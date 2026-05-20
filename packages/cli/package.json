@@ -1,0 +1,23 @@
+{
+  "name": "@tpsdev-ai/milton",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Milton CLI — bootstrap and run Milton-shaped office agents.",
+  "main": "dist/cli.js",
+  "bin": {
+    "milton": "./bin/milton"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@tpsdev-ai/milton-shell": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "dist",
+    "bin"
+  ]
+}
