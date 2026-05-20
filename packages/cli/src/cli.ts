@@ -6,7 +6,7 @@
 // the type surface + role-template structure before we hand-roll the
 // runtime.
 
-import { loadRole, type MiltonRole } from "@tpsdev-ai/milton-shell";
+import { initAgent, loadRole, type MiltonRole } from "@tpsdev-ai/milton-shell";
 
 interface Args {
   command: string;
@@ -44,6 +44,7 @@ Usage: milton <command> [args]
 Commands:
   init <name>         Bootstrap a new Milton-shaped agent
                       Flags: --role <r> --provider <p> --model <m>
+                             --dry-run --force
   run <name> [prompt] Run one session for the named agent
   serve <name>        Run mail watcher + cron loop as a daemon
   doctor <name>       Health check (identity, mail, channels, provider auth)
@@ -55,11 +56,15 @@ Roles: ea | writer | reviewer | coder | qa | custom`);
 
 function init(name: string, flags: Record<string, string | boolean>): void {
   const role = (flags.role ?? "custom") as MiltonRole;
-  const provider = flags.provider ?? "ollama-cloud";
-  const model = flags.model ?? "kimi-k2.6";
-  // Validate role exists before we promise the user a working init
-  const template = loadRole(role);
-  console.log(`[milton init] PLAN (PR-1 stub — actual writes ship in PR-2):
+  const provider = String(flags.provider ?? "ollama-cloud");
+  const model = String(flags.model ?? "kimi-k2.6");
+  const dryRun = flags["dry-run"] === true;
+  const force = flags.force === true;
+
+  if (dryRun) {
+    // Validate role exists, print plan, exit without writing.
+    const template = loadRole(role);
+    console.log(`[milton init] PLAN (--dry-run):
   agent.id        = ${name}
   agent.role      = ${role}
   provider.name   = ${provider}
@@ -67,9 +72,16 @@ function init(name: string, flags: Record<string, string | boolean>): void {
   soul (from template, ${template.soul.length} chars) → ~/agents/${name}/soul.md
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
-  milton.yaml     → ~/agents/${name}/milton.yaml
-  Flair pair      → register Ed25519 key + Agent record
-  TPS mail inbox  → ~/.tps/mail/${name}/`);
+  milton.yaml     → ~/agents/${name}/milton.yaml`);
+    return;
+  }
+
+  const result = initAgent({ name, role, provider, model, noClobber: !force });
+  console.log(`[milton init] wrote ${result.files.length} files to ${result.agentDir}`);
+  for (const f of result.files) console.log(`  ${f}`);
+  console.log(`\nNext: chmod-verified launcher is at ${result.agentDir}/bin/${name}.`);
+  console.log(`Edit ${result.agentDir}/milton.yaml or ${result.agentDir}/soul.md to customize.`);
+  console.log(`Flair pair + TPS mail inbox are PR-3 work — not wired yet.`);
 }
 
 function run(name: string, prompt?: string): void {
