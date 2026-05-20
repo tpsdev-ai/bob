@@ -1,0 +1,20 @@
+{
+  "name": "@tpsdev-ai/milton-shell",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Milton shell runtime — mail consumer, Flair pair, role loader, cron glue.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test"
+  },
+  "license": "Apache-2.0"
+}
