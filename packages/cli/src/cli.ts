@@ -42,9 +42,10 @@ function help(): void {
 Usage: bob <command> [args]
 
 Commands:
-  init <name>         Bootstrap a new Bob-shaped agent
+  onboard <name>      Hire a new Bob-shaped agent and form them into a role
                       Flags: --role <r> --provider <p> --model <m>
                              --dry-run --force
+  align <name>        Recurring check-in to refine an existing agent (PR-9)
   run <name> [prompt] Run one session for the named agent
   serve <name>        Run mail watcher + cron loop as a daemon
   doctor <name>       Health check (identity, mail, channels, provider auth)
@@ -54,7 +55,7 @@ Commands:
 Roles: ea | writer | reviewer | coder | qa | custom`);
 }
 
-function init(name: string, flags: Record<string, string | boolean>): void {
+function onboard(name: string, flags: Record<string, string | boolean>): void {
   const role = (flags.role ?? "custom") as BobRole;
   const provider = String(flags.provider ?? "ollama-cloud");
   const model = String(flags.model ?? "kimi-k2.6");
@@ -64,7 +65,7 @@ function init(name: string, flags: Record<string, string | boolean>): void {
   if (dryRun) {
     // Validate role exists, print plan, exit without writing.
     const template = loadRole(role);
-    console.log(`[bob init] PLAN (--dry-run):
+    console.log(`[bob onboard] PLAN (--dry-run):
   agent.id        = ${name}
   agent.role      = ${role}
   provider.name   = ${provider}
@@ -72,16 +73,28 @@ function init(name: string, flags: Record<string, string | boolean>): void {
   soul (from template, ${template.soul.length} chars) → ~/agents/${name}/soul.md
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
-  bob.yaml     → ~/agents/${name}/bob.yaml`);
+  bob.yaml        → ~/agents/${name}/bob.yaml`);
     return;
   }
 
   const result = initAgent({ name, role, provider, model, noClobber: !force });
-  console.log(`[bob init] wrote ${result.files.length} files to ${result.agentDir}`);
+  console.log(`[bob onboard] hired ${name} into the ${role} role — wrote ${result.files.length} files`);
   for (const f of result.files) console.log(`  ${f}`);
-  console.log(`\nNext: chmod-verified launcher is at ${result.agentDir}/bin/${name}.`);
-  console.log(`Edit ${result.agentDir}/bob.yaml or ${result.agentDir}/soul.md to customize.`);
-  console.log(`Flair pair + TPS mail inbox are PR-3 work — not wired yet.`);
+  console.log(`\nFirst conversation (PR-9): bob align ${name}`);
+  console.log(`Or dispatch directly: bob run ${name} "<prompt>"`);
+  console.log(`Or daemon mode: bob serve ${name}`);
+}
+
+function align(name: string): void {
+  // PR-9 — interactive persona-refinement loop. Until then, a clear stub.
+  console.log(`[bob align ${name}] PR-9 stub — would start an interactive conversation`);
+  console.log(`  - loads current persona from Flair (key: persona:${name})`);
+  console.log(`  - opens a pi-coding-agent session with a meta-instruction:`);
+  console.log(`      "you are being aligned right now — surface what's changed"`);
+  console.log(`  - distills the conversation into a persona update`);
+  console.log(`  - writes back to Flair as persona:${name}`);
+  console.log(`  - next 'bob run/serve' loads the new persona automatically`);
+  console.log(`\nWiring lands in PR-9. For now, edit ~/agents/${name}/soul.md by hand if needed.`);
 }
 
 function run(name: string, prompt?: string): void {
@@ -114,10 +127,24 @@ function main(): number {
   const args = parseArgs(process.argv.slice(2));
   try {
     switch (args.command) {
-      case "init": {
+      case "onboard": {
         const name = args.positional[0];
-        if (!name) { console.error("bob init: missing <name>"); return 2; }
-        init(name, args.flags);
+        if (!name) { console.error("bob onboard: missing <name>"); return 2; }
+        onboard(name, args.flags);
+        return 0;
+      }
+      case "align": {
+        const name = args.positional[0];
+        if (!name) { console.error("bob align: missing <name>"); return 2; }
+        align(name);
+        return 0;
+      }
+      case "init": {
+        // Soft alias — older docs may still say `bob init`. Forward to onboard.
+        const name = args.positional[0];
+        if (!name) { console.error("bob init: missing <name> (note: `bob init` is now `bob onboard`)"); return 2; }
+        console.error("bob init: renamed to `bob onboard`. Forwarding…");
+        onboard(name, args.flags);
         return 0;
       }
       case "run":

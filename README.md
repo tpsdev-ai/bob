@@ -2,7 +2,7 @@
 
 > Moldable office-agent shell. One shape, any role — identity, memory, mail, and channels wired; soul is yours.
 
-Bob is the shell our office agents share. Ember, Reed, Quill all use the same pattern today — launcher script, `.pi-agent/` config, work dir, Flair identity, TPS mail inbox, Discord channel binding. Bob makes that pattern explicit and reusable so spinning up a new agent for a new role is a 30-second `bob init`, not a 150-line launcher rewrite.
+Bob is the shell our office agents share. Ember, Reed, Quill all use the same pattern today — launcher script, `.pi-agent/` config, work dir, Flair identity, TPS mail inbox, Discord channel binding. Bob makes that pattern explicit and reusable so spinning up a new agent for a new role is a 30-second `bob onboard`, not a 150-line launcher rewrite.
 
 ## Status
 
@@ -12,7 +12,7 @@ Design spec: see `docs/DESIGN.md` (lives in `~/ops/specs/BOB-SHELL-DESIGN.md` un
 
 ## What Bob owns
 
-- Launcher script generator (`bob init <name> --role <role>`)
+- Launcher script generator (`bob onboard <name> --role <role>`)
 - Mail consumer loop (poll inbox → dispatch session → drain DONE)
 - Flair identity pairing (Ed25519 keys, Agent record registration, federation)
 - Discord channel binding (read configured channels, reply via bot)
@@ -32,7 +32,7 @@ Design spec: see `docs/DESIGN.md` (lives in `~/ops/specs/BOB-SHELL-DESIGN.md` un
 bun install
 bun run build
 # Try it:
-./packages/cli/bin/bob init testbot --role ea --provider ollama-cloud --model kimi-k2.6
+./packages/cli/bin/bob onboard testbot --role ea --provider ollama-cloud --model kimi-k2.6
 ```
 
 ## Repo layout
