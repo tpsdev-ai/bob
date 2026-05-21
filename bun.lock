@@ -17,6 +17,7 @@
         "bob": "./bin/bob",
       },
       "dependencies": {
+        "@tpsdev-ai/bob-discord": "workspace:*",
         "@tpsdev-ai/bob-shell": "workspace:*",
       },
     },

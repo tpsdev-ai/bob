@@ -13,6 +13,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@tpsdev-ai/bob-discord": "workspace:*",
     "@tpsdev-ai/bob-shell": "workspace:*"
   },
   "license": "Apache-2.0",

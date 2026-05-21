@@ -14,6 +14,7 @@ import {
   runAgent,
   runAlign,
   runOnboard,
+  startDiscordListener,
 } from "@tpsdev-ai/bob-shell";
 
 interface Args {
@@ -57,7 +58,10 @@ Commands:
                       Flags: --provider <p> --model <m> --agent-dir <dir>
   run <name> [prompt] Run one session for the named agent
                       Flags: --model <m> --interactive
-  serve <name>        Run mail watcher + cron loop as a daemon
+  serve <name>        Run mail watcher (+ optional Discord listener) as a daemon
+                      Flags: --discord --discord-token-file <path>
+                             --discord-channels <id1,id2> [--discord-dispatch-all]
+                             [--discord-model <model>]
   doctor <name>       Health check (identity, mail, channels, provider auth)
   office join <name>  Join an existing branch office
   help                Show this help
@@ -157,22 +161,102 @@ async function run(
   return result.exitCode;
 }
 
-function serve(name: string): void {
+async function serve(name: string, flags: Record<string, string | boolean>): Promise<void> {
   const consumer = new MailConsumer({ name });
   consumer.start();
   console.log(`[bob serve] mail consumer running for ${name}`);
   console.log(`  inbox:    ~/.tps/mail/${name}/`);
   console.log(`  launcher: ~/agents/${name}/bin/${name}`);
   console.log(`  poll:     2s · processed:0 failed:0`);
-  console.log(`Ctrl-C to stop. (Cron + Discord wire in PR-5+.)`);
+
+  // Optional Discord listener — when --discord flag is set, also start
+  // a gateway connection and dispatch incoming messages through runAgent.
+  // Requires --discord-token-file and --discord-channels.
+  let discordBridge: { stop: () => Promise<void>; stats: object } | undefined;
+  if (flags.discord === true) {
+    const tokenFile = String(flags["discord-token-file"] ?? "");
+    const channels = String(flags["discord-channels"] ?? "");
+    if (!tokenFile || !channels) {
+      console.error("[bob serve] --discord requires --discord-token-file and --discord-channels");
+      consumer.stop();
+      process.exit(2);
+    }
+    discordBridge = await startDiscordOrExit({
+      agentName: name,
+      tokenFile,
+      channelsCsv: channels,
+      dispatchAll: flags["discord-dispatch-all"] === true,
+      model:
+        flags["discord-model"] !== undefined && flags["discord-model"] !== true
+          ? String(flags["discord-model"])
+          : undefined,
+    });
+    console.log(`[bob serve] discord listener running`);
+    console.log(`  channels: ${channels}`);
+    console.log(
+      `  filter:   ${flags["discord-dispatch-all"] === true ? "all messages" : "mentions only"}`,
+    );
+  }
+
+  console.log(`\nCtrl-C to stop.`);
+
   // Keep the event loop alive
-  const shutdown = () => {
-    console.log(`\n[bob serve] stopping; stats: ${JSON.stringify(consumer.stats)}`);
+  const shutdown = async () => {
+    console.log(
+      `\n[bob serve] stopping; mail stats: ${JSON.stringify(consumer.stats)}${
+        discordBridge ? `; discord stats: ${JSON.stringify(discordBridge.stats)}` : ""
+      }`,
+    );
     consumer.stop();
+    if (discordBridge) await discordBridge.stop();
     process.exit(0);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+}
+
+// Pulled out as a helper so serve() stays linear-readable and the
+// dynamic import + error handling lives in one place.
+async function startDiscordOrExit(args: {
+  agentName: string;
+  tokenFile: string;
+  channelsCsv: string;
+  dispatchAll: boolean;
+  model: string | undefined;
+}): Promise<{ stop: () => Promise<void>; stats: object }> {
+  const fs = await import("node:fs");
+  if (!fs.existsSync(args.tokenFile)) {
+    console.error(`[bob serve] discord token file not found: ${args.tokenFile}`);
+    process.exit(3);
+  }
+  const token = fs.readFileSync(args.tokenFile, "utf8").trim();
+  if (!token) {
+    console.error(`[bob serve] discord token file is empty: ${args.tokenFile}`);
+    process.exit(3);
+  }
+  const listenChannelIds = args.channelsCsv
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (listenChannelIds.length === 0) {
+    console.error(`[bob serve] --discord-channels parsed to zero channels`);
+    process.exit(3);
+  }
+  // discord-js binding lives in @tpsdev-ai/bob-discord — import dynamically
+  // so callers without Discord don't have to install discord.js (~30MB).
+  const { DiscordJsClient } = await import("@tpsdev-ai/bob-discord");
+  const client = new DiscordJsClient({ token });
+  return startDiscordListener({
+    agentName: args.agentName,
+    listenChannelIds,
+    client,
+    dispatchAll: args.dispatchAll,
+    model: args.model,
+  });
 }
 
 function doctor(name: string): void {
@@ -226,7 +310,7 @@ async function main(): Promise<number> {
           console.error("bob serve: missing <name>");
           return 2;
         }
-        serve(args.positional[0]);
+        await serve(args.positional[0], args.flags);
         return 0;
       case "doctor":
         if (!args.positional[0]) {

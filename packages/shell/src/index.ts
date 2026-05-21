@@ -60,6 +60,10 @@ export {
   type DiscordMessage,
 } from "./discord-bridge.js";
 export {
+  type DiscordListenerOptions,
+  startDiscordListener,
+} from "./discord-serve.js";
+export {
   type FlairPairOptions,
   type FlairPairResult,
   flairPair,

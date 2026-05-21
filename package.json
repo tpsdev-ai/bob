@@ -7,9 +7,9 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "cd packages/shell && bun run build && cd ../cli && bun run build && cd ../discord && bun run build",
-    "test": "cd packages/shell && bun test && cd ../cli && bun test && cd ../discord && bun test",
-    "typecheck": "cd packages/shell && bun run build && bun run typecheck && cd ../cli && bun run typecheck && cd ../discord && bun run typecheck",
+    "build": "cd packages/shell && bun run build && cd ../discord && bun run build && cd ../cli && bun run build",
+    "test": "cd packages/shell && bun test && cd ../discord && bun test && cd ../cli && bun test",
+    "typecheck": "cd packages/shell && bun run build && bun run typecheck && cd ../discord && bun run build && bun run typecheck && cd ../cli && bun run typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
