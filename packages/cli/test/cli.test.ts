@@ -35,9 +35,21 @@ describe("bob CLI", () => {
     expect(out).toContain("[bob onboard] PLAN (--dry-run)");
   });
 
-  it("align prints its PR-9 stub", () => {
-    const out = execSync(`node ${CLI} align testbot`, { encoding: "utf8" });
-    expect(out).toContain("PR-9 stub");
-    expect(out).toContain("persona:testbot");
+  it("onboard --no-interactive renders the plan with interview SKIPPED", () => {
+    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run --no-interactive`, {
+      encoding: "utf8",
+    });
+    expect(out).toContain("interview       = SKIPPED");
+  });
+
+  it("onboard --dry-run plans an interactive pi session by default", () => {
+    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run`, { encoding: "utf8" });
+    expect(out).toContain("interview       = interactive pi session");
+  });
+
+  it("help advertises align flags", () => {
+    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    expect(out).toContain("align <name>");
+    expect(out).toContain("--agent-dir");
   });
 });

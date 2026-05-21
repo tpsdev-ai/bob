@@ -51,6 +51,7 @@ export interface BobConfig {
   cron?: CronEntry[];
 }
 
+export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
 export {
   DiscordBridge,
   type DiscordBridgeOptions,
@@ -71,4 +72,10 @@ export {
   type MailConsumerStats,
   type MailMessage,
 } from "./mail-consumer.js";
+export {
+  type OnboardOptions,
+  type OnboardResult,
+  runOnboard,
+  type SpawnFn,
+} from "./onboard.js";
 export { loadRole, type RoleTemplate } from "./role-loader.js";
