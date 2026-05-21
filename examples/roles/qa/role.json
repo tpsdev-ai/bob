@@ -1,0 +1,19 @@
+{
+  "tools": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Grep",
+      "Glob",
+      "WebFetch",
+      "WebSearch",
+      "mcp__flair__memory_search",
+      "mcp__flair__memory_store",
+      "mcp__flair__memory_get"
+    ]
+  },
+  "default_provider": "exe-dev-gateway",
+  "default_model": "claude-sonnet-4-6"
+}

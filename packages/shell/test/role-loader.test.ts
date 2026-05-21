@@ -10,6 +10,22 @@ describe("role-loader", () => {
     expect(t.tools.allow).toContain("mcp__flair__memory_search");
   });
 
+  it.each([
+    "writer",
+    "reviewer",
+    "coder",
+    "qa",
+    "custom",
+  ] as const)("loads the %s role template", (role) => {
+    const t = loadRole(role);
+    expect(t.role).toBe(role);
+    expect(t.soul.length).toBeGreaterThan(0);
+    expect(t.tools.allow.length).toBeGreaterThan(0);
+    // Every role gets Flair memory by default — the office-agent
+    // pattern assumes Flair as the memory layer.
+    expect(t.tools.allow).toContain("mcp__flair__memory_search");
+  });
+
   it("throws on unknown role", () => {
     // @ts-expect-error — intentionally bad role
     expect(() => loadRole("does-not-exist")).toThrow(/unknown role/);
