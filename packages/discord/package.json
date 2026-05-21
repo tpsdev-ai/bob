@@ -1,0 +1,24 @@
+{
+  "name": "@tpsdev-ai/milton-discord",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Discord.js binding for milton-shell's DiscordClient interface.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@tpsdev-ai/milton-shell": "workspace:*",
+    "discord.js": "^14.16.0"
+  },
+  "license": "Apache-2.0"
+}
