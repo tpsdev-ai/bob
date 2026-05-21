@@ -13,7 +13,7 @@
 // Exits 0 if every internal dep version matches the dependency's own
 // package.json `version`. Exits 1 with a clear report otherwise.
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const root = process.cwd();
@@ -69,11 +69,7 @@ if (problems.length === 0) {
 
 console.error("[check-workspace-deps] internal deps out of lockstep:");
 for (const p of problems) {
-  console.error(
-    `  ${p.package} declares ${p.dep}@${p.declared}, but ${p.dep} ships ${p.shipped}`,
-  );
+  console.error(`  ${p.package} declares ${p.dep}@${p.declared}, but ${p.dep} ships ${p.shipped}`);
 }
-console.error(
-  "\nFix: align the declared version to the shipped version (or use workspace:*).",
-);
+console.error("\nFix: align the declared version to the shipped version (or use workspace:*).");
 process.exit(1);
