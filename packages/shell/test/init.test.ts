@@ -125,4 +125,76 @@ describe("initAgent", () => {
     const mode = statSync(res.flair?.privateKeyPath).mode & 0o777;
     expect(mode).toBe(0o600);
   });
+
+  describe("pi launcher generation", () => {
+    it("appends --append-system-prompt to load soul.md", () => {
+      const res = initAgent(baseOpts());
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(launcher).toContain("--append-system-prompt");
+      expect(launcher).toContain('"$(cat $AGENT_DIR/soul.md)"');
+    });
+
+    it("translates exe-dev-gateway provider to anthropic in the launcher", () => {
+      const res = initAgent({
+        ...baseOpts(),
+        provider: "exe-dev-gateway",
+        model: "claude-opus-4-7",
+      });
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(launcher).toContain("--provider anthropic");
+      expect(launcher).not.toContain("--provider exe-dev-gateway");
+      expect(launcher).toContain("--model claude-opus-4-7");
+    });
+
+    it("passes other provider names through unchanged", () => {
+      const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(launcher).toContain("--provider ollama-cloud");
+    });
+  });
+
+  describe("pi agent config (.pi-agent/{models,auth}.json)", () => {
+    it("writes models.json + auth.json for exe-dev-gateway provider", () => {
+      const res = initAgent({
+        ...baseOpts(),
+        provider: "exe-dev-gateway",
+        model: "claude-opus-4-7",
+      });
+      const modelsPath = join(res.agentDir, ".pi-agent", "models.json");
+      const authPath = join(res.agentDir, ".pi-agent", "auth.json");
+      expect(existsSync(modelsPath)).toBe(true);
+      expect(existsSync(authPath)).toBe(true);
+      expect(res.files).toContain(modelsPath);
+      expect(res.files).toContain(authPath);
+
+      const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+      expect(models.providers.anthropic.baseUrl).toBe(
+        "http://169.254.169.254/gateway/llm/anthropic",
+      );
+
+      const auth = JSON.parse(readFileSync(authPath, "utf8"));
+      expect(auth.anthropic.type).toBe("api_key");
+      // Placeholder value — the gateway uses VM identity, not the literal key
+      expect(auth.anthropic.key).toBe("exe-gateway-placeholder");
+    });
+
+    it("auth.json is mode 0600 (credentials must not be world-readable)", () => {
+      const res = initAgent({
+        ...baseOpts(),
+        provider: "exe-dev-gateway",
+        model: "claude-opus-4-7",
+      });
+      const authPath = join(res.agentDir, ".pi-agent", "auth.json");
+      const mode = statSync(authPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    });
+
+    it("does NOT write models.json/auth.json for non-gateway providers", () => {
+      const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
+      const modelsPath = join(res.agentDir, ".pi-agent", "models.json");
+      const authPath = join(res.agentDir, ".pi-agent", "auth.json");
+      expect(existsSync(modelsPath)).toBe(false);
+      expect(existsSync(authPath)).toBe(false);
+    });
+  });
 });
