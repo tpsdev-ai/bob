@@ -55,7 +55,7 @@ Bob is one layer of an open stack:
 - **[Flair](https://github.com/tpsdev-ai/flair)** — the memory layer Bob's agents talk to by default; orchestrator-agnostic, self-host, federates across hosts.
 - **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer Bob's `bob serve` mail consumer plugs into; mail, branch-office bring-up, agent-to-agent dispatch.
 
-Each layer stands alone — use whichever fit your stack, swap out the others. Bob's value is concentrated at the office-shell layer; the rest is composable.
+Each layer stands alone — use whichever fits your stack, swap out the others. Bob's value is concentrated at the office-shell layer; the rest is composable.
 
 If you already use pi and want each agent to have a name, a key, a mailbox, and a channel — Bob is what gets you there.
 
