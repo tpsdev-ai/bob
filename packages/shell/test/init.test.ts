@@ -151,6 +151,18 @@ describe("initAgent", () => {
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
       expect(launcher).toContain("--provider ollama-cloud");
     });
+
+    it("opt-in sources $HOME/.tps/secrets/<name>-github-pat into GH_TOKEN", () => {
+      // Pattern: intel-gathering agents (Pulse, future EAs) hit GitHub for
+      // releases.atom + REST API. Anonymous = 60/hr; authenticated = 5000/hr.
+      // The launcher reads from a 0600 file so the token never lands in
+      // process listings or env-dump output, and silently skips when absent.
+      const res = initAgent({ ...baseOpts(), name: "pulse" });
+      const launcher = readFileSync(join(res.agentDir, "bin", "pulse"), "utf8");
+      expect(launcher).toContain('GH_PAT_FILE="$HOME/.tps/secrets/pulse-github-pat"');
+      expect(launcher).toContain('if [ -r "$GH_PAT_FILE" ]; then');
+      expect(launcher).toContain("export GH_TOKEN");
+    });
   });
 
   describe("pi agent config (.pi-agent/{models,auth}.json)", () => {

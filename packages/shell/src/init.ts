@@ -167,6 +167,16 @@ export GIT_AUTHOR_EMAIL="${opts.name}@tps.dev"
 export GIT_COMMITTER_NAME="${capitalize(opts.name)}"
 export GIT_COMMITTER_EMAIL="${opts.name}@tps.dev"
 
+# Optional GitHub PAT for intel-gathering (releases.atom polling, REST API).
+# Sourced from a 0600 file so the token never lands in process listings or
+# env-dump output. If the file is missing the agent still runs — GitHub
+# anonymous calls just get the ~60/hr rate limit instead of 5000/hr.
+GH_PAT_FILE="$HOME/.tps/secrets/${opts.name}-github-pat"
+if [ -r "$GH_PAT_FILE" ]; then
+  GH_TOKEN=$(cat "$GH_PAT_FILE")
+  export GH_TOKEN
+fi
+
 cd "$AGENT_DIR/work"
 # --append-system-prompt loads the role-customized persona from soul.md.
 # Without this, pi runs with the default coding-assistant prompt and the
