@@ -146,6 +146,14 @@ channels:
 tools:
   allow:
 ${tools}
+
+capabilities:
+  - flair
+
+flair:
+  url: http://127.0.0.1:9926
+  agentId: ${opts.name}
+  keyFile: ~/.flair/keys/${opts.name}.key
 `;
 }
 

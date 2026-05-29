@@ -54,7 +54,21 @@ describe("initAgent", () => {
     expect(yaml).toContain("name: exe-dev-gateway");
     expect(yaml).toContain("model: claude-opus-4-7");
     expect(yaml).toContain("- Bash");
-    expect(yaml).toContain("- mcp__flair__memory_store");
+    // Memory tools come from the flair capability (not the dead mcp__flair__* names).
+    expect(yaml).toContain("- flair_write");
+    expect(yaml).toContain("- flair_search");
+  });
+
+  it("scaffolds the flair memory capability + config block", () => {
+    const res = initAgent({ ...baseOpts(), name: "memo" });
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(yaml).toContain("capabilities:");
+    expect(yaml).toContain("- flair");
+    expect(yaml).toContain("flair:");
+    expect(yaml).toContain("agentId: memo");
+    expect(yaml).toContain("keyFile: ~/.flair/keys/memo.key");
+    // No dead OpenClaw-era mcp__flair__* names anywhere.
+    expect(yaml).not.toContain("mcp__flair__");
   });
 
   it("generates an executable bin/<name> launcher", () => {

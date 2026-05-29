@@ -245,4 +245,28 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
     expect(body.content).toBe("note");
     expect(body.durability).toBe("persistent");
   });
+
+  it("expands a leading ~/ in keyFile to homedir", async () => {
+    const { homedir } = await import("node:os");
+    const kp = (await subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const pkcs8b64 = Buffer.from(await subtle.exportKey("pkcs8", kp.privateKey)).toString("base64");
+    let readPath = "";
+    const client = new FlairHttpClient({
+      url: "http://h",
+      agentId: "a",
+      keyFile: "~/.flair/keys/a.key",
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "{}" }),
+      now: () => 1,
+      uuid: () => "n",
+      readFile: (p) => {
+        readPath = p;
+        return pkcs8b64;
+      },
+    });
+    await client.get("x");
+    expect(readPath).toBe(`${homedir()}/.flair/keys/a.key`);
+  });
 });
