@@ -58,8 +58,9 @@ Commands:
                              --dry-run --force --no-interactive
   align <name>        Recurring check-in to refine an existing agent
                       Flags: --provider <p> --model <m> --agent-dir <dir>
-  run <name> [prompt] Run one session for the named agent
-                      Flags: --model <m> --interactive
+  run <name> <prompt> Run one short-lived task for the named agent (embeds pi
+                      via its SDK — fresh session, one prompt, exit)
+                      Flags: --model <m>  (--interactive: coming in a later PR)
   serve <name>        Run mail watcher (+ optional Discord listener) as a daemon
                       Flags: --discord --discord-token-file <path>
                              --discord-channels <id1,id2> [--discord-dispatch-all]
@@ -158,8 +159,19 @@ async function run(
   flags: Record<string, string | boolean>,
 ): Promise<number> {
   const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
-  const interactive = flags.interactive === true;
-  const result = await runAgent({ name, prompt, model, interactive });
+  // PR1 migrated `bob run` to pi's embedded SDK for the non-interactive prompt
+  // path only. The interactive REPL on the SDK lands in a later phase-1 PR.
+  if (flags.interactive === true) {
+    console.error(
+      "bob run: --interactive is not yet supported on the embedded-SDK path (use a prompt for now)",
+    );
+    return 2;
+  }
+  if (prompt === undefined) {
+    console.error('bob run: a prompt is required, e.g. `bob run <name> "summarize my inbox"`');
+    return 2;
+  }
+  const result = await runAgent({ name, prompt, model });
   return result.exitCode;
 }
 

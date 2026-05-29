@@ -178,6 +178,11 @@ if [ -r "$GH_PAT_FILE" ]; then
 fi
 
 cd "$AGENT_DIR/work"
+# TODO(phase1): migrate to SDK — the persistent/interactive agent runtime
+# embeds pi via createAgentSession (mirrors run.ts) and this generated
+# launcher goes away. Kept for now; PR1 only migrates run.ts's non-interactive
+# prompt path. run.ts already reads provider/model from bob.yaml and appends
+# soul.md the same way this launcher does.
 # --append-system-prompt loads the role-customized persona from soul.md.
 # Without this, pi runs with the default coding-assistant prompt and the
 # agent identity is lost. See reference_bob_init_papercuts.

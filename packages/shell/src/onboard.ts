@@ -88,6 +88,9 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   }
   const soulPath = join(opts.agentDir, "soul.md");
   const soulHashBefore = hashFile(soulPath);
+  // TODO(phase1): migrate to SDK — embed pi via createAgentSession instead of
+  // spawning the `pi` binary (mirrors run.ts). Kept as a subprocess for now;
+  // PR1 only migrates the non-interactive prompt path in run.ts.
   const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
   const piBin = opts.piBin ?? "pi";
 

@@ -147,6 +147,8 @@ export class MailConsumer {
       return this.opts.dispatch(msg);
     }
     // Default: spawn the agent's launcher with body as stdin prompt arg.
+    // TODO(phase1): migrate to SDK — route mail through runAgent's embedded
+    // pi session (run.ts) instead of spawning the generated launcher.
     return new Promise<void>((resolve, reject) => {
       const child = spawn(this.opts.launcherPath, [msg.body], {
         stdio: ["ignore", "pipe", "pipe"],

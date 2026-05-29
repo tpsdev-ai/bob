@@ -20,6 +20,9 @@
     "typecheck": "tsc -p . --noEmit",
     "test": "bun test"
   },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.70.5"
+  },
   "keywords": [
     "agent",
     "office-agent",
