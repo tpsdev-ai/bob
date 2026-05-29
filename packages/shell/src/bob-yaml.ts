@@ -22,7 +22,9 @@ export function readCapabilities(yamlText: string): string[] {
   const lines = yamlText.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const m = line.match(/^capabilities\s*:\s*(.*)$/);
+    // Drop the post-colon `\s*` (the capture trims anyway) to avoid a
+    // polynomial regex (CodeQL js/polynomial-redos) — `\s*` overlapping `(.*)`.
+    const m = line.match(/^capabilities\s*:(.*)$/);
     if (!m) continue;
 
     const inline = m[1].trim();
@@ -42,9 +44,12 @@ export function readCapabilities(yamlText: string): string[] {
       if (l.trim() === "" || l.trim().startsWith("#")) continue;
       // A new column-0, non-comment key ends the block.
       if (/^[A-Za-z0-9_-]+\s*:/.test(l)) break;
-      const item = l.match(/^\s+-\s*(.+?)\s*$/);
-      if (item) {
-        items.push(stripQuotes(item[1].trim()));
+      // Trim first, then a literal "-" prefix check — avoids the polynomial
+      // regex `^\s+-\s*(.+?)\s*$` (CodeQL js/polynomial-redos) on adversarial
+      // whitespace. (Column-0 keys are already handled by the break above.)
+      const t = l.trim();
+      if (t.startsWith("-")) {
+        items.push(stripQuotes(t.slice(1).trim()));
       } else {
         // Non-list, deeper-indented content under capabilities: stop — the
         // block sequence has ended.
@@ -70,7 +75,7 @@ export function readBlock(yamlText: string, key: string): Record<string, unknown
   for (const line of lines) {
     if (/^[A-Za-z0-9_-]+\s*:/.test(line)) {
       // A column-0 key. Are we entering, or leaving, our block?
-      const km = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+      const km = line.match(/^([A-Za-z0-9_-]+)\s*:(.*)$/);
       const isOurs = km?.[1] === key;
       inBlock = isOurs === true;
       if (isOurs) {
@@ -82,7 +87,10 @@ export function readBlock(yamlText: string, key: string): Record<string, unknown
     }
     if (!inBlock) continue;
     if (line.trim() === "" || line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s+([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/);
+    // Trim first, then match without leading/trailing `\s*` — avoids the
+    // polynomial regex (CodeQL js/polynomial-redos). coerceScalar trims the value.
+    const t = line.trim();
+    const m = t.match(/^([A-Za-z0-9_-]+)\s*:(.*)$/);
     if (m) {
       out[m[1]] = coerceScalar(m[2]);
     }

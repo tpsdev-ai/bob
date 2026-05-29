@@ -327,10 +327,13 @@ function readProviderField(yamlText: string, key: string): string | undefined {
       continue;
     }
     if (!inProvider) continue;
-    const m = line.match(/^\s+([A-Za-z0-9_-]+)\s*:\s*(.+?)\s*$/);
+    // Trim first, then match without leading/trailing `\s*` — avoids a
+    // polynomial regex (CodeQL js/polynomial-redos). Value is trimmed below.
+    const t = line.trim();
+    const m = t.match(/^([A-Za-z0-9_-]+)\s*:(.*)$/);
     if (m && m[1] === key) {
-      // Strip surrounding quotes if present.
-      return m[2].replace(/^["']|["']$/g, "");
+      // Strip surrounding whitespace + quotes if present.
+      return m[2].trim().replace(/^["']|["']$/g, "");
     }
   }
   return undefined;
