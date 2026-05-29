@@ -13,13 +13,13 @@ import {
   initAgent,
   installService,
   loadRole,
-  plistPath,
   restart,
   runAgent,
   runAlign,
   runDoctor,
   runOnboard,
   runPersistent,
+  servicePath,
   up,
 } from "@tpsdev-ai/bob-shell";
 
@@ -67,11 +67,11 @@ Commands:
                       Flags: --model <m>  (--interactive: coming in a later PR)
   serve <name>        Run the agent PERSISTENTLY — one warm pi session that stays
                       up, loading the agent's bob.yaml capabilities (incl. discord).
-                      This is what the launchd unit runs. Flags: --model <m>
-  install-service <n> Write the agent's launchd unit (KeepAlive + RunAtLoad) so it
-                      self-runs. Flags: --bob-bin <abs path> --model <m>
-  up <name>           Load + start the agent's launchd unit
-  down <name>         Stop + unload the agent's launchd unit
+                      This is what the service unit runs. Flags: --model <m>
+  install-service <n> Write the agent's service unit (launchd on macOS / systemd
+                      user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
+  up <name>           Load + start the agent's service unit
+  down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
   office join <name>  Join an existing branch office
@@ -200,21 +200,24 @@ async function serve(name: string, flags: Record<string, string | boolean>): Pro
 // (KeepAlive + RunAtLoad). Does NOT start it — that's `bob up`. The plist runs
 // `bob serve <name>`; it embeds NO secrets (the discord token is read from the
 // file path in bob.yaml at runtime).
-function installServiceCmd(name: string, flags: Record<string, string | boolean>): number {
-  // launchd uses a minimal PATH, so the unit needs an absolute path to `bob`.
-  // Default to the current executable's path when not overridden.
+async function installServiceCmd(
+  name: string,
+  flags: Record<string, string | boolean>,
+): Promise<number> {
+  // launchd + systemd both use a minimal PATH, so the unit needs an absolute
+  // path to `bob`. Default to the current executable's path when not overridden.
   const bobBin =
     flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
       ? String(flags["bob-bin"])
       : process.argv[1] || "bob";
   const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
-  const { plistPath: written } = installService({ name, bobBin, model });
+  const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
   console.log(`  runs:    ${bobBin} serve ${name}`);
   console.log(`  next:    bob up ${name}   (load + start)`);
   if (bobBin === "bob") {
     console.error(
-      "[bob install-service] WARNING: could not resolve an absolute bob path; launchd needs one.",
+      "[bob install-service] WARNING: could not resolve an absolute bob path; the unit needs one.",
     );
     console.error("  Re-run with --bob-bin <absolute path to bob>.");
   }
@@ -223,7 +226,7 @@ function installServiceCmd(name: string, flags: Record<string, string | boolean>
 
 async function upCmd(name: string): Promise<number> {
   await up({ name });
-  console.log(`[bob up] loaded ${plistPath(name)} — agent ${name} is running`);
+  console.log(`[bob up] loaded ${servicePath(name)} — agent ${name} is running`);
   return 0;
 }
 
@@ -297,7 +300,7 @@ async function main(): Promise<number> {
           console.error("bob install-service: missing <name>");
           return 2;
         }
-        return installServiceCmd(args.positional[0], args.flags);
+        return await installServiceCmd(args.positional[0], args.flags);
       case "up":
         if (!args.positional[0]) {
           console.error("bob up: missing <name>");

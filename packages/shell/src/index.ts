@@ -112,6 +112,8 @@ export {
   type SessionManagerLike,
 } from "./run.js";
 export {
+  type CommandRunner,
+  detectPlatform,
   down,
   type InstallServiceOptions,
   installService,
@@ -119,9 +121,15 @@ export {
   type LifecycleOptions,
   plistPath,
   type RenderPlistOptions,
+  type RenderServiceOptions,
   renderPlist,
+  renderSystemdUnit,
   restart,
   type ServiceOpsDeps,
+  type ServicePlatform,
   serviceLabel,
+  servicePath,
+  systemdUnitName,
+  systemdUnitPath,
   up,
 } from "./service.js";

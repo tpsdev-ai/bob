@@ -1,33 +1,74 @@
-// launchd service install + lifecycle (`bob up` / `down` / `restart`).
+// Service install + lifecycle (`bob install-service` / `up` / `down` / `restart`).
 //
-// The agent owns its runtime (spec §3): each agent runs as its OWN launchd
-// user-agent unit that hosts the persistent process (`bob serve <agent>` →
-// runPersistent). Bob installs the unit; Bob does NOT babysit the process —
-// launchd's KeepAlive restarts it on crash, RunAtLoad starts it on login.
+// The agent owns its runtime (spec §3): each agent runs as its OWN OS service
+// unit hosting the persistent process (`bob serve <agent>` → runPersistent). Bob
+// installs the unit; Bob does NOT babysit the process — the init system restarts
+// it on crash (launchd KeepAlive / systemd Restart=always) and starts it on
+// login/boot.
 //
-// SECURITY (Sherlock): the generated plist NEVER embeds the bot token (or any
-// secret). The discord capability reads its token from a FILE PATH carried in
-// the agent's bob.yaml `discord.tokenFile` block (see @tpsdev-ai/bob-cap-discord
-// config.ts) — the persistent process reads it from disk at startup and holds
-// it only in memory. The plist only references the agent NAME + the bob binary.
-// No env-var secrets, no inline token, nothing logged.
+// TWO BACKENDS, ONE API:
+//   * macOS → launchd user-agent (~/Library/LaunchAgents/<label>.plist), driven
+//     by launchctl bootstrap/bootout/kickstart.
+//   * Linux → systemd USER unit (~/.config/systemd/user/bob-<name>.service),
+//     driven by `systemctl --user`. A USER unit (not system) keeps install
+//     sudo-free and mirrors launchd's user-agent model. NOTE: for an agent to
+//     stay up across logout / reboot on a headless host, enable lingering once:
+//     `loginctl enable-linger <user>` (a one-time host setup, not bob's job).
+// installService / up / down / restart dispatch on the host platform, override-
+// able via ServiceOpsDeps.platform (CI runs on Linux, so tests pin it).
 //
-// TESTABILITY: every OS interaction is injected. `writeFile` writes the plist;
-// `runLaunchctl` shells out to launchctl. Tests pass capturing fakes so we
-// never touch the real LaunchAgents dir or launchctl.
+// SECURITY (Sherlock): the generated unit NEVER embeds the bot token or any
+// secret. Capabilities read their secrets from FILE PATHS in bob.yaml at
+// runtime. The unit references only the agent NAME + the bob binary.
+//
+// TESTABILITY: every OS interaction is injected (writeFile + the launchctl /
+// systemctl runners + uid + platform), so tests never touch real dirs or the
+// real init system.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-// Same strict class init.ts/run.ts use — agent names are filesystem paths AND
-// get embedded in the plist Label / file name, so this doubles as path + XML
-// injection defense (no `..`, no `/`, no `<`, no whitespace).
+// Strict class init.ts/run.ts use — agent names are filesystem paths AND get
+// embedded in the unit Label / file name / ExecStart, so this doubles as path,
+// XML, and unit-injection defense (no `..`, `/`, `<`, whitespace, newlines).
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
-// launchd domain target for a user agent: gui/<uid>. Used by bootstrap/bootout/
-// kickstart. We resolve <uid> at call time (injectable for tests).
+export type ServicePlatform = "launchd" | "systemd";
+
+// Resolve which backend to use. darwin → launchd; everything else → systemd.
+// Injectable for tests via ServiceOpsDeps.platform.
+export function detectPlatform(override?: ServicePlatform): ServicePlatform {
+  if (override) return override;
+  return process.platform === "darwin" ? "launchd" : "systemd";
+}
+
+function assertName(name: string): void {
+  if (!AGENT_NAME.test(name)) {
+    throw new Error(`invalid agent name: ${JSON.stringify(name)} (must match ${AGENT_NAME})`);
+  }
+}
+
+export interface RenderServiceOptions {
+  name: string;
+  // Absolute path to the `bob` binary the unit runs. Both init systems use a
+  // minimal PATH, so this MUST be absolute (the caller resolves it). Required.
+  bobBin: string;
+  // Optional model override passed through to `bob serve` (→ runPersistent).
+  model?: string;
+  // The agent's home dir for log paths + WorkingDirectory. Defaults to ~. The
+  // agent's working dir is <home>/agents/<name>/work.
+  home?: string;
+}
+
+// Back-compat alias (the launchd renderer historically took RenderPlistOptions).
+export type RenderPlistOptions = RenderServiceOptions;
+
+// =========================================================================
+// launchd (macOS)
+// =========================================================================
+
 function guiDomain(uid: number): string {
   return `gui/${uid}`;
 }
@@ -42,34 +83,15 @@ export function plistPath(name: string, home: string = homedir()): string {
   return join(home, "Library", "LaunchAgents", `${serviceLabel(name)}.plist`);
 }
 
-export interface RenderPlistOptions {
-  name: string;
-  // Absolute path to the `bob` binary the unit runs. launchd uses a minimal
-  // PATH, so this MUST be absolute (the caller resolves it). Required.
-  bobBin: string;
-  // Optional model override passed through to `bob serve` (→ runPersistent).
-  model?: string;
-  // The agent's home dir for stdout/stderr log paths + WorkingDirectory.
-  // Defaults to ~. The agent's working dir is <home>/agents/<name>/work.
-  home?: string;
-}
-
 // Render the per-agent launchd plist. KeepAlive (restart on crash) + RunAtLoad
-// (start on login). ProgramArguments run `bob serve <name>` — the persistent
-// entrypoint. NO token, NO secret env vars — see the security note above.
-export function renderPlist(opts: RenderPlistOptions): string {
-  if (!AGENT_NAME.test(opts.name)) {
-    throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
-  }
+// (start on login). ProgramArguments run `bob serve <name>`. NO secret.
+export function renderPlist(opts: RenderServiceOptions): string {
+  assertName(opts.name);
   const home = opts.home ?? homedir();
   const label = serviceLabel(opts.name);
   const workDir = join(home, "agents", opts.name, "work");
   const logDir = join(home, "agents", opts.name);
 
-  // ProgramArguments: the bob binary + the persistent subcommand. Each arg is
-  // its own <string> — no shell, so no quoting/injection surface. The agent
-  // name already passed the strict regex above; model (if any) is XML-escaped
-  // defensively even though it comes from a trusted flag.
   const args = [opts.bobBin, "serve", opts.name];
   if (opts.model) args.push("--model", opts.model);
   const programArgs = args.map((a) => `    <string>${xmlEscape(a)}</string>`).join("\n");
@@ -104,9 +126,7 @@ ${programArgs}
 `;
 }
 
-// XML-escape a value for safe embedding in the plist. Defense in depth: the
-// agent name already passed the strict regex, but bobBin / model / paths are
-// escaped so a stray `&`/`<` can never break the XML.
+// XML-escape a value for safe embedding in the plist. Defense in depth.
 function xmlEscape(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -116,57 +136,118 @@ function xmlEscape(s: string): string {
     .replace(/'/g, "&apos;");
 }
 
-// --- Lifecycle (`bob up` / `down` / `restart`) ----------------------------
+// =========================================================================
+// systemd (Linux) — USER unit
+// =========================================================================
 
-// Shells out to launchctl. Injected in tests so we never run real launchctl.
-// Returns the exit code; non-zero throws in the wrappers below with the args
+// The systemd unit name for an agent. Stable + unique per agent.
+export function systemdUnitName(name: string): string {
+  return `bob-${name}.service`;
+}
+
+// The user-unit file path. Lives under ~/.config/systemd/user so install needs
+// no sudo (matches launchd's per-user LaunchAgents).
+export function systemdUnitPath(name: string, home: string = homedir()): string {
+  return join(home, ".config", "systemd", "user", systemdUnitName(name));
+}
+
+// Render the per-agent systemd USER unit. Restart=always (restart on crash);
+// WantedBy=default.target (start on login/boot when enabled). ExecStart runs
+// `bob serve <name>`. NO secret env, NO inline token — see the security note.
+// `name` already passed the strict regex, so ExecStart has no whitespace/newline
+// injection surface; bobBin/model are trusted (resolved binary path + a flag).
+export function renderSystemdUnit(opts: RenderServiceOptions): string {
+  assertName(opts.name);
+  const home = opts.home ?? homedir();
+  const workDir = join(home, "agents", opts.name, "work");
+  const logDir = join(home, "agents", opts.name);
+
+  const exec = [opts.bobBin, "serve", opts.name];
+  if (opts.model) exec.push("--model", opts.model);
+
+  return `# Generated by 'bob install-service ${opts.name}'. Don't edit — re-run to update.
+# The agent runs itself: Restart=always restarts on crash; enable it (bob up) to
+# start on login/boot. No credentials here: capabilities read theirs from file
+# paths in bob.yaml at runtime.
+[Unit]
+Description=Bob agent ${opts.name} (self-running persistent session)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${exec.join(" ")}
+WorkingDirectory=${workDir}
+Restart=always
+RestartSec=5
+StandardOutput=append:${join(logDir, "service.out.log")}
+StandardError=append:${join(logDir, "service.err.log")}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+// =========================================================================
+// Shared: paths, runners, install + lifecycle (platform-dispatched)
+// =========================================================================
+
+// The unit file path for an agent on the resolved platform.
+export function servicePath(
+  name: string,
+  opts: { platform?: ServicePlatform; home?: string } = {},
+): string {
+  return detectPlatform(opts.platform) === "launchd"
+    ? plistPath(name, opts.home)
+    : systemdUnitPath(name, opts.home);
+}
+
+// Shells out to a command. Injected in tests so we never run real launchctl /
+// systemctl. Returns the exit code + stderr; non-zero throws in the wrappers
 // (never any secret — there are none in these commands).
+export type CommandRunner = (
+  cmd: string,
+  args: string[],
+) => Promise<{ code: number; stderr: string }>;
+// Back-compat: the launchd-only runner shape used by existing callers/tests.
 export type LaunchctlRunner = (args: string[]) => Promise<{ code: number; stderr: string }>;
 
 export interface ServiceOpsDeps {
-  // Write the plist to disk (install-service). Injected in tests.
+  // Write the unit to disk (install-service). Injected in tests.
   writeFile?: (path: string, contents: string) => void;
-  // Run launchctl. Injected in tests.
+  // Run launchctl (macOS). Injected in tests.
   runLaunchctl?: LaunchctlRunner;
-  // Resolve the current uid for the gui domain target. Injected in tests.
+  // Run systemctl (Linux). Injected in tests.
+  runSystemctl?: LaunchctlRunner;
+  // Resolve the current uid for the launchd gui domain target. Injected in tests.
   getUid?: () => number;
   // Home dir override (tests).
   home?: string;
+  // Force a backend (tests; CI runs on Linux). Defaults to the host platform.
+  platform?: ServicePlatform;
 }
 
-export interface InstallServiceOptions extends RenderPlistOptions, ServiceOpsDeps {}
+export interface InstallServiceOptions extends RenderServiceOptions, ServiceOpsDeps {}
 
-// Write the agent's launchd plist to ~/Library/LaunchAgents. Does NOT load it
-// (that's `bob up`) — install + start are separate so re-installing an updated
-// unit while it's running is a `down` → `install` → `up` (or `restart`).
-export function installService(opts: InstallServiceOptions): { plistPath: string } {
-  const path = plistPath(opts.name, opts.home);
-  const contents = renderPlist(opts);
-  const write =
-    opts.writeFile ??
-    ((p: string, c: string) => {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, c, "utf8");
-    });
-  write(path, contents);
-  return { plistPath: path };
-}
-
-export interface LifecycleOptions extends ServiceOpsDeps {
-  name: string;
-}
+const defaultWrite = (p: string, c: string) => {
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, c, "utf8");
+};
 
 const defaultRunLaunchctl: LaunchctlRunner = async (args: string[]) => {
   const r = spawnSync("launchctl", args, { encoding: "utf8" });
   return { code: r.status ?? 1, stderr: r.stderr ?? "" };
 };
 
-async function launchctl(deps: ServiceOpsDeps, args: string[]): Promise<void> {
-  const runner = deps.runLaunchctl ?? defaultRunLaunchctl;
+const defaultRunSystemctl: LaunchctlRunner = async (args: string[]) => {
+  const r = spawnSync("systemctl", args, { encoding: "utf8" });
+  return { code: r.status ?? 1, stderr: r.stderr ?? "" };
+};
+
+async function runOrThrow(runner: LaunchctlRunner, bin: string, args: string[]): Promise<void> {
   const { code, stderr } = await runner(args);
   if (code !== 0) {
     throw new Error(
-      `launchctl ${args.join(" ")} failed (exit ${code})${stderr ? `: ${stderr.trim()}` : ""}`,
+      `${bin} ${args.join(" ")} failed (exit ${code})${stderr ? `: ${stderr.trim()}` : ""}`,
     );
   }
 }
@@ -175,32 +256,94 @@ function resolveUid(deps: ServiceOpsDeps): number {
   return (deps.getUid ?? (() => process.getuid?.() ?? 0))();
 }
 
-// `bob up <agent>` — load + start the unit. `bootstrap` registers it into the
-// user's gui domain; RunAtLoad then starts it. Idempotent-ish: bootstrap on an
-// already-loaded unit errors, so callers re-running should `down` first (or use
-// `restart`).
+// Write the agent's unit file to disk. Does NOT start it (that's `bob up`). For
+// systemd, also runs `systemctl --user daemon-reload` so the new/updated unit is
+// picked up. Install + start are separate so re-installing an updated unit while
+// it's running is a `down` → `install` → `up` (or `restart`).
+export async function installService(opts: InstallServiceOptions): Promise<{ path: string }> {
+  const platform = detectPlatform(opts.platform);
+  const write = opts.writeFile ?? defaultWrite;
+  if (platform === "launchd") {
+    const path = plistPath(opts.name, opts.home);
+    write(path, renderPlist(opts));
+    return { path };
+  }
+  const path = systemdUnitPath(opts.name, opts.home);
+  write(path, renderSystemdUnit(opts));
+  await runOrThrow(opts.runSystemctl ?? defaultRunSystemctl, "systemctl", [
+    "--user",
+    "daemon-reload",
+  ]);
+  return { path };
+}
+
+export interface LifecycleOptions extends ServiceOpsDeps {
+  name: string;
+}
+
+// `bob up <agent>` — load + start the unit (and enable it to start on boot).
+// launchd: bootstrap into the gui domain (RunAtLoad starts it). systemd:
+// `enable --now` (start now + start on boot; persistence across logout needs
+// `loginctl enable-linger`, a one-time host setup).
 export async function up(opts: LifecycleOptions): Promise<void> {
-  const path = plistPath(opts.name, opts.home);
-  const domain = guiDomain(resolveUid(opts));
-  await launchctl(opts, ["bootstrap", domain, path]);
+  if (detectPlatform(opts.platform) === "launchd") {
+    const path = plistPath(opts.name, opts.home);
+    const domain = guiDomain(resolveUid(opts));
+    await runOrThrow(opts.runLaunchctl ?? defaultRunLaunchctl, "launchctl", [
+      "bootstrap",
+      domain,
+      path,
+    ]);
+    return;
+  }
+  await runOrThrow(opts.runSystemctl ?? defaultRunSystemctl, "systemctl", [
+    "--user",
+    "enable",
+    "--now",
+    systemdUnitName(opts.name),
+  ]);
 }
 
-// `bob down <agent>` — stop + unload the unit. `bootout` removes it from the
-// domain (KeepAlive won't restart a booted-out unit).
+// `bob down <agent>` — stop + unload the unit. launchd: bootout. systemd:
+// `disable --now` (stop + don't start on boot).
 export async function down(opts: LifecycleOptions): Promise<void> {
-  const path = plistPath(opts.name, opts.home);
-  const domain = guiDomain(resolveUid(opts));
-  await launchctl(opts, ["bootout", domain, path]);
+  if (detectPlatform(opts.platform) === "launchd") {
+    const path = plistPath(opts.name, opts.home);
+    const domain = guiDomain(resolveUid(opts));
+    await runOrThrow(opts.runLaunchctl ?? defaultRunLaunchctl, "launchctl", [
+      "bootout",
+      domain,
+      path,
+    ]);
+    return;
+  }
+  await runOrThrow(opts.runSystemctl ?? defaultRunSystemctl, "systemctl", [
+    "--user",
+    "disable",
+    "--now",
+    systemdUnitName(opts.name),
+  ]);
 }
 
-// `bob restart <agent>` — GRACEFUL restart. `kickstart -k` sends SIGTERM to the
-// running process (our persistent runtime disposes the session on SIGTERM —
-// awaits in-flight, session.dispose()), then relaunches it. The session's
-// durable on-disk state + Flair memory mean the agent comes back warm. This is
-// also the "apply changes" step for the evolve loop (align / new capability →
-// restart → agent back with new equipment).
+// `bob restart <agent>` — GRACEFUL restart. Both send SIGTERM (our persistent
+// runtime disposes the session on SIGTERM — awaits in-flight, session.dispose())
+// then relaunch. launchd: `kickstart -k`. systemd: `restart`. The session's
+// durable on-disk state + Flair memory mean the agent comes back warm. Also the
+// "apply changes" step for the evolve loop (align / new capability → restart).
 export async function restart(opts: LifecycleOptions): Promise<void> {
-  const domain = guiDomain(resolveUid(opts));
-  const target = `${domain}/${serviceLabel(opts.name)}`;
-  await launchctl(opts, ["kickstart", "-k", target]);
+  if (detectPlatform(opts.platform) === "launchd") {
+    const domain = guiDomain(resolveUid(opts));
+    const target = `${domain}/${serviceLabel(opts.name)}`;
+    await runOrThrow(opts.runLaunchctl ?? defaultRunLaunchctl, "launchctl", [
+      "kickstart",
+      "-k",
+      target,
+    ]);
+    return;
+  }
+  await runOrThrow(opts.runSystemctl ?? defaultRunSystemctl, "systemctl", [
+    "--user",
+    "restart",
+    systemdUnitName(opts.name),
+  ]);
 }
