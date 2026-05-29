@@ -1,14 +1,6 @@
 {
   "tools": {
-    "allow": [
-      "Bash",
-      "Read",
-      "Grep",
-      "WebFetch",
-      "mcp__flair__memory_search",
-      "mcp__flair__memory_store",
-      "mcp__flair__memory_get"
-    ]
+    "allow": ["Bash", "Read", "Grep", "WebFetch", "flair_search", "flair_write", "flair_get"]
   },
   "default_provider": "exe-dev-gateway",
   "default_model": "claude-opus-4-7"

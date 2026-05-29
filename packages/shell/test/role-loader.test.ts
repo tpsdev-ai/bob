@@ -7,7 +7,7 @@ describe("role-loader", () => {
     expect(t.role).toBe("ea");
     expect(t.soul.length).toBeGreaterThan(0);
     expect(t.tools.allow).toContain("Bash");
-    expect(t.tools.allow).toContain("mcp__flair__memory_search");
+    expect(t.tools.allow).toContain("flair_search");
   });
 
   it.each([
@@ -23,7 +23,7 @@ describe("role-loader", () => {
     expect(t.tools.allow.length).toBeGreaterThan(0);
     // Every role gets Flair memory by default — the office-agent
     // pattern assumes Flair as the memory layer.
-    expect(t.tools.allow).toContain("mcp__flair__memory_search");
+    expect(t.tools.allow).toContain("flair_search");
   });
 
   it("throws on unknown role", () => {

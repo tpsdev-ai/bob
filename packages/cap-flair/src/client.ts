@@ -18,6 +18,7 @@
 
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 
 const { subtle } = webcrypto;
 
@@ -84,7 +85,11 @@ export class FlairHttpClient implements FlairClient {
     while (base.endsWith("/")) base = base.slice(0, -1);
     this.url = base;
     this.agentId = opts.agentId;
-    this.keyFile = opts.keyFile;
+    // Expand a leading ~/ so configs can use the ~/.flair/keys/<name>.key
+    // convention (what `bob init` emits) without the caller pre-resolving it.
+    this.keyFile = opts.keyFile.startsWith("~/")
+      ? `${homedir()}/${opts.keyFile.slice(2)}`
+      : opts.keyFile;
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
