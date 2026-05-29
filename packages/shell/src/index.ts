@@ -63,18 +63,7 @@ export {
   type ResolvedCapability,
   resolveCapabilities,
 } from "./capability-loader.js";
-export {
-  DiscordBridge,
-  type DiscordBridgeOptions,
-  type DiscordBridgeStats,
-  type DiscordClient,
-  type DiscordMessage,
-} from "./discord-bridge.js";
-export {
-  type DiscordListenerOptions,
-  defaultCaptureOutput,
-  startDiscordListener,
-} from "./discord-serve.js";
+export type { DiscordClient, DiscordMessage } from "./discord-types.js";
 export {
   type CheckStatus,
   type DoctorCheck,
@@ -102,5 +91,37 @@ export {
   runOnboard,
   type SpawnFn,
 } from "./onboard.js";
+export {
+  type PersistentHandle,
+  type RunPersistentOptions,
+  runPersistent,
+  startPersistent,
+} from "./persistent.js";
 export { loadRole, type RoleTemplate } from "./role-loader.js";
-export { type RunOptions, type RunResult, runAgent } from "./run.js";
+export {
+  createPiRunSession,
+  type ResolvedRunConfig,
+  type ResolveRunConfigOptions,
+  type RunOptions,
+  type RunResult,
+  type RunSession,
+  type RunSessionConfig,
+  type RunSessionFactory,
+  resolveRunConfig,
+  runAgent,
+  type SessionManagerLike,
+} from "./run.js";
+export {
+  down,
+  type InstallServiceOptions,
+  installService,
+  type LaunchctlRunner,
+  type LifecycleOptions,
+  plistPath,
+  type RenderPlistOptions,
+  renderPlist,
+  restart,
+  type ServiceOpsDeps,
+  serviceLabel,
+  up,
+} from "./service.js";

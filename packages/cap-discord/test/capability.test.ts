@@ -1,25 +1,48 @@
 import { describe, expect, it } from "bun:test";
 import type { DiscordClient, DiscordMessage } from "@tpsdev-ai/bob-shell";
-import { type PiLike, wireDiscordCapability } from "../src/capability.js";
+import {
+  type AssistantMessageLike,
+  type PiLike,
+  wireDiscordCapability,
+} from "../src/capability.js";
 import type { DiscordCapabilityConfig } from "../src/config.js";
 
 // --- Fakes (no live gateway, no real token, no LLM) -------------------------
 
 type ToolDef = Parameters<PiLike["registerTool"]>[0];
 
+type AgentEndHandler = (event: { messages: AssistantMessageLike[] }) => void | Promise<void>;
+
 class FakePi implements PiLike {
   readonly tools = new Map<string, ToolDef>();
   readonly userMessages: string[] = [];
   rateHandler?: (e: { status: number; headers: Record<string, string> }) => void;
+  agentEndHandler?: AgentEndHandler;
 
   registerTool(tool: ToolDef): void {
     this.tools.set(tool.name, tool);
   }
-  on(_event: "after_provider_response", handler: typeof this.rateHandler): void {
-    this.rateHandler = handler;
+  on(
+    event: "after_provider_response" | "agent_end",
+    handler: typeof this.rateHandler | AgentEndHandler,
+  ): void {
+    if (event === "after_provider_response") {
+      this.rateHandler = handler as typeof this.rateHandler;
+    } else {
+      this.agentEndHandler = handler as AgentEndHandler;
+    }
   }
   sendUserMessage(content: string): void {
     this.userMessages.push(content);
+  }
+  // Simulate the agent finishing a turn with the given assistant text. Drives
+  // the agent_end reply-routing path. `await` so the async reply post settles.
+  async finishTurn(assistantText: string | undefined): Promise<void> {
+    const messages: AssistantMessageLike[] =
+      assistantText === undefined
+        ? [{ role: "assistant", content: [{ type: "text", text: "" }] }]
+        : [{ role: "assistant", content: [{ type: "text", text: assistantText }] }];
+    await this.agentEndHandler?.({ messages });
   }
   // helper
   async call(name: string, params: Record<string, unknown>) {
@@ -36,6 +59,7 @@ class FakeDiscordClient implements DiscordClient {
   fetchReturns: DiscordMessage[] = [];
   connectCalled = false;
   disconnectCalled = false;
+  replyThrows = false;
 
   on(_e: "message", handler: (msg: DiscordMessage) => void): void {
     this.handler = handler;
@@ -47,6 +71,7 @@ class FakeDiscordClient implements DiscordClient {
     this.disconnectCalled = true;
   }
   async reply(channelId: string, text: string, opts?: { replyTo?: string }): Promise<void> {
+    if (this.replyThrows) throw new Error("simulated discord REST failure");
     this.replies.push({ channelId, text, replyTo: opts?.replyTo });
   }
   async react(channelId: string, messageId: string, emoji: string): Promise<void> {
@@ -173,6 +198,74 @@ describe("wireDiscordCapability — inbound listener", () => {
     const { pi, client } = setup();
     client.fire({ channelId: "channel-A", content: "<@123>", mentionsBot: true });
     expect(pi.userMessages).toHaveLength(0);
+  });
+});
+
+describe("wireDiscordCapability — reply routing (inbound → originating channel)", () => {
+  it("posts the agent's reply back to the ORIGINATING channel on agent_end", async () => {
+    const { pi, client } = setup();
+    // Inbound on channel-B, message id m42.
+    client.fire({
+      id: "m42",
+      channelId: "channel-B",
+      content: "<@123> status?",
+      mentionsBot: true,
+    });
+    expect(pi.userMessages).toEqual(["status?"]);
+    // Agent finishes its turn with a final answer.
+    await pi.finishTurn("all green");
+    // Reply routed to channel-B (the originator), quote-replying to m42.
+    expect(client.replies).toEqual([{ channelId: "channel-B", text: "all green", replyTo: "m42" }]);
+  });
+
+  it("routes to channel C when the inbound message came from channel C (the spec's mocked proof)", async () => {
+    const { pi, client } = setup({ channelIds: ["channel-C", "channel-A"] });
+    client.fire({ id: "mC", channelId: "channel-C", content: "<@1> ping", mentionsBot: true });
+    await pi.finishTurn("pong");
+    expect(client.replies).toEqual([{ channelId: "channel-C", text: "pong", replyTo: "mC" }]);
+  });
+
+  it("does NOT post when agent_end has no originating Discord message (heartbeat/cron turn)", async () => {
+    const { pi, client } = setup();
+    // No inbound message fired — a self-directed turn finishes.
+    await pi.finishTurn("internal monologue");
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("posts nothing for a tool-only turn (no assistant text) but still consumes pending", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> react", mentionsBot: true });
+    await pi.finishTurn(undefined); // empty assistant text
+    expect(client.replies).toHaveLength(0);
+    // pending was consumed: a later self-directed turn must not leak a reply.
+    await pi.finishTurn("late text");
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("truncates an over-long reply to Discord's limit", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> essay", mentionsBot: true });
+    await pi.finishTurn("y".repeat(5000));
+    expect(client.replies[0].channelId).toBe("channel-A");
+    expect(client.replies[0].text.length).toBeLessThanOrEqual(1901);
+    expect(client.replies[0].text.endsWith("…")).toBe(true);
+  });
+
+  it("a failed reply post is logged, not thrown (persistent session survives)", async () => {
+    const { pi, client, logs } = setup();
+    client.replyThrows = true;
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await pi.finishTurn("hello");
+    expect(logs.some((l) => /failed to post reply to channel-A/.test(l))).toBe(true);
+  });
+
+  it("the reply path never includes the bot token (no token in this core)", async () => {
+    const { pi, client, config } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await pi.finishTurn("hello");
+    const haystack = JSON.stringify({ config, replies: client.replies });
+    expect(haystack).not.toContain("tok_");
+    expect(config.tokenFile).toBe("/secrets/bot.token");
   });
 });
 

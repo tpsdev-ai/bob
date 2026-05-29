@@ -52,4 +52,26 @@ describe("bob CLI", () => {
     expect(out).toContain("align <name>");
     expect(out).toContain("--agent-dir");
   });
+
+  it("help advertises persistent run + lifecycle commands", () => {
+    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    expect(out).toContain("serve <name>");
+    expect(out).toContain("PERSISTENTLY");
+    expect(out).toContain("install-service");
+    expect(out).toContain("up <name>");
+    expect(out).toContain("down <name>");
+    expect(out).toContain("restart <name>");
+  });
+
+  it("lifecycle commands require a <name>", () => {
+    for (const cmd of ["up", "down", "restart", "install-service", "serve"]) {
+      try {
+        execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+        throw new Error(`expected non-zero exit for bare '${cmd}'`);
+      } catch (err) {
+        const e = err as { stdout?: string; message?: string };
+        expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
+      }
+    }
+  });
 });

@@ -8,15 +8,19 @@
 
 import {
   type BobRole,
+  down,
   formatReport,
   initAgent,
+  installService,
   loadRole,
-  MailConsumer,
+  plistPath,
+  restart,
   runAgent,
   runAlign,
   runDoctor,
   runOnboard,
-  startDiscordListener,
+  runPersistent,
+  up,
 } from "@tpsdev-ai/bob-shell";
 
 interface Args {
@@ -61,10 +65,14 @@ Commands:
   run <name> <prompt> Run one short-lived task for the named agent (embeds pi
                       via its SDK — fresh session, one prompt, exit)
                       Flags: --model <m>  (--interactive: coming in a later PR)
-  serve <name>        Run mail watcher (+ optional Discord listener) as a daemon
-                      Flags: --discord --discord-token-file <path>
-                             --discord-channels <id1,id2> [--discord-dispatch-all]
-                             [--discord-model <model>]
+  serve <name>        Run the agent PERSISTENTLY — one warm pi session that stays
+                      up, loading the agent's bob.yaml capabilities (incl. discord).
+                      This is what the launchd unit runs. Flags: --model <m>
+  install-service <n> Write the agent's launchd unit (KeepAlive + RunAtLoad) so it
+                      self-runs. Flags: --bob-bin <abs path> --model <m>
+  up <name>           Load + start the agent's launchd unit
+  down <name>         Stop + unload the agent's launchd unit
+  restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
   office join <name>  Join an existing branch office
   help                Show this help
@@ -175,102 +183,60 @@ async function run(
   return result.exitCode;
 }
 
+// `bob serve <name>` — run the agent PERSISTENTLY. ONE warm pi AgentSession that
+// stays up, loading the agent's bob.yaml `capabilities:` (incl. discord, whose
+// gateway listener feeds inbound messages via pi.sendUserMessage and routes
+// replies back to the originating channel). This is the entrypoint the launchd
+// unit runs. Discord is no longer a CLI flag — it's a declared capability.
+//
+// Blocks until SIGTERM/SIGINT, which runPersistent handles gracefully (await
+// in-flight turn → session.dispose() → exit 0). KeepAlive relaunches it.
 async function serve(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const consumer = new MailConsumer({ name });
-  consumer.start();
-  console.log(`[bob serve] mail consumer running for ${name}`);
-  console.log(`  inbox:    ~/.tps/mail/${name}/`);
-  console.log(`  launcher: ~/agents/${name}/bin/${name}`);
-  console.log(`  poll:     2s · processed:0 failed:0`);
-
-  // Optional Discord listener — when --discord flag is set, also start
-  // a gateway connection and dispatch incoming messages through runAgent.
-  // Requires --discord-token-file and --discord-channels.
-  let discordBridge: { stop: () => Promise<void>; stats: object } | undefined;
-  if (flags.discord === true) {
-    const tokenFile = String(flags["discord-token-file"] ?? "");
-    const channels = String(flags["discord-channels"] ?? "");
-    if (!tokenFile || !channels) {
-      console.error("[bob serve] --discord requires --discord-token-file and --discord-channels");
-      consumer.stop();
-      process.exit(2);
-    }
-    discordBridge = await startDiscordOrExit({
-      agentName: name,
-      tokenFile,
-      channelsCsv: channels,
-      dispatchAll: flags["discord-dispatch-all"] === true,
-      model:
-        flags["discord-model"] !== undefined && flags["discord-model"] !== true
-          ? String(flags["discord-model"])
-          : undefined,
-    });
-    console.log(`[bob serve] discord listener running`);
-    console.log(`  channels: ${channels}`);
-    console.log(
-      `  filter:   ${flags["discord-dispatch-all"] === true ? "all messages" : "mentions only"}`,
-    );
-  }
-
-  console.log(`\nCtrl-C to stop.`);
-
-  // Keep the event loop alive
-  const shutdown = async () => {
-    console.log(
-      `\n[bob serve] stopping; mail stats: ${JSON.stringify(consumer.stats)}${
-        discordBridge ? `; discord stats: ${JSON.stringify(discordBridge.stats)}` : ""
-      }`,
-    );
-    consumer.stop();
-    if (discordBridge) await discordBridge.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", () => {
-    void shutdown();
-  });
-  process.on("SIGTERM", () => {
-    void shutdown();
-  });
+  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  await runPersistent({ name, model });
 }
 
-// Pulled out as a helper so serve() stays linear-readable and the
-// dynamic import + error handling lives in one place.
-async function startDiscordOrExit(args: {
-  agentName: string;
-  tokenFile: string;
-  channelsCsv: string;
-  dispatchAll: boolean;
-  model: string | undefined;
-}): Promise<{ stop: () => Promise<void>; stats: object }> {
-  const fs = await import("node:fs");
-  if (!fs.existsSync(args.tokenFile)) {
-    console.error(`[bob serve] discord token file not found: ${args.tokenFile}`);
-    process.exit(3);
+// `bob install-service <name>` — write the agent's launchd plist so it self-runs
+// (KeepAlive + RunAtLoad). Does NOT start it — that's `bob up`. The plist runs
+// `bob serve <name>`; it embeds NO secrets (the discord token is read from the
+// file path in bob.yaml at runtime).
+function installServiceCmd(name: string, flags: Record<string, string | boolean>): number {
+  // launchd uses a minimal PATH, so the unit needs an absolute path to `bob`.
+  // Default to the current executable's path when not overridden.
+  const bobBin =
+    flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
+      ? String(flags["bob-bin"])
+      : process.argv[1] || "bob";
+  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  const { plistPath: written } = installService({ name, bobBin, model });
+  console.log(`[bob install-service] wrote ${written}`);
+  console.log(`  runs:    ${bobBin} serve ${name}`);
+  console.log(`  next:    bob up ${name}   (load + start)`);
+  if (bobBin === "bob") {
+    console.error(
+      "[bob install-service] WARNING: could not resolve an absolute bob path; launchd needs one.",
+    );
+    console.error("  Re-run with --bob-bin <absolute path to bob>.");
   }
-  const token = fs.readFileSync(args.tokenFile, "utf8").trim();
-  if (!token) {
-    console.error(`[bob serve] discord token file is empty: ${args.tokenFile}`);
-    process.exit(3);
-  }
-  const listenChannelIds = args.channelsCsv
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (listenChannelIds.length === 0) {
-    console.error(`[bob serve] --discord-channels parsed to zero channels`);
-    process.exit(3);
-  }
-  // discord-js binding lives in @tpsdev-ai/bob-discord — import dynamically
-  // so callers without Discord don't have to install discord.js (~30MB).
-  const { DiscordJsClient } = await import("@tpsdev-ai/bob-discord");
-  const client = new DiscordJsClient({ token });
-  return startDiscordListener({
-    agentName: args.agentName,
-    listenChannelIds,
-    client,
-    dispatchAll: args.dispatchAll,
-    model: args.model,
-  });
+  return 0;
+}
+
+async function upCmd(name: string): Promise<number> {
+  await up({ name });
+  console.log(`[bob up] loaded ${plistPath(name)} — agent ${name} is running`);
+  return 0;
+}
+
+async function downCmd(name: string): Promise<number> {
+  await down({ name });
+  console.log(`[bob down] unloaded ${name}`);
+  return 0;
+}
+
+async function restartCmd(name: string): Promise<number> {
+  await restart({ name });
+  console.log(`[bob restart] graceful restart sent to ${name} (SIGTERM → dispose → relaunch)`);
+  return 0;
 }
 
 function doctor(name: string): number {
@@ -326,6 +292,30 @@ async function main(): Promise<number> {
         }
         await serve(args.positional[0], args.flags);
         return 0;
+      case "install-service":
+        if (!args.positional[0]) {
+          console.error("bob install-service: missing <name>");
+          return 2;
+        }
+        return installServiceCmd(args.positional[0], args.flags);
+      case "up":
+        if (!args.positional[0]) {
+          console.error("bob up: missing <name>");
+          return 2;
+        }
+        return await upCmd(args.positional[0]);
+      case "down":
+        if (!args.positional[0]) {
+          console.error("bob down: missing <name>");
+          return 2;
+        }
+        return await downCmd(args.positional[0]);
+      case "restart":
+        if (!args.positional[0]) {
+          console.error("bob restart: missing <name>");
+          return 2;
+        }
+        return await restartCmd(args.positional[0]);
       case "doctor":
         if (!args.positional[0]) {
           console.error("bob doctor: missing <name>");

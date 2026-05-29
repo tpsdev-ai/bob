@@ -2,12 +2,14 @@
 // `claude -p`-style task: spin up a fresh session, send one prompt, capture
 // the assistant's final text, exit.
 //
-// PHASE-1 MIGRATION (this PR): previously this spawned the agent's generated
-// `bin/<name>` launcher as a subprocess (`exec pi --provider … --model …`).
-// It now embeds pi via its SDK (`createAgentSession`/`AgentSession`) in-process.
-// One embedded-pi path, no subprocess. The other spawn sites
-// (onboard/align/mail-consumer/discord-serve/init launcher generation) migrate
-// in later PRs — see the `// TODO(phase1): migrate to SDK` markers there.
+// PHASE-1 MIGRATION: previously this spawned the agent's generated `bin/<name>`
+// launcher as a subprocess (`exec pi --provider … --model …`). It now embeds pi
+// via its SDK (`createAgentSession`/`AgentSession`) in-process. One embedded-pi
+// path, no subprocess. The PERSISTENT variant (the agent keeps running) lives in
+// persistent.ts and shares this file's session builder — `bob run` is the
+// short-lived `-p`-style lifespan, persistent is the warm long-lived one. The
+// remaining spawn sites (onboard/align launcher generation) migrate in later
+// PRs — see the `// TODO(phase1): migrate to SDK` markers there.
 //
 // Config resolution mirrors the launcher `init.ts` generates exactly:
 //   - provider + model come from ~/agents/<name>/bob.yaml (`provider:` block)
@@ -47,6 +49,12 @@ export interface RunSession {
   // Best-effort final assistant text, used as a fallback when no text_delta
   // events were observed (e.g. providers/transports that don't stream).
   readonly messages?: ReadonlyArray<unknown>;
+  // Best-effort idle barrier — pi's AgentSession exposes `agent.waitForIdle()`;
+  // the persistent runtime awaits it before disposing so a SIGTERM doesn't cut
+  // off an in-flight turn. Optional so a fake session in tests need not provide
+  // it. (pi's AgentSession doesn't expose this method directly, so the real
+  // persistent factory wraps it — see persistent.ts.)
+  waitForIdle?(): Promise<void>;
   dispose(): void;
 }
 
@@ -141,35 +149,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const agentDir = join(root, opts.name);
-  if (!existsSync(agentDir)) {
-    throw new Error(
-      `bob run ${opts.name}: agent dir not found at ${agentDir} (run 'bob onboard ${opts.name}' first)`,
-    );
-  }
-
-  const yamlText = readBobYaml(agentDir, opts.name);
-  const { provider, model: yamlModel } = resolveProviderAndModel(yamlText, opts.name);
-  // Per-call override wins, mirroring the old `--model` flag semantics.
-  const model = opts.model ?? yamlModel;
-  const appendSystemPrompt = readSoul(agentDir);
-
-  // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
-  // the blessed catalog, validating each config block. Throws fast on an
-  // unknown / unbuilt / misconfigured capability — better than running an
-  // under-equipped agent. Produces the pi extension sources the session loads
-  // plus the per-capability config env each extension reads (no secrets).
-  const resolution = resolveCapabilities({ yamlText });
-
-  const config: RunSessionConfig = {
-    provider,
-    model,
-    appendSystemPrompt,
-    cwd: join(agentDir, "work"),
-    piAgentDir: join(agentDir, ".pi-agent"),
-    extensionSources: resolution.extensionSources,
-    capabilityEnv: capabilityConfigEnv(resolution),
-  };
+  const { agentDir, provider, model, config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: root,
+    model: opts.model,
+  });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
   const session = await factory(config);
@@ -210,11 +194,82 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   };
 }
 
+// Resolve everything a pi session needs for an agent from disk: provider/model
+// (bob.yaml + per-call override), soul.md (appended system prompt), cwd +
+// .pi-agent dir, and the resolved+validated capabilities (extension sources +
+// config env). Shared by `bob run` (ephemeral) and the persistent runtime
+// (persistent.ts) so both stand up the IDENTICAL session — only the
+// SessionManager lifespan differs. Throws with an onboard hint when the agent
+// dir / bob.yaml is missing, and fails fast on a bad capability.
+export interface ResolveRunConfigOptions {
+  name: string;
+  // Agents root dir (~/agents). The agent lives at <agentsRoot>/<name>.
+  agentsRoot: string;
+  // Optional per-invocation model override (wins over bob.yaml).
+  model?: string;
+}
+
+export interface ResolvedRunConfig {
+  agentDir: string;
+  provider: string;
+  model: string;
+  config: RunSessionConfig;
+}
+
+export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
+  if (!AGENT_NAME.test(opts.name)) {
+    throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
+  }
+  const agentDir = join(opts.agentsRoot, opts.name);
+  if (!existsSync(agentDir)) {
+    throw new Error(
+      `bob: agent dir not found at ${agentDir} (run 'bob onboard ${opts.name}' first)`,
+    );
+  }
+
+  const yamlText = readBobYaml(agentDir, opts.name);
+  const { provider, model: yamlModel } = resolveProviderAndModel(yamlText, opts.name);
+  // Per-call override wins, mirroring the old `--model` flag semantics.
+  const model = opts.model ?? yamlModel;
+  const appendSystemPrompt = readSoul(agentDir);
+
+  // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
+  // the blessed catalog, validating each config block. Throws fast on an
+  // unknown / unbuilt / misconfigured capability — better than running an
+  // under-equipped agent. Produces the pi extension sources the session loads
+  // plus the per-capability config env each extension reads (no secrets).
+  const resolution = resolveCapabilities({ yamlText });
+
+  const config: RunSessionConfig = {
+    provider,
+    model,
+    appendSystemPrompt,
+    cwd: join(agentDir, "work"),
+    piAgentDir: join(agentDir, ".pi-agent"),
+    extensionSources: resolution.extensionSources,
+    capabilityEnv: capabilityConfigEnv(resolution),
+  };
+  return { agentDir, provider, model, config };
+}
+
 // Real SDK factory: stand up a fresh, in-memory pi AgentSession for the agent,
 // scoped to its own .pi-agent credentials dir and work cwd, with soul.md
 // appended to the system prompt. In-memory session manager = ephemeral (a
 // `run` task is short-lived; nothing to persist).
-async function createPiRunSession(config: RunSessionConfig): Promise<RunSession> {
+//
+// Exported so the persistent runtime can build the SAME session via the
+// `persistentSession` factory wrapper (which swaps the SessionManager for a
+// durable one). Keeping a single builder here is the "one embedded-pi path"
+// the spec mandates.
+//
+// `sessionManagerFactory` lets a caller supply the SessionManager — the
+// ephemeral `run` path defaults to in-memory (nothing to persist); the
+// persistent runtime passes `SessionManager.create(cwd)` so the warm session is
+// durable on disk (the working window; Flair remains the long-term store).
+export async function createPiRunSession(
+  config: RunSessionConfig,
+  sessionManagerFactory?: (cwd: string) => SessionManagerLike,
+): Promise<RunSession> {
   // Point auth + model resolution at the agent's own .pi-agent dir, exactly
   // like the old launcher's PI_CODING_AGENT_DIR export. This honors the
   // exe-dev-gateway baseUrl override (models.json) and auth.json.
@@ -258,6 +313,8 @@ async function createPiRunSession(config: RunSessionConfig): Promise<RunSession>
   const resourceLoader = new DefaultResourceLoader(loaderOpts);
   await resourceLoader.reload();
 
+  const makeSessionManager =
+    sessionManagerFactory ?? ((cwd: string) => SessionManager.inMemory(cwd));
   const { session } = await createAgentSession({
     cwd: config.cwd,
     agentDir: config.piAgentDir,
@@ -265,11 +322,17 @@ async function createPiRunSession(config: RunSessionConfig): Promise<RunSession>
     authStorage,
     modelRegistry,
     resourceLoader,
-    sessionManager: SessionManager.inMemory(config.cwd),
+    sessionManager: makeSessionManager(config.cwd) as ReturnType<typeof SessionManager.inMemory>,
   });
 
   return session as unknown as RunSession;
 }
+
+// Minimal structural alias for pi's SessionManager (in-memory or durable). The
+// persistent runtime passes a durable one; we only need it to satisfy
+// createAgentSession's `sessionManager` slot, so a structural alias avoids
+// importing pi's full type here.
+export type SessionManagerLike = ReturnType<typeof SessionManager.inMemory>;
 
 // Pull the text of the last assistant message from session state, as a
 // fallback for transports that don't emit text_delta events. Defensive about

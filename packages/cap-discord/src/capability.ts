@@ -19,9 +19,28 @@ import { type TSchema, Type } from "typebox";
 import { cleanContent } from "./clean.js";
 import type { DiscordCapabilityConfig } from "./config.js";
 
+// A pi assistant message, narrowed to what reply-routing reads. The real
+// AgentMessage union (pi-ai) is wider; we only need the assistant role + its
+// text content blocks. Declared structurally so a test fake and pi's real
+// AgentMessage both satisfy it.
+export interface AssistantMessageLike {
+  role: string;
+  // AssistantMessage.content is (TextContent | ThinkingContent | ToolCall)[];
+  // we read only the text blocks. `unknown[]` keeps the fake + real type
+  // compatible without importing pi-ai here.
+  content: unknown;
+}
+
 // The minimal slice of pi's ExtensionAPI this core needs. Declared structurally
 // so tests pass a tiny fake and the real ExtensionAPI satisfies it. Keeping it
 // minimal also documents exactly which pi primitives the capability touches.
+//
+// REPLY ROUTING (PR4): the listener correlates an inbound Discord message with
+// the turn it drives by remembering the originating channel at inject time and
+// consuming it on `agent_end` (fired once per prompt, carrying that prompt's
+// messages). The final assistant text is posted back to the originating channel
+// — deterministic, not dependent on the LLM choosing discord_reply with the
+// right channel id. So PiLike additionally needs the `agent_end` event.
 export interface PiLike {
   registerTool(tool: {
     name: string;
@@ -36,6 +55,10 @@ export interface PiLike {
   on(
     event: "after_provider_response",
     handler: (event: { status: number; headers: Record<string, string> }) => void,
+  ): void;
+  on(
+    event: "agent_end",
+    handler: (event: { messages: AssistantMessageLike[] }) => void | Promise<void>,
   ): void;
   sendUserMessage(content: string): void;
 }
@@ -65,6 +88,35 @@ export interface WireOptions {
 
 function ok(text: string): { content: Array<{ type: "text"; text: string }>; details: unknown } {
   return { content: [{ type: "text", text }], details: {} };
+}
+
+// Extract the final assistant text from the messages a prompt produced. We take
+// the LAST assistant message's text blocks (the agent's concluding answer after
+// any tool calls) — pi's AssistantMessage.content is an array of
+// (text | thinking | toolCall) blocks; we keep only `text`, dropping thinking +
+// tool calls. Returns "" when there's no assistant text (a tool-only turn).
+function finalAssistantText(messages: AssistantMessageLike[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "assistant") continue;
+    return assistantContentToText(msg.content).trim();
+  }
+  return "";
+}
+
+function assistantContentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let out = "";
+  for (const block of content) {
+    if (typeof block === "string") {
+      out += block;
+      continue;
+    }
+    const b = block as { type?: string; text?: string };
+    if (b && b.type === "text" && typeof b.text === "string") out += b.text;
+  }
+  return out;
 }
 
 export function wireDiscordCapability(opts: WireOptions): WiredCapability {
@@ -172,16 +224,54 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     }
   });
 
+  // --- Reply routing (PR4) ----------------------------------------------
+  // The originating context for the turn currently being driven by an inbound
+  // Discord message: which channel to post the reply back to, and the inbound
+  // message id to quote-reply to. The persistent session processes one prompt
+  // at a time and `agent_end` fires once per prompt, so a single pending
+  // pointer (set when we inject, consumed on agent_end) is the correct
+  // correlation — no per-message id matching needed, and it can't be steered by
+  // a later inbound message because sendUserMessage on a busy session is queued.
+  let pending: { channelId: string; replyTo: string } | undefined;
+
+  // On agent turn completion, post the assistant's final text back to the
+  // channel the inbound message came from. This is the DETERMINISTIC reply path
+  // — it does not rely on the LLM calling discord_reply with the right channel.
+  // If the turn wasn't driven by an inbound Discord message (e.g. a heartbeat
+  // tick or a cron prompt), `pending` is undefined and we post nothing.
+  pi.on("agent_end", async (event) => {
+    const target = pending;
+    pending = undefined; // consume regardless, so a silent turn can't leak into the next
+    if (!target) return;
+    const text = finalAssistantText(event.messages);
+    if (text.length === 0) return; // nothing to say (e.g. the agent only ran tools)
+    const trimmed =
+      text.length <= DISCORD_MAX_REPLY_CHARS ? text : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
+    try {
+      await client.reply(target.channelId, trimmed, { replyTo: target.replyTo });
+    } catch (err) {
+      // A failed post must not crash the persistent session — log + continue.
+      // The error from discord.js names the cause, never the token.
+      const reason = err instanceof Error ? err.message : "reply failed";
+      log(`discord: failed to post reply to ${target.channelId}: ${reason}`);
+    }
+  });
+
   // --- Inbound listener -------------------------------------------------
   // Drives the agent on an incoming Discord message. ENFORCES the channel
   // allow-list (and mention filter unless dispatchAll) so an arbitrary user on
-  // a non-allowed channel can never steer the agent. Only does real work in a
-  // persistent session (PR4); wired + unit-tested now with a mocked gateway.
+  // a non-allowed channel can never steer the agent. Records the originating
+  // channel so agent_end can route the reply back to it.
   client.on("message", (msg: DiscordMessage) => {
     if (!allowed.has(msg.channelId)) return; // trust boundary
     if (!config.dispatchAll && !msg.mentionsBot) return;
     const cleaned = cleanContent(msg.content);
     if (cleaned.length === 0) return;
+    // Remember where to send the reply. The most recent inbound message wins
+    // if several arrive before a turn completes — they're queued onto the same
+    // session, and the reply goes to whoever spoke last (acceptable: the agent
+    // sees the full queued context and answers the latest).
+    pending = { channelId: msg.channelId, replyTo: msg.id };
     pi.sendUserMessage(cleaned);
   });
 
