@@ -96,3 +96,27 @@ export function resolveCapabilities(opts: ResolveCapabilitiesOptions): Capabilit
     extensionSources: resolved.map((c) => c.piPackage),
   };
 }
+
+// The env var a capability extension reads its resolved config from, by
+// convention: BOB_CAP_<NAME_UPPER>. A capability is a pi extension loaded
+// in-process (jiti); pi has no notion of Bob's per-capability config, so Bob
+// hands the *validated* config block to the extension through this env var as a
+// JSON blob. The blob carries config only — paths, ids, flags — NEVER a secret
+// (the discord capability's token stays on disk; config holds a file PATH).
+export function capabilityEnvVar(name: string): string {
+  return `BOB_CAP_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}
+
+// Build the { envVar: jsonConfig } map for a resolution. The caller sets these
+// on the environment before the session's resource loader loads the extensions,
+// so each extension can read + re-validate its own config block. Returns an
+// empty object when no capabilities declare config. NOTE: validated config
+// blocks never contain secrets (schemas forbid an inlined token), so this map
+// is safe to set in-process — but it must NOT be logged wholesale.
+export function capabilityConfigEnv(resolution: CapabilityResolution): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const cap of resolution.capabilities) {
+    out[capabilityEnvVar(cap.name)] = JSON.stringify(cap.config);
+  }
+  return out;
+}

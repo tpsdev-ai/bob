@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { Type } from "typebox";
 import type { CatalogEntry } from "../src/capability.js";
-import { resolveCapabilities } from "../src/capability-loader.js";
+import {
+  capabilityConfigEnv,
+  capabilityEnvVar,
+  resolveCapabilities,
+} from "../src/capability-loader.js";
 
 // A small in-test catalog so resolution can be exercised without depending on
 // the real blessed catalog's contents (which evolve as real capabilities land).
@@ -92,5 +96,24 @@ describe("resolveCapabilities", () => {
     expect(() => resolveCapabilities({ yamlText: yaml, lookup: testCatalog() })).toThrow(
       /declared more than once/,
     );
+  });
+});
+
+describe("capabilityEnvVar / capabilityConfigEnv", () => {
+  it("derives the BOB_CAP_<NAME> env var name", () => {
+    expect(capabilityEnvVar("discord")).toBe("BOB_CAP_DISCORD");
+    expect(capabilityEnvVar("my-cap")).toBe("BOB_CAP_MY_CAP");
+  });
+
+  it("maps each resolved capability to its env var with JSON config", () => {
+    const yaml = ["capabilities:", "  - alpha", "", "alpha:", "  greeting: hi", ""].join("\n");
+    const res = resolveCapabilities({ yamlText: yaml, lookup: testCatalog() });
+    const env = capabilityConfigEnv(res);
+    expect(env).toEqual({ BOB_CAP_ALPHA: JSON.stringify({ greeting: "hi" }) });
+  });
+
+  it("returns {} when no capabilities are declared", () => {
+    const res = resolveCapabilities({ yamlText: "provider:\n  name: x\n", lookup: testCatalog() });
+    expect(capabilityConfigEnv(res)).toEqual({});
   });
 });

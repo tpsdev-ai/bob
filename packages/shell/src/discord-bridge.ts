@@ -23,6 +23,15 @@ export interface DiscordMessage {
 export interface DiscordClient {
   on(event: "message", handler: (msg: DiscordMessage) => void): void;
   reply(channelId: string, text: string, opts?: { replyTo?: string }): Promise<void>;
+  // Add an emoji reaction to a message. `emoji` is a unicode emoji
+  // (e.g. "✅") or a custom-emoji identifier ("name:id"). Used by the
+  // discord capability's `discord_react` tool.
+  react(channelId: string, messageId: string, emoji: string): Promise<void>;
+  // Fetch the most recent messages on a channel (newest first, capped by
+  // `limit`). Used by the discord capability's `discord_fetch` tool so the
+  // agent can read recent context without an inbound event. Does not include
+  // the bot filtering the gateway listener applies — it's a raw read.
+  fetchRecent(channelId: string, limit: number): Promise<DiscordMessage[]>;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
 }

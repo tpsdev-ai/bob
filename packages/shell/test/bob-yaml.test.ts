@@ -94,4 +94,40 @@ describe("readBlock", () => {
     const yaml = ["discord:", '  token: "secret"', ""].join("\n");
     expect(readBlock(yaml, "discord")).toEqual({ token: "secret" });
   });
+
+  it("reads a nested block-sequence list (channelIds)", () => {
+    const yaml = [
+      "discord:",
+      "  tokenFile: ~/.tps/secrets/pulse-discord",
+      "  channelIds:",
+      "    - '111'",
+      "    - '222'",
+      "  dispatchAll: true",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "",
+    ].join("\n");
+    expect(readBlock(yaml, "discord")).toEqual({
+      tokenFile: "~/.tps/secrets/pulse-discord",
+      channelIds: ["111", "222"],
+      dispatchAll: true,
+    });
+  });
+
+  it("reads a nested inline-flow list", () => {
+    const yaml = ["discord:", "  channelIds: [111, 222, 333]", ""].join("\n");
+    expect(readBlock(yaml, "discord")).toEqual({ channelIds: [111, 222, 333] });
+  });
+
+  it("treats an empty list key as []", () => {
+    const yaml = ["discord:", "  channelIds:", "  tokenFile: /p", ""].join("\n");
+    expect(readBlock(yaml, "discord")).toEqual({ channelIds: [], tokenFile: "/p" });
+  });
+
+  it("does not let a sibling block's list bleed in", () => {
+    const yaml = ["discord:", "  channelIds:", "    - '111'", "flair:", "  url: b", ""].join("\n");
+    expect(readBlock(yaml, "discord")).toEqual({ channelIds: ["111"] });
+    expect(readBlock(yaml, "flair")).toEqual({ url: "b" });
+  });
 });

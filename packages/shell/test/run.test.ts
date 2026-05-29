@@ -297,7 +297,7 @@ describe("runAgent", () => {
         "  model: claude-sonnet-4-6",
         "",
         "capabilities:",
-        "  - discord",
+        "  - flair",
         "",
       ].join("\n"),
     );

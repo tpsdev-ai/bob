@@ -32,7 +32,7 @@ import {
   ModelRegistry,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
-import { resolveCapabilities } from "./capability-loader.js";
+import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -73,6 +73,12 @@ export interface RunSessionConfig {
   // the blessed catalog before the factory runs, so a fake factory in tests
   // doesn't need the catalog or filesystem. Empty when the agent declares none.
   extensionSources: string[];
+  // Per-capability config the extensions read from the environment, keyed by
+  // each capability's env var (BOB_CAP_<NAME>). The real factory sets these
+  // before loading the extensions so each reads + re-validates its own config
+  // block. JSON values carry config only — NEVER a secret (schemas forbid an
+  // inlined token; the discord capability holds only a token file PATH).
+  capabilityEnv: Record<string, string>;
 }
 
 // The injectable seam. Production builds a real pi AgentSession; tests inject a
@@ -151,8 +157,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
   // the blessed catalog, validating each config block. Throws fast on an
   // unknown / unbuilt / misconfigured capability — better than running an
-  // under-equipped agent. Produces the pi extension sources the session loads.
-  const { extensionSources } = resolveCapabilities({ yamlText });
+  // under-equipped agent. Produces the pi extension sources the session loads
+  // plus the per-capability config env each extension reads (no secrets).
+  const resolution = resolveCapabilities({ yamlText });
 
   const config: RunSessionConfig = {
     provider,
@@ -160,7 +167,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     appendSystemPrompt,
     cwd: join(agentDir, "work"),
     piAgentDir: join(agentDir, ".pi-agent"),
-    extensionSources,
+    extensionSources: resolution.extensionSources,
+    capabilityEnv: capabilityConfigEnv(resolution),
   };
 
   const factory = opts.sessionFactory ?? createPiRunSession;
@@ -240,6 +248,12 @@ async function createPiRunSession(config: RunSessionConfig): Promise<RunSession>
   // `packages`/`extensions`. pi owns the rest.
   if (config.extensionSources.length > 0) {
     loaderOpts.additionalExtensionPaths = config.extensionSources;
+  }
+  // Hand each capability its validated config via the env var it reads. The
+  // extensions are loaded in-process (jiti) by reload() below, so they see
+  // these immediately. Config only — no secrets (see RunSessionConfig).
+  for (const [key, value] of Object.entries(config.capabilityEnv)) {
+    process.env[key] = value;
   }
   const resourceLoader = new DefaultResourceLoader(loaderOpts);
   await resourceLoader.reload();
