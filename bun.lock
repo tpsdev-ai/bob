@@ -34,6 +34,7 @@
       "version": "0.2.0",
       "dependencies": {
         "@mariozechner/pi-coding-agent": "0.73.1",
+        "typebox": "1.1.38",
       },
     },
   },

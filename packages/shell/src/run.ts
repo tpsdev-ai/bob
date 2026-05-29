@@ -32,6 +32,7 @@ import {
   ModelRegistry,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
+import { resolveCapabilities } from "./capability-loader.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -65,6 +66,13 @@ export interface RunSessionConfig {
   // The agent's pi config dir (~/agents/<name>/.pi-agent) — holds
   // auth.json/models.json. pi's AuthStorage + ModelRegistry read from here.
   piAgentDir: string;
+  // pi extension sources for the agent's declared capabilities, in order.
+  // Each is an npm:/git:/local-path spec handed to pi's resource loader as an
+  // `additionalExtensionPaths` entry (the SDK equivalent of settings.json
+  // `packages`/`extensions`). Resolved from bob.yaml `capabilities:` against
+  // the blessed catalog before the factory runs, so a fake factory in tests
+  // doesn't need the catalog or filesystem. Empty when the agent declares none.
+  extensionSources: string[];
 }
 
 // The injectable seam. Production builds a real pi AgentSession; tests inject a
@@ -134,10 +142,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     );
   }
 
-  const { provider, model: yamlModel } = resolveProviderAndModel(agentDir, opts.name);
+  const yamlText = readBobYaml(agentDir, opts.name);
+  const { provider, model: yamlModel } = resolveProviderAndModel(yamlText, opts.name);
   // Per-call override wins, mirroring the old `--model` flag semantics.
   const model = opts.model ?? yamlModel;
   const appendSystemPrompt = readSoul(agentDir);
+
+  // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
+  // the blessed catalog, validating each config block. Throws fast on an
+  // unknown / unbuilt / misconfigured capability — better than running an
+  // under-equipped agent. Produces the pi extension sources the session loads.
+  const { extensionSources } = resolveCapabilities({ yamlText });
 
   const config: RunSessionConfig = {
     provider,
@@ -145,6 +160,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     appendSystemPrompt,
     cwd: join(agentDir, "work"),
     piAgentDir: join(agentDir, ".pi-agent"),
+    extensionSources,
   };
 
   const factory = opts.sessionFactory ?? createPiRunSession;
@@ -218,6 +234,13 @@ async function createPiRunSession(config: RunSessionConfig): Promise<RunSession>
   if (config.appendSystemPrompt.length > 0) {
     loaderOpts.appendSystemPromptOverride = (base) => [...base, config.appendSystemPrompt];
   }
+  // Compose the agent's capabilities into the session. Each is a pi extension
+  // source (npm:/git:/local path); pi's resource loader resolves + loads them,
+  // exposing their tools/hooks. This is the SDK equivalent of settings.json
+  // `packages`/`extensions`. pi owns the rest.
+  if (config.extensionSources.length > 0) {
+    loaderOpts.additionalExtensionPaths = config.extensionSources;
+  }
   const resourceLoader = new DefaultResourceLoader(loaderOpts);
   await resourceLoader.reload();
 
@@ -262,28 +285,31 @@ function assistantContentToText(content: unknown): string {
   return "";
 }
 
-// Resolve provider + model from ~/agents/<name>/bob.yaml. We parse only the
-// `provider:` block (name + model) — the exact shape init.ts emits — to avoid
-// pulling in a YAML dependency the monorepo has deliberately deferred (see the
-// same note in init.ts renderBobYaml). The bob provider is mapped to pi's
-// provider id the same way init.ts's resolvePiProvider does.
-function resolveProviderAndModel(
-  agentDir: string,
-  name: string,
-): { provider: string; model: string } {
+// Read ~/agents/<name>/bob.yaml, erroring with an onboard hint when absent.
+// Returned text is parsed by the targeted readers below + the capability
+// loader — all hand-rolled to avoid a YAML dependency the monorepo has
+// deliberately deferred (see the note in init.ts renderBobYaml).
+function readBobYaml(agentDir: string, name: string): string {
   const yamlPath = join(agentDir, "bob.yaml");
   if (!existsSync(yamlPath)) {
     throw new Error(
       `bob run ${name}: config not found at ${yamlPath} (run 'bob onboard ${name}' first)`,
     );
   }
-  const text = readFileSync(yamlPath, "utf8");
-  const bobProvider = readProviderField(text, "name");
-  const model = readProviderField(text, "model");
+  return readFileSync(yamlPath, "utf8");
+}
+
+// Resolve provider + model from bob.yaml text. We parse only the `provider:`
+// block (name + model) — the exact shape init.ts emits. The bob provider is
+// mapped to pi's provider id the same way init.ts's resolvePiProvider does.
+function resolveProviderAndModel(
+  yamlText: string,
+  name: string,
+): { provider: string; model: string } {
+  const bobProvider = readProviderField(yamlText, "name");
+  const model = readProviderField(yamlText, "model");
   if (!bobProvider || !model) {
-    throw new Error(
-      `bob run ${name}: bob.yaml is missing provider.name and/or provider.model (${yamlPath})`,
-    );
+    throw new Error(`bob run ${name}: bob.yaml is missing provider.name and/or provider.model`);
   }
   return { provider: resolvePiProvider(bobProvider), model };
 }

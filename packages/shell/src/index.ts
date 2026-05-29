@@ -52,6 +52,15 @@ export interface BobConfig {
 }
 
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
+export { readBlock, readCapabilities } from "./bob-yaml.js";
+export type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
+export { BLESSED_CATALOG, lookupCapability } from "./capability-catalog.js";
+export {
+  type CapabilityResolution,
+  type ResolveCapabilitiesOptions,
+  type ResolvedCapability,
+  resolveCapabilities,
+} from "./capability-loader.js";
 export {
   DiscordBridge,
   type DiscordBridgeOptions,

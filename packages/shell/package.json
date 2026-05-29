@@ -13,7 +13,8 @@
   },
   "files": [
     "dist",
-    "roles"
+    "roles",
+    "examples"
   ],
   "scripts": {
     "build": "tsc -p .",
@@ -21,7 +22,8 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "0.73.1"
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "typebox": "1.1.38"
   },
   "keywords": [
     "agent",

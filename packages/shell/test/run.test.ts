@@ -255,4 +255,55 @@ describe("runAgent", () => {
     await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
     expect(fake.disposed()).toBe(true);
   });
+
+  it("passes no extension sources when bob.yaml declares no capabilities", async () => {
+    const fake = fakeSession({ textDeltas: ["ok"] });
+    const { factory, lastConfig } = factoryReturning(fake.session);
+    await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
+    expect(lastConfig()?.extensionSources).toEqual([]);
+  });
+
+  it("resolves bob.yaml capabilities: into the session's extension sources", async () => {
+    // Append a blessed-and-implemented capability (the fixture) to bob.yaml.
+    writeFileSync(
+      join(agentsRoot, "testbot", "bob.yaml"),
+      [
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-sonnet-4-6",
+        "",
+        "capabilities:",
+        "  - fixture",
+        "",
+        "fixture:",
+        "  greeting: hi",
+        "",
+      ].join("\n"),
+    );
+    const fake = fakeSession({ textDeltas: ["ok"] });
+    const { factory, lastConfig } = factoryReturning(fake.session);
+    await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
+    const sources = lastConfig()?.extensionSources ?? [];
+    expect(sources).toHaveLength(1);
+    expect(sources[0].endsWith("examples/cap-fixture/index.ts")).toBe(true);
+  });
+
+  it("fails fast when bob.yaml declares an unbuilt capability", async () => {
+    writeFileSync(
+      join(agentsRoot, "testbot", "bob.yaml"),
+      [
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-sonnet-4-6",
+        "",
+        "capabilities:",
+        "  - discord",
+        "",
+      ].join("\n"),
+    );
+    const { factory } = factoryReturning(fakeSession({}).session);
+    await expect(
+      runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory }),
+    ).rejects.toThrow(/not yet implemented/);
+  });
 });

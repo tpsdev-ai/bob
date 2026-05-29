@@ -1,0 +1,82 @@
+// Bob's blessed capability catalog — the thin curation/trust layer pi doesn't
+// ship (spec §4, decision "both"). An agent's `bob.yaml capabilities:` entries
+// resolve against this map; only blessed names are allowed in the fleet, and
+// this is the K&S gate for what capability packages an agent may load.
+//
+// pi owns the actual tool/hook *registry* — this is NOT that. It's a name →
+// manifest lookup so Bob knows which pi package a capability resolves to and how
+// to validate its config block, before handing the package to pi's loader.
+//
+// PR2 ships the MECHANISM. Only the `fixture` capability is implemented (it
+// proves the loader). The real capabilities are listed as `notYetImplemented`
+// so the catalog documents the intended fleet surface; resolving one is a hard
+// error until its package lands in a later PR.
+
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
+import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
+
+// Absolute path to the fixture capability extension that ships with this
+// package (under examples/cap-fixture/). Resolved relative to this module so it
+// works from both source (bun/jiti) and the compiled dist/ layout.
+//
+// dist/ layout:  <pkg>/dist/capability-catalog.js  → ../examples/cap-fixture
+// src/ layout:   <pkg>/src/capability-catalog.ts    → ../examples/cap-fixture
+const fixtureExtensionPath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "examples",
+  "cap-fixture",
+  "index.ts",
+);
+
+// The fixture's manifest, with its piPackage resolved to the absolute on-disk
+// path. (Defined here rather than imported from examples/ so the compiled dist
+// doesn't depend on a file outside rootDir; the fixture's manifest.ts mirrors
+// this for standalone use.)
+const fixtureManifest: BobCapabilityManifest = {
+  name: "fixture",
+  piPackage: fixtureExtensionPath,
+  configSchema: Type.Object({
+    greeting: Type.Optional(
+      Type.String({ description: "Optional greeting the fixture would log." }),
+    ),
+  }),
+  provides: { tools: ["bob_fixture_noop"], serves: false },
+};
+
+// Planned capabilities whose packages don't exist yet (later PRs). Listed so
+// the catalog documents the intended fleet surface and `bob doctor` can show
+// "blessed but unbuilt". configSchema is a permissive placeholder until the
+// real package defines it; resolving any of these is rejected (see resolver).
+function placeholder(name: string, provides: BobCapabilityManifest["provides"]): CatalogEntry {
+  return {
+    manifest: {
+      name,
+      piPackage: `npm:@tpsdev-ai/bob-cap-${name}`,
+      configSchema: Type.Object({}, { additionalProperties: true }),
+      provides,
+    },
+    notYetImplemented: true,
+  };
+}
+
+// The catalog. Keyed by capability name. Adding a capability = add an entry
+// (and, for real ones, ship its pi-extension package); zero loader edits.
+export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.freeze({
+  fixture: { manifest: fixtureManifest },
+  // --- planned, not yet implemented (later PRs) ---
+  discord: placeholder("discord", {
+    tools: ["discord_reply", "discord_react", "discord_fetch"],
+    serves: true,
+  }),
+  flair: placeholder("flair", { tools: ["flair_search", "flair_write"] }),
+  mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
+  heartbeat: placeholder("heartbeat", { serves: true }),
+});
+
+// Look up a capability by name. Returns undefined when the name isn't blessed.
+export function lookupCapability(name: string): CatalogEntry | undefined {
+  return BLESSED_CATALOG[name];
+}
