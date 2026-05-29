@@ -31,6 +31,51 @@ const fixtureExtensionPath = resolve(
   "index.ts",
 );
 
+// Absolute path to the discord capability's pi extension. It's a real,
+// publishable package (packages/cap-discord) but is blessed here as a LOCAL
+// path for phase 1 — exactly like the fixture — until it's published as
+// `npm:@tpsdev-ai/bob-cap-discord`. We point at the source `index.ts` (pi loads
+// extensions via jiti, no build needed). The path is the same relative to both
+// the src/ and dist/ layout of this module:
+//   src/  layout: packages/shell/src/capability-catalog.ts  → ../../cap-discord/src/index.ts
+//   dist/ layout: packages/shell/dist/capability-catalog.js  → ../../cap-discord/src/index.ts
+const discordExtensionPath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "cap-discord",
+  "src",
+  "index.ts",
+);
+
+// The discord capability's config schema, mirrored here so the catalog can
+// pre-validate an agent's bob.yaml `discord:` block. Kept in sync with
+// packages/cap-discord/src/config.ts CONFIG_SCHEMA (defined inline rather than
+// imported to avoid the shell package depending on cap-discord — the fixture's
+// manifest is handled the same way). channelIds is REQUIRED + non-empty: the
+// channel allow-list is the trust boundary, so a discord capability with no
+// allow-list must fail config validation, not run wide open.
+const discordConfigSchema = Type.Object(
+  {
+    tokenFile: Type.String({ minLength: 1 }),
+    channelIds: Type.Array(Type.String({ pattern: "^[0-9]+$" }), { minItems: 1 }),
+    botUserId: Type.Optional(Type.String({ pattern: "^[0-9]+$" })),
+    dispatchAll: Type.Optional(Type.Boolean()),
+    model: Type.Optional(Type.String({ minLength: 1 })),
+  },
+  { additionalProperties: false },
+);
+
+const discordManifest: BobCapabilityManifest = {
+  name: "discord",
+  piPackage: discordExtensionPath,
+  configSchema: discordConfigSchema,
+  provides: {
+    tools: ["discord_reply", "discord_react", "discord_fetch"],
+    serves: true,
+  },
+};
+
 // The fixture's manifest, with its piPackage resolved to the absolute on-disk
 // path. (Defined here rather than imported from examples/ so the compiled dist
 // doesn't depend on a file outside rootDir; the fixture's manifest.ts mirrors
@@ -66,11 +111,9 @@ function placeholder(name: string, provides: BobCapabilityManifest["provides"]):
 // (and, for real ones, ship its pi-extension package); zero loader edits.
 export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.freeze({
   fixture: { manifest: fixtureManifest },
+  // Discord is REAL as of PR3 (packages/cap-discord), blessed as a local path.
+  discord: { manifest: discordManifest },
   // --- planned, not yet implemented (later PRs) ---
-  discord: placeholder("discord", {
-    tools: ["discord_reply", "discord_react", "discord_fetch"],
-    serves: true,
-  }),
   flair: placeholder("flair", { tools: ["flair_search", "flair_write"] }),
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
   heartbeat: placeholder("heartbeat", { serves: true }),

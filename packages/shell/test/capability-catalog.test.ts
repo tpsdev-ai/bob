@@ -18,8 +18,27 @@ describe("blessed catalog", () => {
     expect(entry?.manifest.name).toBe("fixture");
   });
 
-  it("lists the planned real capabilities as not-yet-implemented", () => {
-    for (const name of ["discord", "flair", "mail", "heartbeat"]) {
+  it("blesses the discord capability as implemented (PR3)", () => {
+    const entry = lookupCapability("discord");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("discord");
+    expect(entry?.manifest.provides?.tools).toEqual([
+      "discord_reply",
+      "discord_react",
+      "discord_fetch",
+    ]);
+    expect(entry?.manifest.provides?.serves).toBe(true);
+  });
+
+  it("resolves discord to an absolute on-disk extension path", () => {
+    const path = lookupCapability("discord")?.manifest.piPackage ?? "";
+    expect(path.startsWith("/")).toBe(true);
+    expect(path.endsWith("cap-discord/src/index.ts")).toBe(true);
+  });
+
+  it("lists the still-planned capabilities as not-yet-implemented", () => {
+    for (const name of ["flair", "mail", "heartbeat"]) {
       const entry = lookupCapability(name);
       expect(entry, name).toBeDefined();
       expect(entry?.notYetImplemented, name).toBe(true);
@@ -32,8 +51,8 @@ describe("blessed catalog", () => {
     expect(path.endsWith("examples/cap-fixture/index.ts")).toBe(true);
   });
 
-  it("rejects a real (unbuilt) capability through the loader", () => {
-    const yaml = ["capabilities:", "  - discord", ""].join("\n");
+  it("rejects a still-unbuilt capability through the loader", () => {
+    const yaml = ["capabilities:", "  - flair", ""].join("\n");
     expect(() => resolveCapabilities({ yamlText: yaml })).toThrow(/not yet implemented/);
   });
 });

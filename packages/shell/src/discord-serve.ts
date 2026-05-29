@@ -1,3 +1,10 @@
+// TODO(phase1): superseded by cap-discord (packages/cap-discord). This module
+// is the per-message subprocess path — each inbound message cold-spawns a fresh
+// `pi -p` via runAgent (no warm session, no conversational continuity). The
+// discord capability replaces it with a pi extension that drives a persistent
+// session via pi.sendUserMessage. Kept until PR4 lands persistent-run; then
+// this + discord-bridge.ts come out.
+//
 // Discord listener wiring — bridges incoming Discord messages into
 // `bob run`-style sessions and replies with the output.
 //

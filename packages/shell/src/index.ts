@@ -57,6 +57,8 @@ export type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 export { BLESSED_CATALOG, lookupCapability } from "./capability-catalog.js";
 export {
   type CapabilityResolution,
+  capabilityConfigEnv,
+  capabilityEnvVar,
   type ResolveCapabilitiesOptions,
   type ResolvedCapability,
   resolveCapabilities,

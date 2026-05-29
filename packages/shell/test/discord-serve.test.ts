@@ -23,6 +23,14 @@ class FakeDiscordClient implements DiscordClient {
   async reply(channelId: string, text: string, opts?: { replyTo?: string }): Promise<void> {
     this.replies.push({ channelId, text, replyTo: opts?.replyTo });
   }
+  async react(_channelId: string, _messageId: string, _emoji: string): Promise<void> {
+    // discord-serve (the superseded per-message path) never reacts; satisfy
+    // the interface so this fake still type-checks after the capability work
+    // extended DiscordClient with react/fetchRecent.
+  }
+  async fetchRecent(_channelId: string, _limit: number): Promise<DiscordMessage[]> {
+    return [];
+  }
   // Test driver
   async fire(msg: Partial<DiscordMessage> & Pick<DiscordMessage, "channelId" | "content">) {
     const full: DiscordMessage = {
