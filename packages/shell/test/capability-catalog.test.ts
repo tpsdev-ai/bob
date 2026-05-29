@@ -37,8 +37,20 @@ describe("blessed catalog", () => {
     expect(path.endsWith("cap-discord/src/index.ts")).toBe(true);
   });
 
+  it("blesses the flair capability as implemented", () => {
+    const entry = lookupCapability("flair");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("flair");
+    expect(entry?.manifest.provides?.tools).toEqual(["flair_search", "flair_write", "flair_get"]);
+    expect(entry?.manifest.provides?.serves).toBe(false);
+    const path = entry?.manifest.piPackage ?? "";
+    expect(path.startsWith("/")).toBe(true);
+    expect(path.endsWith("cap-flair/src/index.ts")).toBe(true);
+  });
+
   it("lists the still-planned capabilities as not-yet-implemented", () => {
-    for (const name of ["flair", "mail", "heartbeat"]) {
+    for (const name of ["mail", "heartbeat"]) {
       const entry = lookupCapability(name);
       expect(entry, name).toBeDefined();
       expect(entry?.notYetImplemented, name).toBe(true);
@@ -52,7 +64,7 @@ describe("blessed catalog", () => {
   });
 
   it("rejects a still-unbuilt capability through the loader", () => {
-    const yaml = ["capabilities:", "  - flair", ""].join("\n");
+    const yaml = ["capabilities:", "  - mail", ""].join("\n");
     expect(() => resolveCapabilities({ yamlText: yaml })).toThrow(/not yet implemented/);
   });
 });

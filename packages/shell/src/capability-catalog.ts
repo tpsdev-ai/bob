@@ -48,6 +48,19 @@ const discordExtensionPath = resolve(
   "index.ts",
 );
 
+// Absolute path to the flair (memory) capability's pi extension. Same blessing
+// pattern as discord: a real publishable package (packages/cap-flair) pointed at
+// as a LOCAL source path for phase 1 until it's published as
+// `npm:@tpsdev-ai/bob-cap-flair`.
+const flairExtensionPath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "cap-flair",
+  "src",
+  "index.ts",
+);
+
 // The discord capability's config schema, mirrored here so the catalog can
 // pre-validate an agent's bob.yaml `discord:` block. Kept in sync with
 // packages/cap-discord/src/config.ts CONFIG_SCHEMA (defined inline rather than
@@ -73,6 +86,29 @@ const discordManifest: BobCapabilityManifest = {
   provides: {
     tools: ["discord_reply", "discord_react", "discord_fetch"],
     serves: true,
+  },
+};
+
+// The flair capability's config schema, mirrored here (kept in sync with
+// packages/cap-flair/src/config.ts CONFIG_SCHEMA) so the catalog can pre-validate
+// an agent's bob.yaml `flair:` block. keyFile is a PATH — the private key is
+// never inlined; additionalProperties:false fails closed on a stray secret.
+const flairConfigSchema = Type.Object(
+  {
+    url: Type.String({ minLength: 1 }),
+    agentId: Type.String({ minLength: 1, pattern: "^[a-z0-9-]+$" }),
+    keyFile: Type.String({ minLength: 1 }),
+  },
+  { additionalProperties: false },
+);
+
+const flairManifest: BobCapabilityManifest = {
+  name: "flair",
+  piPackage: flairExtensionPath,
+  configSchema: flairConfigSchema,
+  provides: {
+    tools: ["flair_search", "flair_write", "flair_get"],
+    serves: false,
   },
 };
 
@@ -113,8 +149,9 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   fixture: { manifest: fixtureManifest },
   // Discord is REAL as of PR3 (packages/cap-discord), blessed as a local path.
   discord: { manifest: discordManifest },
+  // Flair memory is REAL (packages/cap-flair), blessed as a local path.
+  flair: { manifest: flairManifest },
   // --- planned, not yet implemented (later PRs) ---
-  flair: placeholder("flair", { tools: ["flair_search", "flair_write"] }),
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
   heartbeat: placeholder("heartbeat", { serves: true }),
 });

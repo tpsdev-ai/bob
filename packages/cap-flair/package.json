@@ -1,0 +1,47 @@
+{
+  "name": "@tpsdev-ai/bob-cap-flair",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bob capability: Flair memory. A pi extension — outbound tools (search/write/get) over an agent's Ed25519-authenticated Flair store.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./manifest": {
+      "import": "./dist/manifest.js",
+      "types": "./dist/manifest.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@tpsdev-ai/bob-shell": "workspace:*",
+    "typebox": "1.1.38"
+  },
+  "keywords": [
+    "flair",
+    "memory",
+    "bob",
+    "agent",
+    "pi-coding-agent",
+    "capability"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tpsdev-ai/bob.git",
+    "directory": "packages/cap-flair"
+  },
+  "homepage": "https://github.com/tpsdev-ai/bob#readme",
+  "bugs": "https://github.com/tpsdev-ai/bob/issues",
+  "license": "Apache-2.0"
+}
