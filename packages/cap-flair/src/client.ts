@@ -77,8 +77,12 @@ export class FlairHttpClient implements FlairClient {
   private keyPromise?: Promise<webcrypto.CryptoKey>;
 
   constructor(opts: FlairHttpClientOptions) {
-    // Drop a trailing slash so `${url}${path}` never doubles it.
-    this.url = opts.url.replace(/\/+$/, "");
+    // Drop trailing slashes so `${url}${path}` never doubles them. A linear
+    // loop (not a `/\/+$/` regex) — the regex form is a polynomial-ReDoS class
+    // on uncontrolled (config) input that CodeQL rightly flags.
+    let base = opts.url;
+    while (base.endsWith("/")) base = base.slice(0, -1);
+    this.url = base;
     this.agentId = opts.agentId;
     this.keyFile = opts.keyFile;
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
