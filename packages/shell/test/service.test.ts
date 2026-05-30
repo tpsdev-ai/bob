@@ -28,10 +28,10 @@ function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
 }
 
 describe("renderPlist", () => {
-  it("references the PERSISTENT entrypoint (bob serve <name>)", () => {
+  it("references the PERSISTENT entrypoint (bob run <name>)", () => {
     const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
     expect(xml).toContain("<string>/usr/local/bin/bob</string>");
-    expect(xml).toContain("<string>serve</string>");
+    expect(xml).toContain("<string>run</string>");
     expect(xml).toContain("<string>pulse</string>");
   });
 
@@ -159,7 +159,7 @@ describe("lifecycle (launchd) — up / down / restart invoke the right launchctl
 describe("systemd backend", () => {
   it("renderSystemdUnit runs the persistent entrypoint + Restart=always, no secret", () => {
     const unit = renderSystemdUnit({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
-    expect(unit).toContain("ExecStart=/usr/local/bin/bob serve pulse");
+    expect(unit).toContain("ExecStart=/usr/local/bin/bob run pulse");
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain(`WorkingDirectory=${HOME}/agents/pulse/work`);
@@ -175,7 +175,7 @@ describe("systemd backend", () => {
       model: "claude-fast",
       home: HOME,
     });
-    expect(unit).toContain("ExecStart=/usr/local/bin/bob serve pulse --model claude-fast");
+    expect(unit).toContain("ExecStart=/usr/local/bin/bob run pulse --model claude-fast");
     expect(() => renderSystemdUnit({ name: "../evil", bobBin: "/bin/bob" })).toThrow(
       /invalid agent name/,
     );
@@ -202,7 +202,7 @@ describe("systemd backend", () => {
     });
     expect(res.path).toBe(`${HOME}/.config/systemd/user/bob-pulse.service`);
     expect(written[0].path).toBe(res.path);
-    expect(written[0].contents).toContain("ExecStart=/usr/local/bin/bob serve pulse");
+    expect(written[0].contents).toContain("ExecStart=/usr/local/bin/bob run pulse");
     expect(calls).toEqual([["--user", "daemon-reload"]]);
   });
 

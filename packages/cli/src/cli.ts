@@ -62,12 +62,12 @@ Commands:
                              --dry-run --force --no-interactive
   align <name>        Recurring check-in to refine an existing agent
                       Flags: --provider <p> --model <m> --agent-dir <dir>
-  run <name> <prompt> Run one short-lived task for the named agent (embeds pi
-                      via its SDK — fresh session, one prompt, exit)
+  run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
+                      that stays up, loading bob.yaml capabilities (discord
+                      gateway, cron). This is what the service unit runs.
+  run <name> <prompt> Run ONE short-lived task (claude -p style) — minimal +
+                      ephemeral, no gateway. Prints the response, exits.
                       Flags: --model <m>  (--interactive: coming in a later PR)
-  serve <name>        Run the agent PERSISTENTLY — one warm pi session that stays
-                      up, loading the agent's bob.yaml capabilities (incl. discord).
-                      This is what the service unit runs. Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
   up <name>           Load + start the agent's service unit
@@ -167,21 +167,27 @@ async function run(
   flags: Record<string, string | boolean>,
 ): Promise<number> {
   const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
-  // PR1 migrated `bob run` to pi's embedded SDK for the non-interactive prompt
-  // path only. The interactive REPL on the SDK lands in a later phase-1 PR.
+  // The interactive REPL on the SDK lands in a later phase-1 PR.
   if (flags.interactive === true) {
     console.error(
-      "bob run: --interactive is not yet supported on the embedded-SDK path (use a prompt for now)",
+      "bob run: --interactive is not yet supported on the embedded-SDK path (give a task prompt for now)",
     );
     return 2;
   }
+  // Lifespan is the only knob (`serve` is retired): a task prompt = a MINIMAL
+  // one-shot; NO prompt = the agent runs PERSISTENTLY (on-duty).
   if (prompt === undefined) {
-    console.error('bob run: a prompt is required, e.g. `bob run <name> "summarize my inbox"`');
-    return 2;
+    // PERSISTENT: one warm pi session that stays up, loading the agent's
+    // bob.yaml capabilities (discord's inbound gateway, cron, …) and posting
+    // back via them. This is what the service unit invokes. Blocks until
+    // SIGTERM/SIGINT — runPersistent disposes the session gracefully (await
+    // in-flight turn → dispose → exit 0); KeepAlive/Restart relaunches it.
+    await runPersistent({ name, model });
+    return 0;
   }
-  // captureStdout collects the assistant's final text into result.stdout.
-  // runAgent itself is silent (it accumulates deltas, never writes to console),
-  // so without this `bob run` printed nothing — print the response here.
+  // ONE-SHOT TASK (claude -p style) — minimal + ephemeral (no gateway; see
+  // BOB_PERSISTENT in run.ts). captureStdout collects the assistant's final
+  // text (runAgent is otherwise silent), so we print the response.
   const result = await runAgent({ name, prompt, model, captureStdout: true });
   if (result.stdout && result.stdout.trim().length > 0) {
     console.log(result.stdout);
@@ -189,22 +195,9 @@ async function run(
   return result.exitCode;
 }
 
-// `bob serve <name>` — run the agent PERSISTENTLY. ONE warm pi AgentSession that
-// stays up, loading the agent's bob.yaml `capabilities:` (incl. discord, whose
-// gateway listener feeds inbound messages via pi.sendUserMessage and routes
-// replies back to the originating channel). This is the entrypoint the launchd
-// unit runs. Discord is no longer a CLI flag — it's a declared capability.
-//
-// Blocks until SIGTERM/SIGINT, which runPersistent handles gracefully (await
-// in-flight turn → session.dispose() → exit 0). KeepAlive relaunches it.
-async function serve(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
-  await runPersistent({ name, model });
-}
-
 // `bob install-service <name>` — write the agent's launchd plist so it self-runs
 // (KeepAlive + RunAtLoad). Does NOT start it — that's `bob up`. The plist runs
-// `bob serve <name>`; it embeds NO secrets (the discord token is read from the
+// `bob run <name>`; it embeds NO secrets (the discord token is read from the
 // file path in bob.yaml at runtime).
 async function installServiceCmd(
   name: string,
@@ -219,7 +212,7 @@ async function installServiceCmd(
   const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
   const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
-  console.log(`  runs:    ${bobBin} serve ${name}`);
+  console.log(`  runs:    ${bobBin} run ${name}`);
   console.log(`  next:    bob up ${name}   (load + start)`);
   if (bobBin === "bob") {
     console.error(
@@ -294,13 +287,6 @@ async function main(): Promise<number> {
         const prompt = args.positional.slice(1).join(" ") || undefined;
         return await run(args.positional[0], prompt, args.flags);
       }
-      case "serve":
-        if (!args.positional[0]) {
-          console.error("bob serve: missing <name>");
-          return 2;
-        }
-        await serve(args.positional[0], args.flags);
-        return 0;
       case "install-service":
         if (!args.positional[0]) {
           console.error("bob install-service: missing <name>");
