@@ -61,6 +61,19 @@ const flairExtensionPath = resolve(
   "index.ts",
 );
 
+// Absolute path to the observatory (team-view producer) capability's pi
+// extension. Same blessing pattern as discord/flair: a real publishable package
+// (packages/cap-observatory) pointed at as a LOCAL source path for phase 1 until
+// it's published as `npm:@tpsdev-ai/bob-cap-observatory`.
+const observatoryExtensionPath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "cap-observatory",
+  "src",
+  "index.ts",
+);
+
 // The discord capability's config schema, mirrored here so the catalog can
 // pre-validate an agent's bob.yaml `discord:` block. Kept in sync with
 // packages/cap-discord/src/config.ts CONFIG_SCHEMA (defined inline rather than
@@ -112,6 +125,46 @@ const flairManifest: BobCapabilityManifest = {
   },
 };
 
+// The observatory capability's config schema, mirrored here (kept in sync with
+// packages/cap-observatory/src/config.ts CONFIG_SCHEMA) so the catalog can
+// pre-validate an agent's bob.yaml `observatory:` block. officeKeyFile is a PATH
+// — the OFFICE key is never inlined; additionalProperties:false fails closed on a
+// stray secret. The snapshot-source `agents:` array is required + non-empty (an
+// office reports at least one agent).
+const observatorySnapshotSourceSchema = Type.Object(
+  {
+    agentId: Type.String({ minLength: 1, pattern: "^[a-z0-9-]+$" }),
+    name: Type.Optional(Type.String()),
+    role: Type.Optional(Type.String()),
+    model: Type.Optional(Type.String()),
+    type: Type.Optional(Type.Union([Type.Literal("agent"), Type.Literal("human")])),
+    beadsFile: Type.Optional(Type.String()),
+    heartbeatFile: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+const observatoryConfigSchema = Type.Object(
+  {
+    observatoryUrl: Type.String({ minLength: 1 }),
+    officeId: Type.String({ minLength: 1, pattern: "^[a-z0-9-]+$" }),
+    officeKeyFile: Type.String({ minLength: 1 }),
+    staleThresholdSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
+    agents: Type.Array(observatorySnapshotSourceSchema, { minItems: 1 }),
+  },
+  { additionalProperties: false },
+);
+
+const observatoryManifest: BobCapabilityManifest = {
+  name: "observatory",
+  piPackage: observatoryExtensionPath,
+  configSchema: observatoryConfigSchema,
+  provides: {
+    tools: ["observatory_report"],
+    serves: false,
+  },
+};
+
 // The fixture's manifest, with its piPackage resolved to the absolute on-disk
 // path. (Defined here rather than imported from examples/ so the compiled dist
 // doesn't depend on a file outside rootDir; the fixture's manifest.ts mirrors
@@ -151,6 +204,9 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   discord: { manifest: discordManifest },
   // Flair memory is REAL (packages/cap-flair), blessed as a local path.
   flair: { manifest: flairManifest },
+  // Observatory (team-view producer) is REAL (packages/cap-observatory), blessed
+  // as a local path.
+  observatory: { manifest: observatoryManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
   heartbeat: placeholder("heartbeat", { serves: true }),

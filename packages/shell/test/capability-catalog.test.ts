@@ -49,6 +49,18 @@ describe("blessed catalog", () => {
     expect(path.endsWith("cap-flair/src/index.ts")).toBe(true);
   });
 
+  it("blesses the observatory capability as implemented (team-view producer)", () => {
+    const entry = lookupCapability("observatory");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("observatory");
+    expect(entry?.manifest.provides?.tools).toEqual(["observatory_report"]);
+    expect(entry?.manifest.provides?.serves).toBe(false);
+    const path = entry?.manifest.piPackage ?? "";
+    expect(path.startsWith("/")).toBe(true);
+    expect(path.endsWith("cap-observatory/src/index.ts")).toBe(true);
+  });
+
   it("lists the still-planned capabilities as not-yet-implemented", () => {
     for (const name of ["mail", "heartbeat"]) {
       const entry = lookupCapability(name);
