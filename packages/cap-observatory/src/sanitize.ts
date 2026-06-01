@@ -42,7 +42,11 @@ const SECRET_PATTERNS: RegExp[] = [
   // key=… / token=… / secret=… / password=… / apikey=… assignments (value redacted).
   /\b(?:api[-_]?key|secret|token|password|passwd|pwd|auth)\b\s*[:=]\s*["']?[A-Za-z0-9+/_.:=-]{6,}["']?/gi,
   // PEM private-key blocks (the body lines, conservatively the whole block).
-  /-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/g,
+  // Quantifiers are BOUNDED (type labels are short; a PEM block is < 8 KB) to keep
+  // this linear — unbounded `[^-]*` / `[\s\S]*?` here is a polynomial-ReDoS vector
+  // on crafted "-----BEGIN…PRIVATE KEY-----" repetitions (CodeQL js/polynomial-redos).
+  // The long-base64/hex rules below redact the key body regardless, as backstop.
+  /-----BEGIN[^-]{0,40}PRIVATE KEY-----[\s\S]{0,8192}?-----END[^-]{0,40}PRIVATE KEY-----/g,
   // Long opaque base64/hex runs (>= 40 chars) — JWT segments, raw key material.
   /\b[A-Za-z0-9+/]{40,}={0,2}\b/g,
   /\b[0-9a-fA-F]{40,}\b/g,

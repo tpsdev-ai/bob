@@ -176,6 +176,29 @@ describe("sanitizeString (redaction boundary)", () => {
     expect(out).toContain(REDACTED);
   });
 
+  it("redacts a PEM private-key block (markers + body)", () => {
+    const pem =
+      "-----BEGIN RSA PRIVATE KEY-----\n" +
+      "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDabc123def456\n" +
+      "-----END RSA PRIVATE KEY-----";
+    const out = sanitizeString(`leaked key:\n${pem}\nshipped anyway`);
+    expect(out).not.toContain("PRIVATE KEY");
+    expect(out).not.toContain("MIIEvQIBAD");
+    expect(out).toContain(REDACTED);
+    expect(out).toContain("leaked key");
+  });
+
+  it("is linear-time on crafted PEM-marker repetitions (no polynomial ReDoS)", () => {
+    // Adversarial: many "-----BEGIN…PRIVATE KEY-----" prefixes and no END marker.
+    // The bounded quantifiers keep this near-instant; the prior unbounded regex
+    // (`[^-]*` / `[\s\S]*?`) was O(n^2) here — CodeQL js/polynomial-redos.
+    const evil = "-----BEGIN PRIVATE KEY-----".repeat(5000);
+    const start = performance.now();
+    const out = sanitizeString(evil);
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(typeof out).toBe("string");
+  });
+
   it("redacts to a constant, never a partial echo of the secret", () => {
     const secret = "ghp_SuperSecretTokenValue1234567890";
     const out = sanitizeString(`leaked ${secret}`);
