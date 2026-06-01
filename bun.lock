@@ -30,6 +30,15 @@
         "typebox": "1.1.38",
       },
     },
+    "packages/cap-observatory": {
+      "name": "@tpsdev-ai/bob-cap-observatory",
+      "version": "0.1.0",
+      "dependencies": {
+        "@mariozechner/pi-coding-agent": "0.73.1",
+        "@tpsdev-ai/bob-shell": "workspace:*",
+        "typebox": "1.1.38",
+      },
+    },
     "packages/cli": {
       "name": "@tpsdev-ai/bob",
       "version": "0.2.0",
@@ -238,6 +247,8 @@
     "@tpsdev-ai/bob-cap-discord": ["@tpsdev-ai/bob-cap-discord@workspace:packages/cap-discord"],
 
     "@tpsdev-ai/bob-cap-flair": ["@tpsdev-ai/bob-cap-flair@workspace:packages/cap-flair"],
+
+    "@tpsdev-ai/bob-cap-observatory": ["@tpsdev-ai/bob-cap-observatory@workspace:packages/cap-observatory"],
 
     "@tpsdev-ai/bob-discord": ["@tpsdev-ai/bob-discord@workspace:packages/discord"],
 
