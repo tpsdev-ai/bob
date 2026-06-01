@@ -1,0 +1,48 @@
+{
+  "name": "@tpsdev-ai/bob-cap-observatory",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bob capability: Team-View observatory producer. A pi extension — each office self-reports sanitized, OFFICE-key-signed agent snapshots + event feed to /IngestEvents.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./manifest": {
+      "import": "./dist/manifest.js",
+      "types": "./dist/manifest.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@tpsdev-ai/bob-shell": "workspace:*",
+    "typebox": "1.1.38"
+  },
+  "keywords": [
+    "observatory",
+    "team-view",
+    "cockpit",
+    "bob",
+    "agent",
+    "pi-coding-agent",
+    "capability"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tpsdev-ai/bob.git",
+    "directory": "packages/cap-observatory"
+  },
+  "homepage": "https://github.com/tpsdev-ai/bob#readme",
+  "bugs": "https://github.com/tpsdev-ai/bob/issues",
+  "license": "Apache-2.0"
+}
