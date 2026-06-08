@@ -28,7 +28,7 @@
     "@tpsdev-ai/bob-discord": "workspace:*",
     "@tpsdev-ai/bob-shell": "workspace:*",
     "discord.js": "^14.16.0",
-    "typebox": "1.1.38"
+    "typebox": "1.2.3"
   },
   "keywords": [
     "discord",
