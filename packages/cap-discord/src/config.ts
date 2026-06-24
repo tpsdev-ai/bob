@@ -17,6 +17,7 @@
 // a JSON blob) — config, not the secret. The secret stays on disk.
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -98,9 +99,17 @@ export function readToken(
   tokenFile: string,
   read: (path: string) => string = (p) => readFileSync(p, "utf8"),
 ): string {
+  // Expand a leading ~/ so configs can use the ~-relative paths the schema
+  // documents ("Absolute (or ~-relative) path"). Node's fs does NOT expand ~/
+  // (only the shell does), so without this an unexpanded path throws ENOENT —
+  // and because pi's loader swallows extension-load errors, the discord
+  // capability would silently never load. Mirrors cap-flair / cap-observatory.
+  const resolvedPath = tokenFile.startsWith("~/")
+    ? `${homedir()}/${tokenFile.slice(2)}`
+    : tokenFile;
   let contents: string;
   try {
-    contents = read(tokenFile);
+    contents = read(resolvedPath);
   } catch (err) {
     // err.message from fs already contains only the path, not contents.
     const reason = err instanceof Error ? err.message : "read failed";
@@ -108,7 +117,7 @@ export function readToken(
   }
   const token = contents.trim();
   if (token.length === 0) {
-    throw new Error(`discord capability: token file ${tokenFile} is empty.`);
+    throw new Error(`discord capability: token file ${resolvedPath} is empty.`);
   }
   return token;
 }
