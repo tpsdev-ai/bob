@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Value } from "typebox/value";
 import { CONFIG_ENV_VAR, CONFIG_SCHEMA, loadConfigFromEnv, readToken } from "../src/config.js";
@@ -97,6 +97,30 @@ describe("readToken", () => {
     }
     expect(msg).toMatch(/cannot read token file/);
     expect(msg).not.toContain("the-secret-token");
+  });
+
+  it("expands a leading ~/ in the token file path to the home dir", () => {
+    // Node's fs does NOT expand ~/ (only the shell does); readToken must, so a
+    // bob.yaml `tokenFile: ~/...` does not throw ENOENT and silently kill the
+    // cap. Use the read seam to capture the path actually opened — never a real
+    // token file.
+    let opened = "";
+    const token = readToken("~/agents/rivet/.pi-agent/discord.token", (p) => {
+      opened = p;
+      return "tok-from-home\n";
+    });
+    expect(opened).toBe(`${homedir()}/agents/rivet/.pi-agent/discord.token`);
+    expect(opened.startsWith("~/")).toBe(false);
+    expect(token).toBe("tok-from-home");
+  });
+
+  it("leaves an absolute token file path unchanged", () => {
+    let opened = "";
+    readToken("/secrets/bot.token", (p) => {
+      opened = p;
+      return "abs-token\n";
+    });
+    expect(opened).toBe("/secrets/bot.token");
   });
 
   it("never echoes the token in any error path", () => {
