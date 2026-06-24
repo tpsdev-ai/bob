@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { webcrypto } from "node:crypto";
+import { generateKeyPairSync, webcrypto } from "node:crypto";
 import {
   CONFIG_ENV_VAR,
   type FlairClient,
@@ -268,5 +268,55 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
     });
     await client.get("x");
     expect(readPath).toBe(`${homedir()}/.flair/keys/a.key`);
+  });
+
+  // Regression for ops-kvz6: `bob flair-pair` writes the private key as PEM
+  // PKCS8 (-----BEGIN PRIVATE KEY-----), but loadKey() used to base64-decode
+  // the file then subtle.importKey("pkcs8", …), which throws a DataError on
+  // PEM. Net: EVERY agent's flair_search/write/get failed to sign. This proves
+  // a key in flairPair's ACTUAL on-disk format round-trips through the signer.
+  it("signs with a key in `bob flair-pair`'s PEM PKCS8 output format (ops-kvz6)", async () => {
+    // Reproduce flair-pair.ts's exact key serialization.
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const privPem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    // Sanity-check we built the format the bug report names: PEM, ~119B, 3 lines.
+    expect(privPem.startsWith("-----BEGIN PRIVATE KEY-----")).toBe(true);
+    expect(privPem.trim().split("\n").length).toBe(3);
+
+    let captured: Record<string, string> = {};
+    const client = new FlairHttpClient({
+      url: "http://127.0.0.1:9926",
+      agentId: "rivet",
+      keyFile: "/unused",
+      fetchImpl: async (_url, init) => {
+        captured = init.headers;
+        return { ok: true, status: 200, text: async () => "{}" };
+      },
+      now: () => 1_700_000_000_000,
+      uuid: () => "nonce-pem",
+      readFile: () => privPem, // the PEM the cap-flair client used to choke on
+    });
+
+    // Before the fix this throws ("Invalid keyData") instead of signing.
+    await client.get("rivet-1");
+
+    const auth = captured.Authorization ?? "";
+    expect(auth.startsWith("TPS-Ed25519 ")).toBe(true);
+    const [agentId, ts, nonce, sigB64] = auth.slice("TPS-Ed25519 ".length).split(":");
+    expect(agentId).toBe("rivet");
+    expect(ts).toBe("1700000000000");
+    expect(nonce).toBe("nonce-pem");
+
+    // The signature must verify against the PEM key's matching public key.
+    const spki = publicKey.export({ format: "der", type: "spki" });
+    const verifyKey = await subtle.importKey("spki", spki, { name: "Ed25519" }, false, ["verify"]);
+    const payload = `rivet:1700000000000:nonce-pem:GET:/Memory/rivet-1`;
+    const ok = await subtle.verify(
+      "Ed25519",
+      verifyKey,
+      Buffer.from(sigB64 ?? "", "base64"),
+      new TextEncoder().encode(payload),
+    );
+    expect(ok).toBe(true);
   });
 });
