@@ -18,6 +18,9 @@
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
   },
+  "overrides": {
+    "ws": "^8.21.0"
+  },
   "license": "Apache-2.0",
   "author": "tpsdev-ai",
   "repository": {
