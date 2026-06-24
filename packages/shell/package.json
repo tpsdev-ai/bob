@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "0.73.1",
-    "croner": "9.0.0",
+    "croner": "10.0.1",
     "typebox": "1.1.38"
   },
   "keywords": [
