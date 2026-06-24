@@ -12,15 +12,13 @@
 //   write : PUT  /Memory/<id> {id, agentId, content, durability, createdAt, supersedes?}
 //   get   : GET  /Memory/<id>
 //
-// SECURITY: the private key is read from a FILE PATH once, imported as a
-// non-extractable CryptoKey, and used only to sign. It is never logged, echoed,
-// returned in a tool result, or placed in an error message.
+// SECURITY: the private key is read from a FILE PATH once, parsed into a
+// node KeyObject, and used only to sign. It is never logged, echoed, returned
+// in a tool result, or placed in an error message.
 
-import { webcrypto } from "node:crypto";
+import { createPrivateKey, type KeyObject, sign as signEd25519, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-
-const { subtle } = webcrypto;
 
 export interface FlairSearchHit {
   id: string;
@@ -57,7 +55,9 @@ type FetchLike = (
 export interface FlairHttpClientOptions {
   url: string;
   agentId: string;
-  // Path to the base64-PKCS8 Ed25519 private key. Read once, lazily.
+  // Path to the Ed25519 private key. Read once, lazily. Accepts either the PEM
+  // PKCS8 form that `bob flair-pair` writes (-----BEGIN PRIVATE KEY-----) or a
+  // raw base64-DER PKCS8 string — createPrivateKey handles both.
   keyFile: string;
   // Seams (tests). Production uses global fetch, Date.now, randomUUID, fs.
   fetchImpl?: FetchLike;
@@ -74,8 +74,8 @@ export class FlairHttpClient implements FlairClient {
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => string;
-  // Imported once; reused across requests.
-  private keyPromise?: Promise<webcrypto.CryptoKey>;
+  // Parsed once; reused across requests.
+  private keyObject?: KeyObject;
 
   constructor(opts: FlairHttpClientOptions) {
     // Drop trailing slashes so `${url}${path}` never doubles them. A linear
@@ -96,27 +96,31 @@ export class FlairHttpClient implements FlairClient {
     this.readFile = opts.readFile ?? ((p) => readFileSync(p, "utf8"));
   }
 
-  private loadKey(): Promise<webcrypto.CryptoKey> {
-    if (!this.keyPromise) {
-      const b64 = this.readFile(this.keyFile).trim();
-      this.keyPromise = subtle.importKey(
-        "pkcs8",
-        Buffer.from(b64, "base64"),
-        { name: "Ed25519" },
-        false,
-        ["sign"],
-      );
+  // Parse the on-disk private key into a node KeyObject. createPrivateKey is
+  // forgiving about input shape: a PEM PKCS8 string (what `bob flair-pair`
+  // writes — `-----BEGIN PRIVATE KEY-----`) is parsed directly, while a raw
+  // base64-DER PKCS8 string (the alternate flair convention) is decoded from
+  // base64 into DER first. webcrypto's subtle.importKey("pkcs8", …) throws a
+  // DataError on the PEM form, which is the bug this replaces.
+  private loadKey(): KeyObject {
+    if (!this.keyObject) {
+      const raw = this.readFile(this.keyFile).trim();
+      this.keyObject = raw.includes("-----BEGIN")
+        ? createPrivateKey(raw)
+        : createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
     }
-    return this.keyPromise;
+    return this.keyObject;
   }
 
   private async signedFetch(method: string, path: string, body?: unknown): Promise<unknown> {
-    const key = await this.loadKey();
+    const key = this.loadKey();
     const ts = String(this.now());
     const nonce = this.uuid();
     // tsMs in MILLISECONDS — see protocol note. Signature binds method + path.
     const payload = `${this.agentId}:${ts}:${nonce}:${method}:${path}`;
-    const sig = await subtle.sign("Ed25519", key, new TextEncoder().encode(payload));
+    // Ed25519 sign: the algorithm is the key, so the first arg MUST be null.
+    // signEd25519 returns a Buffer (the 64-byte raw signature).
+    const sig = signEd25519(null, Buffer.from(payload, "utf8"), key);
     const headers: Record<string, string> = {
       Authorization: `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${Buffer.from(sig).toString("base64")}`,
     };

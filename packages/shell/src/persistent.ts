@@ -76,12 +76,23 @@ export interface PersistentHandle {
   shutdown(): Promise<void>;
 }
 
-// The default keep-alive: a promise that never resolves. Keeps bun's/node's
-// event loop alive (the gateway socket would too, but this is explicit and
-// survives a gateway disconnect). The process leaves this only via a signal
-// handler calling exit() after shutdown().
+// The default keep-alive: a promise that never resolves AND holds an active
+// timer handle so the event loop stays alive.
+//
+// A bare `new Promise<void>(() => {})` is NOT enough on Node: with no pending
+// work in the loop, Node detects the empty loop and EXITS (the persistent
+// process's signal handlers are `process.once`, which do not count as active
+// handles). That was the bug — `bob run <name>` logged "persistent session up"
+// then exited 0, and systemd's Restart=always looped it. (`setInterval` alone
+// fails to hold *bun*'s loop — the inverse trap — so we need both: an active
+// interval handle to satisfy Node AND a never-resolving promise so the await
+// genuinely blocks regardless of runtime.) The interval is never cleared: the
+// process leaves this only via a signal handler calling exit() after
+// shutdown(). A huge period means the empty callback effectively never fires.
 function neverResolves(): Promise<void> {
-  return new Promise<void>(() => {});
+  return new Promise<void>(() => {
+    setInterval(() => {}, 1 << 30);
+  });
 }
 
 // Stand up the warm session and return a handle. Does NOT block — call

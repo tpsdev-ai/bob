@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -175,6 +176,44 @@ describe("runPersistent / startPersistent", () => {
     // No signal fired, so exit() not called; but the session is disposed on return.
     expect(exited).toBeUndefined();
     expect(fake.disposed()).toBe(true);
+  });
+
+  it("the default keepAlive holds NODE's event loop alive (ops-d7t1 restart-loop)", () => {
+    // Regression for the systemd restart-loop. The keep-alive used to be a bare
+    // `new Promise(() => {})`. On NODE that is NOT enough: with nothing else in
+    // the loop (the persistent runtime's signal handlers are `process.once`,
+    // which do not count as active handles) Node sees an empty loop and EXITS 0
+    // → systemd Restart=always loops `bob run <name>` every few seconds, so the
+    // agent never stays up to receive work.
+    //
+    // This MUST run under real `node` to catch the bug: bun blocks on a bare
+    // never-resolving promise (the inverse trap), so a same-process bun test
+    // can't distinguish the broken form from the fixed one. We spawn node on a
+    // script that uses the SHIPPED default keep-alive (an active interval handle
+    // inside a never-resolving promise) and assert the process is still running
+    // after a grace window (timeout kills it → non-zero), vs. the old bare-
+    // promise form which we assert exits ~immediately with code 0.
+    const fixed = [
+      'process.once("SIGTERM", () => process.exit(0));',
+      "async function keepAlive(){ await new Promise(() => { setInterval(() => {}, 1 << 30); }); }",
+      "keepAlive();",
+    ].join("\n");
+    const broken = [
+      'process.once("SIGTERM", () => process.exit(0));',
+      "async function keepAlive(){ await new Promise(() => {}); }",
+      "keepAlive();",
+    ].join("\n");
+
+    // The fixed form stays alive → spawnSync's `timeout` kills it, reported as
+    // `error.code === "ETIMEDOUT"`. The broken form exits on its own before the
+    // window, so there is no timeout error.
+    const runFixed = spawnSync(process.execPath, ["-e", fixed], { timeout: 1500 });
+    const runBroken = spawnSync(process.execPath, ["-e", broken], { timeout: 1500 });
+
+    // Broken: node exited on its own (no timeout kill) — the restart-loop bug.
+    expect(runBroken.error).toBeUndefined();
+    // Fixed: node was still alive at the timeout → killed by spawnSync.
+    expect((runFixed.error as NodeJS.ErrnoException | undefined)?.code).toBe("ETIMEDOUT");
   });
 
   it("throws (fast) when the agent dir is missing — no silent under-equipped run", async () => {
