@@ -84,11 +84,10 @@ export function initAgent(opts: InitOptions): InitResult {
   written.push(yamlPath);
 
   // .pi-agent/{models.json,auth.json} — required for pi 0.75+ to find
-  // credentials when PI_CODING_AGENT_DIR is set (launcher exports it).
-  // For exe-dev-gateway provider, we ALSO need a baseUrl override so pi
-  // routes the anthropic API to the gateway endpoint. Without this, the
-  // launcher fails at first invocation with "No API key found" or hits
-  // api.anthropic.com directly and gets 401.
+  // credentials AND resolve the model when PI_CODING_AGENT_DIR is set
+  // (launcher exports it). Written for every provider — see
+  // writePiAgentConfig's doc comment for why bare baseUrl configs aren't
+  // enough for `bob run`.
   written.push(...writePiAgentConfig(opts, agentDir));
 
   // bin/<name> launcher
@@ -211,54 +210,83 @@ function resolvePiProvider(bobProvider: string): string {
 
 // pi 0.75+ reads its config from $PI_CODING_AGENT_DIR (the per-agent
 // dir the launcher exports). Without these two files, the launcher
-// fails at first invocation with either "No API key found for anthropic"
-// (auth.json missing) or hits api.anthropic.com directly and gets a 401
-// (models.json baseUrl override missing).
+// fails at first invocation with either "No API key found for <provider>"
+// (auth.json missing) or "model not found" from pi-coding-agent's
+// ModelRegistry.find(provider, model) — which requires the model to be
+// DECLARED under providers.<provider>.models, not just a bare baseUrl.
 //
-// For exe-dev-gateway: write both — auth.json with a placeholder key
-// (the gateway uses VM identity, not the literal key), and models.json
-// pointing anthropic at the gateway endpoint.
+// We ALWAYS write both files for ANY provider, because `bob run` resolves
+// models strictly (unlike pi's bare launcher, which tolerates a custom id
+// with no declaration). Declaring the model is the core fix here.
 //
-// For other providers (anthropic, ollama-cloud, etc.) callers are
-// expected to populate auth.json themselves — we don't presume credentials.
+// - models.json: providers.<piProvider>.models = [{ id: opts.model }] always.
+//   baseUrl is added only for providers with a known custom endpoint
+//   (see knownProviderBaseUrl) — built-ins like anthropic/openai use pi's
+//   default endpoint.
+// - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
+//   literal value is never checked — the gateway authenticates via VM
+//   identity). Every other provider gets a clearly-labeled placeholder the
+//   human must replace with a real key before the agent can run.
+function knownProviderBaseUrl(bobProvider: string): string | undefined {
+  switch (bobProvider) {
+    case "exe-dev-gateway":
+      return "http://169.254.169.254/gateway/llm/anthropic";
+    case "ollama-cloud":
+    case "ollama":
+      return "https://ollama.com/v1";
+    default:
+      return undefined;
+  }
+}
+
 function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
-  const written: string[] = [];
   const piDir = join(agentDir, ".pi-agent");
   // mkdirSync above already created it; defensive recreate in case caller
   // didn't go through the standard path.
   mkdirSync(piDir, { recursive: true });
 
-  if (opts.provider === "exe-dev-gateway") {
-    const modelsPath = join(piDir, "models.json");
-    const authPath = join(piDir, "auth.json");
-    writeFileSync(
-      modelsPath,
-      `${JSON.stringify(
-        {
-          providers: {
-            anthropic: {
-              baseUrl: "http://169.254.169.254/gateway/llm/anthropic",
-            },
+  const piProvider = resolvePiProvider(opts.provider);
+  const isGateway = opts.provider === "exe-dev-gateway";
+  const baseUrl = knownProviderBaseUrl(opts.provider);
+  const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
+
+  const modelsPath = join(piDir, "models.json");
+  const authPath = join(piDir, "auth.json");
+
+  writeFileSync(
+    modelsPath,
+    `${JSON.stringify(
+      {
+        providers: {
+          [piProvider]: {
+            ...(baseUrl ? { baseUrl } : {}),
+            models: [{ id: opts.model, name: opts.model }],
           },
         },
-        null,
-        2,
-      )}\n`,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
+    authPath,
+    `${JSON.stringify(
+      {
+        [piProvider]: { type: "api_key", key },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  chmodSync(authPath, 0o600);
+
+  if (!isGateway) {
+    console.error(
+      `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );
-    writeFileSync(
-      authPath,
-      `${JSON.stringify(
-        {
-          anthropic: { type: "api_key", key: "exe-gateway-placeholder" },
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    chmodSync(authPath, 0o600);
-    written.push(modelsPath, authPath);
   }
-  return written;
+
+  return [modelsPath, authPath];
 }
 
 function capitalize(s: string): string {

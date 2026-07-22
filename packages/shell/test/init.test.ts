@@ -180,7 +180,7 @@ describe("initAgent", () => {
   });
 
   describe("pi agent config (.pi-agent/{models,auth}.json)", () => {
-    it("writes models.json + auth.json for exe-dev-gateway provider", () => {
+    it("writes models.json + auth.json for exe-dev-gateway provider (regression)", () => {
       const res = initAgent({
         ...baseOpts(),
         provider: "exe-dev-gateway",
@@ -197,6 +197,9 @@ describe("initAgent", () => {
       expect(models.providers.anthropic.baseUrl).toBe(
         "http://169.254.169.254/gateway/llm/anthropic",
       );
+      // Core fix applies here too — the model must be declared so
+      // ModelRegistry.find(provider, model) resolves it.
+      expect(models.providers.anthropic.models[0].id).toBe("claude-opus-4-7");
 
       const auth = JSON.parse(readFileSync(authPath, "utf8"));
       expect(auth.anthropic.type).toBe("api_key");
@@ -215,12 +218,65 @@ describe("initAgent", () => {
       expect(mode).toBe(0o600);
     });
 
-    it("does NOT write models.json/auth.json for non-gateway providers", () => {
-      const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
+    it("writes a runnable config for non-gateway providers, declaring the model", () => {
+      const res = initAgent({
+        ...baseOpts(),
+        provider: "ollama-cloud",
+        model: "deepseek-v4-pro",
+      });
       const modelsPath = join(res.agentDir, ".pi-agent", "models.json");
       const authPath = join(res.agentDir, ".pi-agent", "auth.json");
-      expect(existsSync(modelsPath)).toBe(false);
-      expect(existsSync(authPath)).toBe(false);
+      expect(existsSync(modelsPath)).toBe(true);
+      expect(existsSync(authPath)).toBe(true);
+      expect(res.files).toContain(modelsPath);
+      expect(res.files).toContain(authPath);
+
+      const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+      expect(models.providers["ollama-cloud"].models[0].id).toBe("deepseek-v4-pro");
+      expect(models.providers["ollama-cloud"].baseUrl).toBe("https://ollama.com/v1");
+
+      const auth = JSON.parse(readFileSync(authPath, "utf8"));
+      expect(auth["ollama-cloud"].type).toBe("api_key");
+      // Clearly-labeled placeholder — human must supply the real key.
+      expect(auth["ollama-cloud"].key).toBe("REPLACE_WITH_YOUR_API_KEY");
+
+      const mode = statSync(authPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    });
+
+    it("declares the model for built-in providers without a baseUrl override", () => {
+      const res = initAgent({
+        ...baseOpts(),
+        provider: "anthropic",
+        model: "claude-opus-4-7",
+      });
+      const modelsPath = join(res.agentDir, ".pi-agent", "models.json");
+      const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+      expect(models.providers.anthropic.models[0].id).toBe("claude-opus-4-7");
+      expect(models.providers.anthropic.baseUrl).toBeUndefined();
+
+      const authPath = join(res.agentDir, ".pi-agent", "auth.json");
+      const auth = JSON.parse(readFileSync(authPath, "utf8"));
+      expect(auth.anthropic.key).toBe("REPLACE_WITH_YOUR_API_KEY");
+    });
+
+    it("nudges to set the API key on stderr for non-gateway providers, not for the gateway", () => {
+      const originalError = console.error;
+      const calls: unknown[][] = [];
+      console.error = (...args: unknown[]) => {
+        calls.push(args);
+      };
+      try {
+        initAgent({ ...baseOpts(), name: "nudge-nongw", provider: "ollama-cloud" });
+        initAgent({ ...baseOpts(), name: "nudge-gw", provider: "exe-dev-gateway" });
+      } finally {
+        console.error = originalError;
+      }
+      const messages = calls.map((c) => c.join(" "));
+      expect(messages.some((m) => m.includes("nudge-nongw") && m.includes("ollama-cloud"))).toBe(
+        true,
+      );
+      expect(messages.some((m) => m.includes("nudge-gw"))).toBe(false);
     });
   });
 });
