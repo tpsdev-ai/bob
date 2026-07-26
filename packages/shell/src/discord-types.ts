@@ -33,6 +33,19 @@ export interface DiscordClient {
   // agent can read recent context without an inbound event. Does not include
   // the bot filtering the gateway listener applies — it's a raw read.
   fetchRecent(channelId: string, limit: number): Promise<DiscordMessage[]>;
+  // Fire the "<bot> is typing…" affordance on a channel — the signal that the
+  // agent picked the message up and is working on it.
+  //
+  // This is a PULSE, not a switch. Discord displays the indicator for about ten
+  // seconds and there is no "stop typing" endpoint: it expires on its own, and
+  // posting a message clears it immediately. A caller that wants it visible for
+  // a whole agent turn must therefore re-fire on a cadence — see the typing
+  // heartbeat in @tpsdev-ai/bob-cap-discord.
+  //
+  // Cosmetic by contract: callers treat a rejection as a non-event (the reply
+  // still has to go out), so implementations need not be more reliable than the
+  // underlying REST call.
+  sendTyping(channelId: string): Promise<void>;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
 }

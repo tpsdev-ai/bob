@@ -13,11 +13,15 @@
 //      allow-list + (optionally) mention filter, strip the bot @-mention and
 //      pi.sendUserMessage(cleaned) to drive the agent. The agent's reply goes
 //      back out via the discord_reply tool.
+//   4. A typing-indicator heartbeat spanning that turn, so the channel shows
+//      "<bot> is typing…" for as long as the agent is actually working (see
+//      typing.ts for why it has to repeat).
 
 import type { DiscordClient, DiscordMessage } from "@tpsdev-ai/bob-shell";
 import { type TSchema, Type } from "typebox";
 import { cleanContent } from "./clean.js";
 import type { DiscordCapabilityConfig } from "./config.js";
+import { createTypingHeartbeat } from "./typing.js";
 
 // A pi assistant message, narrowed to what reply-routing reads. The real
 // AgentMessage union (pi-ai) is wider; we only need the assistant role + its
@@ -111,6 +115,13 @@ export interface WireOptions {
   // Max ms to wait for the gateway connect before giving up (default 15s).
   // Tests inject a small value to exercise the hang path quickly.
   connectTimeoutMs?: number;
+  // Re-fire cadence for the typing indicator (default 8s — just inside
+  // Discord's ~10s expiry). Tests inject a few ms to exercise the heartbeat
+  // without waiting.
+  typingIntervalMs?: number;
+  // Ceiling on a single typing heartbeat (default 5min) — the backstop for a
+  // turn that never emits agent_end.
+  typingMaxMs?: number;
 }
 
 function ok(text: string): { content: Array<{ type: "text"; text: string }>; details: unknown } {
@@ -261,6 +272,16 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
   // a later inbound message because sendUserMessage on a busy session is queued.
   let pending: { channelId: string; replyTo: string } | undefined;
 
+  // "The agent is thinking" affordance for the same window: started when we
+  // inject the prompt, stopped when the turn ends. See typing.ts for why a
+  // one-shot call doesn't work.
+  const typing = createTypingHeartbeat({
+    client,
+    intervalMs: opts.typingIntervalMs,
+    maxMs: opts.typingMaxMs,
+    log,
+  });
+
   // On agent turn completion, post the assistant's final text back to the
   // channel the inbound message came from. This is the DETERMINISTIC reply path
   // — it does not rely on the LLM calling discord_reply with the right channel.
@@ -269,18 +290,28 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
   pi.on("agent_end", async (event) => {
     const target = pending;
     pending = undefined; // consume regardless, so a silent turn can't leak into the next
-    if (!target) return;
-    const text = finalAssistantText(event.messages);
-    if (text.length === 0) return; // nothing to say (e.g. the agent only ran tools)
-    const trimmed =
-      text.length <= DISCORD_MAX_REPLY_CHARS ? text : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
     try {
-      await client.reply(target.channelId, trimmed, { replyTo: target.replyTo });
-    } catch (err) {
-      // A failed post must not crash the persistent session — log + continue.
-      // The error from discord.js names the cause, never the token.
-      const reason = err instanceof Error ? err.message : "reply failed";
-      log(`discord: failed to post reply to ${target.channelId}: ${reason}`);
+      if (!target) return;
+      const text = finalAssistantText(event.messages);
+      if (text.length === 0) return; // nothing to say (e.g. the agent only ran tools)
+      const trimmed =
+        text.length <= DISCORD_MAX_REPLY_CHARS
+          ? text
+          : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
+      try {
+        await client.reply(target.channelId, trimmed, { replyTo: target.replyTo });
+      } catch (err) {
+        // A failed post must not crash the persistent session — log + continue.
+        // The error from discord.js names the cause, never the token.
+        const reason = err instanceof Error ? err.message : "reply failed";
+        log(`discord: failed to post reply to ${target.channelId}: ${reason}`);
+      }
+    } finally {
+      // The turn is over on EVERY path out of here — the reply landed, there was
+      // nothing to say, or something threw. Stop typing in a `finally` so the
+      // indicator can never outlive the work it describes; a stuck heartbeat is
+      // worse than no heartbeat.
+      typing.stop();
     }
   });
 
@@ -299,7 +330,20 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     // session, and the reply goes to whoever spoke last (acceptable: the agent
     // sees the full queued context and answers the latest).
     pending = { channelId: msg.channelId, replyTo: msg.id };
-    pi.sendUserMessage(cleaned);
+    // Light the typing indicator BEFORE handing the prompt over: the gap this
+    // exists to fill starts at the first token of model latency, not after it.
+    typing.start(msg.channelId);
+    try {
+      pi.sendUserMessage(cleaned);
+    } catch (err) {
+      // The prompt never reached the agent, so no agent_end will fire to stop
+      // the heartbeat. Clear it here rather than leaving it to the ceiling, then
+      // rethrow — swallowing an injection failure would silently drop the
+      // message.
+      pending = undefined;
+      typing.stop();
+      throw err;
+    }
   });
 
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
@@ -312,6 +356,9 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
       );
     },
     async stop() {
+      // Clear any live heartbeat BEFORE dropping the gateway — a shutdown must
+      // not leave an interval poking a channel we're no longer connected to.
+      typing.stop();
       await client.disconnect();
     },
   };

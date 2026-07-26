@@ -18,6 +18,7 @@ describe("DiscordJsClient", () => {
     expect(typeof client.connect).toBe("function");
     expect(typeof client.disconnect).toBe("function");
     expect(typeof client.reply).toBe("function");
+    expect(typeof client.sendTyping).toBe("function");
   });
 
   it("registers a message handler without throwing", () => {
@@ -93,6 +94,16 @@ describe("outbound via REST (no gateway / login)", () => {
     expect(calls[0]?.method).toBe("put");
     expect(calls[0]?.route).toContain("chan-1");
     expect(calls[0]?.route).toContain(encodeURIComponent("✅"));
+  });
+
+  it("sendTyping POSTs the channel-typing route with no body", async () => {
+    const client = new DiscordJsClient({ token: "fake", botUserId: "999" });
+    const calls = stubRest(client);
+    await client.sendTyping("chan-1");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("post");
+    expect(calls[0]?.route).toBe("/channels/chan-1/typing");
+    expect(calls[0]?.options).toBeUndefined();
   });
 
   it("fetchRecent maps raw API messages (snake_case + mentions array → mentionsBot)", async () => {
