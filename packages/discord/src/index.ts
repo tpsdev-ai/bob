@@ -134,6 +134,14 @@ export class DiscordJsClient implements DiscordClient {
     );
   }
 
+  async sendTyping(channelId: string): Promise<void> {
+    // POST /channels/:c/typing — no body. Discord shows "<bot> is typing…" for
+    // ~10s and then it silently expires; there is no stop endpoint. Anything
+    // that outlives that window re-fires on a cadence (the capability's typing
+    // heartbeat) rather than calling this once.
+    await this.client.rest.post(Routes.channelTyping(channelId));
+  }
+
   async fetchRecent(channelId: string, limit: number): Promise<DiscordMessage[]> {
     const raw = (await this.client.rest.get(Routes.channelMessages(channelId), {
       query: new URLSearchParams({ limit: String(limit) }),

@@ -56,11 +56,14 @@ class FakeDiscordClient implements DiscordClient {
   private handler?: (msg: DiscordMessage) => void;
   readonly replies: Array<{ channelId: string; text: string; replyTo?: string }> = [];
   readonly reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
+  // Every typing pulse, in order — the heartbeat assertions count these.
+  readonly typings: string[] = [];
   fetchReturns: DiscordMessage[] = [];
   connectCalled = false;
   disconnectCalled = false;
   replyThrows = false;
   connectHangs = false;
+  typingThrows = false;
 
   on(_e: "message", handler: (msg: DiscordMessage) => void): void {
     this.handler = handler;
@@ -82,6 +85,10 @@ class FakeDiscordClient implements DiscordClient {
   async fetchRecent(_channelId: string, _limit: number): Promise<DiscordMessage[]> {
     return this.fetchReturns;
   }
+  async sendTyping(channelId: string): Promise<void> {
+    if (this.typingThrows) throw new Error("simulated discord typing failure");
+    this.typings.push(channelId);
+  }
   fire(msg: Partial<DiscordMessage> & Pick<DiscordMessage, "channelId" | "content">): void {
     this.handler?.({
       id: msg.id ?? "m1",
@@ -94,7 +101,14 @@ class FakeDiscordClient implements DiscordClient {
   }
 }
 
-function setup(overrides: Partial<DiscordCapabilityConfig> = {}) {
+// Heartbeat assertions drive REAL timers at a few ms (the same shape as the
+// existing connectTimeoutMs tests) rather than faking the clock.
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function setup(
+  overrides: Partial<DiscordCapabilityConfig> = {},
+  wireOverrides: { typingIntervalMs?: number; typingMaxMs?: number } = {},
+) {
   const pi = new FakePi();
   const client = new FakeDiscordClient();
   const logs: string[] = [];
@@ -104,7 +118,13 @@ function setup(overrides: Partial<DiscordCapabilityConfig> = {}) {
     dispatchAll: false,
     ...overrides,
   };
-  const wired = wireDiscordCapability({ pi, client, config, log: (m) => logs.push(m) });
+  const wired = wireDiscordCapability({
+    pi,
+    client,
+    config,
+    log: (m) => logs.push(m),
+    ...wireOverrides,
+  });
   return { pi, client, logs, config, wired };
 }
 
@@ -268,6 +288,115 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
     const haystack = JSON.stringify({ config, replies: client.replies });
     expect(haystack).not.toContain("tok_");
     expect(config.tokenFile).toBe("/secrets/bot.token");
+  });
+});
+
+describe("wireDiscordCapability — typing indicator spans the turn", () => {
+  it("starts typing on the originating channel the moment the message is dispatched", () => {
+    const { client } = setup();
+    client.fire({ id: "m1", channelId: "channel-B", content: "<@1> think", mentionsBot: true });
+    // Immediately — not one interval later. The wait starts at dispatch.
+    expect(client.typings).toEqual(["channel-B"]);
+  });
+
+  it("REPEATS while the turn is in flight (Discord expires the indicator after ~10s)", async () => {
+    const { client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> slow one", mentionsBot: true });
+    await sleep(60);
+    // Immediate pulse + repeats. A single call would leave exactly 1.
+    expect(client.typings.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(client.typings)).toEqual(new Set(["channel-A"]));
+  });
+
+  it("STOPS once the turn completes — no pulses after the reply lands", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn("done");
+    const atCompletion = client.typings.length;
+    await sleep(60); // several intervals' worth of quiet
+    expect(client.typings.length).toBe(atCompletion);
+    expect(client.replies).toHaveLength(1);
+  });
+
+  it("STOPS when the turn ends with a throw — the indicator can't outlive a failure", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.replyThrows = true; // the reply post blows up inside agent_end
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn("this post will fail");
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+    expect(client.replies).toHaveLength(0); // proof the throw path really ran
+  });
+
+  it("STOPS on a tool-only turn (no assistant text — the early return still clears it)", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> react", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn(undefined);
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+  });
+
+  it("a FAILING typing request never breaks the reply path (cosmetic, swallowed)", async () => {
+    const { pi, client, logs } = setup({}, { typingIntervalMs: 10 });
+    client.typingThrows = true;
+    expect(() => {
+      client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    }).not.toThrow();
+    await sleep(25);
+    await pi.finishTurn("still replied");
+    expect(client.replies).toEqual([
+      { channelId: "channel-A", text: "still replied", replyTo: "m1" },
+    ]);
+    expect(logs.some((l) => /typing indicator failed for channel-A/.test(l))).toBe(true);
+  });
+
+  it("does NOT type for a message the allow-list or mention filter drops", () => {
+    const { client } = setup();
+    client.fire({ channelId: "not-listed", content: "<@1> hi", mentionsBot: true });
+    client.fire({ channelId: "channel-A", content: "ambient chatter", mentionsBot: false });
+    client.fire({ channelId: "channel-A", content: "<@1>", mentionsBot: true }); // empty after strip
+    expect(client.typings).toHaveLength(0);
+  });
+
+  it("a second inbound message re-points the heartbeat instead of stacking a second timer", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> first", mentionsBot: true });
+    client.fire({ id: "m2", channelId: "channel-B", content: "<@1> second", mentionsBot: true });
+    await sleep(45);
+    const total = client.typings.length;
+    // Two stacked intervals would roughly double the pulse rate; one slot keeps
+    // it near ~1 per interval (plus the two immediate pulses).
+    expect(total).toBeLessThanOrEqual(9);
+    // The single remaining timer follows the LATEST message's channel.
+    expect(client.typings[client.typings.length - 1]).toBe("channel-B");
+    // ...and one stop still silences everything.
+    await pi.finishTurn("answered");
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+  });
+
+  it("stop() (shutdown/disconnect) clears a heartbeat that is still running", async () => {
+    const { client, wired } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(25);
+    await wired.stop(); // no agent_end — shutdown mid-turn
+    const atShutdown = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atShutdown);
+    expect(client.disconnectCalled).toBe(true);
+  });
+
+  it("does not type for a self-directed turn (cron/heartbeat prompt, no inbound message)", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    await pi.finishTurn("internal monologue");
+    await sleep(30);
+    expect(client.typings).toHaveLength(0);
   });
 });
 
