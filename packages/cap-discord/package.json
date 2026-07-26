@@ -27,7 +27,7 @@
     "@mariozechner/pi-coding-agent": "0.73.1",
     "@tpsdev-ai/bob-discord": "workspace:*",
     "@tpsdev-ai/bob-shell": "workspace:*",
-    "discord.js": "^14.16.0",
+    "discord.js": "^14.27.0",
     "typebox": "1.1.38"
   },
   "keywords": [
