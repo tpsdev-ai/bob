@@ -23,10 +23,15 @@
     "typecheck": "tsc -p . --noEmit",
     "test": "bun test"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.79.10",
     "@tpsdev-ai/bob-shell": "0.2.0",
     "typebox": "1.1.38"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.79.10"
   },
   "keywords": [
     "flair",

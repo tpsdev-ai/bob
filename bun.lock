@@ -14,29 +14,35 @@
       "name": "@tpsdev-ai/bob-cap-discord",
       "version": "0.2.0",
       "dependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-        "@tpsdev-ai/bob-discord": "workspace:*",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-discord": "0.2.0",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "discord.js": "^14.27.0",
         "typebox": "1.1.38",
+      },
+      "devDependencies": {
+        "@earendil-works/pi-coding-agent": "0.79.10",
       },
     },
     "packages/cap-flair": {
       "name": "@tpsdev-ai/bob-cap-flair",
       "version": "0.1.0",
       "dependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "typebox": "1.1.38",
+      },
+      "devDependencies": {
+        "@earendil-works/pi-coding-agent": "0.79.10",
       },
     },
     "packages/cap-observatory": {
       "name": "@tpsdev-ai/bob-cap-observatory",
       "version": "0.1.0",
       "dependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "typebox": "1.1.38",
+      },
+      "devDependencies": {
+        "@earendil-works/pi-coding-agent": "0.79.10",
       },
     },
     "packages/cli": {
@@ -53,7 +59,7 @@
       "name": "@tpsdev-ai/bob-discord",
       "version": "0.2.0",
       "dependencies": {
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "discord.js": "^14.27.0",
       },
     },

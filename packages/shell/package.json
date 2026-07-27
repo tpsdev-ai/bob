@@ -21,6 +21,9 @@
     "typecheck": "tsc -p . --noEmit",
     "test": "bun test"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.79.10",
     "croner": "9.0.0",

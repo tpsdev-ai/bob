@@ -16,6 +16,9 @@
     "typecheck": "tsc -p . --noEmit",
     "test": "bun test"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
     "@tpsdev-ai/bob-shell": "0.2.0"
   },
