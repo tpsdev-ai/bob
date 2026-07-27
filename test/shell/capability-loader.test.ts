@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
+import {
+  loadConfigFromEnv as loadObservatoryConfig,
+  CONFIG_ENV_VAR as OBSERVATORY_CONFIG_ENV_VAR,
+} from "../../src/capabilities/observatory/config.js";
 import type { CatalogEntry } from "../../src/shell/capability.js";
+import { lookupCapability } from "../../src/shell/capability-catalog.js";
 import {
   capabilityConfigEnv,
   capabilityEnvVar,
@@ -107,6 +114,80 @@ describe("resolveCapabilities", () => {
     expect(() => resolveCapabilities({ yamlText: yaml, lookup: testCatalog() })).toThrow(
       /declared more than once/,
     );
+  });
+});
+
+// Issue #77: the observatory capability was blessed, its package loaded, and
+// its config schema was unsatisfiable from bob.yaml — the ONLY value `agents`
+// could take from the reader was an array of strings. This walks the real
+// catalog entry, the real schema, and the real bob.yaml path, so the "can it be
+// configured at all" question has a test rather than a memory.
+describe("resolveCapabilities — a capability whose schema needs a list of objects", () => {
+  const yaml = [
+    "capabilities:",
+    "  - observatory",
+    "",
+    "observatory:",
+    "  observatoryUrl: http://127.0.0.1:9926",
+    "  officeId: rockit",
+    "  officeKeyFile: ~/.flair/keys/office.key",
+    "  staleThresholdSeconds: 600",
+    "  agents:",
+    "    - agentId: flint",
+    "      name: Flint",
+    "      role: Strategy",
+    "      heartbeatFile: /signals/flint.hb",
+    "    - agentId: anvil",
+    "      type: agent",
+    "",
+  ].join("\n");
+
+  it("resolves an observatory block written the documented way", () => {
+    const res = resolveCapabilities({ yamlText: yaml, lookup: lookupCapability });
+    expect(res.capabilities).toHaveLength(1);
+    expect(res.capabilities[0].config).toEqual({
+      observatoryUrl: "http://127.0.0.1:9926",
+      officeId: "rockit",
+      officeKeyFile: "~/.flair/keys/office.key",
+      staleThresholdSeconds: 600,
+      agents: [
+        {
+          agentId: "flint",
+          name: "Flint",
+          role: "Strategy",
+          heartbeatFile: "/signals/flint.hb",
+        },
+        { agentId: "anvil", type: "agent" },
+      ],
+    });
+  });
+
+  it("hands the extension a config its own loader re-validates", () => {
+    const res = resolveCapabilities({ yamlText: yaml, lookup: lookupCapability });
+    const env = capabilityConfigEnv(res);
+    const config = loadObservatoryConfig({ [OBSERVATORY_CONFIG_ENV_VAR]: env.BOB_CAP_OBSERVATORY });
+    expect(config.agents.map((a) => a.agentId)).toEqual(["flint", "anvil"]);
+  });
+});
+
+// The README's "Configuring a capability" example is the only written answer to
+// "how do I turn this on". #77 shipped partly because there wasn't one — nobody
+// had cause to write the block that turned out to be unwritable. Resolve the
+// documented YAML through the real catalog so the docs can't drift from the
+// reader again.
+describe("the README's capability example", () => {
+  it("resolves against the real blessed catalog", () => {
+    const readme = readFileSync(join(import.meta.dir, "..", "..", "README.md"), "utf8");
+    const block = readme.match(/```yaml\n([\s\S]*?)```/);
+    expect(block).not.toBeNull();
+    const yaml = (block as RegExpMatchArray)[1];
+    expect(yaml).toContain("capabilities:");
+    expect(yaml).toContain("agents:");
+
+    const res = resolveCapabilities({ yamlText: yaml, lookup: lookupCapability });
+    expect(res.capabilities.map((c) => c.name)).toEqual(["flair", "observatory"]);
+    const observatory = res.capabilities[1].config as { agents: Array<{ agentId: string }> };
+    expect(observatory.agents.map((a) => a.agentId)).toEqual(["agent-one", "agent-two"]);
   });
 });
 

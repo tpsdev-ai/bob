@@ -54,9 +54,10 @@ export interface ResolveCapabilitiesOptions {
 
 // Resolve + validate an agent's declared capabilities. Throws a single,
 // actionable error on the first problem (unknown capability, not-yet-built
-// capability, a config block that fails its schema, or a capability package
-// that isn't installed) so a misconfigured agent fails fast at session setup
-// rather than silently running under-equipped.
+// capability, a config block written in a YAML shape the reader doesn't support
+// — `BobYamlError` from readBlock, a config block that fails its schema, or a
+// capability package that isn't installed) so a misconfigured agent fails fast
+// at session setup rather than silently running under-equipped.
 export function resolveCapabilities(opts: ResolveCapabilitiesOptions): CapabilityResolution {
   const lookup = opts.lookup ?? defaultLookup;
   const resolveSource = opts.resolveSource ?? defaultResolveSource;

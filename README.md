@@ -99,6 +99,50 @@ boundary: only blessed names may appear in an agent's `bob.yaml capabilities:`,
 and each one resolves through this package's own `exports` map, so a checkout
 and an install load the identical file.
 
+## Configuring a capability
+
+Declare it in `capabilities:`, then give it a top-level block named after it.
+The block is validated against the capability's schema before its extension
+loads, so a bad block fails at startup with a message naming the problem rather
+than at the first tool call.
+
+```yaml
+capabilities:
+  - flair
+  - observatory
+
+flair:
+  url: http://127.0.0.1:9926
+  agentId: agent-one
+  keyFile: ~/.flair/keys/agent-one.key
+
+observatory:
+  observatoryUrl: http://127.0.0.1:9926
+  officeId: main-office
+  officeKeyFile: ~/.flair/keys/office.key
+  staleThresholdSeconds: 600
+  agents:
+    - agentId: agent-one
+      name: Agent One
+      role: Strategy
+      heartbeatFile: ~/.bob/signals/agent-one.hb
+    - agentId: agent-two
+      role: Execution
+```
+
+`bob.yaml` is read by a small purpose-built reader, not a full YAML parser.
+Inside a capability block it supports scalars (`name: value`), inline lists
+(`name: [a, b]`), block lists of scalars, and block lists of one-level `- name:
+value` mappings — the shapes above. Anything beyond that (nested mappings,
+nested lists, `{a: b}` flow mappings, anchors, multi-line scalars) is rejected
+with the block name and line number rather than parsed into something that
+merely looks right. Values are coerced: `true`/`false` become booleans, whole
+numbers become numbers, and quoting forces a string — quote any id you need to
+stay textual, like a Discord snowflake.
+
+**Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
+`officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
+
 ## Status
 
 `0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
