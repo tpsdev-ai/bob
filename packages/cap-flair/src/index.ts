@@ -11,7 +11,7 @@
 // and lives only inside the FlairHttpClient. It is never logged, echoed,
 // returned in a tool result, or placed in the session transcript.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { wireFlairCapability } from "./capability.js";
 import { FlairHttpClient } from "./client.js";
 import { loadConfigFromEnv } from "./config.js";

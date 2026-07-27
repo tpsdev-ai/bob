@@ -13,7 +13,7 @@
 // catalog points at it. Kept as a sibling module so a real published capability
 // package would export both from one place.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export default function (pi: ExtensionAPI) {

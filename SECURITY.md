@@ -20,7 +20,7 @@ Bob is a moldable office-agent shell. Security-sensitive surfaces include:
 ## Out of scope
 
 - Third-party LLM provider security (Anthropic, OpenAI, Ollama Cloud, etc.)
-- Pi-coding-agent (`@mariozechner/pi-coding-agent`) — report upstream.
+- Pi-coding-agent (`@earendil-works/pi-coding-agent`) — report upstream.
 - Discord.js internals — report upstream.
 - The Flair memory layer — see `tpsdev-ai/flair`'s `SECURITY.md`.
 

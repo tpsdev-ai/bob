@@ -7,7 +7,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { CONFIG_ENV_VAR } from "../src/config.js";
 
 // The load-bearing proof (mirrors the cap-fixture e2e): a REAL pi AgentSession

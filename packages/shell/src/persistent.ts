@@ -27,7 +27,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { type CronSchedulerHandle, startCronScheduler } from "./cron.js";
 import {
   createPiRunSession,
