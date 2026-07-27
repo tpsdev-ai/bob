@@ -31,48 +31,27 @@ const fixtureExtensionPath = resolve(
   "index.ts",
 );
 
-// Absolute path to the discord capability's pi extension. It's a real,
-// publishable package (packages/cap-discord) but is blessed here as a LOCAL
-// path for phase 1 — exactly like the fixture — until it's published as
-// `npm:@tpsdev-ai/bob-cap-discord`. We point at the source `index.ts` (pi loads
-// extensions via jiti, no build needed). The path is the same relative to both
-// the src/ and dist/ layout of this module:
-//   src/  layout: packages/shell/src/capability-catalog.ts  → ../../cap-discord/src/index.ts
-//   dist/ layout: packages/shell/dist/capability-catalog.js  → ../../cap-discord/src/index.ts
-const discordExtensionPath = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "cap-discord",
-  "src",
-  "index.ts",
-);
-
-// Absolute path to the flair (memory) capability's pi extension. Same blessing
-// pattern as discord: a real publishable package (packages/cap-flair) pointed at
-// as a LOCAL source path for phase 1 until it's published as
-// `npm:@tpsdev-ai/bob-cap-flair`.
-const flairExtensionPath = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "cap-flair",
-  "src",
-  "index.ts",
-);
-
-// Absolute path to the observatory (team-view producer) capability's pi
-// extension. Same blessing pattern as discord/flair: a real publishable package
-// (packages/cap-observatory) pointed at as a LOCAL source path for phase 1 until
-// it's published as `npm:@tpsdev-ai/bob-cap-observatory`.
-const observatoryExtensionPath = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "cap-observatory",
-  "src",
-  "index.ts",
-);
+// The three real capabilities are blessed as PACKAGE SPECIFIERS, not paths.
+//
+// They used to be blessed as paths relative to this module — `../../cap-discord
+// /src/index.ts` — which resolves inside a checkout and nowhere else. In a
+// published install that lands on `node_modules/@tpsdev-ai/cap-discord/src/
+// index.ts`: a package name that doesn't exist (they publish as
+// `bob-cap-<name>`), under a directory that isn't shipped (they ship `dist`).
+// pi skips a source it can't find without raising, so every agent declaring
+// discord/flair/observatory came up with none of its tools and no error.
+//
+// A package specifier resolves through Node's ESM resolver in BOTH shapes — the
+// workspace link in a checkout, the installed package in a published install —
+// so development exercises the same code path a user runs. See
+// capability-resolve.ts for the resolution itself and for what a missing
+// package reports.
+//
+// These are dependencies of @tpsdev-ai/bob (so a bob install has them) and
+// devDependencies of this package (so the monorepo resolves them identically).
+const DISCORD_PACKAGE = "@tpsdev-ai/bob-cap-discord";
+const FLAIR_PACKAGE = "@tpsdev-ai/bob-cap-flair";
+const OBSERVATORY_PACKAGE = "@tpsdev-ai/bob-cap-observatory";
 
 // The discord capability's config schema, mirrored here so the catalog can
 // pre-validate an agent's bob.yaml `discord:` block. Kept in sync with
@@ -94,7 +73,7 @@ const discordConfigSchema = Type.Object(
 
 const discordManifest: BobCapabilityManifest = {
   name: "discord",
-  piPackage: discordExtensionPath,
+  piPackage: DISCORD_PACKAGE,
   configSchema: discordConfigSchema,
   provides: {
     tools: ["discord_reply", "discord_react", "discord_fetch"],
@@ -117,7 +96,7 @@ const flairConfigSchema = Type.Object(
 
 const flairManifest: BobCapabilityManifest = {
   name: "flair",
-  piPackage: flairExtensionPath,
+  piPackage: FLAIR_PACKAGE,
   configSchema: flairConfigSchema,
   provides: {
     tools: ["flair_search", "flair_write", "flair_get"],
@@ -157,7 +136,7 @@ const observatoryConfigSchema = Type.Object(
 
 const observatoryManifest: BobCapabilityManifest = {
   name: "observatory",
-  piPackage: observatoryExtensionPath,
+  piPackage: OBSERVATORY_PACKAGE,
   configSchema: observatoryConfigSchema,
   provides: {
     tools: ["observatory_report"],
@@ -188,7 +167,7 @@ function placeholder(name: string, provides: BobCapabilityManifest["provides"]):
   return {
     manifest: {
       name,
-      piPackage: `npm:@tpsdev-ai/bob-cap-${name}`,
+      piPackage: `@tpsdev-ai/bob-cap-${name}`,
       configSchema: Type.Object({}, { additionalProperties: true }),
       provides,
     },
@@ -199,13 +178,15 @@ function placeholder(name: string, provides: BobCapabilityManifest["provides"]):
 // The catalog. Keyed by capability name. Adding a capability = add an entry
 // (and, for real ones, ship its pi-extension package); zero loader edits.
 export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.freeze({
+  // The fixture ships INSIDE this package (examples/cap-fixture), so it stays a
+  // path — there is no package for it to be.
   fixture: { manifest: fixtureManifest },
-  // Discord is REAL as of PR3 (packages/cap-discord), blessed as a local path.
+  // Discord — blessed as its published package (packages/cap-discord).
   discord: { manifest: discordManifest },
-  // Flair memory is REAL (packages/cap-flair), blessed as a local path.
+  // Flair memory — blessed as its published package (packages/cap-flair).
   flair: { manifest: flairManifest },
-  // Observatory (team-view producer) is REAL (packages/cap-observatory), blessed
-  // as a local path.
+  // Observatory (team-view producer) — blessed as its published package
+  // (packages/cap-observatory).
   observatory: { manifest: observatoryManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
