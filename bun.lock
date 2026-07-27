@@ -52,7 +52,10 @@
         "bob": "./bin/bob",
       },
       "dependencies": {
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-cap-discord": "0.2.0",
+        "@tpsdev-ai/bob-cap-flair": "0.1.0",
+        "@tpsdev-ai/bob-cap-observatory": "0.1.0",
+        "@tpsdev-ai/bob-shell": "0.2.0",
       },
     },
     "packages/discord": {
@@ -70,6 +73,11 @@
         "@earendil-works/pi-coding-agent": "0.79.10",
         "croner": "9.0.0",
         "typebox": "1.1.38",
+      },
+      "devDependencies": {
+        "@tpsdev-ai/bob-cap-discord": "0.2.0",
+        "@tpsdev-ai/bob-cap-flair": "0.1.0",
+        "@tpsdev-ai/bob-cap-observatory": "0.1.0",
       },
     },
   },

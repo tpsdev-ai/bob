@@ -18,12 +18,19 @@ import type { TSchema } from "typebox";
 export interface BobCapabilityManifest {
   // Stable capability id used in `bob.yaml capabilities:` (e.g. "discord").
   name: string;
-  // Where the capability's pi extension package lives. Any source pi's package
-  // resolver accepts: an npm spec ("npm:@tpsdev-ai/bob-cap-discord@1.2.3"), a
-  // git spec ("git:github.com/tpsdev-ai/bob-cap-discord@v1"), or a local path
-  // (absolute, or relative to the resolving settings file). This string is
-  // handed verbatim to pi's resource loader as an extension source — the SDK
-  // equivalent of a `settings.json` `packages`/`extensions` entry.
+  // Where the capability's pi extension lives. Four accepted forms:
+  //
+  //   package specifier  "@tpsdev-ai/bob-cap-discord"  ← what real capabilities use
+  //   local path         "/abs/path/index.ts"          ← the in-package fixture
+  //   npm spec           "npm:@tpsdev-ai/bob-cap-x@1.2.3"
+  //   git spec           "git:github.com/tpsdev-ai/bob-cap-x@v1"
+  //
+  // A PACKAGE SPECIFIER is the normal form: Bob resolves it through Node's ESM
+  // resolver (capability-resolve.ts) to an absolute path before pi sees it, so
+  // it works identically in a monorepo checkout and a published install, and a
+  // package that isn't installed is a named error rather than an agent that
+  // quietly comes up without its tools. npm:/git: sources are handed verbatim to
+  // pi's resolver, which fetches them at session start.
   piPackage: string;
   // typebox schema that validates the agent's per-capability config block from
   // bob.yaml (the block keyed by `name`). Use `Type.Object({})` for a

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import type { CatalogEntry } from "../src/capability.js";
 import {
@@ -7,6 +9,17 @@ import {
   resolveCapabilities,
 } from "../src/capability-loader.js";
 
+// A REAL absolute extension path for the path-source cases. It has to exist:
+// resolveCapabilities now existence-checks absolute sources, because handing pi
+// a path that isn't there is silently dropped rather than raised.
+const ALPHA_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "examples",
+  "cap-fixture",
+  "index.ts",
+);
+
 // A small in-test catalog so resolution can be exercised without depending on
 // the real blessed catalog's contents (which evolve as real capabilities land).
 function testCatalog(): (name: string) => CatalogEntry | undefined {
@@ -14,7 +27,7 @@ function testCatalog(): (name: string) => CatalogEntry | undefined {
     alpha: {
       manifest: {
         name: "alpha",
-        piPackage: "/abs/path/alpha.ts",
+        piPackage: ALPHA_PATH,
         configSchema: Type.Object({ greeting: Type.Optional(Type.String()) }),
         provides: { tools: ["alpha_tool"] },
       },
@@ -45,7 +58,7 @@ describe("resolveCapabilities", () => {
     );
     const res = resolveCapabilities({ yamlText: yaml, lookup: testCatalog() });
     expect(res.capabilities.map((c) => c.name)).toEqual(["alpha", "beta"]);
-    expect(res.extensionSources).toEqual(["/abs/path/alpha.ts", "npm:@scope/beta@1.0.0"]);
+    expect(res.extensionSources).toEqual([ALPHA_PATH, "npm:@scope/beta@1.0.0"]);
   });
 
   it("returns empty when no capabilities are declared", () => {

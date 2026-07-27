@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../src/run.js";
-import { runAgent } from "../src/run.js";
+import { assertCapabilitiesLoaded, runAgent } from "../src/run.js";
 
 // A fake AgentSession matching the RunSession seam. Emits canned assistant
 // text via text_delta events (the same event shape every examples/sdk/*.ts
@@ -305,5 +305,59 @@ describe("runAgent", () => {
     await expect(
       runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory }),
     ).rejects.toThrow(/not yet implemented/);
+  });
+});
+
+// pi records extension load failures on the loader and carries on — the agent
+// starts, minus those tools, silently. Bob asked for these extensions, so for
+// Bob a failed load is fatal. This is the guard that keeps the "capabilities
+// silently didn't load" failure mode from ever being quiet again.
+describe("assertCapabilitiesLoaded", () => {
+  const stub = (errors: Array<{ path: string; error: string }>) => ({
+    getExtensions: () => ({ errors }),
+  });
+
+  it("passes when every declared source loaded", () => {
+    expect(() =>
+      assertCapabilitiesLoaded(stub([]), { extensionSources: ["/caps/discord/dist/index.js"] }),
+    ).not.toThrow();
+  });
+
+  it("passes when the agent declared no capabilities", () => {
+    expect(() =>
+      assertCapabilitiesLoaded(stub([{ path: "/somewhere/else.ts", error: "boom" }]), {
+        extensionSources: [],
+      }),
+    ).not.toThrow();
+  });
+
+  it("ignores extension errors Bob did not ask for", () => {
+    // A user's own settings.json packages are pi's business, not Bob's.
+    expect(() =>
+      assertCapabilitiesLoaded(stub([{ path: "/user/own/ext.ts", error: "boom" }]), {
+        extensionSources: ["/caps/discord/dist/index.js"],
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws naming the capability when its extension failed to load", () => {
+    let err: Error | undefined;
+    try {
+      assertCapabilitiesLoaded(
+        stub([{ path: "/caps/discord/dist/index.js", error: "Extension path does not exist" }]),
+        {
+          extensionSources: ["/caps/discord/dist/index.js"],
+          capabilityBySource: { "/caps/discord/dist/index.js": "discord" },
+        },
+      );
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    const msg = err?.message ?? "";
+    expect(msg).toContain('capability "discord"');
+    expect(msg).toContain("/caps/discord/dist/index.js");
+    expect(msg).toContain("Extension path does not exist");
+    expect(msg).toContain("would have started without those tools");
   });
 });

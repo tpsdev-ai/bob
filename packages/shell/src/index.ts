@@ -63,6 +63,7 @@ export {
   type ResolvedCapability,
   resolveCapabilities,
 } from "./capability-loader.js";
+export { resolveExtensionSource } from "./capability-resolve.js";
 export type { DiscordClient, DiscordMessage } from "./discord-types.js";
 export {
   type CheckStatus,

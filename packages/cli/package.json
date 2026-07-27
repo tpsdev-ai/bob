@@ -20,6 +20,9 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
+    "@tpsdev-ai/bob-cap-discord": "0.2.0",
+    "@tpsdev-ai/bob-cap-flair": "0.1.0",
+    "@tpsdev-ai/bob-cap-observatory": "0.1.0",
     "@tpsdev-ai/bob-shell": "0.2.0"
   },
   "keywords": [

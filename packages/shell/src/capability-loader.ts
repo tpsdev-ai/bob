@@ -18,6 +18,7 @@ import { Value } from "typebox/value";
 import { readBlock, readCapabilities } from "./bob-yaml.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 import { lookupCapability as defaultLookup } from "./capability-catalog.js";
+import { resolveExtensionSource as defaultResolveSource } from "./capability-resolve.js";
 
 // One resolved, validated capability.
 export interface ResolvedCapability {
@@ -26,7 +27,10 @@ export interface ResolvedCapability {
   // The agent's validated config block for this capability (from the bob.yaml
   // block keyed by the capability name), or {} when no block was present.
   config: Record<string, unknown>;
-  // The pi extension source to hand to the resource loader (== manifest.piPackage).
+  // The pi extension source to hand to the resource loader. This is the
+  // manifest's `piPackage` RESOLVED (capability-resolve.ts): a package specifier
+  // becomes the absolute path of its installed entry point; npm:/git: sources
+  // pass through for pi to fetch.
   piPackage: string;
 }
 
@@ -43,14 +47,19 @@ export interface ResolveCapabilitiesOptions {
   yamlText: string;
   // Catalog lookup. Injectable for tests; defaults to the blessed catalog.
   lookup?: (name: string) => CatalogEntry | undefined;
+  // Turns a manifest's `piPackage` into a source pi can load. Injectable for
+  // tests; defaults to Node ESM package resolution from the shell package.
+  resolveSource?: (capability: string, spec: string) => string;
 }
 
 // Resolve + validate an agent's declared capabilities. Throws a single,
 // actionable error on the first problem (unknown capability, not-yet-built
-// capability, or a config block that fails its schema) so a misconfigured agent
-// fails fast at session setup rather than silently running under-equipped.
+// capability, a config block that fails its schema, or a capability package
+// that isn't installed) so a misconfigured agent fails fast at session setup
+// rather than silently running under-equipped.
 export function resolveCapabilities(opts: ResolveCapabilitiesOptions): CapabilityResolution {
   const lookup = opts.lookup ?? defaultLookup;
+  const resolveSource = opts.resolveSource ?? defaultResolveSource;
   const names = readCapabilities(opts.yamlText);
 
   const resolved: ResolvedCapability[] = [];
@@ -83,11 +92,15 @@ export function resolveCapabilities(opts: ResolveCapabilitiesOptions): Capabilit
       );
     }
 
+    // Resolve LAST — after the name and its config are known good, so a missing
+    // package doesn't mask a typo'd capability or a bad config block. Resolution
+    // is what turns "blessed" into "on disk"; it throws with the package name
+    // and how to install it.
     resolved.push({
       name,
       manifest: entry.manifest,
       config,
-      piPackage: entry.manifest.piPackage,
+      piPackage: resolveSource(name, entry.manifest.piPackage),
     });
   }
 

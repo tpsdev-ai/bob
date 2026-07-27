@@ -83,6 +83,10 @@ export interface RunSessionConfig {
   // the blessed catalog before the factory runs, so a fake factory in tests
   // doesn't need the catalog or filesystem. Empty when the agent declares none.
   extensionSources: string[];
+  // source → capability name, so a source pi fails to load can be reported as
+  // the capability the agent asked for rather than a bare path. Optional: a
+  // fake factory in tests need not supply it.
+  capabilityBySource?: Record<string, string>;
   // Per-capability config the extensions read from the environment, keyed by
   // each capability's env var (BOB_CAP_<NAME>). The real factory sets these
   // before loading the extensions so each reads + re-validates its own config
@@ -275,9 +279,51 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     cwd: join(agentDir, "work"),
     piAgentDir: join(agentDir, ".pi-agent"),
     extensionSources: resolution.extensionSources,
+    capabilityBySource: Object.fromEntries(
+      resolution.capabilities.map((c) => [c.piPackage, c.name]),
+    ),
     capabilityEnv: capabilityConfigEnv(resolution),
   };
   return { agentDir, provider, model, config, cron: parseCron(yamlText) };
+}
+
+// The minimum of pi's resource loader this check needs. Structural so tests can
+// hand in a stub without constructing a real loader.
+export interface ExtensionErrorSource {
+  getExtensions(): { errors: Array<{ path: string; error: string }> };
+}
+
+// Fail the session if any capability's extension didn't load.
+//
+// pi records extension load failures on the loader and CONTINUES — the agent
+// comes up, just without those tools. That silence is precisely what let a
+// catalog full of unresolvable paths ship: nothing anywhere said "discord did
+// not load". Bob asked for these extensions explicitly, so for Bob they are not
+// optional. Errors from extensions Bob didn't ask for (a user's own settings.json
+// packages) are pi's business and are left alone.
+export function assertCapabilitiesLoaded(
+  loader: ExtensionErrorSource,
+  config: Pick<RunSessionConfig, "extensionSources" | "capabilityBySource">,
+): void {
+  if (config.extensionSources.length === 0) return;
+  const ours = new Set(config.extensionSources);
+  const failures = (loader.getExtensions().errors ?? []).filter((e) => ours.has(e.path));
+  if (failures.length === 0) return;
+
+  const lines = failures.map((f) => {
+    const name = config.capabilityBySource?.[f.path];
+    const who = name ? `capability "${name}"` : "capability";
+    return `  ${who} (${f.path}): ${f.error}`;
+  });
+  throw new Error(
+    [
+      `bob: ${failures.length} declared capabilit${failures.length === 1 ? "y" : "ies"} failed to load:`,
+      ...lines,
+      "",
+      "The agent would have started without those tools. Fix the capability or remove",
+      "it from capabilities: in bob.yaml rather than running under-equipped.",
+    ].join("\n"),
+  );
 }
 
 // Real SDK factory: stand up a fresh, in-memory pi AgentSession for the agent,
@@ -344,6 +390,7 @@ export async function createPiRunSession(
   process.env.BOB_PERSISTENT = config.persistent ? "1" : "";
   const resourceLoader = new DefaultResourceLoader(loaderOpts);
   await resourceLoader.reload();
+  assertCapabilitiesLoaded(resourceLoader, config);
 
   const makeSessionManager =
     sessionManagerFactory ?? ((cwd: string) => SessionManager.inMemory(cwd));

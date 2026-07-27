@@ -14,23 +14,34 @@ name: Release — stage-publish (OIDC) + GitHub release
 #   git tag v0.3.0 && git push origin v0.3.0
 # The tag push triggers this workflow. (workflow_dispatch is a manual fallback.)
 #
-# WHAT SHIPS: only the two packages a `bob` user actually installs —
-#   @tpsdev-ai/bob-shell   (packages/shell)  the runtime library
-#   @tpsdev-ai/bob         (packages/cli)    the `bob` binary, depends on the above
-# The root package is `private: true` and never publishes. bob-discord,
-# bob-cap-discord, bob-cap-flair and bob-cap-observatory are NOT in
-# @tpsdev-ai/bob's dependency chain and are deliberately not published here —
-# publishing them is a separate decision (see docs note in the PR).
+# WHAT SHIPS: every package in @tpsdev-ai/bob's dependency chain, in dependency
+# order —
+#   @tpsdev-ai/bob-shell         (packages/shell)           the runtime library
+#   @tpsdev-ai/bob-discord       (packages/discord)         discord.js binding
+#   @tpsdev-ai/bob-cap-discord   (packages/cap-discord)     capability
+#   @tpsdev-ai/bob-cap-flair     (packages/cap-flair)       capability
+#   @tpsdev-ai/bob-cap-observatory (packages/cap-observatory) capability
+#   @tpsdev-ai/bob               (packages/cli)             the `bob` binary
+# The root package is `private: true` and never publishes.
+#
+# The three capability packages are DEPENDENCIES of @tpsdev-ai/bob, so `npx
+# @tpsdev-ai/bob` gets a bob whose discord/flair/observatory capabilities load.
+# They are not optional extras: an agent's bob.yaml `capabilities:` is the
+# interesting half of what bob does, and a capability package that isn't
+# installed is a hard error at session setup, by design. Publishing them is
+# therefore not a separate decision any more — @tpsdev-ai/bob does not install
+# without them.
 #
 # ONE-TIME SETUP REQUIRED BEFORE THE FIRST TAG (a human with npm org-owner
-# rights must do this — CI cannot):
-#   1. Neither @tpsdev-ai/bob nor @tpsdev-ai/bob-shell exists on npm yet, and
-#      npm requires a package to EXIST before a Trusted Publisher can be added
-#      (npm/cli#8544). `npm stage publish` additionally requires it
-#      (`npm help stage`: "Package must exist"). So each package needs one
-#      manual bootstrap publish from a 2FA-logged-in machine:
-#        cd packages/shell && npm run build && npm publish --access public
-#        cd packages/cli   && npm run build && npm publish --access public
+# rights must do this — CI cannot), FOR EACH of the six packages above:
+#   1. None of them exists on npm yet, and npm requires a package to EXIST
+#      before a Trusted Publisher can be added (npm/cli#8544). `npm stage
+#      publish` additionally requires it (`npm help stage`: "Package must
+#      exist"). So each needs one manual bootstrap publish from a 2FA-logged-in
+#      machine, in dependency order:
+#        for d in shell discord cap-discord cap-flair cap-observatory cli; do
+#          ( cd "packages/$d" && npm run build && npm publish --access public )
+#        done
 #   2. Then, per package, on npmjs.com → package → Settings → Trusted Publisher:
 #        Provider=GitHub Actions, Organization=tpsdev-ai, Repository=bob,
 #        Workflow=release-publish.yml, Environment=release,
@@ -38,7 +49,7 @@ name: Release — stage-publish (OIDC) + GitHub release
 #        unchecked, so the CI identity can never publish live directly).
 #   3. Create the `release` GitHub environment with NO required reviewers, and a
 #      deployment policy that allows `v*` TAGS.
-# Until step 1+2 are done for both packages, the stage-publish job will fail —
+# Until step 1+2 are done for every package, the stage-publish job will fail —
 # that failure is expected and is not a defect in this workflow.
 
 on:
@@ -62,7 +73,7 @@ concurrency:
 
 jobs:
   stage-publish:
-    name: Stage-publish bob + bob-shell
+    name: Stage-publish bob + its dependency chain
     runs-on: ubuntu-latest
     # `release` is an OIDC-scoping environment, NOT an approval gate: it pins the
     # trusted-publisher trust to this environment. The human gate is the npm
@@ -145,9 +156,12 @@ jobs:
         run: sfw bun install --frozen-lockfile
 
       - name: Verify publishable package versions match the tag
-        # Only the two packages this workflow publishes are version-gated. bob is
-        # NOT lockstep-versioned across the whole workspace (the cap-* packages
-        # move independently), so checking every package here would be wrong.
+        # Only bob + bob-shell are version-gated to the tag. bob is NOT
+        # lockstep-versioned across the whole workspace — bob-discord and the
+        # cap-* packages move independently, and the tag names a bob release, not
+        # theirs. What keeps them honest is check-workspace-deps below: bob pins
+        # each capability at the exact version that capability ships, so a tag
+        # can never stage a bob whose declared capability versions don't exist.
         # All values flow through env, never ${{ }} interpolation inside the
         # script body — keeps the resolved version out of the shell parser.
         env:
@@ -169,10 +183,10 @@ jobs:
           done
 
       - name: Check workspace internal-dep lockstep
-        # @tpsdev-ai/bob depends on @tpsdev-ai/bob-shell. This asserts the
-        # declared version equals the version bob-shell actually ships, and
-        # rejects `workspace:` specs outright (see the packed-tarball guard
-        # below for why).
+        # @tpsdev-ai/bob depends on bob-shell and on all three capability
+        # packages. This asserts every declared version equals the version that
+        # dependency actually ships, and rejects `workspace:` specs outright (see
+        # the packed-tarball guard below for why).
         run: node scripts/check-workspace-deps.mjs
 
       - name: Build
@@ -191,7 +205,15 @@ jobs:
         # so packing here and inspecting the result is a faithful preflight.
         run: |
           set -euo pipefail
-          for dir in packages/shell packages/cli; do
+          DIRS=(
+            packages/shell
+            packages/discord
+            packages/cap-discord
+            packages/cap-flair
+            packages/cap-observatory
+            packages/cli
+          )
+          for dir in "${DIRS[@]}"; do
             name="$(node -p "require('./$dir/package.json').name")"
             echo "::group::pack preflight — $name ($dir)"
             tgz="$(cd "$dir" && npm pack --silent --pack-destination "$RUNNER_TEMP")"
@@ -220,14 +242,19 @@ jobs:
           done
 
       - name: Stage-publish (dependency order)
-        # bob-shell first — @tpsdev-ai/bob depends on it. Staging does not
-        # resolve dependencies (that happens at install, post-approval), but we
-        # keep dep order so the approve-and-go-live sequence is consistent:
-        # approving bob before bob-shell would leave bob briefly uninstallable.
+        # Dependency order, bob LAST: everything bob depends on goes first.
+        # Staging does not resolve dependencies (that happens at install,
+        # post-approval), but we keep dep order so the approve-and-go-live
+        # sequence is consistent — approving bob before its capability packages
+        # would leave bob briefly uninstallable.
         run: |
           set -euo pipefail
           DIRS=(
             packages/shell
+            packages/discord
+            packages/cap-discord
+            packages/cap-flair
+            packages/cap-observatory
             packages/cli
           )
           for dir in "${DIRS[@]}"; do
@@ -244,11 +271,13 @@ jobs:
           {
             echo "### 🚀 v$VERSION staged for release"
             echo ""
-            echo "\`@tpsdev-ai/bob-shell\` and \`@tpsdev-ai/bob\` submitted to npm **staging**"
-            echo "with provenance. They are **not live yet**."
+            echo "\`@tpsdev-ai/bob\` and its dependency chain (\`bob-shell\`, \`bob-discord\`,"
+            echo "\`bob-cap-discord\`, \`bob-cap-flair\`, \`bob-cap-observatory\`) submitted to npm"
+            echo "**staging** with provenance. They are **not live yet**."
             echo ""
             echo "**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),"
-            echo "review each tarball, and approve with 2FA — approve \`bob-shell\` first."
+            echo "review each tarball, and approve with 2FA — approve \`@tpsdev-ai/bob\` LAST,"
+            echo "so it is never live ahead of the packages it depends on."
             echo "Or: \`npm stage list\` then \`npm stage approve <id>\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
