@@ -15,8 +15,8 @@
       "version": "0.2.0",
       "dependencies": {
         "@mariozechner/pi-coding-agent": "0.73.1",
-        "@tpsdev-ai/bob-discord": "workspace:*",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-discord": "0.2.0",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "discord.js": "^14.27.0",
         "typebox": "1.1.38",
       },
@@ -26,7 +26,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@mariozechner/pi-coding-agent": "0.73.1",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "typebox": "1.1.38",
       },
     },
@@ -35,7 +35,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@mariozechner/pi-coding-agent": "0.73.1",
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "typebox": "1.1.38",
       },
     },
@@ -46,14 +46,14 @@
         "bob": "./bin/bob",
       },
       "dependencies": {
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
       },
     },
     "packages/discord": {
       "name": "@tpsdev-ai/bob-discord",
       "version": "0.2.0",
       "dependencies": {
-        "@tpsdev-ai/bob-shell": "workspace:*",
+        "@tpsdev-ai/bob-shell": "0.2.0",
         "discord.js": "^14.27.0",
       },
     },

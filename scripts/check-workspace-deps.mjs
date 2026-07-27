@@ -52,14 +52,29 @@ for (const dirent of readdirSync(packagesDir)) {
   };
   for (const [depName, declaredVersion] of Object.entries(allDeps)) {
     if (!shipped.has(depName)) continue; // not an internal dep
-    // workspace:* is the canonical local-symlink form; we accept it as
-    // a clean marker that the publisher intends "whatever ships."
-    if (declaredVersion === "workspace:*" || declaredVersion === "workspace:^") {
+    const shippedVersion = shipped.get(depName);
+    // The `workspace:` protocol is REJECTED, not accepted. It reads as a clean
+    // "whatever ships" marker locally, but it is a publish-time landmine: the
+    // release pipeline publishes with the npm CLI (OIDC trusted publishing is
+    // an npm feature), and npm does NOT rewrite `workspace:` specs when it
+    // builds a tarball. Verified empirically — `npm pack` on this repo emitted
+    // a package.json whose dependency was the literal string "workspace:*",
+    // which is uninstallable for every consumer. (bun pm pack DOES rewrite it,
+    // which is exactly why the breakage is invisible in local dev.)
+    // Pin the exact shipped version instead; that is the shape tpsdev-ai/flair
+    // publishes with.
+    if (declaredVersion.startsWith("workspace:")) {
+      problems.push({
+        package: pkg.name,
+        dep: depName,
+        declared: declaredVersion,
+        shipped: shippedVersion,
+        reason: "npm does not rewrite `workspace:` specs on publish",
+      });
       continue;
     }
     // Otherwise, the version range must match the shipped version's
     // major.minor.patch (we don't accept exact-tag stale pins).
-    const shippedVersion = shipped.get(depName);
     if (!declaredVersion.includes(shippedVersion)) {
       problems.push({
         package: pkg.name,
@@ -78,7 +93,10 @@ if (problems.length === 0) {
 
 console.error("[check-workspace-deps] internal deps out of lockstep:");
 for (const p of problems) {
-  console.error(`  ${p.package} declares ${p.dep}@${p.declared}, but ${p.dep} ships ${p.shipped}`);
+  const why = p.reason ? ` — ${p.reason}` : "";
+  console.error(
+    `  ${p.package} declares ${p.dep}@${p.declared}, but ${p.dep} ships ${p.shipped}${why}`,
+  );
 }
-console.error("\nFix: align the declared version to the shipped version (or use workspace:*).");
+console.error('\nFix: declare the exact shipped version (e.g. "1.2.3"), not a `workspace:` spec.');
 process.exit(1);

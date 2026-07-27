@@ -25,8 +25,8 @@
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "0.73.1",
-    "@tpsdev-ai/bob-discord": "workspace:*",
-    "@tpsdev-ai/bob-shell": "workspace:*",
+    "@tpsdev-ai/bob-discord": "0.2.0",
+    "@tpsdev-ai/bob-shell": "0.2.0",
     "discord.js": "^14.27.0",
     "typebox": "1.1.38"
   },
