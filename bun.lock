@@ -4,80 +4,16 @@
   "workspaces": {
     "": {
       "name": "@tpsdev-ai/bob-monorepo",
+      "dependencies": {
+        "@earendil-works/pi-coding-agent": "0.79.10",
+        "croner": "9.0.0",
+        "discord.js": "^14.27.0",
+        "typebox": "1.1.38",
+      },
       "devDependencies": {
         "@biomejs/biome": "^2.4.4",
         "@types/node": "^22.0.0",
         "typescript": "^5.7.0",
-      },
-    },
-    "packages/cap-discord": {
-      "name": "@tpsdev-ai/bob-cap-discord",
-      "version": "0.2.0",
-      "dependencies": {
-        "@tpsdev-ai/bob-discord": "0.2.0",
-        "@tpsdev-ai/bob-shell": "0.2.0",
-        "discord.js": "^14.27.0",
-        "typebox": "1.1.38",
-      },
-      "devDependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-      },
-    },
-    "packages/cap-flair": {
-      "name": "@tpsdev-ai/bob-cap-flair",
-      "version": "0.1.0",
-      "dependencies": {
-        "@tpsdev-ai/bob-shell": "0.2.0",
-        "typebox": "1.1.38",
-      },
-      "devDependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-      },
-    },
-    "packages/cap-observatory": {
-      "name": "@tpsdev-ai/bob-cap-observatory",
-      "version": "0.1.0",
-      "dependencies": {
-        "@tpsdev-ai/bob-shell": "0.2.0",
-        "typebox": "1.1.38",
-      },
-      "devDependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-      },
-    },
-    "packages/cli": {
-      "name": "@tpsdev-ai/bob",
-      "version": "0.2.0",
-      "bin": {
-        "bob": "./bin/bob",
-      },
-      "dependencies": {
-        "@tpsdev-ai/bob-cap-discord": "0.2.0",
-        "@tpsdev-ai/bob-cap-flair": "0.1.0",
-        "@tpsdev-ai/bob-cap-observatory": "0.1.0",
-        "@tpsdev-ai/bob-shell": "0.2.0",
-      },
-    },
-    "packages/discord": {
-      "name": "@tpsdev-ai/bob-discord",
-      "version": "0.2.0",
-      "dependencies": {
-        "@tpsdev-ai/bob-shell": "0.2.0",
-        "discord.js": "^14.27.0",
-      },
-    },
-    "packages/shell": {
-      "name": "@tpsdev-ai/bob-shell",
-      "version": "0.2.0",
-      "dependencies": {
-        "@earendil-works/pi-coding-agent": "0.79.10",
-        "croner": "9.0.0",
-        "typebox": "1.1.38",
-      },
-      "devDependencies": {
-        "@tpsdev-ai/bob-cap-discord": "0.2.0",
-        "@tpsdev-ai/bob-cap-flair": "0.1.0",
-        "@tpsdev-ai/bob-cap-observatory": "0.1.0",
       },
     },
   },
@@ -255,18 +191,6 @@
     "@smithy/util-buffer-from": ["@smithy/util-buffer-from@2.2.0", "", { "dependencies": { "@smithy/is-array-buffer": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-IJdWBbTcMQ6DA0gdNhh/BwrLkDR+ADW5Kr1aZmd4k3DIF6ezMV4R2NIAmT08wQJ3yUK82thHWmC/TnK/wpMMIA=="],
 
     "@smithy/util-utf8": ["@smithy/util-utf8@2.3.0", "", { "dependencies": { "@smithy/util-buffer-from": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A=="],
-
-    "@tpsdev-ai/bob": ["@tpsdev-ai/bob@workspace:packages/cli"],
-
-    "@tpsdev-ai/bob-cap-discord": ["@tpsdev-ai/bob-cap-discord@workspace:packages/cap-discord"],
-
-    "@tpsdev-ai/bob-cap-flair": ["@tpsdev-ai/bob-cap-flair@workspace:packages/cap-flair"],
-
-    "@tpsdev-ai/bob-cap-observatory": ["@tpsdev-ai/bob-cap-observatory@workspace:packages/cap-observatory"],
-
-    "@tpsdev-ai/bob-discord": ["@tpsdev-ai/bob-discord@workspace:packages/discord"],
-
-    "@tpsdev-ai/bob-shell": ["@tpsdev-ai/bob-shell@workspace:packages/shell"],
 
     "@types/node": ["@types/node@22.19.19", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-dyh/xO2Fh5bYrfWaaqGrRQQGkNdmYw6AmaAUvYeUMNTWQtvb796ikLdmTchRmOlOiIJ1TDXfWgVx1QkUlQ6Hew=="],
 

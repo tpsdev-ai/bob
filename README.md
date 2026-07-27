@@ -65,16 +65,39 @@ If you already use pi and want each agent to have a name, a key, a mailbox, and 
 - **Memory via Flair, with bridges to others.** Flair ships bridges to mem0, claude-project memory, ChatGPT, and more. A Bob agent can read memory from whichever layer your stack already uses.
 - **LLM provider-neutral.** Bob's `bob.yaml` picks; current production examples use exe.dev's VM-authenticated LLM gateway (anthropic via baseUrl override), but `ollama-cloud`, `ollama-newton`, `anthropic` direct, `openai`, and `omlx` all work.
 
+## Install
+
+```sh
+npx @tpsdev-ai/bob help          # try it
+npm install -g @tpsdev-ai/bob    # keep it
+```
+
+One package. The CLI, the shell runtime, the role templates and every blessed
+capability ship together — there is nothing else to install to get a working
+agent, and no way to end up with half of one.
+
 ## Repo layout
 
 ```
-packages/
-  shell/        runtime + integrations + role templates
-    src/        mail consumer, Discord bridge, init, run, onboard/align, doctor
-    roles/      ea, writer, reviewer, coder, qa, custom
-  cli/          the `bob` command
-  discord/      discord.js binding for shell's DiscordClient interface
+bin/bob                 the `bob` entry point
+src/
+  cli.ts                the `bob` command
+  shell/                runtime + integrations — mail consumer, Discord bridge,
+                        init, run, onboard/align, doctor, capability catalog
+  capabilities/         the blessed capabilities, each a pi extension
+    discord/            outbound tools + inbound gateway listener
+    flair/              memory search/write/get over the agent's Flair store
+    observatory/        team-view producer
+    fixture/            a no-op capability that proves the loader end to end
+roles/                  ea, writer, reviewer, coder, qa, custom
+test/                   mirrors src/
 ```
+
+A capability is a [pi](https://github.com/badlogic/pi-mono) extension plus a
+manifest. Bob's catalog (`src/shell/capability-catalog.ts`) is the curation
+boundary: only blessed names may appear in an agent's `bob.yaml capabilities:`,
+and each one resolves through this package's own `exports` map, so a checkout
+and an install load the identical file.
 
 ## Status
 

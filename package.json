@@ -1,17 +1,35 @@
 {
-  "name": "@tpsdev-ai/bob-monorepo",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Moldable office-agent shell. One shape, any role.",
-  "workspaces": [
-    "packages/*"
+  "name": "@tpsdev-ai/bob",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Bob — office-agent shell. Hire a Bob, give them a role, and they show up to work.",
+  "bin": {
+    "bob": "./bin/bob"
+  },
+  "exports": {
+    "./capabilities/*": "./dist/capabilities/*/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "roles"
   ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
-    "build": "cd packages/shell && bun run build && cd ../discord && bun run build && cd ../cap-discord && bun run build && cd ../cap-flair && bun run build && cd ../cap-observatory && bun run build && cd ../cli && bun run build",
-    "test": "cd packages/shell && bun test && cd ../discord && bun test && cd ../cap-discord && bun test && cd ../cap-flair && bun test && cd ../cap-observatory && bun test && cd ../cli && bun test",
-    "typecheck": "cd packages/shell && bun run build && bun run typecheck && cd ../discord && bun run build && bun run typecheck && cd ../cap-discord && bun run build && bun run typecheck && cd ../cap-flair && bun run build && bun run typecheck && cd ../cap-observatory && bun run build && bun run typecheck && cd ../cli && bun run typecheck",
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.79.10",
+    "croner": "9.0.0",
+    "discord.js": "^14.27.0",
+    "typebox": "1.1.38"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
@@ -24,10 +42,21 @@
     "protobufjs": "^7.6.5",
     "brace-expansion": "^5.0.7"
   },
+  "keywords": [
+    "agent",
+    "office-agent",
+    "ea",
+    "pi-coding-agent",
+    "discord-bot",
+    "flair",
+    "cli"
+  ],
   "license": "Apache-2.0",
   "author": "tpsdev-ai",
   "repository": {
     "type": "git",
     "url": "https://github.com/tpsdev-ai/bob.git"
-  }
+  },
+  "homepage": "https://github.com/tpsdev-ai/bob#readme",
+  "bugs": "https://github.com/tpsdev-ai/bob/issues"
 }

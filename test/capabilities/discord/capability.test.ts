@@ -1,0 +1,486 @@
+import { describe, expect, it } from "bun:test";
+import {
+  type AssistantMessageLike,
+  type PiLike,
+  wireDiscordCapability,
+} from "../../../src/capabilities/discord/capability.js";
+import type { DiscordCapabilityConfig } from "../../../src/capabilities/discord/config.js";
+import type { DiscordClient, DiscordMessage } from "../../../src/shell/discord-types.js";
+
+// --- Fakes (no live gateway, no real token, no LLM) -------------------------
+
+type ToolDef = Parameters<PiLike["registerTool"]>[0];
+
+type AgentEndHandler = (event: { messages: AssistantMessageLike[] }) => void | Promise<void>;
+
+class FakePi implements PiLike {
+  readonly tools = new Map<string, ToolDef>();
+  readonly userMessages: string[] = [];
+  rateHandler?: (e: { status: number; headers: Record<string, string> }) => void;
+  agentEndHandler?: AgentEndHandler;
+
+  registerTool(tool: ToolDef): void {
+    this.tools.set(tool.name, tool);
+  }
+  on(
+    event: "after_provider_response" | "agent_end",
+    handler: typeof this.rateHandler | AgentEndHandler,
+  ): void {
+    if (event === "after_provider_response") {
+      this.rateHandler = handler as typeof this.rateHandler;
+    } else {
+      this.agentEndHandler = handler as AgentEndHandler;
+    }
+  }
+  sendUserMessage(content: string): void {
+    this.userMessages.push(content);
+  }
+  // Simulate the agent finishing a turn with the given assistant text. Drives
+  // the agent_end reply-routing path. `await` so the async reply post settles.
+  async finishTurn(assistantText: string | undefined): Promise<void> {
+    const messages: AssistantMessageLike[] =
+      assistantText === undefined
+        ? [{ role: "assistant", content: [{ type: "text", text: "" }] }]
+        : [{ role: "assistant", content: [{ type: "text", text: assistantText }] }];
+    await this.agentEndHandler?.({ messages });
+  }
+  // helper
+  async call(name: string, params: Record<string, unknown>) {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`tool ${name} not registered`);
+    return tool.execute(`call-${name}`, params);
+  }
+}
+
+class FakeDiscordClient implements DiscordClient {
+  private handler?: (msg: DiscordMessage) => void;
+  readonly replies: Array<{ channelId: string; text: string; replyTo?: string }> = [];
+  readonly reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
+  // Every typing pulse, in order — the heartbeat assertions count these.
+  readonly typings: string[] = [];
+  fetchReturns: DiscordMessage[] = [];
+  connectCalled = false;
+  disconnectCalled = false;
+  replyThrows = false;
+  connectHangs = false;
+  typingThrows = false;
+
+  on(_e: "message", handler: (msg: DiscordMessage) => void): void {
+    this.handler = handler;
+  }
+  async connect(): Promise<void> {
+    this.connectCalled = true;
+    if (this.connectHangs) await new Promise<void>(() => {}); // never resolves
+  }
+  async disconnect(): Promise<void> {
+    this.disconnectCalled = true;
+  }
+  async reply(channelId: string, text: string, opts?: { replyTo?: string }): Promise<void> {
+    if (this.replyThrows) throw new Error("simulated discord REST failure");
+    this.replies.push({ channelId, text, replyTo: opts?.replyTo });
+  }
+  async react(channelId: string, messageId: string, emoji: string): Promise<void> {
+    this.reactions.push({ channelId, messageId, emoji });
+  }
+  async fetchRecent(_channelId: string, _limit: number): Promise<DiscordMessage[]> {
+    return this.fetchReturns;
+  }
+  async sendTyping(channelId: string): Promise<void> {
+    if (this.typingThrows) throw new Error("simulated discord typing failure");
+    this.typings.push(channelId);
+  }
+  fire(msg: Partial<DiscordMessage> & Pick<DiscordMessage, "channelId" | "content">): void {
+    this.handler?.({
+      id: msg.id ?? "m1",
+      channelId: msg.channelId,
+      authorId: msg.authorId ?? "u1",
+      authorName: msg.authorName ?? "user",
+      content: msg.content,
+      mentionsBot: msg.mentionsBot ?? false,
+    });
+  }
+}
+
+// Heartbeat assertions drive REAL timers at a few ms (the same shape as the
+// existing connectTimeoutMs tests) rather than faking the clock.
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function setup(
+  overrides: Partial<DiscordCapabilityConfig> = {},
+  wireOverrides: { typingIntervalMs?: number; typingMaxMs?: number } = {},
+) {
+  const pi = new FakePi();
+  const client = new FakeDiscordClient();
+  const logs: string[] = [];
+  const config: DiscordCapabilityConfig = {
+    tokenFile: "/secrets/bot.token",
+    channelIds: ["channel-A", "channel-B"],
+    dispatchAll: false,
+    ...overrides,
+  };
+  const wired = wireDiscordCapability({
+    pi,
+    client,
+    config,
+    log: (m) => logs.push(m),
+    ...wireOverrides,
+  });
+  return { pi, client, logs, config, wired };
+}
+
+describe("wireDiscordCapability — tools", () => {
+  it("registers reply/react/fetch", () => {
+    const { pi } = setup();
+    expect([...pi.tools.keys()].sort()).toEqual([
+      "discord_fetch",
+      "discord_react",
+      "discord_reply",
+    ]);
+  });
+
+  it("discord_reply posts to an allow-listed channel via the client", async () => {
+    const { pi, client } = setup();
+    await pi.call("discord_reply", { channelId: "channel-A", text: "hi", replyTo: "m9" });
+    expect(client.replies).toEqual([{ channelId: "channel-A", text: "hi", replyTo: "m9" }]);
+  });
+
+  it("discord_reply REFUSES a channel outside the allow-list", async () => {
+    const { pi, client } = setup();
+    await expect(pi.call("discord_reply", { channelId: "evil", text: "x" })).rejects.toThrow(
+      /not in the configured allow-list/,
+    );
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("discord_react routes to client.react and enforces the allow-list", async () => {
+    const { pi, client } = setup();
+    await pi.call("discord_react", { channelId: "channel-A", messageId: "m1", emoji: "✅" });
+    expect(client.reactions).toEqual([{ channelId: "channel-A", messageId: "m1", emoji: "✅" }]);
+    await expect(
+      pi.call("discord_react", { channelId: "nope", messageId: "m1", emoji: "✅" }),
+    ).rejects.toThrow(/allow-list/);
+  });
+
+  it("discord_fetch reads recent messages from an allow-listed channel", async () => {
+    const { pi, client } = setup();
+    client.fetchReturns = [
+      {
+        id: "1",
+        channelId: "channel-A",
+        authorId: "a",
+        authorName: "alice",
+        content: "yo",
+        mentionsBot: false,
+      },
+    ];
+    const res = await pi.call("discord_fetch", { channelId: "channel-A", limit: 5 });
+    expect(res.content[0].text).toContain("alice: yo");
+  });
+
+  it("discord_fetch refuses an un-allowed channel", async () => {
+    const { pi } = setup();
+    await expect(pi.call("discord_fetch", { channelId: "nope" })).rejects.toThrow(/allow-list/);
+  });
+
+  it("discord_reply truncates over-long text", async () => {
+    const { pi, client } = setup();
+    await pi.call("discord_reply", { channelId: "channel-A", text: "x".repeat(5000) });
+    expect(client.replies[0].text.length).toBeLessThanOrEqual(1901);
+    expect(client.replies[0].text.endsWith("…")).toBe(true);
+  });
+});
+
+describe("wireDiscordCapability — inbound listener", () => {
+  it("drives the agent on a mention in an allow-listed channel (mention stripped)", () => {
+    const { pi, client } = setup();
+    client.fire({ channelId: "channel-A", content: "<@123> what's the brief?", mentionsBot: true });
+    expect(pi.userMessages).toEqual(["what's the brief?"]);
+  });
+
+  it("DROPS messages on a channel outside the allow-list (trust boundary)", () => {
+    const { pi, client } = setup();
+    client.fire({ channelId: "not-listed", content: "<@123> hi", mentionsBot: true });
+    expect(pi.userMessages).toHaveLength(0);
+  });
+
+  it("ignores non-mentions by default (dispatchAll=false)", () => {
+    const { pi, client } = setup();
+    client.fire({ channelId: "channel-A", content: "ambient chatter", mentionsBot: false });
+    expect(pi.userMessages).toHaveLength(0);
+  });
+
+  it("dispatches all messages on allow-listed channels when dispatchAll=true — still bounded by allow-list", () => {
+    const { pi, client } = setup({ dispatchAll: true });
+    client.fire({ channelId: "channel-A", content: "ambient", mentionsBot: false });
+    client.fire({ channelId: "not-listed", content: "ambient", mentionsBot: false });
+    expect(pi.userMessages).toEqual(["ambient"]);
+  });
+
+  it("ignores a message that is empty after stripping the mention", () => {
+    const { pi, client } = setup();
+    client.fire({ channelId: "channel-A", content: "<@123>", mentionsBot: true });
+    expect(pi.userMessages).toHaveLength(0);
+  });
+});
+
+describe("wireDiscordCapability — reply routing (inbound → originating channel)", () => {
+  it("posts the agent's reply back to the ORIGINATING channel on agent_end", async () => {
+    const { pi, client } = setup();
+    // Inbound on channel-B, message id m42.
+    client.fire({
+      id: "m42",
+      channelId: "channel-B",
+      content: "<@123> status?",
+      mentionsBot: true,
+    });
+    expect(pi.userMessages).toEqual(["status?"]);
+    // Agent finishes its turn with a final answer.
+    await pi.finishTurn("all green");
+    // Reply routed to channel-B (the originator), quote-replying to m42.
+    expect(client.replies).toEqual([{ channelId: "channel-B", text: "all green", replyTo: "m42" }]);
+  });
+
+  it("routes to channel C when the inbound message came from channel C (the spec's mocked proof)", async () => {
+    const { pi, client } = setup({ channelIds: ["channel-C", "channel-A"] });
+    client.fire({ id: "mC", channelId: "channel-C", content: "<@1> ping", mentionsBot: true });
+    await pi.finishTurn("pong");
+    expect(client.replies).toEqual([{ channelId: "channel-C", text: "pong", replyTo: "mC" }]);
+  });
+
+  it("does NOT post when agent_end has no originating Discord message (heartbeat/cron turn)", async () => {
+    const { pi, client } = setup();
+    // No inbound message fired — a self-directed turn finishes.
+    await pi.finishTurn("internal monologue");
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("posts nothing for a tool-only turn (no assistant text) but still consumes pending", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> react", mentionsBot: true });
+    await pi.finishTurn(undefined); // empty assistant text
+    expect(client.replies).toHaveLength(0);
+    // pending was consumed: a later self-directed turn must not leak a reply.
+    await pi.finishTurn("late text");
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("truncates an over-long reply to Discord's limit", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> essay", mentionsBot: true });
+    await pi.finishTurn("y".repeat(5000));
+    expect(client.replies[0].channelId).toBe("channel-A");
+    expect(client.replies[0].text.length).toBeLessThanOrEqual(1901);
+    expect(client.replies[0].text.endsWith("…")).toBe(true);
+  });
+
+  it("a failed reply post is logged, not thrown (persistent session survives)", async () => {
+    const { pi, client, logs } = setup();
+    client.replyThrows = true;
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await pi.finishTurn("hello");
+    expect(logs.some((l) => /failed to post reply to channel-A/.test(l))).toBe(true);
+  });
+
+  it("the reply path never includes the bot token (no token in this core)", async () => {
+    const { pi, client, config } = setup();
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await pi.finishTurn("hello");
+    const haystack = JSON.stringify({ config, replies: client.replies });
+    expect(haystack).not.toContain("tok_");
+    expect(config.tokenFile).toBe("/secrets/bot.token");
+  });
+});
+
+describe("wireDiscordCapability — typing indicator spans the turn", () => {
+  it("starts typing on the originating channel the moment the message is dispatched", () => {
+    const { client } = setup();
+    client.fire({ id: "m1", channelId: "channel-B", content: "<@1> think", mentionsBot: true });
+    // Immediately — not one interval later. The wait starts at dispatch.
+    expect(client.typings).toEqual(["channel-B"]);
+  });
+
+  it("REPEATS while the turn is in flight (Discord expires the indicator after ~10s)", async () => {
+    const { client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> slow one", mentionsBot: true });
+    await sleep(60);
+    // Immediate pulse + repeats. A single call would leave exactly 1.
+    expect(client.typings.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(client.typings)).toEqual(new Set(["channel-A"]));
+  });
+
+  it("STOPS once the turn completes — no pulses after the reply lands", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn("done");
+    const atCompletion = client.typings.length;
+    await sleep(60); // several intervals' worth of quiet
+    expect(client.typings.length).toBe(atCompletion);
+    expect(client.replies).toHaveLength(1);
+  });
+
+  it("STOPS when the turn ends with a throw — the indicator can't outlive a failure", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.replyThrows = true; // the reply post blows up inside agent_end
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn("this post will fail");
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+    expect(client.replies).toHaveLength(0); // proof the throw path really ran
+  });
+
+  it("STOPS on a tool-only turn (no assistant text — the early return still clears it)", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> react", mentionsBot: true });
+    await sleep(35);
+    await pi.finishTurn(undefined);
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+  });
+
+  it("a FAILING typing request never breaks the reply path (cosmetic, swallowed)", async () => {
+    const { pi, client, logs } = setup({}, { typingIntervalMs: 10 });
+    client.typingThrows = true;
+    expect(() => {
+      client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    }).not.toThrow();
+    await sleep(25);
+    await pi.finishTurn("still replied");
+    expect(client.replies).toEqual([
+      { channelId: "channel-A", text: "still replied", replyTo: "m1" },
+    ]);
+    expect(logs.some((l) => /typing indicator failed for channel-A/.test(l))).toBe(true);
+  });
+
+  it("does NOT type for a message the allow-list or mention filter drops", () => {
+    const { client } = setup();
+    client.fire({ channelId: "not-listed", content: "<@1> hi", mentionsBot: true });
+    client.fire({ channelId: "channel-A", content: "ambient chatter", mentionsBot: false });
+    client.fire({ channelId: "channel-A", content: "<@1>", mentionsBot: true }); // empty after strip
+    expect(client.typings).toHaveLength(0);
+  });
+
+  it("a second inbound message re-points the heartbeat instead of stacking a second timer", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> first", mentionsBot: true });
+    client.fire({ id: "m2", channelId: "channel-B", content: "<@1> second", mentionsBot: true });
+    await sleep(45);
+    const total = client.typings.length;
+    // Two stacked intervals would roughly double the pulse rate; one slot keeps
+    // it near ~1 per interval (plus the two immediate pulses).
+    expect(total).toBeLessThanOrEqual(9);
+    // The single remaining timer follows the LATEST message's channel.
+    expect(client.typings[client.typings.length - 1]).toBe("channel-B");
+    // ...and one stop still silences everything.
+    await pi.finishTurn("answered");
+    const atCompletion = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atCompletion);
+  });
+
+  it("stop() (shutdown/disconnect) clears a heartbeat that is still running", async () => {
+    const { client, wired } = setup({}, { typingIntervalMs: 10 });
+    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(25);
+    await wired.stop(); // no agent_end — shutdown mid-turn
+    const atShutdown = client.typings.length;
+    await sleep(60);
+    expect(client.typings.length).toBe(atShutdown);
+    expect(client.disconnectCalled).toBe(true);
+  });
+
+  it("does not type for a self-directed turn (cron/heartbeat prompt, no inbound message)", async () => {
+    const { pi, client } = setup({}, { typingIntervalMs: 10 });
+    await pi.finishTurn("internal monologue");
+    await sleep(30);
+    expect(client.typings).toHaveLength(0);
+  });
+});
+
+describe("wireDiscordCapability — 429 surfacing + lifecycle", () => {
+  it("logs a provider 429 with retry-after via after_provider_response", () => {
+    const { pi, logs } = setup();
+    pi.rateHandler?.({ status: 429, headers: { "retry-after": "7" } });
+    expect(logs.some((l) => /429/.test(l) && /7/.test(l))).toBe(true);
+  });
+
+  it("does not log on a 200", () => {
+    const { pi, logs } = setup();
+    pi.rateHandler?.({ status: 200, headers: {} });
+    expect(logs).toHaveLength(0);
+  });
+
+  it("start() connects + stop() disconnects the gateway", async () => {
+    const { client, wired } = setup();
+    await wired.start();
+    expect(client.connectCalled).toBe(true);
+    await wired.stop();
+    expect(client.disconnectCalled).toBe(true);
+  });
+
+  it("start() rejects when the gateway connect hangs (timeout)", async () => {
+    const pi = new FakePi();
+    const client = new FakeDiscordClient();
+    client.connectHangs = true;
+    const config: DiscordCapabilityConfig = {
+      tokenFile: "/s",
+      channelIds: ["c"],
+      dispatchAll: false,
+    };
+    const wired = wireDiscordCapability({
+      pi,
+      client,
+      config,
+      log: () => {},
+      connectTimeoutMs: 20,
+    });
+    await expect(wired.start()).rejects.toThrow(/timed out/);
+  });
+
+  it("start() resolves normally when connect is fast (timeout not hit)", async () => {
+    const pi = new FakePi();
+    const client = new FakeDiscordClient();
+    const config: DiscordCapabilityConfig = {
+      tokenFile: "/s",
+      channelIds: ["c"],
+      dispatchAll: false,
+    };
+    const wired = wireDiscordCapability({
+      pi,
+      client,
+      config,
+      log: () => {},
+      connectTimeoutMs: 5000,
+    });
+    await wired.start();
+    expect(client.connectCalled).toBe(true);
+  });
+});
+
+describe("wireDiscordCapability — secret hygiene", () => {
+  it("never surfaces the token (config carries only a file path)", async () => {
+    // The whole config + every tool result + every log line is scanned for a
+    // canary. The token never enters this core (it lives in the client), so it
+    // cannot leak through tools/logs/transcript.
+    const { pi, client, logs, config } = setup();
+    const canary = "tok_LEAK_CANARY_999";
+    // Drive every surface.
+    client.fire({ channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    const r1 = await pi.call("discord_reply", { channelId: "channel-A", text: "ok" });
+    pi.rateHandler?.({ status: 429, headers: { "retry-after": "1" } });
+    const haystack = JSON.stringify({
+      config,
+      tools: [...pi.tools.keys()],
+      userMessages: pi.userMessages,
+      replies: client.replies,
+      logs,
+      r1,
+    });
+    expect(haystack).not.toContain(canary);
+    // tokenFile is a PATH, not the token.
+    expect(config.tokenFile).toBe("/secrets/bot.token");
+  });
+});

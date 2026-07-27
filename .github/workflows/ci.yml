@@ -31,11 +31,6 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
-      - name: Check workspace internal-dep lockstep
-        # Catches the bug shape where a workspace package declares an
-        # internal @tpsdev-ai/* dep at a version different from what it
-        # ships. Local dev hides it (bun symlinks); consumers don't.
-        run: node scripts/check-workspace-deps.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck
@@ -56,6 +51,36 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - run: bun run test
+
+  pack:
+    name: Published Artifact
+    needs: build
+    runs-on: ubuntu-latest
+    # Every packaging defect this repo has hit — an uninstallable `workspace:`
+    # spec, a capability catalog pointing at a path that exists only in a
+    # checkout — was green in the monorepo the entire time. The only thing that
+    # catches that class is packing a tarball, installing it into a directory
+    # with nothing else in it, and running the result. So CI does that on every
+    # PR rather than trusting anyone to remember.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      # npm, not bun: npm is what a user runs, what the release pipeline
+      # publishes with, and the one that does NOT rewrite specs when it builds a
+      # tarball — a bun-only check passes on artifacts npm would break. Under
+      # sfw so the tarball's own install still goes through Socket Firewall.
+      - name: Pack, install and run the published artifact
+        run: sfw node scripts/verify-pack.mjs
 
   audit:
     name: Dependency Audit
