@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readBlock, readCapabilities } from "../../src/shell/bob-yaml.js";
+import { BobYamlError, readBlock, readCapabilities } from "../../src/shell/bob-yaml.js";
 
 describe("readCapabilities", () => {
   it("reads a block-sequence list", () => {
@@ -129,5 +129,184 @@ describe("readBlock", () => {
     const yaml = ["discord:", "  channelIds:", "    - '111'", "flair:", "  url: b", ""].join("\n");
     expect(readBlock(yaml, "discord")).toEqual({ channelIds: ["111"] });
     expect(readBlock(yaml, "flair")).toEqual({ url: "b" });
+  });
+});
+
+// A block sequence whose items are one-level mappings. The observatory
+// capability's `agents` needs this: before it was supported, `- agentId: x`
+// coerced to the STRING "agentId: x", the item's second key was hoisted into
+// the enclosing block, and every later item was dropped — a wrong value that
+// looked plausible enough to ship. See issue #77.
+describe("readBlock — block sequence of mappings", () => {
+  it("reads a list of single-key mappings", () => {
+    const yaml = ["observatory:", "  agents:", "    - agentId: testbot", ""].join("\n");
+    expect(readBlock(yaml, "observatory")).toEqual({ agents: [{ agentId: "testbot" }] });
+  });
+
+  it("reads multi-key items, keeping each item's keys in that item", () => {
+    const yaml = [
+      "observatory:",
+      "  observatoryUrl: http://127.0.0.1:9926",
+      "  officeId: rockit",
+      "  agents:",
+      "    - agentId: flint",
+      "      name: Flint",
+      "      role: Strategy",
+      "    - agentId: anvil",
+      "      type: agent",
+      "  staleThresholdSeconds: 600",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "",
+    ].join("\n");
+    // Every assertion here fails under the old reader: `agents` was
+    // ["agentId: flint", "agentId: anvil"], `name`/`role`/`type` were hoisted
+    // to the block, and `staleThresholdSeconds` still landed correctly only by
+    // accident of ordering.
+    expect(readBlock(yaml, "observatory")).toEqual({
+      observatoryUrl: "http://127.0.0.1:9926",
+      officeId: "rockit",
+      agents: [
+        { agentId: "flint", name: "Flint", role: "Strategy" },
+        { agentId: "anvil", type: "agent" },
+      ],
+      staleThresholdSeconds: 600,
+    });
+  });
+
+  it("coerces item values the same way scalar sub-keys are coerced", () => {
+    const yaml = [
+      "observatory:",
+      "  agents:",
+      "    - agentId: a",
+      "      port: 9926",
+      "      enabled: true",
+      "      quoted: '9926'",
+      "      path: /a/b.key",
+      "",
+    ].join("\n");
+    expect(readBlock(yaml, "observatory")).toEqual({
+      agents: [{ agentId: "a", port: 9926, enabled: true, quoted: "9926", path: "/a/b.key" }],
+    });
+  });
+
+  it("supports an inline-flow list as an item value", () => {
+    const yaml = ["observatory:", "  agents:", "    - agentId: a", "      tags: [x, y]", ""].join(
+      "\n",
+    );
+    expect(readBlock(yaml, "observatory")).toEqual({
+      agents: [{ agentId: "a", tags: ["x", "y"] }],
+    });
+  });
+
+  it("ends the list at a sibling sub-key and at the next column-0 key", () => {
+    const yaml = [
+      "observatory:",
+      "  agents:",
+      "    - agentId: a",
+      "  officeId: rockit",
+      "flair:",
+      "  url: b",
+      "",
+    ].join("\n");
+    expect(readBlock(yaml, "observatory")).toEqual({
+      agents: [{ agentId: "a" }],
+      officeId: "rockit",
+    });
+    expect(readBlock(yaml, "flair")).toEqual({ url: "b" });
+  });
+
+  it("skips comments and blank lines between items", () => {
+    const yaml = [
+      "observatory:",
+      "  agents:",
+      "    # the first agent",
+      "    - agentId: a",
+      "",
+      "    - agentId: b",
+      "",
+    ].join("\n");
+    expect(readBlock(yaml, "observatory")).toEqual({
+      agents: [{ agentId: "a" }, { agentId: "b" }],
+    });
+  });
+
+  // The colon-must-be-followed-by-space rule. Without it a list of URLs turns
+  // into a list of objects keyed `http`, which is the same class of silent
+  // wrong parse this fix exists to remove.
+  it("keeps a scalar item that merely CONTAINS a colon a scalar", () => {
+    const yaml = [
+      "discord:",
+      "  hosts:",
+      "    - http://a.example",
+      "    - 09:00",
+      "    - 'k: v'",
+      "",
+    ].join("\n");
+    expect(readBlock(yaml, "discord")).toEqual({
+      hosts: ["http://a.example", "09:00", "k: v"],
+    });
+  });
+});
+
+// Shapes the reader deliberately does NOT support. Each must throw rather than
+// return something plausible — a silent wrong parse is how #77 reached a
+// published package.
+describe("readBlock — unsupported shapes throw", () => {
+  const cases: Array<[string, string[]]> = [
+    ["a nested mapping under a sub-key", ["x:", "  a:", "    b: 1"]],
+    ["a nested mapping under a valued sub-key", ["x:", "  a: 1", "    b: 2"]],
+    ["a sub-key with no value inside a list item", ["x:", "  l:", "    - a: 1", "      b:"]],
+    ["a nested list inside a list item", ["x:", "  l:", "    - a: 1", "      - b"]],
+    ["a list of lists", ["x:", "  l:", "    - - a"]],
+    ["an empty dash", ["x:", "  l:", "    -", "      a: 1"]],
+    ["a list mixing scalar then mapping items", ["x:", "  l:", "    - a", "    - b: 1"]],
+    ["a list mixing mapping then scalar items", ["x:", "  l:", "    - b: 1", "    - a"]],
+    ["a flow mapping as a sub-key value", ["x:", "  a: { b: 1 }"]],
+    ["a flow mapping as an item value", ["x:", "  l:", "    - a: { b: 1 }"]],
+    ["a flow mapping as a whole item", ["x:", "  l:", "    - { a: 1 }"]],
+    ["ragged list-item indentation", ["x:", "  l:", "    - a: 1", "      - a: 2"]],
+    ["a list item with no sub-key opening a list", ["x:", "  a: 1", "  - b"]],
+    ["a block that is itself a list", ["x:", "  - a", "  - b"]],
+    ["an unrecognized line", ["x:", "  not a key value pair"]],
+    ["an unrecognized line inside a list item", ["x:", "  l:", "    - a: 1", "      nope"]],
+    ["an outdented line", ["x:", "    a: 1", "  b: 2"]],
+  ];
+
+  for (const [label, lines] of cases) {
+    it(`throws on ${label}`, () => {
+      expect(() => readBlock(`${lines.join("\n")}\n`, "x")).toThrow(BobYamlError);
+    });
+  }
+
+  it("names the block and the 1-based line, and never echoes a value", () => {
+    const yaml = [
+      "other:",
+      "  k: v",
+      "x:",
+      "  token: super-secret-value",
+      "    nested: 1",
+      "",
+    ].join("\n");
+    let err: unknown;
+    try {
+      readBlock(yaml, "x");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(BobYamlError);
+    const e = err as BobYamlError;
+    expect(e.key).toBe("x");
+    expect(e.line).toBe(5);
+    expect(e.message).toContain('bob.yaml "x:" block, line 5');
+    // The value on the preceding line must never reach the message/log.
+    expect(e.message).not.toContain("super-secret-value");
+  });
+
+  it("only throws for the block asked for, not a malformed sibling", () => {
+    const yaml = ["good:", "  a: 1", "bad:", "  n:", "    m: 2", ""].join("\n");
+    expect(readBlock(yaml, "good")).toEqual({ a: 1 });
+    expect(() => readBlock(yaml, "bad")).toThrow(BobYamlError);
   });
 });
