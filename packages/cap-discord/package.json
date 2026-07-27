@@ -24,7 +24,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@earendil-works/pi-coding-agent": "0.79.10",
     "@tpsdev-ai/bob-discord": "workspace:*",
     "@tpsdev-ai/bob-shell": "workspace:*",
     "discord.js": "^14.27.0",

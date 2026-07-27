@@ -16,7 +16,7 @@
 // only inside the DiscordJsClient. It is never logged, echoed, returned in a
 // tool result, or placed in the session transcript.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DiscordJsClient } from "@tpsdev-ai/bob-discord";
 import { wireDiscordCapability } from "./capability.js";
 import { loadConfigFromEnv, readToken } from "./config.js";
