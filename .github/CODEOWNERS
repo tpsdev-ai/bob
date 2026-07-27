@@ -6,11 +6,14 @@
 * @tps-flint @tps-kern @tps-sherlock
 
 # Security-sensitive surfaces — explicit Sherlock gate
-/packages/shell/src/flair-pair.ts   @tps-sherlock @tps-flint
-/packages/shell/src/init.ts         @tps-sherlock @tps-flint
-/packages/shell/src/role-loader.ts  @tps-sherlock @tps-flint
-/packages/shell/src/mail-consumer.ts @tps-sherlock @tps-flint
-/packages/discord/                  @tps-sherlock @tps-flint
+/src/shell/flair-pair.ts            @tps-sherlock @tps-flint
+/src/shell/init.ts                  @tps-sherlock @tps-flint
+/src/shell/role-loader.ts           @tps-sherlock @tps-flint
+/src/shell/mail-consumer.ts         @tps-sherlock @tps-flint
+/src/shell/capability-catalog.ts    @tps-sherlock @tps-flint
+/src/shell/capability-resolve.ts    @tps-sherlock @tps-flint
+/src/capabilities/                  @tps-sherlock @tps-flint
+/bin/bob                            @tps-sherlock @tps-flint
 
 # CI + supply-chain configs — both K&S
 /.github/                           @tps-sherlock @tps-kern @tps-flint

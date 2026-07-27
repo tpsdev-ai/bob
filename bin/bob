@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// The `bob` entry point. Two jobs: load the CLI, and make an incomplete install
+// say so.
+//
+// The second job is not decoration. Bob's whole program — the CLI, the shell,
+// and every blessed capability — now ships in one tarball, so a file missing
+// from dist is an INSTALL fault, and it surfaces as an ESM resolution failure
+// while the module graph is still being built. That happens before any of
+// bob's own error handling exists to catch it, and node's default rendering of
+// it is a 20-line stack trace into node:internal/modules/esm/resolve that tells
+// a user nothing they can act on.
+//
+// This is the only place that can catch it, which is why the shim is not a
+// one-liner. Everything else stays in TypeScript.
+
+const CLI = "../dist/cli.js";
+
+// Pull the capability name out of a missing dist/capabilities/<name>/… path, so
+// a partially-installed capability set is reported as the capability the agent
+// asked for rather than as a path into node_modules.
+function capabilityFrom(message) {
+  const m = /dist\/capabilities\/([a-z0-9-]+)\//.exec(message ?? "");
+  return m ? m[1] : undefined;
+}
+
+try {
+  await import(CLI);
+} catch (err) {
+  // Only module-resolution failures mean "incomplete install". Anything else is
+  // a real error from the program and must not be dressed up as a packaging
+  // problem — rethrow it untouched.
+  if (err?.code !== "ERR_MODULE_NOT_FOUND" && err?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") {
+    throw err;
+  }
+  const capability = capabilityFrom(err.message);
+  const missing = err.url ?? "a file it ships";
+  console.error(
+    [
+      capability
+        ? `bob: capability "${capability}" is not present in this install.`
+        : "bob: this bob install is incomplete.",
+      "",
+      `Missing: ${missing}`,
+      "",
+      "Bob ships as a single package, so a missing file means a partial or",
+      "corrupted install rather than a configuration problem. Reinstall:",
+      "",
+      "  npm install -g @tpsdev-ai/bob",
+      "",
+      ...(capability
+        ? [`To run the agent without it, remove "${capability}" from capabilities: in bob.yaml.`]
+        : ["In a bob checkout, build first:", "", "  bun run build"]),
+    ].join("\n"),
+  );
+  process.exit(1);
+}
