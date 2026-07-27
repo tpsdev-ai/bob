@@ -20,7 +20,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@tpsdev-ai/bob-shell": "workspace:*",
+    "@tpsdev-ai/bob-shell": "0.2.0",
     "discord.js": "^14.27.0"
   },
   "keywords": [

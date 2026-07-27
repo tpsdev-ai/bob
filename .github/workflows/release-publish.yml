@@ -1,0 +1,319 @@
+name: Release — stage-publish (OIDC) + GitHub release
+
+# Tokenless release pipeline, triggered by pushing a vX.Y.Z tag. Authenticates to
+# npm via OIDC trusted publishing (no NPM_TOKEN lives anywhere) and submits the
+# publishable workspace packages to npm's STAGING area via `npm stage publish`
+# rather than publishing live. A maintainer approves the staged tarballs on
+# npmjs.com with 2FA to go live — that approval is the release gate.
+#
+# A separate, INDEPENDENT job (github-release) cuts a GitHub release for the tag
+# from the matching CHANGELOG.md section. It does NOT depend on the npm staging
+# approval — the GitHub release documents the tagged commit immediately on push.
+#
+# Cut a release: after the `release: vX.Y.Z` PR merges to main, push the tag:
+#   git tag v0.3.0 && git push origin v0.3.0
+# The tag push triggers this workflow. (workflow_dispatch is a manual fallback.)
+#
+# WHAT SHIPS: only the two packages a `bob` user actually installs —
+#   @tpsdev-ai/bob-shell   (packages/shell)  the runtime library
+#   @tpsdev-ai/bob         (packages/cli)    the `bob` binary, depends on the above
+# The root package is `private: true` and never publishes. bob-discord,
+# bob-cap-discord, bob-cap-flair and bob-cap-observatory are NOT in
+# @tpsdev-ai/bob's dependency chain and are deliberately not published here —
+# publishing them is a separate decision (see docs note in the PR).
+#
+# ONE-TIME SETUP REQUIRED BEFORE THE FIRST TAG (a human with npm org-owner
+# rights must do this — CI cannot):
+#   1. Neither @tpsdev-ai/bob nor @tpsdev-ai/bob-shell exists on npm yet, and
+#      npm requires a package to EXIST before a Trusted Publisher can be added
+#      (npm/cli#8544). `npm stage publish` additionally requires it
+#      (`npm help stage`: "Package must exist"). So each package needs one
+#      manual bootstrap publish from a 2FA-logged-in machine:
+#        cd packages/shell && npm run build && npm publish --access public
+#        cd packages/cli   && npm run build && npm publish --access public
+#   2. Then, per package, on npmjs.com → package → Settings → Trusted Publisher:
+#        Provider=GitHub Actions, Organization=tpsdev-ai, Repository=bob,
+#        Workflow=release-publish.yml, Environment=release,
+#        Allowed actions = `npm stage publish` ONLY (leave `npm publish`
+#        unchecked, so the CI identity can never publish live directly).
+#   3. Create the `release` GitHub environment with NO required reviewers, and a
+#      deployment policy that allows `v*` TAGS.
+# Until step 1+2 are done for both packages, the stage-publish job will fail —
+# that failure is expected and is not a defect in this workflow.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Fallback only: version to stage (a vX.Y.Z tag must already exist on a merged commit)"
+        required: true
+        type: string
+
+# Default to read-only; the publish job opts into exactly what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  stage-publish:
+    name: Stage-publish bob + bob-shell
+    runs-on: ubuntu-latest
+    # `release` is an OIDC-scoping environment, NOT an approval gate: it pins the
+    # trusted-publisher trust to this environment. The human gate is the npm
+    # staging approval (2FA), not a GitHub reviewer.
+    environment: release
+    permissions:
+      id-token: write   # mint the short-lived OIDC token for npm trusted publishing
+      contents: read    # checkout + fetch main for the ancestry guard
+    steps:
+      - name: Resolve version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            # tag push: github.ref_name is the tag (vX.Y.Z)
+            VERSION="${REF_NAME#v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION'. Expected semver (e.g. 0.3.0 or 1.0.0-rc.1)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit is on main
+        # A tag can point at any commit; require it to be merged to main so a tag
+        # can never ship un-reviewed code past the npm staging gate.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Commit ${GITHUB_SHA} is not an ancestor of origin/main. Tag a merged release commit."
+            exit 1
+          fi
+          echo "  ok ${GITHUB_SHA} is on main"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          # NO registry-url: it makes setup-node write an .npmrc with
+          # _authToken=${NODE_AUTH_TOKEN} + always-auth, and with NODE_AUTH_TOKEN
+          # unset npm tries the EMPTY token and fails E401 instead of falling
+          # through to OIDC trusted publishing. OIDC needs no token config; npm
+          # defaults to registry.npmjs.org.
+
+      - name: Upgrade npm to a staging-capable version
+        # OIDC trusted publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
+        # Node 22 ships npm 10.x, so upgrade explicitly.
+        run: |
+          npm install -g npm@^11.15.0
+          echo "npm $(npm --version)"
+
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+
+      - name: Cache bun install
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-cache-${{ runner.os }}-
+
+      - name: Install
+        run: sfw bun install --frozen-lockfile
+
+      - name: Verify publishable package versions match the tag
+        # Only the two packages this workflow publishes are version-gated. bob is
+        # NOT lockstep-versioned across the whole workspace (the cap-* packages
+        # move independently), so checking every package here would be wrong.
+        # All values flow through env, never ${{ }} interpolation inside the
+        # script body — keeps the resolved version out of the shell parser.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG_JSONS=(
+            packages/shell/package.json
+            packages/cli/package.json
+          )
+          for pj in "${PKG_JSONS[@]}"; do
+            name="$(node -p "require('./$pj').name")"
+            pv="$(node -p "require('./$pj').version")"
+            if [ "$pv" != "$VERSION" ]; then
+              echo "::error::$name is at $pv, expected $VERSION (tag v$VERSION). Tag a merged release commit."
+              exit 1
+            fi
+            echo "  ok $name @ $pv"
+          done
+
+      - name: Check workspace internal-dep lockstep
+        # @tpsdev-ai/bob depends on @tpsdev-ai/bob-shell. This asserts the
+        # declared version equals the version bob-shell actually ships, and
+        # rejects `workspace:` specs outright (see the packed-tarball guard
+        # below for why).
+        run: node scripts/check-workspace-deps.mjs
+
+      - name: Build
+        run: bun run build
+
+      - name: Guard — no `workspace:` spec survives into a packed tarball
+        # THE failure this pipeline exists to prevent. npm does NOT rewrite
+        # `workspace:` dependency specs when it builds a tarball (unlike bun,
+        # which silently does — so local `bun pm pack` checks pass while the
+        # npm-published artifact is broken). A published @tpsdev-ai/bob whose
+        # dependency is the literal string "workspace:*" fails to install for
+        # EVERY user with:
+        #   npm error code EUNSUPPORTEDPROTOCOL
+        #   npm error Unsupported URL Type "workspace:": workspace:*
+        # `npm stage publish` builds its tarball the same way `npm pack` does,
+        # so packing here and inspecting the result is a faithful preflight.
+        run: |
+          set -euo pipefail
+          for dir in packages/shell packages/cli; do
+            name="$(node -p "require('./$dir/package.json').name")"
+            echo "::group::pack preflight — $name ($dir)"
+            tgz="$(cd "$dir" && npm pack --silent --pack-destination "$RUNNER_TEMP")"
+            node -e '
+              const { execFileSync } = require("node:child_process");
+              const [tarball, pkgName] = process.argv.slice(1);
+              const json = execFileSync("tar", ["-xzOf", tarball, "package/package.json"], {
+                encoding: "utf8",
+              });
+              const pkg = JSON.parse(json);
+              const groups = ["dependencies", "peerDependencies", "optionalDependencies"];
+              const bad = [];
+              for (const g of groups) {
+                for (const [dep, range] of Object.entries(pkg[g] || {})) {
+                  if (String(range).startsWith("workspace:")) bad.push(`${g}.${dep} = ${range}`);
+                }
+              }
+              if (bad.length) {
+                console.error(`::error::${pkgName} would publish an unresolved workspace spec:`);
+                for (const b of bad) console.error(`  ${b}`);
+                process.exit(1);
+              }
+              console.log(`  ok ${pkgName} — no workspace: specs in the packed manifest`);
+            ' "$RUNNER_TEMP/$tgz" "$name"
+            echo "::endgroup::"
+          done
+
+      - name: Stage-publish (dependency order)
+        # bob-shell first — @tpsdev-ai/bob depends on it. Staging does not
+        # resolve dependencies (that happens at install, post-approval), but we
+        # keep dep order so the approve-and-go-live sequence is consistent:
+        # approving bob before bob-shell would leave bob briefly uninstallable.
+        run: |
+          set -euo pipefail
+          DIRS=(
+            packages/shell
+            packages/cli
+          )
+          for dir in "${DIRS[@]}"; do
+            name="$(node -p "require('./$dir/package.json').name")"
+            echo "::group::npm stage publish — $name ($dir)"
+            ( cd "$dir" && npm stage publish )
+            echo "::endgroup::"
+          done
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "### 🚀 v$VERSION staged for release"
+            echo ""
+            echo "\`@tpsdev-ai/bob-shell\` and \`@tpsdev-ai/bob\` submitted to npm **staging**"
+            echo "with provenance. They are **not live yet**."
+            echo ""
+            echo "**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),"
+            echo "review each tarball, and approve with 2FA — approve \`bob-shell\` first."
+            echo "Or: \`npm stage list\` then \`npm stage approve <id>\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  github-release:
+    name: Cut GitHub release from CHANGELOG
+    runs-on: ubuntu-latest
+    # Independent of stage-publish on purpose: the GitHub release documents the
+    # tagged commit and can be cut immediately on tag push. It does NOT wait on
+    # the npm staging 2FA approval (a manual external gate) — that gate governs
+    # what goes LIVE on npm, not whether the tag is recorded on GitHub.
+    if: github.event_name == 'push'
+    permissions:
+      contents: write   # create/edit the GitHub release for the tag
+    steps:
+      - name: Resolve version
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # tag push: github.ref_name is the tag (vX.Y.Z)
+          VERSION="${REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION'. Expected semver (e.g. 0.3.0 or 1.0.0-rc.1)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Extract CHANGELOG section
+        # The node script reads CHANGELOG.md and writes the matching section body
+        # to a file. Version flows through env, never ${{ }} interpolation in the
+        # script body, and the body is captured to a file (never re-emitted into a
+        # shell string) so neither the tag nor the CHANGELOG text can be parsed as
+        # shell. Fails loudly (non-zero) if the section is missing or empty.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > release-notes.md
+          echo "Extracted $(wc -l < release-notes.md) lines for v$VERSION"
+
+      - name: Create or update GitHub release
+        # Idempotent: if a release for the tag already exists (re-run), update it
+        # in place instead of failing. The notes body is passed via --notes-file
+        # (a file on disk), and the tag/title via env-expanded argv — content is
+        # never interpolated into the command text.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes."
+            gh release edit "$TAG" \
+              --title "v$VERSION" \
+              --notes-file release-notes.md
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" \
+              --title "v$VERSION" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
+          echo "Release URL: $(gh release view "$TAG" --json url --jq .url)"
