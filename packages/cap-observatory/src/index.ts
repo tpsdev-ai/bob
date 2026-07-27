@@ -13,7 +13,7 @@
 // returned in a tool result, or placed in the session transcript. This is the
 // OFFICE key (verified against ObsOffice.publicKey), NOT an agent's Flair key.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { wireObservatoryCapability } from "./capability.js";
 import { ObservatoryHttpClient } from "./client.js";
 import { loadConfigFromEnv } from "./config.js";

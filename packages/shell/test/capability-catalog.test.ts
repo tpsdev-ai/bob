@@ -6,7 +6,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { BLESSED_CATALOG, lookupCapability } from "../src/capability-catalog.js";
 import { resolveCapabilities } from "../src/capability-loader.js";
 

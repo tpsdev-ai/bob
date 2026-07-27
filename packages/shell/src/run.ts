@@ -33,7 +33,7 @@ import {
   DefaultResourceLoader,
   ModelRegistry,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { readCron } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
 import type { CronEntry } from "./index.js";
