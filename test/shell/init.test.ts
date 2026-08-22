@@ -46,6 +46,22 @@ describe("initAgent", () => {
     expect(soul.length).toBeGreaterThan(500);
   });
 
+  it("stamps agent identity (name/id/role) at the top of soul.md (#89)", () => {
+    // --no-interactive agents get no hiring interview — soul.md is the only
+    // thing the launcher feeds the model, so the identity must be IN it.
+    const res = initAgent(baseOpts());
+    const soul = readFileSync(join(res.agentDir, "soul.md"), "utf8");
+    // Header comes FIRST, before any template content.
+    expect(soul.startsWith("# You are Testbot (`testbot`)")).toBe(true);
+    expect(soul).toContain("hired into the `ea` role");
+    expect(soul).toContain("your Flair agent id is `testbot`");
+    // Role-template content is preserved intact below the header.
+    expect(soul).toContain("# EA (Executive Assistant) — base role soul");
+    expect(soul.indexOf("# You are Testbot")).toBeLessThan(
+      soul.indexOf("# EA (Executive Assistant)"),
+    );
+  });
+
   it("writes bob.yaml with provider + model + tools", () => {
     const res = initAgent({ ...baseOpts(), provider: "exe-dev-gateway", model: "claude-opus-4-7" });
     const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
@@ -164,6 +180,40 @@ describe("initAgent", () => {
       const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
       expect(launcher).toContain("--provider ollama-cloud");
+    });
+
+    it("exports FLAIR_AGENT_ID / FLAIR_URL / FLAIR_KEY_PATH from the flair config (#90)", () => {
+      // pi-flair reads exactly these three env names (flair
+      // packages/pi-flair/src/index.ts) — without them the agent can't
+      // reach its own memory scope. Fixture paths only; no real keys.
+      const res = initAgent(baseOpts());
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(launcher).toContain('export FLAIR_AGENT_ID="testbot"');
+      expect(launcher).toContain('export FLAIR_URL="http://127.0.0.1:19926"');
+      expect(launcher).toContain('export FLAIR_KEY_PATH="$HOME/.flair/keys/testbot.key"');
+    });
+
+    it("omits FLAIR_* exports entirely when skipFlair=true (no empty exports)", () => {
+      const res = initAgent({ ...baseOpts(), skipFlair: true });
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(launcher).not.toContain("FLAIR_AGENT_ID");
+      expect(launcher).not.toContain("FLAIR_URL");
+      expect(launcher).not.toContain("FLAIR_KEY_PATH");
+      expect(launcher).not.toContain('export FLAIR_URL=""');
+    });
+
+    it("defaults every Flair URL to :19926 — :9926 is a dead port (#90 mutation guard)", () => {
+      // Stock `flair init` serves 19926 (flair cli.ts DEFAULT_PORT). The
+      // `:`-anchored negative assertions fail if anything flips back to
+      // 9926 while still matching the 1 in :19926.
+      const res = initAgent(baseOpts());
+      const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+      expect(yaml).toContain("url: http://127.0.0.1:19926");
+      expect(yaml).toContain("flair_url: http://127.0.0.1:19926");
+      expect(launcher).toContain("http://127.0.0.1:19926");
+      expect(yaml).not.toContain(":9926");
+      expect(launcher).not.toContain(":9926");
     });
 
     it("opt-in sources $HOME/.tps/secrets/<name>-github-pat into GH_TOKEN", () => {
