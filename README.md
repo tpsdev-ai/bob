@@ -112,7 +112,7 @@ capabilities:
   - observatory
 
 flair:
-  url: http://127.0.0.1:9926
+  url: http://127.0.0.1:19926
   agentId: agent-one
   keyFile: ~/.flair/keys/agent-one.key
 

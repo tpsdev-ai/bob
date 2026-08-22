@@ -30,7 +30,7 @@ export const CONFIG_SCHEMA = Type.Object(
     // Flair base URL the agent's memory lives behind (its local spoke or a hub).
     url: Type.String({
       minLength: 1,
-      description: "Flair base URL, e.g. http://127.0.0.1:9926",
+      description: "Flair base URL, e.g. http://127.0.0.1:19926",
     }),
     // This agent's Flair id (the principal every request is signed as). Snake/
     // kebab lowercase — matches the Flair Agent record id.

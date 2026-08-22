@@ -23,6 +23,18 @@ import { loadRole } from "./role-loader.js";
 // keep them strict-safe.
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
+// Flair connection defaults shared by bob.yaml and the launcher. Stock
+// `flair init` serves HTTP on 19926 (flair cli.ts DEFAULT_PORT) — the old
+// :9926 default here pointed every fresh agent at a dead port (#90; same
+// bug as tpsdev-ai/flair#1347 in pi-flair).
+const DEFAULT_FLAIR_URL = "http://127.0.0.1:19926";
+
+// Where the agent's Ed25519 private key lives, in bob.yaml's `~` form.
+// The launcher swaps `~` for `$HOME` (expanded at runtime, not render time).
+function flairKeyFile(name: string): string {
+  return `~/.flair/keys/${name}.key`;
+}
+
 export interface InitOptions {
   name: string;
   role: BobRole;
@@ -73,9 +85,13 @@ export function initAgent(opts: InitOptions): InitResult {
   mkdirSync(join(agentDir, "memory"), { recursive: true });
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
 
-  // soul.md (from role template; user editable)
+  // soul.md (identity header + role template; user editable). The role
+  // template only describes the ROLE — the header stamps WHO the agent is
+  // (name, id, role), so a --no-interactive agent still boots knowing its
+  // own identity (#89). The hiring interview overwrites the file with a
+  // refined persona; this header is the floor, not the ceiling.
   const soulPath = join(agentDir, "soul.md");
-  writeFileSync(soulPath, template.soul);
+  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + template.soul);
   written.push(soulPath);
 
   // bob.yaml — canonical config
@@ -128,8 +144,8 @@ provider:
 
 identity:
   # PR-3 populates these (Ed25519 keypair + Flair Agent record).
-  flair_url: http://127.0.0.1:9926
-  key_file: ~/.flair/keys/${opts.name}.key
+  flair_url: ${DEFAULT_FLAIR_URL}
+  key_file: ${flairKeyFile(opts.name)}
   pub_file: ~/.flair/keys/${opts.name}.pub
 
 channels:
@@ -150,9 +166,24 @@ capabilities:
   - flair
 
 flair:
-  url: http://127.0.0.1:9926
+  url: ${DEFAULT_FLAIR_URL}
   agentId: ${opts.name}
-  keyFile: ~/.flair/keys/${opts.name}.key
+  keyFile: ${flairKeyFile(opts.name)}
+`;
+}
+
+// Identity header stamped above the role template in soul.md (#89).
+// soul.md is the only thing the launcher/run.ts feed the model
+// (--append-system-prompt), so if the name/id aren't HERE, the agent
+// doesn't know who it is — it can only guess from cwd or how it's
+// addressed. Mirrors the hiring interview's framing (onboard.ts
+// META_PROMPT: a new agent named "<name>" in the "<role>" role).
+function renderSoulIdentityHeader(opts: InitOptions): string {
+  const displayName = capitalize(opts.name);
+  return `# You are ${displayName} (\`${opts.name}\`)
+
+You are ${displayName}, a new agent hired into the \`${opts.role}\` role; your Flair agent id is \`${opts.name}\`.
+
 `;
 }
 
@@ -167,7 +198,7 @@ function renderLauncher(opts: InitOptions): string {
 
 AGENT_DIR=${homedirEscape()}/agents/${opts.name}
 export PI_CODING_AGENT_DIR="$AGENT_DIR/.pi-agent"
-
+${renderLauncherFlairEnv(opts)}
 # Identity for any git commits the agent makes
 export GIT_AUTHOR_NAME="${capitalize(opts.name)}"
 export GIT_AUTHOR_EMAIL="${opts.name}@tps.dev"
@@ -195,6 +226,24 @@ cd "$AGENT_DIR/work"
 # agent identity is lost. See reference_bob_init_papercuts.
 exec pi --provider ${piProvider} --model ${opts.model} \\
   --append-system-prompt "$(cat $AGENT_DIR/soul.md)" "$@"
+`;
+}
+
+// Flair env for the launcher (#90). pi-flair reads exactly these three
+// vars — FLAIR_URL / FLAIR_AGENT_ID / FLAIR_KEY_PATH (verified against
+// packages/pi-flair/src/index.ts on tpsdev-ai/flair main) — to sign
+// requests as THIS agent; without them it guesses an identity from cwd
+// (or errors) and the agent can't reach its own memory. Values mirror
+// bob.yaml's flair block. skipFlair means no key was generated, so we
+// omit the whole block rather than export paths to nothing.
+function renderLauncherFlairEnv(opts: InitOptions): string {
+  if (opts.skipFlair) return "";
+  const keyPath = flairKeyFile(opts.name).replace(/^~/, "$HOME");
+  return `
+# Flair memory (pi-flair) — scope reads/writes to this agent's own identity.
+export FLAIR_AGENT_ID="${opts.name}"
+export FLAIR_URL="${DEFAULT_FLAIR_URL}"
+export FLAIR_KEY_PATH="${keyPath}"
 `;
 }
 

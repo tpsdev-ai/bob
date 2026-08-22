@@ -21,7 +21,7 @@ export interface FlairPairOptions {
   name: string;
   // Where keys live. Defaults to ~/.flair/keys/. Tests override.
   keysDir?: string;
-  // Flair admin endpoint (e.g., http://127.0.0.1:9926). If empty, only
+  // Flair admin endpoint (e.g., http://127.0.0.1:19926). If empty, only
   // generates the keypair on disk and skips registration.
   flairUrl?: string;
   // Path to admin password file. Defaults to ~/.flair/admin-pass.
