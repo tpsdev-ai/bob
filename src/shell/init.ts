@@ -27,7 +27,7 @@ const AGENT_NAME = /^[a-z0-9-]+$/;
 // `flair init` serves HTTP on 19926 (flair cli.ts DEFAULT_PORT) — the old
 // :9926 default here pointed every fresh agent at a dead port (#90; same
 // bug as tpsdev-ai/flair#1347 in pi-flair).
-const DEFAULT_FLAIR_URL = "http://127.0.0.1:19926";
+export const DEFAULT_FLAIR_URL = "http://127.0.0.1:19926";
 
 // Where the agent's Ed25519 private key lives, in bob.yaml's `~` form.
 // The launcher swaps `~` for `$HOME` (expanded at runtime, not render time).
@@ -52,6 +52,10 @@ export interface InitOptions {
   // If true, skip Ed25519 keypair generation entirely. For dry-runs or
   // hostless tests that don't want the .flair dir polluted.
   skipFlair?: boolean;
+  // Flair REST base URL baked into bob.yaml + the launcher. Defaults to
+  // DEFAULT_FLAIR_URL. Set it when the agent belongs to a hub rather than a
+  // local spoke.
+  flairUrl?: string;
 }
 
 export interface InitResult {
@@ -61,6 +65,17 @@ export interface InitResult {
   // separate step (registerWithFlair) — initAgent only generates the
   // keypair on disk to keep the function sync + filesystem-only.
   flair?: FlairPairResult;
+  // The Flair wiring this scaffold actually emitted, so the caller registers
+  // against the SAME url/key it wrote into bob.yaml and the launcher instead
+  // of re-deriving the defaults and drifting from them. Undefined when
+  // skipFlair=true. `keyFile` is bob.yaml's `~`-prefixed form; `keyPath` is
+  // the absolute path on this machine.
+  flairConfig?: {
+    url: string;
+    agentId: string;
+    keyFile: string;
+    keyPath: string;
+  };
 }
 
 export function initAgent(opts: InitOptions): InitResult {
@@ -112,20 +127,35 @@ export function initAgent(opts: InitOptions): InitResult {
   chmodSync(binPath, 0o755);
   written.push(binPath);
 
-  // Flair Ed25519 keypair (registration is a separate async step;
-  // we only generate the keys on disk here to keep initAgent sync).
+  // Flair Ed25519 keypair. Registration is a separate ASYNC step — initAgent
+  // stays sync + filesystem-only — but it is no longer an OPTIONAL one: the
+  // caller (cli.ts's onboard) runs provisionFlairIdentity() with the
+  // flairConfig returned below, and fails loudly if it cannot. Leaving a key
+  // on disk with no Agent record is the defect of #93.
   let flair: FlairPairResult | undefined;
+  let flairConfig: InitResult["flairConfig"];
   if (!opts.skipFlair) {
     flair = flairPair({
       name: opts.name,
       keysDir: opts.flairKeysDir,
-      // No flairUrl — caller invokes registerWithFlair() separately
-      // with the URL of their hub.
     });
     written.push(flair.privateKeyPath, flair.publicKeyPath);
+    flairConfig = {
+      url: flairUrlFor(opts),
+      agentId: opts.name,
+      keyFile: flairKeyFile(opts.name),
+      keyPath: flair.privateKeyPath,
+    };
   }
 
-  return { agentDir, files: written, flair };
+  return { agentDir, files: written, flair, flairConfig };
+}
+
+// Single resolution point for the agent's Flair URL: bob.yaml, the launcher's
+// FLAIR_URL export, and the registration the caller performs all read THIS, so
+// none of them can drift from the others.
+function flairUrlFor(opts: Pick<InitOptions, "flairUrl">): string {
+  return opts.flairUrl ?? DEFAULT_FLAIR_URL;
 }
 
 function renderBobYaml(opts: InitOptions, toolsAllow: string[]): string {
@@ -143,8 +173,8 @@ provider:
   model: ${opts.model}
 
 identity:
-  # PR-3 populates these (Ed25519 keypair + Flair Agent record).
-  flair_url: ${DEFAULT_FLAIR_URL}
+  # Ed25519 keypair on disk + the Flair Agent record registered at onboard.
+  flair_url: ${flairUrlFor(opts)}
   key_file: ${flairKeyFile(opts.name)}
   pub_file: ~/.flair/keys/${opts.name}.pub
 
@@ -166,7 +196,7 @@ capabilities:
   - flair
 
 flair:
-  url: ${DEFAULT_FLAIR_URL}
+  url: ${flairUrlFor(opts)}
   agentId: ${opts.name}
   keyFile: ${flairKeyFile(opts.name)}
 `;
@@ -242,7 +272,7 @@ function renderLauncherFlairEnv(opts: InitOptions): string {
   return `
 # Flair memory (pi-flair) — scope reads/writes to this agent's own identity.
 export FLAIR_AGENT_ID="${opts.name}"
-export FLAIR_URL="${DEFAULT_FLAIR_URL}"
+export FLAIR_URL="${flairUrlFor(opts)}"
 export FLAIR_KEY_PATH="${keyPath}"
 `;
 }

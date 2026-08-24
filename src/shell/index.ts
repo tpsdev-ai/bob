@@ -74,12 +74,48 @@ export {
   runDoctor,
 } from "./doctor.js";
 export {
+  ADMIN_PASS_ENV,
+  adminPassPath,
+  checkFlairRegistration,
+  FlairAdminCredentialError,
+  type FlairFetch,
   type FlairPairOptions,
   type FlairPairResult,
+  type FlairRegistration,
   flairPair,
+  OPS_TARGET_ENV,
+  type RegistrationOutcome,
+  type RegistrationState,
   registerWithFlair,
+  resolveFlairAdminPass,
+  resolveFlairOpsUrl,
+  verifyRegisteredWithFlair,
 } from "./flair-pair.js";
-export { type InitOptions, type InitResult, initAgent } from "./init.js";
+export {
+  describeProvisioning,
+  type ProvisionFlairIdentityOptions,
+  type ProvisionFlairIdentityResult,
+  provisionFlairIdentity,
+  type SyncFlairSoulOptions,
+  syncFlairSoul,
+} from "./flair-provision.js";
+export {
+  type PushSoulOptions,
+  pushSoulToFlair,
+  readFlairSoul,
+  SOUL_DIVERGENCE_BACKUP,
+  SOUL_KEY_NAME,
+  SOUL_KEY_PERSONA,
+  SOUL_KEY_ROLE,
+  type SoulPushResult,
+  soulPathFor,
+} from "./flair-soul.js";
+export {
+  DEFAULT_FLAIR_URL,
+  type InitOptions,
+  type InitResult,
+  initAgent,
+} from "./init.js";
 export {
   MailConsumer,
   type MailConsumerOptions,
