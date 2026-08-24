@@ -97,6 +97,12 @@ const ENV = {
   npm_config_fund: "false",
   npm_config_update_notifier: "false",
 };
+// This sandbox has no Flair instance, so it must carry no Flair credential
+// either. Otherwise the "refuses to half-provision" check below would pass or
+// fail on the RUNNER's ambient environment rather than on bob's behaviour —
+// a check that fires only where it isn't needed.
+delete ENV.FLAIR_ADMIN_PASS;
+delete ENV.FLAIR_OPS_TARGET;
 
 try {
   console.log(`scratch: ${scratch}\n`);
@@ -194,10 +200,33 @@ try {
     return "exit 0";
   });
 
-  check("bob onboard --no-interactive (scaffolds a real agent)", () => {
-    const r = cli("onboard", "packbot", "--role", "ea", "--no-interactive");
+  // --no-flair: this sandbox has no Flair instance and no admin credential, and
+  // onboarding a Flair-native agent needs both. The explicit opt-out is the
+  // supported way to scaffold without an identity — the check below pins the
+  // other branch, that WITHOUT the opt-out bob refuses rather than shipping a
+  // half-provisioned agent (#93).
+  check("bob onboard --no-interactive --no-flair (scaffolds a real agent)", () => {
+    const r = cli("onboard", "packbot", "--role", "ea", "--no-interactive", "--no-flair");
     if (r.status !== 0) throw new Error(`exit ${r.status}\n${r.stderr}`);
     return "exit 0";
+  });
+
+  check("bob onboard REFUSES to half-provision when it cannot register (#93)", () => {
+    // No FLAIR_ADMIN_PASS and no ~/.flair/admin-pass in this sandbox, so the
+    // Agent record cannot be created. The published artifact must FAIL here —
+    // a zero exit would mean it shipped an agent with a keypair and no
+    // identity, which is the defect the flag above exists to opt out of.
+    const r = cli("onboard", "packbot-unregistered", "--role", "ea", "--no-interactive");
+    if (r.status === 0) throw new Error("exit 0 — onboard silently skipped registration");
+    const out = `${r.stdout}${r.stderr}`;
+    if (!out.includes("no admin credential available")) {
+      throw new Error(`failed, but not for the stated reason:\n${out.slice(0, 400)}`);
+    }
+    // Actionable: names the env var, the file, and the manual fallback.
+    for (const needle of ["FLAIR_ADMIN_PASS", "admin-pass", "flair agent add", "--no-flair"]) {
+      if (!out.includes(needle)) throw new Error(`message omits ${needle}`);
+    }
+    return `exit ${r.status}, actionable`;
   });
 
   check("bob doctor", () => {
