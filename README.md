@@ -11,19 +11,28 @@ Bob is a thin TypeScript shell on top of [pi-coding-agent](https://github.com/ea
 bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
 ```
 
-`bob onboard` does three things:
+`bob onboard` does four things:
 
 1. **Scaffolds** `~/agents/pulse/` — soul.md (from the role template), bob.yaml config, ed25519 keypair, per-agent pi config (auth + gateway routing), and an executable launcher at `bin/pulse`.
-2. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done.
-3. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob serve pulse --discord --discord-token-file ~/.tps/secrets/pulse-token --discord-channels 123,456` keeps Pulse listening on Discord and responding to mentions.
+2. **Provisions the Flair identity** — registers the Ed25519 public key as a Flair **Agent** record and writes the persona into Pulse's Flair **soul**, in that order. Without the Agent record the agent's signed memory/soul calls don't verify; without the soul entry its own `bootstrap` returns no persona. Both are part of "onboarded", not follow-up chores.
+3. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done. Bob mirrors the result back into Flair.
+4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob serve pulse --discord --discord-token-file ~/.tps/secrets/pulse-token --discord-channels 123,456` keeps Pulse listening on Discord and responding to mentions.
+
+### Flair identity, and where the soul lives
+
+Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Bob reads it from `FLAIR_ADMIN_PASS` in the environment, or from the `0600` `~/.flair/admin-pass` file `flair init` writes — **never from a command-line flag**, because argv is world-readable and lands in shell history. If neither is available, `bob onboard` fails with the exact fix rather than leaving a keypair on disk with no identity behind it. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points it at a hub instead of the local spoke.
+
+The persona is mirrored **one way: `soul.md` → Flair**, at the points where bob is already authoring one (`bob onboard`, `bob align`). Flair is the source of truth for *consumers* — it's what `bootstrap` returns, what travels to another machine running that identity, and what federates. `soul.md` is the source of truth for *authoring* — the hiring interview and your editor both write it, and the launcher reads it locally so a Flair outage can never boot a persona-less agent. Launch itself never syncs, in either direction.
+
+If the two diverge (you edited `soul.md` after onboarding, or something else wrote the soul), the local file wins — loudly and losslessly: bob saves Flair's copy to `soul.flair.bak.md` next to `soul.md` and warns, naming both. Nothing is resolved silently.
 
 ## What's wired
 
 | Concern             | Owner                                                          |
 | ------------------- | -------------------------------------------------------------- |
 | Agent loop, tools, model providers | [pi-coding-agent](https://github.com/earendil-works/pi) |
-| Soul / persona      | `~/agents/<name>/soul.md` — shaped by `bob onboard` / `bob align` |
-| Identity            | Ed25519 keypair + Flair Agent record (Bob)                     |
+| Soul / persona      | Flair soul (canonical) ← mirrored from `~/agents/<name>/soul.md` by `bob onboard` / `bob align` |
+| Identity            | Ed25519 keypair + Flair Agent record, both provisioned at onboard (Bob) |
 | Memory              | [Flair](https://github.com/tpsdev-ai/flair)                    |
 | Inbound mail        | TPS mail consumer (Bob)                                        |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
@@ -34,8 +43,8 @@ bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
 
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
-| `bob onboard <name>`     | Scaffold + interactive hiring interview (writes soul.md)                     |
-| `bob align <name>`       | Recurring drift check — refines persona through conversation                 |
+| `bob onboard <name>`     | Scaffold + register the Flair identity + write its soul + hiring interview   |
+| `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair          |
 | `bob run <name> [prompt]`| Run one session. `--model X` overrides per call; `--interactive` for a TUI   |
 | `bob serve <name>`       | Daemon: mail consumer + optional `--discord` listener                        |
 | `bob doctor <name>`      | Health check (stubbed — coming with branch-office tooling)                   |

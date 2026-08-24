@@ -6,13 +6,20 @@
 // the type surface + role-template structure before we hand-roll the
 // runtime.
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   type BobRole,
+  DEFAULT_FLAIR_URL,
+  describeProvisioning,
   down,
   formatReport,
+  type InitResult,
   initAgent,
   installService,
   loadRole,
+  provisionFlairIdentity,
+  readBlock,
   restart,
   runAgent,
   runAlign,
@@ -20,6 +27,7 @@ import {
   runOnboard,
   runPersistent,
   servicePath,
+  syncFlairSoul,
   up,
 } from "./shell/index.js";
 
@@ -57,11 +65,16 @@ function help(): void {
 Usage: bob <command> [args]
 
 Commands:
-  onboard <name>      Hire a new Bob-shaped agent and form them into a role
+  onboard <name>      Hire a new Bob-shaped agent and form them into a role.
+                      Registers the Flair Agent record and writes the persona
+                      into the agent's Flair soul.
                       Flags: --role <r> --provider <p> --model <m>
+                             --flair-url <u> --no-flair
                              --dry-run --force --no-interactive
-  align <name>        Recurring check-in to refine an existing agent
+  align <name>        Recurring check-in to refine an existing agent. Mirrors
+                      the revised persona back into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
+                             --no-flair
   run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
                       that stays up, loading bob.yaml capabilities (discord
                       gateway, cron). This is what the service unit runs.
@@ -77,7 +90,12 @@ Commands:
   office join <name>  Join an existing branch office
   help                Show this help
 
-Roles: ea | writer | reviewer | coder | qa | custom`);
+Roles: ea | writer | reviewer | coder | qa | custom
+
+Flair: onboarding registers the agent as a Flair principal, which needs an admin
+credential for the target instance — FLAIR_ADMIN_PASS in the environment, or the
+0600 ~/.flair/admin-pass file 'flair init' writes. Never pass it as a flag. Use
+--no-flair to scaffold an agent with no Flair identity at all.`);
 }
 
 async function onboard(name: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -87,6 +105,14 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   const dryRun = flags["dry-run"] === true;
   const force = flags.force === true;
   const noInteractive = flags["no-interactive"] === true;
+  // --no-flair is an EXPLICIT opt-out, not a fallback. When Flair is in play
+  // (the default) a missing admin credential FAILS the command; the way to
+  // scaffold without an identity is to say so.
+  const noFlair = flags["no-flair"] === true;
+  const flairUrl =
+    flags["flair-url"] !== undefined && flags["flair-url"] !== true
+      ? String(flags["flair-url"])
+      : DEFAULT_FLAIR_URL;
 
   if (dryRun) {
     const template = loadRole(role);
@@ -99,19 +125,33 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
   bob.yaml        → ~/agents/${name}/bob.yaml
+  flair identity  = ${noFlair ? "SKIPPED (--no-flair)" : `Agent record + soul at ${flairUrl}`}
   interview       = ${noInteractive ? "SKIPPED (--no-interactive)" : "interactive pi session"}`);
     return;
   }
 
-  const result = initAgent({ name, role, provider, model, noClobber: !force });
+  const result = initAgent({
+    name,
+    role,
+    provider,
+    model,
+    noClobber: !force,
+    skipFlair: noFlair,
+    flairUrl,
+  });
   console.log(
     `[bob onboard] scaffolded ${name} — wrote ${result.files.length} files into ${result.agentDir}`,
   );
   for (const f of result.files) console.log(`  ${f}`);
 
+  // Identity BEFORE persona (#93 then #94). Both are part of "onboarded" —
+  // a keypair with no Agent record is a scaffold, not an agent, and the soul
+  // write is signed as that identity so it cannot precede it.
+  await provisionOnboard(result, { name, role, flairUrl, noFlair });
+
   if (noInteractive) {
     console.log(`\nSkipped interview (--no-interactive). Edit ~/agents/${name}/soul.md by hand,`);
-    console.log(`or run 'bob align ${name}' later to shape the persona conversationally.`);
+    console.log(`then run 'bob align ${name}' to push the revised persona into Flair.`);
     return;
   }
 
@@ -133,10 +173,59 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   }
   if (outcome.soulUpdated) {
     console.log(`[bob onboard] persona updated — ${outcome.soulPath} rewritten`);
+    // The interview rewrote soul.md AFTER the first mirror, so Flair still
+    // holds the seed template. Push again — otherwise the whole point of the
+    // interview stops at the local file, which is #94 all over again.
+    if (!noFlair && result.flairConfig) {
+      const again = await syncFlairSoul({
+        name,
+        role,
+        flairUrl: result.flairConfig.url,
+        keyFile: result.flairConfig.keyPath,
+        soulPath: outcome.soulPath,
+      });
+      console.log(`[bob onboard] Flair soul updated with the interviewed persona`);
+      console.log(describeProvisioning(again));
+    }
   } else {
     console.log(`[bob onboard] persona unchanged — ${outcome.soulPath} still the seed template.`);
     console.log(`Run 'bob align ${name}' to try the interview again.`);
   }
+}
+
+// Register the Agent record + mirror the seed soul. Kept next to onboard()
+// rather than inline so the "identity, then soul" order is one call, and so
+// the --no-flair branch is the only way past it.
+async function provisionOnboard(
+  result: InitResult,
+  opts: { name: string; role: string; flairUrl: string; noFlair: boolean },
+): Promise<void> {
+  if (opts.noFlair) {
+    console.log(
+      `\n[bob onboard] --no-flair: no keypair, no Agent record, no soul in Flair.\n` +
+        `  ${opts.name} will run with a local soul.md only. Register later with:\n` +
+        `    flair agent add ${opts.name} && bob onboard ${opts.name} --force`,
+    );
+    return;
+  }
+  if (!result.flairConfig || !result.flair) {
+    // Unreachable via the CLI (both are populated whenever skipFlair is
+    // false), but an empty branch here would hide a future regression that
+    // stops populating them — which is exactly the silent skip #93 is about.
+    throw new Error(
+      `bob onboard ${opts.name}: scaffold produced no Flair config; cannot register the identity.`,
+    );
+  }
+  console.log(`\n[bob onboard] provisioning Flair identity for ${opts.name}…`);
+  const provisioned = await provisionFlairIdentity({
+    name: opts.name,
+    role: opts.role,
+    flairUrl: result.flairConfig.url,
+    publicKeyBase64: result.flair.publicKeyBase64,
+    keyFile: result.flairConfig.keyPath,
+    soulPath: join(result.agentDir, "soul.md"),
+  });
+  console.log(describeProvisioning(provisioned));
 }
 
 async function align(name: string, flags: Record<string, string | boolean>): Promise<void> {
@@ -159,6 +248,45 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   } else {
     console.log(`[bob align] no drift surfaced — persona unchanged`);
   }
+
+  // Mirror local → Flair whether or not the interview changed anything: an
+  // unchanged soul.md can still differ from Flair (someone edited the file by
+  // hand since the last align), and that divergence is the case worth
+  // surfacing. syncFlairSoul verifies registration first — no admin
+  // credential required, because align only ever writes the agent's own soul.
+  if (flags["no-flair"] === true) return;
+  const flair = readFlairBlock(agentDir);
+  const synced = await syncFlairSoul({
+    name,
+    role: readAgentRole(agentDir),
+    flairUrl: flair.url,
+    keyFile: flair.keyFile,
+    soulPath: outcome.soulPath,
+  });
+  console.log(describeProvisioning(synced));
+}
+
+// Read the agent's own `flair:` block out of its bob.yaml. Align must target
+// the instance and key the agent was ONBOARDED against, not today's default —
+// re-deriving them here is how an agent silently gets a soul on the wrong hub.
+function readFlairBlock(agentDir: string): { url: string; agentId: string; keyFile: string } {
+  const yamlPath = join(agentDir, "bob.yaml");
+  const block = readBlock(readFileSync(yamlPath, "utf8"), "flair");
+  const url = block?.url;
+  const agentId = block?.agentId;
+  const keyFile = block?.keyFile;
+  if (typeof url !== "string" || typeof agentId !== "string" || typeof keyFile !== "string") {
+    throw new Error(
+      `${yamlPath}: the flair: block must carry url, agentId and keyFile. ` +
+        `Re-run 'bob onboard <name> --force' to regenerate it.`,
+    );
+  }
+  return { url, agentId, keyFile };
+}
+
+function readAgentRole(agentDir: string): string | undefined {
+  const block = readBlock(readFileSync(join(agentDir, "bob.yaml"), "utf8"), "agent");
+  return typeof block?.role === "string" ? block.role : undefined;
 }
 
 async function run(

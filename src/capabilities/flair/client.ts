@@ -11,6 +11,8 @@
 //   search: POST /SemanticSearch {agentId, q, limit} -> { results:[{id,content,createdAt,_score}] }
 //   write : PUT  /Memory/<id> {id, agentId, content, durability, createdAt, supersedes?}
 //   get   : GET  /Memory/<id>
+//   soul  : PUT  /Soul/<agentId:key> {id, agentId, key, value, durability, createdAt}
+//           GET  /Soul/<agentId:key>
 //
 // SECURITY: the private key is read from a FILE PATH once, parsed into a
 // node KeyObject, and used only to sign. It is never logged, echoed, returned
@@ -32,6 +34,16 @@ export interface FlairMemory {
   content?: string;
   createdAt?: string;
   durability?: string;
+  [k: string]: unknown;
+}
+
+export interface FlairSoulEntry {
+  id: string;
+  agentId?: string;
+  key?: string;
+  value: string;
+  durability?: string;
+  updatedAt?: string;
   [k: string]: unknown;
 }
 
@@ -66,6 +78,51 @@ export interface FlairHttpClientOptions {
   readFile?: (path: string) => string;
 }
 
+// ─── Signing primitives (exported for reuse by the shell) ───────────────────
+//
+// Bob signs Flair requests from TWO places: this capability (the agent's own
+// memory tools at runtime) and the shell's provisioning path (registering the
+// identity + mirroring the soul during `bob onboard` / `bob align`). Both use
+// the SAME protocol, so the protocol lives in exactly one pair of functions.
+// A second hand-rolled copy is how the tsMs-in-seconds 1000x defect called out
+// at the top of this file gets reintroduced somewhere else.
+
+// Parse an on-disk Flair private key into a node KeyObject. createPrivateKey is
+// forgiving about input shape: a PEM PKCS8 string (what `bob onboard` writes —
+// `-----BEGIN PRIVATE KEY-----`) is parsed directly, while a raw base64-DER
+// PKCS8 string (the alternate flair convention) is decoded from base64 into DER
+// first. webcrypto's subtle.importKey("pkcs8", …) throws a DataError on the PEM
+// form, which is the bug this replaces.
+//
+// SECURITY: takes the key MATERIAL, returns an opaque KeyObject. It never
+// stringifies, logs or returns the input.
+export function loadFlairPrivateKey(keyFileContents: string): KeyObject {
+  const raw = keyFileContents.trim();
+  return raw.includes("-----BEGIN")
+    ? createPrivateKey(raw)
+    : createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+}
+
+// Build the `Authorization: TPS-Ed25519 …` header for one request. tsMs is in
+// MILLISECONDS (a seconds value is a 1000x error the server answers with 401).
+// The signature binds agentId + ts + nonce + METHOD + path, so a header cannot
+// be replayed against a different route.
+export function tpsEd25519AuthHeader(args: {
+  agentId: string;
+  key: KeyObject;
+  method: string;
+  path: string;
+  tsMs: number;
+  nonce: string;
+}): string {
+  const ts = String(args.tsMs);
+  const payload = `${args.agentId}:${ts}:${args.nonce}:${args.method}:${args.path}`;
+  // Ed25519 sign: the algorithm is the key, so the first arg MUST be null.
+  // signEd25519 returns a Buffer (the 64-byte raw signature).
+  const sig = signEd25519(null, Buffer.from(payload, "utf8"), args.key);
+  return `TPS-Ed25519 ${args.agentId}:${ts}:${args.nonce}:${Buffer.from(sig).toString("base64")}`;
+}
+
 export class FlairHttpClient implements FlairClient {
   private readonly url: string;
   private readonly agentId: string;
@@ -96,33 +153,35 @@ export class FlairHttpClient implements FlairClient {
     this.readFile = opts.readFile ?? ((p) => readFileSync(p, "utf8"));
   }
 
-  // Parse the on-disk private key into a node KeyObject. createPrivateKey is
-  // forgiving about input shape: a PEM PKCS8 string (what `bob flair-pair`
-  // writes — `-----BEGIN PRIVATE KEY-----`) is parsed directly, while a raw
-  // base64-DER PKCS8 string (the alternate flair convention) is decoded from
-  // base64 into DER first. webcrypto's subtle.importKey("pkcs8", …) throws a
-  // DataError on the PEM form, which is the bug this replaces.
+  // Parse the on-disk private key into a node KeyObject. See
+  // loadFlairPrivateKey (module scope) for the shape-handling rationale;
+  // this only adds per-instance caching.
   private loadKey(): KeyObject {
     if (!this.keyObject) {
-      const raw = this.readFile(this.keyFile).trim();
-      this.keyObject = raw.includes("-----BEGIN")
-        ? createPrivateKey(raw)
-        : createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+      this.keyObject = loadFlairPrivateKey(this.readFile(this.keyFile));
     }
     return this.keyObject;
   }
 
-  private async signedFetch(method: string, path: string, body?: unknown): Promise<unknown> {
-    const key = this.loadKey();
-    const ts = String(this.now());
-    const nonce = this.uuid();
-    // tsMs in MILLISECONDS — see protocol note. Signature binds method + path.
-    const payload = `${this.agentId}:${ts}:${nonce}:${method}:${path}`;
-    // Ed25519 sign: the algorithm is the key, so the first arg MUST be null.
-    // signEd25519 returns a Buffer (the 64-byte raw signature).
-    const sig = signEd25519(null, Buffer.from(payload, "utf8"), key);
+  private async signedFetch(
+    method: string,
+    path: string,
+    body?: unknown,
+    // Statuses to surface as `null` instead of throwing. Only ever passed
+    // `[404]`, by soulGet — "this entry does not exist yet" is an ordinary
+    // answer to a read, not a failure, and string-matching a thrown message
+    // for "404" is the fragile alternative.
+    nullOnStatus?: readonly number[],
+  ): Promise<unknown> {
     const headers: Record<string, string> = {
-      Authorization: `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${Buffer.from(sig).toString("base64")}`,
+      Authorization: tpsEd25519AuthHeader({
+        agentId: this.agentId,
+        key: this.loadKey(),
+        method,
+        path,
+        tsMs: this.now(),
+        nonce: this.uuid(),
+      }),
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const res = await this.fetchImpl(`${this.url}${path}`, {
@@ -132,6 +191,7 @@ export class FlairHttpClient implements FlairClient {
     });
     const text = await res.text();
     if (!res.ok) {
+      if (nullOnStatus?.includes(res.status)) return null;
       // Never include request body or auth header — only status + a short,
       // server-provided reason (which names no secret).
       throw new Error(`flair ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
@@ -181,5 +241,48 @@ export class FlairHttpClient implements FlairClient {
       | FlairMemory
       | undefined;
     return r ?? null;
+  }
+
+  // ── Soul (per-identity persona/context entries) ───────────────────────────
+  //
+  // Soul rows are keyed `<agentId>:<key>` and are written by PUT on that id —
+  // the Soul table resource has no collection POST, so a bare `POST /Soul`
+  // 405s (flair#498). Body carries agentId because flair's Soul.put()
+  // validates it against the SIGNING identity and rejects a mismatch, so this
+  // can only ever write the signing agent's own soul.
+  //
+  // Durability defaults to `permanent` server-side: a soul entry is identity,
+  // not working memory, and must not age out of bootstrap.
+
+  soulEntryId(key: string): string {
+    return `${this.agentId}:${key}`;
+  }
+
+  async soulSet(key: string, value: string): Promise<{ id: string }> {
+    const id = this.soulEntryId(key);
+    await this.signedFetch("PUT", `/Soul/${encodeURIComponent(id)}`, {
+      id,
+      agentId: this.agentId,
+      key,
+      value,
+      durability: "permanent",
+      createdAt: new Date(this.now()).toISOString(),
+    });
+    return { id };
+  }
+
+  async soulGet(key: string): Promise<FlairSoulEntry | null> {
+    const id = this.soulEntryId(key);
+    const r = (await this.signedFetch(
+      "GET",
+      `/Soul/${encodeURIComponent(id)}`,
+      undefined,
+      [404],
+    )) as FlairSoulEntry | null | undefined;
+    // A verified read of a missing row can come back as null, undefined, or an
+    // empty object depending on the Harper version — treat all three as "absent"
+    // rather than as an entry whose value happens to be undefined.
+    if (!r || typeof r.value !== "string") return null;
+    return r;
   }
 }

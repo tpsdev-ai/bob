@@ -35,6 +35,36 @@ describe("bob CLI", () => {
     expect(out).toContain("[bob onboard] PLAN (--dry-run)");
   });
 
+  it("onboard --dry-run states that it will provision the Flair identity (#93/#94)", () => {
+    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run`, { encoding: "utf8" });
+    expect(out).toContain("flair identity  = Agent record + soul at http://127.0.0.1:19926");
+  });
+
+  it("onboard --dry-run --no-flair states the identity is SKIPPED", () => {
+    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run --no-flair`, {
+      encoding: "utf8",
+    });
+    expect(out).toContain("flair identity  = SKIPPED (--no-flair)");
+  });
+
+  it("onboard --dry-run honours --flair-url", () => {
+    const out = execSync(
+      `node ${CLI} onboard testbot --role ea --dry-run --flair-url http://hub.example:19926`,
+      { encoding: "utf8" },
+    );
+    expect(out).toContain("Agent record + soul at http://hub.example:19926");
+  });
+
+  it("help documents the admin credential channel — and that it is never a flag", () => {
+    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    expect(out).toContain("FLAIR_ADMIN_PASS");
+    expect(out).toContain("Never pass it as a flag");
+    expect(out).toContain("--no-flair");
+    // There must be no --admin-pass flag to find: a credential in argv is
+    // world-readable and lands in shell history.
+    expect(out).not.toContain("--admin-pass");
+  });
+
   it("onboard --no-interactive renders the plan with interview SKIPPED", () => {
     const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run --no-interactive`, {
       encoding: "utf8",

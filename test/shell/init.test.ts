@@ -145,9 +145,38 @@ describe("initAgent", () => {
   it("skips Flair keypair when skipFlair=true", () => {
     const res = initAgent({ ...baseOpts(), skipFlair: true });
     expect(res.flair).toBeUndefined();
+    expect(res.flairConfig).toBeUndefined();
     // Files list shouldn't include any .key/.pub paths
     expect(res.files.some((f) => f.endsWith(".key"))).toBe(false);
     expect(res.files.some((f) => f.endsWith(".pub"))).toBe(false);
+  });
+
+  // #93: the caller registers the Agent record, so it needs the SAME url and
+  // key path the scaffold baked into bob.yaml + the launcher. Re-deriving the
+  // default in the caller is how an agent gets registered on one instance and
+  // configured to talk to another.
+  it("returns the flair wiring it actually emitted", () => {
+    const res = initAgent(baseOpts());
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(res.flairConfig).toBeDefined();
+    expect(res.flairConfig?.agentId).toBe("testbot");
+    expect(res.flairConfig?.keyPath).toBe(res.flair?.privateKeyPath ?? "");
+    expect(yaml).toContain(`url: ${res.flairConfig?.url}`);
+    expect(yaml).toContain(`keyFile: ${res.flairConfig?.keyFile}`);
+  });
+
+  it("--flair-url reaches bob.yaml, the launcher AND the returned config together", () => {
+    const url = "http://hub.example:19926";
+    const res = initAgent({ ...baseOpts(), flairUrl: url });
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
+    expect(res.flairConfig?.url).toBe(url);
+    expect(yaml).toContain(`url: ${url}`);
+    expect(yaml).toContain(`flair_url: ${url}`);
+    expect(launcher).toContain(`export FLAIR_URL="${url}"`);
+    // …and the old default is gone from all three, not merely joined by the new one.
+    expect(yaml).not.toContain("127.0.0.1:19926");
+    expect(launcher).not.toContain("127.0.0.1:19926");
   });
 
   it("private key is mode 0600", () => {
