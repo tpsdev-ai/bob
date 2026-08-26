@@ -14,4 +14,19 @@
 
 [install]
 minimumReleaseAge = 604800
-minimumReleaseAgeExcludes = ["@types/node", "typescript", "@biomejs/biome"]
+# @biomejs/biome was excluded here until 2026-08-26. The exclusion was
+# BROKEN as written -- it named only the meta package, while biome ships
+# its executables as separate platform packages (@biomejs/cli-darwin-arm64,
+# cli-linux-x64-musl, and six more). Excluding the meta package alone was
+# unsatisfiable, so any lockfile regeneration produced either a biome with
+# no runnable binary or a hard install failure (bob#67).
+#
+# It was DROPPED rather than widened to nine. No rationale for it was ever
+# recorded, and the reasons given below for @types/node and typescript cut
+# the other way for biome: it ships precompiled native binaries that execute
+# during lint (the highest-risk class to fast-track), it is not coupled to
+# our runtime version, and it is published by a smaller org. Nothing breaks
+# if a linter is seven days old.
+#
+# Do not re-add biome -- or anything else -- without a written reason here.
+minimumReleaseAgeExcludes = ["@types/node", "typescript"]
