@@ -27,7 +27,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.79.10",
-    "croner": "9.0.0",
+    "croner": "10.0.1",
     "discord.js": "^14.27.0",
     "typebox": "1.1.38"
   },
