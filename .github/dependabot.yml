@@ -16,6 +16,23 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # PAIRED WITH bunfig.toml `minimumReleaseAge = 604800` (7 days). Keep them
+    # equal. Dependabot's updater runs `bun install` INSIDE this repo, so it
+    # reads that gate; without a matching cooldown it proposes versions younger
+    # than the window and the job HARD-FAILS with
+    # `dependency_file_not_resolvable`, turning the Dependabot lane red on main
+    # (bob#98). Dependabot's own default is only 3 days, which is why the
+    # mismatch bites.
+    #
+    # Units here are DAYS (1-90); bunfig is SECONDS. 7 days == 604800 s.
+    # The excludes MIRROR bunfig's `minimumReleaseAgeExcludes` — a package our
+    # install guard accepts immediately should not be held back by dependabot.
+    # If you change one list, change the other.
+    cooldown:
+      default-days: 7
+      exclude:
+        - "@types/node"
+        - "typescript"
     groups:
       typescript-ecosystem:
         patterns:
