@@ -1,7 +1,16 @@
 version: 2
 updates:
-  # Root + per-workspace package.json
-  - package-ecosystem: npm
+  # Single-package repo -- bob has no `workspaces` field in package.json and no
+  # packages/ tree. (The old comment here said "per-workspace", which was never
+  # true and actively misled a review: bun.lock contains a `"workspaces"` block
+  # whose only key is `""`, the root package, present in EVERY bun.lock.)
+  #
+  # Ecosystem is `bun`, not `npm`. Declaring `npm` on a bun project tells
+  # dependabot to update package.json and leave bun.lock alone, so every PR it
+  # opened was manifest-only and every one failed `sfw bun install
+  # --frozen-lockfile`. That is bob#103 -- a config bug, not a tooling limit.
+  # dependabot's bundled bun supports lockfile v1; bob's bun.lock is v1.
+  - package-ecosystem: bun
     directory: /
     schedule:
       interval: weekly
@@ -20,8 +29,19 @@ updates:
           - "discord.js"
 
   # GitHub Actions
+  #
+  # codeql-action MUST bump as one PR. Dependabot models init/autobuild/analyze
+  # as separate dependencies, so without this group it emits single-sub-path PRs
+  # -- and CodeQL rejects those outright ("Not all workflow steps that use
+  # github/codeql-action actions use the same version"). That was bob#58, which
+  # was never a bad bump: it was the only shape dependabot could produce.
+  # See bob#99.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
