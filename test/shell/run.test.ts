@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
@@ -305,6 +313,114 @@ describe("runAgent", () => {
     await expect(
       runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory }),
     ).rejects.toThrow(/not yet implemented/);
+  });
+
+  // Read the single run-log JSONL file written under ~/agents/<name>/runs.
+  // Returns { path, lines } — lines are the parsed JSON records in order.
+  function readRunLog(name: string): { path: string; lines: unknown[] } {
+    const runsDir = join(agentsRoot, name, "runs");
+    expect(existsSync(runsDir)).toBe(true);
+    const files = readdirSync(runsDir).filter((f) => f.endsWith(".jsonl"));
+    expect(files).toHaveLength(1);
+    const path = join(runsDir, files[0]);
+    const text = readFileSync(path, "utf8");
+    const lines = text
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l));
+    return { path, lines };
+  }
+
+  // Run `fn` with process.stderr.write captured; returns everything written.
+  async function captureStderr(fn: () => Promise<void>): Promise<string> {
+    const original = process.stderr.write.bind(process.stderr);
+    let buf = "";
+    // biome-ignore lint/suspicious/noExplicitAny: monkeypatch signature match
+    (process.stderr as any).write = (chunk: any): boolean => {
+      buf += typeof chunk === "string" ? chunk : String(chunk);
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      process.stderr.write = original;
+    }
+    return buf;
+  }
+
+  it("surfaces the error to stderr and writes a non-empty run-log when the session dies", async () => {
+    const fake = fakeSession({ throwOnPrompt: true });
+    const { factory } = factoryReturning(fake.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "hi",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // Fix 1: error is surfaced (no longer swallowed), exit code non-zero.
+    expect(res?.exitCode).toBe(1);
+    expect(stderr).toMatch(/simulated session failure/);
+    expect(stderr).toMatch(/run failed/);
+    // The run-log path is announced on stderr at the start.
+    expect(stderr).toMatch(/run log:/);
+    // Fix 2: a run-log file exists, is non-empty, and records the death.
+    const { lines } = readRunLog("testbot");
+    expect(lines.length).toBeGreaterThan(0);
+    const doneLine = lines.find(
+      (l): l is { done: boolean; exitCode: number } =>
+        typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
+    );
+    expect(doneLine).toBeDefined();
+    expect(doneLine?.exitCode).toBe(1);
+  });
+
+  it("labels a provider rate-limit/cap distinctly on stderr", async () => {
+    const capSession = fakeSession({});
+    // Override prompt() to throw a cap-shaped error.
+    capSession.session.prompt = async () => {
+      throw new Error("429 Too Many Requests: usage limit reached");
+    };
+    const { factory } = factoryReturning(capSession.session);
+    const stderr = await captureStderr(async () => {
+      await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
+    });
+    expect(stderr).toMatch(/PROVIDER RATE-LIMIT\/CAP/);
+    expect(stderr).not.toMatch(/run failed/);
+  });
+
+  it("tees every event to the run-log and still returns byte-identical captured text (happy path)", async () => {
+    const fake = fakeSession({ textDeltas: ["partial reply ", "more reply"] });
+    const { factory } = factoryReturning(fake.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "hi",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // Happy-path returned text is UNCHANGED by the logging.
+    expect(res?.stdout).toBe("partial reply more reply");
+    expect(res?.exitCode).toBe(0);
+    // The run-log captured the text_delta events plus a done line.
+    const { lines } = readRunLog("testbot");
+    const eventLines = lines.filter(
+      (l): l is { t: string; event: unknown } =>
+        typeof l === "object" && l !== null && "event" in (l as object),
+    );
+    expect(eventLines.length).toBe(2);
+    const doneLine = lines.find(
+      (l): l is { done: boolean; exitCode: number } =>
+        typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
+    );
+    expect(doneLine).toBeDefined();
+    expect(doneLine?.exitCode).toBe(0);
   });
 });
 

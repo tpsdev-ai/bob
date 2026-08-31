@@ -23,15 +23,14 @@
 // Model override is per-call (`opts.model`): it replaces the bob.yaml model
 // for this invocation only, same semantics as the old `--model` flag.
 
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   type AgentSessionEvent,
-  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { readCron } from "./bob-yaml.js";
@@ -170,10 +169,31 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const factory = opts.sessionFactory ?? createPiRunSession;
   const session = await factory(config);
 
+  // Tee every session event to a per-run JSONL log so a mid-run death (e.g. an
+  // ollama rate-limit/cap) is post-mortem-able instead of leaving no trace.
+  // The filename is the run's start timestamp with `:`/`.` swapped so it's a
+  // filesystem-safe name. Logging is strictly best-effort — a logging failure
+  // must never break the run — hence appendRunLog swallows everything.
+  const runsDir = join(agentDir, "runs");
+  mkdirSync(runsDir, { recursive: true });
+  const runLogPath = join(runsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
+  process.stderr.write(`run log: ${runLogPath}\n`);
+  const appendRunLog = (record: unknown) => {
+    try {
+      appendFileSync(runLogPath, `${JSON.stringify(record)}\n`);
+    } catch {
+      // Best-effort: never throw from the logger (disk full, races, etc.).
+    }
+  };
+
   let captured = "";
   const unsubscribe = session.subscribe((event) => {
+    // Post-mortem trail first: record EVERY event (tool calls, results, errors,
+    // retries), not just text — that's what makes a death diagnosable.
+    appendRunLog({ t: new Date().toISOString(), event });
     // Stream the assistant's text deltas — same event shape the SDK
-    // quickstart and every examples/sdk/*.ts use.
+    // quickstart and every examples/sdk/*.ts use. UNCHANGED: the captured
+    // accumulation stays byte-identical so the returned final text is stable.
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       captured += event.assistantMessageEvent.delta;
     }
@@ -182,11 +202,23 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   let exitCode = 0;
   try {
     await session.prompt(opts.prompt);
-  } catch (_err) {
+  } catch (err) {
     exitCode = 1;
+    // Surface the error instead of swallowing it: an underscore-ignored catch
+    // made a cap-hit look like a silent clean exit. Label a provider
+    // rate-limit/cap so a budget stall is distinguishable from a crash.
+    const msg = err instanceof Error ? err.message : String(err);
+    const isCap =
+      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+    process.stderr.write(
+      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+    );
   } finally {
     unsubscribe();
   }
+
+  // Final record so a reader can tell a clean completion from a truncated log.
+  appendRunLog({ done: true, exitCode });
 
   // Fallback: if no text_delta events were observed (some transports don't
   // stream), pull the last assistant text from session state.
@@ -346,15 +378,24 @@ export async function createPiRunSession(
 ): Promise<RunSession> {
   // Point auth + model resolution at the agent's own .pi-agent dir, exactly
   // like the old launcher's PI_CODING_AGENT_DIR export. This honors the
-  // exe-dev-gateway baseUrl override (models.json) and auth.json.
-  const authStorage = AuthStorage.create(join(config.piAgentDir, "auth.json"));
-  const modelRegistry = ModelRegistry.create(authStorage, join(config.piAgentDir, "models.json"));
+  // exe-dev-gateway baseUrl override (models.json) and auth.json. pi 0.84.x
+  // consolidates the old AuthStorage + ModelRegistry pair into a single
+  // ModelRuntime (the "canonical model/auth runtime"); ModelRuntime.create is
+  // async (the old sync constructors are gone), so we await it. allowModelNetwork
+  // defaults false, so create() does no network catalog fetch — static built-ins
+  // plus the agent's models.json customs are available for lookup immediately.
+  const modelRuntime = await ModelRuntime.create({
+    authPath: join(config.piAgentDir, "auth.json"),
+    modelsPath: join(config.piAgentDir, "models.json"),
+  });
 
-  // find() resolves both built-in models and custom ones from models.json,
-  // without requiring a valid API key at lookup time. We deliberately use
-  // find() over pi-ai's getModel() — getModel/Model aren't re-exported from
-  // the main package and pi-ai is only a transitive dep.
-  const model = modelRegistry.find(config.provider, config.model);
+  // getModel() resolves both built-in models and custom ones from models.json,
+  // synchronously and without requiring a valid API key at lookup time — the
+  // runtime is already configured with the agent's models.json, so this is the
+  // models.json-aware lookup (NOT pi-ai's standalone getModel(), which wouldn't
+  // see the agent's custom exe-dev-gateway model). Same contract as the old
+  // ModelRegistry.find().
+  const model = modelRuntime.getModel(config.provider, config.model);
   if (!model) {
     throw new Error(
       `model not found: ${config.provider}/${config.model} (check bob.yaml provider/model and ${config.piAgentDir}/models.json)`,
@@ -398,8 +439,7 @@ export async function createPiRunSession(
     cwd: config.cwd,
     agentDir: config.piAgentDir,
     model,
-    authStorage,
-    modelRegistry,
+    modelRuntime,
     resourceLoader,
     sessionManager: makeSessionManager(config.cwd) as ReturnType<typeof SessionManager.inMemory>,
   });
