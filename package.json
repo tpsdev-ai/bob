@@ -26,7 +26,7 @@
     "lint:fix": "biome check --write ."
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.79.10",
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "croner": "10.0.1",
     "discord.js": "^14.27.0",
     "typebox": "1.3.16"
