@@ -98,16 +98,13 @@ describe("bob CLI", () => {
   // them inside a single test raced bun's 5 s default budget (timed out at
   // 5075 ms on 2026-09-03). it.each gives every command its own budget and its
   // own name in the report — the shape test/shell/role-loader.test.ts uses.
-  it.each(["up", "down", "restart", "install-service"] as const)(
-    "%s requires a <name>",
-    (cmd) => {
-      try {
-        execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
-        throw new Error(`expected non-zero exit for bare '${cmd}'`);
-      } catch (err) {
-        const e = err as { stdout?: string; message?: string };
-        expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
-      }
-    },
-  );
+  it.each(["up", "down", "restart", "install-service"] as const)("%s requires a <name>", (cmd) => {
+    try {
+      execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+      throw new Error(`expected non-zero exit for bare '${cmd}'`);
+    } catch (err) {
+      const e = err as { stdout?: string; message?: string };
+      expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
+    }
+  });
 });
