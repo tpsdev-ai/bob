@@ -98,7 +98,7 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
     const fake = makeFakeFlair();
     await provision(fake);
     const seq = fake.sequence();
-    const registered = seq.findIndex((s) => s === "ops:insert:Agent");
+    const registered = seq.indexOf("ops:insert:Agent");
     const firstSoulWrite = seq.findIndex((s) => s.startsWith("rest:PUT:/Soul"));
     expect(registered).toBeGreaterThanOrEqual(0);
     expect(firstSoulWrite).toBeGreaterThanOrEqual(0);
