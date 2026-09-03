@@ -94,6 +94,9 @@ describe("bob CLI", () => {
     expect(out).toContain("restart <name>");
   });
 
+  // Four sequential CLI spawns at ~1.2 s each on a CI runner sit right at bun's
+  // 5 s default per-test budget; it timed out at 5075 ms on 2026-09-03 with no
+  // code change. Budget the spawns explicitly instead of racing the default.
   it("lifecycle commands require a <name>", () => {
     for (const cmd of ["up", "down", "restart", "install-service"]) {
       try {
@@ -104,5 +107,5 @@ describe("bob CLI", () => {
         expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
       }
     }
-  });
+  }, 30_000);
 });
