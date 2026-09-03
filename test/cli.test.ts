@@ -94,11 +94,13 @@ describe("bob CLI", () => {
     expect(out).toContain("restart <name>");
   });
 
-  // Four sequential CLI spawns at ~1.2 s each on a CI runner sit right at bun's
-  // 5 s default per-test budget; it timed out at 5075 ms on 2026-09-03 with no
-  // code change. Budget the spawns explicitly instead of racing the default.
-  it("lifecycle commands require a <name>", () => {
-    for (const cmd of ["up", "down", "restart", "install-service"]) {
+  // One case per command: each spawn costs ~1.2 s on a CI runner, and four of
+  // them inside a single test raced bun's 5 s default budget (timed out at
+  // 5075 ms on 2026-09-03). it.each gives every command its own budget and its
+  // own name in the report — the shape test/shell/role-loader.test.ts uses.
+  it.each(["up", "down", "restart", "install-service"] as const)(
+    "%s requires a <name>",
+    (cmd) => {
       try {
         execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
         throw new Error(`expected non-zero exit for bare '${cmd}'`);
@@ -106,6 +108,6 @@ describe("bob CLI", () => {
         const e = err as { stdout?: string; message?: string };
         expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
       }
-    }
-  }, 30_000);
+    },
+  );
 });
