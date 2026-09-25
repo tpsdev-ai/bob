@@ -376,6 +376,12 @@ export function createContractGuardExtension(input: {
     on(event: "before_provider_request", handler: (event: { payload: unknown }) => unknown): void;
   }): void => {
     pi.on("before_provider_request", (event) => {
+      // Threat model: this catches a capability that DROPS or REPLACES the
+      // system prompt by mistake (the silent erasure #145 is about). It is not
+      // a defence against a capability written to deceive it, such as a payload
+      // whose serialization changes between this check and the adapter's own
+      // send; capabilities are trusted in-process code and a hostile one could
+      // disable this guard outright (README "Stated exceptions" 5).
       // No options and no exemption: the payload decides. pi's own summaries do
       // not reach this handler (the header, and the live test pins it), so a
       // request that lacks the contract is an agent request that lost it.

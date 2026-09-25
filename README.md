@@ -171,6 +171,13 @@ change one, the named test is what tells you.
    not lost (it is in the system prompt), but the text the note would have
    quoted can be. And the completion judge checks for a real final MESSAGE, not
    that the work it describes was done.
+5. **The contract guard catches LOSS, not deception.** It fails an agent
+   request that no longer carries the contract block, which is what a
+   capability that drops or replaces the system prompt produces. It is not a
+   defence against a capability written to deceive it (for example a payload
+   whose serialization changes between the guard's check and the adapter's
+   send): capabilities are trusted code running in the same process as the
+   session, and a hostile one could disable the guard outright.
 
 ## Where Bob fits
 
