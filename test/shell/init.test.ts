@@ -3,6 +3,47 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initAgent } from "../../src/shell/init.js";
+import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
+import { knownToolNames } from "../../src/shell/tool-allowlist.js";
+
+// Pull the `tools:` block's list out of a generated bob.yaml. Deliberately
+// hand-parsed (same shape `bob init` emits) so the test does not depend on the
+// reader it is checking.
+function toolsAllowFromYaml(yaml: string): string[] {
+  const lines = yaml.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^tools\s*:/.test(l));
+  if (start < 0) return [];
+  const names: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) break;
+    const m = line.match(/^\s+-\s+(.*)$/);
+    if (m) names.push(m[1].trim());
+  }
+  return names;
+}
+
+// Every name a shipped role may allow: pi's lowercase built-ins plus the tool
+// names the blessed capabilities actually register. A name outside this set is
+// a load error (see tool-allowlist.ts), so a shipped role must not carry one.
+const REAL_TOOL_NAMES = new Set([
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+  "powershell",
+  "bob_fixture_noop",
+  "discord_fetch",
+  "discord_react",
+  "discord_reply",
+  "flair_get",
+  "flair_search",
+  "flair_write",
+  "observatory_report",
+]);
 
 describe("initAgent", () => {
   let tmpRoot: string;
@@ -69,10 +110,104 @@ describe("initAgent", () => {
     expect(yaml).toContain("role: ea");
     expect(yaml).toContain("name: exe-dev-gateway");
     expect(yaml).toContain("model: claude-opus-4-7");
-    expect(yaml).toContain("- Bash");
+    expect(yaml).toContain("- read");
     // Memory tools come from the flair capability (not the dead mcp__flair__* names).
     expect(yaml).toContain("- flair_write");
     expect(yaml).toContain("- flair_search");
+  });
+
+  it("stamps real pi + capability tool names for EVERY shipped role", () => {
+    // role.json's tools.allow goes straight into bob.yaml. The shipped names
+    // were OpenClaw/Claude-Code casings (Bash, Read, WebFetch,
+    // mcp__plugin_discord_discord__reply) that pi's registry does not know, so
+    // every role's allowlist was inert. Assert against the whole set, per role,
+    // so a bad rename names the role it came from.
+    for (const role of ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const) {
+      const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
+      const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+      expect(names.length).toBeGreaterThan(0);
+      const unknown = names.filter((n) => !REAL_TOOL_NAMES.has(n));
+      expect({ role, unknown }).toEqual({ role, unknown: [] });
+    }
+  });
+
+  it("keeps read, bash, edit and write for the coder (builder) role", () => {
+    // The builder role writes code and opens PRs; it cannot do that without
+    // shell + file-writing tools.
+    const res = initAgent({ ...baseOpts(), name: "bot-coder-check", role: "coder" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    for (const tool of ["read", "bash", "edit", "write"]) {
+      expect(names).toContain(tool);
+    }
+  });
+
+  it("stamps the tools of the capabilities it declares — and only those", () => {
+    // The stamped allowlist is the role's CEILING intersected with what can
+    // actually be enabled for this agent: pi's built-ins plus the tools of the
+    // capabilities bob init stamps. `flair` is stamped, so the flair tools are
+    // in; `discord_*` is in the ea role's ceiling but NOT stamped here, so a
+    // fresh ea agent never carries a name nothing can register (round 3).
+    const res = initAgent({ ...baseOpts(), name: "bot-ea-check", role: "ea" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    for (const tool of ["read", "flair_search", "flair_write", "flair_get"]) {
+      expect(names).toContain(tool);
+    }
+    expect(names).not.toContain("discord_reply");
+    expect(names).not.toContain("discord_fetch");
+    expect(names).not.toContain("discord_react");
+    expect(names.join(",")).not.toContain("mcp__");
+  });
+
+  it("loads a freshly initialised agent of EVERY role (allowlist ⊆ what can exist)", () => {
+    // The consequence the round-3 spec names: every role's stamped agent must
+    // resolve a policy that holds. Anything the role's ceiling allows but no
+    // stamped capability provides is dropped, so the stamped list is always a
+    // subset of pi's built-ins + the stamped capabilities' tools.
+    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    for (const role of roles) {
+      const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
+      const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+      expect(names.length, `${role}: a stamped agent has a policy`).toBeGreaterThan(0);
+      const { config } = resolveRunConfig({ name: `bot-${role}`, agentsRoot: tmpRoot });
+      // The policy resolves, and every name in it is one the agent can have:
+      // a pi built-in or a tool of the capability bob stamps.
+      expect(config.tools, `${role}: stamped = resolved`).toEqual(names);
+      for (const name of names) {
+        expect(knownToolNames(), `${role}: ${name} is a known tool`).toContain(name);
+      }
+    }
+  });
+
+  it("LOADS a freshly initialised agent of EVERY role (a real session, not just a policy)", async () => {
+    // The consequence the round-3 spec names. "Loads" is the operative word:
+    // build the real session for a freshly stamped agent of each role and check
+    // that every name in its stamped policy is actually ACTIVE — the audit that
+    // runs at creation is the same check, so a stamped agent that could not
+    // hold its policy would fail here.
+    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    for (const role of roles) {
+      const res = initAgent({
+        ...baseOpts(),
+        name: `load-${role}`,
+        role,
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+      const { config } = resolveRunConfig({ name: `load-${role}`, agentsRoot: tmpRoot });
+      const session = (await createPiRunSession(config)) as unknown as {
+        getActiveToolNames(): string[];
+        dispose(): void;
+      };
+      try {
+        const active = new Set(session.getActiveToolNames());
+        for (const name of config.tools) {
+          expect(active, `${role}: ${name} is active`).toContain(name);
+        }
+      } finally {
+        session.dispose();
+      }
+      expect(res.agentDir.endsWith(`load-${role}`)).toBe(true);
+    }
   });
 
   it("scaffolds the flair memory capability + config block", () => {
@@ -92,7 +227,10 @@ describe("initAgent", () => {
     const bin = join(res.agentDir, "bin", "testbot");
     const launcher = readFileSync(bin, "utf8");
     expect(launcher).toContain("#!/bin/sh");
-    expect(launcher).toContain("pi --provider ollama-cloud --model kimi-k2.6");
+    // The launcher starts its session through `bob launch` — the path that
+    // resolves the tool policy — not by invoking pi itself.
+    expect(launcher).toContain("launch testbot");
+    expect(launcher).not.toContain("exec pi");
     expect(launcher).toContain("PI_CODING_AGENT_DIR=");
     const mode = statSync(bin).mode & 0o777;
     expect(mode & 0o111).toBeGreaterThan(0);
@@ -185,30 +323,26 @@ describe("initAgent", () => {
     expect(mode).toBe(0o600);
   });
 
-  describe("pi launcher generation", () => {
-    it("appends --append-system-prompt to load soul.md", () => {
+  describe("the generated launcher", () => {
+    it("starts every session through `bob launch` — never pi directly", () => {
+      // The launcher used to `exec pi --provider … --model …` itself, which is a
+      // launch path with no tool policy at all. It now hands off to bob, which
+      // resolves the agent's role allowlist + bob.yaml and passes the result to
+      // pi. A launcher with its own `exec pi` would be that hole again.
       const res = initAgent(baseOpts());
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--append-system-prompt");
-      expect(launcher).toContain('"$(cat $AGENT_DIR/soul.md)"');
+      expect(launcher).toContain('launch testbot -- "$@"');
+      expect(launcher).toContain("BOB_BIN");
+      expect(launcher).not.toContain("--provider");
+      expect(launcher).not.toContain("exec pi");
     });
 
-    it("translates exe-dev-gateway provider to anthropic in the launcher", () => {
-      const res = initAgent({
-        ...baseOpts(),
-        provider: "exe-dev-gateway",
-        model: "claude-opus-4-7",
-      });
+    it("forwards its own args to the session after `--`", () => {
+      // A prompt or a pi flag given to bin/<name> has to survive the hand-off to
+      // bob (and then to pi) instead of being eaten as a bob flag.
+      const res = initAgent(baseOpts());
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--provider anthropic");
-      expect(launcher).not.toContain("--provider exe-dev-gateway");
-      expect(launcher).toContain("--model claude-opus-4-7");
-    });
-
-    it("passes other provider names through unchanged", () => {
-      const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
-      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--provider ollama-cloud");
+      expect(launcher).toContain('-- "$@"');
     });
 
     it("exports FLAIR_AGENT_ID / FLAIR_URL / FLAIR_KEY_PATH from the flair config (#90)", () => {

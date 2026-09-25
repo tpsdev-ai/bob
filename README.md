@@ -37,7 +37,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Inbound mail        | TPS mail consumer (Bob)                                        |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
 | Cron                | Generated launcher invocations (Bob + system cron)             |
-| Tool allowlist      | Per-role template, passed through to pi                        |
+| Tool allowlist      | `roles/<role>/role.json` is the ceiling, `bob.yaml` may only narrow it, and bob's session factory applies the result to every session |
 
 ## Commands
 
@@ -45,11 +45,72 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `bob onboard <name>`     | Scaffold + register the Flair identity + write its soul + hiring interview   |
 | `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair          |
-| `bob run <name> [prompt]`| Run one session. `--model X` overrides per call; `--interactive` for a TUI   |
-| `bob serve <name>`       | Daemon: mail consumer + optional `--discord` listener                        |
+| `bob run <name>`         | Run the agent on duty (persistent session)                                   |
+| `bob run <name> <prompt>`| Run ONE task and print the answer. `--model X` overrides per call            |
+| `bob launch <name>`      | The agent's session, with its resolved tool allowlist. No prompt opens the interactive TUI; ONE prompt (quoted if multi-word) runs it as a task. This is what `bin/<name>` runs |
 | `bob doctor <name>`      | Health check (stubbed — coming with branch-office tooling)                   |
 
 Per-call model override is the lightweight version of dynamic routing — bake the right model into each cron command (opus for strategy, sonnet for briefings, kimi for digests) without standing up multiple agents.
+
+## Operator guarantees, and the tests that pin them
+
+Each guarantee below is enforced in one place and pinned by a test. If you
+change one, the named test is what tells you.
+
+- **One session, one policy.** Every session — `bob run`, the persistent
+  runtime, `bob launch`, the mail consumer, the hiring interview, `bob align` —
+  comes from a single bob factory (`src/shell/session.ts`); bob never spawns the
+  pi CLI and never builds pi argv. The effective tool policy is the role's
+  ceiling intersected with `bob.yaml`, minus `exclude` and the resident
+  exclusions, and it is REQUIRED: a config without it is refused, in the type
+  and at runtime. *(`test/shell/run-tool-allowlist.test.ts`, `run.test.ts`)*
+- **Isolated session resources.** pi's settings and resource sources are built
+  by bob: project trust off, no configured package installed, and no global
+  `SYSTEM.md` / `APPEND_SYSTEM.md`. pi still enumerates the ambient extension,
+  skill, prompt-template and theme paths while resolving its package sources;
+  bob's loader flags stop them LOADING, so the only extensions in the session are
+  the capabilities you declared in `bob.yaml`, and a reload re-reads exactly
+  those. Nothing ambient is ever loaded. *(`test/shell/session.test.ts` —
+  including a control proving pi would otherwise load the ambient files)*
+- **The audit.** Every name in the effective policy must be active in the
+  session, no tool outside the effective policy may be active, and no
+  model-callable tool name — one that is allowlisted and not
+  excluded — is provided by two sources (pi's built-ins or a declared
+  capability). It runs on the session, at creation, after the mode binds
+  extensions (`bindExtensions`) and after every reload (`session.reload`), i.e.
+  once pi has finished rebuilding its tool list; a failure disposes the session
+  and ends the process with the error, and a reload or a bind that itself FAILS
+  ends the session the same way, naming THAT failure rather than the audit's —
+  pi's TUI shows reload errors and carries on, so a half-rebuilt session would
+  otherwise keep serving on a tool state nobody audited.
+  *(`test/shell/session.test.ts`)*
+- **`bob launch` takes at most one prompt and nothing else.** Any other argument
+  is refused BY NAME, so no caller-controlled flag can reach a session.
+  `bob launch a -- --tools` sends the literal prompt `--tools`;
+  `bob launch a --tools` is refused. *(`test/shell/launch.test.ts`)*
+- **`bob init` stamps a policy that loads.** A fresh agent of every role is
+  stamped with the role's ceiling intersected with the tools that can exist for
+  it: pi's built-ins plus the tools of the capabilities bob stamps (currently
+  `flair`). *(`test/shell/init.test.ts`)*
+- **Prompts are prompts.** Non-interactive prompts go through bob's own runner
+  as text, with no command, prompt-template or skill expansion, so nothing bob
+  did not declare can interpret your mail or your task. *(`test/shell/session.test.ts`,
+  `run.test.ts`)*
+- **Doctor points at the right file.** A resident agent whose allowlist names a
+  tool the resident policy drops is a WARN whose fix names
+  `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
+  narrow it. *(`test/shell/doctor.test.ts`)*
+
+### Stated exceptions
+
+1. **Onboarding and alignment are privileged local setup commands**, available
+   to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
+   `read` and `write`, which may exceed the role's ceiling — the interview's job
+   is to write `soul.md`. A model can only reach them through a shell tool, and
+   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
+   `align.test.ts`)*
+2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
+   `!!` run the operator's own shell and are out of scope.
 
 ## Where Bob fits
 
@@ -70,7 +131,15 @@ If you already use pi and want each agent to have a name, a key, a mailbox, and 
 
 ### Compatibility
 
-- **Runs any pi extension, skill, prompt template, or theme.** Bob's launcher is a thin wrapper around `pi --provider ... --model ... --append-system-prompt ...`. Anything pi accepts, Bob's agents accept.
+- **A capability is a bob.yaml declaration, not an ambient pi extension.**
+  Ambient pi extensions, skills, prompt templates, themes and configured
+  packages **do not load for bob agents**, and bob never installs anything.
+  Skills and prompt templates are not expanded into prompts either. To give an
+  agent a tool: put the capability's name in `bob.yaml` under `capabilities:`,
+  configure its block, and list its tools within the role's ceiling in
+  `roles/<role>/role.json` (then narrow it in `bob.yaml` if you like). This is
+  deliberate — a session's tools are the role's allowlist, and anything ambient
+  would be a second way to change them.
 - **Memory via Flair, with bridges to others.** Flair ships bridges to mem0, claude-project memory, ChatGPT, and more. A Bob agent can read memory from whichever layer your stack already uses.
 - **LLM provider-neutral.** Bob's `bob.yaml` picks; current production examples use exe.dev's VM-authenticated LLM gateway (anthropic via baseUrl override), but `ollama-cloud`, `ollama-newton`, `anthropic` direct, `openai`, and `omlx` all work.
 

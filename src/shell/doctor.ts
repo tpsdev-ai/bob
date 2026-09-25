@@ -15,9 +15,23 @@
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  readAgentRole,
+  readCapabilities,
+  readResident,
+  readTools,
+  type ToolsBlock,
+} from "./bob-yaml.js";
+import { resolveAgentToolPolicy } from "./run.js";
+import {
+  auditToolNames,
+  capabilityForTool,
+  residentDroppedTools,
+  type ToolPolicy,
+} from "./tool-allowlist.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
@@ -87,6 +101,12 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       onMissing: `re-run 'bob onboard ${opts.name} --force'`,
     }),
   );
+
+  // The role's tool allowlist. pi ignores an unknown tool name SILENTLY, so a
+  // bob.yaml carrying a name pi cannot enable (the OpenClaw-era casings bob
+  // used to stamp) leaves the agent without a tool its role asked for and says
+  // nothing. Report every offender with the fix.
+  checks.push(toolAllowlistCheck(join(agentDir, "bob.yaml")));
 
   // Launcher — exists + executable
   const launcherPath = join(agentDir, "bin", opts.name);
@@ -200,6 +220,153 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   }
 
   return finalize(opts.name, agentDir, checks);
+}
+
+// The `tools:` allowlist check. Audits every name in the agent's bob.yaml
+// against the tools pi and the blessed capabilities can actually enable, and
+// reports a resident agent whose allowlist asks for a tool the resident policy
+// drops. NEVER throws: a malformed block or a bad `resident:` value is a FAIL
+// with a fix, not a doctor crash (doctor is what you run when something is
+// wrong).
+function toolAllowlistCheck(yamlPath: string): DoctorCheck {
+  const name = "tool allowlist";
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(yamlPath, "utf8");
+  } catch {
+    return { name, status: "skip", detail: `${yamlPath} unreadable` };
+  }
+
+  let block: ToolsBlock | undefined;
+  try {
+    block = readTools(yamlText);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "fix the shape of the tools: block in bob.yaml",
+    };
+  }
+
+  // Audit the names before resolving so EVERY offender gets its own fix, rather
+  // than the resolver's single throw.
+  const declared = [...(block?.allow ?? []), ...(block?.exclude ?? [])];
+  const problems = auditToolNames(declared).problems;
+  if (problems.length > 0) {
+    return {
+      name,
+      status: "fail",
+      detail: `unmapped tool name${problems.length === 1 ? "" : "s"}: ${problems
+        .map((p) => p.name)
+        .join(", ")}`,
+      fix: problems.map((p) => `${p.name}: ${p.hint}`).join("; "),
+    };
+  }
+
+  try {
+    // Validation only — the policy below re-reads it. A non-boolean value is a
+    // FAIL with a fix saying so (rather than the resolver's generic hint).
+    readResident(yamlText);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "set resident: true or false in bob.yaml",
+    };
+  }
+
+  if (block?.allow === undefined) {
+    // A missing policy is a FAIL, not an "ok, pi's defaults apply": pi's
+    // defaults are not something bob.yaml decided, they are the absence of a
+    // decision — and a session started on them holds whatever pi ships.
+    return {
+      name,
+      status: "fail",
+      detail:
+        block === undefined
+          ? "no tools: block in bob.yaml — the role's allowlist is missing"
+          : "the tools: block declares no allow: list",
+      fix: 'declare the role\'s allowlist: "tools:" with "allow:" (an explicit empty list means no tools)',
+    };
+  }
+
+  // The FULL resolution — role.json as the ceiling, bob.yaml narrowing it, the
+  // resident policy on top — i.e. the same call every launch path makes. So
+  // doctor fails on exactly what a session would refuse: an allowlist that
+  // widens past the role, a role bob cannot read, a name pi cannot enable.
+  let policy: ToolPolicy;
+  try {
+    policy = resolveAgentToolPolicy(yamlText);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "fix the tools: block (or the agent.role it widens past) in bob.yaml",
+    };
+  }
+  // A name can be real in bob's catalog and still not exist for THIS agent: pi
+  // enables only the tools the loaded capabilities register, and the session
+  // REFUSES an allowlisted name that nothing provides, at load. Report that
+  // here, before any session, naming the capability to declare — otherwise
+  // doctor says OK for a config whose next run fails.
+  //
+  // BEFORE the resident-drop warning below: a resident agent can trip both, and
+  // the missing capability is the FAILURE (it stops the session) while the drop
+  // is a warning. Reporting the warning first would bury it. And a name the
+  // denylist removes is absent ON PURPOSE — the session audit skips those, so
+  // this check must too, or a valid narrowed policy fails doctor.
+  const declaredCapabilities = new Set(readCapabilities(yamlText));
+  const excludedTools = new Set(policy.excludeTools);
+  const missingByCapability = new Map<string, string[]>();
+  for (const tool of policy.tools) {
+    if (excludedTools.has(tool)) continue;
+    const capability = capabilityForTool(tool);
+    if (capability === undefined || declaredCapabilities.has(capability)) continue;
+    const names = missingByCapability.get(capability) ?? [];
+    names.push(tool);
+    missingByCapability.set(capability, names);
+  }
+  if (missingByCapability.size > 0) {
+    const summary = [...missingByCapability]
+      .map(([capability, tools]) => `${capability} (${tools.join(", ")})`)
+      .join(", ");
+    return {
+      name,
+      status: "fail",
+      detail: `allowlisted tool${policy.tools.length === 1 ? "" : "s"} from a capability this agent does not declare: ${summary}`,
+      fix: `declare it in bob.yaml (capabilities:) and configure its block — a session refuses an allowlisted tool nothing provides — or drop ${[...missingByCapability.values()].flat().join(", ")} from tools.allow`,
+    };
+  }
+
+  const dropped = residentDroppedTools(policy);
+  if (dropped.length > 0) {
+    // The grant lives in the ROLE (roles/<role>/role.json), not in bob.yaml:
+    // bob.yaml may only narrow the role's list, so setting
+    // tools.allowResidentShell: true there would widen past the role and be
+    // refused at load. Name the file the permission is actually in — and when
+    // bob.yaml ALSO carries an explicit denial, name it too: the resolver keeps
+    // the agent's explicit `false`, so granting it in the role alone would
+    // still leave the tools dropped.
+    const role = readAgentRole(yamlText) ?? "<role>";
+    const denial = block.allowResidentShell === false;
+    return {
+      name,
+      status: "warn",
+      detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
+      fix: denial
+        ? `grant it in roles/${role}/role.json (tools.allowResidentShell: true) AND remove tools.allowResidentShell: false from bob.yaml — the grant lives in the role, and bob.yaml may only narrow it, but the explicit false in bob.yaml denies the grant even once the role gives it — or drop ${dropped.join(", ")} from tools.allow`
+        : `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
+    };
+  }
+
+  return {
+    name,
+    status: "ok",
+    detail: `${block.allow.length} name${block.allow.length === 1 ? "" : "s"}: ${block.allow.join(", ")}`,
+  };
 }
 
 function fileCheck(name: string, path: string, opts: { onMissing: string }): DoctorCheck {

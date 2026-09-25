@@ -5,14 +5,17 @@
 // agent. The agent reads its own current soul.md and the human surfaces
 // drift, new constraints, or fresh signal; the agent rewrites soul.md.
 //
-// Same spawn/observe shape as onboard — soul.md hash before/after tells
-// us whether the alignment actually produced a persona update.
+// Same session shape as onboard — bob's factory through pi's InteractiveMode,
+// under the fixed setup policy (read + write) — and the same soul.md
+// hash-before/after test of whether the alignment actually produced a persona
+// update.
 
-import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import type { SpawnFn } from "./onboard.js";
+import { dirname, join } from "node:path";
+import type { SessionRunner } from "./onboard.js";
+import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
+import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
 
 // Same path-traversal + prompt-injection defense as runOnboard.
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -22,8 +25,9 @@ export interface AlignOptions {
   agentDir: string;
   provider: string;
   model: string;
-  piBin?: string;
-  spawnFn?: SpawnFn;
+  // Test seam: the interactive session. Defaults to pi's InteractiveMode over
+  // bob's session runtime.
+  sessionRunner?: SessionRunner;
 }
 
 export interface AlignResult {
@@ -60,6 +64,9 @@ Do NOT:
 This is a 5-10 minute conversation, not a session. Keep it tight.
 `.trim();
 
+const FIRST_MESSAGE = (name: string, soulPath: string) =>
+  `Hi ${name}. Quick alignment check — what feels off, what's drifted, what's new? Read your soul at ${soulPath} first.`;
+
 export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -69,31 +76,23 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     throw new Error(`cannot align ${opts.name}: ${soulPath} not found — run 'bob onboard' first`);
   }
   const soulHashBefore = hashFile(soulPath);
-  // TODO(phase1): migrate to SDK — embed pi via createAgentSession instead of
-  // spawning the `pi` binary (mirrors run.ts). Kept as a subprocess for now;
-  // PR1 only migrates the non-interactive prompt path in run.ts.
-  const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
-  const piBin = opts.piBin ?? "pi";
 
-  const sessionDir = join(opts.agentDir, ".pi-agent");
-  const workDir = join(opts.agentDir, "work");
+  const { config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: dirname(opts.agentDir),
+  });
+  const sessionConfig: RunSessionConfig = {
+    ...config,
+    provider: mapBobProviderToPi(opts.provider),
+    model: opts.model,
+    appendSystemPrompt: META_PROMPT(opts.name, soulPath),
+  };
 
-  const args = [
-    "--provider",
-    opts.provider,
-    "--model",
-    opts.model,
-    "--session-dir",
-    sessionDir,
-    "--append-system-prompt",
-    META_PROMPT(opts.name, soulPath),
-    `Hi ${opts.name}. Quick alignment check — what feels off, what's drifted, what's new? Read your soul at ${soulPath} first.`,
-  ];
-
-  const exitCode = await spawnAndWait(spawnFn, piBin, args, {
-    cwd: workDir,
-    stdio: "inherit",
-    env: process.env,
+  const runner = opts.sessionRunner ?? runInteractiveSession;
+  const exitCode = await runner({
+    config: sessionConfig,
+    policy: SETUP_TOOL_POLICY,
+    initialMessage: FIRST_MESSAGE(opts.name, soulPath),
   });
 
   const soulHashAfter = hashFile(soulPath);
@@ -104,19 +103,6 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     soulHashBefore,
     soulHashAfter,
   };
-}
-
-function spawnAndWait(
-  spawnFn: SpawnFn,
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const child = spawnFn(command, args, options);
-    child.on("error", reject);
-    child.on("exit", (code) => resolve(code ?? 0));
-  });
 }
 
 function hashFile(path: string): string {

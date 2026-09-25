@@ -6,8 +6,13 @@ import type { BobRole } from "./index.js";
 export interface RoleTemplate {
   role: BobRole;
   soul: string; // markdown persona file contents
+  // The role's tool policy — the CEILING an agent's bob.yaml can narrow but
+  // never widen (tool-allowlist.ts). `allowResidentShell` moves the residency
+  // opt-in here, out of bob.yaml: whether an unattended agent keeps a shell is
+  // a property of the ROLE, not of a file the agent itself can edit.
   tools: {
     allow: string[];
+    allowResidentShell?: boolean;
   };
   default_provider?: string;
   default_model?: string;
