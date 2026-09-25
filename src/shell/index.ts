@@ -72,6 +72,7 @@ export {
   createCompactionReinjector,
   DEFAULT_PINNED_CAP_CHARS,
   evaluateCompletion,
+  MIN_PINNED_CAP_CHARS,
   readWorktreeStatus,
   type SilenceReason,
 } from "./compaction-contract.js";

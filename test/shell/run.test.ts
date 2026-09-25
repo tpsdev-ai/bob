@@ -20,6 +20,10 @@ import { assertCapabilitiesLoaded, runAgent } from "../../src/shell/run.js";
 // subscribes to), so tests exercise the capture path without an LLM call.
 function fakeSession(opts: {
   textDeltas?: string[];
+  // End the stream the way pi does when the provider stream FAILS: the
+  // assistant message ends with EMPTY content and stopReason "error", so the
+  // earlier deltas are never a final message (round 3, item 1).
+  failAtEnd?: boolean;
   // Last-assistant-message fallback (used when no text_delta is emitted).
   finalMessages?: ReadonlyArray<unknown>;
   // Throw from prompt() to simulate a session error.
@@ -40,11 +44,25 @@ function fakeSession(opts: {
     async prompt(text) {
       promptCalls.push(text);
       if (opts.throwOnPrompt) throw new Error("simulated session failure");
-      for (const delta of opts.textDeltas ?? []) {
+      const deltas = opts.textDeltas ?? [];
+      for (const delta of deltas) {
         for (const listener of listeners) {
           listener({
             type: "message_update",
             assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+          });
+        }
+      }
+      // pi ends every assistant message with `message_end`. A transport that
+      // emits nothing at all (no deltas, no failure) is modelled by emitting
+      // nothing — the session-state fallback covers that shape.
+      if (deltas.length > 0 || opts.failAtEnd) {
+        for (const listener of listeners) {
+          listener({
+            type: "message_end",
+            message: opts.failAtEnd
+              ? { role: "assistant", content: [], stopReason: "error" }
+              : { role: "assistant", content: [{ type: "text", text: deltas.join("") }] },
           });
         }
       }
@@ -85,6 +103,9 @@ function scriptedSession(
     textDeltasBefore?: string[];
     compact?: "threshold" | "overflow" | "manual";
     aborted?: boolean;
+    /** End the assistant message with stopReason "error" and empty content
+     *  (a stream that failed) — round 3, item 1. */
+    failAtEnd?: boolean;
   }>,
 ): { session: RunSession; calls: Array<{ text: string; streamingBehavior?: string }> } {
   const calls: Array<{ text: string; streamingBehavior?: string }> = [];
@@ -128,6 +149,20 @@ function scriptedSession(
           listener({
             type: "message_update",
             assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+          });
+        }
+      }
+      // pi ends each assistant message with `message_end`; a failed stream ends
+      // it EMPTY with stopReason "error" (round 3, item 1). A step with neither
+      // text nor a failure models a silent settle: no message_end at all.
+      const deltas = step.textDeltas ?? [];
+      if (deltas.length > 0 || step.failAtEnd) {
+        for (const listener of listeners) {
+          listener({
+            type: "message_end",
+            message: step.failAtEnd
+              ? { role: "assistant", content: [], stopReason: "error" }
+              : { role: "assistant", content: [{ type: "text", text: deltas.join("") }] },
           });
         }
       }
@@ -493,13 +528,14 @@ describe("runAgent", () => {
     // Happy-path returned text is UNCHANGED by the logging.
     expect(res?.stdout).toBe("partial reply more reply");
     expect(res?.exitCode).toBe(0);
-    // The run-log captured the text_delta events plus a done line.
+    // The run-log captured the text_delta events + the message that ended them,
+    // plus a done line.
     const { lines } = readRunLog("testbot");
     const eventLines = lines.filter(
       (l): l is { t: string; event: unknown } =>
         typeof l === "object" && l !== null && "event" in (l as object),
     );
-    expect(eventLines.length).toBe(2);
+    expect(eventLines.length).toBe(3);
     const doneLine = lines.find(
       (l): l is { done: boolean; exitCode: number } =>
         typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
@@ -579,6 +615,61 @@ describe("runAgent", () => {
         typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
     );
     expect(doneLine?.exitCode).toBe(1);
+  });
+
+  it("cli#145 round 3: a stream that emits deltas then FAILS after a compaction is not a final message — retries once and exits non-zero", async () => {
+    // The repro: the provider stream throws, pi ends the assistant message with
+    // EMPTY content (stopReason "error") and lets the prompt settle. The run
+    // used to substitute the earlier streamed deltas and accept them as the
+    // final message (completion.ok=true, exit 0). The final text must be exactly
+    // the content of the message that ENDED.
+    const s = scriptedSession([
+      { compact: "threshold", textDeltas: ["committing the two core files"], failAtEnd: true },
+    ]);
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // task, the steered pinned block, then exactly ONE retry.
+    expect(s.calls).toHaveLength(3);
+    expect(s.calls[1]?.streamingBehavior).toBe("steer");
+    expect(s.calls[2]?.text).toBe(CONTINUE_TURN);
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("settled_after_compaction");
+    expect(res?.stdout, "deltas from a failed stream are not the final message").toBe("");
+    expect(stderr).toContain("settled_after_compaction");
+  });
+
+  it("cli#145 round 3: an ERROR stop reason after a compaction is no final message even when the message carries text", async () => {
+    // Same boundary, but the failed message DID assemble text. An error stop
+    // reason is still not a final message, so the run must retry and refuse.
+    const s = scriptedSession([
+      { compact: "threshold", textDeltas: ["half a sentence"], failAtEnd: true },
+      { textDeltas: [""], failAtEnd: true },
+    ]);
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "finish the task",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(s.calls).toHaveLength(3); // task, re-injection, ONE retry
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("settled_after_compaction");
+    expect(res?.stdout).toBe("");
+    expect(stderr).toContain("settled_after_compaction");
   });
 
   it("cli#145: a normal run with a final message exits 0 and never retries (unchanged)", async () => {

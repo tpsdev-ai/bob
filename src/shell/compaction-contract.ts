@@ -12,14 +12,19 @@
 //      persistent runtime), plus "what remains" — the last plan the agent stated,
 //      or a generated note describing the worktree (git status --short) and the
 //      last few tool calls. The block is capped so the re-injection can never be
-//      the thing that tips the context back over the threshold.
+//      the thing that tips the context back over the threshold: a cap below
+//      MIN_PINNED_CAP_CHARS is refused outright, and within the cap the TASK is
+//      truncated before the "what remains" body (never the section headers), so
+//      the block always carries "WHAT REMAINS" and never exceeds its cap.
 //   2. The completion contract for a one-shot run: it settles `exitCode 0` only
-//      with a NON-EMPTY final assistant message (and matches an expected shape
-//      when one is declared). Settling silently after a compaction retries ONCE
-//      with an explicit "continue from the state above" turn; if it still settles
-//      without meeting the contract the run exits non-zero with a named reason
-//      (`settled_after_compaction` / `no_final_message`). Never exit 0 for
-//      silence.
+//      with a final assistant message — EXACTLY the text of the last assistant
+//      message that ENDED after the last compaction (never rebuilt from streamed
+//      deltas; an empty ending, or one whose stop reason is an error, is no final
+//      message) — and matches an expected shape when one is declared. Settling
+//      silently after a compaction retries ONCE with an explicit "continue from
+//      the state above" turn; if it still settles without meeting the contract
+//      the run exits non-zero with a named reason (`settled_after_compaction` /
+//      `no_final_message`). Never exit 0 for silence.
 //
 // Everything here is pure/injectable so it is unit-testable without pi: the
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
@@ -30,6 +35,12 @@ import { spawnSync } from "node:child_process";
  *  a task + a plan, small enough that the re-injection cannot itself trip the
  *  context threshold. The cap is named in the block's own header. */
 export const DEFAULT_PINNED_CAP_CHARS = 6000;
+
+/** The SMALLEST cap the pinned block may be given. Below this the block cannot
+ *  carry both of its sections (its headers plus some content), so a smaller cap
+ *  is REJECTED at validation rather than silently producing a block with neither
+ *  section (round 3, item 2). */
+export const MIN_PINNED_CAP_CHARS = 512;
 
 /** How many recent tool calls the generated worktree note lists. */
 export const DEFAULT_RECENT_TOOL_CALLS = 5;
@@ -45,18 +56,16 @@ export type SilenceReason =
   // not silence, so it gets its own reason (round 2, item 3).
   | "final_shape_mismatch";
 
-/** How much of the block's variable budget is RESERVED for "what remains".
- *  "What remains" is the point of the block (round 2, item 2), so it is budgeted
- *  first and the task portion is truncated to fit around it. */
-export const REMAINING_BUDGET_SHARE = 0.5;
-
-/** The pinned block's cap must be a positive number of characters. A cap of 0 or
- *  less is REJECTED, not treated as "no cap" (round 2, item 2): an uncapped
- *  re-injection is the thing that would tip the context back over the threshold. */
+/** The pinned block's cap: a finite number of characters, at least
+ *  MIN_PINNED_CAP_CHARS. A cap of 0 or less is REJECTED, not treated as "no cap"
+ *  (round 2, item 2): an uncapped re-injection is the thing that would tip the
+ *  context back over the threshold. A cap BELOW the minimum is rejected too
+ *  (round 3, item 2) — the block cannot carry both of its sections in less, so
+ *  accepting it only produces a block with neither section. */
 export function assertPinnedCap(cap: unknown): number {
-  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap < MIN_PINNED_CAP_CHARS) {
     throw new Error(
-      `compaction contract: the pinned-block cap must be a positive number of characters (got ${String(cap)}); there is no "no cap"`,
+      `compaction contract: the pinned-block cap must be a positive number of characters and at least ${MIN_PINNED_CAP_CHARS} (got ${String(cap)}) — a smaller block cannot carry both of its sections, and there is no "no cap"`,
     );
   }
   return cap;
@@ -69,11 +78,17 @@ export const CONTINUE_TURN =
   "restate what remains in one line, finish the task, and end with a final message describing " +
   "the outcome (including any commit/push the task asked for).";
 
-/** Truncate `text` to `cap` characters, marking the cut. */
+/** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
+ *  less yields "" — never the untruncated text (an unbounded block is exactly
+ *  what capText exists to prevent; returning the text unchanged there was what
+ *  let a small cap overflow and get the whole block cut, round 3, item 2). A cap
+ *  too small for the marker cuts hard, so the result never exceeds `cap`. */
 export function capText(text: string, cap: number): string {
-  if (cap <= 0 || text.length <= cap) return text;
+  if (!Number.isFinite(cap) || cap <= 0) return "";
+  if (text.length <= cap) return text;
   const marker = "\n… [truncated]";
-  return text.slice(0, Math.max(0, cap - marker.length)) + marker;
+  if (cap <= marker.length) return text.slice(0, cap);
+  return text.slice(0, cap - marker.length) + marker;
 }
 
 /** The "what remains" inputs: the last plan the agent stated, and/or the
@@ -165,12 +180,16 @@ export function buildPinnedBlock(opts: {
   const overhead = compose("", "").length;
   const bodyBudget = Math.max(0, cap - overhead);
 
-  // "What remains" is budgeted FIRST — it is the point of the block — and the
-  // TASK portion is truncated to fit around it (round 2, item 2).
-  const remainingShown = capText(remaining, Math.floor(bodyBudget * REMAINING_BUDGET_SHARE));
+  // "What remains" is budgeted FIRST — it is the point of the block — and takes
+  // whatever it needs up to the whole body budget; the TASK is then truncated
+  // into what is left. Truncation therefore always shrinks the TASK first and
+  // only then the remains BODY, and both section headers live in the fixed
+  // skeleton above, so a header is never the part that gets cut (round 3,
+  // item 2). By construction `overhead + the two bodies <= cap`, so there is no
+  // whole-block truncation — that is what used to erase "WHAT REMAINS".
+  const remainingShown = capText(remaining, bodyBudget);
   const taskShown = capText(contract, Math.max(0, bodyBudget - remainingShown.length));
-  const block = compose(taskShown, remainingShown);
-  return block.length <= cap ? block : capText(block, cap);
+  return compose(taskShown, remainingShown);
 }
 
 /** Build the standing contract for the PERSISTENT runtime from the agent's
@@ -205,10 +224,18 @@ export interface SessionEventLike {
   type?: string;
   aborted?: boolean;
   reason?: string;
-  message?: { role?: string; content?: unknown } | null;
+  message?: { role?: string; content?: unknown; stopReason?: string } | null;
   assistantMessageEvent?: { type?: string; delta?: string } | null;
   toolName?: string;
   args?: unknown;
+}
+
+/** pi ends a failed or aborted stream with a final assistant message whose
+ *  stopReason is "error" or "aborted" (pi-agent-core's StreamFn contract:
+ *  failures are encoded in the stream, not thrown). Such an ending is NOT a
+ *  final message — its content is empty or partial (round 3, item 1). */
+function isFailureStopReason(reason: unknown): boolean {
+  return reason === "error" || reason === "aborted";
 }
 
 function textFromContent(content: unknown): string {
@@ -256,8 +283,10 @@ export interface CompactionReinjector {
    */
   startTurn(): void;
   /**
-   * The last assistant text that ENDED since the last compaction (or the last
-   * startTurn) — the completion contract's "final message" (round 2, item 1).
+   * The text of the last assistant TURN that ENDED since the last compaction (or
+   * the last startTurn) — the completion contract's "final message" (round 2
+   * item 1, round 3 item 1). It is exactly the content of the message that
+   * ended: streamed deltas are never substituted for it.
    */
   finalText(): string;
   /**
@@ -310,9 +339,10 @@ export function createCompactionReinjector(
     compactions: () => compactions,
     lastBlock: () => lastBlock,
     startTurn: () => clearCapture(),
-    // The last message that ENDED, else the deltas of a message still in flight
-    // (a test fake, or a transport whose message_end has not arrived yet).
-    finalText: () => (finalMessage || deltaBuffer).trim(),
+    // The LAST message that ENDED. Streamed deltas are never substituted for it
+    // (round 3, item 1): a message still in flight, or one that ended empty or
+    // with a failure stop reason, leaves this empty.
+    finalText: () => finalMessage.trim(),
     assistantEnded: () => sawAssistantEnd,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
@@ -362,14 +392,30 @@ export function createCompactionReinjector(
           return;
         }
         case "message_end": {
-          // A message that ENDED. Its text is the best "what remains" we can
-          // capture without understanding the agent's plan ourselves — and, when
-          // it is an ASSISTANT message, it is also the run's current final
-          // message (until another one ends, or a compaction moves the boundary).
+          // A message that ENDED. When it is an ASSISTANT message its own text is
+          // (a) the best "what remains" we can capture without understanding the
+          // agent's plan ourselves, and (b) the run's current final message.
           if (e.message?.role === "assistant") {
-            const text = textFromContent(e.message.content).trim() || deltaBuffer.trim();
-            if (text.length > 0) lastStatedPlan = text;
-            finalMessage = text;
+            // The text of the message that ENDED — NEVER rebuilt from the
+            // streamed deltas (round 3, item 1). A stream that fails ends the
+            // assistant message with EMPTY content and lets the prompt settle;
+            // substituting the deltas for that content is what let a failed run
+            // report success.
+            const ended = textFromContent(e.message.content).trim();
+            const failed = isFailureStopReason(e.message.stopReason);
+            // "What remains" is best-effort and separate from the completion
+            // contract: a message that ended without assembled content still
+            // leaves its streamed text as the last plan the agent stated — but a
+            // FAILED stream's partial text is not a plan the agent stated.
+            if (!failed) {
+              const plan = ended || deltaBuffer.trim();
+              if (plan.length > 0) lastStatedPlan = plan;
+            }
+            // The final message: exactly this message's text, and never an empty
+            // or failure-ended one (round 3, item 1). `sawAssistantEnd` records
+            // that a message DID end, so the session-state fallback cannot
+            // resurrect an EARLIER message in its place.
+            finalMessage = failed ? "" : ended;
             sawAssistantEnd = true;
           }
           deltaBuffer = "";
@@ -391,10 +437,14 @@ export function createCompactionReinjector(
 
 /**
  * The one-shot completion contract. `ok` only when the final assistant text is
- * non-empty AND (when an expected shape is declared) matches it. Silence names
- * whether a compaction was seen (`settled_after_compaction` / `no_final_message`);
- * a message that EXISTS but does not match gets its OWN reason
- * (`final_shape_mismatch`, round 2 item 3) — it is not silence.
+ * non-empty AND (when an expected shape is declared) matches it. The text is the
+ * content of the last assistant message that ENDED after the boundary — streamed
+ * deltas are never substituted for it, and an empty or failure-ended message is
+ * no final message (round 3, item 1), so this function only classifies what the
+ * caller captured. Silence names whether a compaction was seen
+ * (`settled_after_compaction` / `no_final_message`); a message that EXISTS but
+ * does not match gets its OWN reason (`final_shape_mismatch`, round 2 item 3) —
+ * it is not silence.
  */
 export function evaluateCompletion(opts: {
   capturedText: string;

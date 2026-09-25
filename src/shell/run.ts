@@ -57,8 +57,10 @@ export interface RunSession {
   // (interrupt + deliver) or `followUp` (deliver when idle) — the compaction
   // contract re-injects its pinned block as a steer (issue #145).
   prompt(text: string, options?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
-  // Best-effort final assistant text, used as a fallback when no text_delta
-  // events were observed (e.g. providers/transports that don't stream).
+  // Best-effort final assistant text, used as a fallback only when the transport
+  // ended no assistant message at all (e.g. providers that don't stream and emit
+  // no message_end): the completion contract reads the ENDED message, never the
+  // streamed deltas (round 3, item 1).
   readonly messages?: ReadonlyArray<unknown>;
   // Best-effort idle barrier — pi's AgentSession exposes `agent.waitForIdle()`;
   // the persistent runtime awaits it before disposing so a SIGTERM doesn't cut
@@ -244,15 +246,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
 
   // The FINAL message is the text of the LAST assistant message that ENDED
-  // since the last compaction (round 2, item 1): text streamed BEFORE a
-  // compaction can never satisfy the completion contract, and the contract
-  // tracker clears its capture on `compaction_end` and at every `startTurn()`.
+  // since the last compaction (round 2 item 1, round 3 item 1): text streamed
+  // before a compaction can never satisfy the completion contract, streamed
+  // deltas are never substituted for the ended message's own content, and the
+  // contract tracker clears its capture on `compaction_end` and at every
+  // `startTurn()`.
   const finalTextNow = (): string => {
     const tracked = reinjector.finalText();
     if (tracked.length > 0) return tracked;
-    // NOTHING ended since the boundary. Only a transport that emitted neither
-    // deltas nor a message_end may fall back to session state — and NEVER after a
-    // compaction, whose boundary the session's message list cannot express.
+    // NOTHING ended with text since the boundary. Only a transport that ended no
+    // assistant message at all may fall back to session state — and NEVER after
+    // a compaction, whose boundary the session's message list cannot express.
     if (reinjector.compactions() > 0 || reinjector.assistantEnded()) return "";
     return lastAssistantText(session) ?? "";
   };
@@ -332,8 +336,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // Final record so a reader can tell a clean completion from a truncated log.
   appendRunLog({ done: true, exitCode });
 
-  // The run's final text — the last assistant message that ended since the last
-  // compaction (or the session-state fallback for a non-streaming transport).
+  // The run's final text — exactly the content of the last assistant message
+  // that ended since the last compaction (or the session-state fallback for a
+  // transport that ended no message at all).
   const finalStdout = finalTextNow();
 
   session.dispose();

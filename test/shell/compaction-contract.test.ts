@@ -9,6 +9,7 @@ import {
   createCompactionReinjector,
   DEFAULT_PINNED_CAP_CHARS,
   evaluateCompletion,
+  MIN_PINNED_CAP_CHARS,
   readWorktreeStatus,
   renderWorktreeNote,
 } from "../../src/shell/compaction-contract.js";
@@ -62,9 +63,55 @@ describe("compaction contract — the pinned block", () => {
 
   it("is BOUNDED by the cap it names", () => {
     const huge = "x".repeat(DEFAULT_PINNED_CAP_CHARS * 2);
-    const block = buildPinnedBlock({ task: huge, state: { lastStatedPlan: huge }, capChars: 500 });
-    expect(block.length).toBeLessThanOrEqual(500);
+    const block = buildPinnedBlock({
+      task: huge,
+      state: { lastStatedPlan: huge },
+      capChars: MIN_PINNED_CAP_CHARS,
+    });
+    expect(block.length).toBeLessThanOrEqual(MIN_PINNED_CAP_CHARS);
     expect(block).toContain("[truncated]");
+  });
+
+  it("at the MINIMUM cap, a long task and a long plan give a block within the cap that still carries WHAT REMAINS (round 3, item 2)", () => {
+    // A 300-char cap used to yield a block with neither section, and cap 1
+    // yielded 14 characters — the whole block was truncated. Truncation must
+    // shrink the TASK first and then the remains BODY, never the headers, and
+    // the block must always contain its "WHAT REMAINS" header.
+    const cap = MIN_PINNED_CAP_CHARS;
+    // Longer than half the body budget (so the old 50/50 split cut it) but
+    // short enough to fit the budget on its own: the plan survives IN FULL
+    // while the task is the part that gets truncated.
+    const plan = `PLAN-START ${"p".repeat(130)} PLAN-END`;
+    const block = buildPinnedBlock({
+      task: "t".repeat(5000),
+      state: { lastStatedPlan: plan },
+      capChars: cap,
+      reason: "threshold",
+      count: 1,
+    });
+    expect(block.length, "never exceeds the cap").toBeLessThanOrEqual(cap);
+    expect(block, "the WHAT REMAINS header is present").toContain("WHAT REMAINS:");
+    expect(block, "the TASK header is present too").toContain("TASK:");
+    expect(block, "the remains body survived in full").toContain(plan);
+    expect(block, "and the TASK is the part that was shrunk").toContain("[truncated]");
+  });
+
+  it("shrinks the task before the remains body when the plan alone is over budget (round 3, item 2)", () => {
+    // Here the plan alone cannot fit: the remains BODY is the thing truncated
+    // (the task gets nothing), and the block still stays within the cap with
+    // its headers intact.
+    const cap = MIN_PINNED_CAP_CHARS;
+    const block = buildPinnedBlock({
+      task: "task text that has no room left for it",
+      state: { lastStatedPlan: `PLAN-START ${"p".repeat(1000)} PLAN-END` },
+      capChars: cap,
+    });
+    expect(block.length).toBeLessThanOrEqual(cap);
+    expect(block).toContain("WHAT REMAINS:");
+    expect(block).toContain("TASK:");
+    expect(block).toContain("[truncated]");
+    expect(block, "the truncated portion is the remains body").toContain("PLAN-START");
+    expect(block, "the task was shrunk away entirely").toContain("(none recorded)");
   });
 
   it("renderWorktreeNote handles a clean tree and no tool calls", () => {
@@ -89,16 +136,24 @@ describe("compaction contract — the pinned block", () => {
     expect(block, "the task portion was the part truncated").toContain("[truncated]");
   });
 
-  it("rejects a pinned-block cap of 0 or less — there is no 'no cap' (round 2, item 2)", () => {
-    expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: 0 })).toThrow(
-      /positive number/,
+  it("rejects a cap below the minimum at validation, with a named error (round 3, item 2)", () => {
+    // 0 or less is not "no cap"; and a cap smaller than the minimum cannot
+    // carry the block's two sections at all, so it is rejected at validation.
+    for (const bad of [0, -10, 1, 100, MIN_PINNED_CAP_CHARS - 1]) {
+      expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: bad })).toThrow(
+        /at least 512/,
+      );
+    }
+    expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: Number.NaN })).toThrow(
+      /at least 512/,
     );
-    expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: -10 })).toThrow(
-      /positive number/,
-    );
-    expect(() => createCompactionReinjector({ task: "t", capChars: 0, inject: () => {} })).toThrow(
-      /positive number/,
-    );
+    expect(() =>
+      createCompactionReinjector({ task: "t", capChars: 100, inject: () => {} }),
+    ).toThrow(/at least 512/);
+    // The minimum itself is accepted.
+    expect(() =>
+      buildPinnedBlock({ task: "t", state: {}, capChars: MIN_PINNED_CAP_CHARS }),
+    ).not.toThrow();
   });
 
   it("buildStandingContract renders the agent and its scheduled duties", () => {
@@ -193,25 +248,97 @@ describe("compaction contract — the reinjector", () => {
     ).toThrow(/task OR standingContract/);
   });
 
-  it("clears the final-message capture at the compaction boundary (round 2, item 1)", () => {
+  it("clears the final-message capture at the compaction boundary, and deltas alone are never the final message (round 2 + round 3, item 1)", () => {
     const r = createCompactionReinjector({ task: "t", worktreeStatus: () => "", inject: () => {} });
     r.startTurn();
     r.observe({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "review, then commit" },
     });
-    expect(r.finalText()).toContain("review, then commit");
+    expect(
+      r.finalText(),
+      "streamed deltas are not the final message — only the text of an ENDED message is",
+    ).toBe("");
 
+    // The message ENDS, carrying its own text: that is the final message.
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "review, then commit" }] },
+    });
+    expect(r.finalText()).toBe("review, then commit");
+
+    // …and the compaction boundary clears it again.
     r.observe({ type: "compaction_end", reason: "threshold", aborted: false });
-    expect(r.finalText(), "text streamed BEFORE the compaction is not the final message").toBe("");
+    expect(r.finalText(), "text that ENDED before the compaction is not the final message").toBe(
+      "",
+    );
 
-    // …and a new turn starts with an empty capture too.
+    // A new turn starts with an empty capture too (deltas still do not count).
     r.observe({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "after" },
     });
     r.startTurn();
     expect(r.finalText()).toBe("");
+  });
+
+  it("an empty ending, or one whose stop reason is an error, is NO final message (round 3, item 1)", () => {
+    const r = createCompactionReinjector({ task: "t", inject: () => {} });
+
+    // The repro: a stream emits deltas and then fails. pi ends the assistant
+    // message with EMPTY content and stopReason "error" — the deltas are never
+    // the final message.
+    r.startTurn();
+    r.observe({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "partial text from a failed stream" },
+    });
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "error" },
+    });
+    expect(r.finalText(), "a failed stream is not a final message").toBe("");
+    expect(r.assistantEnded(), "but the message DID end (no session-state fallback)").toBe(true);
+
+    // Even with text present, an error stop reason is not a final message.
+    r.startTurn();
+    r.observe({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "half a sentence" }],
+        stopReason: "error",
+      },
+    });
+    expect(r.finalText()).toBe("");
+
+    // An aborted ending is no final message either.
+    r.startTurn();
+    r.observe({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "aborted text" }],
+        stopReason: "aborted",
+      },
+    });
+    expect(r.finalText()).toBe("");
+
+    // An empty (non-errored) ending is no final message either.
+    r.startTurn();
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "" }] },
+    });
+    expect(r.finalText()).toBe("");
+
+    // …but a normal ending with text still is.
+    r.startTurn();
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done: committed" }] },
+    });
+    expect(r.finalText()).toBe("done: committed");
   });
 
   it("tracks whether an assistant message ENDED since the boundary (round 2, item 1)", () => {
