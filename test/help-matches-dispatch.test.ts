@@ -12,6 +12,11 @@ const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 // per-command result is trusted.
 const CONTROL_CMD = "definitely-not-a-command";
 
+/**
+ * Probes that dist/cli.js reached the command dispatcher (and did not miss or
+ * crash before it), so the per-command "unknown command" checks below are
+ * trusted rather than passing vacuously.
+ */
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {

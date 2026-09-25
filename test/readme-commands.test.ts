@@ -119,6 +119,10 @@ function cliAccepts(cmd: string): boolean {
 // cliAccepts result is trusted.
 const CONTROL_CMD = "definitely-not-a-command";
 
+/**
+ * Probes that dist/cli.js reached the command dispatcher, so the cliAccepts
+ * result the test asserts on is trusted rather than passing vacuously.
+ */
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {
