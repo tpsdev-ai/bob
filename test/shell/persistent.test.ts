@@ -443,4 +443,194 @@ describe("runPersistent / startPersistent", () => {
       `the dispose failure is logged (saw: ${JSON.stringify(logs)})`,
     ).toBe(true);
   });
+
+  // ── cli#145 round 9: a lost standing contract stops a RESIDENT runtime ──
+
+  it("cli#145 round 9: a REJECTED standing-contract attach stops the runtime — non-zero exit, session disposed, nothing prompted after", async () => {
+    // The persistent half of round 8. pi compacts AFTER a run, so a failed
+    // attach leaves a warm session that compacts, keeps accepting inbound
+    // prompts, and serves every later one with the standing contract silently
+    // gone — the #145 silent-abandonment class, with no exit code to turn red.
+    // So the runtime stops serving instead: it disposes the session and exits
+    // non-zero with the named reason, and its supervisor restarts it fresh.
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const custom: unknown[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let disposeCount = 0;
+    let disposed = false;
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        if (disposed) throw new Error("prompt() after dispose() — session was torn down");
+        prompts.push(text);
+      },
+      async sendCustomMessage(message) {
+        custom.push(message);
+        return Promise.reject(new Error("the gateway dropped the attach"));
+      },
+      dispose() {
+        disposeCount += 1;
+        disposed = true;
+      },
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "threshold", result: {}, aborted: false });
+    }
+    // The attach rejects: let its handler and the fail-closed shutdown run.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(custom, "the standing contract WAS offered to the session").toHaveLength(1);
+    expect(exits, "the runtime ends itself, exactly once").toHaveLength(1);
+    expect(exits[0], "and with a non-zero code").not.toBe(0);
+    const joined = logs.join("\n");
+    expect(joined, "the named reason is logged").toContain("reinjection_failed");
+    expect(joined, "the attach error is named, not swallowed").toContain(
+      "the gateway dropped the attach",
+    );
+    expect(disposeCount, "the session is disposed — not left serving").toBe(1);
+    // …so no later inbound prompt (a Discord reply, a mail, a cron fire) can
+    // run on the session that lost its contract.
+    await expect(handle.session.prompt("inbound from discord")).rejects.toThrow(/after dispose/);
+    expect(prompts, "no prompt was ever sent to the lost-contract session").toHaveLength(0);
+    await handle.shutdown(); // idempotent: the fail-closed path already disposed
+    expect(disposeCount, "and shutdown does not dispose it twice").toBe(1);
+  });
+
+  it("cli#145 round 9: a THROWING standing-contract attach stops it the same way", async () => {
+    // The other half: `sendCustomMessage` throws synchronously rather than
+    // returning a rejected promise. It must not escape as an anonymous crash and
+    // must not leave the runtime serving either.
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let disposeCount = 0;
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      sendCustomMessage() {
+        throw new Error("the session refused the attach");
+      },
+      dispose() {
+        disposeCount += 1;
+      },
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "overflow", result: {}, aborted: false });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(exits, "the runtime ends itself, exactly once").toHaveLength(1);
+    expect(exits[0]).not.toBe(0);
+    const joined = logs.join("\n");
+    expect(joined).toContain("reinjection_failed");
+    expect(joined, "the thrown error is named").toContain("the session refused the attach");
+    expect(disposeCount, "the session is disposed").toBe(1);
+    expect(prompts, "nothing is prompted on it").toHaveLength(0);
+    await handle.shutdown();
+  });
+
+  it("cli#145 round 9: a STALE rejection from an older attempt does not stop a runtime whose newest attach succeeded", async () => {
+    // Ordering hazard, the persistent half of round 8's guard: attempt #1's
+    // promise is still pending when compaction #2 lands and attaches cleanly.
+    // #2 is the LAST compaction, so #1's late rejection must not stop the
+    // runtime — the session is holding the contract #2 attached.
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let disposeCount = 0;
+    let attachCount = 0;
+    let releaseFirst: (() => void) | undefined;
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      sendCustomMessage() {
+        attachCount += 1;
+        if (attachCount === 1) {
+          return new Promise<void>((_resolve, reject) => {
+            releaseFirst = () => reject(new Error("stale attach failure"));
+          });
+        }
+        return Promise.resolve();
+      },
+      dispose() {
+        disposeCount += 1;
+      },
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    // #1 stays pending; #2 attaches cleanly.
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "threshold", result: {}, aborted: false });
+      listener({ type: "compaction_end", reason: "overflow", result: {}, aborted: false });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(attachCount, "both attempts were made").toBe(2);
+    expect(exits, "a clean newest attach keeps it serving").toHaveLength(0);
+
+    // Now the OLD attempt's rejection lands.
+    releaseFirst?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(exits, "the stale rejection does not stop the runtime").toHaveLength(0);
+    expect(disposeCount, "and does not dispose the session").toBe(0);
+    expect(logs.join("\n"), "no named failure is logged").not.toContain("reinjection_failed");
+    // Still serving: an inbound prompt goes through.
+    await handle.session.prompt("inbound from discord");
+    expect(prompts).toEqual(["inbound from discord"]);
+
+    await handle.shutdown();
+  });
 });

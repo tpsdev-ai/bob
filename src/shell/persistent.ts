@@ -100,6 +100,12 @@ function neverResolves(): Promise<void> {
   });
 }
 
+// cli#145 round 9: the named reason and non-zero exit code a PERSISTENT runtime
+// stops with when it cannot attach its standing contract. Same reason the
+// one-shot runtime refuses with — one name for one failure.
+const REINJECTION_FAILURE_REASON = "reinjection_failed";
+const EXIT_REINJECTION_FAILED = 1;
+
 // Stand up the warm session and return a handle. Does NOT block — call
 // `awaitForever` (or rely on the returned blocking promise from runPersistent)
 // to keep the process up. Factored out so tests can build the handle, exercise
@@ -153,6 +159,68 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
+  // ── the state every serving path shares ──────────────────────────────
+  let disposed = false;
+  let disposing: Promise<void> | undefined;
+  // cli#145 round 9: the named reason this runtime STOPPED SERVING. Set when its
+  // standing contract could not be attached; from then on no scheduled fire may
+  // run, and the session is disposed so no later prompt can either.
+  let stopped: string | undefined;
+  let cronScheduler: CronSchedulerHandle | undefined;
+  // Process exit seam (tests). Defaults to process.exit — production fail-closed
+  // really ends the process so launchd restarts it.
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+
+  const shutdown = async (): Promise<void> => {
+    if (disposed) return;
+    if (disposing) return disposing;
+    disposing = (async () => {
+      // Stop scheduling first so a pending cron tick can't fire into a session
+      // we're about to dispose.
+      cronScheduler?.stop();
+      unsubscribeContract();
+      // Await any in-flight turn so we don't cut off a reply mid-stream. The
+      // RunSession seam exposes `prompt` but not an idle barrier; production's
+      // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
+      // through the optional hook so a fake session in tests need not implement
+      // it.
+      try {
+        await session.waitForIdle?.();
+      } catch {
+        // ignore — proceed to dispose regardless
+      }
+      session.dispose();
+      disposed = true;
+      log(`[bob] persistent session for ${opts.name} disposed cleanly`);
+    })();
+    return disposing;
+  };
+
+  // cli#145 round 9: FAIL CLOSED. If the pinned standing contract could not be
+  // attached — the attach rejected, or it threw — then the session compacts,
+  // keeps accepting inbound prompts, and serves every later one with the
+  // contract silently gone. That is the #145 silent-abandonment class, and a
+  // resident agent has no exit code to go red: the failure would be one log line
+  // in a stream nobody reads. So the runtime stops serving instead. It stops the
+  // scheduler, disposes the session (nothing can be prompted on it after that),
+  // and exits non-zero with the named reason and the error in the log; its
+  // supervisor (launchd KeepAlive + RunAtLoad) then restarts it with a FRESH
+  // session whose standing contract is intact from the start.
+  const failClosed = (failure: string): void => {
+    if (stopped !== undefined) return; // already stopping — the first reason stands
+    stopped = failure;
+    log(
+      `[bob] ${REINJECTION_FAILURE_REASON}: the standing contract could not be attached — ${failure}`,
+    );
+    log(
+      `[bob] ${REINJECTION_FAILURE_REASON}: stopping ${opts.name} so it is restarted with a fresh session`,
+    );
+    void (async () => {
+      await shutdown();
+      exit(EXIT_REINJECTION_FAILED);
+    })();
+  };
+
   // cli#145: subscribe to the SAME event seam the discord capability uses for
   // agent_end. A resident agent that hits the context threshold mid-task used to
   // go silent with its standing duties erased; after every non-aborted
@@ -180,6 +248,12 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       );
     },
     log,
+    // Round 9: a failed attach stops the runtime. The verdict is per-compaction,
+    // so a rejection arriving late from an older attempt reports undefined here
+    // and cannot stop a runtime whose newest attach succeeded.
+    onInjectionSettled: (failure) => {
+      if (failure !== undefined) failClosed(failure);
+    },
   });
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
 
@@ -187,12 +261,20 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // its cadence (one gateway, no second `bob run` process). Await the idle
   // barrier first so a tick doesn't cut into an in-flight inbound turn; fires
   // are serialized by the scheduler. No-op when the agent declares no cron.
-  let cronScheduler: CronSchedulerHandle | undefined;
   if (cron.length > 0) {
     log(`[bob] scheduling ${cron.length} cron job(s) for ${opts.name}`);
     cronScheduler = startCronScheduler({
       entries: cron,
       fire: async (entry) => {
+        if (stopped !== undefined) {
+          // The session lost its standing contract and is being disposed: a fire
+          // now is exactly the silent service this round exists to prevent (and
+          // pi would reject the prompt — the session is disposed).
+          log(
+            `[bob] ${REINJECTION_FAILURE_REASON}: not firing a scheduled prompt — this session stopped serving`,
+          );
+          return;
+        }
         try {
           await session.waitForIdle?.();
         } catch {
@@ -203,33 +285,6 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       log,
     });
   }
-
-  let disposed = false;
-  let disposing: Promise<void> | undefined;
-  const shutdown = async (): Promise<void> => {
-    if (disposed) return;
-    if (disposing) return disposing;
-    disposing = (async () => {
-      // Stop scheduling first so a pending cron tick can't fire into a session
-      // we're about to dispose.
-      cronScheduler?.stop();
-      unsubscribeContract();
-      // Await any in-flight turn so we don't cut off a reply mid-stream. The
-      // RunSession seam exposes `prompt` but not an idle barrier; production's
-      // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
-      // through the optional hook so a fake session in tests need not implement
-      // it.
-      try {
-        await session.waitForIdle?.();
-      } catch {
-        // ignore — proceed to dispose regardless
-      }
-      session.dispose();
-      disposed = true;
-      log(`[bob] persistent session for ${opts.name} disposed cleanly`);
-    })();
-    return disposing;
-  };
 
   return { session, provider, model, shutdown };
 }

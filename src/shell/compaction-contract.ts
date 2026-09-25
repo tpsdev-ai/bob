@@ -301,6 +301,15 @@ export interface CompactionReinjectorOptions {
   worktreeStatus?: () => string;
   /** How many recent tool calls to list (default DEFAULT_RECENT_TOOL_CALLS). */
   recentToolCalls?: number;
+  /**
+   * Called after every re-injection settles, with the verdict for the LAST
+   * compaction (`reinjectionFailure()` — undefined when that block was
+   * injected) (round 9). The PERSISTENT runtime fails closed here: a resident
+   * agent whose standing contract could not be attached must not go on serving
+   * later prompts with it silently missing. The ONE-SHOT runtime does not use
+   * this — it judges the same record at its completion boundary instead.
+   */
+  onInjectionSettled?: (failure: string | undefined) => void;
   /** Logger (never logs a secret — this module sees none). */
   log?: (msg: string) => void;
 }
@@ -393,19 +402,32 @@ export function createCompactionReinjector(
       failureMessage = message;
     }
   };
+  const reinjectionFailure = (): string | undefined =>
+    failureSeq === compactions && failureMessage !== undefined ? failureMessage : undefined;
   const finishInjection = (): void => {
     inFlight -= 1;
     if (inFlight === 0) {
       for (const waiter of settleWaiters.splice(0)) waiter();
     }
   };
+  // Round 9: after EVERY attempt settles, hand the runtime the verdict for the
+  // LAST compaction (not this attempt's own outcome — a late rejection from an
+  // older attempt must not be able to fail a runtime whose newest attach
+  // succeeded). The persistent runtime stops serving on a defined verdict.
+  const notifyInjectionSettled = (): void => {
+    opts.onInjectionSettled?.(reinjectionFailure());
+  };
   const settleInjection = (injected: Promise<void>, seq: number): void => {
     inFlight += 1;
     void injected.then(
-      () => finishInjection(),
+      () => {
+        finishInjection();
+        notifyInjectionSettled();
+      },
       (err) => {
         recordFailure(seq, err);
         finishInjection();
+        notifyInjectionSettled();
       },
     );
   };
@@ -424,8 +446,7 @@ export function createCompactionReinjector(
     compactions: () => compactions,
     lastBlock: () => lastBlock,
     startTurn: () => clearCapture(),
-    reinjectionFailure: () =>
-      failureSeq === compactions && failureMessage !== undefined ? failureMessage : undefined,
+    reinjectionFailure,
     settled: async () => {
       while (inFlight > 0) {
         await new Promise<void>((resolve) => settleWaiters.push(resolve));
@@ -474,7 +495,10 @@ export function createCompactionReinjector(
           try {
             settleInjection(Promise.resolve(opts.inject(block)), injectionSeq);
           } catch (err) {
+            // A SYNCHRONOUS throw never reaches `settleInjection`'s handlers, so
+            // the verdict is announced here (round 9).
             recordFailure(injectionSeq, err);
+            notifyInjectionSettled();
           }
           return;
         }
