@@ -11,14 +11,18 @@
 //      task (a one-shot `bob run`) or the agent's standing contract (the
 //      persistent runtime), plus "what remains" — the last plan the agent stated,
 //      or a generated note describing the worktree (git status --short) and the
-//      last few tool calls. The block is capped so the re-injection can never be
-//      the thing that tips the context back over the threshold: a cap below
-//      MIN_PINNED_CAP_CHARS is refused outright, and within the cap the TASK is
-//      truncated before the "what remains" body (never the section headers), so
-//      the block always carries "WHAT REMAINS" and never exceeds its cap. The
-//      header is counted against that cap too, and the compaction reason it
-//      carries is bounded, so no reason (a 1,000-character one, say) can push
-//      the block past it (round 4, item 2).
+//      last few tool calls. The block's SIZE is bounded by a cap — it is a
+//      bounded addition to the context, which is not a claim about the context
+//      threshold; a cap below MIN_PINNED_CAP_CHARS is refused outright. Within
+//      the cap the CONTRACT is always present: it is the thing the block exists
+//      to restore, so it takes the budget first and is truncated, with a marker
+//      saying how much was elided, only when it does not fit its share; "what
+//      remains" keeps a bounded reserve (a quarter of the body budget, or less
+//      when the section is shorter) plus whatever the contract leaves. The
+//      section headers are never the part cut, so the block carries both
+//      sections and never exceeds its cap. The header is counted against that
+//      cap too, and the compaction reason it carries is bounded, so no reason (a
+//      1,000-character one, say) can push the block past it (round 4, item 2).
 //   2. The completion contract for a one-shot run: it settles `exitCode 0` only
 //      with a final assistant message — EXACTLY the text of the last assistant
 //      message that ENDED after the last compaction (never rebuilt from streamed
@@ -36,9 +40,11 @@
 
 import { spawnSync } from "node:child_process";
 
-/** Cap on the re-injected pinned block, in characters. Generous enough to carry
- *  a task + a plan, small enough that the re-injection cannot itself trip the
- *  context threshold. The cap is named in the block's own header. */
+/** Cap on the re-injected pinned block, in characters. It BOUNDS THE BLOCK'S
+ *  SIZE (round 11) — that is all it claims: the re-injection stays a bounded
+ *  addition to the context, while how close that leaves the session to pi's
+ *  threshold is pi's business, not this number's. Generous enough to carry a
+ *  contract + a plan. The cap is named in the block's own header. */
 export const DEFAULT_PINNED_CAP_CHARS = 6000;
 
 /** The SMALLEST cap the pinned block may be given. Below this the block cannot
@@ -66,15 +72,16 @@ export type SilenceReason =
   // A final message EXISTS but does not match the declared expected shape — it is
   // not silence, so it gets its own reason (round 2, item 3).
   | "final_shape_mismatch"
-  // The LAST compaction's re-injection FAILED, so the run continued without its
-  // task (round 8). Not silence either — the run may well end with text — which
-  // is exactly why the text cannot be accepted as completion.
+  // A re-injection FAILED, so the run continued without its task (round 8). The
+  // ONE-SHOT runtime refuses on ANY failed attempt, not only the newest
+  // (round 11, item 2). Not silence either — the run may well end with text —
+  // which is exactly why the text cannot be accepted as completion.
   | "reinjection_failed";
 
 /** The pinned block's cap: a finite number of characters, at least
  *  MIN_PINNED_CAP_CHARS. A cap of 0 or less is REJECTED, not treated as "no cap"
- *  (round 2, item 2): an uncapped re-injection is the thing that would tip the
- *  context back over the threshold. A cap BELOW the minimum is rejected too
+ *  (round 2, item 2): the cap is what BOUNDS THE BLOCK'S SIZE, so "no cap" is
+ *  an unbounded re-injection. A cap BELOW the minimum is rejected too
  *  (round 3, item 2) — the block cannot carry both of its sections in less, so
  *  accepting it only produces a block with neither section. */
 export function assertPinnedCap(cap: unknown): number {
@@ -104,6 +111,32 @@ export function capText(text: string, cap: number): string {
   const marker = "\n… [truncated]";
   if (cap <= marker.length) return text.slice(0, cap);
   return text.slice(0, cap - marker.length) + marker;
+}
+
+/** The "what remains" inputs: the last plan the agent stated, and/or the
+ *  generated worktree state (git status + recent tool calls). */
+/** Truncate the CONTRACT section (the task, or the standing contract) to at most
+ *  `cap` characters, marking the cut with HOW MANY characters were elided
+ *  (round 11, item 1). The contract is never dropped from the block: when it does
+ *  not fit its share it is cut HERE, visibly, and the marker states the size of
+ *  what was elided. A cap too small for the marker cuts hard (there is no room to
+ *  state anything); a cap of 0 or less yields "". */
+export function capContract(text: string, cap: number): string {
+  if (!Number.isFinite(cap) || cap <= 0) return "";
+  if (text.length <= cap) return text;
+  const markerFor = (elided: number): string => `\n… [truncated: ${elided} chars elided]`;
+  // The marker's own length moves the elided count and vice versa; two or three
+  // passes settle it (the digit count stabilises), so the result IS `cap` long
+  // and the marker states the number of characters actually dropped.
+  let keep = Math.max(0, cap - markerFor(text.length).length);
+  for (let i = 0; i < 4; i += 1) {
+    const next = Math.max(0, cap - markerFor(text.length - keep).length);
+    if (next === keep) break;
+    keep = next;
+  }
+  const marker = markerFor(text.length - keep);
+  if (keep <= 0) return text.slice(0, cap); // no room for the marker — cut hard
+  return text.slice(0, keep) + marker;
 }
 
 /** The "what remains" inputs: the last plan the agent stated, and/or the
@@ -192,6 +225,9 @@ export function buildPinnedBlock(opts: {
     plan.length > 0 ? `Last plan you stated:\n${plan}` : renderWorktreeNote(opts.state)
   ).trim();
 
+  // The reserve "what remains" keeps when the contract needs the rest of the
+  // body budget: a quarter of it, or the whole section when that is shorter.
+
   // Compose with the two variable sections as arguments, so the FIXED skeleton's
   // length can be measured once (with placeholders — conservative).
   const compose = (taskShown: string, remainingShown: string): string =>
@@ -215,16 +251,20 @@ export function buildPinnedBlock(opts: {
   const overhead = compose("", "").length;
   const bodyBudget = Math.max(0, cap - overhead);
 
-  // "What remains" is budgeted FIRST — it is the point of the block — and takes
-  // whatever it needs up to the whole body budget; the TASK is then truncated
-  // into what is left. Truncation therefore always shrinks the TASK first and
-  // only then the remains BODY, and both section headers live in the fixed
-  // skeleton above, so a header is never the part that gets cut (round 3,
-  // item 2). By construction `overhead + the two bodies <= cap`, so there is no
-  // whole-block truncation — that is what used to erase "WHAT REMAINS".
-  const remainingShown = capText(remaining, bodyBudget);
-  const taskShown = capText(contract, Math.max(0, bodyBudget - remainingShown.length));
-  return compose(taskShown, remainingShown);
+  // The CONTRACT is budgeted FIRST (round 11, item 1): the block exists to
+  // restore it, so it is ALWAYS present. "What remains" keeps a bounded reserve
+  // — a quarter of the body budget, or less when the section is shorter — plus
+  // whatever the contract leaves, so a long "what remains" can no longer squeeze
+  // the contract out (that produced a block reading "(none recorded)" and
+  // restored nothing). When the contract does not fit its share it is truncated
+  // with a marker stating the elided count; it is never dropped. Both section
+  // headers live in the fixed skeleton above, so a header is never the part that
+  // gets cut, and by construction `overhead + the two bodies <= cap` — there is
+  // no whole-block truncation.
+  const reserve = Math.min(Math.floor(bodyBudget / 4), remaining.length);
+  const contractShown = capContract(contract, Math.max(0, bodyBudget - reserve));
+  const remainingShown = capText(remaining, Math.max(0, bodyBudget - contractShown.length));
+  return compose(contractShown, remainingShown);
 }
 
 /** Build the standing contract for the PERSISTENT runtime from the agent's
@@ -310,7 +350,8 @@ export interface CompactionReinjectorOptions {
    * this — it judges the same record at its completion boundary instead.
    */
   onInjectionSettled?: (failure: string | undefined) => void;
-  /** Logger (never logs a secret — this module sees none). */
+  /** Logger. It is given the block's SIZE (never the block), and a failed
+   *  re-injection's message verbatim. */
   log?: (msg: string) => void;
 }
 
@@ -345,8 +386,28 @@ export interface CompactionReinjector {
    * when that block was injected (or no compaction happened yet) (round 8).
    * Only the last compaction counts: a later compaction is a fresh attempt, and
    * a rejection that arrives late from an OLDER attempt must not outvote it.
+   * The PERSISTENT runtime uses THIS verdict — it judges the session's CURRENT
+   * state, so what matters is whether the newest attach landed. The one-shot
+   * runtime uses `anyReinjectionFailure()` instead (round 11, item 2).
    */
   reinjectionFailure(): string | undefined;
+  /**
+   * The FIRST re-injection failure recorded during this run, or undefined when
+   * none failed (round 11, item 2). The ONE-SHOT runtime refuses on THIS: it
+   * judges its WHOLE output, so a compaction whose block failed to re-inject
+   * means the run spent part of its life without its task — a later attach that
+   * succeeded does not undo that. The persistent runtime keeps the newest-attach
+   * verdict above and does not use this.
+   */
+  anyReinjectionFailure(): string | undefined;
+  /**
+   * The pending re-injection as a promise that resolves when it settles, or
+   * undefined when none is in flight (round 11, item 3). The persistent
+   * runtime's admission gate waits on this before letting a prompt through: a
+   * prompt that arrives while the standing contract is still attaching must not
+   * run before the block lands.
+   */
+  pendingInjection(): Promise<void> | undefined;
   /**
    * Resolves once every re-injection handed to `inject` has settled (fulfilled
    * or rejected), so a caller judges the completion contract only after a
@@ -389,11 +450,18 @@ export function createCompactionReinjector(
   // to, so a late rejection from an older attempt cannot speak for a newer one.
   let failureSeq = 0;
   let failureMessage: string | undefined;
+  // The FIRST failure of the run, whatever came after it (round 11, item 2): the
+  // one-shot runtime judges its whole output, so one dropped task anywhere in it
+  // refuses the run.
+  let anyFailureMessage: string | undefined;
   let inFlight = 0;
   const settleWaiters: Array<() => void> = [];
   const recordFailure = (seq: number, err: unknown): void => {
     const message = err instanceof Error ? err.message : String(err);
     log(`bob: could not re-inject the pinned block: ${message}`);
+    // The FIRST failure is remembered for the one-shot verdict (round 11):
+    // every failure is a task that was not restored.
+    if (anyFailureMessage === undefined) anyFailureMessage = message;
     // Every failure is logged; only a failure of the NEWEST attempt is recorded,
     // so a rejection that arrives late from an older attempt cannot replace the
     // verdict on the compaction that came after it (round 8).
@@ -447,6 +515,9 @@ export function createCompactionReinjector(
     lastBlock: () => lastBlock,
     startTurn: () => clearCapture(),
     reinjectionFailure,
+    anyReinjectionFailure: () => anyFailureMessage,
+    pendingInjection: () =>
+      inFlight > 0 ? new Promise<void>((resolve) => settleWaiters.push(resolve)) : undefined,
     settled: async () => {
       while (inFlight > 0) {
         await new Promise<void>((resolve) => settleWaiters.push(resolve));
@@ -487,10 +558,11 @@ export function createCompactionReinjector(
               `${opts.standingContract !== undefined ? "standing contract" : "task"} block (${block.length} chars)`,
           );
           // cli#145 round 8: record the outcome of THIS attempt. A failure is
-          // not merely logged — the completion boundary (see `reinjectionFailure`)
-          // refuses the run, because an agent that continued without its task can
-          // still end with nonempty text, and the CONTINUE_TURN retry does not
-          // resend the task either.
+          // not merely logged — the completion boundary refuses the run (the
+          // one-shot runtime on ANY failure, `anyReinjectionFailure`, round 11),
+          // because an agent that continued without its task can still end with
+          // nonempty text, and the CONTINUE_TURN retry does not resend the task
+          // either.
           const injectionSeq = compactions;
           try {
             settleInjection(Promise.resolve(opts.inject(block)), injectionSeq);
@@ -565,17 +637,19 @@ export function createCompactionReinjector(
  * whitespace. Silence names whether a compaction was seen
  * (`settled_after_compaction` / `no_final_message`); a message that EXISTS but
  * does not match gets its OWN reason (`final_shape_mismatch`, round 2 item 3) —
- * it is not silence. A failed re-injection after the last compaction OUTRANKS
- * all of that (`reinjection_failed`, round 8): the text cannot be trusted as
- * completion at all when the task it was supposed to answer was never restored.
+ * it is not silence. A failed re-injection — ANY of them, for a one-shot run
+ * (round 11, item 2) — OUTRANKS all of that (`reinjection_failed`, round 8):
+ * the text cannot be trusted as completion at all when the task it was supposed
+ * to answer was never restored.
  */
 export function evaluateCompletion(opts: {
   capturedText: string;
   compactions: number;
   expectedFinal?: (text: string) => boolean;
-  /** The error of the LAST compaction's failed re-injection, when it failed
-   *  (round 8). Checked FIRST, before the text: the agent continued without its
-   *  task, so no final text — however long — is evidence of completion. */
+  /** A failed re-injection, when one happened. WHICH one is the caller's
+   *  window: the one-shot run passes ANY failure in the run (round 11, item 2).
+   *  Checked FIRST, before the text: the agent continued without its task, so no
+   *  final text — however long — is evidence of completion. */
   reinjectionFailure?: string;
 }): { ok: boolean; reason?: SilenceReason } {
   if (opts.reinjectionFailure !== undefined) {

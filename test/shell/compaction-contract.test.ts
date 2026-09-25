@@ -73,15 +73,14 @@ describe("compaction contract — the pinned block", () => {
     expect(block).toContain("[truncated]");
   });
 
-  it("at the MINIMUM cap, a long task and a long plan give a block within the cap that still carries WHAT REMAINS (round 3, item 2)", () => {
+  it("at the MINIMUM cap, a long task and a long plan give a block within the cap that still carries BOTH sections (round 3, item 2)", () => {
     // A 300-char cap used to yield a block with neither section, and cap 1
     // yielded 14 characters — the whole block was truncated. Truncation must
-    // shrink the TASK first and then the remains BODY, never the headers, and
-    // the block must always contain its "WHAT REMAINS" header.
+    // never touch the section headers, and the block must always carry both.
+    // Round 11 reversed the priority: "what remains" no longer takes the budget
+    // first, so at this cap the plan keeps its RESERVE and the task — longer than
+    // its own share — is the section marked as truncated.
     const cap = MIN_PINNED_CAP_CHARS;
-    // Longer than half the body budget (so the old 50/50 split cut it) but
-    // short enough to fit the budget on its own: the plan survives IN FULL
-    // while the task is the part that gets truncated.
     const plan = `PLAN-START ${"p".repeat(130)} PLAN-END`;
     const block = buildPinnedBlock({
       task: "t".repeat(5000),
@@ -93,14 +92,18 @@ describe("compaction contract — the pinned block", () => {
     expect(block.length, "never exceeds the cap").toBeLessThanOrEqual(cap);
     expect(block, "the WHAT REMAINS header is present").toContain("WHAT REMAINS:");
     expect(block, "the TASK header is present too").toContain("TASK:");
-    expect(block, "the remains body survived in full").toContain(plan);
-    expect(block, "and the TASK is the part that was shrunk").toContain("[truncated]");
+    expect(block, "the TASK is carried, not dropped").toContain("t".repeat(20));
+    expect(block, "and it is marked with how much was elided").toContain("chars elided");
+    expect(block, "the remains keeps its reserve and its start").toContain("PLAN-START");
+    expect(block, "while the plan is no longer carried in full here").not.toContain(plan);
   });
 
-  it("shrinks the task before the remains body when the plan alone is over budget (round 3, item 2)", () => {
-    // Here the plan alone cannot fit: the remains BODY is the thing truncated
-    // (the task gets nothing), and the block still stays within the cap with
-    // its headers intact.
+  it("keeps the task when the plan alone is over budget — the remains body is cut to its reserve (round 11, item 1)", () => {
+    // The old expectation here was the inverse: "what remains" was budgeted
+    // FIRST, so a 1,000-character plan left the task NO room and the block read
+    // "TASK: (none recorded)" — the one thing the block exists to restore was
+    // dropped. The contract is budgeted first and is never dropped; the remains
+    // body keeps its bounded reserve.
     const cap = MIN_PINNED_CAP_CHARS;
     const block = buildPinnedBlock({
       task: "task text that has no room left for it",
@@ -110,9 +113,13 @@ describe("compaction contract — the pinned block", () => {
     expect(block.length).toBeLessThanOrEqual(cap);
     expect(block).toContain("WHAT REMAINS:");
     expect(block).toContain("TASK:");
-    expect(block).toContain("[truncated]");
-    expect(block, "the truncated portion is the remains body").toContain("PLAN-START");
-    expect(block, "the task was shrunk away entirely").toContain("(none recorded)");
+    expect(block, "the TASK is present — never dropped").toContain(
+      "task text that has no room left for it",
+    );
+    expect(block, "and it is not marked truncated (it fit its share)").not.toContain(
+      "chars elided",
+    );
+    expect(block, "the remains body is what was cut").toContain("PLAN-START");
   });
 
   it("bounds the reason in the header and counts the whole header against the cap (round 4, item 2)", () => {
@@ -169,10 +176,11 @@ describe("compaction contract — the pinned block", () => {
     expect(note).toContain("(none observed)");
   });
 
-  it("reserves budget for 'what remains' and truncates the TASK first (round 2, item 2)", () => {
+  it("reserves budget for 'what remains' while the TASK keeps the rest (round 2, item 2; round 11, item 1)", () => {
     // The task comes first in the block; a naive whole-block truncation would
-    // leave no plan or worktree note at all. The remaining section is budgeted
-    // FIRST, and the task is cut to fit around it.
+    // leave no plan or worktree note at all. The CONTRACT is budgeted first and
+    // is never dropped; the remaining section keeps its bounded reserve, and the
+    // task is cut into what is left — with the elision stated.
     const cap = 1200;
     const block = buildPinnedBlock({
       task: "x".repeat(cap * 3),
@@ -181,8 +189,53 @@ describe("compaction contract — the pinned block", () => {
     });
     expect(block.length, "the block fits the cap").toBeLessThanOrEqual(cap);
     expect(block, "and it still carries its 'what remains' section").toContain("WHAT REMAINS:");
-    expect(block).toContain("next: commit the two files, then push");
-    expect(block, "the task portion was the part truncated").toContain("[truncated]");
+    expect(block, "the plan is short enough to survive in full").toContain(
+      "next: commit the two files, then push",
+    );
+    expect(block, "the task is carried, marked with what was elided").toContain("chars elided");
+  });
+
+  it("cli#145 round 11: a long 'what remains' with a SHORT task keeps the WHOLE task", () => {
+    // The defect this round closes: "what remains" was budgeted first, so a long
+    // plan squeezed the task out entirely — a 494-char block that recorded no
+    // task at all. The task is what the block exists to restore; it is never
+    // dropped, and a plan long enough to fill the budget no longer displaces it.
+    const cap = 1200;
+    const task = "commit the two core files and push";
+    const plan = `PLAN-START ${"p".repeat(3000)} PLAN-END`;
+    const block = buildPinnedBlock({ task, state: { lastStatedPlan: plan }, capChars: cap });
+    expect(block.length, "the block fits the cap").toBeLessThanOrEqual(cap);
+    expect(block, "the WHOLE task survives a long 'what remains'").toContain(task);
+    expect(block, "and it is not marked truncated").not.toContain("chars elided");
+    expect(block, "WHAT REMAINS is still a section").toContain("WHAT REMAINS:");
+    expect(block, "and the remains is still carried").toContain("PLAN-START");
+  });
+
+  it("cli#145 round 11: a long task and a long 'what remains' keep a MARKED task AND the reserve of 'what remains'", () => {
+    // The other direction: neither section fits, so the task is truncated — but
+    // VISIBLY, with the elision counted — and "what remains" still gets its
+    // bounded reserve (a quarter of the body budget) plus nothing more, since the
+    // task's share is larger.
+    const cap = 1200;
+    const task = `TASK-START ${"t".repeat(5000)} TASK-END`;
+    const plan = `PLAN-START ${"p".repeat(5000)} PLAN-END`;
+    const bodyOf = (b: string): string =>
+      (b.split("WHAT REMAINS:\n")[1] ?? "").split("\n\nContinue from the state above")[0] ?? "";
+    // With NO task the remains section takes the WHOLE body budget (the plan is
+    // longer than any budget), so its length IS that budget.
+    const budget = bodyOf(
+      buildPinnedBlock({ state: { lastStatedPlan: plan }, capChars: cap }),
+    ).length;
+    const block = buildPinnedBlock({ task, state: { lastStatedPlan: plan }, capChars: cap });
+    expect(block.length, "the block fits the cap").toBeLessThanOrEqual(cap);
+    expect(block, "the TASK header is present").toContain("TASK:");
+    expect(block, "the task is carried, not dropped").toContain("TASK-START");
+    expect(block, "and it is marked, stating the elision").toContain("chars elided");
+    expect(
+      bodyOf(block).length,
+      "what remains keeps at least its quarter reserve",
+    ).toBeGreaterThanOrEqual(Math.floor(budget / 4));
+    expect(bodyOf(block), "and it still starts at the plan").toContain("PLAN-START");
   });
 
   it("rejects a cap below the minimum at validation, with a named error (round 3, item 2)", () => {
