@@ -14,8 +14,8 @@
 // points where bob is already authoring a persona: `bob onboard` and
 // `bob align`. It is the "edit here, publish there" model.
 //
-//   * Why not pull on launch. The launcher is a POSIX sh script whose whole
-//     job is `pi --append-system-prompt "$(cat soul.md)"`. Fetching the soul
+//   * Why not pull on launch. Launch reads the local soul.md and hands it to pi
+//     as the session's appended system prompt, in-process. Fetching the soul
 //     from Flair on every start would put a network round-trip on the hot path
 //     of every agent invocation and make a Flair outage boot a persona-less
 //     agent. A stale local file is a strictly better failure than an agent

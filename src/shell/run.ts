@@ -124,9 +124,9 @@ export interface RunSessionConfig {
   excludeTools?: string[];
 }
 
-// The injectable seam. Production builds a real pi AgentSession; tests inject a
-// fake that returns canned assistant text without any LLM call. Replaces the
-// old `spawnFn` injection point.
+// The injectable seam. Production builds a real pi AgentSession through bob's
+// ONE session factory (session.ts); tests inject a fake that returns canned
+// assistant text without any LLM call.
 export type RunSessionFactory = (config: RunSessionConfig) => Promise<RunSession>;
 
 export interface RunOptions {
