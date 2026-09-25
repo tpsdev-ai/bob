@@ -220,10 +220,27 @@ describe("runLaunch", () => {
 
   it("sends a prompt through bob's own runner — the session, not the pi CLI", async () => {
     const prompts: Array<{ text: string; options?: unknown }> = [];
+    // The fake ends an assistant message, as a real pi turn does: the #145
+    // completion contract settles 0 only with a final message, so a session
+    // that ends nothing is a silent run (pinned in run.test.ts).
+    const listeners: Array<(event: unknown) => void> = [];
     const session = {
-      subscribe: () => () => {},
+      subscribe: (listener: (event: unknown) => void) => {
+        listeners.push(listener);
+        return () => {};
+      },
       async prompt(text: string, options?: unknown) {
         prompts.push({ text, options });
+        for (const listener of listeners) {
+          listener({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+        }
       },
       dispose() {},
     } as unknown as RunSession;

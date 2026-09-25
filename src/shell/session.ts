@@ -41,12 +41,19 @@ import {
   createAgentSessionRuntime,
   createAgentSessionServices,
   type DefaultResourceLoader,
+  type InlineExtension,
   InteractiveMode,
   ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RunSession, RunSessionConfig } from "./run.js";
+import {
+  appendContractOverride,
+  buildContractBlock,
+  type ContractGuardDeps,
+  createContractGuardExtension,
+} from "./system-prompt-contract.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
 
 // pi does not export DefaultResourceLoaderOptions at the package root, so
@@ -106,10 +113,29 @@ export function isolatedSettings(): SettingsManager {
 }
 
 // The isolated resource-loader options: nothing ambient, only the agent's
-// declared capabilities.
+// declared capabilities — plus, when the agent has a contract (#145), the
+// contract block appended as LITERAL TEXT and bob's guard loaded as an INLINE
+// extension.
+//
+// The contract is appended through `appendSystemPromptOverride`, never as an
+// `appendSystemPrompt` source: pi resolves a source string that happens to name
+// an existing file as that FILE's contents (core/resource-loader.js
+// `resolvePromptInput`), which would silently turn a task into whatever is on
+// disk at that path. `appendContractOverride` is called after pi has
+// turned its sources into text, so what it returns is used as text, full stop.
+//
+// `extensionFactories` is where the guard goes: pi appends inline extensions
+// AFTER every path-loaded one (core/resource-loader.js `loadExtensionFactories`
+// / `loadFinalExtensionSet`), and runs `before_provider_request` handlers in
+// list order, so the guard sees the payload last — after every declared
+// capability has had its turn.
 export function isolatedLoaderOptions(
-  config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir">,
+  config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir"> & {
+    contractBlock?: string;
+  },
+  extra?: { guard?: InlineExtension },
 ): LoaderOptions {
+  const contractBlock = config.contractBlock;
   return {
     // The only extensions are the declared capabilities' paths. With
     // noExtensions the loader uses exactly these (temporary CLI scope) and
@@ -125,6 +151,10 @@ export function isolatedLoaderOptions(
     // global APPEND_SYSTEM.md too. The append source is exactly soul.md.
     systemPrompt: "",
     appendSystemPrompt: config.appendSystemPrompt.length > 0 ? [config.appendSystemPrompt] : [],
+    ...(contractBlock !== undefined
+      ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
+      : {}),
+    ...(extra?.guard !== undefined ? { extensionFactories: [extra.guard] } : {}),
   };
 }
 
@@ -319,13 +349,94 @@ export interface BobFactoryInput {
   // The effective tool policy (role ceiling ∩ bob.yaml, minus the exclusions).
   policy: ToolPolicy;
   deps?: SessionDeps;
+  // Test seam: a pre-built model runtime, so a test can drive a REAL pi session
+  // with a scripted provider (a stub model) instead of a network one. Omitted
+  // in production, where the runtime is built from the agent's own
+  // auth.json/models.json.
+  modelRuntime?: unknown;
+}
+
+// Fail the session if bob's OWN guard extension did not load (#145). pi records
+// an extension load failure on the loader and CONTINUES, so a guard that failed
+// to load would leave every outgoing request unchecked while the session looked
+// healthy — the exact silent-loss shape the guard exists to end. Inline
+// extensions are the ones pi names `<inline:...>`; every other extension here is
+// a declared capability, which assertCapabilitiesLoaded already covers.
+export function assertContractGuardLoaded(
+  loader: ExtensionErrorSource,
+  guard: InlineExtension | undefined,
+): void {
+  if (guard === undefined) return;
+  const failures = (loader.getExtensions().errors ?? []).filter((e) =>
+    e.path.startsWith("<inline:"),
+  );
+  if (failures.length === 0) return;
+  throw new Error(
+    [
+      `bob: ${failures.length} of bob's own inline extension${failures.length === 1 ? " did" : "s did"} not load:`,
+      ...failures.map((f) => `  ${f.path}: ${f.error}`),
+      "",
+      "The #145 contract guard is registered as an inline extension; without it no request",
+      "is checked for the contract, so the session is refused rather than run unguarded.",
+    ].join("\n"),
+  );
+}
+
+/**
+ * The literal contract block a session carries in its system prompt, or
+ * undefined when it carries none. The one-shot task and the persistent standing
+ * contract are mutually exclusive: a session that was started for one task and
+ * also claims a standing contract would be carrying two answers to "what am I
+ * doing", so that config is refused rather than resolved.
+ */
+export function contractBlockFor(
+  config: Pick<RunSessionConfig, "taskContract" | "standingContract" | "contractCapChars">,
+): string | undefined {
+  const hasTask = config.taskContract !== undefined;
+  const hasStanding = config.standingContract !== undefined;
+  if (hasTask && hasStanding) {
+    throw new Error(
+      "bob: refusing a session config with BOTH a task contract and a standing contract — pass taskContract (a one-shot run) OR standingContract (the persistent runtime), never both",
+    );
+  }
+  if (!hasTask && !hasStanding) return undefined;
+  return buildContractBlock({
+    label: hasTask ? "TASK" : "STANDING CONTRACT",
+    text: (hasTask ? config.taskContract : config.standingContract) as string,
+    capChars: config.contractCapChars,
+  });
 }
 
 // The runtime factory. pi calls it for the initial session and again for every
 // /new, /resume, /fork, /clone and /import, so all of those go through the
 // pinned identity, the isolated sources and the audit.
 export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSessionRuntimeFactory {
-  const { config, policy, deps } = input;
+  const { config, policy } = input;
+  const deps = input.deps;
+  // The #145 contract, built ONCE: the same literal block is appended to the
+  // system prompt (through the loader's override) and handed to the guard, so
+  // "the request carries the contract" is one string compared with itself.
+  const contractBlock = contractBlockFor(config);
+  // The guard's deps. The session exists only after the factory has built it,
+  // so the holder is filled in below; a guard that fires before then (it cannot
+  // — no request is made before the session exists) still ends the process,
+  // just without a session to dispose.
+  const guardTarget: { session?: { dispose(): void } } = {};
+  const guardDeps: ContractGuardDeps = {
+    dispose: () => {
+      try {
+        guardTarget.session?.dispose();
+      } catch {
+        // the failed contract check is the error that matters
+      }
+    },
+    exit: deps?.exit ?? ((code: number) => process.exit(code)),
+    log: deps?.log ?? ((m: string) => console.error(m)),
+  };
+  const guard =
+    contractBlock === undefined
+      ? undefined
+      : createContractGuardExtension({ contract: contractBlock, deps: () => guardDeps });
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
   return async ({ sessionManager }) => {
@@ -341,20 +452,28 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     }
     process.env.BOB_PERSISTENT = config.persistent ? "1" : "";
 
-    const modelRuntime = await ModelRuntime.create({
-      authPath: join(agentDir, "auth.json"),
-      modelsPath: join(agentDir, "models.json"),
-    });
+    const modelRuntime =
+      (input.modelRuntime as ModelRuntime | undefined) ??
+      (await ModelRuntime.create({
+        authPath: join(agentDir, "auth.json"),
+        modelsPath: join(agentDir, "models.json"),
+      }));
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
       settingsManager: isolatedSettings(),
       modelRuntime,
-      resourceLoaderOptions: isolatedLoaderOptions(config),
+      resourceLoaderOptions: isolatedLoaderOptions(
+        { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
+        { ...(guard !== undefined ? { guard } : {}) },
+      ),
     });
     // bob asked for these extensions explicitly: a declared capability whose
     // extension did not load is not an optional nicety.
     assertCapabilitiesLoaded(services.resourceLoader, config);
+    // And so is the guard: an inline extension that pi failed to load would
+    // leave every request unchecked while the session looked healthy.
+    assertContractGuardLoaded(services.resourceLoader, guard);
 
     const model = services.modelRuntime.getModel(config.provider, config.model);
     if (!model) {
@@ -370,6 +489,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       tools: policy.tools,
       ...(policy.excludeTools.length > 0 ? { excludeTools: policy.excludeTools } : {}),
     });
+
+    // The guard's dispose target: the session is now the thing a failed
+    // contract check must take down.
+    guardTarget.session = result.session as unknown as { dispose(): void };
 
     const assertActive = (session: AuditSession) => {
       assertAllowedToolsActive(session, policy);

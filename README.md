@@ -100,6 +100,34 @@ change one, the named test is what tells you.
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
   narrow it. *(`test/shell/doctor.test.ts`)*
+- **The task survives compaction, and every AGENT RESPONSE request is checked.**
+  A one-shot `bob run` carries its TASK, and the persistent runtime carries the
+  agent's STANDING CONTRACT (its role and cron duties), in the session's SYSTEM
+  PROMPT, appended as literal text through the resource loader's
+  `appendSystemPromptOverride` — never as an append-system-prompt *source*,
+  which pi would read as a FILE whenever the text happens to name one. The block
+  is bounded by a cap its own heading states and is cut with a visible
+  `[truncated: N chars elided]` marker. pi rebuilds the system prompt at session
+  creation, at bind, on every reload and on every tool change, and compaction
+  rewrites only the message history — so no compaction can erase what the run is
+  working on. bob's guard is registered LAST on `before_provider_request`, so it
+  sees the payload after every declared capability: an agent response request
+  whose system prompt does not carry the contract fails the turn exactly like a
+  failed audit — the session is disposed, the process ends, and the reason is
+  named. A blank task is refused before the session starts. **The guarantee is
+  stated for AGENT RESPONSE requests:** pi's own compaction and branch-summary
+  calls carry pi's summarization prompt instead and are excluded by name.
+  *(`test/shell/system-prompt-contract.test.ts`,
+  `system-prompt-contract-live.test.ts` — a real pi session on a stub model with
+  a real mid-turn threshold compaction and both loss paths, `run.test.ts`)*
+- **A one-shot run reports success only with a real final message.** `bob run`
+  settles exit 0 only when the last assistant message that ENDED after the last
+  compaction carries text — exactly the text of that message, never rebuilt from
+  streamed deltas; a message that ended empty or on an error is no final
+  message. A silent settlement after a compaction retries ONCE with an explicit
+  continue turn; if it is still silent the run exits non-zero naming the reason
+  (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
+  *(`test/shell/compaction-contract.test.ts`, `run.test.ts`)*
 
 ### Stated exceptions
 
@@ -111,6 +139,18 @@ change one, the named test is what tells you.
    `align.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
+3. **The contract costs tokens, per request.** The task is sent in the first
+   user message AND in every agent request's system prompt. Within a run the
+   system prompt is stable, so a provider's prompt cache can cover it; it is not
+   shared across runs. The cap is printed in the block's own heading, and a long
+   task is truncated with a marker that states how much was elided.
+4. **The "what remains" note is best-effort, and the judge judges the message.**
+   After a compaction bob sends one note — the last plan the agent stated, or
+   `git status --short` plus the recent tool calls — as a steer. If that send
+   fails it is logged and nothing else happens: the TASK is not lost (it is in
+   the system prompt), but the plan the note would have quoted can be. And the
+   completion judge checks for a real final MESSAGE, not that the work it
+   describes was done.
 
 ## Where Bob fits
 
