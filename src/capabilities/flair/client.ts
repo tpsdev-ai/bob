@@ -49,6 +49,12 @@ export interface FlairSoulEntry {
 
 export type Durability = "ephemeral" | "standard" | "persistent" | "permanent";
 
+// The presence activity enum. Mirrors PresenceActivity in capabilities/presence
+// (the same five values); kept in sync by construction, defined here (not
+// imported from the presence package) to avoid a circular dependency: the
+// presence capability depends on this client, not the other way around.
+export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
+
 export interface FlairClient {
   search(query: string, limit?: number): Promise<FlairSearchHit[]>;
   write(
@@ -243,6 +249,31 @@ export class FlairHttpClient implements FlairClient {
     return r ?? null;
   }
 
+  // ── Presence heartbeats (POST /Presence) ──────────────────────────────────
+  //
+  // A presence beat is a liveness + activity report for the roster. The body
+  // carries ONLY { activity?, currentTask? }:
+  //   * a beat with NEITHER field is a liveness-only beat — the server preserves
+  //     the prior activity stamp (natural presence), so the beacon can't erase a
+  //     busy stamp.
+  //   * the fields are runtime-authored (a busy label, or "idle") — never a
+  //     prompt, model output, or tool output. See the presence capability for the
+  //     content-decision rationale.
+  //
+  // Verified against Flair's Presence.post: it reads exactly these two fields,
+  // merges them into buildPresenceRecord, enforces the activity enum server-side,
+  // caps currentTask at 200 chars, and only lets an agent write its OWN record
+  // (403 cross-agent).
+  async presenceBeat(opts: {
+    activity?: PresenceActivity;
+    currentTask?: string | null;
+  }): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (opts.activity !== undefined) body.activity = opts.activity;
+    if (opts.currentTask != null && opts.currentTask !== "") body.currentTask = opts.currentTask;
+    await this.signedFetch("POST", "/Presence", body);
+  }
+
   // ── Soul (per-identity persona/context entries) ───────────────────────────
   //
   // Soul rows are keyed `<agentId>:<key>` and are written by PUT on that id —
@@ -284,5 +315,21 @@ export class FlairHttpClient implements FlairClient {
     // rather than as an entry whose value happens to be undefined.
     if (!r || typeof r.value !== "string") return null;
     return r;
+  }
+
+  // ── Agent record read (GET /Agent/<name>) ─────────────────────────────────
+  //
+  // Read a Flair Agent record by id. A 404 (the record is not registered yet)
+  // is an ordinary answer to a read, not a failure, so it is surfaced as null
+  // via signedFetch's nullOnStatus. Used to verify the signing identity exists
+  // before emitting presence beats (and exercised by the client's protocol test).
+  async agentGet(name: string): Promise<Record<string, unknown> | null> {
+    const r = (await this.signedFetch(
+      "GET",
+      `/Agent/${encodeURIComponent(name)}`,
+      undefined,
+      [404],
+    )) as Record<string, unknown> | undefined;
+    return r ?? null;
   }
 }

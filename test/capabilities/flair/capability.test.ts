@@ -320,3 +320,140 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
     expect(ok).toBe(true);
   });
 });
+
+// ── Presence beat (POST /Presence) + agent record read (GET /Agent/<name>) ─────
+//
+// These tests prove the presence capability's wire protocol against a Flair
+// store (using a real Ed25519 key so the TPS-Ed25519 signature verifies):
+//   1. a liveness-only beat sends an EMPTY body — the assertion that the beacon
+//      can't erase a busy stamp.
+//   2. a busy beat sends exactly { activity, currentTask } — no other keys, so
+//      no prompt/model/tool text can ride along.
+//   3. an idle beat sends { activity: "idle" } only (currentTask:null omitted).
+//   4. the request is signed with a MILLISECOND ts (the 1000x trap, named here).
+//   5. agentGet GETs /Agent/<name> and surfaces a 404 as null.
+
+async function makePresenceClient() {
+  const kp = (await subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const pkcs8b64 = Buffer.from(await subtle.exportKey("pkcs8", kp.privateKey)).toString("base64");
+  type Cap = {
+    url: string;
+    method: string;
+    body?: string;
+    headers: Record<string, string>;
+  };
+  const captured: Cap[] = [];
+  const fetchImpl = async (
+    url: string,
+    init: { method: string; headers: Record<string, string>; body?: string },
+  ): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> => {
+    if (url.includes("/Agent/")) {
+      // Simulate Flair returning 404 for an unregistered agent so the
+      // agentGet null-on-404 path is exercised.
+      captured.push({ url, method: init.method, body: init.body, headers: init.headers });
+      return { ok: false, status: 404, text: async () => "not found" };
+    }
+    captured.push({ url, method: init.method, body: init.body, headers: init.headers });
+    return { ok: true, status: 200, text: async () => "{}" };
+  };
+  const client = new FlairHttpClient({
+    url: "http://127.0.0.1:9926",
+    agentId: "pulse",
+    keyFile: "/unused",
+    fetchImpl,
+    now: () => 1_700_000_000_000,
+    uuid: () => "nonce-presence",
+    readFile: () => pkcs8b64,
+  });
+  return { client, captured, verifyKey: kp.publicKey };
+}
+
+describe("FlairHttpClient.presenceBeat — POST /Presence (metadata only)", () => {
+  it("a liveness-only beat sends an empty body (no activity/currentTask keys)", async () => {
+    const { client, captured } = await makePresenceClient();
+    await client.presenceBeat({});
+    expect(captured[0]?.method).toBe("POST");
+    expect(captured[0]?.url).toBe("http://127.0.0.1:9926/Presence");
+    // The load-bearing assertion: an empty body means the server preserves
+    // the prior activity stamp (natural presence) — the beacon can't erase busy.
+    expect(captured[0]?.body).toBe("{}");
+  });
+
+  it("a busy beat sends exactly {activity, currentTask} — no other keys", async () => {
+    const { client, captured } = await makePresenceClient();
+    await client.presenceBeat({ activity: "coding", currentTask: "mail from flint" });
+    const body = JSON.parse(captured[0]?.body ?? "{}");
+    expect(body).toEqual({ activity: "coding", currentTask: "mail from flint" });
+    // exactly two keys — no prompt/model/tool text has a field to hide in
+    expect(Object.keys(body).sort()).toEqual(["activity", "currentTask"]);
+  });
+
+  it("an idle beat sends {activity:'idle'} only (currentTask:null omitted)", async () => {
+    const { client, captured } = await makePresenceClient();
+    await client.presenceBeat({ activity: "idle", currentTask: null });
+    const body = JSON.parse(captured[0]?.body ?? "{}");
+    expect(body).toEqual({ activity: "idle" });
+    expect(body.currentTask).toBeUndefined();
+  });
+
+  it("an empty-string currentTask is omitted (only activity lands)", async () => {
+    const { client, captured } = await makePresenceClient();
+    await client.presenceBeat({ activity: "debugging", currentTask: "" });
+    const body = JSON.parse(captured[0]?.body ?? "{}");
+    expect(body).toEqual({ activity: "debugging" });
+  });
+
+  // The 1000x trap: ts MUST be in milliseconds. A seconds value signs a
+  // payload the server rejects (401). This test asserts the timestamp is the
+  // full millisecond value AND the signature verifies over it.
+  it("signs with a MILLIsecond timestamp (the 1000x trap) that verifies", async () => {
+    const { client, captured, verifyKey } = await makePresenceClient();
+    await client.presenceBeat({ activity: "planning", currentTask: "cron daily-brief" });
+    const auth = captured[0]?.headers.Authorization ?? "";
+    expect(auth.startsWith("TPS-Ed25519 ")).toBe(true);
+    const [agentId, ts, nonce, sigB64] = auth.slice("TPS-Ed25519 ".length).split(":");
+    expect(agentId).toBe("pulse");
+    expect(ts).toBe("1700000000000"); // 13 digits = ms, not 10-digit seconds
+    expect(Number(ts) > 1_000_000_000_000).toBe(true); // > a trillion: impossible for seconds
+    expect(nonce).toBe("nonce-presence");
+    const payload = "pulse:1700000000000:nonce-presence:POST:/Presence";
+    const ok = await subtle.verify(
+      "Ed25519",
+      verifyKey,
+      Buffer.from(sigB64 ?? "", "base64"),
+      new TextEncoder().encode(payload),
+    );
+    expect(ok).toBe(true);
+  });
+});
+
+describe("FlairHttpClient.agentGet — GET /Agent/<name>", () => {
+  it("GETs /Agent/<name> and surfaces a 404 as null", async () => {
+    const { client, captured } = await makePresenceClient();
+    const got = await client.agentGet("pulse");
+    expect(captured[0]?.method).toBe("GET");
+    expect(captured[0]?.url).toBe("http://127.0.0.1:9926/Agent/pulse");
+    expect(got).toBeNull();
+  });
+
+  it("signs the GET /Agent/<name> request with a ms timestamp that verifies", async () => {
+    const { client, captured, verifyKey } = await makePresenceClient();
+    // Use a name the fake fetch returns 200 for (anything not /Agent/ in the
+    // helper, but agentGet always hits /Agent/ → 404 → null; still signed).
+    await client.agentGet("flint");
+    const auth = captured[0]?.headers.Authorization ?? "";
+    const ts = auth.slice("TPS-Ed25519 ".length).split(":")[1];
+    expect(ts).toBe("1700000000000");
+    const payload = "pulse:1700000000000:nonce-presence:GET:/Agent/flint";
+    const ok = await subtle.verify(
+      "Ed25519",
+      verifyKey,
+      Buffer.from(auth.slice("TPS-Ed25519 ".length).split(":")[3] ?? "", "base64"),
+      new TextEncoder().encode(payload),
+    );
+    expect(ok).toBe(true);
+  });
+});

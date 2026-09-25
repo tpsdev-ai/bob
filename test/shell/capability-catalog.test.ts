@@ -69,8 +69,29 @@ describe("blessed catalog", () => {
     expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/observatory");
   });
 
+  it("blesses the presence capability as implemented (replaces the heartbeat placeholder)", () => {
+    const entry = lookupCapability("presence");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("presence");
+    // presence ships no tools — it is a runtime beacon + turn summary, not a
+    // tool surface.
+    expect(entry?.manifest.provides?.tools).toEqual([]);
+    // It "serves" (a persistent beacon + turn-end capture), so it only wires
+    // under BOB_PERSISTENT — exactly like discord's gateway.
+    expect(entry?.manifest.provides?.serves).toBe(true);
+    expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/presence");
+  });
+
+  it("the old heartbeat placeholder is GONE (replaced by presence)", () => {
+    // presence IS the heartbeat — one liveness system. The separate placeholder
+    // must not linger so an agent cannot declare a now-removed capability.
+    expect(lookupCapability("heartbeat")).toBeUndefined();
+    expect(BLESSED_CATALOG.heartbeat).toBeUndefined();
+  });
+
   it("lists the still-planned capabilities as not-yet-implemented", () => {
-    for (const name of ["mail", "heartbeat"]) {
+    for (const name of ["mail"]) {
       const entry = lookupCapability(name);
       expect(entry, name).toBeDefined();
       expect(entry?.notYetImplemented, name).toBe(true);
