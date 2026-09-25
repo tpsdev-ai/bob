@@ -94,6 +94,28 @@ async function deadPid(): Promise<number> {
   return child.pid;
 }
 
+// A LIVE PID held by a child of this test — never by the test process itself. The
+// live-lock case must be proven by ANOTHER live process (issue #146, round 5):
+// naming the test's own pid only proves the test is running, not that retention
+// reads a lock the way a real concurrent run's would. Returns the pid plus a stop()
+// that waits for the child to exit.
+async function livePid(): Promise<{ pid: number; stop: () => Promise<void> }> {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    stdio: "ignore",
+  });
+  if (child.pid === undefined) throw new Error("livePid: child PID unavailable");
+  const pid = child.pid;
+  // Let the child actually start before anything probes its liveness.
+  await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  return {
+    pid,
+    stop: async () => {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    },
+  };
+}
+
 // Build a message_update event exactly like the real pi SDK emits one: a
 // text_delta `assistantMessageEvent` carrying the growing `partial`, plus a
 // growing shallow-copy `message` (its content grows in place).
@@ -111,7 +133,7 @@ function eventType(r: unknown): string | undefined {
   return (r as any)?.event?.type;
 }
 
-function isCapLine(r: unknown): r is { cap: true; capBytes?: number } {
+function isCapLine(r: unknown): r is { cap: true; kind?: string; capBytes?: number } {
   return typeof r === "object" && r !== null && (r as { cap?: unknown }).cap === true;
 }
 
@@ -223,7 +245,7 @@ describe("run-log sizing + retention (issue #146)", () => {
     }
   });
 
-  it("past the per-run cap: drops deltas but keeps tool/error events; cap line once", async () => {
+  it("past the per-run DELTA cap: drops streamed deltas but keeps tool/error events; one delta-cap marker", async () => {
     const events: unknown[] = [];
     for (let i = 0; i < 300; i++) {
       // Each delta carries a small growing partial; ~13 of them overflow the cap.
@@ -254,8 +276,10 @@ describe("run-log sizing + retention (issue #146)", () => {
     // Exactly one line records that the cap was hit.
     const capLines = log.lines.filter(isCapLine);
     expect(capLines.length).toBe(1);
-    // The cap line records the configured cap so a reader knows the bound.
+    // The cap line records the configured cap so a reader knows the bound, and
+    // names WHAT it capped: the streamed deltas, not the log.
     expect(capLines[0].capBytes).toBe(2000);
+    expect(capLines[0].kind).toBe("delta");
     // Deltas after the cap are dropped: fewer message_update lines than tokens.
     const updates = log.lines.filter((l) => eventType(l) === "message_update");
     expect(updates.length).toBeGreaterThan(0);
@@ -270,6 +294,104 @@ describe("run-log sizing + retention (issue #146)", () => {
     for (const l of log.lines.slice(capIdx + 1)) {
       expect(eventType(l)).not.toBe("message_update");
     }
+  });
+
+  it("past the delta cap: message_end still records the final message, in full", async () => {
+    // The documented consequence of the delta cap, pinned: past the cap the streamed
+    // deltas are dropped, but message_end still records each final message once — so
+    // the message's CONTENT is recoverable from the log even when its deltas were not
+    // all written.
+    const finalText = "FINAL-MESSAGE-BODY";
+    const events: unknown[] = [];
+    for (let i = 0; i < 60; i++) {
+      events.push({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_delta",
+          contentIndex: 0,
+          delta: "tok",
+          partial: "tok".repeat(i + 1),
+        },
+      });
+    }
+    events.push({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+    });
+    events.push({
+      type: "tool_execution_start",
+      toolCallId: "tc-after-cap",
+      toolName: "read",
+      args: {},
+    });
+
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(fakeSession(events)),
+      runLogCapBytes: 1500,
+    });
+    expect(res.exitCode).toBe(0);
+
+    const log = readRunLog("testbot");
+    const capIdx = log.lines.findIndex(isCapLine);
+    expect(capIdx).toBeGreaterThan(0);
+    // The final message is logged ONCE, after the cap, carrying its full content.
+    const endIdx = log.lines.findIndex((l) => eventType(l) === "message_end");
+    expect(endIdx).toBeGreaterThan(capIdx);
+    expect(JSON.stringify(log.lines[endIdx])).toContain(finalText);
+    // Everything after the cap line is non-delta: the tool call is still logged.
+    for (const l of log.lines.slice(capIdx + 1)) {
+      expect(eventType(l)).not.toBe("message_update");
+    }
+    expect(log.lines.map(eventType)).toContain("tool_execution_start");
+  });
+
+  it("a crash past the cap before any message_end leaves no post-cap content", async () => {
+    // The other half of the documented trade-off, pinned honestly: with the deltas
+    // dropped and no message_end yet, that message's post-cap tail is simply not in
+    // the log. (A reader of such a log needs to know that, not to guess it.)
+    const events: unknown[] = [];
+    for (let i = 0; i < 200; i++) {
+      events.push({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_delta",
+          contentIndex: 0,
+          delta: "tok",
+          partial: "tok".repeat(i + 1),
+        },
+      });
+    }
+
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(
+        fakeSession(events, {
+          throwAfter: events.length,
+          throwError: new Error("simulated mid-run crash"),
+        }),
+      ),
+      runLogCapBytes: 1200,
+    });
+    expect(res.exitCode).toBe(1);
+
+    const log = readRunLog("testbot");
+    const capIdx = log.lines.findIndex(isCapLine);
+    expect(capIdx).toBeGreaterThan(0);
+    // No message_end was ever emitted, so no final message is in the log: the
+    // post-cap tail of that message is genuinely absent.
+    expect(log.lines.map(eventType)).not.toContain("message_end");
+    const updatesAfterCap = log.lines
+      .slice(capIdx + 1)
+      .filter((l) => eventType(l) === "message_update");
+    expect(updatesAfterCap.length).toBe(0);
+    // The death is still recorded, so the log says why it ends there.
+    const doneLine = log.lines.find((l) => (l as { done?: boolean }).done === true);
+    expect(doneLine).toBeDefined();
   });
 
   it("writes each record to disk when the append returns (read before the next event)", async () => {
@@ -317,6 +439,9 @@ describe("run-log sizing + retention (issue #146)", () => {
     // A standalone runs dir, NOT driven through runAgent (which hardcodes the newest-5
     // / 500 MB defaults), so the lock-aware path can be exercised with a small budget.
     const dir = mkdtempSync(join(tmpdir(), "bob-runlog-retain-"));
+    // The live lock must name ANOTHER live process — a child of this test, not the
+    // test process itself.
+    const live = await livePid();
     try {
       const mk = (name: string, mtimeSec: number, withLock: boolean, pid: number): void => {
         const p = join(dir, `${name}.jsonl`);
@@ -332,8 +457,8 @@ describe("run-log sizing + retention (issue #146)", () => {
       // A crashed/finished run: its lock names a dead PID -> treated as finished -> pruned.
       const dead = await deadPid();
       mk("dead", now - 5000, true, dead);
-      // THIS run's log: its lock names a live PID (the test process) -> must be skipped.
-      mk("live", now - 4000, true, process.pid);
+      // THIS run's log: its lock names a live process (a child of this test) -> skipped.
+      mk("live", now - 4000, true, live.pid);
       // The newest log: inside the newest-1 window, protected unconditionally.
       mk("newest", now, false, 0);
 
@@ -352,6 +477,59 @@ describe("run-log sizing + retention (issue #146)", () => {
       // The newest log is untouched.
       expect(res.removed).not.toContain("newest.jsonl");
       expect(res.kept).toBe(1);
+    } finally {
+      await live.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retention fails safe: a lock it cannot read or parse KEEPS the log", async () => {
+    // An unreadable or unparsable lock means "we cannot show this run is finished",
+    // and retention must never prune what it cannot show is dead (issue #146, round
+    // 5). Only a POSITIVE proof of death — no lock at all, or a lock naming a dead
+    // PID — makes a log prunable.
+    const dir = mkdtempSync(join(tmpdir(), "bob-runlog-failsafe-"));
+    try {
+      const mk = (name: string, mtimeSec: number): string => {
+        const p = join(dir, `${name}.jsonl`);
+        writeFileSync(p, `${name}\n`.repeat(20));
+        utimesSync(p, mtimeSec, mtimeSec);
+        return p;
+      };
+      const now = Math.floor(Date.now() / 1000);
+      // Unreadable: a DIRECTORY where the lock file belongs, so readFileSync throws
+      // (EISDIR) regardless of uid — no chmod, no root, same result everywhere.
+      const unreadable = mk("unreadable", now - 8000);
+      mkdirSync(`${unreadable}.lock`);
+      // Present but not a PID.
+      const unparsable = mk("unparsable", now - 7000);
+      writeFileSync(`${unparsable}.lock`, "not-a-pid");
+      // Present, names nothing at all.
+      const empty = mk("empty", now - 6000);
+      writeFileSync(`${empty}.lock`, "");
+      // Provably dead: a lock naming a finished child's PID -> prunable.
+      const dead = mk("dead", now - 5000);
+      writeFileSync(`${dead}.lock`, String(await deadPid()));
+      // No lock at all: the run dropped it at the end -> prunable.
+      mk("finished", now - 4000);
+      // The newest log: inside the newest-1 window, protected unconditionally.
+      mk("newest", now);
+
+      const res = pruneOldRunLogs(dir, { keep: 1, budgetBytes: 10 });
+
+      // Kept: every log whose lock cannot be shown to be finished, plus the newest.
+      for (const name of ["unreadable", "unparsable", "empty", "newest"]) {
+        expect(res.removed, `${name} is kept`).not.toContain(`${name}.jsonl`);
+        expect(existsSync(join(dir, `${name}.jsonl`)), `${name} still on disk`).toBe(true);
+      }
+      // The locks of the kept logs are left alone too.
+      expect(existsSync(`${unreadable}.lock`)).toBe(true);
+      expect(existsSync(`${unparsable}.lock`)).toBe(true);
+      // Pruned: the two logs we could positively show are finished.
+      expect(res.removed).toContain("dead.jsonl");
+      expect(res.removed).toContain("finished.jsonl");
+      expect(existsSync(join(dir, "dead.jsonl"))).toBe(false);
+      expect(existsSync(join(dir, "finished.jsonl"))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

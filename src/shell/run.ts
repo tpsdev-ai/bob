@@ -23,14 +23,18 @@
 // Model override is per-call (`opts.model`): it replaces the bob.yaml model
 // for this invocation only, same semantics as the old `--model` flag.
 
+import { randomBytes } from "node:crypto";
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -57,17 +61,28 @@ const AGENT_NAME = /^[a-z0-9-]+$/;
 // 2.6 GB log for one 2h35m run and 15 GB in `runs/` on a 40 GB disk — the disk
 // fills, the agent dies mid-task, and the logger swallows the disk-full error.
 //
-// DEFAULT_RUNLOG_CAP_BYTES: the per-run size cap. Once a single run's log
-// reaches this, delta (message_update) events stop being written, but
-// non-delta events — tool calls, results, errors, lifecycle, the done line —
-// keep coming, and exactly one line records that the cap was hit.
-const DEFAULT_RUNLOG_CAP_BYTES = 50 * 1024 * 1024; // 50 MB
+// DEFAULT_RUNLOG_DELTA_CAP_BYTES: the per-run DELTA cap. It caps the STREAMED
+// DELTA events only — message_update, tool_execution_update,
+// bash_execution_update and queue_update, the four events that repeat per stream
+// chunk (`isDeltaEvent`). Once the log reaches this many bytes those deltas stop
+// being written; every NON-delta event — tool calls and results, errors,
+// lifecycle, the *_end finals, the done line — keeps coming, and exactly one line
+// records that the DELTA cap was hit.
+//
+// The consequence, stated plainly (README + PR body say the same): past the cap
+// the deltas are dropped; `message_end` still records each final message once, so
+// content is recoverable there; a crash before a `message_end` loses that
+// message's post-cap tail.
+const DEFAULT_RUNLOG_DELTA_CAP_BYTES = 50 * 1024 * 1024; // 50 MB
 
 // RUNLOG_KEEP / RUNLOG_BUDGET_BYTES: on run start, the newest RUNLOG_KEEP logs
 // are always kept; older ones are deleted oldest-first once their combined size
 // exceeds RUNLOG_BUDGET_BYTES. A log still being written is never touched
 // (retention runs before the current run's file exists, and a live sibling's
-// fresh mtime keeps it in the newest-K window).
+// fresh mtime keeps it in the newest-K window). Retention FAILS SAFE: a log is
+// pruned only when we can POSITIVELY show its run is finished — it has no lock at
+// all, or its lock names a provably dead PID. A lock that exists but cannot be
+// read, or whose content does not name a PID, is KEPT.
 const RUNLOG_KEEP = 5;
 const RUNLOG_BUDGET_BYTES = 500 * 1024 * 1024; // 500 MB for logs older than newest-K
 
@@ -81,30 +96,45 @@ export interface RunLogRetentionResult {
   remainingBytes: number;
 }
 
-// True when `logPath` has a sidecar lock (`<logPath>.lock`) that names a PID
-// still alive — i.e. a run is still writing that log. Retention skips such logs
-// (a live run's writer would keep writing to a path that is no longer on disk).
-// A missing lock, or a lock whose PID is dead or unparseable, marks the run as
-// finished, so the log is prunable like any other.
+// True when `logPath` has a sidecar lock (`<logPath>.lock`) that shows the run is
+// NOT finished, so retention must keep the log. Retention FAILS SAFE (issue #146,
+// round 5): a log is pruned only when we can POSITIVELY show its run is finished.
+//
+//     no lock file          -> the run removed it at the end  -> finished, prunable
+//     lock names a live PID -> the run is still writing       -> KEEP
+//     lock unreadable       -> cannot show it is finished     -> KEEP (fail safe)
+//     lock unparsable       -> cannot show it is finished     -> KEEP (fail safe)
+//     lock names a dead PID -> ESRCH; the run is gone         -> prunable
 //
 // `process.kill(pid, 0)` probes liveness without signaling the target: it throws
 // ESRCH for a dead PID and EPERM for a live PID we can't signal (different uid),
 // so "no throw, or EPERM" means the run is live.
 function logHasLiveLock(logPath: string): boolean {
+  const lockPath = `${logPath}.lock`;
+  // No lock at all: the run dropped its lock at run end, so it is finished and the
+  // log is prunable. Distinguishing this from a PRESENT but unreadable lock is
+  // exactly what lets the unreadable case fail safe below.
+  if (!existsSync(lockPath)) return false;
   let raw: string;
   try {
-    raw = readFileSync(`${logPath}.lock`, "utf8");
+    raw = readFileSync(lockPath, "utf8");
   } catch {
-    // No readable lock -> the run is finished; the log is prunable.
-    return false;
+    // The lock exists but cannot be read (perms, or a directory named as the lock).
+    // We cannot show the run is finished, so keep the log.
+    return true;
   }
   const pid = Number.parseInt(raw.trim(), 10);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    // The lock exists but does not name a PID. We cannot show the run is finished,
+    // so keep the log.
+    return true;
+  }
   try {
     process.kill(pid, 0);
-    return true;
+    return true; // live
   } catch (err) {
-    // EPERM = a live PID we aren't allowed to signal (still alive). ESRCH = gone.
+    // EPERM = a live PID we aren't allowed to signal (still alive) -> keep.
+    // ESRCH = gone; a dead PID is a finished run -> the log is prunable.
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
@@ -161,23 +191,158 @@ export function pruneOldRunLogs(
   return { kept: Math.min(keep, files.length), removed, remainingBytes };
 }
 
-// Recursively drop every `partial` field from a value. Streamed `message_update`
-// events carry `partial` — the whole assistant message so far, repeated and
-// growing on every token — which is what made the run-log quadratic. The delta
-// alone reconstructs the message and `message_end` carries the final one once, so
-// dropping `partial` at any nesting level is safe and keeps the log linear.
-function scrubPartial(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(scrubPartial);
-  if (value && typeof value === "object") {
-    const src = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(src)) {
-      if (k === "partial") continue;
-      out[k] = scrubPartial(v);
-    }
-    return out;
+// --- Run-log projection (issue #146, round 5) -----------------------------------
+//
+// The log used to copy each session event WHOLE and strip the snapshot fields it
+// already knew about. Each review round then found one more accumulated field it
+// did not know about — message_update's growing `partial` and `message`, then
+// tool_execution_update's cumulative `partialResult`, then queue_update's whole
+// steering/follow-up queues — because a denylist can only ever be as complete as
+// the last field someone remembered. The projection inverts that: a field
+// WHITELIST mapping every event type in pi 0.84.3's event unions (pi-agent-core's
+// AgentEvent and pi-coding-agent's AgentSessionEvent, enumerated from the
+// installed `.d.ts`) to exactly the fields worth logging.
+//
+//     - streamed updates log their increment only: message_update the inner
+//       event kind and its delta — never `partial` or `message`;
+//       tool_execution_update no `partialResult` (the result is logged once, on
+//       tool_execution_end); queue_update counts only; bash_execution_update its
+//       per-chunk delta;
+//     - `*_end` events log the final content exactly once;
+//     - an event type the projection does not name logs `{ type, unknownEvent:
+//       true }` and none of its payload.
+//
+// Because each record's shape depends only on the event's own named fields, a
+// record never grows with the events before it, so the log stays linear in the
+// number of events rather than in their accumulated payload.
+
+// The event types the DELTA cap drops once it is hit (see
+// DEFAULT_RUNLOG_DELTA_CAP_BYTES): the streamed updates that repeat per stream
+// chunk — a growing message, a cumulative tool result, a streaming bash delta, a
+// queue snapshot. Every other event is a NON-delta and is ALWAYS written, even
+// past the cap, so the log stays a faithful post-mortem.
+export function isDeltaEvent(type: unknown): boolean {
+  return (
+    type === "message_update" ||
+    type === "tool_execution_update" ||
+    type === "bash_execution_update" ||
+    type === "queue_update"
+  );
+}
+
+// A short random suffix so two runs that start in the same millisecond get
+// distinct log filenames — and therefore distinct locks. 6 random bytes
+// (crypto, 2^48) against a millisecond timestamp and a PID: not a secret, just
+// enough entropy that a collision is not a thing that happens.
+function randomLogSuffix(): string {
+  return randomBytes(6).toString("hex");
+}
+
+// A session event as it reaches the log: pi's events, widened to a plain record.
+type EventRecord = Record<string, unknown>;
+
+// Copy the named fields, dropping the ones the event does not carry, so a record
+// holds exactly what it logs (no `undefined` keys).
+function projectFields(event: EventRecord, keys: readonly string[]): EventRecord {
+  const out: EventRecord = { type: event.type };
+  for (const k of keys) {
+    if (event[k] !== undefined) out[k] = event[k];
   }
-  return value;
+  return out;
+}
+
+// Map one session event to the fields the run log records. See the block comment
+// above for the shape and why it is a whitelist.
+export function projectRunLogRecord(event: EventRecord): EventRecord {
+  const type = event.type;
+  switch (type) {
+    // Lifecycle: no payload of their own.
+    case "agent_start":
+    case "turn_start":
+    case "agent_settled":
+    case "summarization_retry_finished":
+      return { type };
+
+    // The message, logged once (message_start) or once final (message_end).
+    case "message_start":
+    case "message_end":
+      return projectFields(event, ["message"]);
+
+    // message_update: the inner stream event's KIND and its increment only. Never
+    // `partial` (the whole message so far) or `message` (its growing shallow copy)
+    // — that pair is what made the log quadratic. The delta reconstructs the
+    // message and message_end carries the final one once.
+    case "message_update": {
+      const inner = (event.assistantMessageEvent ?? {}) as EventRecord;
+      const out: EventRecord = { type };
+      if (inner.type !== undefined) out.kind = inner.type;
+      if (inner.delta !== undefined) out.delta = inner.delta;
+      return out;
+    }
+
+    // tool_execution_start: the call and its args, logged once.
+    case "tool_execution_start":
+      return projectFields(event, ["toolCallId", "toolName", "args"]);
+    // tool_execution_update: NO `partialResult` — it is the CUMULATIVE tool output
+    // (a long `bash` run streams the whole output on every update); the result is
+    // logged once, on tool_execution_end.
+    case "tool_execution_update":
+      return projectFields(event, ["toolCallId", "toolName"]);
+    // tool_execution_end: the final result, logged once.
+    case "tool_execution_end":
+      return projectFields(event, ["toolCallId", "toolName", "result", "isError"]);
+
+    // turn_end: the turn's final message and the tool results it produced, once.
+    case "turn_end":
+      return projectFields(event, ["message", "toolResults"]);
+
+    // agent_end: each low-level run's OWN `messages`, logged UNCHANGED (issue
+    // #139). They are that run's own newMessages, not the accumulated history, so
+    // they are already bounded by the run — never slice them against a running
+    // count (a shorter retry or failure run would silently lose messages).
+    case "agent_end":
+      return projectFields(event, ["messages", "willRetry"]);
+
+    // queue_update: the COUNTS only — never the steering/follow-up text, which is
+    // the whole pending queue repeated on every update.
+    case "queue_update":
+      return {
+        type,
+        steeringCount: Array.isArray(event.steering) ? event.steering.length : 0,
+        followUpCount: Array.isArray(event.followUp) ? event.followUp.length : 0,
+      };
+
+    // bash_execution_update: the per-chunk output delta (already an increment).
+    case "bash_execution_update":
+      return projectFields(event, ["id", "delta"]);
+
+    case "compaction_start":
+      return projectFields(event, ["reason"]);
+    case "compaction_end":
+      return projectFields(event, ["reason", "result", "aborted", "willRetry", "errorMessage"]);
+
+    case "auto_retry_start":
+      return projectFields(event, ["attempt", "maxAttempts", "delayMs", "errorMessage"]);
+    case "auto_retry_end":
+      return projectFields(event, ["success", "attempt", "finalError"]);
+    case "summarization_retry_scheduled":
+      return projectFields(event, ["attempt", "maxAttempts", "delayMs", "errorMessage"]);
+    case "summarization_retry_attempt_start":
+      return projectFields(event, ["source", "reason"]);
+
+    case "entry_appended":
+      return projectFields(event, ["entry"]);
+    case "session_info_changed":
+      return projectFields(event, ["name"]);
+    case "thinking_level_changed":
+      return projectFields(event, ["level"]);
+
+    default:
+      // An event type the projection does not name: the type alone, none of its
+      // payload. A future pi event is logged as unrecognised rather than copied
+      // whole (which is how each previous round's accumulated field got in).
+      return { type, unknownEvent: true };
+  }
 }
 
 // A minimal view of what a `run` task needs from a pi AgentSession. Keeping
@@ -266,11 +431,19 @@ export interface RunOptions {
   agentsRoot?: string;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
-  // Per-run run-log size cap in bytes (see DEFAULT_RUNLOG_CAP_BYTES). Past it,
-  // delta (message_update) events stop being written; non-delta events (tool
-  // calls, errors, lifecycle, the done line) keep coming. Tests set a small cap
-  // to exercise the cap without writing gigabytes.
+  // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
+  // caps the STREAMED DELTA events only (message_update, tool_execution_update,
+  // bash_execution_update, queue_update). Past it those deltas stop being written;
+  // every non-delta event (tool calls and results, errors, lifecycle, the *_end
+  // finals, the done line) keeps coming. message_end still records each final
+  // message, so content is recoverable there; a crash before a message_end loses
+  // that message's post-cap tail. Tests set a small cap to exercise it without
+  // writing gigabytes.
   runLogCapBytes?: number;
+  // Injectable clock for the run-log filename and record timestamps (tests).
+  // Defaults to a fresh Date() per call. Lets a test pin the start millisecond so
+  // two runs started in the same millisecond still get distinct files and locks.
+  now?: () => Date;
 }
 
 export interface RunResult {
@@ -313,104 +486,120 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const factory = opts.sessionFactory ?? createPiRunSession;
   const session = await factory(config);
 
-  // Tee every session event to a per-run JSONL log so a mid-run death (e.g. an
-  // ollama rate-limit/cap) is post-mortem-able instead of leaving no trace.
-  // The filename is the run's start timestamp with `:`/`.` swapped so it's a
-  // filesystem-safe name. Logging is strictly best-effort — a logging failure
-  // must never break the run — and writeRunLog swallows everything.
+  // Tee every session event to a per-run JSONL log so a mid-run death (a provider
+  // cap, an OOM, a crash) is post-mortem-able instead of leaving no trace. Logging
+  // is strictly best-effort: NOTHING about it — including creating the runs
+  // directory — may throw into the run. If the log cannot even be set up we warn
+  // ONCE and continue with a no-op logger, so the run still completes and the
+  // failure is a stderr line rather than a crash (issue #146, round 5).
+  const now = opts.now ?? (() => new Date());
   const runsDir = join(agentDir, "runs");
-  mkdirSync(runsDir, { recursive: true });
 
-  // Retention first: keep the newest few logs and delete older ones oldest-first
-  // past a total budget, so a 15 GB / 40 GB disk can't silently fill a runs dir
-  // and kill a long run. This runs BEFORE the current run's file is created, so
-  // it never touches a run still being written.
+  // writeRunLog stays a no-op until setup finishes, and runLogLockPath stays ""
+  // unless a lock was actually dropped. A failure anywhere in the setup below (an
+  // unwritable runs dir, a file where the dir belongs) leaves the run running
+  // without its log.
+  let writeRunLog: (record: unknown, isDelta: boolean) => void = () => {};
+  let runLogLockPath = "";
+
   try {
-    pruneOldRunLogs(runsDir, {});
-  } catch {
-    // Retention is best-effort; never let it abort the run.
-  }
+    // (1) Create the runs directory. This is the setup step that can throw into the
+    // run; the outer catch turns a failure into one warning line + the no-op logger.
+    mkdirSync(runsDir, { recursive: true });
 
-  const runLogPath = join(runsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
-  process.stderr.write(`run log: ${runLogPath}\n`);
-
-  // Sidecar lock: while this run is writing its log it drops `<log>.lock`
-  // holding its PID. Retention reads it to leave a live run's log alone (a
-  // dead-PID lock means the run has finished). Removed at run end.
-  const runLogLockPath = `${runLogPath}.lock`;
-  try {
-    appendFileSync(runLogLockPath, String(process.pid));
-  } catch {
-    // Best-effort: if we can't drop the lock, retention can't tell liveness and
-    // treats the log as finished — the safe default.
-  }
-
-  // Synchronous writer: appendFileSync commits each record to disk before it
-  // returns — exactly the post-mortem property this log exists for (a hard crash
-  // leaves every record written before it on disk). With `partial` stripped each
-  // record is small, so there is no per-write cost worth buffering. A failed
-  // append (disk full, race, perms) is swallowed: logging is best-effort and must
-  // never throw into the run.
-  const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_CAP_BYTES;
-  let logBytes = 0; // running total of bytes committed to this log
-  let capHit = false; // set once we cross the cap; then deltas stop
-
-  // Write one log record.
-  // - `isDelta` marks streamed message_update events: the only kind the cap drops,
-  //   because their `partial` field (the whole message so far) made the log
-  //   quadratic.
-  // - message_update events are logged WITHOUT `partial`: the delta alone
-  //   reconstructs the message and message_end carries the final message once.
-  // - non-delta events (tool calls, results, errors, lifecycle, the done line) are
-  //   ALWAYS written, even past the cap, so the log stays a faithful post-mortem.
-  const writeRunLog = (record: unknown, isDelta: boolean): void => {
+    // (2) Retention first (best-effort): keep the newest few logs and delete older
+    // ones oldest-first past a total budget, so a full disk can't silently kill a
+    // long run. Runs BEFORE this run's file exists, so it never touches a run still
+    // being written.
     try {
-      const rec = record as Record<string, unknown>;
-      const ev = rec.event as Record<string, unknown> | undefined;
-      let out: unknown = record;
-      if (isDelta && ev) {
-        // message_update: the delta alone reconstructs the message; message_end
-        // carries the final one, so drop the growing partial and the in-place
-        // growing shallow-copy message — keeps the log linear (issue #146).
-        const stripped = scrubPartial(ev) as Record<string, unknown>;
-        delete stripped.message;
-        out = { ...rec, event: stripped };
-      }
-      // agent_end is logged UNCHANGED. In pi each agent_end comes from one low-level
-      // run and its `messages` are only that run's own messages (the agent loop
-      // builds them from the run's newMessages), so the record is already bounded
-      // by the run and the log stays linear in the number of turns without
-      // touching it. It must not be sliced against a running count: a retry or a
-      // failure agent_end yields a SHORTER array than a previous run, and slicing
-      // by the previous length silently drops those messages (issue #139).
-      // Past the cap: drop deltas, keep everything else.
-      if (isDelta && capHit) return;
-      const line = `${JSON.stringify(out)}\n`;
-      const n = Buffer.byteLength(line);
-      appendFileSync(runLogPath, line);
-      logBytes += n;
-      if (!capHit && logBytes >= capBytes) {
-        // One line, ever, recording that the per-run cap was hit.
-        capHit = true;
-        const capLine = `${JSON.stringify({
-          t: new Date().toISOString(),
-          cap: true,
-          bytes: logBytes,
-          capBytes,
-        })}\n`;
-        appendFileSync(runLogPath, capLine);
-        logBytes += Buffer.byteLength(capLine);
-      }
+      pruneOldRunLogs(runsDir, {});
     } catch {
-      // Best-effort: never throw from the logger (disk full, races, etc.).
+      // Retention is best-effort; never let it abort the run.
     }
-  };
+
+    // (3) ONE log per run, even when two runs start in the same millisecond: the
+    // name carries the start timestamp, the run's PID and a random suffix, so
+    // distinct runs get distinct files — and therefore distinct locks. Created
+    // EXCLUSIVELY (`wx`), so an existing path is never clobbered.
+    const runLogName = `${now().toISOString().replace(/[:.]/g, "-")}.${process.pid}.${randomLogSuffix()}.jsonl`;
+    const runLogPath = join(runsDir, runLogName);
+    closeSync(openSync(runLogPath, "wx"));
+    process.stderr.write(`run log: ${runLogPath}\n`);
+
+    // (4) Sidecar lock: while this run writes its log it holds `<log>.lock` naming
+    // its PID; retention reads it to leave a live run's log alone. The lock belongs
+    // to this log file alone (the name above is unique), and is created exclusively
+    // too. Removed at run end.
+    runLogLockPath = `${runLogPath}.lock`;
+    try {
+      writeFileSync(runLogLockPath, String(process.pid), { flag: "wx" });
+    } catch {
+      // Best-effort: without a lock, retention can't show this run is live and may
+      // prune the log — the pre-existing caveat, unchanged.
+    }
+
+    // (5) The DELTA cap: the per-run limit on the STREAMED DELTA events
+    // (isDeltaEvent). Past it those deltas are dropped; every NON-delta event — tool
+    // calls and results, errors, lifecycle, the *_end finals, the done line — keeps
+    // coming, and exactly one line records that the DELTA cap was hit.
+    const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_DELTA_CAP_BYTES;
+    let logBytes = 0; // running total of bytes committed to this log
+    let deltaCapHit = false; // set once the marker below is on disk; then deltas stop
+
+    // Synchronous writer: appendFileSync commits each record to disk before it
+    // returns — exactly the post-mortem property this log exists for (a hard crash
+    // leaves every record written before it on disk). Each record is projected to a
+    // bounded shape (`projectRunLogRecord`), so there is no per-write cost worth
+    // buffering and no accumulated payload in it. A failed append (disk full, race,
+    // perms) is swallowed: logging is best-effort and never throws into the run.
+    writeRunLog = (record: unknown, isDelta: boolean): void => {
+      try {
+        // Past the delta cap the STREAMED DELTAS are dropped; every non-delta event
+        // keeps coming, so the log stays a faithful post-mortem.
+        if (isDelta && deltaCapHit) return;
+        const line = `${JSON.stringify(record)}\n`;
+        const n = Buffer.byteLength(line);
+        appendFileSync(runLogPath, line);
+        logBytes += n;
+        if (!deltaCapHit && logBytes >= capBytes) {
+          // One line, ever, recording that the delta cap was hit — written BEFORE
+          // the flag is set, so the flag never claims "delta cap hit" without the
+          // marker already on disk. If that append throws, the flag stays clear and
+          // the catch below swallows it.
+          const capLine = `${JSON.stringify({
+            t: now().toISOString(),
+            cap: true,
+            kind: "delta",
+            bytes: logBytes,
+            capBytes,
+          })}\n`;
+          appendFileSync(runLogPath, capLine);
+          logBytes += Buffer.byteLength(capLine);
+          deltaCapHit = true;
+        }
+      } catch {
+        // Best-effort: never throw from the logger (disk full, races, etc.).
+      }
+    };
+  } catch {
+    // Setting up the log failed — including creating the runs directory. Warn once
+    // and continue with the no-op logger: logging never throws into the run.
+    process.stderr.write(
+      `bob run ${opts.name}: run log unavailable (could not create ${runsDir}); continuing without a run log\n`,
+    );
+  }
 
   let captured = "";
   const unsubscribe = session.subscribe((event) => {
     // Post-mortem trail first: record EVERY event (tool calls, results, errors,
     // retries), not just text — that's what makes a death diagnosable.
-    writeRunLog({ t: new Date().toISOString(), event }, event.type === "message_update");
+    writeRunLog(
+      {
+        t: now().toISOString(),
+        event: projectRunLogRecord(event as unknown as Record<string, unknown>),
+      },
+      isDeltaEvent(event.type),
+    );
     // Stream the assistant's text deltas — same event shape the SDK
     // quickstart and every examples/sdk/*.ts use. UNCHANGED: the captured
     // accumulation stays byte-identical so the returned final text is stable.
@@ -448,7 +637,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // live. Best-effort — a leaked lock names a now-dead PID, which the next
     // sweep treats as finished.
     try {
-      unlinkSync(runLogLockPath);
+      if (runLogLockPath !== "") unlinkSync(runLogLockPath);
     } catch {
       // best-effort: the lock may already be gone
     }
