@@ -259,6 +259,9 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
           content: "[BOB STANDING CONTRACT — re-injected after context compaction]",
         },
         { role: "assistant", content: [{ type: "text", text: "continued: committed" }] },
+        // …and a trailing NON-assistant message: the reply is still the LAST
+        // ASSISTANT message — never the pinned block, never the trailing chit-chat.
+        { role: "user", content: "[queued follow-up]" },
       ],
     });
     expect(client.replies).toEqual([
