@@ -261,7 +261,7 @@ export function pruneOldRunLogs(
 // value that can grow (the entry) is reduced to its size, a record never grows
 // with the events before it, so the log stays linear in the number of events
 // rather than in their accumulated payload. The records the DELTA cap does not
-// cover are NOT bounded by it — see DEFAULT_RUNLOG_DELTA_CAP_BYTES:
+// cover are NOT bounded by it — see DEFAULT_RUNLOG_DELTA_CAP_BYTES.
 
 // The event types the DELTA cap drops once it is hit (see
 // DEFAULT_RUNLOG_DELTA_CAP_BYTES): the streamed updates that repeat per stream
@@ -714,9 +714,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     let logBytes = 0; // running total of bytes committed to this log
     let deltaCapHit = false; // set once the marker below is on disk; then deltas stop
 
-    // Synchronous writer: appendFileSync commits each record to disk before it
-    // returns — exactly the post-mortem property this log exists for (a hard crash
-    // leaves every record written before it on disk). Each record is projected to a
+    // Synchronous writer: appendFileSync puts each record in the page cache when it
+    // returns: every reader sees it and it survives the process dying, but power
+    // loss or a kernel panic can still lose the tail, because nothing calls fsync.
+    // This is the post-mortem property this log exists for — a hard crash leaves
+    // every record written before it in the cache, readable until a power loss or a panic. Each record is projected to a
     // bounded shape (`projectRunLogRecord`), so there is no per-write cost worth
     // buffering and no accumulated payload in it. A failed append (disk full, race,
     // perms) is swallowed: logging is best-effort and never throws into the run.

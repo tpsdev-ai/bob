@@ -274,6 +274,7 @@ describe("run-log sizing + retention (issue #146)", () => {
     }
     // Non-delta events that must still be written even past the cap.
     events.push({ type: "tool_execution_start", toolName: "read", toolCallId: "tc-1", args: {} });
+    // "error" is not in pi 0.84.3's session unions, so it exercises the unknown-event branch and shows an unknown non-delta type still lands in the log past the cap.
     events.push({ type: "error", message: "provider blew up mid-run" });
     // A message ENDS, so the run settles 0 under the #145 contract; this test is
     // about the delta cap in the log.
