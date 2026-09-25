@@ -92,7 +92,8 @@ export interface RunSessionConfig {
   // against the blessed catalog before the factory runs, so a fake factory in
   // tests doesn't need the catalog or filesystem. Empty when the agent
   // declares none. With round 3 this is the ONLY extension source that LOADS:
-  // nothing ambient is ever loaded, and no package is installed.
+  // the ambient pi extension, skill and prompt-template paths are never LOADED,
+  // and no package is installed.
   extensionSources: string[];
   // source → capability name, so a source pi fails to load can be reported as
   // the capability the agent asked for rather than a bare path. Optional: a
