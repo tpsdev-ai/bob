@@ -113,6 +113,16 @@ export function assertContractCap(cap: unknown): number {
  *  vice versa, so a few passes settle it (the digit count stabilises) and the
  *  result IS at most `cap` long. A cap too small for the marker cuts hard —
  *  there is no room to state anything. */
+// Never end a cut inside a surrogate pair: a lone high surrogate is not a
+// character a provider is ever sent (pi-ai's adapters strip it), so a block cut
+// mid-emoji would differ from the block in the payload and the guard would
+// refuse a legitimate request.
+function codePointSafeEnd(text: string, end: number): number {
+  if (end <= 0 || end >= text.length) return Math.max(0, end);
+  const code = text.charCodeAt(end - 1);
+  return code >= 0xd800 && code <= 0xdbff ? end - 1 : end;
+}
+
 export function capContractText(text: string, cap: number): string {
   if (!Number.isFinite(cap) || cap <= 0) return "";
   if (text.length <= cap) return text;
@@ -123,9 +133,9 @@ export function capContractText(text: string, cap: number): string {
     if (next === keep) break;
     keep = next;
   }
-  const marker = markerFor(text.length - keep);
-  if (keep <= 0) return text.slice(0, cap);
-  return text.slice(0, keep) + marker;
+  if (keep <= 0) return text.slice(0, codePointSafeEnd(text, cap));
+  keep = codePointSafeEnd(text, keep);
+  return text.slice(0, keep) + markerFor(text.length - keep);
 }
 
 /** Refuse a contract that says nothing. A blank task is not a task: the session
@@ -207,16 +217,29 @@ export function appendContractOverride(block: string): (base: string[]) => strin
   return (base: string[]) => [...base, block];
 }
 
-/** The payload's DECODED value. Some adapters hand the guard a body that is
- *  already a string, and that string is a serialization: parse it, because the
- *  decoded value is what the provider's own client sends and what its escaping
- *  no longer hides. A string that is not JSON is its own value. */
+/** A payload that cannot be serialized cannot be sent either; the guard treats
+ *  it as unreadable. */
+const UNSERIALIZABLE = Symbol("unserializable request payload");
+
+/** The payload's DECODED value, as it will be SENT. Some adapters hand the guard
+ *  a body that is already a string (a serialization): parse it. An object is
+ *  put through the same round trip the client performs before it sends
+ *  (JSON.stringify, which applies any toJSON(), then JSON.parse), so the guard
+ *  reads what goes on the wire, not an object whose serialization differs from
+ *  its fields. A string that is not JSON is its own value. */
 export function decodedRequestPayload(payload: unknown): unknown {
-  if (typeof payload !== "string") return payload;
+  if (typeof payload === "string") {
+    try {
+      return JSON.parse(payload);
+    } catch {
+      return payload;
+    }
+  }
   try {
-    return JSON.parse(payload);
+    const wire = JSON.stringify(payload);
+    return wire === undefined ? UNSERIALIZABLE : JSON.parse(wire);
   } catch {
-    return payload;
+    return UNSERIALIZABLE;
   }
 }
 
@@ -278,8 +301,10 @@ function scanStringValue(
  */
 export function scanRequestPayload(payload: unknown, text: string): RequestPayloadScan {
   if (payload === undefined) return { carries: false, stringValues: 0, readable: false };
+  const decoded = decodedRequestPayload(payload);
+  if (decoded === UNSERIALIZABLE) return { carries: false, stringValues: 0, readable: false };
   const count = { n: 0 };
-  const carries = scanStringValue(decodedRequestPayload(payload), text, new Set<object>(), count);
+  const carries = scanStringValue(decoded, text, new Set<object>(), count);
   return { carries, stringValues: count.n, readable: true };
 }
 
