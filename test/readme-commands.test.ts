@@ -9,13 +9,13 @@ import { join } from "node:path";
 // The test reads the `bob <command>` names the README carries in three places —
 // inline code spans, fenced code blocks, and the Commands table — and fails if
 // the CLI rejects any of them. It also fails if the retired `--interactive` flag
-// appears in a `bob` example.
+// appears in a code span or code fence (table cells are not scanned for flags).
 //
 // Two vacuous-pass modes are closed:
 //  - a plain-text Commands-table row (no backticks) is read as a table cell,
 //    not skipped, so a `bob serve` row written in prose is caught;
-//  - an empty extraction is refused: the Commands table must name at least
-//    run, launch, init and onboard, so the test can only pass because it
+//  - an empty extraction is refused: the names extracted from spans, fences and
+//    the table must include run, launch, init and onboard, so the test can only pass because it
 //    actually found them, not because it found nothing.
 //
 // The command matcher binds only within a single line: a `bob` at the end of a
@@ -34,7 +34,7 @@ const README = process.env.BOB_README
 // later PR" parenthetical — that would mask the very failure this guards.
 const RETIRED_FLAGS = ["--interactive"];
 
-// The Commands table must name at least these, else the extraction is trusted to
+// The extracted names (spans, fences and the table) must include these, else the extraction is trusted to
 // have found nothing (the empty-extraction vacuous-pass).
 const REQUIRED_COMMANDS = ["run", "launch", "init", "onboard"];
 
@@ -153,13 +153,13 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
           "below would pass while checking nothing",
       );
     }
-    // The Commands table (and the code around it) must name the commands a bob
+    // The names extracted from spans, fences and the table must include the commands a bob
     // user will actually reach. If any is missing, the extraction is incomplete
     // and the "non-empty" check above is a false positive.
     for (const need of REQUIRED_COMMANDS) {
       if (!named.includes(need)) {
         throw new Error(
-          `README Commands table / code does not name the required command ` +
+          `README code spans, fences and Commands table do not name the required command ` +
             `'bob ${need}' — the extraction is incomplete`,
         );
       }
@@ -174,7 +174,7 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
     expect(rejected).toEqual([]);
   }, 120_000);
 
-  it("rejects retired flags in a `bob` example", () => {
+  it("rejects retired flags in a code span or code fence", () => {
     const flagged = retiredFlagsNamedIn(readFileSync(README, "utf8"));
     if (flagged.length) {
       throw new Error(`README names flags the CLI rejects: ${flagged.join(", ")}`);
