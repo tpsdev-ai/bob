@@ -5,31 +5,44 @@ import { join } from "node:path";
 
 // Closes tpsdev-ai/bob#149.
 //
-// The README's usage section must only name commands and flags the CLI actually
-// accepts. Before the fix it advertised `bob serve` (a retired command — a run
-// with no prompt *is* the persistent mode); it named `--interactive` (the CLI
-// rejects it); and it described scheduling as system cron, when the persistent
-// `bob run` runtime fires bob.yaml `cron:` entries in-process.
+// The README's usage section must only name commands the CLI actually accepts.
+// The test reads the `bob <command>` names the README carries in three places —
+// inline code spans, fenced code blocks, and the Commands table — and fails if
+// the CLI rejects any of them. It also fails if the retired `--interactive` flag
+// appears in a `bob` example.
 //
-// This test reads README.md, collects every `bob <command>` it names in code
-// spans or code blocks, and fails if the CLI does not accept that command.
+// Two vacuous-pass modes are closed:
+//  - a plain-text Commands-table row (no backticks) is read as a table cell,
+//    not skipped, so a `bob serve` row written in prose is caught;
+//  - an empty extraction is refused: the Commands table must name at least
+//    run, launch, init and onboard, so the test can only pass because it
+//    actually found them, not because it found nothing.
 //
-// The command matcher is deliberately strict. A `bob` preceded by `/` (such as
-// "bin/bob" in the repo-layout block) is not a command, and a multi-line code
-// chunk must not let a `bob` bind to an unrelated word (`the`, `is`) on a later
-// line. Requiring whitespace / a backtick / start-of-chunk immediately before
-// `bob` closes both holes.
+// The command matcher binds only within a single line: a `bob` at the end of a
+// line must not catch an unrelated word (the, is) at the start of the next.
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
-const README = join(import.meta.dir, "..", "README.md");
+// BOB_README lets the test run against a fixture copy of the README (used to
+// prove the Commands-table read and the non-empty guard actually fire) without
+// touching the real README.
+const README = process.env.BOB_README
+  ? process.env.BOB_README
+  : join(import.meta.dir, "..", "README.md");
 
 // Flags the CLI rejects, named in issue #149. Kept small and explicit rather than
 // derived from `bob help`, which advertises `--interactive` in a "coming in a
 // later PR" parenthetical — that would mask the very failure this guards.
 const RETIRED_FLAGS = ["--interactive"];
 
-// `bob` as a standalone command, not the tail of a path ("bin/bob"/"bob.yaml").
-const BOB_COMMAND = /(^|[\s`])bob\s+([a-z][\w-]*)/g;
+// The Commands table must name at least these, else the extraction is trusted to
+// have found nothing (the empty-extraction vacuous-pass).
+const REQUIRED_COMMANDS = ["run", "launch", "init", "onboard"];
+
+// `bob` as a standalone command, matched within a single line only. A `bob`
+// preceded by `/` (such as "bin/bob" in the repo-layout block) is not a
+// command; the [ \t] gap (never \s, which includes \n) keeps a `bob` at the end
+// of a line from binding to a word on the next.
+const BOB_COMMAND = /(^|[ \t`])bob[ \t]+([a-z][\w-]*)/g;
 
 // Every piece of code in the README: fenced ``` blocks and inline ` spans.
 function codeChunks(md: string): string[] {
@@ -39,11 +52,32 @@ function codeChunks(md: string): string[] {
   return chunks;
 }
 
+// The command column (first cell) of each row in the `## Commands` markdown
+// table, read as plain text — a row written in prose (no backticks) is still
+// read. That prose row is the hole the vacuous-pass mode "a plain-text Commands
+// table row names bob serve" left open in the previous round.
+function commandsTableCells(md: string): string[] {
+  const m = md.match(/(?:^|\n)#{2,}\s+Commands\b([\s\S]*?)(?:\n#{2,}\s|\n#\s|$)/);
+  if (!m) return [];
+  const cells: string[] = [];
+  for (const line of m[1].split(/\n/)) {
+    const t = line.trim();
+    if (t.startsWith("|")) {
+      // First cell sits between the leading `|` and the next `|`.
+      const parts = t.split("|");
+      if (parts.length >= 2) cells.push(parts[1] ?? "");
+    }
+  }
+  return cells;
+}
+
 function commandsNamedIn(md: string): string[] {
   const found = new Set<string>();
-  for (const chunk of codeChunks(md)) {
-    BOB_COMMAND.lastIndex = 0;
-    for (const m of chunk.matchAll(BOB_COMMAND)) found.add(m[2]);
+  for (const chunk of [...codeChunks(md), ...commandsTableCells(md)]) {
+    for (const line of chunk.split(/\n/)) {
+      BOB_COMMAND.lastIndex = 0;
+      for (const m of line.matchAll(BOB_COMMAND)) found.add(m[2]);
+    }
   }
   return [...found];
 }
@@ -108,11 +142,33 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
           probe.out,
       );
     }
-    const rejected = commandsNamedIn(readFileSync(README, "utf8")).filter((c) => !cliAccepts(c));
+    const named = commandsNamedIn(readFileSync(README, "utf8"));
+    // An empty extraction is itself a failure: with no `bob <command>` found,
+    // the "rejects" assertion below passes vacuously. Require a non-empty set so
+    // the test can only pass because the README actually named commands.
+    if (named.length === 0) {
+      throw new Error(
+        "extracted zero `bob <command>` names from the README — the Commands " +
+          "table / code spans / fences were not read; the 'rejects' assertion " +
+          "below would pass while checking nothing",
+      );
+    }
+    // The Commands table (and the code around it) must name the commands a bob
+    // user will actually reach. If any is missing, the extraction is incomplete
+    // and the "non-empty" check above is a false positive.
+    for (const need of REQUIRED_COMMANDS) {
+      if (!named.includes(need)) {
+        throw new Error(
+          `README Commands table / code does not name the required command ` +
+            `'bob ${need}' — the extraction is incomplete`,
+        );
+      }
+    }
+    const rejected = named.filter((c) => !cliAccepts(c));
     if (rejected.length) {
       throw new Error(
         `README names commands the CLI no longer accepts: ${rejected.join(", ")} ` +
-          `(run 'bob help' for the real list)`,
+          "(run 'bob help' for the real list)",
       );
     }
     expect(rejected).toEqual([]);
@@ -124,5 +180,34 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
       throw new Error(`README names flags the CLI rejects: ${flagged.join(", ")}`);
     }
     expect(flagged).toEqual([]);
+  });
+
+  it("reads plain-text Commands-table rows and refuses an empty extraction", () => {
+    // A prose row (no backticks) must be read as a command — the vacuous-pass
+    // mode that used to slip through when only spans and fences were read.
+    const proseTable =
+      "## Commands\n\n" +
+      "| Command | What it does |\n" +
+      "| ------- | ------------ |\n" +
+      "| bob serve | a prose row, no backticks |\n" +
+      "| `bob run <name>` | the backtick row |\n" +
+      "\n## Section two\n\ntext.\n";
+    const got = commandsNamedIn(proseTable);
+    if (!got.includes("serve") || !got.includes("run")) {
+      throw new Error("Commands table not read as expected: " + JSON.stringify(got));
+    }
+    // An empty Commands table must extract zero commands; the non-empty guard in
+    // the file-reading test relies on this so it can never pass vacuously.
+    const empty = "## Commands\n\n| Command | What it does |\n| ---- | ---- |\n\n## After\ntext.\n";
+    if (commandsNamedIn(empty).length !== 0) {
+      throw new Error("an empty Commands table should extract zero commands");
+    }
+    // The cross-line hole must stay closed: a `bob` at the end of one line
+    // must not bind to `run` at the start of the next.
+    const splitCommand = "in a fence:\n```\nbob\nrun\n```\n";
+    if (commandsNamedIn(splitCommand).includes("run")) {
+      throw new Error("a `bob` on one line wrongly bound to `run` on the next");
+    }
+    expect(got).toContain("serve");
   });
 });

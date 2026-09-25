@@ -50,7 +50,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
-| `bob doctor <name>`        | Health check (identity, mail, channels, provider auth)                                          |
+| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
 | `bob help`                 | Show this usage                                                                               |
 
 A `cron:` entry fires into the one live `bob run <name>` session, which runs on that agent's configured model. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task — it does not, and cannot, pick a model per `cron:` command.
@@ -195,7 +195,7 @@ Bob is one layer of an open stack:
 - **[pi-coding-agent](https://github.com/earendil-works/pi)** — the agent loop, tools, and LLM provider abstraction Bob sits on top of.
 - **Bob** (you are here) — the office shell: identity, mailbox, channels, scheduling, doctor.
 - **[Flair](https://github.com/tpsdev-ai/flair)** — the memory layer Bob's agents talk to by default; orchestrator-agnostic, self-host, federates across hosts.
-- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer Bob's `bob run` persistent runtime plugs into (its mail consumer); mail, branch-office bring-up, agent-to-agent dispatch.
+- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer for mail, branch-office bring-up, and agent-to-agent dispatch. Bob's mail consumer is a separate component: it polls the agent's inbox and launches the agent's launcher (`bin/<name>`) as a child process per message — it does not plug into the persistent `bob run` runtime.
 
 Each layer stands alone — use whichever fits your stack, swap out the others. Bob's value is concentrated at the office-shell layer; the rest is composable.
 
