@@ -1,6 +1,6 @@
 // Scheduled work for the PERSISTENT runtime — `cron:` in bob.yaml.
 //
-// Bob's persistent session (`bob serve`) can run prompts on a schedule: each
+// Bob's persistent session (`bob run <name>`) can run prompts on a schedule: each
 // bob.yaml `cron:` entry { name, schedule (cron expr), prompt } fires its prompt
 // INTO the live session on its cadence. This is how an agent does proactive work
 // (e.g. Pulse's daily intel brief) without a second process — and crucially

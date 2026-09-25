@@ -208,7 +208,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 }
 
 // Run persistently and BLOCK until a shutdown signal (or the injected
-// keepAlive) resolves. This is what the launchd unit / `bob serve` invokes.
+// keepAlive) resolves. `bob run <name>` invokes this; the service unit runs that.
 export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const handle = await startPersistent(opts);

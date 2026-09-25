@@ -93,13 +93,13 @@ Commands:
                       gateway, cron). This is what the service unit runs.
   run <name> <prompt> Run ONE short-lived task (claude -p style) — minimal +
                       ephemeral, no gateway. Prints the response, exits.
-                      Flags: --model <m>  (--interactive: coming in a later PR)
+                      Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
   up <name>           Load + start the agent's service unit
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
-  doctor <name>       Health check (identity, mail, channels, provider auth)
+  doctor <name>       Health check of the agent's setup — prints each check
   launch <name>       The agent's session, with its resolved role tool
                       allowlist. This is what bin/<name> runs.
                       Takes at most ONE prompt (a multi-word one needs quotes).
