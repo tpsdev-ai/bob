@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -67,10 +67,11 @@ function retiredFlagsNamedIn(md: string): string[] {
 function cliAccepts(cmd: string): boolean {
   let out = "";
   try {
-    out = execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+    out = execFileSync("node", [CLI, cmd], { encoding: "utf8" });
   } catch (e) {
     out =
-      (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
+      ((e as { stdout?: string; stderr?: string }).stdout ?? "") +
+      ((e as { stderr?: string }).stderr ?? "");
   }
   return !/unknown command/i.test(out);
 }
@@ -87,10 +88,11 @@ const CONTROL_CMD = "definitely-not-a-command";
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {
-    out = execSync(`node ${CLI} ${CONTROL_CMD} 2>&1`, { encoding: "utf8" });
+    out = execFileSync("node", [CLI, CONTROL_CMD], { encoding: "utf8" });
   } catch (e) {
     out =
-      (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
+      ((e as { stdout?: string; stderr?: string }).stdout ?? "") +
+      ((e as { stderr?: string }).stderr ?? "");
   }
   return { ok: /unknown command/i.test(out), out };
 }
