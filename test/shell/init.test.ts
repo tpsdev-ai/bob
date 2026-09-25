@@ -4,6 +4,45 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initAgent } from "../../src/shell/init.js";
 
+// Pull the `tools:` block's list out of a generated bob.yaml. Deliberately
+// hand-parsed (same shape `bob init` emits) so the test does not depend on the
+// reader it is checking.
+function toolsAllowFromYaml(yaml: string): string[] {
+  const lines = yaml.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^tools\s*:/.test(l));
+  if (start < 0) return [];
+  const names: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) break;
+    const m = line.match(/^\s+-\s+(.*)$/);
+    if (m) names.push(m[1].trim());
+  }
+  return names;
+}
+
+// Every name a shipped role may allow: pi's lowercase built-ins plus the tool
+// names the blessed capabilities actually register. A name outside this set is
+// a load error (see tool-allowlist.ts), so a shipped role must not carry one.
+const REAL_TOOL_NAMES = new Set([
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+  "powershell",
+  "bob_fixture_noop",
+  "discord_fetch",
+  "discord_react",
+  "discord_reply",
+  "flair_get",
+  "flair_search",
+  "flair_write",
+  "observatory_report",
+]);
+
 describe("initAgent", () => {
   let tmpRoot: string;
   let keysRoot: string;
@@ -73,6 +112,47 @@ describe("initAgent", () => {
     // Memory tools come from the flair capability (not the dead mcp__flair__* names).
     expect(yaml).toContain("- flair_write");
     expect(yaml).toContain("- flair_search");
+  });
+
+  it("stamps real pi + capability tool names for EVERY shipped role", () => {
+    // role.json's tools.allow goes straight into bob.yaml. The shipped names
+    // were OpenClaw/Claude-Code casings (Bash, Read, WebFetch,
+    // mcp__plugin_discord_discord__reply) that pi's registry does not know, so
+    // every role's allowlist was inert. Assert against the whole set, per role,
+    // so a bad rename names the role it came from.
+    for (const role of ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const) {
+      const res = initAgent({ ...baseOpts(), role });
+      const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+      expect(names.length).toBeGreaterThan(0);
+      const unknown = names.filter((n) => !REAL_TOOL_NAMES.has(n));
+      expect({ role, unknown }).toEqual({ role, unknown: [] });
+    }
+  });
+
+  it("keeps read, bash, edit and write for the coder (builder) role", () => {
+    // The builder role writes code and opens PRs; it cannot do that without
+    // shell + file-writing tools.
+    const res = initAgent({ ...baseOpts(), role: "coder" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    for (const tool of ["read", "bash", "edit", "write"]) {
+      expect(names).toContain(tool);
+    }
+  });
+
+  it("gives the ea role the capabilities' real tool names, not the mcp__ ones", () => {
+    const res = initAgent({ ...baseOpts(), role: "ea" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    for (const tool of [
+      "flair_search",
+      "flair_write",
+      "flair_get",
+      "discord_reply",
+      "discord_fetch",
+      "discord_react",
+    ]) {
+      expect(names).toContain(tool);
+    }
+    expect(names.join(",")).not.toContain("mcp__");
   });
 
   it("scaffolds the flair memory capability + config block", () => {

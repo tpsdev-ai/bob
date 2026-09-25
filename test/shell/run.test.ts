@@ -477,3 +477,164 @@ describe("assertCapabilitiesLoaded", () => {
     expect(msg).toContain("would have started without those tools");
   });
 });
+
+// The role tool allowlist must actually bind the session. role.json's
+// tools.allow is stamped into bob.yaml's `tools:` block by `bob init`, and
+// nothing used to read it back: every agent got pi's defaults (read, bash,
+// edit, write) plus capability tools regardless of its role. These tests drive
+// the resolved config a session factory receives, which is what createPiRunSession
+// hands to createAgentSession (see run-tool-allowlist.test.ts for the call
+// itself).
+describe("runAgent — the role tool allowlist binds the session", () => {
+  let agentsRoot: string;
+
+  beforeEach(() => {
+    agentsRoot = mkdtempSync(join(tmpdir(), "bob-run-tools-"));
+    const agentDir = join(agentsRoot, "testbot");
+    mkdirSync(join(agentDir, "work"), { recursive: true });
+    mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+    writeFileSync(join(agentDir, "soul.md"), "You are Testbot.");
+  });
+
+  afterEach(() => {
+    rmSync(agentsRoot, { recursive: true, force: true });
+  });
+
+  // Write the agent's bob.yaml. `allow` renders as the block list `bob init`
+  // emits, so the test exercises the real reader, not a hand-built object.
+  function writeBobYaml(opts: {
+    allow?: string[];
+    exclude?: string[];
+    allowResidentShell?: boolean;
+    resident?: boolean;
+  }): void {
+    const lines = [
+      "agent:",
+      "  id: testbot",
+      "  name: Testbot",
+      "  role: ea",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "  model: claude-sonnet-4-6",
+      "",
+    ];
+    if (opts.resident !== undefined) lines.push(`resident: ${opts.resident}`, "");
+    lines.push("tools:");
+    if (opts.allow !== undefined) {
+      lines.push("  allow:");
+      for (const name of opts.allow) lines.push(`    - ${name}`);
+    }
+    if (opts.exclude !== undefined) {
+      lines.push("  exclude:");
+      for (const name of opts.exclude) lines.push(`    - ${name}`);
+    }
+    if (opts.allowResidentShell !== undefined) {
+      lines.push(`  allowResidentShell: ${opts.allowResidentShell}`);
+    }
+    lines.push("");
+    writeFileSync(join(agentsRoot, "testbot", "bob.yaml"), lines.join("\n"));
+  }
+
+  type TooledConfig = RunSessionConfig & { tools?: string[]; excludeTools?: string[] };
+
+  async function configFor(): Promise<TooledConfig> {
+    const { factory, lastConfig } = factoryReturning(fakeSession({ textDeltas: ["ok"] }).session);
+    await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
+    return lastConfig() as TooledConfig;
+  }
+
+  it("hands the session EXACTLY the bob.yaml allowlist", async () => {
+    writeBobYaml({ allow: ["read", "flair_search", "flair_write"] });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "flair_search", "flair_write"]);
+  });
+
+  it("carries a tools.exclude block through as excludeTools", async () => {
+    writeBobYaml({ allow: ["read", "bash"], exclude: ["bash"] });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "bash"]);
+    expect(config.excludeTools).toEqual(["bash"]);
+  });
+
+  it("refuses an allowlisted name that maps to nothing, naming it and the fix", async () => {
+    // "Bash" is the OpenClaw-era casing `bob init` used to stamp into bob.yaml.
+    // pi's registry only knows "bash", so an unmapped name must be a loud load
+    // error rather than a silent drop (pi ignores unknown names).
+    writeBobYaml({ allow: ["read", "Bash"] });
+    const { factory } = factoryReturning(fakeSession({ textDeltas: ["ok"] }).session);
+    let err: Error | undefined;
+    try {
+      await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory });
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    const msg = err?.message ?? "";
+    expect(msg).toContain("Bash");
+    expect(msg).toContain("bash");
+  });
+
+  it("refuses an unknown key in the tools block", async () => {
+    writeFileSync(
+      join(agentsRoot, "testbot", "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-sonnet-4-6",
+        "",
+        "tools:",
+        "  alow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const { factory } = factoryReturning(fakeSession({ textDeltas: ["ok"] }).session);
+    await expect(
+      runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory }),
+    ).rejects.toThrow(/alow/);
+  });
+
+  it("excludes shell + file-writing tools from a RESIDENT agent", async () => {
+    // A resident agent runs unattended behind a service unit; the role's
+    // allowlist must not hand it a shell unless the role opts in.
+    writeBobYaml({ allow: ["read", "bash", "edit", "write"], resident: true });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "bash", "edit", "write"]);
+    expect(config.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+  });
+
+  it("keeps shell + file-writing tools when the role opts in with allowResidentShell", async () => {
+    writeBobYaml({
+      allow: ["read", "bash", "edit", "write"],
+      resident: true,
+      allowResidentShell: true,
+    });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "bash", "edit", "write"]);
+    expect(config.excludeTools).toEqual([]);
+  });
+
+  it("does not invent an allowlist when bob.yaml has no tools block", async () => {
+    // No `tools:` block = pi's own defaults; the run must not silently narrow
+    // an agent that never declared a policy.
+    writeFileSync(
+      join(agentsRoot, "testbot", "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-sonnet-4-6",
+        "",
+      ].join("\n"),
+    );
+    const config = await configFor();
+    expect(config.tools).toBeUndefined();
+    expect(config.excludeTools).toEqual([]);
+  });
+});

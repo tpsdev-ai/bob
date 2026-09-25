@@ -135,6 +135,97 @@ describe("runDoctor", () => {
     expect(report.checks.find((c) => c.name === "pi models.json")?.status).toBe("skip");
   });
 
+  it("FAIL + fix on an unmapped tool name in bob.yaml", () => {
+    // Existing agents' bob.yaml carry the pre-fix names (Bash, Read,
+    // WebFetch, mcp__plugin_discord_discord__reply). pi ignores unknown tool
+    // names silently, so doctor has to name them and the replacement.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - Bash",
+        "    - flair_search",
+        "    - mcp__plugin_discord_discord__reply",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("Bash");
+    expect(check?.detail).toContain("mcp__plugin_discord_discord__reply");
+    expect(check?.fix).toContain("bash");
+    expect(check?.fix).toContain("discord_reply");
+  });
+
+  it("OK on a bob.yaml whose tool allowlist is all real names", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "    - discord_reply",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    expect(report.checks.find((c) => c.name === "tool allowlist")?.status).toBe("ok");
+    expect(report.summary.fail).toBe(0);
+  });
+
+  it("WARN when a resident agent's allowlist lists tools the resident policy drops", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: coder",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("bash");
+    expect(check?.fix).toContain("allowResidentShell");
+  });
+
   it("WARN on pi auth.json mode != 0600 (contains API key)", () => {
     const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
     chmodSync(join(agentDir, ".pi-agent", "auth.json"), 0o644);
