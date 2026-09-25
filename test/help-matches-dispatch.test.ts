@@ -4,6 +4,25 @@ import { join } from "node:path";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
+// Control probe: a made-up command the dispatcher MUST refuse. If dist/cli.js
+// is missing or crashes before dispatch, Node prints no "unknown command"
+// line, and the per-command assertions below would read every failure as
+// "not unknown" and pass vacuously. Requiring this control to refuse a
+// made-up command proves the probe reached the command dispatcher before any
+// per-command result is trusted.
+const CONTROL_CMD = "definitely-not-a-command";
+
+function cliProbeOk(): { ok: boolean; out: string } {
+  let out = "";
+  try {
+    out = execSync(`node ${CLI} ${CONTROL_CMD} 2>&1`, { encoding: "utf8" });
+  } catch (e) {
+    out =
+      (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
+  }
+  return { ok: /unknown command/i.test(out), out };
+}
+
 // Every command `bob help` advertises must be one the dispatcher actually
 // accepts. A command the help lists but the switch rejects surfaces as
 // "unknown command '<name>'" — exactly the `office join <name>` mismatch
@@ -34,6 +53,22 @@ describe("help matches dispatch (#161)", () => {
   // dist, not the source.
   const help = execSync(`node ${CLI} help`, { encoding: "utf8" });
   const commands = advertisedCommands(help);
+
+  // Prove the CLI probe reached the dispatcher before trusting any per-command
+  // result; a missing/crashing dist/cli.js prints no "unknown command" and would
+  // leave every failing spawn reading as "not unknown" (a vacuous pass).
+  it("the CLI probe reaches the command dispatcher", () => {
+    const probe = cliProbeOk();
+    if (!probe.ok) {
+      throw new Error(
+        "could not probe the CLI dispatcher: a made-up command did not yield " +
+          "'unknown command', so dist/cli.js is missing or crashed before dispatch. " +
+          "The help-vs-dispatch cases below are untrustworthy. Output:\n" +
+          probe.out,
+      );
+    }
+    expect(probe.ok).toBe(true);
+  });
 
   // Guard against a vacuous pass: if the parser found nothing, every
   // per-command case below would be skipped and the test would appear green.
