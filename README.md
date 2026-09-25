@@ -54,30 +54,54 @@ Per-call model override is the lightweight version of dynamic routing — bake t
 ## `run` logs and retention
 
 Every `bob run` (but **not** `bob serve` — its persistent session never calls this
-logger) tees each session event to a per-run
-JSONL log at `~/agents/<name>/runs/<start-timestamp>.jsonl`, so a mid-run death
+logger) tees each session event to a per-run JSONL log at
+`~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
 (a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
 Because the log exists for post-mortems — not for replaying a growing message —
 it is kept small and bounded:
 
-- **No `partial`.** Each `message_update` event carries `partial` (the whole
-  assistant message so far) and a growing copy of `message`, repeated on every
-  streamed token — that is what made the log grow quadratically with message
-  length (15 GB of logs on a 40 GB builder disk). `message_update` events are
-  logged without those fields: the delta alone reconstructs the message, and
-  `message_end` carries the final message once.
-- **A per-run size cap.** Each run's log is capped (default **50 MB**, override
-  with `runLogCapBytes` for a one-off run). Past the cap, deltas
-  (`message_update`) stop being written, but everything else — tool calls,
-  tool results, errors, lifecycle events, and the final `done` line — keeps
-  coming, and a single line records that the cap was hit.
+- **A projection, not a copy.** Each event is logged as a fixed set of fields for
+  its type. The streamed updates (`message_update`, `tool_execution_update`,
+  `bash_execution_update`, `queue_update`) log their increment only — never
+  `partial`, `partialResult`, or the steering/follow-up queues — and an event type
+  bob does not know is logged as `{type, unknownEvent: true}` with none of its
+  payload. That is what stops a record from growing with the events before it;
+  the log used to grow quadratically with message length (15 GB of logs on a
+  40 GB builder disk). (`test/shell/run-log-projection.test.ts` — "projects EVERY
+  event type in pi 0.84.3's unions to a fixed, non-growing record", "logs NO
+  payload for an event type the projection does not name";
+  `test/shell/run-log.test.ts` — "keeps a 5,000-token streamed message's log
+  linear, not quadratic", "never logs `partial` on a message_update event".)
+- **A per-run DELTA cap** (default **50 MB**, override with `runLogCapBytes` for a
+  one-off run). Once the log reaches it, the streamed deltas stop being written;
+  every non-delta event — tool calls and results, errors, lifecycle events, each
+  `*_end` final, and the final `done` line — keeps coming, and a single line
+  records that the **delta** cap was hit. The consequence, plainly: past the cap
+  the deltas are dropped, `message_end` still records each final message once, and
+  a crash before a `message_end` loses that message's post-cap tail.
+  ("past the per-run DELTA cap: drops streamed deltas but keeps tool/error events;
+  one delta-cap marker", "past the delta cap: message_end still records the final
+  message, in full", "a crash past the cap before any message_end leaves no
+  post-cap content".)
+- **One log per run, even in the same millisecond.** The name carries the start
+  timestamp, the run's pid and a random suffix, and the file is created
+  exclusively, so two runs that start in the same millisecond get distinct files —
+  and each file's sidecar lock belongs to that file alone.
+  ("gives two runs started in the same millisecond distinct logs — and distinct
+  locks".)
 - **Retention on run start.** Before writing its own log, a run keeps the
   **newest 5** logs untouched and then, for the older ones, deletes the
-  oldest-first until their combined size is back under a **500 MB** budget.
-  A log that is still being written is never touched: each active run drops a
-  sidecar lock (`<log>.lock`) holding its PID and removes it when the run ends, and
-  retention skips any log whose lock names a live PID. A lock whose PID is dead
-  (a crashed or finished run) is treated as finished and pruned like any other.
+  oldest-first until their combined size is back under a **500 MB** budget. The
+  logs left OUTSIDE that budget are exactly: the newest five, and any log
+  retention cannot show is finished — one whose lock names a live PID, and one
+  whose lock exists but cannot be read, or does not name a PID. It fails safe:
+  never prune what it cannot show is dead. A log with no lock, or a lock naming a
+  dead PID, is prunable like any other. ("retention leaves an older run whose
+  sidecar lock is live untouched", "retention fails safe: a lock it cannot read
+  or parse KEEPS the log".)
+- **Logging never throws into the run** — including creating the runs directory.
+  If the run log cannot be set up at all, the run still completes and warns once.
+  ("completes and warns ONCE when the runs directory cannot be created".)
 
 These bounds keep a long or a long-running run from filling the disk and
 killing the agent mid-task — the original failure.
