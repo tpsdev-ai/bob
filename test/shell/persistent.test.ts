@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPersistent, startPersistent } from "../../src/shell/persistent.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
+import { setPendingOrigin, takePendingOrigin } from "../../src/shell/turn-origin-registry.js";
 
 // A fake warm AgentSession. Records every prompt, tracks idle/dispose, and
 // emits canned assistant text via the documented agent_end-style flow. Lets us
@@ -259,5 +260,31 @@ describe("runPersistent / startPersistent", () => {
     await done;
     expect(exited).toBe(0);
     expect(fake.disposed()).toBe(true);
+  });
+
+  it("shutdown clears the pending origin slot (round-4 item 2: no origin survives a restart)", async () => {
+    const fake = fakeWarmSession();
+    const factory: RunSessionFactory = async () => fake.session;
+
+    // An in-flight turn's origin is set in the registry (simulating the injector's set).
+    setPendingOrigin({ kind: "cron", job: "daily-brief" });
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: factory,
+      log: () => {},
+    });
+
+    // A post-start take returns the set origin (proves the slot is live).
+    expect(takePendingOrigin()).toEqual({ kind: "cron", job: "daily-brief" });
+
+    // A new in-flight turn sets another origin, then the host shuts down. The
+    // shutdown path clears the slot so it cannot survive a session restart.
+    setPendingOrigin({ kind: "mail", from: "flint" });
+    await handle.shutdown();
+
+    // Post-shutdown take is run: the slot was cleared by shutdown.
+    expect(takePendingOrigin()).toEqual({ kind: "run" });
   });
 });

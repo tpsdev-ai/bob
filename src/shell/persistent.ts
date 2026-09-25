@@ -36,6 +36,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
+import { clearPendingOrigin, setPendingOrigin } from "./turn-origin-registry.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -133,7 +134,17 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
         } catch {
           // proceed — pi serializes turns regardless
         }
-        await session.prompt(entry.prompt);
+        // Set the single pending-origin slot immediately before session.prompt; the
+        // presence capability takes + empties it on before_agent_start. An invalid
+        // job name is rejected at the registry (the turn runs). The finally clears
+        // the slot whatever the prompt does -- a rejected / aborted prompt leaves
+        // no stale origin for the next turn (round-4 item 2).
+        try {
+          setPendingOrigin({ kind: "cron", job: entry.name });
+          await session.prompt(entry.prompt);
+        } finally {
+          clearPendingOrigin();
+        }
       },
       log,
     });
@@ -148,6 +159,10 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       // Stop scheduling first so a pending cron tick can't fire into a session
       // we're about to dispose.
       cronScheduler?.stop();
+      // Clear the pending origin slot on shutdown: a
+      // set-but-unconsumed origin from a last in-flight turn must not
+      // survive a restart (round-4 item 2).
+      clearPendingOrigin();
       // Await any in-flight turn so we don't cut off a reply mid-stream. The
       // RunSession seam exposes `prompt` but not an idle barrier; production's
       // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
