@@ -31,6 +31,11 @@ function fakeWarmSession(): {
       // doesn't cut off an in-flight turn.
       idleWaits += 1;
     },
+    async sendCustomMessage() {
+      // The persistent runtime REQUIRES this seam (round 6: it rejects a session
+      // without it at setup, because the standing contract is attached through
+      // it). The attachment itself is asserted by the round-2 test below.
+    },
     dispose() {
       disposed = true;
     },
@@ -144,6 +149,7 @@ describe("runPersistent / startPersistent", () => {
       subscribe: () => () => {},
       prompt: async () => {},
       waitForIdle: async () => {},
+      sendCustomMessage: async () => {},
       dispose: () => {
         disposeCount += 1;
       },
@@ -325,17 +331,22 @@ describe("runPersistent / startPersistent", () => {
     await handle.shutdown();
   });
 
-  it("cli#145 round 5: a session with no sendCustomMessage logs the drop and starts NO turn", async () => {
-    // The fallback for a session implementation without pi's sendCustomMessage
-    // seam (persistent.ts:153). The block cannot ride the NEXT prompt there, so
-    // the runtime drops it — LOUDLY, and without inventing a turn whose reply
-    // would have nowhere to go. This was the last branch of the control flow no
-    // test reached (Kern round 5, finding 3).
+  it("cli#145 round 6: a session with no sendCustomMessage is REJECTED at setup, before it serves", async () => {
+    // The standing contract is attached through sendCustomMessage, so a session
+    // without that seam cannot hold it: it would compact, keep accepting inbound
+    // prompts and serve them with the contract silently lost. There is no other
+    // attachment API (delivery rides the NEXT prompt by design — see the test
+    // above), so a session that cannot attach the block is not supportable for
+    // persistent use at all. pi's AgentSession provides the seam; this rejects a
+    // degraded implementation, and it must reject it at setup — before the
+    // session is announced as up, wired into the event seam, or handed a prompt.
     const listeners: Array<(event: unknown) => void> = [];
     const prompts: string[] = [];
     const logs: string[] = [];
+    let subscribed = false;
     const session: RunSession = {
       subscribe(listener) {
+        subscribed = true;
         const l = listener as (event: unknown) => void;
         listeners.push(l);
         return () => {
@@ -349,31 +360,37 @@ describe("runPersistent / startPersistent", () => {
       dispose() {},
     };
 
-    const handle = await startPersistent({
-      name: "pulse",
-      agentsRoot: root,
-      sessionFactory: async () => session,
-      log: (m) => logs.push(m),
-    });
-
-    for (const listener of listeners) {
-      listener({
-        type: "compaction_end",
-        reason: "threshold",
-        result: {},
-        aborted: false,
-        willRetry: false,
+    let error: unknown;
+    try {
+      await startPersistent({
+        name: "pulse",
+        agentsRoot: root,
+        sessionFactory: async () => session,
+        log: (m) => logs.push(m),
       });
+    } catch (e) {
+      error = e;
     }
 
-    // NO turn starts — a post-run compaction cannot invent one.
-    expect(prompts, "the drop must not start a turn").toHaveLength(0);
-    // …and the drop is on the record, naming the reason it could not attach.
+    // The setup rejects it: the runtime never returns a handle for a session
+    // that cannot hold the contract.
+    expect(error, "setup rejects the session instead of accepting a degraded one").toBeInstanceOf(
+      Error,
+    );
+    // …and the error is actionable — which factory, what is missing, and why it
+    // is required.
+    const message = (error as Error).message;
+    expect(message, "names the missing seam").toContain("sendCustomMessage");
+    expect(message, "names the actor — the session factory for this agent").toContain("pulse");
+    expect(message, "says persistent use is what requires it").toContain("persistent");
+    expect(message, "names the factory as the thing to change").toContain("factory");
+    // No prompt is ever sent, the session is never wired into the event seam,
+    // and the runtime never announces it as up.
+    expect(prompts, "no prompt is ever sent").toHaveLength(0);
+    expect(subscribed, "the session is never subscribed to the event seam").toBe(false);
     expect(
-      logs.some((m) => m.includes("cannot attach the pinned block") && m.includes("dropped")),
-      `the drop is logged (saw: ${JSON.stringify(logs)})`,
-    ).toBe(true);
-
-    await handle.shutdown();
+      logs.some((m) => m.includes("persistent session up")),
+      `the session is never announced as up (saw: ${JSON.stringify(logs)})`,
+    ).toBe(false);
   });
 });
