@@ -7,7 +7,7 @@
 //
 // This module is the fix, in two halves:
 //
-//   1. AFTER EVERY compaction, re-inject ONE bounded "pinned block": the original
+//   1. AFTER EVERY NON-ABORTED compaction, re-inject ONE bounded "pinned block": the original
 //      task (a one-shot `bob run`) or the agent's standing contract (the
 //      persistent runtime), plus "what remains" — the last plan the agent stated,
 //      or a generated note describing the worktree (git status --short) and the
