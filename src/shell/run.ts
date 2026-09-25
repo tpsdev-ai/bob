@@ -233,9 +233,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   let reason: SilenceReason | undefined;
 
   // cli#145: subscribe to the SAME event seam the discord capability uses for
-  // agent_end. After every compaction the reinjector re-injects ONE pinned block
-  // (the task, plus "what remains") as a steer, so the agent gets its own plan
-  // back instead of treating the erased context as completion.
+  // agent_end. After every non-aborted compaction the reinjector re-injects ONE
+  // pinned block (the task, plus "what remains") as a steer, so the agent gets
+  // its own plan back instead of treating the erased context as completion.
   const reinjector = createCompactionReinjector({
     task: opts.prompt,
     capChars: opts.pinnedCapChars,

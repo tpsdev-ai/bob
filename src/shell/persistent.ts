@@ -125,10 +125,10 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 
   // cli#145: subscribe to the SAME event seam the discord capability uses for
   // agent_end. A resident agent that hits the context threshold mid-task used to
-  // go silent with its standing duties erased; after every compaction the
-  // reinjector hands it back the standing contract (its role + scheduled duties)
-  // plus "what remains". Additive: it does not touch the capability's reply
-  // routing, which still keys off agent_end.
+  // go silent with its standing duties erased; after every non-aborted
+  // compaction the reinjector hands it back the standing contract (its role +
+  // scheduled duties) plus "what remains". Additive: it does not touch the
+  // capability's reply routing, which still keys off agent_end.
   const reinjector = createCompactionReinjector({
     standingContract: buildStandingContract({
       name: agent.name ?? opts.name,
