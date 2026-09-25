@@ -356,61 +356,61 @@ describe("run-log sizing + retention (issue #146)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-  it("keeps a session's run log LINEAR in the number of turns (issue #139)", async () => {
-    const turns = 100;
-    const body = "x".repeat(50);
-    const events: unknown[] = [];
-    for (let k = 1; k <= turns; k++) {
-      // Turn k sees exactly k messages — a monotonic, growing history like pi's.
-      const messages: unknown[] = [];
-      for (let i = 0; i < k; i++) {
-        messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: `${body}-${i}` }],
-        });
-      }
-      events.push({ type: "agent_end", messages });
-    }
+  it("logs every agent_end's own messages, unchanged — nothing dropped when a later run is shorter (#139)", async () => {
+    // pi emits one agent_end per low-level run, and its `messages` array holds
+    // only that run's own messages — the agent loop builds each agent_end from
+    // the run's own newMessages, not from the accumulated session history. So
+    // the arrays are INDEPENDENT, and a retry or a failure can produce a
+    // SHORTER array than the run before it.
+    //
+    // Round 3 assumed agent_end carried the whole history and sliced each array
+    // against a running count. With real pi shapes that silently drops
+    // messages: after a 6-message run, slice(6) on the next run's 2 messages
+    // returns NOTHING; and a 10-message run followed by a 4-message one loses
+    // all 4. Both shapes are exercised here.
+    const runOf = (prefix: string, n: number): unknown[] =>
+      Array.from({ length: n }, (_, i) => ({
+        role: "assistant",
+        content: [{ type: "text", text: `${prefix}${i + 1}` }],
+      }));
+    // 6 then 2 (the drop case), then a shrinking 10 then 4.
+    const lengths = [6, 2, 10, 4];
+    const runs = lengths.map((n, r) => runOf(`run${r + 1}-m`, n));
+    const events: unknown[] = runs.map((messages) => ({ type: "agent_end", messages }));
 
     const res = await runAgent({
       name: "testbot",
       prompt: "go",
       agentsRoot,
       sessionFactory: factoryReturning(fakeSession(events)),
-      // Huge cap: this test is about per-turn growth, not the per-run cap.
+      // Huge cap: this test is about the agent_end transform, not the cap.
       runLogCapBytes: 1 << 30,
     });
     expect(res.exitCode).toBe(0);
 
     const log = readRunLog("testbot");
-    const logBytes = statSync(log.path).size;
-
-    // LINEAR: the log grows with the number of turns, not the number of
-    // messages ever seen. A quadratic log (old behaviour — the whole history
-    // each turn, ~turns^2/2 * 60B ~ 360KB for 100 turns) fails this bound.
-    expect(logBytes).toBeLessThan(300 * turns);
-
-    // One agent_end record per turn, each holding only that turn's own
-    // (delta) message — exactly one per turn — not the whole history. If the
-    // whole history were logged, the sum of logged messages would be ~5050.
     const agentEnds = log.lines.filter((l) => eventType(l) === "agent_end");
-    expect(agentEnds.length).toBe(turns);
-    let totalLoggedMessages = 0;
-    let maxPrior = 0;
-    for (const e of agentEnds) {
+    // One record per run, all of them: a record is never merged or skipped.
+    expect(agentEnds.length).toBe(lengths.length);
+
+    const logged: unknown[] = [];
+    for (const [i, e] of agentEnds.entries()) {
       // biome-ignore lint/suspicious/noExplicitAny: log records are untyped
       const ev = (e as any).event;
-      const msgs = Array.isArray(ev?.messages) ? (ev.messages as unknown[]).length : 0;
-      // Each turn logs only its one delta message, never the accumulated history.
-      expect(msgs).toBe(1);
-      totalLoggedMessages += msgs;
-      if (typeof ev?.priorMessageCount === "number") {
-        maxPrior = Math.max(maxPrior, ev.priorMessageCount);
-      }
+      const msgs = Array.isArray(ev?.messages) ? (ev.messages as unknown[]) : [];
+      // The array is logged UNCHANGED — not sliced by any earlier run's length.
+      expect(msgs, `run ${i + 1} logs its own ${lengths[i]} messages unchanged`).toEqual(runs[i]);
+      // Round 3's carried prior-history count is gone with the slice it served.
+      expect(
+        (ev as Record<string, unknown>)?.priorMessageCount,
+        "no priorMessageCount is written",
+      ).toBeUndefined();
+      logged.push(...msgs);
     }
-    expect(totalLoggedMessages).toBe(turns);
-    // The final turn recorded the full prior history (turns - 1) as a bare
-    // count without re-serialising it — the property that keeps the log linear.
-    expect(maxPrior).toBe(turns - 1);
+    // Every message of every run, exactly once — nothing dropped, nothing
+    // duplicated. (The round-3 slicing logged 6 + 0 + 8 + 0 = 14 of these 22:
+    // both shorter runs after a longer one vanished entirely.)
+    expect(logged).toEqual(runs.flat());
+    expect(logged.length).toBe(lengths.reduce((a, b) => a + b, 0));
   });
 });

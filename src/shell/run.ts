@@ -354,8 +354,6 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_CAP_BYTES;
   let logBytes = 0; // running total of bytes committed to this log
   let capHit = false; // set once we cross the cap; then deltas stop
-  let lastAgentEndCount = 0; // # messages the previous agent_end already logged;
-  // agent_end carries the WHOLE history — each turn logs only its own delta (#139)
 
   // Write one log record.
   // - `isDelta` marks streamed message_update events: the only kind the cap drops,
@@ -377,27 +375,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         const stripped = scrubPartial(ev) as Record<string, unknown>;
         delete stripped.message;
         out = { ...rec, event: stripped };
-      } else if (!isDelta && ev && ev.type === "agent_end") {
-        // agent_end carries the WHOLE message history. In a long session every
-        // turn re-serialises everything before it (issue #139). Log only this
-        // turn's own messages — those added since the previous agent_end — plus a
-        // count of the prior history, so the run log stays linear in the number
-        // of turns.
-        const all = Array.isArray(ev.messages) ? (ev.messages as unknown[]) : [];
-        const prior = lastAgentEndCount;
-        const ownMessages = all.slice(lastAgentEndCount);
-        lastAgentEndCount = all.length;
-        out = {
-          ...rec,
-          event: {
-            ...ev,
-            messages: ownMessages,
-            // priorMessageCount: how many messages already existed before this turn,
-            // so a reader knows the run's total without re-serialising the history.
-            priorMessageCount: prior,
-          },
-        };
       }
+      // agent_end is logged UNCHANGED. In pi each agent_end comes from one low-level
+      // run and its `messages` are only that run's own messages (the agent loop
+      // builds them from the run's newMessages), so the record is already bounded
+      // by the run and the log stays linear in the number of turns without
+      // touching it. It must not be sliced against a running count: a retry or a
+      // failure agent_end yields a SHORTER array than a previous run, and slicing
+      // by the previous length silently drops those messages (issue #139).
       // Past the cap: drop deltas, keep everything else.
       if (isDelta && capHit) return;
       const line = `${JSON.stringify(out)}\n`;
