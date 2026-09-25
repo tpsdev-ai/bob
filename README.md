@@ -16,7 +16,7 @@ bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
 1. **Scaffolds** `~/agents/pulse/` — soul.md (from the role template), bob.yaml config, ed25519 keypair, per-agent pi config (auth + gateway routing), and an executable launcher at `bin/pulse`.
 2. **Provisions the Flair identity** — registers the Ed25519 public key as a Flair **Agent** record and writes the persona into Pulse's Flair **soul**, in that order. Without the Agent record the agent's signed memory/soul calls don't verify; without the soul entry its own `bootstrap` returns no persona. Both are part of "onboarded", not follow-up chores.
 3. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done. Bob mirrors the result back into Flair.
-4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob serve pulse --discord --discord-token-file ~/.tps/secrets/pulse-token --discord-channels 123,456` keeps Pulse listening on Discord and responding to mentions.
+4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob run pulse` keeps Pulse on duty — one warm, persistent session that loads the bob.yaml capabilities: the Discord listener that responds to mentions, plus the in-process `cron:` scheduler that fires the agent's briefings and sweeps into the live session (configure the Discord channel and the `cron:` entries in bob.yaml, not on the command line).
 
 ### Flair identity, and where the soul lives
 
@@ -36,21 +36,24 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Memory              | [Flair](https://github.com/tpsdev-ai/flair)                    |
 | Inbound mail        | TPS mail consumer (Bob)                                        |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
-| Cron                | Generated launcher invocations (Bob + system cron)             |
+| Cron                | The persistent `bob run` runtime's in-process scheduler — it fires bob.yaml `cron:` entries into the live session (Bob)             |
 | Tool allowlist      | `roles/<role>/role.json` is the ceiling, `bob.yaml` may only narrow it, and bob's session factory applies the result to every session |
 
 ## Commands
 
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
-| `bob onboard <name>`     | Scaffold + register the Flair identity + write its soul + hiring interview   |
-| `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair          |
-| `bob run <name>`         | Run the agent on duty (persistent session)                                   |
-| `bob run <name> <prompt>`| Run ONE task and print the answer. `--model X` overrides per call            |
-| `bob launch <name>`      | The agent's session, with its resolved tool allowlist. No prompt opens the interactive TUI; ONE prompt (quoted if multi-word) runs it as a task. This is what `bin/<name>` runs |
-| `bob doctor <name>`      | Health check (stubbed — coming with branch-office tooling)                   |
+| `bob onboard <name>`       | Scaffold + register the Flair identity + write its soul + open the hiring interview              |
+| `bob align <name>`         | Recurring drift check — refines the persona and mirrors it back into Flair                       |
+| `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). `--model X` overrides bob.yaml's model for the whole session. This is what the service unit runs |
+| `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
+| `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
+| `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
+| `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
+| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
+| `bob help`                 | Show this usage                                                                               |
 
-Per-call model override is the lightweight version of dynamic routing — bake the right model into each cron command (opus for strategy, sonnet for briefings, kimi for digests) without standing up multiple agents.
+A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
 ## Operator guarantees, and the tests that pin them
 
@@ -183,8 +186,8 @@ change one, the named test is what tells you.
 
 ## `run` logs and retention
 
-Every `bob run` (but **not** `bob serve` — its persistent session never calls this
-logger) tees each session event to a per-run JSONL log at
+Every one-shot `bob run <name> <prompt>` (but **not** the persistent `bob run <name>`:
+its session never calls this logger) tees each session event to a per-run JSONL log at
 `~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
 (a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
 Because the log exists for post-mortems — not for replaying a growing message —
@@ -278,7 +281,7 @@ Bob is one layer of an open stack:
 - **[pi-coding-agent](https://github.com/earendil-works/pi)** — the agent loop, tools, and LLM provider abstraction Bob sits on top of.
 - **Bob** (you are here) — the office shell: identity, mailbox, channels, scheduling, doctor.
 - **[Flair](https://github.com/tpsdev-ai/flair)** — the memory layer Bob's agents talk to by default; orchestrator-agnostic, self-host, federates across hosts.
-- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer Bob's `bob serve` mail consumer plugs into; mail, branch-office bring-up, agent-to-agent dispatch.
+- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer for mail, branch-office bring-up, and agent-to-agent dispatch. Bob's mail consumer is a separate component: it polls the agent's inbox and launches the agent's launcher (`bin/<name>`) as a child process per message — it does not plug into the persistent `bob run` runtime.
 
 Each layer stands alone — use whichever fits your stack, swap out the others. Bob's value is concentrated at the office-shell layer; the rest is composable.
 
