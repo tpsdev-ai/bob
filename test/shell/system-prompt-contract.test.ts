@@ -13,10 +13,11 @@ import {
   contractVerdictForRequest,
   createContractGuardExtension,
   DEFAULT_CONTRACT_CAP_CHARS,
-  jsonEscapedRequestText,
+  decodedRequestPayload,
   MIN_CONTRACT_CAP_CHARS,
   payloadCarriesRequestText,
-  serializeRequestPayload,
+  scanRequestPayload,
+  wellFormedContractText,
 } from "../../src/shell/system-prompt-contract.js";
 
 /** pi's own summarization system prompt, VERBATIM (pi 0.84.3,
@@ -291,32 +292,69 @@ describe("the loader options the factory builds", () => {
   });
 });
 
-describe("the request check: a serialized payload, no provider shapes", () => {
-  it("serializes an object payload as the JSON it is sent as", () => {
-    expect(serializeRequestPayload({ a: 1 })).toBe('{"a":1}');
+describe("the request check: the payload's DECODED string values, never a serialization", () => {
+  it("reads a string payload as the JSON it is sent as", () => {
+    expect(decodedRequestPayload('{"a":1}')).toEqual({ a: 1 });
   });
 
-  it("treats a string payload as the serialization it already is", () => {
-    expect(serializeRequestPayload('{"a":1}')).toBe('{"a":1}');
+  it("treats a string that is not JSON as its own value", () => {
+    expect(decodedRequestPayload("raw text, not a body")).toBe("raw text, not a body");
   });
 
-  it("refuses to vouch for a payload it cannot serialize", () => {
+  it("leaves a non-string payload alone", () => {
+    expect(decodedRequestPayload({ a: 1 })).toEqual({ a: 1 });
+  });
+
+  it("never vouches for a payload it cannot read", () => {
+    // A cycle cannot appear in a payload a provider sends, and walking one must
+    // not loop: it is a check the guard cannot run, never a pass.
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
-    expect(serializeRequestPayload(cyclic)).toBeUndefined();
-    expect(serializeRequestPayload(undefined)).toBeUndefined();
     expect(payloadCarriesRequestText(cyclic, "anything")).toBe(false);
+    expect(payloadCarriesRequestText(undefined, "anything")).toBe(false);
+    expect(contractVerdictForRequest(undefined, "the block").allowed).toBe(false);
   });
 
-  it("escapes text the way JSON escapes it inside a payload", () => {
-    expect(jsonEscapedRequestText('a\nb"c')).toBe('a\\nb\\"c');
-  });
-
-  it("finds a block in a payload escaped or not, and nothing when it is absent", () => {
+  it("finds the block in a decoded string value, and nothing when it is absent", () => {
     const block = buildContractBlock({ label: "TASK", text: "do the thing" });
     expect(payloadCarriesRequestText({ system: block }, block)).toBe(true);
     expect(payloadCarriesRequestText(JSON.stringify({ system: block }), block)).toBe(true);
     expect(payloadCarriesRequestText({ system: "a capability replaced me" }, block)).toBe(false);
+  });
+
+  it("passes a body that writes a character ESCAPED — the decoded value is what counts", () => {
+    // Round 3's defect: a substring search of the serialization false-fails
+    // equivalent text. A client that escapes non-ASCII writes `é` as `\u00e9`,
+    // and no search of that text finds a block that carries the character.
+    const block = buildContractBlock({ label: "TASK", text: "résumé the inbox" });
+    const body = JSON.stringify({ system: block }).replace(/\u00e9/g, "\\u00e9");
+    expect(body).toContain("\\u00e9");
+    expect(body).not.toContain("\u00e9");
+    expect(payloadCarriesRequestText(body, block)).toBe(true);
+    expect(decodedRequestPayload(body)).toEqual({ system: block });
+  });
+
+  it("counts the string values it walked, so a refusal states what it looked at", () => {
+    const scan = scanRequestPayload(
+      { system: "no contract", messages: [{ role: "user", content: "hi" }] },
+      "THE BLOCK",
+    );
+    expect(scan).toEqual({ carries: false, stringValues: 3, readable: true });
+  });
+
+  it("builds the block WELL-FORMED — unpaired surrogates are gone before it is compared", () => {
+    // pi-ai's adapters strip unpaired surrogates from the system prompt before
+    // they build a request (utils/sanitize-unicode `sanitizeSurrogates`), so a
+    // block that carried one would not be the block in the payload.
+    const lone = String.fromCharCode(0xd83d);
+    expect(wellFormedContractText(`keep ${lone} drop`)).toBe("keep  drop");
+    expect(wellFormedContractText("keep éàü drop")).toBe("keep éàü drop");
+    const block = buildContractBlock({ label: "TASK", text: `clean the ${lone} inbox` });
+    expect(block).not.toContain(lone);
+    expect(block).toContain("clean the  inbox");
+    // A task that is nothing but unpaired surrogates says nothing once they are
+    // gone, and is refused rather than shipped as an empty contract.
+    expect(() => buildContractBlock({ label: "TASK", text: lone })).toThrow(/blank task/);
   });
 });
 
@@ -345,9 +383,32 @@ describe("the guard across the payload of EVERY provider pi-ai 0.84.3 ships", ()
       );
       const verdict = contractVerdictForRequest(missing, block);
       expect(verdict.allowed, `${probe.name} without the block is refused`).toBe(false);
-      if (!verdict.allowed) expect(verdict.reason).toBe("contract_missing_from_system_prompt");
+      if (!verdict.allowed) expect(verdict.reason).toBe("contract_missing_from_request");
     });
   }
+
+  it("passes a task with an UNPAIRED SURROGATE through the real OpenAI Completions adapter", async () => {
+    // Round 3's defect, on the adapter that reproduced it: pi-ai's
+    // openai-completions builder sanitizes the system prompt with
+    // `sanitizeSurrogates` BEFORE the hook (api/openai-completions.js), so a
+    // block that carried an unpaired surrogate would be a DIFFERENT string in
+    // the payload and a legitimate turn would be refused. The block is built
+    // well-formed, so the adapter's sanitizing is a no-op on it.
+    const probe = PROVIDER_PROBES.find((p) => p.model.api === "openai-completions");
+    if (probe === undefined) throw new Error("the OpenAI Completions probe is missing");
+    const lone = String.fromCharCode(0xd83d);
+    const block = buildContractBlock({
+      label: "TASK",
+      text: `clean the ${lone} inbox, then report`,
+    });
+    expect(block, "the block is built without the unpaired surrogate").not.toContain(lone);
+
+    const payload = await payloadFor(probe, `You are bob, an office agent.\n\n${block}`);
+    expect(contractVerdictForRequest(payload, block)).toEqual({
+      allowed: true,
+      kind: "carries-contract",
+    });
+  });
 });
 
 describe("contractVerdictForRequest", () => {
@@ -361,12 +422,13 @@ describe("contractVerdictForRequest", () => {
     expect(verdict).toEqual({ allowed: true, kind: "carries-contract" });
   });
 
-  it("REFUSES an agent request whose payload lost it, and says what it looked at", () => {
+  it("REFUSES an agent request that lost it, and says what it looked at", () => {
     const verdict = contractVerdictForRequest({ system: "a capability replaced me" }, block);
     expect(verdict.allowed).toBe(false);
     if (!verdict.allowed) {
-      expect(verdict.reason).toBe("contract_missing_from_system_prompt");
-      expect(verdict.detail).toContain("payload");
+      expect(verdict.reason).toBe("contract_missing_from_request");
+      expect(verdict.detail).toContain("string value");
+      expect(verdict.detail).toContain("contract block");
     }
   });
 
@@ -379,56 +441,63 @@ describe("contractVerdictForRequest", () => {
     expect(verdict.allowed).toBe(false);
   });
 
-  it("EXEMPTS pi's own summarization request — on pi's compaction flag, not on text", () => {
-    const summarizationPayload = { system: [{ type: "text", text: PI_SUMMARIZATION_PROMPT }] };
-    const verdict = contractVerdictForRequest(summarizationPayload, block, {
-      compacting: () => true,
-    });
-    expect(verdict).toEqual({ allowed: true, kind: "pi-summarization" });
+  it("REFUSES an agent request that appears during BRANCH SUMMARIZATION — there is no exemption to consult", () => {
+    // Round 3 deletes round 2's exemption: pi 0.84.3 sets `isCompacting`
+    // during a branch summary too (`navigateTree`), and a capability's
+    // `sendMessage` with `triggerTurn` can start an agent turn in that window,
+    // so a flag-based exemption could pass a REAL agent request with no block.
+    // The verdict takes no flag now: a request that does not carry the block
+    // fails, whatever pi is doing.
+    const verdict = contractVerdictForRequest(
+      { system: "a branch summary is running; an agent turn started anyway" },
+      block,
+    );
+    expect(verdict.allowed).toBe(false);
+    if (!verdict.allowed) expect(verdict.reason).toBe("contract_missing_from_request");
   });
 
-  it("does NOT let a capability borrow the exemption: the marker, or pi's WHOLE prompt", () => {
+  it("does NOT let a capability borrow an exemption: pi's prompt, in full or in part", () => {
     // Round 2: the exemption keyed on a marker IN THE PROMPT, so a capability
-    // could paste the marker in and drop the contract. Now the flag decides, and
-    // an agent request is never made while pi is compacting — so both texts are
-    // refused when the flag is false.
+    // could paste the marker in and drop the contract. Round 3 deletes the
+    // exemption outright, so even pi's WHOLE summarization prompt — the
+    // hardest text to tell from pi's own call — exempts nothing.
     for (const text of [
       "You are a context summarization assistant.",
       PI_SUMMARIZATION_PROMPT,
       `${PI_SUMMARIZATION_PROMPT}\n\nAgent turn: answer the operator.`,
     ]) {
-      const verdict = contractVerdictForRequest({ system: text }, block, {
-        compacting: () => false,
-      });
+      const verdict = contractVerdictForRequest({ system: text }, block);
       expect(verdict.allowed, `"${text.slice(0, 40)}…" must not exempt`).toBe(false);
     }
   });
 
-  it("exempts nothing when the flag is absent or false", () => {
-    for (const opts of [{}, { compacting: () => false }]) {
-      expect(contractVerdictForRequest({ system: "no contract here" }, block, opts).allowed).toBe(
-        false,
-      );
-    }
+  it("PASSES when the block rides a user message instead of the system field", () => {
+    // The guarantee is that the request CARRIES the contract block: the system
+    // prompt is where bob puts it, and a capability that moves it into the
+    // conversation still sends the block to the model — which is what #145 is
+    // about (a request that goes out WITHOUT it).
+    const carried = {
+      messages: [{ role: "user", content: [{ type: "text", text: block }] }],
+    };
+    expect(contractVerdictForRequest(carried, block)).toEqual({
+      allowed: true,
+      kind: "carries-contract",
+    });
   });
 });
 
 describe("the guard extension", () => {
   type Handler = (event: { payload: unknown }) => unknown;
 
-  function loadGuard(
-    deps: {
-      dispose: () => void;
-      exit: (code: number) => void;
-      log: (m: string) => void;
-    },
-    compacting?: () => boolean,
-  ): Handler {
+  function loadGuard(deps: {
+    dispose: () => void;
+    exit: (code: number) => void;
+    log: (m: string) => void;
+  }): Handler {
     const handlers: Handler[] = [];
     const extension = createContractGuardExtension({
       contract: "THE CONTRACT",
       deps: () => deps,
-      ...(compacting !== undefined ? { compacting } : {}),
     });
     const factory = typeof extension === "function" ? extension : extension.factory;
     factory({
@@ -454,8 +523,8 @@ describe("the guard extension", () => {
 
     expect(disposed, "the session is disposed").toEqual([1]);
     expect(exits, "the process is ended with a failure code").toEqual([1]);
-    expect(logs.join("\n")).toContain("contract_missing_from_system_prompt");
-    expect(logs.join("\n")).toContain("payload");
+    expect(logs.join("\n")).toContain("contract_missing_from_request");
+    expect(logs.join("\n")).toContain("string value");
   });
 
   it("does nothing when the request carries the contract", () => {
@@ -471,16 +540,21 @@ describe("the guard extension", () => {
     expect(exits).toEqual([]);
   });
 
-  it("does nothing while pi is compacting — its own summarization request", () => {
+  it("fails a block-less agent request DURING branch summarization — the guard consults no flag", () => {
+    // The request that round 2's exemption would have passed: pi is summarizing
+    // a branch (`isCompacting` true, `navigateTree`), and an agent turn starts
+    // in that window (`sendMessage` with `triggerTurn`). With the exemption
+    // deleted there is nothing to consult, so the request fails like any other.
     const disposed: number[] = [];
     const exits: number[] = [];
-    const handler = loadGuard(
-      { dispose: () => disposed.push(1), exit: (code) => exits.push(code), log: () => {} },
-      () => true,
-    );
-    handler({ payload: { system: "pi's summarization prompt, no contract" } });
-    expect(disposed).toEqual([]);
-    expect(exits).toEqual([]);
+    const handler = loadGuard({
+      dispose: () => disposed.push(1),
+      exit: (code) => exits.push(code),
+      log: () => {},
+    });
+    handler({ payload: { system: "pi is summarizing a branch; an agent turn started anyway" } });
+    expect(disposed, "the session is disposed").toEqual([1]);
+    expect(exits, "the process is ended").toEqual([1]);
   });
 
   it("is a HIDDEN inline extension, so pi appends it last without listing it", () => {

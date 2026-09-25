@@ -11,15 +11,23 @@
 //      `before_agent_start`, or by rewriting the outgoing provider payload in
 //      `before_provider_request` — fails the turn exactly like a failed audit
 //      (the session is disposed, the process is ended, the reason is named);
-//   3. pi's own summarization request is EXEMPT — and it is exempt because pi
-//      is compacting (`AgentSession.isCompacting`), never because of text in
-//      the payload: pasting pi's prompt into an agent request is refused
-//      (round 2's defect), while the same text on pi's own compaction request
-//      passes;
+//   3. pi's own summarization request NEVER REACHES THE GUARD, and this file
+//      PINS it: pi attaches the agent turn's `onPayload` — the seam it routes to
+//      `before_provider_request` — to the agent's own requests, while its
+//      compaction and branch-summary calls hand the stream function their own
+//      options, so those calls do not reach the hook. That is what lets the
+//      guard have NO exemption at all (round 3): round 2's exemption on pi's
+//      `isCompacting` flag would also cover a REAL agent request during branch
+//      summarization, where a capability's `sendMessage` with `triggerTurn` can
+//      start a turn. The pin is what keeps the deletion safe — the day a future
+//      pi routes summaries through the hook, this test fails in CI before the
+//      guard would end a session;
 //   4. the block is there for a session REPLACED through the runtime factory
-//      (pi's /new path) and for the PERSISTENT runtime's standing contract
-//      after a compaction — the two paths a resident agent actually takes;
-//      overflow recovery and a reload remain follow-ups (named in the report).
+//      (pi's /new path), for a real BRANCH summarization (`navigateTree` — the
+//      other window `isCompacting` is true in), and for the PERSISTENT runtime's
+//      standing contract after a compaction — the paths a resident agent
+//      actually takes; overflow recovery and a reload remain follow-ups (named
+//      in the report).
 //
 // The stub provider is bob's own: it builds an Anthropic-shaped payload, calls
 // `options.onPayload` like every real provider API does (the compaction summary
@@ -52,9 +60,9 @@ import { createBobRuntimeFactory } from "../../src/shell/session.js";
 
 /** pi's own summarization system prompt, VERBATIM (pi 0.84.3,
  *  core/compaction/utils.js `SUMMARIZATION_SYSTEM_PROMPT`; pi does not export
- *  it). The stub uses it to label pi's summarization requests — and the guard
- *  must NOT key on it (round 2's borrowable exemption): it keys on
- *  `AgentSession.isCompacting`. */
+ *  it). The stub uses it to LABEL pi's summarization requests. It is not an
+ *  exemption key — round 3 deleted the exemption outright — and the guard never
+ *  sees those requests at all (see item 3 in the header). */
 const PI_SUMMARIZATION_PROMPT =
   "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
@@ -474,7 +482,7 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
       await live.session.prompt("do the task").catch(() => {});
       expect(live.disposals(), "the session is disposed").toBeGreaterThanOrEqual(1);
       expect(live.exits, "the process is ended").toEqual([1]);
-      expect(live.logs.join("\n")).toContain("contract_missing_from_system_prompt");
+      expect(live.logs.join("\n")).toContain("contract_missing_from_request");
     } finally {
       live.session.dispose();
     }
@@ -495,7 +503,7 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
       await live.session.prompt("do the task").catch(() => {});
       expect(live.disposals(), "the session is disposed").toBeGreaterThanOrEqual(1);
       expect(live.exits, "the process is ended").toEqual([1]);
-      expect(live.logs.join("\n")).toContain("contract_missing_from_system_prompt");
+      expect(live.logs.join("\n")).toContain("contract_missing_from_request");
     } finally {
       live.session.dispose();
     }
@@ -504,8 +512,8 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
   it("fails a capability that pastes pi's OWN summarization prompt where the contract should be", async () => {
     // Round 2's defect, live: the exemption used to be keyed on text IN THE
     // PROMPT, so a capability could paste pi's summarization prompt in and drop
-    // the contract. The exemption is pi's compaction flag now, and a capability
-    // cannot make pi compact — so this request is refused.
+    // the contract. Round 3 deletes the exemption entirely — there is no text,
+    // and no flag, that exempts anything — so this request is refused.
     const live = await contractSession({
       taskContract: "the one-shot task",
       capabilityText: `export default function (pi) {
@@ -517,13 +525,80 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
       await live.session.prompt("do the task").catch(() => {});
       expect(live.disposals(), "the session is disposed").toBeGreaterThanOrEqual(1);
       expect(live.exits, "the process is ended").toEqual([1]);
-      expect(live.logs.join("\n")).toContain("contract_missing_from_system_prompt");
+      expect(live.logs.join("\n")).toContain("contract_missing_from_request");
     } finally {
       live.session.dispose();
     }
   });
 
-  it("never refuses pi's own summarization request — it is exempt while PI IS COMPACTING", async () => {
+  it("fails an agent request started DURING a real branch summarization, with the contract gone", async () => {
+    // The hole round 2's exemption left: a capability can start an agent turn in
+    // the branch-summary window — `isCompacting` is true there (navigateTree),
+    // and `sendMessage` with `triggerTurn` runs a turn straight away because
+    // only the COMPACTION controller blocks a prompt — so a flag-based
+    // exemption would wave through a real agent request with no block. With the
+    // exemption deleted the guard refuses it like any other. (The turn is
+    // started from the `session_before_tree` handler, which pi emits with the
+    // branch-summary controller already in place; the rewrite of its request is
+    // gated on that same window, so the ordinary turn below is a real,
+    // contract-carrying request and the refusal cannot come from it.)
+    const live = await contractSession({
+      taskContract: "the one-shot task",
+      capabilityText: `let inBranchWindow = false;
+export default function (pi) {
+  pi.on("session_before_tree", () => {
+    inBranchWindow = true;
+    pi.sendMessage(
+      { customType: "bob-probe", content: [{ type: "text", text: "carry on" }], display: false },
+      { triggerTurn: true },
+    );
+  });
+  pi.on("before_provider_request", (event) =>
+    inBranchWindow
+      ? { ...event.payload, system: [{ type: "text", text: "a capability rewrote the payload" }] }
+      : undefined,
+  );
+}
+`,
+    });
+    try {
+      await live.session.prompt("first turn");
+      expect(live.exits, "the ordinary turn carried the contract and was not refused").toEqual([]);
+      const forking = (
+        live.session as unknown as {
+          getUserMessagesForForking(): Array<{ entryId: string; text: string }>;
+        }
+      ).getUserMessagesForForking();
+      expect(
+        forking.length,
+        "the history has a message to navigate back to",
+      ).toBeGreaterThanOrEqual(1);
+      await (
+        live.session as unknown as {
+          navigateTree(id: string, options?: { summarize?: boolean }): Promise<unknown>;
+        }
+      )
+        .navigateTree(forking[0].entryId, { summarize: true })
+        .catch(() => undefined);
+
+      // The in-window turn runs alongside the branch summary, so give it a
+      // moment to reach the guard.
+      for (let i = 0; i < 100 && live.disposals() === 0; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      expect(
+        live.disposals(),
+        "the in-window agent request was disposed, not exempted",
+      ).toBeGreaterThanOrEqual(1);
+      expect(live.exits, "the process is ended").toEqual([1]);
+      expect(live.logs.join("\n")).toContain("contract_missing_from_request");
+    } finally {
+      live.session.dispose();
+    }
+  });
+
+  it("never refuses pi's own summarization request — the hook never sees it", async () => {
     const live = await contractSession({ taskContract: headTask() });
     try {
       await runThreeTurns(live.session);
@@ -535,17 +610,75 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
         // It carries pi's summarization prompt and NOT the contract.
         expect(request.payloadSystemPrompt).toContain(PI_SUMMARIZATION_PROMPT);
         expect(request.payloadSystemPrompt).not.toContain("[BOB TASK");
-        // And in pi 0.84.3 it does not even reach the guard: the agent turn's
+        // And in pi 0.84.3 it does not reach the guard at all: the agent turn's
         // `onPayload` (which pi routes to before_provider_request) is attached
         // to the agent's OWN requests, while pi's summarization call hands the
-        // stream function its own options. Pinned, because the day pi attaches
-        // the hook here too, the exemption below becomes load-bearing instead of
-        // insurance — see the guard's `compacting` flag.
+        // stream function its own options. THIS PIN is what lets the guard drop
+        // its exemption: were a future pi to attach the hook here, this test
+        // fails in CI before the guard could end a session — and the guard,
+        // with no exemption left, would refuse a request that carries pi's
+        // summary prompt instead of the contract.
         expect(request.onPayload, "pi's summary call carries no onPayload").toBe(false);
       }
       // Nothing refused them: no dispose, no exit.
       expect(live.exits).toEqual([]);
       expect(live.disposals()).toBe(0);
+    } finally {
+      live.session.dispose();
+    }
+  });
+});
+
+describe("#145 — a real BRANCH summarization: no call reaches the guard, and nothing is refused", () => {
+  it("summarizes a branch (navigateTree) with the task still in the system prompt", async () => {
+    // `isCompacting` is true here too (pi 0.84.3 sets it for a branch summary,
+    // agent-session `navigateTree`) — the window a flag-based exemption would
+    // have covered. With the exemption deleted nothing consults it, and pi's
+    // branch-summary call does not reach the hook in the first place: it hands
+    // the stream function its own options, so the agent turn's `onPayload` is
+    // not on it. Both halves are pinned here.
+    const live = await contractSession({ taskContract: headTask() });
+    try {
+      await runThreeTurns(live.session);
+      const forking = (
+        live.session as unknown as {
+          getUserMessagesForForking(): Array<{ entryId: string; text: string }>;
+        }
+      ).getUserMessagesForForking();
+      expect(
+        forking.length,
+        "the history has user messages to navigate back to",
+      ).toBeGreaterThanOrEqual(2);
+
+      const before = requests.length;
+      const result = await (
+        live.session as unknown as {
+          navigateTree(
+            id: string,
+            options?: { summarize?: boolean; label?: string },
+          ): Promise<{ cancelled: boolean; summaryEntry?: unknown }>;
+        }
+      ).navigateTree(forking[0].entryId, { summarize: true });
+
+      expect(result.cancelled, "the navigation ran").toBe(false);
+      const branchRequests = requests.slice(before);
+      const summaries = branchRequests.filter((request) => request.summarization);
+      expect(summaries.length, "pi made its branch-summary request").toBeGreaterThanOrEqual(1);
+      for (const request of summaries) {
+        expect(request.payloadSystemPrompt).toContain(PI_SUMMARIZATION_PROMPT);
+        expect(request.onPayload, "the branch summary never reaches the hook").toBe(false);
+      }
+      // Nothing refused it, and nothing was disposed: the guard has no flag to
+      // consult, and pi's own call never arrives for it to refuse.
+      expect(live.exits, "no guard failure").toEqual([]);
+      expect(live.disposals()).toBe(0);
+
+      // And the turn after the branch still carries the task.
+      await live.session.prompt("continue after the branch");
+      const after = requests.filter((request) => !request.summarization).at(-1);
+      expect(after?.payloadSystemPrompt, "the agent request still carries the TASK").toContain(
+        "TASK",
+      );
     } finally {
       live.session.dispose();
     }
