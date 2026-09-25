@@ -68,6 +68,181 @@ export function readCapabilities(yamlText: string): string[] {
   return [];
 }
 
+// --- `tools:` block ---------------------------------------------------------
+//
+// The role's tool allowlist, exactly as `bob init` stamps it out of role.json:
+//
+//   tools:
+//     allow:
+//       - read
+//       - bash
+//     exclude:
+//       - bash
+//     allowResidentShell: false
+//
+// `readBlock` already handles the shape (a flat mapping of scalar / inline-list
+// / block-sequence-list values); this wrapper is the SCHEMA on top of it. A key
+// it does not recognize is an error, not an ignored setting — the allowlist
+// spent its whole life inert because nothing validated it, and a typo like
+// `alow:` must not read as "allow everything".
+//
+// Names are NOT resolved here (this module stays free of any pi/capability
+// knowledge): tool-allowlist.ts resolves them against the tools that can
+// actually exist. This reader only guarantees the block's shape.
+export interface ToolsBlock {
+  // Tool names to enable — the strict allowlist handed to pi. Absent is a load
+  // error (tool-allowlist.ts resolveToolPolicy); an explicit empty list means
+  // no tools.
+  allow?: string[];
+  // Tool names to disable after the allowlist.
+  exclude?: string[];
+  // Opt a resident agent back into the shell + file-writing tools the resident
+  // policy drops (see tool-allowlist.ts, RESIDENT_EXCLUDED_TOOLS).
+  allowResidentShell?: boolean;
+}
+
+const TOOLS_KEYS = ["allow", "exclude", "allowResidentShell"] as const;
+
+export function readTools(yamlText: string): ToolsBlock | undefined {
+  // The INLINE form (`tools: {allow: [read]}`) is refused, not ignored.
+  // `readBlock` drops a block key's inline value silently, which on this key
+  // means the block reads as empty — and "empty" is one step away from pi's
+  // defaults, the state this whole reader exists to make impossible. One shape
+  // for the block: `tools:` followed by allow:/exclude:/allowResidentShell: on
+  // indented lines.
+  const inline = /^tools[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "tools",
+      lineOf(yamlText, /^tools[ \t]*:/m),
+      `the inline form is not supported — write the block form: "tools:" on its own line, then allow:/exclude: indented under it.`,
+    );
+  }
+
+  const raw = readBlock(yamlText, "tools");
+  if (raw === undefined) return undefined;
+
+  const out: ToolsBlock = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(TOOLS_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "tools",
+        lineOfKey(yamlText, "tools", key),
+        `unknown key "${key}" — supported keys are ${TOOLS_KEYS.join(", ")}.`,
+      );
+    }
+    if (key === "allowResidentShell") {
+      if (typeof value !== "boolean") {
+        throw new BobYamlError(
+          "tools",
+          lineOfKey(yamlText, "tools", key),
+          `"allowResidentShell" must be true or false.`,
+        );
+      }
+      out.allowResidentShell = value;
+      continue;
+    }
+    const names = toToolNames(value);
+    if (names === undefined) {
+      throw new BobYamlError(
+        "tools",
+        lineOfKey(yamlText, "tools", key),
+        `"${key}" must be a list of tool names, or one name.`,
+      );
+    }
+    // Narrowed for the assignment below: the key is one of the two name lists
+    // (allowResidentShell was handled above).
+    if (key === "allow" || key === "exclude") out[key] = names;
+  }
+  return out;
+}
+
+// Normalize a parsed value into a list of tool names. A single scalar is one
+// name (`allow: read`); an explicit empty list stays empty (`allow:` with no
+// items means "no tools", the same strict reading pi gives an empty `tools`).
+// Anything else — a number, a mapping, a list with a non-string item — is
+// undefined, which the caller turns into a schema error.
+function toToolNames(value: unknown): string[] | undefined {
+  const list = Array.isArray(value) ? value : [value];
+  const names: string[] = [];
+  for (const item of list) {
+    if (typeof item !== "string" || item.trim() === "") return undefined;
+    names.push(item.trim());
+  }
+  return names;
+}
+
+// The role this agent was hired into (bob.yaml `agent.role`). The role is the
+// CEILING on the tool allowlist (tool-allowlist.ts): roles/<role>/role.json
+// ships with bob, while bob.yaml is agent-writable, so bob.yaml may narrow the
+// role's list but never widen it. An absent or non-scalar role is an error — a
+// session cannot apply a ceiling it cannot read.
+export function readAgentRole(yamlText: string): string {
+  const block = readBlock(yamlText, "agent");
+  const raw = block?.role;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new BobYamlError(
+      "agent",
+      lineOfKey(yamlText, "agent", "role"),
+      raw === undefined
+        ? `bob.yaml must declare the agent's role (agent.role) — the role's role.json is the ceiling on the tool allowlist.`
+        : `"role" must be a role name (ea, writer, reviewer, coder, qa, custom).`,
+    );
+  }
+  return raw.trim();
+}
+
+// Read the top-level `resident:` flag. True means the agent runs unattended
+// behind its service unit, which is what the resident tool policy keys off
+// (tool-allowlist.ts). Absent = false. A non-boolean value is an error rather
+// than a silent "not resident" — the flag decides whether an agent holds a
+// shell, so guessing it is the wrong failure mode.
+export function readResident(yamlText: string): boolean {
+  const m = yamlText.match(/^resident[ \t]*:(.*)$/m);
+  if (!m) return false;
+  const value = m[1].trim();
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new BobYamlError(
+    "resident",
+    lineOf(yamlText, /^resident[ \t]*:/m),
+    "`resident` must be true or false.",
+  );
+}
+
+// 1-based line of the first match of `pattern`, or 1. Used to point a config
+// error at the line a human edits.
+export function lineOf(yamlText: string, pattern: RegExp): number {
+  const lines = yamlText.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (pattern.test(lines[i])) return i + 1;
+  }
+  return 1;
+}
+
+// 1-based line of a sub-key inside a top-level block, falling back to the
+// block's own line. Same targeted scanning style as run.ts's readProviderField.
+function lineOfKey(yamlText: string, blockKey: string, subKey: string): number {
+  const lines = yamlText.split(/\r?\n/);
+  let inBlock = false;
+  let blockLine = 1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) {
+      inBlock = new RegExp(`^${blockKey}\\s*:`).test(line);
+      if (inBlock) blockLine = i + 1;
+      continue;
+    }
+    if (!inBlock) continue;
+    const t = line.trim();
+    if (t === "" || t.startsWith("#")) continue;
+    const m = t.match(/^([A-Za-z0-9_-]+)\s*:/);
+    if (m && m[1] === subKey) return i + 1;
+  }
+  return blockLine;
+}
+
 // A shape `readBlock` deliberately does not support. Thrown rather than guessed
 // at: the whole reason issue #77 shipped is that an unsupported shape produced a
 // plausible-looking wrong value (a list of maps became a list of strings, and

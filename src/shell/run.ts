@@ -2,26 +2,28 @@
 // `claude -p`-style task: spin up a fresh session, send one prompt, capture
 // the assistant's final text, exit.
 //
-// PHASE-1 MIGRATION: previously this spawned the agent's generated `bin/<name>`
-// launcher as a subprocess (`exec pi --provider … --model …`). It now embeds pi
-// via its SDK (`createAgentSession`/`AgentSession`) in-process. One embedded-pi
-// path, no subprocess. The PERSISTENT variant (the agent keeps running) lives in
-// persistent.ts and shares this file's session builder — `bob run` is the
-// short-lived `-p`-style lifespan, persistent is the warm long-lived one. The
-// remaining spawn sites (onboard/align launcher generation) migrate in later
-// PRs — see the `// TODO(phase1): migrate to SDK` markers there.
+// THERE IS ONE SESSION BUILDER: `createPiRunSession` below is a thin wrapper
+// over the runtime factory in session.ts, so `bob run`, the persistent runtime,
+// the launcher (`bob launch`), the mail consumer, onboarding and alignment all
+// stand up the same session from the same place. bob never spawns the pi CLI
+// and never builds pi argv — an argv built here is a second policy surface,
+// which is how a caller's arguments used to widen the role ceiling.
 //
-// Config resolution mirrors the launcher `init.ts` generates exactly:
+// EVERY launch path resolves the tool policy HERE: the session factory gets it
+// through RunSessionConfig (required — see the interface), so there is no path
+// that starts an agent session without it. In the interactive mode the same
+// resolved policy is what the factory creates the session with.
+//
+// Config resolution:
 //   - provider + model come from ~/agents/<name>/bob.yaml (`provider:` block)
-//   - soul.md is appended to pi's system prompt (--append-system-prompt
-//     equivalent), preserving the agent's persona
+//   - soul.md is appended to pi's system prompt, preserving the agent's persona
 //   - per-agent credentials live in ~/agents/<name>/.pi-agent/{auth,models}.json
-//     (PI_CODING_AGENT_DIR in the old launcher) — we point pi's AuthStorage +
-//     ModelRegistry at that dir so the exe-dev-gateway baseUrl override and
-//     auth.json are honored without env juggling.
+//     (the old launcher's PI_CODING_AGENT_DIR) — we point pi's ModelRuntime at
+//     that dir so the exe-dev-gateway baseUrl override and auth.json are honored
+//     without env juggling.
 //
 // Model override is per-call (`opts.model`): it replaces the bob.yaml model
-// for this invocation only, same semantics as the old `--model` flag.
+// for this invocation only.
 
 import { randomBytes } from "node:crypto";
 import {
@@ -38,16 +40,25 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
-  type AgentSessionEvent,
-  createAgentSession,
-  DefaultResourceLoader,
-  ModelRuntime,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
-import { readCron } from "./bob-yaml.js";
+import { type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
+import { readAgentRole, readBlock, readCron, readResident, readTools } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
-import type { CronEntry } from "./index.js";
+import {
+  CONTINUE_TURN,
+  createCompactionObserver,
+  evaluateCompletion,
+  readWorktreeStatus,
+  type SilenceReason,
+} from "./compaction-contract.js";
+import type { BobRole, CronEntry } from "./index.js";
+import { loadRole } from "./role-loader.js";
+import {
+  createBobRuntimeFactory,
+  promptSession,
+  runInteractiveSession,
+  type SessionDeps,
+} from "./session.js";
+import { resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -350,7 +361,14 @@ export function projectRunLogRecord(event: EventRecord): EventRecord {
 // inject a fake session without standing up the whole SDK.
 export interface RunSession {
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
-  prompt(text: string): Promise<void>;
+  // Send a turn. `expandPromptTemplates: false` is how bob sends a prompt: the
+  // text is the prompt, and nothing bob did not declare can interpret it (no
+  // command, prompt-template or skill expansion). The persistent runtime also
+  // uses `streamingBehavior` to steer a running turn.
+  prompt(
+    text: string,
+    options?: { expandPromptTemplates?: boolean; streamingBehavior?: "steer" | "followUp" },
+  ): Promise<void>;
   // Best-effort final assistant text, used as a fallback when no text_delta
   // events were observed (e.g. providers/transports that don't stream).
   readonly messages?: ReadonlyArray<unknown>;
@@ -377,14 +395,16 @@ export interface RunSessionConfig {
   // The agent's working dir (~/agents/<name>/work) — pi's cwd.
   cwd: string;
   // The agent's pi config dir (~/agents/<name>/.pi-agent) — holds
-  // auth.json/models.json. pi's AuthStorage + ModelRegistry read from here.
+  // auth.json/models.json. pi's ModelRuntime reads from here.
   piAgentDir: string;
   // pi extension sources for the agent's declared capabilities, in order.
   // Each is an npm:/git:/local-path spec handed to pi's resource loader as an
-  // `additionalExtensionPaths` entry (the SDK equivalent of settings.json
-  // `packages`/`extensions`). Resolved from bob.yaml `capabilities:` against
-  // the blessed catalog before the factory runs, so a fake factory in tests
-  // doesn't need the catalog or filesystem. Empty when the agent declares none.
+  // `additionalExtensionPaths` entry. Resolved from bob.yaml `capabilities:`
+  // against the blessed catalog before the factory runs, so a fake factory in
+  // tests doesn't need the catalog or filesystem. Empty when the agent
+  // declares none. With round 3 this is the ONLY extension source that LOADS:
+  // the ambient pi extension, skill and prompt-template paths are never LOADED,
+  // and no package is installed.
   extensionSources: string[];
   // source → capability name, so a source pi fails to load can be reported as
   // the capability the agent asked for rather than a bare path. Optional: a
@@ -402,11 +422,37 @@ export interface RunSessionConfig {
   // one-shot `bob run` stays minimal (outbound tools, no gateway). Defaults
   // falsy (ephemeral run).
   persistent?: boolean;
+  // The tool policy resolved from bob.yaml's `tools:` block + top-level
+  // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
+  // `tools` is pi's STRICT allowlist and is REQUIRED: the type says so, and
+  // createPiRunSession refuses a config without it at runtime. A session
+  // without the resolved allowlist is the defect this whole area recovers
+  // from, so "absent" is not a shape that can reach a session any more —
+  // resolveAgentToolPolicy always produces it, and an empty array is the
+  // explicit "no tools" decision. `excludeTools` is pi's denylist, applied
+  // after `tools` (always an array at the factory; the resident policy rides
+  // in it).
+  tools: string[];
+  excludeTools?: string[];
+  // #145 — the CONTRACT carried in the system prompt. A one-shot `bob run`
+  // carries its TASK (`taskContract`); the persistent runtime carries the
+  // agent's STANDING CONTRACT (`standingContract`). They are mutually
+  // exclusive, and the factory refuses a config with both. The contract is
+  // appended to the system prompt as LITERAL TEXT through the loader's
+  // `appendSystemPromptOverride`, so it is present on every model call and no
+  // context compaction can remove it — which is why neither field is a message.
+  // A blank value is refused (see assertContractText).
+  taskContract?: string;
+  standingContract?: string;
+  // Cap on the appended contract block, in characters (default
+  // DEFAULT_CONTRACT_CAP_CHARS). The block is cut with a visible truncation
+  // marker; the heading is never the part that is cut.
+  contractCapChars?: number;
 }
 
-// The injectable seam. Production builds a real pi AgentSession; tests inject a
-// fake that returns canned assistant text without any LLM call. Replaces the
-// old `spawnFn` injection point.
+// The injectable seam. Production builds a real pi AgentSession through bob's
+// ONE session factory (session.ts); tests inject a fake that returns canned
+// assistant text without any LLM call.
 export type RunSessionFactory = (config: RunSessionConfig) => Promise<RunSession>;
 
 export interface RunOptions {
@@ -444,6 +490,15 @@ export interface RunOptions {
   // Defaults to a fresh Date() per call. Lets a test pin the start millisecond so
   // two runs started in the same millisecond still get distinct files and locks.
   now?: () => Date;
+  // #145: the ONE completion contract this run is judged by. When the caller
+  // (or bob.yaml) declares an expected final-assistant-message shape, a run only
+  // settles exit 0 when the captured final text matches it. Omitted → the
+  // contract is "the final message is non-empty".
+  expectedFinal?: (text: string) => boolean;
+  // #145: cap on the contract block appended to the system prompt. Defaults to
+  // DEFAULT_CONTRACT_CAP_CHARS. A blank task is refused before the session
+  // starts, whatever this is.
+  contractCapChars?: number;
 }
 
 export interface RunResult {
@@ -458,6 +513,10 @@ export interface RunResult {
   // Captured assistant final text, populated only when captureStdout=true.
   // Undefined otherwise.
   stdout?: string;
+  // #145: the named reason a one-shot run refused to report success
+  // (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
+  // Undefined on exit 0.
+  reason?: SilenceReason;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -475,6 +534,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       "runAgent: a prompt is required (the SDK prompt path sends one prompt and exits)",
     );
   }
+  // #145: a BLANK task is refused here, BEFORE the session starts. The task is
+  // carried in the session's system prompt for its whole life, so an empty one
+  // would spend a whole run on nothing while looking like a real one.
+  if (opts.prompt.trim().length === 0) {
+    throw new Error(
+      "runAgent: refusing to start a session with a blank task — the task is carried in the session's system prompt, and an empty one guarantees nothing",
+    );
+  }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
   const { agentDir, provider, model, config } = resolveRunConfig({
@@ -484,7 +551,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
-  const session = await factory(config);
+  // #145: the task is the session's CONTRACT, carried in its system prompt
+  // through the factory. (It is ALSO the first user message below, so a provider
+  // that shows only messages still sees it; see the README's stated limits.)
+  const session = await factory({
+    ...config,
+    taskContract: opts.prompt,
+    ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
+  });
 
   // Tee every session event to a per-run JSONL log so a mid-run death (a provider
   // cap, an OOM, a crash) is post-mortem-able instead of leaving no trace. Logging
@@ -589,10 +663,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     );
   }
 
-  let captured = "";
-  const unsubscribe = session.subscribe((event) => {
-    // Post-mortem trail first: record EVERY event (tool calls, results, errors,
-    // retries), not just text — that's what makes a death diagnosable.
+  const unsubscribeRunLog = session.subscribe((event) => {
+    // Post-mortem trail: record EVERY event (tool calls, results, errors,
+    // retries), not just text — that's what makes a death diagnosable. The
+    // FINAL-MESSAGE capture is NOT here: it lives on the compaction observer
+    // below, which knows the compaction boundary, and the record is the
+    // projected, bounded shape (projectRunLogRecord), not the raw event.
     writeRunLog(
       {
         t: now().toISOString(),
@@ -600,39 +676,124 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       },
       isDeltaEvent(event.type),
     );
-    // Stream the assistant's text deltas — same event shape the SDK
-    // quickstart and every examples/sdk/*.ts use. UNCHANGED: the captured
-    // accumulation stays byte-identical so the returned final text is stable.
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      captured += event.assistantMessageEvent.delta;
-    }
   });
 
   let exitCode = 0;
+  let reason: SilenceReason | undefined;
+
+  // #145: after every non-aborted compaction the observer sends ONE best-effort
+  // "what remains" note (a steer: the last thing the agent said, git status,
+  // recent tool calls).
+  // It is never load-bearing — the task is in the system prompt — so a failed
+  // note is logged and nothing else happens. The observer also owns the
+  // final-message boundary the judge reads.
+  const observer = createCompactionObserver({
+    worktreeStatus: () => readWorktreeStatus(config.cwd),
+    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    log: (m) => process.stderr.write(`${m}\n`),
+  });
+  const unsubscribeContract = session.subscribe((event) => observer.observe(event));
+
+  // The FINAL message is the text of the LAST assistant message that ENDED since
+  // the last compaction (or the last startTurn): text streamed before a
+  // compaction can never satisfy the completion contract, streamed deltas are
+  // never substituted for the ended message's own content, and the observer
+  // clears its capture on `compaction_end` and at every `startTurn()`.
+  const finalTextNow = (): string => {
+    const tracked = observer.finalText();
+    if (tracked.length > 0) return tracked;
+    // NOTHING ended with text since the boundary. Only a transport that ended no
+    // assistant message at all may fall back to session state — and NEVER after
+    // a compaction, whose boundary the session's message list cannot express.
+    if (observer.compactions() > 0 || observer.assistantEnded()) return "";
+    return lastAssistantText(session) ?? "";
+  };
+
+  // ONE judge: the first evaluation and the one after the continue turn are the
+  // same call, so the run cannot be judged by two different rules.
+  const judge = (): { ok: boolean; reason?: SilenceReason } =>
+    evaluateCompletion({
+      capturedText: finalTextNow(),
+      compactions: observer.compactions(),
+      expectedFinal: opts.expectedFinal,
+    });
+
   try {
-    try {
-      await session.prompt(opts.prompt);
-    } catch (err) {
-      exitCode = 1;
-      // Surface the error instead of swallowing it: an underscore-ignored catch
-      // made a cap-hit look like a silent clean exit. Label a provider
-      // rate-limit/cap so a budget stall is distinguishable from a crash.
-      const msg = err instanceof Error ? err.message : String(err);
-      const isCap =
-        /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+    observer.startTurn();
+    // bob's own runner: the text IS the prompt (no command/template/skill
+    // expansion — see session.ts promptSession).
+    await promptSession(session, opts.prompt);
+
+    // #145: the completion contract. Before this, a run settled `exitCode 0`
+    // whenever the prompt promise resolved — including after a compaction that
+    // erased the plan. Now it settles 0 ONLY with a final message (matching an
+    // expected shape when one is declared).
+    let outcome = judge();
+    if (!outcome.ok && outcome.reason === "settled_after_compaction") {
+      // Settled after a compaction with no final message: retry ONCE with an
+      // explicit "continue from the state above" turn. This retry is meaningful
+      // because the task is still in the system prompt.
       process.stderr.write(
-        `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+        `bob run ${opts.name}: settled after a context compaction with no final message — retrying once with a continue turn\n`,
       );
-    } finally {
-      unsubscribe();
+      try {
+        observer.startTurn(); // the retry is its own turn: its final message counts
+        // Through the one non-interactive prompt entry point, so template and
+        // command expansion stay off by construction (not because of the text).
+        await promptSession(session, CONTINUE_TURN);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
+      }
+      outcome = judge();
     }
+    if (!outcome.ok) {
+      // NEVER exit 0 for silence. Name the reason and print what we can (the
+      // dirty paths, if the agent's cwd is a git worktree).
+      exitCode = 1;
+      reason = outcome.reason;
+      process.stderr.write(
+        `bob run ${opts.name}: REFUSING to report success — ${reason}` +
+          (reason === "settled_after_compaction"
+            ? " (the session settled after a context compaction without a final message)"
+            : reason === "final_shape_mismatch"
+              ? " (the final message did not match the declared shape)"
+              : " (the session settled without a final message)") +
+          "\n",
+      );
+      const status = readWorktreeStatus(config.cwd);
+      if (status.length > 0) {
+        process.stderr.write(`bob run ${opts.name}: uncommitted paths in ${config.cwd}:\n`);
+        for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
+      } else {
+        process.stderr.write(
+          `bob run ${opts.name}: no dirty paths in ${config.cwd} (nothing to commit there)\n`,
+        );
+      }
+    }
+  } catch (err) {
+    exitCode = 1;
+    // Surface the error instead of swallowing it: an underscore-ignored catch
+    // made a cap-hit look like a silent clean exit. Label a provider
+    // rate-limit/cap so a budget stall is distinguishable from a crash.
+    const msg = err instanceof Error ? err.message : String(err);
+    const isCap =
+      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+    process.stderr.write(
+      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+    );
+  } finally {
+    // Stop recording first: the done line below is this log's last record, and the
+    // run is over whatever the turn did.
+    unsubscribeRunLog();
+    unsubscribeContract();
 
     // Final record, so a reader can tell a clean completion from a truncated log.
     // A synchronous append is on disk when writeRunLog returns, so a mid-run crash
     // leaves every record written before it — the post-mortem trail this log exists
     // for.
     writeRunLog({ done: true, exitCode }, false);
-  } finally {
+
     // Run end: drop the sidecar lock so retention no longer sees this log as
     // live. Best-effort — a leaked lock names a now-dead PID, which the next
     // sweep treats as finished.
@@ -643,12 +804,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     }
   }
 
-  // Fallback: if no text_delta events were observed (some transports don't
-  // stream), pull the last assistant text from session state.
-  if (captured.length === 0) {
-    const fromState = lastAssistantText(session);
-    if (fromState !== undefined) captured = fromState;
-  }
+  // The run's final text — exactly the content of the last assistant message
+  // that ended since the last compaction (or the session-state fallback for a
+  // transport that ended no message at all).
+  const finalStdout = finalTextNow();
 
   session.dispose();
 
@@ -657,7 +816,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     agentDir,
     provider,
     model,
-    ...(opts.captureStdout ? { stdout: captured } : {}),
+    ...(opts.captureStdout ? { stdout: finalStdout } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
 }
 
@@ -674,6 +834,12 @@ export interface ResolveRunConfigOptions {
   agentsRoot: string;
   // Optional per-invocation model override (wins over bob.yaml).
   model?: string;
+  // True when the caller is the PERSISTENT runtime, which is resident by
+  // definition: an agent kept up by its service unit runs unattended, so the
+  // resident tool policy (no shell, no file-writing tools, unless the role opts
+  // in) applies even when bob.yaml does not say `resident: true`. The one-shot
+  // `bob run` path leaves this falsy.
+  persistent?: boolean;
 }
 
 export interface ResolvedRunConfig {
@@ -684,6 +850,163 @@ export interface ResolvedRunConfig {
   // bob.yaml `cron:` entries (validated). Only the PERSISTENT runtime uses
   // these (it schedules them into the live session); `bob run` ignores them.
   cron: CronEntry[];
+  // bob.yaml `agent:` block (id/name/role). The persistent runtime's standing
+  // contract — the text carried in its system prompt — is built from it.
+  agent: { id?: string; name?: string; role?: string };
+  // The resolved tool policy (role ceiling + bob.yaml narrowing + the resident
+  // decision), so a caller that only has the result can still hand the SAME
+  // policy to a session it starts itself (`bob launch` does exactly that).
+  policy: ToolPolicy;
+}
+
+// The tool policy for an agent's bob.yaml. ONE entry point for every launch
+// path, so `bob run`/the persistent runtime (via resolveRunConfig) and the pi
+// CLI paths (onboard, align, `bob launch`) cannot drift:
+//
+//   * role.json is the CEILING — it ships with bob, while bob.yaml is
+//     agent-writable, so bob.yaml may narrow the role's list but never widen it;
+//   * a missing `tools.allow` is a load error, not "pi's defaults";
+//   * every name must be one pi (or a loaded capability) can enable.
+//
+// Throws rather than returning a default, because a session without the
+// resolved policy is the defect this whole area is recovering from.
+export function resolveAgentToolPolicy(
+  yamlText: string,
+  opts?: { persistent?: boolean },
+): ToolPolicy {
+  const roleName = readAgentRole(yamlText);
+  // loadRole validates the name (path traversal) and throws a named error when
+  // bob does not ship the role. The ceiling has to be readable: an agent whose
+  // role.json cannot be found cannot start a session.
+  const role = loadRole(roleName as BobRole);
+  return resolveToolPolicy({
+    yamlText,
+    tools: readTools(yamlText),
+    role: {
+      name: roleName,
+      allow: role.tools.allow,
+      allowResidentShell: role.tools.allowResidentShell,
+    },
+    resident: readResident(yamlText),
+    persistent: opts?.persistent,
+  });
+}
+
+// The policy for an on-disk agent, for the launch paths that only have an
+// agent dir (onboard, align, `bob launch`). Same reader as resolveRunConfig, so
+// a CLI session and an embedded session get the same policy — and fail closed
+// the same way when bob.yaml is missing, roleless, or has no allowlist.
+export function readAgentToolPolicy(agentDir: string): ToolPolicy {
+  const yamlPath = join(agentDir, "bob.yaml");
+  if (!existsSync(yamlPath)) {
+    throw new Error(
+      `config not found at ${yamlPath} (run 'bob onboard <name>' first, or point --agent-dir at the agent)`,
+    );
+  }
+  return resolveAgentToolPolicy(readFileSync(yamlPath, "utf8"));
+}
+
+export interface LaunchOptions {
+  name: string;
+  // The launcher's one optional prompt. `bob launch` accepts at most one
+  // prompt and nothing else (see parseLaunchArgs); a pi flag never reaches a
+  // session because there is no argv to put it in.
+  prompt?: string;
+  // Agents root dir. Defaults to ~/agents. Tests override.
+  agentsRoot?: string;
+  // Per-invocation model override (same semantics as `bob run --model`).
+  model?: string;
+  // Test seam for the one-shot path (defaults to the real SDK factory).
+  sessionFactory?: RunSessionFactory;
+  // Test seam for the interactive path (defaults to pi's InteractiveMode in a
+  // real terminal).
+  interactive?: (input: {
+    config: RunSessionConfig;
+    policy: ToolPolicy;
+    deps?: SessionDeps;
+  }) => Promise<number>;
+  deps?: SessionDeps;
+}
+
+// A refused `bob launch` argument. Thrown by parseLaunchArgs; the CLI turns it
+// into exit code 2 with the message on stderr.
+export class LaunchArgError extends Error {}
+
+// `bob launch` takes a name and AT MOST ONE PROMPT — nothing else.
+//
+// The launcher is the mail path and the human path: whatever reaches a session
+// comes from here. A caller-supplied argument is refused BY NAME (rather than
+// dropped or forwarded): the session's tools are the role's allowlist resolved
+// by bob, and there is no argument path into a session at all.
+//
+// `-- <prompt>` is how a prompt that starts with `-` gets through:
+//   bob launch pulse -- --tools   → the literal prompt "--tools"
+//   bob launch pulse --tools      → refused (no `--`, so it is a flag)
+//
+// An empty prompt is "no prompt": the launcher with no arguments opens the
+// interactive TUI.
+export function parseLaunchArgs(
+  positional: readonly string[],
+  flags: Readonly<Record<string, string | boolean>>,
+): LaunchOptions {
+  const flagNames = Object.keys(flags);
+  if (flagNames.length > 0) {
+    throw new LaunchArgError(
+      `bob launch: refusing argument "--${flagNames[0]}" — bob launch takes at most one prompt and nothing else. The session's tools come from the role's allowlist (roles/<role>/role.json narrowed by bob.yaml), never from a flag. To send a prompt that starts with "-", pass it after --: bob launch <name> -- --${flagNames[0]}`,
+    );
+  }
+  const [name, ...rest] = positional;
+  if (name === undefined) {
+    throw new LaunchArgError("bob launch: missing <name>");
+  }
+  if (rest.length > 1) {
+    throw new LaunchArgError(
+      `bob launch: refusing argument "${rest[1]}" — bob launch takes at most one prompt and nothing else. Quote a multi-word prompt: bob launch <name> -- "the whole prompt".`,
+    );
+  }
+  const prompt = rest[0];
+  if (prompt !== undefined && prompt.trim() === "") {
+    return { name };
+  }
+  return prompt === undefined ? { name } : { name, prompt };
+}
+
+// `bob launch <name> [prompt]` — the agent's session, started with the resolved
+// tool policy. This is what the generated `bin/<name>` launcher runs, and
+// therefore what the mail consumer reaches when it invokes that launcher.
+//
+// Two shapes, one policy:
+//   * a prompt → bob's OWN runner (runAgent) sends it through the factory's
+//     session, keeping the capture + run-log behaviour `bob run` has;
+//   * no prompt → pi's InteractiveMode, given an AgentSessionRuntime whose
+//     factory is bob's (session.ts), so a new/resumed/forked session is still
+//     the agent's own with the agent's policy.
+//
+// It never spawns the pi CLI and never assembles a command line: a session's
+// tools come from the factory's policy, never from an argument.
+export async function runLaunch(opts: LaunchOptions): Promise<number> {
+  if (opts.prompt !== undefined && opts.prompt.trim() !== "") {
+    const result = await runAgent({
+      name: opts.name,
+      prompt: opts.prompt,
+      model: opts.model,
+      agentsRoot: opts.agentsRoot,
+      captureStdout: true,
+      sessionFactory: opts.sessionFactory,
+    });
+    if (result.stdout && result.stdout.trim().length > 0) {
+      process.stdout.write(`${result.stdout}\n`);
+    }
+    return result.exitCode;
+  }
+
+  const { config, policy } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
+    model: opts.model,
+  });
+  const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
+  return interactive({ config, policy, deps: opts.deps });
 }
 
 // Parse + validate bob.yaml `cron:` into CronEntry[]. Drops any entry missing
@@ -727,6 +1050,29 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // plus the per-capability config env each extension reads (no secrets).
   const resolution = resolveCapabilities({ yamlText });
 
+  // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
+  // may only narrow it; a missing allowlist is a load error; every name must be
+  // one pi or a loaded capability can enable (pi drops an unknown name
+  // SILENTLY, so a stale name would otherwise look like a working allowlist
+  // while the tool is simply absent). Throws naming the offender and the fix.
+  const toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
+
+  // The agent block (id/name/role). Read through readBlock, but a malformed
+  // `agent:` block must not stop the agent from running: it is only used to
+  // render the persistent runtime's standing contract, which falls back to the
+  // agent's directory name.
+  let agentBlock: Record<string, unknown> | undefined;
+  try {
+    agentBlock = readBlock(yamlText, "agent");
+  } catch {
+    agentBlock = undefined;
+  }
+  const agent = {
+    ...(typeof agentBlock?.id === "string" ? { id: agentBlock.id } : {}),
+    ...(typeof agentBlock?.name === "string" ? { name: agentBlock.name } : {}),
+    ...(typeof agentBlock?.role === "string" ? { role: agentBlock.role } : {}),
+  };
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -738,58 +1084,41 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
       resolution.capabilities.map((c) => [c.piPackage, c.name]),
     ),
     capabilityEnv: capabilityConfigEnv(resolution),
+    // Always both: resolveAgentToolPolicy refuses an agent without an
+    // allowlist, so there is no longer a "declared none" case here.
+    tools: toolPolicy.tools,
+    excludeTools: toolPolicy.excludeTools,
   };
-  return { agentDir, provider, model, config, cron: parseCron(yamlText) };
+  return {
+    agentDir,
+    provider,
+    model,
+    config,
+    cron: parseCron(yamlText),
+    agent,
+    policy: toolPolicy,
+  };
 }
 
-// The minimum of pi's resource loader this check needs. Structural so tests can
-// hand in a stub without constructing a real loader.
-export interface ExtensionErrorSource {
-  getExtensions(): { errors: Array<{ path: string; error: string }> };
-}
+// The capability-load and active-tool checks live in session.ts, next to the
+// factory that runs them. Re-exported here because they are part of this
+// module's public surface (tests and doctor use them).
+export {
+  type ActiveToolSource,
+  assertAllowedToolsActive,
+  assertCapabilitiesLoaded,
+  type ExtensionErrorSource,
+} from "./session.js";
 
-// Fail the session if any capability's extension didn't load.
+// The ONE session builder. Every path routes through it: `bob run` (ephemeral,
+// in-memory SessionManager), the persistent runtime (durable SessionManager),
+// `bob launch` with a prompt, the mail consumer, onboarding and alignment (the
+// interactive shape goes through session.ts's runInteractiveSession, which
+// builds its runtime from the same factory).
 //
-// pi records extension load failures on the loader and CONTINUES — the agent
-// comes up, just without those tools. That silence is precisely what let a
-// catalog full of unresolvable paths ship: nothing anywhere said "discord did
-// not load". Bob asked for these extensions explicitly, so for Bob they are not
-// optional. Errors from extensions Bob didn't ask for (a user's own settings.json
-// packages) are pi's business and are left alone.
-export function assertCapabilitiesLoaded(
-  loader: ExtensionErrorSource,
-  config: Pick<RunSessionConfig, "extensionSources" | "capabilityBySource">,
-): void {
-  if (config.extensionSources.length === 0) return;
-  const ours = new Set(config.extensionSources);
-  const failures = (loader.getExtensions().errors ?? []).filter((e) => ours.has(e.path));
-  if (failures.length === 0) return;
-
-  const lines = failures.map((f) => {
-    const name = config.capabilityBySource?.[f.path];
-    const who = name ? `capability "${name}"` : "capability";
-    return `  ${who} (${f.path}): ${f.error}`;
-  });
-  throw new Error(
-    [
-      `bob: ${failures.length} declared capabilit${failures.length === 1 ? "y" : "ies"} failed to load:`,
-      ...lines,
-      "",
-      "The agent would have started without those tools. Fix the capability or remove",
-      "it from capabilities: in bob.yaml rather than running under-equipped.",
-    ].join("\n"),
-  );
-}
-
-// Real SDK factory: stand up a fresh, in-memory pi AgentSession for the agent,
-// scoped to its own .pi-agent credentials dir and work cwd, with soul.md
-// appended to the system prompt. In-memory session manager = ephemeral (a
-// `run` task is short-lived; nothing to persist).
-//
-// Exported so the persistent runtime can build the SAME session via the
-// `persistentSession` factory wrapper (which swaps the SessionManager for a
-// durable one). Keeping a single builder here is the "one embedded-pi path"
-// the spec mandates.
+// It is a thin wrapper over createBobRuntimeFactory (session.ts), which owns
+// the isolated settings/resource sources, the effective policy, and the audit —
+// so there is exactly one place where a session's tools are decided.
 //
 // `sessionManagerFactory` lets a caller supply the SessionManager — the
 // ephemeral `run` path defaults to in-memory (nothing to persist); the
@@ -799,75 +1128,36 @@ export async function createPiRunSession(
   config: RunSessionConfig,
   sessionManagerFactory?: (cwd: string) => SessionManagerLike,
 ): Promise<RunSession> {
-  // Point auth + model resolution at the agent's own .pi-agent dir, exactly
-  // like the old launcher's PI_CODING_AGENT_DIR export. This honors the
-  // exe-dev-gateway baseUrl override (models.json) and auth.json. pi 0.84.x
-  // consolidates the old AuthStorage + ModelRegistry pair into a single
-  // ModelRuntime (the "canonical model/auth runtime"); ModelRuntime.create is
-  // async (the old sync constructors are gone), so we await it. allowModelNetwork
-  // defaults false, so create() does no network catalog fetch — static built-ins
-  // plus the agent's models.json customs are available for lookup immediately.
-  const modelRuntime = await ModelRuntime.create({
-    authPath: join(config.piAgentDir, "auth.json"),
-    modelsPath: join(config.piAgentDir, "models.json"),
-  });
-
-  // getModel() resolves both built-in models and custom ones from models.json,
-  // synchronously and without requiring a valid API key at lookup time — the
-  // runtime is already configured with the agent's models.json, so this is the
-  // models.json-aware lookup (NOT pi-ai's standalone getModel(), which wouldn't
-  // see the agent's custom exe-dev-gateway model). Same contract as the old
-  // ModelRegistry.find().
-  const model = modelRuntime.getModel(config.provider, config.model);
-  if (!model) {
-    throw new Error(
-      `model not found: ${config.provider}/${config.model} (check bob.yaml provider/model and ${config.piAgentDir}/models.json)`,
-    );
-  }
-
-  // Append soul.md to pi's system prompt — the SDK equivalent of the old
-  // launcher's `--append-system-prompt "$(cat soul.md)"`. When there's no
-  // soul we leave the default prompt untouched.
-  const loaderOpts: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
-    cwd: config.cwd,
-    agentDir: config.piAgentDir,
+  assertToolPolicy(config);
+  const policy: ToolPolicy = {
+    tools: config.tools,
+    // resolveToolPolicy already folded the resident exclusions into
+    // excludeTools, so the factory's job is simply to hand pi the resolved pair.
+    excludeTools: config.excludeTools ?? [],
+    resident: config.persistent === true,
+    allowResidentShell: false,
   };
-  if (config.appendSystemPrompt.length > 0) {
-    loaderOpts.appendSystemPromptOverride = (base) => [...base, config.appendSystemPrompt];
-  }
-  // Compose the agent's capabilities into the session. Each is a pi extension
-  // source (npm:/git:/local path); pi's resource loader resolves + loads them,
-  // exposing their tools/hooks. This is the SDK equivalent of settings.json
-  // `packages`/`extensions`. pi owns the rest.
-  if (config.extensionSources.length > 0) {
-    loaderOpts.additionalExtensionPaths = config.extensionSources;
-  }
-  // Hand each capability its validated config via the env var it reads. The
-  // extensions are loaded in-process (jiti) by reload() below, so they see
-  // these immediately. Config only — no secrets (see RunSessionConfig).
-  for (const [key, value] of Object.entries(config.capabilityEnv)) {
-    process.env[key] = value;
-  }
-  // Runtime-mode signal for "serving" capabilities (discord's inbound gateway):
-  // set BEFORE the extensions load. "1" only for the persistent runtime; a
-  // one-shot run clears it so capabilities stay outbound-only.
-  process.env.BOB_PERSISTENT = config.persistent ? "1" : "";
-  const resourceLoader = new DefaultResourceLoader(loaderOpts);
-  await resourceLoader.reload();
-  assertCapabilitiesLoaded(resourceLoader, config);
-
   const makeSessionManager =
     sessionManagerFactory ?? ((cwd: string) => SessionManager.inMemory(cwd));
-  const { session } = await createAgentSession({
+  const factory = createBobRuntimeFactory({ config, policy });
+  const { session } = await factory({
     cwd: config.cwd,
     agentDir: config.piAgentDir,
-    model,
-    modelRuntime,
-    resourceLoader,
-    sessionManager: makeSessionManager(config.cwd) as ReturnType<typeof SessionManager.inMemory>,
+    sessionManager: makeSessionManager(config.cwd),
   });
-
   return session as unknown as RunSession;
+}
+
+// A session config MUST carry the resolved policy — the type says so, and this
+// says so at runtime for a caller that got here through `any`. pi's defaults
+// (read, bash, edit, write) are not a policy, they are the absence of one, and
+// that absence is the defect this area recovers from.
+function assertToolPolicy(config: RunSessionConfig): void {
+  if (!Array.isArray(config.tools)) {
+    throw new Error(
+      "bob: refusing to create a session without a resolved tool policy — RunSessionConfig.tools is required (it is pi's strict allowlist; an empty array means no tools). Resolve it with resolveAgentToolPolicy/readAgentToolPolicy.",
+    );
+  }
 }
 
 // Minimal structural alias for pi's SessionManager (in-memory or durable). The
@@ -930,7 +1220,7 @@ function resolveProviderAndModel(
   if (!bobProvider || !model) {
     throw new Error(`bob run ${name}: bob.yaml is missing provider.name and/or provider.model`);
   }
-  return { provider: resolvePiProvider(bobProvider), model };
+  return { provider: mapBobProviderToPi(bobProvider), model };
 }
 
 // Read a scalar `key: value` field from inside the top-level `provider:` block.
@@ -958,10 +1248,11 @@ function readProviderField(yamlText: string, key: string): string | undefined {
   return undefined;
 }
 
-// Mirror of init.ts's resolvePiProvider: `exe-dev-gateway` is bob's term for
-// "anthropic API shape via the exe.dev gateway"; pi only knows `anthropic`
-// (the gateway baseUrl override lives in .pi-agent/models.json).
-function resolvePiProvider(bobProvider: string): string {
+// Map a bob provider name to pi's provider id: `exe-dev-gateway` is bob's term
+// for "anthropic API shape via the exe.dev gateway"; pi only knows `anthropic`
+// (the gateway baseUrl override lives in .pi-agent/models.json). Exported so
+// onboarding/alignment map a caller's provider override the same way.
+export function mapBobProviderToPi(bobProvider: string): string {
   if (bobProvider === "exe-dev-gateway") return "anthropic";
   return bobProvider;
 }

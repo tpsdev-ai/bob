@@ -17,6 +17,13 @@
 // `assistantMessageEvent` (a text_delta with a growing `partial`) AND a growing
 // shallow-copy `message` (its content grows in place) — both must be stripped for
 // the log to stay linear.
+//
+// The fake sessions here also END an assistant message where a run must settle
+// exit 0: since #145/#158 a run's final text is the last assistant message that
+// ENDED (the observer's boundary), not the deltas accumulated in the subscribe
+// callback the log is written from — so a stream of deltas with no message_end
+// is a silent run by design, and a test that wants a successful run says so the
+// way a real provider does.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
@@ -193,6 +200,12 @@ describe("run-log sizing + retention (issue #146)", () => {
       acc += delta;
       events.push(messageUpdate(delta, acc));
     }
+    // The message ENDS: its own content is the run's final text (the observer's
+    // capture), and here it is exactly what the deltas accumulated.
+    events.push({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: acc }] },
+    });
 
     const res = await runAgent({
       name: "testbot",
@@ -202,7 +215,7 @@ describe("run-log sizing + retention (issue #146)", () => {
       captureStdout: true,
     });
 
-    // The captured assistant text is byte-identical (the deltas, concatenated).
+    // The captured assistant text is byte-identical to the ended message's text.
     expect(res.stdout).toBe(acc);
     expect(res.exitCode).toBe(0);
 
@@ -262,6 +275,12 @@ describe("run-log sizing + retention (issue #146)", () => {
     // Non-delta events that must still be written even past the cap.
     events.push({ type: "tool_execution_start", toolName: "read", toolCallId: "tc-1", args: {} });
     events.push({ type: "error", message: "provider blew up mid-run" });
+    // A message ENDS, so the run settles 0 under the #145 contract; this test is
+    // about the delta cap in the log.
+    events.push({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+    });
 
     const res = await runAgent({
       name: "testbot",
@@ -555,6 +574,12 @@ describe("run-log sizing + retention (issue #146)", () => {
     const lengths = [6, 2, 10, 4];
     const runs = lengths.map((n, r) => runOf(`run${r + 1}-m`, n));
     const events: unknown[] = runs.map((messages) => ({ type: "agent_end", messages }));
+    // One message ENDS, so the run settles 0 under the #145 contract; the
+    // agent_end records below are the point of this test.
+    events.push({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+    });
 
     const res = await runAgent({
       name: "testbot",

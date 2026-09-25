@@ -19,7 +19,26 @@ function makeHealthyAgent(opts: { home: string; name: string }): {
   mkdirSync(join(opts.home, ".tps", "mail", opts.name, "cur"), { recursive: true });
 
   writeFileSync(join(agentDir, "soul.md"), "stub soul");
-  writeFileSync(join(agentDir, "bob.yaml"), "agent:\n  id: testbot\n");
+  // A healthy agent has a readable role + a tool allowlist: doctor FAILs a
+  // missing policy now, so the healthy fixture must carry one (role ea allows
+  // `read`).
+  writeFileSync(
+    join(agentDir, "bob.yaml"),
+    [
+      "agent:",
+      "  id: testbot",
+      "  name: Testbot",
+      "  role: ea",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "",
+      "tools:",
+      "  allow:",
+      "    - read",
+      "",
+    ].join("\n"),
+  );
 
   const launcher = join(agentDir, "bin", opts.name);
   writeFileSync(launcher, "#!/bin/sh\necho ok\n");
@@ -133,6 +152,325 @@ describe("runDoctor", () => {
     expect(report.summary.fail).toBe(0);
     expect(report.checks.find((c) => c.name === "pi auth.json")?.status).toBe("skip");
     expect(report.checks.find((c) => c.name === "pi models.json")?.status).toBe("skip");
+  });
+
+  it("FAIL + fix on an unmapped tool name in bob.yaml", () => {
+    // Existing agents' bob.yaml carry the pre-fix names (Bash, Read,
+    // WebFetch, mcp__plugin_discord_discord__reply). pi ignores unknown tool
+    // names silently, so doctor has to name them and the replacement.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - Bash",
+        "    - flair_search",
+        "    - mcp__plugin_discord_discord__reply",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("Bash");
+    expect(check?.detail).toContain("mcp__plugin_discord_discord__reply");
+    expect(check?.fix).toContain("bash");
+    expect(check?.fix).toContain("discord_reply");
+  });
+
+  it("FAIL when bob.yaml declares no tools: block at all", () => {
+    // A missing policy is a FAIL, not "ok, pi's defaults apply": pi's defaults
+    // are not a decision the config made, and a session on them holds whatever
+    // pi ships.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      ["agent:", "  id: testbot", "  role: ea", "", "provider:", "  name: anthropic", ""].join(
+        "\n",
+      ),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toMatch(/no tools: block/);
+    expect(check?.fix).toMatch(/allow/);
+  });
+
+  it("FAIL when bob.yaml widens the allowlist past the role", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("bash");
+    expect(check?.detail).toMatch(/role/);
+  });
+
+  it("OK on a bob.yaml whose tool allowlist is all real names the agent can have", () => {
+    // `flair_search` is a real name AND this agent declares flair, so the
+    // session would hold it (round 3 reports a capability tool whose
+    // capability is not declared as a FAIL, so the OK case has to declare it).
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "",
+        "capabilities:",
+        "  - flair",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    expect(report.checks.find((c) => c.name === "tool allowlist")?.status).toBe("ok");
+    expect(report.summary.fail).toBe(0);
+  });
+
+  it("WARN when a resident agent's allowlist lists tools the resident policy drops", () => {
+    // qa, not coder: the coder role grants tools.allowResidentShell, so its
+    // allowlist is not dropped. The warning is for a role that does NOT grant
+    // it while its resident allowlist still lists a shell tool.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: qa",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("bash");
+    // The grant lives in the ROLE, not in bob.yaml (round 3): bob.yaml may only
+    // narrow the role, so an advice line telling the user to set
+    // tools.allowResidentShell: true in bob.yaml would send them into a load
+    // error. Name roles/<role>/role.json.
+    expect(check?.fix).toContain("allowResidentShell");
+    expect(check?.fix).toContain("roles/qa/role.json");
+    expect(check?.fix).not.toMatch(/set tools\.allowResidentShell: true to keep them/);
+  });
+
+  it("FAIL — not WARN — when a resident agent trips both the drop and an undeclared capability tool", () => {
+    // Both conditions at once: the resident policy drops `bash`, AND
+    // `flair_search` needs a capability this agent does not declare. The
+    // missing capability is the FAILURE — the session refuses it at load — so
+    // it must not be buried under the resident warning, which is only advice.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: qa",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "    - flair_search",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("flair_search");
+    expect(check?.detail).toContain("flair");
+    expect(check?.fix).toContain("capabilities:");
+  });
+
+  it("does not require a capability for a tool bob.yaml removes (the session drops it first)", () => {
+    // `flair_search` is allowlisted AND excluded: the session's audit skips a
+    // name the denylist removes (absent on purpose), so doctor must not fail a
+    // valid narrowed policy for a capability the agent does not need.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "  exclude:",
+        "    - flair_search",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("ok");
+  });
+
+  it("names the explicit bob.yaml denial in the resident-shell fix", () => {
+    // The coder role GRANTS tools.allowResidentShell, so the resolver would keep
+    // `bash` — except bob.yaml sets the flag `false`, which narrows the grant
+    // away. Setting the role's grant to true would not restore the tools, so
+    // the fix has to name the denial too.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: coder",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "  allowResidentShell: false",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("bash");
+    expect(check?.fix).toContain("roles/coder/role.json");
+    expect(check?.fix, "the bob.yaml denial is named").toContain("tools.allowResidentShell: false");
+    expect(check?.fix).toContain("bob.yaml");
+  });
+
+  it("FAIL when an allowlisted capability tool's capability is not declared", () => {
+    // A name can be real in bob's catalog and still not exist for THIS agent:
+    // pi enables only what the loaded capabilities register, and a session
+    // refuses such a name at load (round 3's audit). Doctor must not report OK
+    // for a config whose next run fails.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        `  role: ea`,
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - discord_reply",
+        "",
+        "capabilities:",
+        "  - flair",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("discord_reply");
+    expect(check?.detail).toContain("discord");
+    expect(check?.fix).toContain("capabilities:");
+  });
+
+  it("OK when the capability an allowlisted tool needs IS declared", () => {
+    // The flair capability is declared in the scaffold, so its tools are fine.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "",
+        "capabilities:",
+        "  - flair",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("ok");
   });
 
   it("WARN on pi auth.json mode != 0600 (contains API key)", () => {

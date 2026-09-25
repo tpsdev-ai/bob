@@ -17,13 +17,16 @@ import {
   type InitResult,
   initAgent,
   installService,
+  LaunchArgError,
   loadRole,
+  parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
   restart,
   runAgent,
   runAlign,
   runDoctor,
+  runLaunch,
   runOnboard,
   runPersistent,
   servicePath,
@@ -43,6 +46,13 @@ function parseArgs(argv: string[]): Args {
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
+    if (tok === "--") {
+      // Everything after `--` is positional. The generated launcher forwards
+      // its own args this way (`bob launch <name> -- "$@"`), so a pi flag
+      // cannot be swallowed as a bob flag.
+      positional.push(...rest.slice(i + 1));
+      break;
+    }
     if (tok.startsWith("--")) {
       const key = tok.slice(2);
       const next = rest[i + 1];
@@ -87,7 +97,12 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
-  office join <name>  Join an existing branch office
+  launch <name>       The agent's session, with its resolved role tool
+                      allowlist. This is what bin/<name> runs.
+                      Takes at most ONE prompt (a multi-word one needs quotes).
+                      No prompt opens the interactive TUI. Any other argument is
+                      refused by name — a pi flag cannot be passed at all.
+                      To send a prompt that starts with "-", use: launch <name> -- --tools
   help                Show this help
 
 Roles: ea | writer | reviewer | coder | qa | custom
@@ -414,6 +429,20 @@ async function main(): Promise<number> {
         }
         const prompt = args.positional.slice(1).join(" ") || undefined;
         return await run(args.positional[0], prompt, args.flags);
+      }
+      case "launch": {
+        // At most one prompt, and nothing else: the whitelist is enforced in
+        // parseLaunchArgs, which refuses any other argument BY NAME.
+        try {
+          const launch = parseLaunchArgs(args.positional, args.flags);
+          return await runLaunch(launch);
+        } catch (err: unknown) {
+          if (err instanceof LaunchArgError) {
+            console.error(err.message);
+            return 2;
+          }
+          throw err;
+        }
       }
       case "install-service":
         if (!args.positional[0]) {

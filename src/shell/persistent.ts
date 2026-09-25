@@ -28,6 +28,11 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  buildStandingContract,
+  createCompactionObserver,
+  readWorktreeStatus,
+} from "./compaction-contract.js";
 import { type CronSchedulerHandle, startCronScheduler } from "./cron.js";
 import {
   createPiRunSession,
@@ -36,6 +41,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
+import { promptSession } from "./session.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -102,10 +108,15 @@ function neverResolves(): Promise<void> {
 export async function startPersistent(opts: RunPersistentOptions): Promise<PersistentHandle> {
   const log = opts.log ?? ((m: string) => console.error(m));
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { provider, model, config, cron } = resolveRunConfig({
+  const { provider, model, config, cron, agent } = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    // The persistent runtime is resident by definition: this process stays up
+    // behind the agent's service unit with nobody at the keyboard, which is
+    // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
+    // `resident: true` says the same thing for the one-shot path.
+    persistent: true,
   });
 
   // Mark this as the persistent runtime so "serving" capabilities (discord's
@@ -113,10 +124,35 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // BOB_PERSISTENT before loading extensions. A one-shot `bob run` leaves it
   // falsy and stays outbound-only.
   config.persistent = true;
+  // #145: the STANDING CONTRACT, and it lives in the SYSTEM PROMPT — the one
+  // place pi's compaction cannot reach. It is built from the agent's bob.yaml
+  // `agent:` block plus its declared cron duties, and the factory appends it as
+  // literal text on every session it builds (creation, and again for every
+  // /new, /resume, /fork, /clone and /import), so a resident agent that hits
+  // the context threshold mid-task keeps its role and its duties in front of
+  // the model without any attach step that could fail.
+  config.standingContract = buildStandingContract({
+    name: agent.name ?? opts.name,
+    role: agent.role,
+    duties: cron,
+  });
   const factory = opts.sessionFactory ?? defaultPersistentFactory;
   const session = await factory(config);
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
+
+  // #145: after every non-aborted compaction, ONE best-effort "what remains"
+  // note (the last thing the agent said, git status --short, the last few tool
+  // calls) is sent as a steer. It is useful and it is NEVER load-bearing: the standing contract is
+  // in the system prompt, so a note that fails to send is logged and the
+  // runtime keeps serving. There is no admission gate and no fail-closed exit
+  // here — the shape change removed the need for both.
+  const observer = createCompactionObserver({
+    worktreeStatus: () => readWorktreeStatus(config.cwd),
+    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    log,
+  });
+  const unsubscribeContract = session.subscribe((event) => observer.observe(event));
 
   // Scheduled work: fire each bob.yaml `cron:` prompt INTO this live session on
   // its cadence (one gateway, no second `bob run` process). Await the idle
@@ -133,7 +169,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
         } catch {
           // proceed — pi serializes turns regardless
         }
-        await session.prompt(entry.prompt);
+        // bob's prompt entry point: the text is the prompt, no command /
+        // template / skill expansion (session.ts promptSession).
+        await promptSession(session, entry.prompt);
       },
       log,
     });
@@ -148,6 +186,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       // Stop scheduling first so a pending cron tick can't fire into a session
       // we're about to dispose.
       cronScheduler?.stop();
+      unsubscribeContract();
       // Await any in-flight turn so we don't cut off a reply mid-stream. The
       // RunSession seam exposes `prompt` but not an idle barrier; production's
       // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
