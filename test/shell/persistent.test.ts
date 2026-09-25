@@ -324,4 +324,56 @@ describe("runPersistent / startPersistent", () => {
 
     await handle.shutdown();
   });
+
+  it("cli#145 round 5: a session with no sendCustomMessage logs the drop and starts NO turn", async () => {
+    // The fallback for a session implementation without pi's sendCustomMessage
+    // seam (persistent.ts:153). The block cannot ride the NEXT prompt there, so
+    // the runtime drops it — LOUDLY, and without inventing a turn whose reply
+    // would have nowhere to go. This was the last branch of the control flow no
+    // test reached (Kern round 5, finding 3).
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const logs: string[] = [];
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      dispose() {},
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+    });
+
+    for (const listener of listeners) {
+      listener({
+        type: "compaction_end",
+        reason: "threshold",
+        result: {},
+        aborted: false,
+        willRetry: false,
+      });
+    }
+
+    // NO turn starts — a post-run compaction cannot invent one.
+    expect(prompts, "the drop must not start a turn").toHaveLength(0);
+    // …and the drop is on the record, naming the reason it could not attach.
+    expect(
+      logs.some((m) => m.includes("cannot attach the pinned block") && m.includes("dropped")),
+      `the drop is logged (saw: ${JSON.stringify(logs)})`,
+    ).toBe(true);
+
+    await handle.shutdown();
+  });
 });

@@ -106,7 +106,14 @@ function scriptedSession(
     /** End the assistant message with stopReason "error" and empty content
      *  (a stream that failed) — round 3, item 1. */
     failAtEnd?: boolean;
+    /** Throw from THIS prompt — a failed continue/retry turn (round 5, item 3). */
+    throwOnPrompt?: boolean;
   }>,
+  // The session state the transport-fallback reads (`session.messages`). Left
+  // undefined by every older test, because an EMPTY list is what the old mock
+  // modelled — and round 5's finding 1 needs a POPULATED one, since a real
+  // session's list is never empty and cannot express the compaction boundary.
+  opts: { messages?: ReadonlyArray<unknown> } = {},
 ): { session: RunSession; calls: Array<{ text: string; streamingBehavior?: string }> } {
   const calls: Array<{ text: string; streamingBehavior?: string }> = [];
   // biome-ignore lint/suspicious/noExplicitAny: minimal event listener stub
@@ -125,6 +132,7 @@ function scriptedSession(
     async prompt(text, options) {
       calls.push({ text, streamingBehavior: options?.streamingBehavior });
       const step = options?.streamingBehavior === undefined ? (script[topLevelCall++] ?? {}) : {};
+      if (step.throwOnPrompt) throw new Error("simulated continue-turn failure");
       for (const delta of step.textDeltasBefore ?? []) {
         for (const listener of listeners) {
           listener({
@@ -168,7 +176,7 @@ function scriptedSession(
       }
     },
     get messages() {
-      return undefined;
+      return opts.messages;
     },
     dispose() {},
   };
@@ -760,6 +768,68 @@ describe("runAgent", () => {
     expect(res.exitCode).toBe(0);
     expect(res.reason).toBeUndefined();
     expect(res.stdout).toBe("continued: committed");
+  });
+
+  // ── cli#145 round 5: Kern's two untested seams ─────────────────────
+
+  it("cli#145 round 5: the transport fallback cannot resurrect pre-compaction text — a POPULATED message list after one compaction still refuses", async () => {
+    // The fallback (run.ts:260) reads session state only when NO assistant
+    // message ended since the boundary. After a compaction that state holds the
+    // PRE-compaction assistant text — the exact text #145 lost — and the guard
+    // that blocks it is one disjunct: `reinjector.compactions() > 0`. Every
+    // older mock left `messages` undefined, so the fallback returned "" either
+    // way and deleting the disjunct failed no test. This mock populates it
+    // where the fallback would read it.
+    const s = scriptedSession([{ compact: "threshold" }], {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "review, then commit the two core files" }],
+        },
+      ],
+    });
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "finish the release",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(s.calls).toHaveLength(3); // task, the steered block, ONE retry
+    expect(res?.exitCode, "pre-compaction session state must not exit 0").not.toBe(0);
+    expect(res?.reason).toBe("settled_after_compaction");
+    expect(res?.stdout, "the pre-compaction text is never the final message").toBe("");
+    expect(stderr).toContain("settled_after_compaction");
+  });
+
+  it("cli#145 round 5: a THROWN continue turn is caught, re-evaluated, and still refuses — the named reason is never lost", async () => {
+    // The inner catch around the retry (run.ts:288). A retry whose prompt throws
+    // must be logged and re-evaluated against the cleared capture; if it bubbled
+    // to the OUTER catch the run would exit 1 with NO named reason, and if the
+    // throw were treated as a turn ending the run could exit 0 on nothing.
+    const s = scriptedSession([{ compact: "threshold" }, { throwOnPrompt: true }]);
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(s.calls).toHaveLength(3); // task, the steered block, the (thrown) retry
+    expect(s.calls[2]?.text).toBe(CONTINUE_TURN);
+    expect(res?.exitCode, "a failed retry is not a clean completion").not.toBe(0);
+    expect(res?.reason, "the inner catch keeps the named reason").toBe("settled_after_compaction");
+    expect(res?.stdout).toBe("");
+    expect(stderr, "the inner catch names the failure").toContain("the continue turn failed");
+    expect(stderr).toContain("settled_after_compaction");
   });
 });
 
