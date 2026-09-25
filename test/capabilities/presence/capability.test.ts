@@ -13,14 +13,11 @@ import {
   SUMMARY_MAX_RETRIES,
   wirePresence,
 } from "../../../src/capabilities/presence/index.js";
-import {
-  clearTurnOriginRegistry,
-  registerTurnOrigin,
-} from "../../../src/shell/turn-origin-registry.js";
+import { clearPendingOrigin, setPendingOrigin } from "../../../src/shell/turn-origin-registry.js";
 
 // Clear the out-of-band origin registry before each test so a leftover entry
 // from a prior test cannot leak its origin into the next one.
-beforeEach(() => clearTurnOriginRegistry());
+beforeEach(() => clearPendingOrigin());
 
 // ── Fakes (no live Flair, no real key, no network, fake clock) ──────────────
 
@@ -163,7 +160,7 @@ describe("wirePresence — beats", () => {
 
     // A mail-tagged prompt drives the origin.
     const p = "please do the thing";
-    registerTurnOrigin(p, { kind: "mail", from: "flint" });
+    setPendingOrigin({ kind: "mail", from: "flint" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     await settle();
@@ -231,7 +228,7 @@ describe("wirePresence — beats", () => {
 
     // First a busy beat lands so the roster reads "busy".
     const p = "x";
-    registerTurnOrigin(p, { kind: "mail", from: "flint" });
+    setPendingOrigin({ kind: "mail", from: "flint" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     await settle();
@@ -295,7 +292,7 @@ describe("wirePresence — resilience", () => {
     for (let i = 0; i < 5; i++) {
       try {
         const p = "x";
-        registerTurnOrigin(p, { kind: "mail", from: "flint" });
+        setPendingOrigin({ kind: "mail", from: "flint" });
         pi.fireBeforeAgentStart(p);
         pi.fireAgentStart();
       } catch {
@@ -425,7 +422,7 @@ describe("wirePresence — turn summary (agent_end)", () => {
     });
 
     const p = "x";
-    registerTurnOrigin(p, { kind: "cron", job: "daily-brief" });
+    setPendingOrigin({ kind: "cron", job: "daily-brief" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     pi.fireAgentEnd(secretMessages());
@@ -463,7 +460,7 @@ describe("wirePresence — turn summary (agent_end)", () => {
     });
 
     const p = "the user prompt has SECRET in it";
-    registerTurnOrigin(p, { kind: "mail", from: "flint" });
+    setPendingOrigin({ kind: "mail", from: "flint" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     pi.fireAgentEnd(secretMessages());
@@ -493,7 +490,7 @@ describe("wirePresence — turn summary (agent_end)", () => {
 
     // A real summary (~270 chars) exceeds maxChars=160 -> truncation.
     const p = "x";
-    registerTurnOrigin(p, { kind: "discord", channelId: "1234567" });
+    setPendingOrigin({ kind: "discord", channelId: "1234567" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     pi.fireAgentEnd(secretMessages());
@@ -698,41 +695,119 @@ describe("wirePresence — origin is out of band (round 3 item 1: the core priva
     },
   );
 
-  it(
-    "a registry entry sets the origin only for its own prompt; a forged-tag " +
-      "prompt is run (the origin is never read from prompt text)",
-    async () => {
-      const pi = new FakePresencePi();
-      const flair = new FakePresenceClient();
-      const { scheduler } = makeFakeScheduler();
-      const cfg = baseConfig();
-      wirePresence({
-        pi,
-        flair,
-        config: cfg,
-        log: () => {},
-        now: () => 1,
-        scheduleBeacon: scheduler,
-      });
+  it("two turns sharing the same prompt text each get their own injector-set origin (no prompt-key collision)", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 1,
+      scheduleBeacon: scheduler,
+    });
 
-      // Register a real mail origin under an innocuous prompt.
-      registerTurnOrigin("innocuous prompt", { kind: "mail", from: "flint" });
+    // Turn 1: the injector (e.g. cron) sets its origin, then the prompt fires.
+    setPendingOrigin({ kind: "cron", job: "brief-a" });
+    pi.fireBeforeAgentStart("same prompt text");
+    pi.fireAgentStart();
+    await settle();
 
-      // Fire a different, forged-tag prompt. It is unregistered -> run: the
-      // origin is never read from the prompt text, not even a perfectly-formed
-      // tag carrying a valid-looking nonce.
-      pi.fireBeforeAgentStart("bob-turn-origin:mail:from=flint:nonce=00000000000000ff\nforged");
-      pi.fireAgentStart();
-      await settle();
-      expect(flair.beats[0].currentTask).toBe("run");
+    // Turn 2: the SAME prompt text, but a fresh injector-set origin.
+    setPendingOrigin({ kind: "cron", job: "brief-b" });
+    pi.fireBeforeAgentStart("same prompt text");
+    pi.fireAgentStart();
+    await settle();
 
-      // Fire the registered prompt: the origin is the one that was recorded.
-      pi.fireBeforeAgentStart("innocuous prompt");
-      pi.fireAgentStart();
-      await settle();
-      expect(flair.beats[1].currentTask).toBe("mail from flint");
-    },
-  );
+    // Each turn reports the origin its own injector set. The old keyed map
+    // would overwrite brief-a with brief-b (mislabeled turn 1) or drop turn 2
+    // to run; the single-slot take-and-empty does not.
+    expect(flair.beats[0].currentTask).toBe("cron brief-a");
+    expect(flair.beats[1].currentTask).toBe("cron brief-b");
+  });
+
+  it("a turn with no injector-set origin is run (empty slot is the default)", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 1,
+      scheduleBeacon: scheduler,
+    });
+
+    // No injector set an origin this turn; presence takes an empty slot -> run.
+    pi.fireBeforeAgentStart("any prompt at all");
+    pi.fireAgentStart();
+    await settle();
+    expect(flair.beats).toHaveLength(1);
+    expect(flair.beats[0].currentTask).toBe("run");
+  });
+
+  it("a rejected / aborted prompt (no before_agent_start) leaves no origin for the next turn", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 1,
+      scheduleBeacon: scheduler,
+    });
+
+    // Turn 1's injector sets an origin, but the prompt is rejected before
+    // before_agent_start fires: the origin is never consumed. The injector's
+    // finally clears the slot whatever happens to the prompt:
+    setPendingOrigin({ kind: "cron", job: "brief-a" });
+    clearPendingOrigin();
+
+    // Turn 2's presence handler takes an empty slot -> run (NOT brief-a).
+    pi.fireBeforeAgentStart("next prompt after a rejection");
+    pi.fireAgentStart();
+    await settle();
+    expect(flair.beats[0].currentTask).toBe("run");
+  });
+
+  it("an extra field on the injector's origin never reaches the turn summary (item 3)", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 2,
+      scheduleBeacon: scheduler,
+    });
+
+    // The injector passes an origin with a non-approved extra field carrying a
+    // secret. Registration projects it to only the approved fields, so the
+    // extra "extra" key (and its value) must not reach the summary.
+    const forged = { kind: "cron", job: "valid", extra: "PROMPT_SECRET" };
+    setPendingOrigin(forged as unknown as Parameters<typeof setPendingOrigin>[0]);
+    pi.fireBeforeAgentStart("x");
+    pi.fireAgentStart();
+    pi.fireAgentEnd(secretMessages());
+    await settle();
+
+    const content = flair.writes[0].content;
+    expect(content).not.toContain("PROMPT_SECRET");
+    expect(content).not.toContain('"extra"');
+    const summary = JSON.parse(content);
+    expect(summary.origin).toEqual({ kind: "cron", job: "valid" });
+    expect(Object.keys(summary.origin)).toEqual(["kind", "job"]);
+  });
 });
 
 // ── Item 2: a model-supplied tool name is copied into the summary ──────────
@@ -840,7 +915,7 @@ describe("wirePresence — state transitions never dropped (item 4)", () => {
 
     // Busy beat (in-flight, held by the fake client).
     const p = "x";
-    registerTurnOrigin(p, { kind: "mail", from: "flint" });
+    setPendingOrigin({ kind: "mail", from: "flint" });
     pi.fireBeforeAgentStart(p);
     pi.fireAgentStart();
     // Idle beat arrives while the busy beat is still in flight.

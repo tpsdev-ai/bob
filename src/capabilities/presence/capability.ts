@@ -11,7 +11,7 @@
 // Flair roster and writes a metadata-only turn summary at turn end. It wires
 // FOUR subscriptions to pi and ONE beacon interval:
 //
-//   1. before_agent_start  — read the turn's origin from the out-of-band registry (consumeTurnOrigin)
+//   1. before_agent_start  — read the turn's origin from the out-of-band registry (takePendingOrigin)
 //                             and stamp the turn start time. The origin is the
 //                             single source of truth for the busy-beat label and
 //                             the turn summary's origin field.
@@ -61,7 +61,7 @@
 //     into pi.
 
 import { originLabel, type TurnOrigin } from "../../shell/turn-origin.js";
-import { consumeTurnOrigin } from "../../shell/turn-origin-registry.js";
+import { takePendingOrigin } from "../../shell/turn-origin-registry.js";
 import type { Durability } from "../flair/client.js";
 import type { PresenceActivity, PresenceCapabilityConfig } from "./config.js";
 
@@ -424,8 +424,8 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // ── before_agent_start: parse origin + stamp turn start ─────────────
   // The origin is the single source of truth for the busy-beat label and
   // the turn summary's origin field. `turnStartedAt` feeds durationMs.
-  pi.on("before_agent_start", (e) => {
-    currentOrigin = consumeTurnOrigin(e.prompt);
+  pi.on("before_agent_start", () => {
+    currentOrigin = takePendingOrigin();
     turnStartedAt = now();
   });
 

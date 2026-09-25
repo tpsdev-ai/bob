@@ -4,8 +4,8 @@
 // in-prompt nonce-bearing tag grammar — the old tagPrompt / parseTurnOrigin). A
 // trusted injector records the origin OUT OF BAND in the turn-origin registry
 // (see turn-origin-registry.ts) immediately before it calls session.prompt,
-// keyed by the exact prompt. The presence capability reads it back on
-// before_agent_start via consumeTurnOrigin. No prompt content — whatever it
+// into a single pending slot (not keyed by prompt text). It is taken back on
+// before_agent_start via takePendingOrigin. No prompt content — whatever it
 // contains, including a perfectly-formed forged tag — can ever set an origin.
 //
 // This module therefore keeps only the origin MODEL (the TurnOrigin union) and
