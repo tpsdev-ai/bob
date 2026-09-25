@@ -65,18 +65,21 @@ change one, the named test is what tells you.
   exclusions, and it is REQUIRED: a config without it is refused, in the type
   and at runtime. *(`test/shell/run-tool-allowlist.test.ts`, `run.test.ts`)*
 - **Isolated session resources.** pi's settings and resource sources are built
-  by bob: project trust off, no configured packages, no discovery of user or
-  project extensions, skills, prompt templates, themes or context files, and no
-  global `SYSTEM.md` / `APPEND_SYSTEM.md`. The only extensions that load are the
-  capabilities you declared in `bob.yaml`, and a reload re-reads exactly those.
-  Nothing is resolved and nothing is installed. *(`test/shell/session.test.ts` —
+  by bob: project trust off, no configured package installed, and no global
+  `SYSTEM.md` / `APPEND_SYSTEM.md`. pi still enumerates the ambient extension,
+  skill, prompt-template and theme paths while resolving its package sources;
+  bob's loader flags stop them LOADING, so the only extensions in the session are
+  the capabilities you declared in `bob.yaml`, and a reload re-reads exactly
+  those. Nothing ambient is ever loaded. *(`test/shell/session.test.ts` —
   including a control proving pi would otherwise load the ambient files)*
 - **The audit.** Every name in the effective policy must be active in the
-  session, and no name may be provided by two sources (pi's built-ins or a
-  declared capability). The audit runs at creation, after the interactive mode
-  binds extensions, and after every reload; a failure disposes the session and
-  ends the process with the error, rather than leaving one running whose policy
-  no longer holds. *(`test/shell/session.test.ts`)*
+  session, and no model-callable tool name — one that is allowlisted and not
+  excluded — is provided by two sources (pi's built-ins or a declared
+  capability). It runs on the session, at creation, after the mode binds
+  extensions (`bindExtensions`) and after every reload (`session.reload`), i.e.
+  once pi has finished rebuilding its tool list; a failure disposes the session
+  and ends the process with the error, rather than leaving one running whose
+  policy no longer holds. *(`test/shell/session.test.ts`)*
 - **`bob launch` takes at most one prompt and nothing else.** Any other argument
   is refused BY NAME, so no caller-controlled flag can reach a session.
   `bob launch a -- --tools` sends the literal prompt `--tools`;

@@ -6,9 +6,9 @@
 // soul.md. When the human exits the session, bob reads back soul.md and reports
 // whether it was updated.
 //
-// Round 3: the session comes from bob's ONE factory through pi's InteractiveMode
-// (session.ts) — bob no longer spawns the pi CLI, so there is no argv for a
-// caller to add a flag to. The interview runs under the FIXED setup policy
+// The session comes from bob's ONE factory through pi's InteractiveMode
+// (session.ts) — bob never spawns the pi CLI, and no argument reaches the
+// session. The interview runs under the FIXED setup policy
 // (read + write, session.ts SETUP_TOOL_POLICY), which may exceed the role's
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated

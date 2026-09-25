@@ -433,8 +433,7 @@ async function main(): Promise<number> {
       }
       case "launch": {
         // At most one prompt, and nothing else: the whitelist is enforced in
-        // parseLaunchArgs, which refuses a pi flag BY NAME (there is no argv to
-        // forward it to any more).
+        // parseLaunchArgs, which refuses any other argument BY NAME.
         try {
           const launch = parseLaunchArgs(args.positional, args.flags);
           return await runLaunch(launch);

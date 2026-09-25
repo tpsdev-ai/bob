@@ -15,9 +15,9 @@
 // The launcher is also where the tool policy binds: it runs `bob launch`, which
 // resolves the agent's role allowlist + bob.yaml and stands up the session from
 // bob's own factory. So a mail-driven turn starts with the same policy as `bob
-// run`, and this class never starts a session on its own — there is no mail
-// path that opens a session with no allowlist, and (round 3) no pi command line
-// for a mail body to add a flag to.
+// run`, and this class never starts a session on its own — no mail path opens a
+// session with no allowlist, and a mail body cannot add an argument to the
+// session it reaches.
 
 import { spawn } from "node:child_process";
 import {

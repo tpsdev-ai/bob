@@ -375,12 +375,9 @@ export class LaunchArgError extends Error {}
 // `bob launch` takes a name and AT MOST ONE PROMPT — nothing else.
 //
 // The launcher is the mail path and the human path: whatever reaches a session
-// comes from here. A caller-supplied flag is refused BY NAME (rather than
-// dropped or forwarded), because the session's tools are the role's allowlist
-// resolved by bob — an argument that could reach pi's own parser is exactly how
-// the ceiling used to be widened (pi's parser reads flags after bob's, last
-// wins). There is no argv to forward any more, so the whitelist is the whole
-// surface.
+// comes from here. A caller-supplied argument is refused BY NAME (rather than
+// dropped or forwarded): the session's tools are the role's allowlist resolved
+// by bob, and there is no argument path into a session at all.
 //
 // `-- <prompt>` is how a prompt that starts with `-` gets through:
 //   bob launch pulse -- --tools   → the literal prompt "--tools"
@@ -425,8 +422,8 @@ export function parseLaunchArgs(
 //     factory is bob's (session.ts), so a new/resumed/forked session is still
 //     the agent's own with the agent's policy.
 //
-// It never spawns the pi CLI: a spawned CLI is started from argv, and a caller
-// who controls argv controls the session's tools.
+// It never spawns the pi CLI and never assembles a command line: a session's
+// tools come from the factory's policy, never from an argument.
 export async function runLaunch(opts: LaunchOptions): Promise<number> {
   if (opts.prompt !== undefined && opts.prompt.trim() !== "") {
     const result = await runAgent({

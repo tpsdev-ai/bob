@@ -276,14 +276,9 @@ fi
 cd "$AGENT_DIR/work"
 # EVERY session starts through \`bob launch\`, which resolves THIS agent's tool
 # policy (role.json is the ceiling, bob.yaml narrows it) and builds the session
-# itself — pi's SDK, in this process. The launcher deliberately does NOT invoke
-# the pi binary: a launch path that assembled its own pi command line would let
-# the arguments below reach pi's parser, and the session's tools would stop
-# being the role's allowlist.
-#
-# bob launch takes at most ONE prompt and nothing else. "$@" is passed after
-# --, so a prompt (even one starting with "-") arrives intact and a pi flag is
-# refused by name.
+# itself — pi's SDK, in this process. bob launch takes at most ONE prompt and
+# nothing else: "$@" is passed after --, so a prompt (even one starting with
+# "-") arrives intact and anything that looks like a flag is refused by name.
 #
 # BOB_BIN picks which bob runs the session (a service unit with a minimal PATH,
 # or a test). It defaults to \`bob\` on PATH; if that is missing the exec fails

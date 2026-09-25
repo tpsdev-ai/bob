@@ -2,10 +2,8 @@
 // launcher starts, and therefore the mail path too.
 //
 // Round 3 deletes pi argv entirely: bob never spawns the pi CLI and never
-// assembles a command line, so an argument a caller controls can no longer
-// reach pi's parser (which reads flags AFTER bob's, last wins — the widening
-// round 2 found). `bob launch` takes AT MOST ONE PROMPT and nothing else, and
-// every other argument is refused BY NAME.
+// assembles a command line. `bob launch` takes AT MOST ONE PROMPT and nothing
+// else, and every other argument is refused BY NAME.
 //
 // Three levels:
 //   * parseLaunchArgs — the whitelist itself;
