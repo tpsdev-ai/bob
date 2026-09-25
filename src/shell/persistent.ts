@@ -163,8 +163,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   let disposed = false;
   let disposing: Promise<void> | undefined;
   // cli#145 round 9: the named reason this runtime STOPPED SERVING. Set when its
-  // standing contract could not be attached; from then on no scheduled fire may
-  // run, and the session is disposed so no later prompt can either.
+  // standing contract could not be attached — synchronously, which is what
+  // closes the admission gate (round 11) — and from then on no prompt from any
+  // source is issued: the gate refuses it, and the session is disposed.
   let stopped: string | undefined;
   let cronScheduler: CronSchedulerHandle | undefined;
   // Process exit seam (tests). Defaults to process.exit — production fail-closed
@@ -201,13 +202,19 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // keeps accepting inbound prompts, and serves every later one with the
   // contract silently gone. That is the #145 silent-abandonment class, and a
   // resident agent has no exit code to go red: the failure would be one log line
-  // in a stream nobody reads. So the runtime stops serving instead. It stops the
-  // scheduler, disposes the session (nothing can be prompted on it after that),
+  // in a stream nobody reads. So the runtime stops serving instead. CLOSING THE
+  // ADMISSION GATE is the first thing it does, synchronously, before anything is
+  // awaited (round 11, item 3): pi does not guard a prompt on a disposed session
+  // (`dispose()` sets no flag and `prompt()` has no guard), so the gate — not the
+  // disposal — is what makes the stop effective for a prompt already on its way.
+  // Then it stops the scheduler, unsubscribes, drains idle, disposes the session,
   // and exits non-zero with the named reason and the error in the log; its
   // supervisor (launchd KeepAlive + RunAtLoad) then restarts it with a FRESH
   // session whose standing contract is intact from the start.
   const failClosed = (failure: string): void => {
     if (stopped !== undefined) return; // already stopping — the first reason stands
+    // Close the gate FIRST, synchronously: this write is what the gate reads, and
+    // everything below is async — it may not have run when a prompt arrives.
     stopped = failure;
     log(
       `[bob] ${REINJECTION_FAILURE_REASON}: the standing contract could not be attached — ${failure}`,
@@ -257,14 +264,66 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   });
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
 
-  // cli#145 round 10: ONE prompt path. Every prompt this runtime issues goes
-  // through here, and `stopped` is re-read IMMEDIATELY before session.prompt —
-  // after EVERY await. A fire used to check `stopped`, then wait for idle, then
-  // prompt regardless: a session that fail-closed DURING that wait (its standing
-  // contract could not be attached, so the runtime is disposing it) would still
-  // be driven a turn — exactly the silent service round 9 exists to prevent.
-  // The final check is the last thing before the prompt; nothing runs between
-  // them.
+  // cli#145 round 11, item 3: ONE ADMISSION GATE FOR EVERY PROMPT SOURCE. Round
+  // 10 covered the prompts THIS runtime issues (a cron fire). The discord
+  // capability's inbound listener calls `pi.sendUserMessage()` directly, which pi
+  // routes to `AgentSession.sendUserMessage` and on to `prompt()` — a path bob
+  // never sees. And pi does not close that door on dispose: `dispose()` sets no
+  // flag and `prompt()` has no guard, so nothing below us refuses a prompt on a
+  // session bob has stopped serving. So the gate is installed on the session
+  // INSTANCE's prompt entry points, where every caller must pass it whatever it
+  // is — the scheduler, the discord inbound handler, a future mail consumer —
+  // with no capability code touched.
+  //
+  // The gate refuses once the runtime has stopped, and while an attach is still
+  // in flight (after a compaction, until the standing contract settles) it WAITS
+  // — then RE-CHECKS, because that attach failing is exactly what stops the
+  // runtime. `stopped` is therefore re-read after every wait, and the last read
+  // is the last thing before the prompt is issued.
+  const refusePrompt = (when: string): void => {
+    log(
+      `[bob] ${REINJECTION_FAILURE_REASON}: not issuing a prompt — this session stopped serving${when}`,
+    );
+  };
+  const gate = async (issue: () => Promise<void>): Promise<void> => {
+    for (;;) {
+      if (stopped !== undefined) {
+        refusePrompt("");
+        return;
+      }
+      const attaching = reinjector.pendingInjection();
+      if (attaching === undefined) break;
+      // The standing contract is still being attached: let it land first, then
+      // loop. If it FAILED the runtime has stopped serving, so this prompt is
+      // refused rather than driven into the session that lost its contract.
+      await attaching;
+    }
+    await issue();
+  };
+  const originalPrompt = session.prompt.bind(session);
+  session.prompt = (text, options) => gate(() => originalPrompt(text, options));
+  // `sendUserMessage` delegates to `prompt` INSIDE pi (AgentSession awaits
+  // `this.prompt(...)`), so a call that arrives this way passes the gate twice:
+  // once here and once at the prompt wrapper. That is not a double admission —
+  // the inner pass re-checks the same two conditions immediately before pi's own
+  // prompt, which is exactly what round 10 asked for — and a refusal returns
+  // before calling through, so it is logged once. Wrapping both means the gate
+  // does not depend on that delegation.
+  const originalSendUserMessage = session.sendUserMessage?.bind(session);
+  if (originalSendUserMessage !== undefined) {
+    session.sendUserMessage = (content, options) =>
+      gate(() => originalSendUserMessage(content, options));
+  }
+
+  // cli#145 round 10: ONE prompt path for the prompts THIS runtime issues. Every
+  // one goes through here, and `stopped` is re-read IMMEDIATELY before
+  // session.prompt — after EVERY await. A fire used to check `stopped`, then wait
+  // for idle, then prompt regardless: a session that fail-closed DURING that wait
+  // (its standing contract could not be attached, so the runtime is disposing it)
+  // would still be driven a turn — exactly the silent service round 9 exists to
+  // prevent. The final check is the last thing before the prompt; nothing runs
+  // between them. (A scheduler-side check stays here for its own wording; the
+  // session-boundary gate above is what covers EVERY source.)
   const issuePrompt = async (prompt: string): Promise<void> => {
     const refuse = (when: string): void => {
       log(
@@ -273,8 +332,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     };
     if (stopped !== undefined) {
       // The session lost its standing contract and is being disposed: a prompt
-      // now is exactly the silent service this round exists to prevent (and pi
-      // would reject the prompt — the session is disposed).
+      // now is exactly the silent service round 9 exists to prevent. (pi does NOT
+      // refuse it — see the admission gate above — so this check and the gate are
+      // what stand between a stopped runtime and a driven turn.)
       refuse("");
       return;
     }

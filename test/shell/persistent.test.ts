@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type PiLike, wireDiscordCapability } from "../../src/capabilities/discord/capability.js";
+import type { DiscordClient, DiscordMessage } from "../../src/shell/discord-types.js";
 import { runPersistent, startPersistent } from "../../src/shell/persistent.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
 
@@ -22,8 +24,11 @@ function fakeWarmSession(): {
     subscribe() {
       return () => {};
     },
+    // pi does NOT refuse a prompt after dispose (its dispose() sets no flag and
+    // its prompt() has no guard) — round 11 removed the fake that pretended it
+    // did; the runtime's admission gate is what refuses a prompt on a stopped
+    // session.
     async prompt(text: string) {
-      if (disposed) throw new Error("prompt() after dispose() — session was torn down");
       prompts.push(text);
     },
     async waitForIdle() {
@@ -61,6 +66,56 @@ function scaffoldAgent(root: string, name: string): void {
       "\n",
     ),
   );
+}
+
+// cli#145 round 11, item 3: the REAL discord capability, driven through a pi
+// adapter that mirrors pi's own routing. The capability's inbound listener calls
+// `pi.sendUserMessage(content)`, and pi's extension API routes that to the
+// session's `sendUserMessage` — the entry point the runtime installs its
+// admission gate on. Pointing the adapter at the runtime's session is what makes
+// the capability's call (not a direct test call) pass that gate.
+function piRoutingTo(session: RunSession): PiLike {
+  return {
+    registerTool() {},
+    on() {},
+    sendUserMessage(content: string) {
+      void session.sendUserMessage?.(content);
+    },
+  } as unknown as PiLike;
+}
+
+// A minimal DiscordClient: records the gateway listener so a test can fire an
+// inbound message through the capability's real `message` handler.
+function discordClientFake(): {
+  client: DiscordClient;
+  fire: (content: string, id?: string) => void;
+} {
+  let handler: ((msg: DiscordMessage) => void) | undefined;
+  const client: DiscordClient = {
+    on(_event, h) {
+      handler = h;
+    },
+    async connect() {},
+    async disconnect() {},
+    async reply() {},
+    async react() {},
+    async fetchRecent() {
+      return [];
+    },
+    async sendTyping() {},
+  };
+  return {
+    client,
+    fire: (content, id = "m1") =>
+      handler?.({
+        id,
+        channelId: "channel-A",
+        authorId: "u1",
+        authorName: "user",
+        content,
+        mentionsBot: true,
+      }),
+  };
 }
 
 describe("runPersistent / startPersistent", () => {
@@ -459,7 +514,6 @@ describe("runPersistent / startPersistent", () => {
     const logs: string[] = [];
     const exits: number[] = [];
     let disposeCount = 0;
-    let disposed = false;
     const session: RunSession = {
       subscribe(listener) {
         const l = listener as (event: unknown) => void;
@@ -469,8 +523,10 @@ describe("runPersistent / startPersistent", () => {
           if (i >= 0) listeners.splice(i, 1);
         };
       },
+      // pi does not refuse a prompt on a disposed session (round 11, item 4),
+      // so this fake records what REACHES it; the runtime's admission gate is
+      // what the assertion below rests on.
       async prompt(text: string) {
-        if (disposed) throw new Error("prompt() after dispose() — session was torn down");
         prompts.push(text);
       },
       async sendCustomMessage(message) {
@@ -479,7 +535,6 @@ describe("runPersistent / startPersistent", () => {
       },
       dispose() {
         disposeCount += 1;
-        disposed = true;
       },
     };
 
@@ -506,10 +561,16 @@ describe("runPersistent / startPersistent", () => {
       "the gateway dropped the attach",
     );
     expect(disposeCount, "the session is disposed — not left serving").toBe(1);
-    // …so no later inbound prompt (a Discord reply, a mail, a cron fire) can
-    // run on the session that lost its contract.
-    await expect(handle.session.prompt("inbound from discord")).rejects.toThrow(/after dispose/);
+    // …so no later inbound prompt (a Discord reply, a mail, a cron fire) can run
+    // on the session that lost its contract. pi does NOT refuse it (round 11,
+    // item 4: the fake that pretended it did is gone) — the runtime's own
+    // admission gate refuses it: the call returns without reaching the session's
+    // prompt, and the refusal is logged.
+    await handle.session.prompt("inbound from discord");
     expect(prompts, "no prompt was ever sent to the lost-contract session").toHaveLength(0);
+    expect(logs.join("\n"), "and the refusal is named, not silent").toContain(
+      "not issuing a prompt",
+    );
     await handle.shutdown(); // idempotent: the fail-closed path already disposed
     expect(disposeCount, "and shutdown does not dispose it twice").toBe(1);
   });
@@ -742,6 +803,160 @@ describe("runPersistent / startPersistent", () => {
     expect(joined, "the stop was seen BEFORE the prompt, not after it").toContain(
       "it stopped while this prompt waited to go idle",
     );
+    await handle.shutdown();
+  });
+
+  // ── cli#145 round 11: ONE admission gate for EVERY prompt source ────
+
+  it("cli#145 round 11: an inbound Discord message that arrives while the standing contract is still attaching waits, then runs WITH the contract attached", async () => {
+    // Round 10 covered the prompts the runtime issues itself (cron). The discord
+    // capability's inbound listener calls `pi.sendUserMessage()` directly, which
+    // pi routes to `AgentSession.sendUserMessage` -> `prompt()` — a path bob
+    // never sees, and one pi does not refuse on a disposed session either. The
+    // gate lives on the session INSTANCE's prompt entry points, so this message
+    // passes it: while the standing contract is still attaching it WAITS, and it
+    // is prompted only once the block has landed.
+    const listeners: Array<(event: unknown) => void> = [];
+    const events: string[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let released: (() => void) | undefined;
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        events.push(`prompt:${text}`);
+      },
+      // Mirrors pi: `pi.sendUserMessage` ends up in `prompt()` on this same
+      // session, so the gate is passed twice — which must not double-admit, and
+      // must not prompt twice.
+      async sendUserMessage(content: string) {
+        await this.prompt(content);
+      },
+      sendCustomMessage() {
+        return new Promise<void>((resolve) => {
+          released = () => {
+            events.push("attach-settled");
+            resolve();
+          };
+        });
+      },
+      dispose() {},
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "threshold", result: {}, aborted: false });
+    }
+    const { client, fire } = discordClientFake();
+    wireDiscordCapability({
+      pi: piRoutingTo(session),
+      client,
+      config: { tokenFile: "/secrets/bot.token", channelIds: ["channel-A"], dispatchAll: false },
+      log: (m) => logs.push(m),
+      typingIntervalMs: 5,
+      typingMaxMs: 20,
+    });
+    fire("<@123> the brief?");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events, "nothing is prompted while the contract is still attaching").toEqual([]);
+    expect(exits, "and nothing stopped").toEqual([]);
+
+    released?.();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events, "the attach lands FIRST, then the message runs").toEqual([
+      "attach-settled",
+      "prompt:the brief?",
+    ]);
+    expect(exits, "a landed attach keeps it serving").toEqual([]);
+    await handle.shutdown();
+  });
+
+  it("cli#145 round 11: an inbound Discord message whose wait ends in a FAILED attach never reaches pi's prompt", async () => {
+    // The other half: the message waits on the pending attach, and that attach
+    // FAILS. The gate re-checks after the wait, sees the stopped runtime, and
+    // refuses — the message never reaches the session's prompt. pi would not
+    // refuse it (its dispose() sets no flag), which is why the gate is what the
+    // stop has to rely on.
+    const listeners: Array<(event: unknown) => void> = [];
+    const events: string[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let disposeCount = 0;
+    let failAttach: (() => void) | undefined;
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        events.push(`prompt:${text}`);
+      },
+      async sendUserMessage(content: string) {
+        await this.prompt(content);
+      },
+      sendCustomMessage() {
+        return new Promise<void>((_resolve, reject) => {
+          failAttach = () => reject(new Error("the gateway dropped the attach"));
+        });
+      },
+      dispose() {
+        disposeCount += 1;
+      },
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "threshold", result: {}, aborted: false });
+    }
+    const { client, fire } = discordClientFake();
+    wireDiscordCapability({
+      pi: piRoutingTo(session),
+      client,
+      config: { tokenFile: "/secrets/bot.token", channelIds: ["channel-A"], dispatchAll: false },
+      log: (m) => logs.push(m),
+      typingIntervalMs: 5,
+      typingMaxMs: 20,
+    });
+    fire("<@123> are you still there?");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events, "the message is waiting on the attach, not prompted").toEqual([]);
+
+    // The attach FAILS: the runtime stops serving and the gate closes.
+    failAttach?.();
+    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(events, "the inbound message never reaches a prompt").toEqual([]);
+    expect(exits, "the runtime still ends itself, non-zero").toEqual([1]);
+    expect(disposeCount, "and the session is disposed").toBe(1);
+    const joined = logs.join("\n");
+    expect(joined, "the named reason is logged").toContain("reinjection_failed");
+    expect(joined, "and the inbound refusal is named too").toContain("not issuing a prompt");
     await handle.shutdown();
   });
 });
