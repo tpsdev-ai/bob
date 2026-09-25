@@ -15,12 +15,17 @@
 //      the thing that tips the context back over the threshold: a cap below
 //      MIN_PINNED_CAP_CHARS is refused outright, and within the cap the TASK is
 //      truncated before the "what remains" body (never the section headers), so
-//      the block always carries "WHAT REMAINS" and never exceeds its cap.
+//      the block always carries "WHAT REMAINS" and never exceeds its cap. The
+//      header is counted against that cap too, and the compaction reason it
+//      carries is bounded, so no reason (a 1,000-character one, say) can push
+//      the block past it (round 4, item 2).
 //   2. The completion contract for a one-shot run: it settles `exitCode 0` only
 //      with a final assistant message — EXACTLY the text of the last assistant
 //      message that ENDED after the last compaction (never rebuilt from streamed
 //      deltas; an empty ending, or one whose stop reason is an error, is no final
-//      message) — and matches an expected shape when one is declared. Settling
+//      message), kept exactly as it ended — only EMPTINESS is judged on the
+//      trimmed text (round 4, item 1) — and matches an expected shape, on that
+//      verbatim text, when one is declared. Settling
 //      silently after a compaction retries ONCE with an explicit "continue from
 //      the state above" turn; if it still settles without meeting the contract
 //      the run exits non-zero with a named reason (`settled_after_compaction` /
@@ -41,6 +46,12 @@ export const DEFAULT_PINNED_CAP_CHARS = 6000;
  *  is REJECTED at validation rather than silently producing a block with neither
  *  section (round 3, item 2). */
 export const MIN_PINNED_CAP_CHARS = 512;
+
+/** How much of the compaction reason the block's HEADER may carry. The header is
+ *  part of the cap (`overhead` in `buildPinnedBlock`), so an unbounded reason
+ *  overflowed it — a 1,000-character reason produced a 1,315-character block
+ *  under a 512 cap (round 4, item 2). */
+export const MAX_HEADER_REASON_CHARS = 80;
 
 /** How many recent tool calls the generated worktree note lists. */
 export const DEFAULT_RECENT_TOOL_CALLS = 5;
@@ -131,6 +142,17 @@ export function renderWorktreeNote(
   return lines.join("\n");
 }
 
+/** Bound the compaction reason for the header: ONE line, at most
+ *  MAX_HEADER_REASON_CHARS characters including its elision marker. The header
+ *  is counted against the block's cap, so an unbounded reason is what let a
+ *  1,000-character one overflow a 512-character cap (round 4, item 2); line
+ *  breaks collapse to spaces so a reason cannot break the header into lines. */
+function headerReason(reason: unknown): string {
+  const oneLine = (typeof reason === "string" ? reason : "").replace(/[\r\n]+/g, " ").trim();
+  if (oneLine.length <= MAX_HEADER_REASON_CHARS) return oneLine;
+  return `${oneLine.slice(0, MAX_HEADER_REASON_CHARS - 1)}…`;
+}
+
 /** Build the ONE pinned block re-injected after a compaction. Bounded by
  *  `capChars`. `task` (one-shot) and `standingContract` (persistent) are
  *  mutually exclusive; whichever is set is the contract that is restored. */
@@ -139,7 +161,8 @@ export function buildPinnedBlock(opts: {
   standingContract?: string;
   state: RemainingState;
   capChars?: number;
-  /** The compaction reason (threshold/overflow/manual), for the header. */
+  /** The compaction reason (threshold/overflow/manual), for the header. It is
+   *  bounded — see `headerReason` — before it enters the header. */
   reason?: string;
   /** 1-based compaction counter, for the header. */
   count?: number;
@@ -148,9 +171,13 @@ export function buildPinnedBlock(opts: {
   const cap = assertPinnedCap(opts.capChars ?? DEFAULT_PINNED_CAP_CHARS);
   const contractLabel = opts.standingContract !== undefined ? "STANDING CONTRACT" : "TASK";
   const contract = (opts.standingContract ?? opts.task ?? "").trim();
+  // The reason is bounded BEFORE it enters the header (round 4, item 2): the
+  // header is counted against the cap below, so an unbounded reason is what let
+  // the block overflow it.
+  const reason = headerReason(opts.reason);
   const heading =
     `[BOB ${contractLabel} — re-injected after context compaction` +
-    `${opts.count ? ` #${opts.count}` : ""}${opts.reason ? ` (${opts.reason})` : ""}; cap ${cap} chars]`;
+    `${opts.count ? ` #${opts.count}` : ""}${reason ? ` (${reason})` : ""}; cap ${cap} chars]`;
   const intro =
     "The conversation above was compacted. That is NOT completion — the task is still open.";
   const footer =
@@ -177,6 +204,10 @@ export function buildPinnedBlock(opts: {
       footer,
     ].join("\n");
 
+  // `overhead` is the FIXED skeleton PLUS THE WHOLE HEADER (its label, the
+  // count, the bounded reason and the cap number), so the header is counted
+  // against the cap too — that, with the bounded reason, is what keeps the block
+  // within its cap whatever the reason says (round 4, item 2).
   const overhead = compose("", "").length;
   const bodyBudget = Math.max(0, cap - overhead);
 
@@ -286,7 +317,8 @@ export interface CompactionReinjector {
    * The text of the last assistant TURN that ENDED since the last compaction (or
    * the last startTurn) — the completion contract's "final message" (round 2
    * item 1, round 3 item 1). It is exactly the content of the message that
-   * ended: streamed deltas are never substituted for it.
+   * ended, KEPT AS IT ENDED: streamed deltas are never substituted for it, and it
+   * is never trimmed (round 4, item 1) — callers judge emptiness on `trim()`.
    */
   finalText(): string;
   /**
@@ -339,10 +371,13 @@ export function createCompactionReinjector(
     compactions: () => compactions,
     lastBlock: () => lastBlock,
     startTurn: () => clearCapture(),
-    // The LAST message that ENDED. Streamed deltas are never substituted for it
-    // (round 3, item 1): a message still in flight, or one that ended empty or
-    // with a failure stop reason, leaves this empty.
-    finalText: () => finalMessage.trim(),
+    // The LAST message that ENDED, EXACTLY as it ended (round 4, item 1): the
+    // text is kept VERBATIM — an exact `expectedFinal` predicate must see the
+    // content the message ended with, whitespace and all; only EMPTINESS is
+    // judged on the trimmed text (in `evaluateCompletion`). A message still in
+    // flight, or one that ended empty or with a failure stop reason, leaves this
+    // empty.
+    finalText: () => finalMessage,
     assistantEnded: () => sawAssistantEnd,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
@@ -397,18 +432,20 @@ export function createCompactionReinjector(
           // agent's plan ourselves, and (b) the run's current final message.
           if (e.message?.role === "assistant") {
             // The text of the message that ENDED — NEVER rebuilt from the
-            // streamed deltas (round 3, item 1). A stream that fails ends the
-            // assistant message with EMPTY content and lets the prompt settle;
-            // substituting the deltas for that content is what let a failed run
-            // report success.
-            const ended = textFromContent(e.message.content).trim();
+            // streamed deltas (round 3, item 1), and NEVER trimmed here (round
+            // 4, item 1). A stream that fails ends the assistant message with
+            // EMPTY content and lets the prompt settle; substituting the deltas
+            // for that content is what let a failed run report success.
+            const ended = textFromContent(e.message.content);
             const failed = isFailureStopReason(e.message.stopReason);
             // "What remains" is best-effort and separate from the completion
             // contract: a message that ended without assembled content still
             // leaves its streamed text as the last plan the agent stated — but a
             // FAILED stream's partial text is not a plan the agent stated.
+            // (The PLAN is display text and is trimmed; only the final message
+            // is kept verbatim.)
             if (!failed) {
-              const plan = ended || deltaBuffer.trim();
+              const plan = ended.trim() || deltaBuffer.trim();
               if (plan.length > 0) lastStatedPlan = plan;
             }
             // The final message: exactly this message's text, and never an empty
@@ -441,7 +478,10 @@ export function createCompactionReinjector(
  * content of the last assistant message that ENDED after the boundary — streamed
  * deltas are never substituted for it, and an empty or failure-ended message is
  * no final message (round 3, item 1), so this function only classifies what the
- * caller captured. Silence names whether a compaction was seen
+ * caller captured. That text is judged EXACTLY as it ended (round 4, item 1):
+ * only EMPTINESS is decided on the trimmed text, and `expectedFinal` sees the
+ * verbatim content — trimming it here made an exact predicate fail on
+ * whitespace. Silence names whether a compaction was seen
  * (`settled_after_compaction` / `no_final_message`); a message that EXISTS but
  * does not match gets its OWN reason (`final_shape_mismatch`, round 2 item 3) —
  * it is not silence.
@@ -451,8 +491,8 @@ export function evaluateCompletion(opts: {
   compactions: number;
   expectedFinal?: (text: string) => boolean;
 }): { ok: boolean; reason?: SilenceReason } {
-  const text = opts.capturedText.trim();
-  if (text.length === 0) {
+  const text = opts.capturedText;
+  if (text.trim().length === 0) {
     return {
       ok: false,
       reason: opts.compactions > 0 ? "settled_after_compaction" : "no_final_message",
