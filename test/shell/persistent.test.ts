@@ -344,6 +344,7 @@ describe("runPersistent / startPersistent", () => {
     const prompts: string[] = [];
     const logs: string[] = [];
     let subscribed = false;
+    let disposeCount = 0;
     const session: RunSession = {
       subscribe(listener) {
         subscribed = true;
@@ -357,7 +358,9 @@ describe("runPersistent / startPersistent", () => {
       async prompt(text: string) {
         prompts.push(text);
       },
-      dispose() {},
+      dispose() {
+        disposeCount += 1;
+      },
     };
 
     let error: unknown;
@@ -387,10 +390,57 @@ describe("runPersistent / startPersistent", () => {
     // No prompt is ever sent, the session is never wired into the event seam,
     // and the runtime never announces it as up.
     expect(prompts, "no prompt is ever sent").toHaveLength(0);
+    // cli#145 round 7: the session the factory created is handed back exactly
+    // once — an unsupported session left running can hold an open connection or
+    // timer and keep the process alive after startup failed.
+    expect(disposeCount, "the rejected session is disposed exactly once").toBe(1);
     expect(subscribed, "the session is never subscribed to the event seam").toBe(false);
     expect(
       logs.some((m) => m.includes("persistent session up")),
       `the session is never announced as up (saw: ${JSON.stringify(logs)})`,
     ).toBe(false);
+  });
+
+  it("cli#145 round 7: a dispose that throws does not replace the rejection", async () => {
+    // Cleanup is best-effort. If the rejected session's dispose itself throws,
+    // the caller must still get the reason the session was refused (the missing
+    // seam) — not the teardown failure — and that failure is logged instead of
+    // propagated.
+    const logs: string[] = [];
+    let disposeCount = 0;
+    const session: RunSession = {
+      subscribe() {
+        return () => {};
+      },
+      async prompt() {},
+      dispose() {
+        disposeCount += 1;
+        throw new Error("teardown exploded");
+      },
+    };
+
+    let error: unknown;
+    try {
+      await startPersistent({
+        name: "pulse",
+        agentsRoot: root,
+        sessionFactory: async () => session,
+        log: (m) => logs.push(m),
+      });
+    } catch (e) {
+      error = e;
+    }
+
+    expect(disposeCount, "the rejected session is still disposed (once)").toBe(1);
+    expect(error, "setup still rejects").toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message, "the caller gets the missing-seam reason").toContain("sendCustomMessage");
+    expect(message, "the dispose failure never replaces the rejection").not.toContain(
+      "teardown exploded",
+    );
+    expect(
+      logs.some((m) => m.includes("teardown exploded")),
+      `the dispose failure is logged (saw: ${JSON.stringify(logs)})`,
+    ).toBe(true);
   });
 });

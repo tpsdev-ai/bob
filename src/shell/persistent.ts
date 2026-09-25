@@ -130,7 +130,20 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // the session is announced as up or wired into a prompt path. pi's
   // AgentSession provides the seam, so this rejects a bespoke implementation,
   // not production.
+  //
+  // cli#145 round 7: hand back the session the factory already created before
+  // refusing it — an unsupported session left running can hold an open
+  // connection or timer and keep the process alive after startup failed. The
+  // dispose is best-effort and must not replace the rejection: a dispose that
+  // throws is logged, and the caller still gets the sendCustomMessage reason.
   if (typeof session.sendCustomMessage !== "function") {
+    try {
+      session.dispose();
+    } catch (err) {
+      log(
+        `[bob] disposing the rejected session for ${opts.name} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     throw new Error(
       `the session factory for "${opts.name}" returned a session with no sendCustomMessage: persistent use requires it, because the standing contract is attached to the session for its next prompt. Use a session factory whose session provides sendCustomMessage (pi's AgentSession does).`,
     );
