@@ -148,19 +148,19 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
     // the test can only pass because the README actually named commands.
     if (named.length === 0) {
       throw new Error(
-        "extracted zero `bob <command>` names from the README — the Commands " +
-          "table / code spans / fences were not read; the 'rejects' assertion " +
+        "extracted zero `bob <command>` names from the README's Commands " +
+          "table, code spans and fences; the 'rejects' assertion " +
           "below would pass while checking nothing",
       );
     }
     // The names extracted from spans, fences and the table must include the commands a bob
-    // user will actually reach. If any is missing, the extraction is incomplete
-    // and the "non-empty" check above is a false positive.
+    // user will actually reach. If any is missing, either the README dropped it or
+    // the extraction missed it; the "non-empty" check alone would not notice.
     for (const need of REQUIRED_COMMANDS) {
       if (!named.includes(need)) {
         throw new Error(
           `README code spans, fences and Commands table do not name the required command ` +
-            `'bob ${need}' — the extraction is incomplete`,
+            `'bob ${need}' — either the README dropped it or the extraction missed it`,
         );
       }
     }
@@ -182,7 +182,7 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
     expect(flagged).toEqual([]);
   });
 
-  it("reads plain-text Commands-table rows and refuses an empty extraction", () => {
+  it("reads plain-text Commands-table rows, and an empty table yields no names", () => {
     // A prose row (no backticks) must be read as a command — the vacuous-pass
     // mode that used to slip through when only spans and fences were read.
     const proseTable =
@@ -196,8 +196,8 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
     if (!got.includes("serve") || !got.includes("run")) {
       throw new Error("Commands table not read as expected: " + JSON.stringify(got));
     }
-    // An empty Commands table must extract zero commands; the non-empty guard in
-    // the file-reading test relies on this so it can never pass vacuously.
+    // An empty Commands table must extract zero commands, so that the non-empty
+    // guard in the file-reading test trips on it.
     const empty = "## Commands\n\n| Command | What it does |\n| ---- | ---- |\n\n## After\ntext.\n";
     if (commandsNamedIn(empty).length !== 0) {
       throw new Error("an empty Commands table should extract zero commands");
