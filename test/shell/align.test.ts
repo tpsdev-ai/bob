@@ -6,7 +6,7 @@
 // the setup policy is the fixed read + write, and the soul hash tells us
 // whether the check-in actually produced an update.
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runAlign } from "../../src/shell/align.js";
@@ -16,7 +16,9 @@ import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[] };
-  config: { appendSystemPrompt: string; provider: string; model: string };
+  config: { appendSystemPrompt: string; provider: string; model: string; piAgentDir: string };
+  // The whole session config, for tests that compare every field.
+  fullConfig: Record<string, unknown>;
   initialMessage: string;
 }
 
@@ -32,7 +34,9 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
         appendSystemPrompt: input.config.appendSystemPrompt,
         provider: input.config.provider,
         model: input.config.model,
+        piAgentDir: input.config.piAgentDir,
       },
+      fullConfig: { ...(input.config as unknown as Record<string, unknown>) },
       initialMessage: input.initialMessage,
     };
     runs.push(run);
@@ -289,5 +293,62 @@ describe("runAlign — the agent's own provider and model (#155)", () => {
     });
     expect(runs[0].config.provider).toBe("ollama-cloud");
     expect(runs[0].config.model).toBe("kimi-k2.6");
+  });
+});
+
+// #170 follow-up: an --provider / --model override may change ONLY the provider
+// and model it names. It must NOT move the credential source: pi reads its
+// auth.json from the agent's own .pi-agent dir (RunSessionConfig.piAgentDir),
+// which is fixed to the agent's directory and is never a field the override
+// touches. (An override that redirected the credential dir would let `bob align`
+// sign in as a different principal than the agent it was aligning.)
+describe("runAlign — an override cannot change the credential source (#170)", () => {
+  afterEach(() => {
+    rmSync(dirname(agentDir), { recursive: true, force: true });
+  });
+
+  it("keeps every field but provider and model (piAgentDir and capabilityEnv included) under a --provider + --model override", async () => {
+    // bob.yaml's own provider is ollama-cloud (a pass-through), but the override
+    // names a DIFFERENT bob provider (exe-dev-gateway -> anthropic) and a
+    // different model. The provider + model fields must follow the override, while
+    // piAgentDir must stay the agent's own dir — the credential source is fixed.
+    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    // A capability whose config names a credential file, so capabilityEnv is
+    // not empty and the comparison below can fail.
+    appendFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "capabilities:",
+        "  - flair",
+        "",
+        "flair:",
+        "  url: http://127.0.0.1:9",
+        "  agentId: testbot",
+        "  keyFile: /dev/null",
+        "",
+      ].join("\n"),
+    );
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      provider: "exe-dev-gateway",
+      model: "claude-opus-4-7",
+      sessionRunner: runner,
+    });
+    // The override took effect on the provider (mapped once to pi's id) and model.
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-opus-4-7");
+    // But the credential source is still the agent's own .pi-agent dir.
+    expect(runs[0].config.piAgentDir).toBe(join(agentDir, ".pi-agent"));
+
+    // And every other field besides provider and model is exactly what an
+    // unflagged check-in resolves: capabilityEnv (which can name a credential
+    // file) included.
+    await runAlign({ name: "testbot", agentDir, sessionRunner: runner });
+    const { provider: _p0, model: _m0, ...overridden } = runs[0].fullConfig;
+    const { provider: _p1, model: _m1, ...unflagged } = runs[1].fullConfig;
+    expect(Object.keys(overridden.capabilityEnv as Record<string, string>)).not.toHaveLength(0);
+    expect(overridden).toEqual(unflagged);
   });
 });

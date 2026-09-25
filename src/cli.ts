@@ -9,7 +9,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type Args,
   type BobRole,
+  boolFlag,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
   down,
@@ -19,6 +21,7 @@ import {
   installService,
   LaunchArgError,
   loadRole,
+  parseArgs,
   parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
@@ -32,43 +35,9 @@ import {
   servicePath,
   stringFlag,
   syncFlairSoul,
+  UsageError,
   up,
 } from "./shell/index.js";
-
-interface Args {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): Args {
-  const [command = "help", ...rest] = argv;
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < rest.length; i++) {
-    const tok = rest[i];
-    if (tok === "--") {
-      // Everything after `--` is positional. The generated launcher forwards
-      // its own args this way (`bob launch <name> -- "$@"`), so a pi flag
-      // cannot be swallowed as a bob flag.
-      positional.push(...rest.slice(i + 1));
-      break;
-    }
-    if (tok.startsWith("--")) {
-      const key = tok.slice(2);
-      const next = rest[i + 1];
-      if (!next || next.startsWith("--")) {
-        flags[key] = true;
-      } else {
-        flags[key] = next;
-        i++;
-      }
-    } else {
-      positional.push(tok);
-    }
-  }
-  return { command, positional, flags };
-}
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
@@ -117,20 +86,20 @@ credential for the target instance — FLAIR_ADMIN_PASS in the environment, or t
 }
 
 async function onboard(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const role = (flags.role ?? "custom") as BobRole;
-  const provider = String(flags.provider ?? "ollama-cloud");
-  const model = String(flags.model ?? "kimi-k2.6");
-  const dryRun = flags["dry-run"] === true;
-  const force = flags.force === true;
-  const noInteractive = flags["no-interactive"] === true;
+  // Value flags go through stringFlag: a bare `--model`, or the empty
+  // `--model=` form, means "not given" — the default applies — never the
+  // literal id "true" or an empty id written into bob.yaml and models.json.
+  const role = (stringFlag(flags, "role") ?? "custom") as BobRole;
+  const provider = stringFlag(flags, "provider") ?? "ollama-cloud";
+  const model = stringFlag(flags, "model") ?? "kimi-k2.6";
+  const dryRun = boolFlag(flags, "dry-run");
+  const force = boolFlag(flags, "force");
+  const noInteractive = boolFlag(flags, "no-interactive");
   // --no-flair is an EXPLICIT opt-out, not a fallback. When Flair is in play
   // (the default) a missing admin credential FAILS the command; the way to
   // scaffold without an identity is to say so.
-  const noFlair = flags["no-flair"] === true;
-  const flairUrl =
-    flags["flair-url"] !== undefined && flags["flair-url"] !== true
-      ? String(flags["flair-url"])
-      : DEFAULT_FLAIR_URL;
+  const noFlair = boolFlag(flags, "no-flair");
+  const flairUrl = stringFlag(flags, "flair-url") ?? DEFAULT_FLAIR_URL;
 
   if (dryRun) {
     const template = loadRole(role);
@@ -254,6 +223,9 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   const provider = stringFlag(flags, "provider");
   const model = stringFlag(flags, "model");
   const agentDir = stringFlag(flags, "agent-dir") ?? `${process.env.HOME}/agents/${name}`;
+  // Read every flag BEFORE the session starts: the check-in can rewrite
+  // soul.md, so a bad --no-flair spelling must fail here, not after it.
+  const noFlair = boolFlag(flags, "no-flair");
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -276,7 +248,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // hand since the last align), and that divergence is the case worth
   // surfacing. syncFlairSoul verifies registration first — no admin
   // credential required, because align only ever writes the agent's own soul.
-  if (flags["no-flair"] === true) return;
+  if (noFlair) return;
   const flair = readFlairBlock(agentDir);
   const synced = await syncFlairSoul({
     name,
@@ -318,7 +290,7 @@ async function run(
 ): Promise<number> {
   const model = stringFlag(flags, "model");
   // The interactive REPL on the SDK lands in a later phase-1 PR.
-  if (flags.interactive === true) {
+  if (boolFlag(flags, "interactive")) {
     console.error(
       "bob run: --interactive is not yet supported on the embedded-SDK path (give a task prompt for now)",
     );
@@ -355,10 +327,7 @@ async function installServiceCmd(
 ): Promise<number> {
   // launchd + systemd both use a minimal PATH, so the unit needs an absolute
   // path to `bob`. Default to the current executable's path when not overridden.
-  const bobBin =
-    flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
-      ? String(flags["bob-bin"])
-      : process.argv[1] || "bob";
+  const bobBin = stringFlag(flags, "bob-bin") ?? (process.argv[1] || "bob");
   const model = stringFlag(flags, "model");
   const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
@@ -397,8 +366,25 @@ function doctor(name: string): number {
   return report.summary.fail > 0 ? 1 : 0;
 }
 
+function usageError(err: unknown): number | undefined {
+  if (err instanceof UsageError) {
+    console.error(`bob: ${err.message}`);
+    return 2;
+  }
+  return undefined;
+}
+
 async function main(): Promise<number> {
-  const args = parseArgs(process.argv.slice(2));
+  // parseArgs validates every declared boolean flag, so a bad spelling is a
+  // usage error HERE — before any command runs — and never a stack trace.
+  let args: Args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
+    throw err;
+  }
   try {
     switch (args.command) {
       case "onboard": {
@@ -491,6 +477,8 @@ async function main(): Promise<number> {
         return 2;
     }
   } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`bob: ${msg}`);
     return 1;
