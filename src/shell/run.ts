@@ -82,6 +82,15 @@ export interface RunSession {
     message: { customType: string; content: string; display: boolean },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
   ): Promise<void>;
+  /**
+   * The OTHER prompt entry point (round 11, item 3): pi's extension API routes
+   * an extension's `pi.sendUserMessage(content)` here — the discord capability's
+   * inbound gateway calls exactly that — and pi's `AgentSession.sendUserMessage`
+   * normalizes the content and then awaits `this.prompt(...)`. The PERSISTENT
+   * runtime wraps it (and `prompt`) so that entry point cannot bypass its
+   * admission gate; optional, because a fake session in tests need not provide it.
+   */
+  sendUserMessage?(content: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void>;
   dispose(): void;
 }
 
@@ -272,13 +281,22 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // continue turn whose steer rejected after the prompt had resolved was judged
   // before the failure existed, and the run settled `exitCode 0` with its task
   // never restored — the #145 class this whole contract exists to close.
+  //
+  // cli#145 round 11, item 2: the verdict is ANY failed re-injection in the run,
+  // not only the newest compaction's. A one-shot run judges its WHOLE output —
+  // the text it produced is offered as the answer to the task — so one dropped
+  // task anywhere in it means some of that text was written with no task in
+  // front of the agent, and a later attach that succeeded does not undo it. (The
+  // persistent runtime keeps the newest-attach verdict: it judges the session's
+  // CURRENT state, so what matters there is whether its newest attach landed —
+  // see persistent.ts.)
   const judge = async (): Promise<{ ok: boolean; reason?: SilenceReason }> => {
     await reinjector.settled();
     return evaluateCompletion({
       capturedText: finalTextNow(),
       compactions: reinjector.compactions(),
       expectedFinal: opts.expectedFinal,
-      reinjectionFailure: reinjector.reinjectionFailure(),
+      reinjectionFailure: reinjector.anyReinjectionFailure(),
     });
   };
 

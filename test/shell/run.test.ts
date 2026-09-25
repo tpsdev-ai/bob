@@ -1003,6 +1003,86 @@ describe("runAgent", () => {
     expect(stderr).toContain("the continue-turn steer was rejected");
     expect(stderr).toContain("reinjection_failed");
   });
+
+  // ── cli#145 round 11: ANY failed re-injection refuses a one-shot run ───
+
+  it("cli#145 round 11: a run refuses when an EARLIER re-injection failed though a LATER one attached (fail #1, succeed #2)", async () => {
+    // Round 8 judged the NEWEST compaction's record, so a failed first injection
+    // followed by a successful second passed — the run exited 0 on text produced
+    // with its task missing for part of its life. A one-shot run judges its WHOLE
+    // output: the text it produces is offered as the answer to the task, so ANY
+    // failed re-injection during the run refuses it. (The persistent runtime
+    // keeps newest-attach semantics: it judges the session's current state.)
+    const calls: Array<{ text: string; streamingBehavior?: string }> = [];
+    // biome-ignore lint/suspicious/noExplicitAny: minimal event listener stub
+    const listeners: Array<(event: any) => void> = [];
+    const session: RunSession = {
+      subscribe(listener) {
+        listeners.push(listener);
+        return () => {
+          const i = listeners.indexOf(listener);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      prompt(text, options) {
+        calls.push({ text, streamingBehavior: options?.streamingBehavior });
+        if (options?.streamingBehavior !== undefined) {
+          // The two mid-run re-injections: the FIRST rejects, the SECOND lands.
+          const steers = calls.filter((c) => c.streamingBehavior !== undefined).length;
+          return steers === 1
+            ? Promise.reject(new Error("the first steer was rejected"))
+            : Promise.resolve();
+        }
+        return (async () => {
+          // Both compactions happen inside the ONE task turn.
+          for (const reason of ["threshold", "overflow"]) {
+            for (const listener of listeners) {
+              listener({ type: "compaction_end", reason, result: {}, aborted: false });
+            }
+          }
+          // The run ends with a real final message: nonempty, so nothing else
+          // would refuse it.
+          for (const listener of listeners) {
+            listener({
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "finished: all done" }],
+              },
+            });
+          }
+        })();
+      },
+      dispose() {},
+    };
+    const { factory } = factoryReturning(session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // The task turn plus the two steered blocks; NO retry — the run did end with
+    // a final message, so only the re-injection failure refuses it.
+    expect(calls).toHaveLength(3);
+    expect(calls[1]?.streamingBehavior, "the block is a steer").toBe("steer");
+    expect(calls[2]?.streamingBehavior, "and so is the second one").toBe("steer");
+    expect(
+      calls.some((c) => c.text === CONTINUE_TURN),
+      "no retry was attempted",
+    ).toBe(false);
+    expect(res?.stdout, "the text WAS produced — it is just not acceptable").toBe(
+      "finished: all done",
+    );
+    expect(res?.exitCode, "a run that lost its task once is not a success").not.toBe(0);
+    expect(res?.reason).toBe("reinjection_failed");
+    expect(stderr).toContain("the first steer was rejected");
+    expect(stderr).toContain("reinjection_failed");
+  });
 });
 
 // pi records extension load failures on the loader and carries on — the agent
