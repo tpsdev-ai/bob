@@ -6,7 +6,7 @@
 //      none of them load, on creation or on reload, and nothing is installed;
 //   2. THE AUDIT — every name in the effective policy must be active, and no
 //      name may come from two sources; a failed audit disposes the session and
-//      ends the process;
+//      ends the process — and so does a reload or a bind that THROWS;
 //   3. THE PIN — whatever cwd/agentDir a resumed, forked, cloned or imported
 //      session names, the factory builds the agent's own session.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -280,6 +280,7 @@ describe("the audit", () => {
     return {
       session,
       extPath,
+      loader: result.services.resourceLoader,
       logs,
       exits,
       disposals: () => disposals,
@@ -327,6 +328,69 @@ describe("the audit", () => {
       expect(probe.exits, "the process is ended").toEqual([1]);
       expect(probe.logs.join("\n")).toContain("bob_probe_tool");
       expect(probe.session.getActiveToolNames()).not.toContain("bob_probe_tool");
+    } finally {
+      probe.cleanup();
+    }
+  });
+
+  // Round 5: a reload or a bind that THROWS is a FAILED AUDIT. pi's interactive
+  // mode catches the throw and stays open, so a wrapper that audited only after
+  // the work SUCCEEDED left the mode serving on a tool state nobody audited.
+  // Both tests below force the failure at a step pi's own method body awaits,
+  // so the SESSION method rejects for real (pi swallows errors thrown by
+  // extension handlers, so a throwing handler cannot produce this).
+  it("round 5: a reload that THROWS ends the session — a failed reload is a failed audit", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      // The resource loader is the same object the session reloads, so pi's own
+      // reload() body runs and rejects.
+      const loader = probe.loader as unknown as { reload(...args: unknown[]): Promise<void> };
+      const originalLoaderReload = loader.reload.bind(loader);
+      loader.reload = () => Promise.reject(new Error("the resource loader could not be reloaded"));
+
+      await expect(probe.session.reload()).rejects.toThrow(
+        /the resource loader could not be reloaded/,
+      );
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      const logs = probe.logs.join("\n");
+      expect(logs, "the ORIGINAL error is named").toContain(
+        "the resource loader could not be reloaded",
+      );
+      expect(logs).toContain("the session could not be reloaded or bound");
+
+      loader.reload = originalLoaderReload;
+    } finally {
+      probe.cleanup();
+    }
+  });
+
+  it("round 5: a bind that THROWS ends the session — a failed bind is a failed audit", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      // pi's bindExtensions() awaits this step at its end (it returns early
+      // unless the capability discovers resources), so its real body rejects.
+      const session = probe.session as unknown as {
+        extendResourcesFromExtensions(reason: string): Promise<void>;
+      };
+      const originalExtend = session.extendResourcesFromExtensions.bind(session);
+      session.extendResourcesFromExtensions = () =>
+        Promise.reject(new Error("the extension resources could not be bound"));
+
+      await expect(probe.session.bindExtensions({})).rejects.toThrow(
+        /the extension resources could not be bound/,
+      );
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      const logs = probe.logs.join("\n");
+      expect(logs, "the ORIGINAL error is named").toContain(
+        "the extension resources could not be bound",
+      );
+      expect(logs).toContain("the session could not be reloaded or bound");
+
+      session.extendResourcesFromExtensions = originalExtend;
     } finally {
       probe.cleanup();
     }

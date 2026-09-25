@@ -13,18 +13,22 @@
 //       minus `exclude` and the resident exclusions — is what the session is
 //       created with (resolved by run.ts; it is REQUIRED, see RunSessionConfig);
 //   (b) pi's settings and resource sources are built HERE, isolated: project
-//       trust off, no configured packages, no discovery of user or project
-//       extensions, skills, prompt templates, themes or context files, and no
-//       global SYSTEM.md / APPEND_SYSTEM.md. The only extensions are the
-//       declared capabilities' paths. A reload re-reads these same isolated
-//       sources — it cannot reach anything else;
+//       trust off, no configured package installed, and the ambient user and
+//       project extension, skill, prompt-template, theme and context-file paths
+//       are never LOADED (pi still enumerates them while resolving its package
+//       sources) — no global SYSTEM.md / APPEND_SYSTEM.md either. The only
+//       extensions that load are the declared capabilities' paths. A reload
+//       re-reads exactly these isolated sources — it cannot reach anything
+//       else;
 //   (c) the audit runs at creation, again after the mode binds extensions (that
 //       is a bindExtensions, which emits session_start and extends resources
 //       from the extensions) and after EVERY session.reload() — NOT from inside
 //       the reload, where pi has not rebuilt the tool list yet. pi's TUI shows
 //       a reload error and carries on, so throwing is not enough: a failed
 //       audit disposes the session and ends the process with the named error
-//       before another turn can run.
+//       before another turn can run. A reload or a bind that THROWS is a failed
+//       audit too — the session may be half-rebuilt, and the mode would
+//       otherwise stay open on a tool state nobody audited.
 
 import { join } from "node:path";
 import {
@@ -186,10 +190,15 @@ export function auditCreatedSession(
 // hook would leave a session running whose policy no longer holds. Never
 // returns in production (process.exit); a test injects `exit` and sees the
 // throw instead.
+//
+// `what` names the situation for the log line, because a reload or a bind that
+// THROWS takes this same path (round 5) and is not literally a policy that
+// stopped holding.
 export function auditOrExit(
   audit: () => void,
   session: { dispose(): void },
   deps?: SessionDeps,
+  what = "the session's tool policy no longer holds after binding extensions",
 ): void {
   try {
     audit();
@@ -202,10 +211,7 @@ export function auditOrExit(
       // must not replace it.
     }
     const log = deps?.log ?? ((m: string) => console.error(m));
-    log(
-      "bob: the session's tool policy no longer holds after binding extensions; " +
-        `disposing it and ending the process before another turn can run.\n${msg}`,
-    );
+    log(`bob: ${what}; disposing it and ending the process before another turn can run.\n${msg}`);
     (deps?.exit ?? ((code: number) => process.exit(code)))(1);
     throw err;
   }
@@ -230,24 +236,36 @@ export function auditOrExit(
 // So both are wrapped on the SESSION INSTANCE, and both audit after the original
 // returns. Because the loader only ever re-reads the isolated sources above, a
 // reload cannot pull in anything it did not have at creation.
+//
+// Round 5: a reload or a bind that THROWS is a FAILED AUDIT. pi's interactive
+// mode catches the throw and stays open, so auditing only after success left the
+// session serving on a tool state nobody audited — exactly what an audit that
+// fails exists to stop. The callback is given the original error in that case,
+// and the caller puts it on the same path as a failed audit (dispose + end the
+// process with the ORIGINAL error named). Nothing is audited after a throw: the
+// state is unknown, so no reading of it can be trusted.
 export function installSessionAudits(
   session: {
     reload(options?: unknown): Promise<void>;
     bindExtensions(bindings: unknown): Promise<void>;
   },
-  audit: () => void,
+  audit: (failure?: unknown) => void,
 ): void {
-  const originalReload = session.reload.bind(session);
-  session.reload = async (options?: unknown) => {
-    await originalReload(options);
+  const runThenAudit = async (work: () => Promise<void>): Promise<void> => {
+    try {
+      await work();
+    } catch (err) {
+      audit(err);
+      return;
+    }
     audit();
   };
 
+  const originalReload = session.reload.bind(session);
+  session.reload = (options?: unknown) => runThenAudit(() => originalReload(options));
+
   const originalBind = session.bindExtensions.bind(session);
-  session.bindExtensions = async (bindings: unknown) => {
-    await originalBind(bindings);
-    audit();
-  };
+  session.bindExtensions = (bindings: unknown) => runThenAudit(() => originalBind(bindings));
 }
 
 export interface BobFactoryInput {
@@ -341,12 +359,27 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // Dispose it and end the process with the named error instead. Wrapped on
     // the SESSION, not the loader: pi rebuilds the tool list after the loader's
     // reload returns, so a loader hook audits the state pi is about to replace.
+    //
+    // Round 5: a reload or a bind that THROWS is a failed audit too. The session
+    // may be half-rebuilt and the mode stays open on it, so the original error
+    // takes the same path (dispose + end the process, naming THAT error).
+    const disposeSession = () => (result.session as unknown as { dispose(): void }).dispose();
     installSessionAudits(
       result.session as unknown as {
         reload(options?: unknown): Promise<void>;
         bindExtensions(bindings: unknown): Promise<void>;
       },
-      () => auditOrExit(runAudit, result.session as unknown as { dispose(): void }, deps),
+      (failure?: unknown) =>
+        failure === undefined
+          ? auditOrExit(runAudit, { dispose: disposeSession }, deps)
+          : auditOrExit(
+              () => {
+                throw failure;
+              },
+              { dispose: disposeSession },
+              deps,
+              "the session could not be reloaded or bound",
+            ),
     );
 
     return {
