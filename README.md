@@ -186,8 +186,8 @@ change one, the named test is what tells you.
 
 ## `run` logs and retention
 
-Every `bob run` (but **not** `bob serve` — its persistent session never calls this
-logger) tees each session event to a per-run JSONL log at
+Every one-shot `bob run <name> <prompt>` (but **not** the persistent `bob run <name>`:
+its session never calls this logger) tees each session event to a per-run JSONL log at
 `~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
 (a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
 Because the log exists for post-mortems — not for replaying a growing message —
