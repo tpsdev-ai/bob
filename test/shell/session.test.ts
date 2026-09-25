@@ -9,10 +9,11 @@
 //      ends the process — and so does a reload or a bind that THROWS;
 //   3. THE PIN — whatever cwd/agentDir a resumed, forked, cloned or imported
 //      session names, the factory builds the agent's own session.
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as piReal from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
   SessionManager,
@@ -648,5 +649,93 @@ describe("assertContractGuardLoaded fails closed (bob#158 K&S review)", () => {
 
   it("passes a clean load", () => {
     expect(() => assertContractGuardLoaded(loaderWith([]), guard)).not.toThrow();
+  });
+});
+
+// The factory's catch around installSessionAudits. When the session the factory
+// just built lacks a method pi's 0.84.3 contract promises it wraps (reload or
+// bindExtensions), installSessionAudits refuses; no test drove the factory's
+// catch around that refusal before (bob#151 K&S follow-up, bob#157). The guard
+// itself is unit-tested above; this is the call site around it.
+describe("the one factory disposes the session when installSessionAudits refuses (bob#157 K&S follow-up)", () => {
+  // Snapshot the real pi exports BEFORE any mock, so spreading them back in
+  // the mock always gives the factory the real loader, model runtime and
+  // services. Only createAgentSessionFromServices is replaced, so the session
+  // the factory builds is the stub below.
+  const realPi = { ...piReal };
+  // The mock persists for the whole process (bun does not auto-reset module
+  // mocks). Restore the real pi after each test, or every test file that
+  // runs after this one inherits the stubbed createAgentSessionFromServices.
+  afterEach(() => {
+    mock.module("@earendil-works/pi-coding-agent", () => ({ ...realPi }));
+  });
+
+  // A "built" session the factory hands to installSessionAudits. It passes the
+  // creation audit (read is an active builtin and the only name in the reduced
+  // policy) but is missing one of the two methods installSessionAudits wraps.
+  // dispose() is counted so the test can assert the factory's catch disposed
+  // the session exactly once.
+  let disposals = 0;
+  let missingMethod: "reload" | "bindExtensions" = "reload";
+  const makeStubSession = () => {
+    const stub: Record<string, unknown> = {
+      getActiveToolNames: () => ["read"],
+      reload: async () => {},
+      bindExtensions: async () => {},
+      dispose: () => {
+        disposals += 1;
+      },
+    };
+    delete stub[missingMethod];
+    return stub;
+  };
+
+  // Build a factory exactly as run.ts and the launcher do, but route the
+  // session build through a mocked createAgentSessionFromServices whose output
+  // is the stub above. Everything else the factory touches — ModelRuntime.create,
+  // createAgentSessionServices, the resource loader and the creation audit — stays
+  // real, so only the built session (not the audit path) is faked.
+  const buildFactory = () => {
+    const { cwd, piAgentDir } = scaffold();
+    const { config, policy } = resolveRunConfig({ name: "testbot", agentsRoot });
+    const logs: string[] = [];
+    const exits: number[] = [];
+    mock.module("@earendil-works/pi-coding-agent", () => ({
+      ...realPi,
+      createAgentSessionFromServices: async () => ({ session: makeStubSession() }),
+    }));
+    const factory = createBobRuntimeFactory({
+      config: {
+        ...config,
+        extensionSources: [],
+        capabilityBySource: {},
+      },
+      policy: { ...policy, tools: ["read"], excludeTools: [] },
+      deps: { log: (m: string) => logs.push(m), exit: (code: number) => exits.push(code) },
+    });
+    return { factory, cwd, piAgentDir, logs, exits };
+  };
+
+  const runFactory = async () => {
+    const { factory, cwd, piAgentDir } = buildFactory();
+    return factory({
+      cwd,
+      agentDir: piAgentDir,
+      sessionManager: SessionManager.inMemory(cwd) as never,
+    });
+  };
+
+  it("refuses a session missing reload and disposes it exactly once", async () => {
+    disposals = 0;
+    missingMethod = "reload";
+    await expect(runFactory()).rejects.toThrow(/no reload\(\)\/bindExtensions\(\) to audit after/);
+    expect(disposals, "the factory disposes the session it just built, once").toBe(1);
+  });
+
+  it("refuses a session missing bindExtensions and disposes it exactly once", async () => {
+    disposals = 0;
+    missingMethod = "bindExtensions";
+    await expect(runFactory()).rejects.toThrow(/no reload\(\)\/bindExtensions\(\) to audit after/);
+    expect(disposals, "the factory disposes the session it just built, once").toBe(1);
   });
 });
