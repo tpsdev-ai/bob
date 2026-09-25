@@ -51,6 +51,35 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 
 Per-call model override is the lightweight version of dynamic routing — bake the right model into each cron command (opus for strategy, sonnet for briefings, kimi for digests) without standing up multiple agents.
 
+## `run` logs and retention
+
+Every `bob run` (and `bob serve` turn) tees each session event to a per-run
+JSONL log at `~/agents/<name>/runs/<start-timestamp>.jsonl`, so a mid-run death
+(a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
+Because the log exists for post-mortems — not for replaying a growing message —
+it is kept small and bounded:
+
+- **No `partial`.** Each `message_update` event carries `partial` (the whole
+  assistant message so far) and a growing copy of `message`, repeated on every
+  streamed token — that is what made the log grow quadratically with message
+  length (15 GB of logs on a 40 GB builder disk). `message_update` events are
+  logged without those fields: the delta alone reconstructs the message, and
+  `message_end` carries the final message once.
+- **A per-run size cap.** Each run's log is capped (default **50 MB**, override
+  with `runLogCapBytes` for a one-off run). Past the cap, deltas
+  (`message_update`) stop being written, but everything else — tool calls,
+  tool results, errors, lifecycle events, and the final `done` line — keeps
+  coming, and a single line records that the cap was hit.
+- **Retention on run start.** Before writing its own log, a run keeps the
+  **newest 5** logs untouched and then, for the older ones, deletes the
+  oldest-first until their combined size is back under a **500 MB** budget.
+  A log that is still being written is never touched: retention runs before the
+  current run's file exists, and a live sibling run's recent modification time
+  keeps it inside the newest-5 window.
+
+These bounds keep a long or a long-running run from filling the disk and
+killing the agent mid-task — the original failure.
+
 ## Where Bob fits
 
 Bob is for small teams who want a handful of named, role-specific agents — a strategist, an EA, a reviewer — and want them to show up in mail and chat as themselves.
