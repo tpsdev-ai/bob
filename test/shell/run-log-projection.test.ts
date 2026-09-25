@@ -678,6 +678,12 @@ describe("run-log one-per-run + never-throw (issue #146, round 5)", () => {
     // Exactly one warning, and no run-log path announced (there was no log).
     const warnings = stderr.split("\n").filter((l) => l.includes("run log unavailable"));
     expect(warnings.length).toBe(1);
+    // The warning names the REAL cause and the directory it happened in, never a
+    // guessed step (this catch covers creating the dir, naming the file and
+    // opening it): the failure here is mkdirSync hitting a file at the runs path.
+    expect(warnings[0]).toContain(runsDir());
+    expect(warnings[0]).toMatch(/EEXIST|ENOTDIR/);
+    expect(warnings[0]).not.toContain("could not create");
     expect(stderr).not.toContain("run log: ");
     // The runs path is still the file it was: nothing was created over it.
     expect(readFileSync(runsDir(), "utf8")).toBe("not a directory\n");

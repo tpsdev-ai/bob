@@ -655,11 +655,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         // Best-effort: never throw from the logger (disk full, races, etc.).
       }
     };
-  } catch {
-    // Setting up the log failed — including creating the runs directory. Warn once
-    // and continue with the no-op logger: logging never throws into the run.
+  } catch (err) {
+    // Setting up the log failed — creating the runs directory, naming the file, or
+    // opening it. Warn once, name the real cause and the directory it happened in
+    // (never a guessed step, since this catch covers all three), and continue with
+    // the no-op logger: logging never throws into the run.
+    const reason = err instanceof Error ? err.message : String(err);
     process.stderr.write(
-      `bob run ${opts.name}: run log unavailable (could not create ${runsDir}); continuing without a run log\n`,
+      `bob run ${opts.name}: run log unavailable in ${runsDir} (${reason}); continuing without a run log\n`,
     );
   }
 
