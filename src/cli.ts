@@ -9,7 +9,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  type Args,
   type BobRole,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
