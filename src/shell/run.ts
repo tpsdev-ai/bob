@@ -24,7 +24,7 @@
 // for this invocation only, same semantics as the old `--model` flag.
 
 import {
-  createWriteStream,
+  appendFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -81,9 +81,40 @@ export interface RunLogRetentionResult {
   remainingBytes: number;
 }
 
+// True when `logPath` has a sidecar lock (`<logPath>.lock`) that names a PID
+// still alive — i.e. a run is still writing that log. Retention skips such logs
+// (a live run's writer would keep writing to a path that is no longer on disk).
+// A missing lock, or a lock whose PID is dead or unparseable, marks the run as
+// finished, so the log is prunable like any other.
+//
+// `process.kill(pid, 0)` probes liveness without signaling the target: it throws
+// ESRCH for a dead PID and EPERM for a live PID we can't signal (different uid),
+// so "no throw, or EPERM" means the run is live.
+function logHasLiveLock(logPath: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(`${logPath}.lock`, "utf8");
+  } catch {
+    // No readable lock -> the run is finished; the log is prunable.
+    return false;
+  }
+  const pid = Number.parseInt(raw.trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM = a live PID we aren't allowed to signal (still alive). ESRCH = gone.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 // On run start: keep the newest `keep` logs untouched and, of the older ones,
 // delete the oldest-first until their combined size is at or under
-// `budgetBytes`. Never touches a run still in progress.
+// `budgetBytes`. Never touches a run still in progress — its sidecar lock
+// (`<log>.lock`, which names the run's PID) protects it; a lock whose PID is dead
+// (a crashed or finished run) is treated as finished and pruned like any other
+// (see logHasLiveLock).
 export function pruneOldRunLogs(
   dir: string,
   opts: { keep?: number; budgetBytes?: number } = {},
@@ -106,8 +137,20 @@ export function pruneOldRunLogs(
   for (let i = older.length - 1; i >= 0; i--) {
     if (remainingBytes <= budgetBytes) break;
     const f = older[i];
+    const logPath = join(dir, f.name);
+    // A run still in progress drops a sidecar lock naming its PID; never unlink
+    // such a log (its writer would keep writing to a now-deleted path). A dead-PID
+    // (stale) lock, or no lock, marks a finished run — prunable.
+    if (logHasLiveLock(logPath)) continue;
     try {
-      unlinkSync(join(dir, f.name));
+      unlinkSync(logPath);
+      // A stale lock left by a crashed run goes with its log so we do not
+      // accumulate orphan locks; best-effort — a missing lock is the common case.
+      try {
+        unlinkSync(`${logPath}.lock`);
+      } catch {
+        // best-effort
+      }
       remainingBytes -= f.size;
       removed.push(f.name);
     } catch {
@@ -291,29 +334,26 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const runLogPath = join(runsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
   process.stderr.write(`run log: ${runLogPath}\n`);
 
-  // Buffered writer: writes flow through one WriteStream (each write is pushed to
-  // the OS page cache, so a mid-run crash still leaves the events written before
-  // it on disk) instead of one appendFileSync per streamed token. Stream is
-  // flushed on exit and on the fatal-error path.
+  // Sidecar lock: while this run is writing its log it drops `<log>.lock`
+  // holding its PID. Retention reads it to leave a live run's log alone (a
+  // dead-PID lock means the run has finished). Removed at run end.
+  const runLogLockPath = `${runLogPath}.lock`;
+  try {
+    appendFileSync(runLogLockPath, String(process.pid));
+  } catch {
+    // Best-effort: if we can't drop the lock, retention can't tell liveness and
+    // treats the log as finished — the safe default.
+  }
+
+  // Synchronous writer: appendFileSync commits each record to disk before it
+  // returns — exactly the post-mortem property this log exists for (a hard crash
+  // leaves every record written before it on disk). With `partial` stripped each
+  // record is small, so there is no per-write cost worth buffering. A failed
+  // append (disk full, race, perms) is swallowed: logging is best-effort and must
+  // never throw into the run.
   const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_CAP_BYTES;
-  const logStream = createWriteStream(runLogPath, { flags: "a" });
   let logBytes = 0; // running total of bytes committed to this log
   let capHit = false; // set once we cross the cap; then deltas stop
-  let logEnded = false; // guard so flushLog is idempotent
-
-  // Flush + close the buffered log. Idempotent: a second flush is a no-op so an
-  // error path and the normal exit path can both call it.
-  const flushLog = (): Promise<void> => {
-    if (logEnded) return Promise.resolve();
-    logEnded = true;
-    return new Promise<void>((resolve) => {
-      try {
-        logStream.end(() => resolve());
-      } catch {
-        resolve();
-      }
-    });
-  };
 
   // Write one log record.
   // - `isDelta` marks streamed message_update events: the only kind the cap drops,
@@ -342,7 +382,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       if (isDelta && capHit) return;
       const line = `${JSON.stringify(out)}\n`;
       const n = Buffer.byteLength(line);
-      logStream.write(line);
+      appendFileSync(runLogPath, line);
       logBytes += n;
       if (!capHit && logBytes >= capBytes) {
         // One line, ever, recording that the per-run cap was hit.
@@ -353,7 +393,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
           bytes: logBytes,
           capBytes,
         })}\n`;
-        logStream.write(capLine);
+        appendFileSync(runLogPath, capLine);
         logBytes += Buffer.byteLength(capLine);
       }
     } catch {
@@ -376,27 +416,38 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
   let exitCode = 0;
   try {
-    await session.prompt(opts.prompt);
-  } catch (err) {
-    exitCode = 1;
-    // Surface the error instead of swallowing it: an underscore-ignored catch
-    // made a cap-hit look like a silent clean exit. Label a provider
-    // rate-limit/cap so a budget stall is distinguishable from a crash.
-    const msg = err instanceof Error ? err.message : String(err);
-    const isCap =
-      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
-    process.stderr.write(
-      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
-    );
-  } finally {
-    unsubscribe();
-  }
+    try {
+      await session.prompt(opts.prompt);
+    } catch (err) {
+      exitCode = 1;
+      // Surface the error instead of swallowing it: an underscore-ignored catch
+      // made a cap-hit look like a silent clean exit. Label a provider
+      // rate-limit/cap so a budget stall is distinguishable from a crash.
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCap =
+        /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+      process.stderr.write(
+        `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+      );
+    } finally {
+      unsubscribe();
+    }
 
-  // Final record + flush, so a reader can tell a clean completion from a
-  // truncated log. Flushing here (the error catch above routes here too) is
-  // what makes a mid-run crash leave the events written before it on disk.
-  writeRunLog({ done: true, exitCode }, false);
-  await flushLog();
+    // Final record, so a reader can tell a clean completion from a truncated log.
+    // A synchronous append is on disk when writeRunLog returns, so a mid-run crash
+    // leaves every record written before it — the post-mortem trail this log exists
+    // for.
+    writeRunLog({ done: true, exitCode }, false);
+  } finally {
+    // Run end: drop the sidecar lock so retention no longer sees this log as
+    // live. Best-effort — a leaked lock names a now-dead PID, which the next
+    // sweep treats as finished.
+    try {
+      unlinkSync(runLogLockPath);
+    } catch {
+      // best-effort: the lock may already be gone
+    }
+  }
 
   // Fallback: if no text_delta events were observed (some transports don't
   // stream), pull the last assistant text from session state.

@@ -8,8 +8,9 @@
 //      quadratic.
 //   2. No logged `message_update` line contains `partial`.
 //   3. Past the per-run size cap: tool-call and error events are still written,
-//      deltas are dropped, and the cap line appears exactly once.
-//   4. A mid-run crash still leaves the events written before it on disk (the
+//   4. Each record is on disk when its appendFileSync returns (read the log
+//      before the next event), and retention leaves a live concurrent run's
+//      older log untouched (dead-pid locks are treated as finished).
 //      post-mortem property this log exists for).
 //
 // The fake session mirrors the real pi event shape: a `message_update` carries
@@ -18,26 +19,35 @@
 // the log to stay linear.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawn } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
-import { runAgent } from "../../src/shell/run.js";
+import { pruneOldRunLogs, runAgent } from "../../src/shell/run.js";
 
 // A fake AgentSession matching the RunSession seam. Emits a fixed list of raw
 // events to every subscribed listener. `throwAfter` throws (a fatal mid-run
 // error) once that many events have been emitted, after emitting them.
 function fakeSession(
   events: unknown[],
-  opts: { throwAfter?: number; throwError?: unknown } = {},
+  opts: {
+    throwAfter?: number;
+    throwError?: unknown;
+    // Observe the on-disk log before the NEXT event is emitted — this is the "read
+    // the file before the next event" seam for the on-disk-when-append-returns test.
+    onEmit?: (count: number) => void | Promise<void>;
+  } = {},
 ): RunSession {
   // biome-ignore lint/suspicious/noExplicitAny: minimal listener stub
   const listeners: Array<(event: any) => void> = [];
@@ -57,6 +67,8 @@ function fakeSession(
         if (opts.throwAfter !== undefined && emitted >= opts.throwAfter) {
           throw opts.throwError ?? new Error("simulated mid-run crash");
         }
+        // Let a test read the log before the next event is emitted.
+        await opts.onEmit?.(emitted);
       }
     },
     get messages() {
@@ -69,6 +81,17 @@ function fakeSession(
 // A factory that hands back a pre-made fake session.
 function factoryReturning(session: RunSession): RunSessionFactory {
   return async () => session;
+}
+
+// A reliably-dead PID for the retention test: spawn a tiny child and wait for it to
+// exit. The finished child's PID is (for all practical purposes) not reused for the
+// test's short duration, so process.kill(pid, 0) reports it as gone (ESRCH), i.e. the
+// run that holds that lock is "finished" and its log is prunable like any other.
+async function deadPid(): Promise<number> {
+  const child = spawn(process.execPath, ["-e", "0"], { stdio: "ignore" });
+  await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+  if (child.pid === undefined) throw new Error("deadPid: child PID unavailable");
+  return child.pid;
 }
 
 // Build a message_update event exactly like the real pi SDK emits one: a
@@ -249,50 +272,88 @@ describe("run-log sizing + retention (issue #146)", () => {
     }
   });
 
-  it("a mid-run crash still leaves the events before it on disk", async () => {
+  it("writes each record to disk when the append returns (read before the next event)", async () => {
+    // A mix of delta (message_update) and a non-delta (tool) event, so the "read
+    // before the next event" assertion is not delta-only.
     const events: unknown[] = [];
     let acc = "";
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 12; i++) {
       acc += "tok";
       events.push(messageUpdate("tok", acc));
     }
-    // A tool call right before the crash — the last thing the run did.
     events.push({
       type: "tool_execution_start",
       toolName: "read",
-      toolCallId: "tc-crash",
+      toolCallId: "tc-ondisk",
       args: {},
     });
 
-    // The run dies (throws) after emitting all events, before it would finish.
-    const res = await runAgent({
+    // Read the log after every event, before the next one is emitted. appendFileSync
+    // is synchronous, so the just-emitted record is already on disk: the line count
+    // equals the number of events emitted so far (no cap line is interleaved here).
+    let observed = 0; // highest event count we saw already on disk
+    await runAgent({
       name: "testbot",
       prompt: "go",
       agentsRoot,
       sessionFactory: factoryReturning(
         fakeSession(events, {
-          throwAfter: events.length,
-          throwError: new Error("hard crash mid-run"),
+          onEmit: async (count) => {
+            const log = readRunLog("testbot");
+            expect(log.lines.length).toBe(count);
+            observed = count;
+          },
         }),
       ),
+      // Huge cap so no cap line is interleaved (keeps the on-disk line count exact).
+      runLogCapBytes: 1 << 30,
     });
-    // The fatal error is surfaced (non-zero exit), not swallowed.
-    expect(res.exitCode).toBe(1);
+    // We observed the log after every one of the 13 events, each time with that many
+    // lines already committed — the record landed on disk when its append returned.
+    expect(observed).toBe(events.length);
+  });
 
-    const log = readRunLog("testbot");
-    // The durability property: everything emitted before the crash is on disk
-    // (the post-mortem trail this log exists for). `partial` stripping is test
-    // 2's concern, not this one's.
-    expect(log.lines.filter((l) => eventType(l) === "message_update").length).toBe(5);
-    // The last event before the crash (the tool call) is on disk.
-    const types = log.lines.map(eventType).filter((t): t is string => t !== undefined);
-    expect(types).toContain("tool_execution_start");
-    // A done line records the non-zero exit, so the log is not silently truncated.
-    const done = log.lines.find(
-      (l): l is { done: boolean; exitCode: number } =>
-        typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
-    );
-    expect(done).toBeDefined();
-    expect(done?.exitCode).toBe(1);
+  it("retention leaves an older run whose sidecar lock is live untouched", async () => {
+    // A standalone runs dir, NOT driven through runAgent (which hardcodes the newest-5
+    // / 500 MB defaults), so the lock-aware path can be exercised with a small budget.
+    const dir = mkdtempSync(join(tmpdir(), "bob-runlog-retain-"));
+    try {
+      const mk = (name: string, mtimeSec: number, withLock: boolean, pid: number): void => {
+        const p = join(dir, `${name}.jsonl`);
+        // ~20 lines, well over the tiny 10-byte budget, so every older log is prunable.
+        writeFileSync(p, `${name}\n`.repeat(20));
+        utimesSync(p, mtimeSec, mtimeSec);
+        if (withLock) writeFileSync(`${p}.lock`, String(pid));
+      };
+      const now = Math.floor(Date.now() / 1000);
+      // Oldest -> newest (the loop tries them oldest-first); all sit in the "older" set.
+      mk("p1", now - 7000, false, 0);
+      mk("p2", now - 6000, false, 0);
+      // A crashed/finished run: its lock names a dead PID -> treated as finished -> pruned.
+      const dead = await deadPid();
+      mk("dead", now - 5000, true, dead);
+      // THIS run's log: its lock names a live PID (the test process) -> must be skipped.
+      mk("live", now - 4000, true, process.pid);
+      // The newest log: inside the newest-1 window, protected unconditionally.
+      mk("newest", now, false, 0);
+
+      const res = pruneOldRunLogs(dir, { keep: 1, budgetBytes: 10 });
+
+      // The live run's older log is NOT removed, and its lock is left intact.
+      expect(res.removed).not.toContain("live.jsonl");
+      expect(existsSync(join(dir, "live.jsonl"))).toBe(true);
+      expect(existsSync(join(dir, "live.jsonl.lock"))).toBe(true);
+      // The dead-PID (finished) log IS removed — treated as finished.
+      expect(res.removed).toContain("dead.jsonl");
+      expect(existsSync(join(dir, "dead.jsonl"))).toBe(false);
+      // The plain (no-lock) older logs are removed oldest-first.
+      expect(res.removed).toContain("p1.jsonl");
+      expect(res.removed).toContain("p2.jsonl");
+      // The newest log is untouched.
+      expect(res.removed).not.toContain("newest.jsonl");
+      expect(res.kept).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
