@@ -78,8 +78,11 @@ change one, the named test is what tells you.
   capability). It runs on the session, at creation, after the mode binds
   extensions (`bindExtensions`) and after every reload (`session.reload`), i.e.
   once pi has finished rebuilding its tool list; a failure disposes the session
-  and ends the process with the error, rather than leaving one running whose
-  policy no longer holds. *(`test/shell/session.test.ts`)*
+  and ends the process with the error, and a reload or a bind that itself FAILS
+  ends the session the same way, naming THAT failure rather than the audit's —
+  pi's TUI shows reload errors and carries on, so a half-rebuilt session would
+  otherwise keep serving on a tool state nobody audited.
+  *(`test/shell/session.test.ts`)*
 - **`bob launch` takes at most one prompt and nothing else.** Any other argument
   is refused BY NAME, so no caller-controlled flag can reach a session.
   `bob launch a -- --tools` sends the literal prompt `--tools`;
