@@ -30,8 +30,8 @@ const README = process.env.BOB_README
   : join(import.meta.dir, "..", "README.md");
 
 // Flags the CLI rejects, named in issue #149. Kept small and explicit rather than
-// derived from `bob help`, which advertises `--interactive` in a "coming in a
-// later PR" parenthetical — that would mask the very failure this guards.
+// derived from `bob help`: the help lists what the CLI accepts, so it cannot name
+// what the CLI rejects.
 const RETIRED_FLAGS = ["--interactive"];
 
 // The extracted names (spans, fences and the table) must include these, else the extraction is trusted to
