@@ -239,7 +239,10 @@ describe("runDoctor", () => {
     expect(check?.detail).toMatch(/role/);
   });
 
-  it("OK on a bob.yaml whose tool allowlist is all real names", () => {
+  it("OK on a bob.yaml whose tool allowlist is all real names the agent can have", () => {
+    // `flair_search` is a real name AND this agent declares flair, so the
+    // session would hold it (round 3 reports a capability tool whose
+    // capability is not declared as a FAIL, so the OK case has to declare it).
     const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
     writeFileSync(
       join(agentDir, "bob.yaml"),
@@ -252,7 +255,9 @@ describe("runDoctor", () => {
         "  allow:",
         "    - read",
         "    - flair_search",
-        "    - discord_reply",
+        "",
+        "capabilities:",
+        "  - flair",
         "",
       ].join("\n"),
     );
@@ -303,6 +308,70 @@ describe("runDoctor", () => {
     expect(check?.fix).toContain("allowResidentShell");
     expect(check?.fix).toContain("roles/qa/role.json");
     expect(check?.fix).not.toMatch(/set tools\.allowResidentShell: true to keep them/);
+  });
+
+  it("FAIL when an allowlisted capability tool's capability is not declared", () => {
+    // A name can be real in bob's catalog and still not exist for THIS agent:
+    // pi enables only what the loaded capabilities register, and a session
+    // refuses such a name at load (round 3's audit). Doctor must not report OK
+    // for a config whose next run fails.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        `  role: ea`,
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - discord_reply",
+        "",
+        "capabilities:",
+        "  - flair",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("discord_reply");
+    expect(check?.detail).toContain("discord");
+    expect(check?.fix).toContain("capabilities:");
+  });
+
+  it("OK when the capability an allowlisted tool needs IS declared", () => {
+    // The flair capability is declared in the scaffold, so its tools are fine.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "",
+        "capabilities:",
+        "  - flair",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("ok");
   });
 
   it("WARN on pi auth.json mode != 0600 (contains API key)", () => {

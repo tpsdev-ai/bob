@@ -104,6 +104,12 @@ function unbuiltCapabilityTools(): Map<string, string> {
   return index;
 }
 
+// The blessed capability that provides a tool name, when one does. A name with
+// no capability behind it is a pi built-in (or unknown).
+export function capabilityForTool(name: string): string | undefined {
+  return builtCapabilityTools().get(name);
+}
+
 // The names an agent may allow: pi's built-ins plus the built capabilities'
 // tools. Sorted, for the error text and for doctor.
 export function knownToolNames(): string[] {

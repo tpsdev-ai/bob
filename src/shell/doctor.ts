@@ -18,9 +18,20 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readAgentRole, readResident, readTools, type ToolsBlock } from "./bob-yaml.js";
+import {
+  readAgentRole,
+  readCapabilities,
+  readResident,
+  readTools,
+  type ToolsBlock,
+} from "./bob-yaml.js";
 import { resolveAgentToolPolicy } from "./run.js";
-import { auditToolNames, residentDroppedTools, type ToolPolicy } from "./tool-allowlist.js";
+import {
+  auditToolNames,
+  capabilityForTool,
+  residentDroppedTools,
+  type ToolPolicy,
+} from "./tool-allowlist.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
@@ -310,6 +321,33 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
       fix: `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
     };
   }
+
+  // A name can be real in bob's catalog and still not exist for THIS agent: pi
+  // enables only the tools the loaded capabilities register, and the session
+  // REFUSES an allowlisted name that nothing provides, at load. Report that
+  // here, before any session, naming the capability to declare — otherwise
+  // doctor says OK for a config whose next run fails.
+  const declaredCapabilities = new Set(readCapabilities(yamlText));
+  const missingByCapability = new Map<string, string[]>();
+  for (const tool of policy.tools) {
+    const capability = capabilityForTool(tool);
+    if (capability === undefined || declaredCapabilities.has(capability)) continue;
+    const names = missingByCapability.get(capability) ?? [];
+    names.push(tool);
+    missingByCapability.set(capability, names);
+  }
+  if (missingByCapability.size > 0) {
+    const summary = [...missingByCapability]
+      .map(([capability, tools]) => `${capability} (${tools.join(", ")})`)
+      .join(", ");
+    return {
+      name,
+      status: "fail",
+      detail: `allowlisted tool${policy.tools.length === 1 ? "" : "s"} from a capability this agent does not declare: ${summary}`,
+      fix: `declare it in bob.yaml (capabilities:) and configure its block — a session refuses an allowlisted tool nothing provides — or drop ${[...missingByCapability.values()].flat().join(", ")} from tools.allow`,
+    };
+  }
+
   return {
     name,
     status: "ok",
