@@ -11,7 +11,7 @@
 // Flair roster and writes a metadata-only turn summary at turn end. It wires
 // FOUR subscriptions to pi and ONE beacon interval:
 //
-//   1. before_agent_start  — parse the (possibly tagged) prompt into a TurnOrigin
+//   1. before_agent_start  — read the turn's origin from the out-of-band registry (consumeTurnOrigin)
 //                             and stamp the turn start time. The origin is the
 //                             single source of truth for the busy-beat label and
 //                             the turn summary's origin field.
@@ -60,7 +60,8 @@
 //     A summary write never blocks the turn (fire-and-forget) and never throws
 //     into pi.
 
-import { originLabel, parseTurnOrigin, type TurnOrigin } from "../../shell/turn-origin.js";
+import { originLabel, type TurnOrigin } from "../../shell/turn-origin.js";
+import { consumeTurnOrigin } from "../../shell/turn-origin-registry.js";
 import type { Durability } from "../flair/client.js";
 import type { PresenceActivity, PresenceCapabilityConfig } from "./config.js";
 
@@ -196,17 +197,17 @@ function countAssistantMessages(messages: PresenceMessage[]): number {
   return n;
 }
 
-// Count tool calls by tool *name*. When `registeredTools` is provided, only
-// names in that set are counted by name; any other tool name — a model-supplied
-// name outside the registered set (e.g. "SECRET") — is bucketed under the "other"
-// key so a crafted tool name can never surface verbatim in the summary. Without
-// `registeredTools` (pure-function tests without a pi context) the count falls
-// back to counting by name, preserving backward compatibility. Neither path ever
-// reads a tool-result (the *output*) message — only toolCall *names* are counted,
-// so the counts carry no tool-output content.
+// Count tool calls by tool *name*. `registeredTools` is REQUIRED (round-3
+// item 3): only names in the registered set (from pi.getAllTools()) are counted
+// by name; any other tool name — a model-supplied name outside the registered
+// set (e.g. "SECRET") — is bucketed under the "other" key, so a crafted tool
+// name can never surface verbatim in the summary. There is no raw-name fallback:
+// an unregistered name is always "other". This never reads a tool-result (the
+// *output*) message — only toolCall *names* are counted, so the counts carry no
+// tool-output content.
 function countToolCallsByTool(
   messages: PresenceMessage[],
-  registeredTools?: Set<string>,
+  registeredTools: Set<string>,
 ): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const m of messages) {
@@ -218,8 +219,8 @@ function countToolCallsByTool(
       if (b.type === "toolCall" && typeof b.name === "string") {
         const name = b.name;
         // Count only registered tool names; an unknown, model-supplied name is
-        // bucketed under "other" (item 2) so it cannot surface verbatim.
-        const key = registeredTools && !registeredTools.has(name) ? "other" : name;
+        // bucketed under "other" (round-3 item 3) so it cannot surface verbatim.
+        const key = registeredTools.has(name) ? name : "other";
         counts[key] = (counts[key] ?? 0) + 1;
       }
     }
@@ -241,10 +242,10 @@ export interface BuildTurnSummaryArgs {
   endedAt: number; // epoch millis
   messages: PresenceMessage[];
   maxChars: number;
-  // Registered tool set (from pi.getAllTools()). A model-supplied tool name
-  // outside this set is bucketed under "other" (item 2: no crafted tool name
+  // Registered tool set (from pi.getAllTools()) — REQUIRED (round-3 item 3); a model-supplied tool name
+  // outside this set is bucketed under "other" (round-3 item 3: no crafted tool name
   // can surface verbatim in the summary).
-  registeredTools?: Set<string>;
+  registeredTools: Set<string>;
 }
 
 // Build the turn summary JSON string. The output is guaranteed to be at most
@@ -424,7 +425,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // The origin is the single source of truth for the busy-beat label and
   // the turn summary's origin field. `turnStartedAt` feeds durationMs.
   pi.on("before_agent_start", (e) => {
-    currentOrigin = parseTurnOrigin(e.prompt);
+    currentOrigin = consumeTurnOrigin(e.prompt);
     turnStartedAt = now();
   });
 

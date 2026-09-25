@@ -36,6 +36,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
+import { registerTurnOrigin } from "./turn-origin-registry.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -133,6 +134,10 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
         } catch {
           // proceed — pi serializes turns regardless
         }
+        // Record the cron origin in the runtime registry, keyed by the exact prompt
+        // about to be sent. The presence capability reads it back on before_agent_start;
+        // an unregistered / rejected prompt (e.g. an invalid job name) is run.
+        registerTurnOrigin(entry.prompt, { kind: "cron", job: entry.name });
         await session.prompt(entry.prompt);
       },
       log,
