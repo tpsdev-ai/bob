@@ -9,7 +9,7 @@ import { join } from "node:path";
 // The test reads the `bob <command>` names the README carries in three places —
 // inline code spans, fenced code blocks, and the Commands table — and fails if
 // the CLI rejects any of them. It also fails if the retired `--interactive` flag
-// appears in a code span or code fence (table cells are not scanned for flags).
+// appears as a word in a code span or code fence (table cells are not scanned for flags).
 //
 // Two vacuous-pass modes are closed:
 //  - a plain-text Commands-table row (no backticks) is read as a table cell,
