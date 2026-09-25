@@ -30,6 +30,7 @@ import {
   runOnboard,
   runPersistent,
   servicePath,
+  stringFlag,
   syncFlairSoul,
   up,
 } from "./shell/index.js";
@@ -81,8 +82,10 @@ Commands:
                       Flags: --role <r> --provider <p> --model <m>
                              --flair-url <u> --no-flair
                              --dry-run --force --no-interactive
-  align <name>        Recurring check-in to refine an existing agent. Mirrors
-                      the revised persona back into Flair.
+  align <name>        Recurring check-in to refine an existing agent. The session
+                      runs on the agent's own bob.yaml provider + model (the same
+                      pair 'bob run' uses); --provider / --model override just the
+                      field each names. Mirrors the revised persona into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
                              --no-flair
   run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
@@ -244,9 +247,13 @@ async function provisionOnboard(
 }
 
 async function align(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const provider = String(flags.provider ?? "ollama-cloud");
-  const model = String(flags.model ?? "kimi-k2.6");
-  const agentDir = String(flags["agent-dir"] ?? `${process.env.HOME}/agents/${name}`);
+  // #155 — the check-in runs on the agent's OWN provider and model, read from
+  // its bob.yaml by runAlign. A flag replaces only the field it names, and it is
+  // read the way `bob run` and `bob install-service` read one: a bare flag (no
+  // value) means "not given", never the literal text "true".
+  const provider = stringFlag(flags, "provider");
+  const model = stringFlag(flags, "model");
+  const agentDir = stringFlag(flags, "agent-dir") ?? `${process.env.HOME}/agents/${name}`;
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -309,7 +316,7 @@ async function run(
   prompt: string | undefined,
   flags: Record<string, string | boolean>,
 ): Promise<number> {
-  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  const model = stringFlag(flags, "model");
   // The interactive REPL on the SDK lands in a later phase-1 PR.
   if (flags.interactive === true) {
     console.error(
@@ -352,7 +359,7 @@ async function installServiceCmd(
     flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
       ? String(flags["bob-bin"])
       : process.argv[1] || "bob";
-  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  const model = stringFlag(flags, "model");
   const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
   console.log(`  runs:    ${bobBin} run ${name}`);

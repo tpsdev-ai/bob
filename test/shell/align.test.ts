@@ -10,12 +10,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runAlign } from "../../src/shell/align.js";
+import { stringFlag } from "../../src/shell/argv.js";
 import type { SessionRunner } from "../../src/shell/onboard.js";
 import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[] };
-  config: { appendSystemPrompt: string };
+  config: { appendSystemPrompt: string; provider: string; model: string };
   initialMessage: string;
 }
 
@@ -27,7 +28,11 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
   const runner: SessionRunner = async (input) => {
     const run: Run = {
       policy: { tools: [...input.policy.tools] },
-      config: { appendSystemPrompt: input.config.appendSystemPrompt },
+      config: {
+        appendSystemPrompt: input.config.appendSystemPrompt,
+        provider: input.config.provider,
+        model: input.config.model,
+      },
       initialMessage: input.initialMessage,
     };
     runs.push(run);
@@ -40,7 +45,10 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
 
 let agentDir: string;
 
-function scaffoldAgent(role = "ea"): void {
+function scaffoldAgent(
+  role = "ea",
+  provider: { name: string; model: string } = { name: "anthropic", model: "claude-sonnet-4-6" },
+): void {
   const root = mkdtempSync(join(tmpdir(), "bob-align-"));
   agentDir = join(root, "testbot");
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
@@ -55,8 +63,8 @@ function scaffoldAgent(role = "ea"): void {
       `  role: ${role}`,
       "",
       "provider:",
-      "  name: anthropic",
-      "  model: claude-sonnet-4-6",
+      `  name: ${provider.name}`,
+      `  model: ${provider.model}`,
       "",
       "tools:",
       "  allow:",
@@ -194,5 +202,92 @@ describe("runAlign", () => {
         sessionRunner: fakeRunner({}).runner,
       }),
     ).rejects.toThrow(/invalid agent name/);
+  });
+});
+
+// #155: the check-in runs on the agent's OWN provider and model. `bob align`
+// used to hand runAlign its own hardcoded defaults (`ollama-cloud` /
+// `kimi-k2.6`), so an alignment session could run on a different model than the
+// agent it was aligning. The fields are optional overrides now, and an override
+// replaces only the field it names.
+describe("runAlign — the agent's own provider and model (#155)", () => {
+  afterEach(() => {
+    rmSync(dirname(agentDir), { recursive: true, force: true });
+  });
+
+  it("carries bob.yaml's provider and model when neither flag is given", async () => {
+    scaffoldAgent(); // provider.name: anthropic, provider.model: claude-sonnet-4-6
+    const { runner, runs } = fakeRunner({});
+    await runAlign({ name: "testbot", agentDir, sessionRunner: runner });
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("maps bob.yaml's provider to pi's id exactly once", async () => {
+    // bob's `exe-dev-gateway` is pi's `anthropic` (see run.ts
+    // mapBobProviderToPi): the resolved value arrives already mapped, and
+    // runAlign must not map it a second time or hand pi bob's own name.
+    scaffoldAgent("ea", { name: "exe-dev-gateway", model: "claude-opus-4-7" });
+    const { runner, runs } = fakeRunner({});
+    await runAlign({ name: "testbot", agentDir, sessionRunner: runner });
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-opus-4-7");
+  });
+
+  it("--model alone replaces the model and keeps bob.yaml's provider", async () => {
+    scaffoldAgent();
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      model: stringFlag({ model: "claude-opus-4-7" }, "model"),
+      sessionRunner: runner,
+    });
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-opus-4-7");
+  });
+
+  it("--provider alone replaces the provider and keeps bob.yaml's model", async () => {
+    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      provider: stringFlag({ provider: "exe-dev-gateway" }, "provider"),
+      sessionRunner: runner,
+    });
+    // The override is a BOB provider name and is mapped once, at this boundary.
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("kimi-k2.6");
+  });
+
+  it("a bare --model (no value) is not a value: bob.yaml's model stays", async () => {
+    // What the CLI hands runAlign for `bob align testbot --model`: parseArgs
+    // yields `true` for a valueless flag, and stringFlag reads that as "not
+    // given" (the rule `bob run` and `bob install-service` already use). `bob
+    // run <name> --model` behaves the same way — the flag is treated as absent.
+    scaffoldAgent();
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      model: stringFlag({ model: true }, "model"),
+      sessionRunner: runner,
+    });
+    expect(runs[0].config.model).toBe("claude-sonnet-4-6");
+    expect(runs[0].config.provider).toBe("anthropic");
+  });
+
+  it("a bare --provider (no value) is not a value: bob.yaml's provider stays", async () => {
+    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      provider: stringFlag({ provider: true }, "provider"),
+      sessionRunner: runner,
+    });
+    expect(runs[0].config.provider).toBe("ollama-cloud");
+    expect(runs[0].config.model).toBe("kimi-k2.6");
   });
 });

@@ -23,8 +23,12 @@ const AGENT_NAME = /^[a-z0-9-]+$/;
 export interface AlignOptions {
   name: string;
   agentDir: string;
-  provider: string;
-  model: string;
+  // Optional per-check-in overrides. When absent the session runs on the
+  // agent's OWN provider and model, read from its bob.yaml — the same pair
+  // `bob run` uses (#155). `provider` names it the way bob.yaml does (a bob
+  // provider, mapped to pi's id here); setting one replaces only that field.
+  provider?: string;
+  model?: string;
   // Test seam: the interactive session. Defaults to pi's InteractiveMode over
   // bob's session runtime.
   sessionRunner?: SessionRunner;
@@ -83,8 +87,15 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   });
   const sessionConfig: RunSessionConfig = {
     ...config,
-    provider: mapBobProviderToPi(opts.provider),
-    model: opts.model,
+    // bob.yaml supplies both fields, the same pair `bob run` runs the agent on
+    // (#155) — an alignment check-in that ran on some other model was aligning
+    // an agent it was not looking at. An override replaces ONLY the field it
+    // names. resolveRunConfig has ALREADY mapped bob.yaml's provider to pi's id
+    // (run.ts resolveProviderAndModel), so `config.provider` is used as-is; a
+    // caller's provider is a bob name and is mapped here — once, at the
+    // boundary where a bob name enters.
+    provider: opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : config.provider,
+    model: opts.model ?? config.model,
     appendSystemPrompt: META_PROMPT(opts.name, soulPath),
   };
 
