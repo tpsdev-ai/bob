@@ -188,7 +188,7 @@ logger) tees each session event to a per-run JSONL log at
 `~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
 (a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
 Because the log exists for post-mortems — not for replaying a growing message —
-it is kept small and bounded:
+each record is a fixed shape for its event type, bounded like this:
 
 - **A projection, not a copy.** Each event is logged as a fixed set of fields for
   its type. Of the streamed updates, `message_update` logs the inner event's kind,
@@ -201,8 +201,12 @@ it is kept small and bounded:
   is an extension's own, and a session-state snapshot in it grows with the
   session. An event type bob does not know is logged as `{type, unknownEvent:
   true}` with none of its payload. That is what stops a record from growing with
-  the events before it; the log used to grow quadratically with message length
-  (15 GB of logs on a 40 GB builder disk). (`test/shell/run-log-projection.test.ts`
+  the EVENTS BEFORE IT; the log used to grow quadratically with message length
+  (15 GB of logs on a 40 GB builder disk). It does not make every record small:
+  the records that finalize something — `message_end`, `turn_end`, `agent_end`'s
+  per-run `messages`, a tool's `result` — each carry their payload once, and are
+  as large as that payload (see the closing note below).
+  (`test/shell/run-log-projection.test.ts`
   — "projects EVERY event type in pi 0.84.3's unions to a fixed, non-growing
   record", "logs NO payload for an event type the projection does not name", "logs
   a growing extension entry as its identity and size — flat across events";
