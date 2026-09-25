@@ -73,8 +73,10 @@ export interface RunSession {
    * NEXT turn instead of steering a new one. pi appends it to the session as a
    * custom message and delivers it with the next user turn, so a post-run
    * compaction starts no turn — and does not consume the reply destination the
-   * capability already used for the turn that just ended. Optional, so a
-   * one-shot test fake need not provide it.
+   * capability already used for the turn that just ended. The persistent
+   * runtime REQUIRES it — a session without it is rejected at setup, before it
+   * is announced as up (round 6) — while a one-shot test fake need not provide
+   * it.
    */
   sendCustomMessage?(
     message: { customType: string; content: string; display: boolean },

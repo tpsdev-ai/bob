@@ -121,6 +121,23 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   const factory = opts.sessionFactory ?? defaultPersistentFactory;
   const session = await factory(config);
 
+  // cli#145 round 6: a session that cannot attach the pinned block is not
+  // accepted for persistent use at all. The standing contract rides
+  // `sendCustomMessage` (delivered WITH the next prompt — see the reinjector
+  // below); a session without that seam would compact, keep accepting inbound
+  // prompts and serve them with the contract silently lost. There is no other
+  // attachment API, so that mode is not supported — reject it at setup, BEFORE
+  // the session is announced as up or wired into a prompt path. pi's
+  // AgentSession provides the seam, so this rejects a bespoke implementation,
+  // not production.
+  if (typeof session.sendCustomMessage !== "function") {
+    throw new Error(
+      `the session factory for "${opts.name}" returned a session with no sendCustomMessage: persistent use requires it, because the standing contract is attached to the session for its next prompt. Use a session factory whose session provides sendCustomMessage (pi's AgentSession does).`,
+    );
+  }
+  // Narrowed once, here after the guard; the injector below never re-checks.
+  const sendCustomMessage = session.sendCustomMessage.bind(session);
+
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
   // cli#145: subscribe to the SAME event seam the discord capability uses for
@@ -142,17 +159,12 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       // would drive a turn whose reply has nowhere to go. Attach the pinned block
       // to the NEXT turn instead — pi appends it to the session and delivers it
       // with the next prompt (Discord, cron or mail), which keeps its own reply
-      // routing. The one-shot runtime keeps the steer.
-      if (typeof session.sendCustomMessage === "function") {
-        return session.sendCustomMessage(
-          { customType: "bob-compaction-contract", content: text, display: false },
-          { deliverAs: "nextTurn" },
-        );
-      }
-      log(
-        "[bob] this session cannot attach the pinned block (no sendCustomMessage) — the block is dropped",
+      // routing. The one-shot runtime keeps the steer. (A session without this
+      // seam never reaches here: setup rejects it — there is no drop path.)
+      return sendCustomMessage(
+        { customType: "bob-compaction-contract", content: text, display: false },
+        { deliverAs: "nextTurn" },
       );
-      return Promise.resolve();
     },
     log,
   });
