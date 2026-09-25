@@ -489,7 +489,7 @@ export interface RunSessionConfig {
   // block. JSON values carry config only — NEVER a secret (schemas forbid an
   // inlined token; the discord capability holds only a token file PATH).
   capabilityEnv: Record<string, string>;
-  // True only for the PERSISTENT runtime (`bob serve`/runPersistent). Surfaced
+  // True only for the PERSISTENT runtime (`bob run <name>`/runPersistent). Surfaced
   // to capabilities via BOB_PERSISTENT so "serving" capabilities (e.g. discord's
   // inbound gateway listener) only open their connection persistently — a
   // one-shot `bob run` stays minimal (outbound tools, no gateway). Defaults
