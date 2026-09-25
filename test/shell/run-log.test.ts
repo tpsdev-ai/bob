@@ -526,6 +526,13 @@ describe("run-log sizing + retention (issue #146)", () => {
       // Present, names nothing at all.
       const empty = mk("empty", now - 6000);
       writeFileSync(`${empty}.lock`, "");
+      // Present, and a DEAD PID's digits followed by something that is not: a prefix
+      // parse (`Number.parseInt`) reads "<pid>garbage" as that pid and would prune
+      // the log on a number the lock never named. The whole content must be digits,
+      // so this is unparsable and KEPT (issue #146, round 7). The pid is a real
+      // finished child's, so the prefix parse would take the PRUNING branch.
+      const garbage = mk("garbage", now - 5500);
+      writeFileSync(`${garbage}.lock`, `${await deadPid()}garbage`);
       // Provably dead: a lock naming a finished child's PID -> prunable.
       const dead = mk("dead", now - 5000);
       writeFileSync(`${dead}.lock`, String(await deadPid()));
@@ -537,13 +544,14 @@ describe("run-log sizing + retention (issue #146)", () => {
       const res = pruneOldRunLogs(dir, { keep: 1, budgetBytes: 10 });
 
       // Kept: every log whose lock cannot be shown to be finished, plus the newest.
-      for (const name of ["unreadable", "unparsable", "empty", "newest"]) {
+      for (const name of ["unreadable", "unparsable", "empty", "garbage", "newest"]) {
         expect(res.removed, `${name} is kept`).not.toContain(`${name}.jsonl`);
         expect(existsSync(join(dir, `${name}.jsonl`)), `${name} still on disk`).toBe(true);
       }
       // The locks of the kept logs are left alone too.
       expect(existsSync(`${unreadable}.lock`)).toBe(true);
       expect(existsSync(`${unparsable}.lock`)).toBe(true);
+      expect(existsSync(`${garbage}.lock`)).toBe(true);
       // Pruned: the two logs we could positively show are finished.
       expect(res.removed).toContain("dead.jsonl");
       expect(res.removed).toContain("finished.jsonl");
@@ -553,6 +561,122 @@ describe("run-log sizing + retention (issue #146)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  it("keeps a growing extension entry flat: identity and size, never the entry", async () => {
+    // An extension that appends a session STATE snapshot makes each entry grow with
+    // the session, so logging `entry` whole would put that growth back into the log —
+    // the quadratic shape, one opaque payload away. Each record carries the entry's
+    // identity and the size of what it dropped instead, so the log grows with the
+    // NUMBER of entries and the snapshots themselves never reach disk.
+    const events: unknown[] = [];
+    for (const kb of [1, 16, 256, 4096]) {
+      events.push({
+        type: "entry_appended",
+        entry: {
+          type: "custom",
+          customType: "state-snapshot",
+          id: "e1",
+          parentId: null,
+          data: { seen: "z".repeat(kb * 1024) },
+        },
+      });
+    }
+    // One message ENDS, so the run settles 0; this test is about the entries.
+    events.push({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+    });
+
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(fakeSession(events)),
+      runLogCapBytes: 1 << 30,
+    });
+    expect(res.exitCode).toBe(0);
+
+    const log = readRunLog("testbot");
+    // biome-ignore lint/suspicious/noExplicitAny: log records are untyped
+    const entries = log.lines.map((l: any) => l.event).filter((e) => e?.type === "entry_appended");
+    expect(entries.length).toBe(4);
+    // Every record is small and the same size, whatever the entry that produced it.
+    const sizes = entries.map((e) => JSON.stringify(e).length);
+    expect(Math.max(...sizes)).toBeLessThan(128);
+    expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(4);
+    // Each one says what the entry was and how big it was — 4 MiB for the last.
+    expect(entries[3].entryType).toBe("custom");
+    expect(entries[3].entryCustomType).toBe("state-snapshot");
+    expect(entries[3].entryId).toBe("e1");
+    expect(entries[3].entryBytes).toBeGreaterThan(4_000_000);
+    // The snapshots the entries carried are NOT in the log: the whole file is a
+    // rounding error next to the ~4 MiB they held.
+    expect(log.raw).not.toContain("z".repeat(100));
+    expect(log.raw.length).toBeLessThan(4000);
+  });
+
+  it("a run that dies before message_end still records WHICH block each delta came from", async () => {
+    // One message streams several blocks — thinking, then text, then tool-call
+    // arguments — and each delta names its own block with `contentIndex`. The
+    // message_end that would describe the message as a whole never arrives when the
+    // run dies, so the deltas are all a reader has: without the block index they
+    // cannot be attributed or reassembled.
+    const events: unknown[] = [
+      {
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "thinking_delta",
+          contentIndex: 0,
+          delta: "hmm",
+          partial: { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }] },
+        },
+      },
+      {
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_delta",
+          contentIndex: 1,
+          delta: "I will ",
+          partial: { role: "assistant", content: [{ type: "text", text: "I will " }] },
+        },
+      },
+      {
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 2,
+          delta: '{"pa',
+          partial: { role: "assistant", content: [{ type: "toolCall", id: "tc-1" }] },
+        },
+      },
+    ];
+
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(
+        fakeSession(events, {
+          throwAfter: events.length,
+          throwError: new Error("simulated mid-run crash"),
+        }),
+      ),
+    });
+    expect(res.exitCode).toBe(1);
+
+    const log = readRunLog("testbot");
+    // No message_end was written: the deltas ARE the record of that message.
+    expect(log.lines.map(eventType)).not.toContain("message_end");
+    // biome-ignore lint/suspicious/noExplicitAny: log records are untyped
+    const updates = log.lines.map((l: any) => l.event).filter((e) => e?.type === "message_update");
+    expect(updates.map((u) => [u.kind, u.contentIndex])).toEqual([
+      ["thinking_delta", 0],
+      ["text_delta", 1],
+      ["toolcall_delta", 2],
+    ]);
+    // Placing a delta is all this is for: the payloads are still not logged.
+    expect(log.raw).not.toContain("partial");
+  });
+
   it("logs every agent_end's own messages, unchanged — nothing dropped when a later run is shorter (#139)", async () => {
     // pi emits one agent_end per low-level run, and its `messages` array holds
     // only that run's own messages — the agent loop builds each agent_end from

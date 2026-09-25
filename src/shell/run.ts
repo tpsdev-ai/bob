@@ -84,6 +84,13 @@ const AGENT_NAME = /^[a-z0-9-]+$/;
 // the deltas are dropped; `message_end` still records each final message once, so
 // content is recoverable there; a crash before a `message_end` loses that
 // message's post-cap tail.
+//
+// What this does NOT bound, just as plainly: the NON-delta records. They keep
+// coming past the cap without limit, and retention's budget is a sweep at run
+// start, not a per-run limit — so a run that emits hundreds of thousands of tool
+// events writes every one of them, and one run can exceed the budget before the
+// next run's sweep sees it. The cap bounds the deltas; the budget bounds what a
+// series of runs leaves behind.
 const DEFAULT_RUNLOG_DELTA_CAP_BYTES = 50 * 1024 * 1024; // 50 MB
 
 // RUNLOG_KEEP / RUNLOG_BUDGET_BYTES: on run start, the newest RUNLOG_KEEP logs
@@ -93,7 +100,12 @@ const DEFAULT_RUNLOG_DELTA_CAP_BYTES = 50 * 1024 * 1024; // 50 MB
 // fresh mtime keeps it in the newest-K window). Retention FAILS SAFE: a log is
 // pruned only when we can POSITIVELY show its run is finished — it has no lock at
 // all, or its lock names a provably dead PID. A lock that exists but cannot be
-// read, or whose content does not name a PID, is KEPT.
+// read, or whose content is not EXACTLY a PID (the whole content as digits), is
+// KEPT.
+//
+// The one state that would defeat that rule — an ACTIVE run whose log has no lock
+// at all — is not reachable: a run takes its lock BEFORE it creates its log file,
+// and a run that cannot take its lock writes no log (see runAgent's setup).
 const RUNLOG_KEEP = 5;
 const RUNLOG_BUDGET_BYTES = 500 * 1024 * 1024; // 500 MB for logs older than newest-K
 
@@ -117,6 +129,11 @@ export interface RunLogRetentionResult {
 //     lock unparsable       -> cannot show it is finished     -> KEEP (fail safe)
 //     lock names a dead PID -> ESRCH; the run is gone         -> prunable
 //
+// "Unparsable" means the whole content is not a PID — not merely that it starts
+// with something that is not one. `parseInt` reads the longest digit PREFIX, so
+// it turns "123garbage" into 123 and the lock's fate would turn on a number it
+// never named; the check below is digits-only, all of it.
+//
 // `process.kill(pid, 0)` probes liveness without signaling the target: it throws
 // ESRCH for a dead PID and EPERM for a live PID we can't signal (different uid),
 // so "no throw, or EPERM" means the run is live.
@@ -134,12 +151,22 @@ function logHasLiveLock(logPath: string): boolean {
     // We cannot show the run is finished, so keep the log.
     return true;
   }
-  const pid = Number.parseInt(raw.trim(), 10);
-  if (!Number.isInteger(pid) || pid <= 0) {
+  // The lock must name a PID and nothing else: the WHOLE trimmed content is
+  // digits. `Number.parseInt("123garbage", 10)` is 123, so a prefix test would
+  // read a lock whose content is not a PID as the PID 123 — and then decide the
+  // log's fate on it (prunable if that PID happens to be dead). Not a PID means
+  // unparsable, and unparsable KEEPS the log.
+  const text = raw.trim();
+  if (!/^[0-9]+$/.test(text)) {
     // The lock exists but does not name a PID. We cannot show the run is finished,
     // so keep the log.
     return true;
   }
+  const pid = Number(text);
+  // A digits-only string can still fail to be a PID: the empty string is refused
+  // above, a very long one overflows to Infinity, and 0 is not a PID. All three
+  // are unparsable, so they keep the log too.
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
   try {
     process.kill(pid, 0);
     return true; // live
@@ -214,18 +241,27 @@ export function pruneOldRunLogs(
 // AgentEvent and pi-coding-agent's AgentSessionEvent, enumerated from the
 // installed `.d.ts`) to exactly the fields worth logging.
 //
-//     - streamed updates log their increment only: message_update the inner
-//       event kind and its delta — never `partial` or `message`;
-//       tool_execution_update no `partialResult` (the result is logged once, on
-//       tool_execution_end); queue_update counts only; bash_execution_update its
-//       per-chunk delta;
+//     - streamed updates log their increment only: message_update the inner event
+//       kind, its content block index and its delta — never `partial` or
+//       `message`, and never the whole event. The other three name their bound
+//       exactly: tool_execution_update the call's IDENTIFIERS (no `partialResult`,
+//       the cumulative tool output, which is logged once on tool_execution_end),
+//       queue_update the COUNTS (never the steering/follow-up text), and
+//       bash_execution_update its per-chunk delta;
+//     - entry_appended logs a bounded SUMMARY of the entry it carries — its type
+//       (and a custom entry's `customType`), its id, and the serialized size — and
+//       never the entry itself: `entry` is an extension's own opaque payload, and
+//       an extension that appends a growing snapshot would otherwise put that
+//       growth back into the log;
 //     - `*_end` events log the final content exactly once;
 //     - an event type the projection does not name logs `{ type, unknownEvent:
 //       true }` and none of its payload.
 //
-// Because each record's shape depends only on the event's own named fields, a
-// record never grows with the events before it, so the log stays linear in the
-// number of events rather than in their accumulated payload.
+// Because each record's shape depends only on the event's own named fields, and a
+// value that can grow (the entry) is reduced to its size, a record never grows
+// with the events before it, so the log stays linear in the number of events
+// rather than in their accumulated payload. The records the DELTA cap does not
+// cover are NOT bounded by it — see DEFAULT_RUNLOG_DELTA_CAP_BYTES:
 
 // The event types the DELTA cap drops once it is hit (see
 // DEFAULT_RUNLOG_DELTA_CAP_BYTES): the streamed updates that repeat per stream
@@ -251,6 +287,20 @@ function randomLogSuffix(): string {
 
 // A session event as it reaches the log: pi's events, widened to a plain record.
 type EventRecord = Record<string, unknown>;
+
+// How many bytes a value takes when it is serialized, or 0 when it cannot be
+// serialized at all (a cycle) — the size WITHOUT the bytes, which is what lets a
+// record say how big the payload it dropped was. The intermediate string is not
+// kept; only its length is.
+function serializedBytes(value: unknown): number {
+  if (value === undefined) return 0;
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? 0 : Buffer.byteLength(json);
+  } catch {
+    return 0;
+  }
+}
 
 // Copy the named fields, dropping the ones the event does not carry, so a record
 // holds exactly what it logs (no `undefined` keys).
@@ -279,14 +329,23 @@ export function projectRunLogRecord(event: EventRecord): EventRecord {
     case "message_end":
       return projectFields(event, ["message"]);
 
-    // message_update: the inner stream event's KIND and its increment only. Never
-    // `partial` (the whole message so far) or `message` (its growing shallow copy)
-    // — that pair is what made the log quadratic. The delta reconstructs the
-    // message and message_end carries the final one once.
+    // message_update: the inner stream event's KIND, the content block it belongs
+    // to, and its increment only. Never `partial` (the whole message so far) or
+    // `message` (its growing shallow copy) — that pair is what made the log
+    // quadratic. The delta reconstructs the message and message_end carries the
+    // final one once.
     case "message_update": {
       const inner = (event.assistantMessageEvent ?? {}) as EventRecord;
       const out: EventRecord = { type };
       if (inner.type !== undefined) out.kind = inner.type;
+      // `contentIndex` is the delta's OWN block (pi-ai's AssistantMessageEvent:
+      // every text/thinking/tool-call event carries it). Without it a delta is
+      // just text with no place to go: the message as a whole arrives on
+      // message_end, so a run that dies before one would leave deltas from
+      // several blocks — thinking, text, tool-call arguments — that nothing can
+      // attribute or reassemble. It is a small integer per delta, so keeping it
+      // costs nothing and does not grow.
+      if (inner.contentIndex !== undefined) out.contentIndex = inner.contentIndex;
       if (inner.delta !== undefined) out.delta = inner.delta;
       return out;
     }
@@ -341,8 +400,22 @@ export function projectRunLogRecord(event: EventRecord): EventRecord {
     case "summarization_retry_attempt_start":
       return projectFields(event, ["source", "reason"]);
 
-    case "entry_appended":
-      return projectFields(event, ["entry"]);
+    // entry_appended: a BOUNDED SUMMARY of the entry, never the entry. `entry` is
+    // an extension's own opaque payload (session-manager.d.ts: CustomEntry.data,
+    // BranchSummaryEntry.details, CustomMessageEntry.content), and an extension
+    // that appends a growing state snapshot makes the entry grow with the SESSION,
+    // not with the event — logging it whole re-introduces exactly the growth this
+    // projection removes. Identity and size instead: what it was, and what it
+    // would have cost to keep.
+    case "entry_appended": {
+      const entry = (event.entry ?? {}) as EventRecord;
+      const out: EventRecord = { type };
+      if (entry.type !== undefined) out.entryType = entry.type;
+      if (entry.customType !== undefined) out.entryCustomType = entry.customType;
+      if (entry.id !== undefined) out.entryId = entry.id;
+      out.entryBytes = serializedBytes(event.entry);
+      return out;
+    }
     case "session_info_changed":
       return projectFields(event, ["name"]);
     case "thinking_level_changed":
@@ -593,26 +666,45 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     // (3) ONE log per run, even when two runs start in the same millisecond: the
     // name carries the start timestamp, the run's PID and a random suffix, so
-    // distinct runs get distinct files — and therefore distinct locks. Created
-    // EXCLUSIVELY (`wx`), so an existing path is never clobbered.
+    // distinct runs get distinct files — and therefore distinct locks.
     const runLogName = `${now().toISOString().replace(/[:.]/g, "-")}.${process.pid}.${randomLogSuffix()}.jsonl`;
     const runLogPath = join(runsDir, runLogName);
-    closeSync(openSync(runLogPath, "wx"));
-    process.stderr.write(`run log: ${runLogPath}\n`);
 
-    // (4) Sidecar lock: while this run writes its log it holds `<log>.lock` naming
-    // its PID; retention reads it to leave a live run's log alone. The lock belongs
-    // to this log file alone (the name above is unique), and is created exclusively
+    // (4) The sidecar lock FIRST, before the log file exists: while this run writes
+    // its log it holds `<log>.lock` naming its PID, and retention reads exactly that
+    // to leave a live run's log alone. Taking it first means there is no window in
+    // which an ACTIVE log has no lock — an unlocked `.jsonl` cannot be told from a
+    // crashed run's, which is what makes it prunable, so a concurrent run's sweep
+    // (or this agent's next run) would delete it under its writer. The lock belongs
+    // to this log file alone (the name above is unique) and is created exclusively
     // too. Removed at run end.
     runLogLockPath = `${runLogPath}.lock`;
     try {
       writeFileSync(runLogLockPath, String(process.pid), { flag: "wx" });
-    } catch {
-      // Best-effort: without a lock, retention can't show this run is live and may
-      // prune the log — the pre-existing caveat, unchanged.
+    } catch (err) {
+      // NO LOCK, NO LOG (issue #146, round 7): this used to be swallowed and the log
+      // kept being written, which produced the one log retention is allowed to
+      // delete — an ACTIVE one with no lock, deleted under the writer by the next
+      // run's sweep. A run that cannot hold its lock writes no log at all instead:
+      // the log file is never created (the lock is taken first), and the warning
+      // below is its only trace. A lock this run did not create is never removed —
+      // if the write failed because the path already existed, that lock is someone
+      // else's, so `runLogLockPath` is cleared and run end leaves it alone.
+      runLogLockPath = "";
+      const reason = err instanceof Error ? err.message : String(err);
+      // Re-thrown so the ONE setup warning names it: this catch KNOWS which step
+      // failed (the lock) rather than guessing it, which is the point of round 6's
+      // warning and this one's.
+      throw new Error(`the run-log lock could not be created (${reason})`);
     }
 
-    // (5) The DELTA cap: the per-run limit on the STREAMED DELTA events
+    // (5) The log file itself, created EXCLUSIVELY (`wx`) so an existing path is
+    // never clobbered; the line naming it comes after it exists, so the path is
+    // announced only for a log that is really there.
+    closeSync(openSync(runLogPath, "wx"));
+    process.stderr.write(`run log: ${runLogPath}\n`);
+
+    // (6) The DELTA cap: the per-run limit on the STREAMED DELTA events
     // (isDeltaEvent). Past it those deltas are dropped; every NON-delta event — tool
     // calls and results, errors, lifecycle, the *_end finals, the done line — keeps
     // coming, and exactly one line records that the DELTA cap was hit.
@@ -656,10 +748,13 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       }
     };
   } catch (err) {
-    // Setting up the log failed — creating the runs directory, naming the file, or
-    // opening it. Warn once, name the real cause and the directory it happened in
-    // (never a guessed step, since this catch covers all three), and continue with
-    // the no-op logger: logging never throws into the run.
+    // Setting up the log failed — creating the runs directory, creating the lock,
+    // naming the file, or opening it. Warn once, name the real cause and the
+    // directory it happened in (never a guessed step, since this catch covers all
+    // four; the lock's own failure carries its step with it), and continue with the
+    // no-op logger: logging never throws into the run. A lock taken before a later
+    // step failed is dropped at run end; a leaked one names a now-dead PID, which
+    // the next sweep treats as a finished run's.
     const reason = err instanceof Error ? err.message : String(err);
     process.stderr.write(
       `bob run ${opts.name}: run log unavailable in ${runsDir} (${reason}); continuing without a run log\n`,

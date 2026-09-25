@@ -16,12 +16,28 @@
 //      streamed updates carry no cumulative result.
 //   3. One log per run, even in the same millisecond: the name carries the
 //      timestamp, the pid and a random suffix, created exclusively; the lock
-//      belongs to that file alone.
-//   4. Logging never throws into the run — including creating the runs directory:
-//      the run completes and warns once.
+//      belongs to that file alone — and it is taken BEFORE the log file exists, so
+//      an active log never exists without one.
+//   4. Logging never throws into the run — including creating the runs directory,
+//      and including a lock that cannot be created: that one means NO log at all
+//      (an active, unlocked log is the one log retention may delete), one warning.
+//   5. A value that can grow is reduced to its SIZE: an extension's `entry_appended`
+//      payload is logged as the entry's identity and byte count, so a growing
+//      snapshot does not put its growth back into the log.
+//   6. A streamed delta keeps the content block it belongs to (`contentIndex`): a
+//      run that dies before its `message_end` leaves deltas that can still be
+//      placed.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
@@ -30,6 +46,12 @@ import { projectRunLogRecord, runAgent } from "../../src/shell/run.js";
 type EventRecord = Record<string, unknown>;
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
+
+// One test below makes a write fail by removing write permission from a directory,
+// which root ignores — so it is SKIPPED for root rather than reported as a false
+// failure. Everywhere the suite actually runs (a CI runner, a build agent) the uid
+// is a normal one; the skip says so instead of hiding it.
+const IS_ROOT = (process.getuid?.() ?? 0) === 0;
 
 // The event type names pi 0.84.3's two event unions actually declare, read out of
 // the INSTALLED `.d.ts` files rather than copied into this test: "every event type
@@ -82,295 +104,340 @@ const toolResult = { content: [{ type: "text", text: "done" }], details: {} };
 // One case per event type: `small` and `big` carry the SAME whitelisted fields and
 // differ only in what the projection must drop, so any record that grows between
 // them is a leaked field.
-const cases: Array<{ type: string; small: EventRecord; big: EventRecord; expected: EventRecord }> =
-  [
-    {
-      type: "agent_start",
-      small: { type: "agent_start" },
-      big: { type: "agent_start", extraPayload: BIG },
-      expected: { type: "agent_start" },
-    },
-    {
-      type: "turn_start",
-      small: { type: "turn_start" },
-      big: { type: "turn_start", extraPayload: BIG },
-      expected: { type: "turn_start" },
-    },
-    {
-      type: "agent_settled",
-      small: { type: "agent_settled" },
-      big: { type: "agent_settled", extraPayload: BIG },
-      expected: { type: "agent_settled" },
-    },
-    {
-      type: "summarization_retry_finished",
-      small: { type: "summarization_retry_finished" },
-      big: { type: "summarization_retry_finished", extraPayload: BIG },
-      expected: { type: "summarization_retry_finished" },
-    },
-    {
-      type: "message_start",
-      small: { type: "message_start", message: smallMessage },
-      big: { type: "message_start", message: smallMessage, extraPayload: BIG },
-      expected: { type: "message_start", message: smallMessage },
-    },
-    {
-      type: "message_end",
-      small: { type: "message_end", message: smallMessage },
-      big: { type: "message_end", message: smallMessage, extraPayload: BIG },
-      expected: { type: "message_end", message: smallMessage },
-    },
-    {
-      // The quadratic pair lives here: `partial` and `message` grow on every
-      // streamed token. Only the inner event kind and its delta are logged.
+const cases: Array<{
+  type: string;
+  small: EventRecord;
+  big: EventRecord;
+  // The record the projection must produce. A function of the input for the one
+  // case whose record legitimately carries a value derived from the payload (the
+  // serialized SIZE of the entry in `entry_appended`).
+  expected: EventRecord | ((input: EventRecord) => EventRecord);
+  // How much the record's SIZE may differ between `small` and `big` — 0 (the
+  // default) for every field that is copied, and the digits of a count where the
+  // record carries one.
+  sizeSlack?: number;
+}> = [
+  {
+    type: "agent_start",
+    small: { type: "agent_start" },
+    big: { type: "agent_start", extraPayload: BIG },
+    expected: { type: "agent_start" },
+  },
+  {
+    type: "turn_start",
+    small: { type: "turn_start" },
+    big: { type: "turn_start", extraPayload: BIG },
+    expected: { type: "turn_start" },
+  },
+  {
+    type: "agent_settled",
+    small: { type: "agent_settled" },
+    big: { type: "agent_settled", extraPayload: BIG },
+    expected: { type: "agent_settled" },
+  },
+  {
+    type: "summarization_retry_finished",
+    small: { type: "summarization_retry_finished" },
+    big: { type: "summarization_retry_finished", extraPayload: BIG },
+    expected: { type: "summarization_retry_finished" },
+  },
+  {
+    type: "message_start",
+    small: { type: "message_start", message: smallMessage },
+    big: { type: "message_start", message: smallMessage, extraPayload: BIG },
+    expected: { type: "message_start", message: smallMessage },
+  },
+  {
+    type: "message_end",
+    small: { type: "message_end", message: smallMessage },
+    big: { type: "message_end", message: smallMessage, extraPayload: BIG },
+    expected: { type: "message_end", message: smallMessage },
+  },
+  {
+    // The quadratic pair lives here: `partial` and `message` grow on every
+    // streamed token. Only the inner event kind and its delta are logged.
+    type: "message_update",
+    small: {
       type: "message_update",
-      small: {
-        type: "message_update",
-        assistantMessageEvent: {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: "tok",
-          partial: smallMessage,
-        },
-        message: smallMessage,
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "tok",
+        partial: smallMessage,
       },
-      big: {
-        type: "message_update",
-        assistantMessageEvent: {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: "tok",
-          partial: { role: "assistant", content: [{ type: "text", text: BIG }] },
-        },
-        message: { role: "assistant", content: [{ type: "text", text: BIG }] },
-        extraPayload: BIG,
-      },
-      expected: { type: "message_update", kind: "text_delta", delta: "tok" },
+      message: smallMessage,
     },
-    {
+    big: {
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "tok",
+        partial: { role: "assistant", content: [{ type: "text", text: BIG }] },
+      },
+      message: { role: "assistant", content: [{ type: "text", text: BIG }] },
+      extraPayload: BIG,
+    },
+    expected: { type: "message_update", kind: "text_delta", contentIndex: 0, delta: "tok" },
+  },
+  {
+    type: "tool_execution_start",
+    small: {
       type: "tool_execution_start",
-      small: {
-        type: "tool_execution_start",
-        toolCallId: "tc-1",
-        toolName: "read",
-        args: { path: "a" },
-      },
-      big: {
-        type: "tool_execution_start",
-        toolCallId: "tc-1",
-        toolName: "read",
-        args: { path: "a" },
-        extraPayload: BIG,
-      },
-      expected: {
-        type: "tool_execution_start",
-        toolCallId: "tc-1",
-        toolName: "read",
-        args: { path: "a" },
-      },
+      toolCallId: "tc-1",
+      toolName: "read",
+      args: { path: "a" },
     },
-    {
-      // `partialResult` is the CUMULATIVE tool output: a long bash run streams the
-      // whole output on every update. None of it is logged; the result arrives once
-      // on tool_execution_end.
+    big: {
+      type: "tool_execution_start",
+      toolCallId: "tc-1",
+      toolName: "read",
+      args: { path: "a" },
+      extraPayload: BIG,
+    },
+    expected: {
+      type: "tool_execution_start",
+      toolCallId: "tc-1",
+      toolName: "read",
+      args: { path: "a" },
+    },
+  },
+  {
+    // `partialResult` is the CUMULATIVE tool output: a long bash run streams the
+    // whole output on every update. None of it is logged; the result arrives once
+    // on tool_execution_end.
+    type: "tool_execution_update",
+    small: {
       type: "tool_execution_update",
-      small: {
-        type: "tool_execution_update",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        args: { command: "build" },
-        partialResult: { content: [{ type: "text", text: "step 1" }], details: {} },
-      },
-      big: {
-        type: "tool_execution_update",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        args: { command: "build" },
-        partialResult: { content: [{ type: "text", text: BIG }], details: {} },
-        extraPayload: BIG,
-      },
-      expected: { type: "tool_execution_update", toolCallId: "tc-1", toolName: "bash" },
+      toolCallId: "tc-1",
+      toolName: "bash",
+      args: { command: "build" },
+      partialResult: { content: [{ type: "text", text: "step 1" }], details: {} },
     },
-    {
+    big: {
+      type: "tool_execution_update",
+      toolCallId: "tc-1",
+      toolName: "bash",
+      args: { command: "build" },
+      partialResult: { content: [{ type: "text", text: BIG }], details: {} },
+      extraPayload: BIG,
+    },
+    expected: { type: "tool_execution_update", toolCallId: "tc-1", toolName: "bash" },
+  },
+  {
+    type: "tool_execution_end",
+    small: {
       type: "tool_execution_end",
-      small: {
-        type: "tool_execution_end",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        result: toolResult,
-        isError: false,
-      },
-      big: {
-        type: "tool_execution_end",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        result: toolResult,
-        isError: false,
-        extraPayload: BIG,
-      },
-      expected: {
-        type: "tool_execution_end",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        result: toolResult,
-        isError: false,
-      },
+      toolCallId: "tc-1",
+      toolName: "bash",
+      result: toolResult,
+      isError: false,
     },
-    {
+    big: {
+      type: "tool_execution_end",
+      toolCallId: "tc-1",
+      toolName: "bash",
+      result: toolResult,
+      isError: false,
+      extraPayload: BIG,
+    },
+    expected: {
+      type: "tool_execution_end",
+      toolCallId: "tc-1",
+      toolName: "bash",
+      result: toolResult,
+      isError: false,
+    },
+  },
+  {
+    type: "turn_end",
+    small: { type: "turn_end", message: smallMessage, toolResults: [{ toolCallId: "tc-1" }] },
+    big: {
       type: "turn_end",
-      small: { type: "turn_end", message: smallMessage, toolResults: [{ toolCallId: "tc-1" }] },
-      big: {
-        type: "turn_end",
-        message: smallMessage,
-        toolResults: [{ toolCallId: "tc-1" }],
-        extraPayload: BIG,
-      },
-      expected: { type: "turn_end", message: smallMessage, toolResults: [{ toolCallId: "tc-1" }] },
+      message: smallMessage,
+      toolResults: [{ toolCallId: "tc-1" }],
+      extraPayload: BIG,
     },
-    {
-      // Each agent_end carries only ITS OWN run's messages (issue #139), so the
-      // array is logged unchanged — never sliced against an earlier run's count.
-      type: "agent_end",
-      small: { type: "agent_end", messages: [smallMessage], willRetry: false },
-      big: { type: "agent_end", messages: [smallMessage], willRetry: false, extraPayload: BIG },
-      expected: { type: "agent_end", messages: [smallMessage], willRetry: false },
-    },
-    {
-      // The whole steering/follow-up TEXT is what accumulates, so only the counts
-      // are logged. Same counts, bigger text: the same record.
-      type: "queue_update",
-      small: { type: "queue_update", steering: ["steer"], followUp: ["later"] },
-      big: { type: "queue_update", steering: [BIG], followUp: [BIG] },
-      expected: { type: "queue_update", steeringCount: 1, followUpCount: 1 },
-    },
-    {
-      type: "bash_execution_update",
-      small: { type: "bash_execution_update", id: "bash-1", delta: "chunk" },
-      big: { type: "bash_execution_update", id: "bash-1", delta: "chunk", extraPayload: BIG },
-      expected: { type: "bash_execution_update", id: "bash-1", delta: "chunk" },
-    },
-    {
-      type: "compaction_start",
-      small: { type: "compaction_start", reason: "threshold" },
-      big: { type: "compaction_start", reason: "threshold", extraPayload: BIG },
-      expected: { type: "compaction_start", reason: "threshold" },
-    },
-    {
+    expected: { type: "turn_end", message: smallMessage, toolResults: [{ toolCallId: "tc-1" }] },
+  },
+  {
+    // Each agent_end carries only ITS OWN run's messages (issue #139), so the
+    // array is logged unchanged — never sliced against an earlier run's count.
+    type: "agent_end",
+    small: { type: "agent_end", messages: [smallMessage], willRetry: false },
+    big: { type: "agent_end", messages: [smallMessage], willRetry: false, extraPayload: BIG },
+    expected: { type: "agent_end", messages: [smallMessage], willRetry: false },
+  },
+  {
+    // The whole steering/follow-up TEXT is what accumulates, so only the counts
+    // are logged. Same counts, bigger text: the same record.
+    type: "queue_update",
+    small: { type: "queue_update", steering: ["steer"], followUp: ["later"] },
+    big: { type: "queue_update", steering: [BIG], followUp: [BIG] },
+    expected: { type: "queue_update", steeringCount: 1, followUpCount: 1 },
+  },
+  {
+    type: "bash_execution_update",
+    small: { type: "bash_execution_update", id: "bash-1", delta: "chunk" },
+    big: { type: "bash_execution_update", id: "bash-1", delta: "chunk", extraPayload: BIG },
+    expected: { type: "bash_execution_update", id: "bash-1", delta: "chunk" },
+  },
+  {
+    type: "compaction_start",
+    small: { type: "compaction_start", reason: "threshold" },
+    big: { type: "compaction_start", reason: "threshold", extraPayload: BIG },
+    expected: { type: "compaction_start", reason: "threshold" },
+  },
+  {
+    type: "compaction_end",
+    small: {
       type: "compaction_end",
-      small: {
-        type: "compaction_end",
-        reason: "threshold",
-        result: { summary: "s" },
-        aborted: false,
-        willRetry: false,
-      },
-      big: {
-        type: "compaction_end",
-        reason: "threshold",
-        result: { summary: "s" },
-        aborted: false,
-        willRetry: false,
-        extraPayload: BIG,
-      },
-      expected: {
-        type: "compaction_end",
-        reason: "threshold",
-        result: { summary: "s" },
-        aborted: false,
-        willRetry: false,
-      },
+      reason: "threshold",
+      result: { summary: "s" },
+      aborted: false,
+      willRetry: false,
     },
-    {
+    big: {
+      type: "compaction_end",
+      reason: "threshold",
+      result: { summary: "s" },
+      aborted: false,
+      willRetry: false,
+      extraPayload: BIG,
+    },
+    expected: {
+      type: "compaction_end",
+      reason: "threshold",
+      result: { summary: "s" },
+      aborted: false,
+      willRetry: false,
+    },
+  },
+  {
+    type: "auto_retry_start",
+    small: {
       type: "auto_retry_start",
-      small: {
-        type: "auto_retry_start",
-        attempt: 1,
-        maxAttempts: 3,
-        delayMs: 100,
-        errorMessage: "overloaded",
-      },
-      big: {
-        type: "auto_retry_start",
-        attempt: 1,
-        maxAttempts: 3,
-        delayMs: 100,
-        errorMessage: "overloaded",
-        extraPayload: BIG,
-      },
-      expected: {
-        type: "auto_retry_start",
-        attempt: 1,
-        maxAttempts: 3,
-        delayMs: 100,
-        errorMessage: "overloaded",
-      },
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 100,
+      errorMessage: "overloaded",
     },
-    {
+    big: {
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 100,
+      errorMessage: "overloaded",
+      extraPayload: BIG,
+    },
+    expected: {
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 100,
+      errorMessage: "overloaded",
+    },
+  },
+  {
+    type: "auto_retry_end",
+    small: { type: "auto_retry_end", success: false, attempt: 2, finalError: "overloaded" },
+    big: {
       type: "auto_retry_end",
-      small: { type: "auto_retry_end", success: false, attempt: 2, finalError: "overloaded" },
-      big: {
-        type: "auto_retry_end",
-        success: false,
-        attempt: 2,
-        finalError: "overloaded",
-        extraPayload: BIG,
-      },
-      expected: { type: "auto_retry_end", success: false, attempt: 2, finalError: "overloaded" },
+      success: false,
+      attempt: 2,
+      finalError: "overloaded",
+      extraPayload: BIG,
     },
-    {
+    expected: { type: "auto_retry_end", success: false, attempt: 2, finalError: "overloaded" },
+  },
+  {
+    type: "summarization_retry_scheduled",
+    small: {
       type: "summarization_retry_scheduled",
-      small: {
-        type: "summarization_retry_scheduled",
-        attempt: 1,
-        maxAttempts: 2,
-        delayMs: 50,
-        errorMessage: "rate limit",
-      },
-      big: {
-        type: "summarization_retry_scheduled",
-        attempt: 1,
-        maxAttempts: 2,
-        delayMs: 50,
-        errorMessage: "rate limit",
-        extraPayload: BIG,
-      },
-      expected: {
-        type: "summarization_retry_scheduled",
-        attempt: 1,
-        maxAttempts: 2,
-        delayMs: 50,
-        errorMessage: "rate limit",
-      },
+      attempt: 1,
+      maxAttempts: 2,
+      delayMs: 50,
+      errorMessage: "rate limit",
     },
-    {
+    big: {
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 2,
+      delayMs: 50,
+      errorMessage: "rate limit",
+      extraPayload: BIG,
+    },
+    expected: {
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 2,
+      delayMs: 50,
+      errorMessage: "rate limit",
+    },
+  },
+  {
+    type: "summarization_retry_attempt_start",
+    small: { type: "summarization_retry_attempt_start", source: "branchSummary" },
+    big: {
       type: "summarization_retry_attempt_start",
-      small: { type: "summarization_retry_attempt_start", source: "branchSummary" },
-      big: {
-        type: "summarization_retry_attempt_start",
-        source: "branchSummary",
-        extraPayload: BIG,
-      },
-      expected: { type: "summarization_retry_attempt_start", source: "branchSummary" },
+      source: "branchSummary",
+      extraPayload: BIG,
     },
-    {
-      type: "session_info_changed",
-      small: { type: "session_info_changed", name: "s" },
-      big: { type: "session_info_changed", name: "s", extraPayload: BIG },
-      expected: { type: "session_info_changed", name: "s" },
-    },
-    {
-      type: "thinking_level_changed",
-      small: { type: "thinking_level_changed", level: "high" },
-      big: { type: "thinking_level_changed", level: "high", extraPayload: BIG },
-      expected: { type: "thinking_level_changed", level: "high" },
-    },
-    {
+    expected: { type: "summarization_retry_attempt_start", source: "branchSummary" },
+  },
+  {
+    type: "session_info_changed",
+    small: { type: "session_info_changed", name: "s" },
+    big: { type: "session_info_changed", name: "s", extraPayload: BIG },
+    expected: { type: "session_info_changed", name: "s" },
+  },
+  {
+    type: "thinking_level_changed",
+    small: { type: "thinking_level_changed", level: "high" },
+    big: { type: "thinking_level_changed", level: "high", extraPayload: BIG },
+    expected: { type: "thinking_level_changed", level: "high" },
+  },
+  {
+    // `entry` is an extension's own opaque payload, and an extension whose entry
+    // is a session STATE snapshot makes it grow with the session. Only a bounded
+    // summary is logged: what the entry was, and how many bytes it would have
+    // taken. Its `data` never reaches the log.
+    type: "entry_appended",
+    small: {
       type: "entry_appended",
-      small: { type: "entry_appended", entry: { id: "e1" } },
-      big: { type: "entry_appended", entry: { id: "e1" }, extraPayload: BIG },
-      expected: { type: "entry_appended", entry: { id: "e1" } },
+      entry: {
+        type: "custom",
+        customType: "artifact-index",
+        id: "e1",
+        parentId: null,
+        data: "x".repeat(64),
+      },
     },
-  ];
+    big: {
+      type: "entry_appended",
+      entry: {
+        type: "custom",
+        customType: "artifact-index",
+        id: "e1",
+        parentId: null,
+        data: "x".repeat(64 * 1024),
+      },
+      extraPayload: BIG,
+    },
+    // `entryBytes` is the ONE field the projection derives from the payload, so
+    // the expected record computes it: a NUMBER, whose whole cost is its decimal
+    // digits (hence the sizeSlack below). The record itself stays ~60 bytes while
+    // the entry grows 1,024-fold.
+    expected: (input: EventRecord) => ({
+      type: "entry_appended",
+      entryType: "custom",
+      entryCustomType: "artifact-index",
+      entryId: "e1",
+      entryBytes: Buffer.byteLength(JSON.stringify(input.entry)),
+    }),
+    sizeSlack: 8,
+  },
+];
 
 describe("run-log projection (issue #146, round 5)", () => {
   it("projects EVERY event type in pi 0.84.3's unions to a fixed, non-growing record", () => {
@@ -381,15 +448,16 @@ describe("run-log projection (issue #146, round 5)", () => {
     expect(names.length).toBe(23);
     expect(cases.map((c) => c.type).sort()).toEqual(names);
     for (const c of cases) {
+      const expectedOf = (input: EventRecord): EventRecord =>
+        typeof c.expected === "function" ? c.expected(input) : c.expected;
       const small = projectRunLogRecord(c.small);
       const big = projectRunLogRecord(c.big);
-      expect(small, `${c.type}: named fields only`).toEqual(c.expected);
-      expect(big, `${c.type}: named fields only`).toEqual(c.expected);
+      expect(small, `${c.type}: named fields only`).toEqual(expectedOf(c.small));
+      expect(big, `${c.type}: named fields only`).toEqual(expectedOf(c.big));
       // A record whose size does not grow with the payload a whole-copy logger
       // would carry (the accumulated snapshot, or an unnamed extra field).
-      expect(JSON.stringify(big).length, `${c.type}: size does not grow`).toBe(
-        JSON.stringify(small).length,
-      );
+      const grew = Math.abs(JSON.stringify(big).length - JSON.stringify(small).length);
+      expect(grew, `${c.type}: size does not grow`).toBeLessThanOrEqual(c.sizeSlack ?? 0);
       expect(JSON.stringify(big), `${c.type}: no leaked payload`).not.toContain("extraPayload");
     }
   });
@@ -405,6 +473,71 @@ describe("run-log projection (issue #146, round 5)", () => {
     expect(JSON.stringify(unknown).length).toBeLessThan(64);
     // Not even a type-less event leaks: it is still just an unrecognised event.
     expect(projectRunLogRecord({ payload: BIG })).toEqual({ unknownEvent: true });
+  });
+
+  it("logs a growing extension entry as its identity and size — flat across events", () => {
+    // `entry` is opaque to bob and can be a session STATE snapshot an extension
+    // rebuilds as the session grows. Every entry_appended must then cost a fixed,
+    // small record — the entry's identity and the size of what was dropped — so the
+    // log grows with the NUMBER of entries, never with the state they describe.
+    const sizes: number[] = [];
+    const bytes: number[] = [];
+    for (const kb of [1, 8, 64, 512, 4096]) {
+      const record = projectRunLogRecord({
+        type: "entry_appended",
+        entry: {
+          type: "custom",
+          customType: "state-snapshot",
+          id: "e1",
+          parentId: null,
+          data: { seen: "y".repeat(kb * 1024) },
+        },
+      });
+      const json = JSON.stringify(record);
+      expect(json).not.toContain("data");
+      expect(record.entryType).toBe("custom");
+      expect(record.entryCustomType).toBe("state-snapshot");
+      expect(record.entryId).toBe("e1");
+      sizes.push(json.length);
+      bytes.push(record.entryBytes as number);
+    }
+    // The entry grew 4,096-fold; the record grew only by the digits of its size
+    // field, and stays a rounding error next to what it dropped.
+    expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(4);
+    expect(Math.max(...sizes)).toBeLessThan(128);
+    // The size field is the serialized size of the entry, so a reader can tell a
+    // marker from a snapshot without the snapshot being logged.
+    expect(bytes[0]).toBeLessThan(2000);
+    expect(bytes[4]).toBeGreaterThan(4_000_000);
+  });
+
+  it("keeps the delta's content block index, so a dead run's deltas can be placed", () => {
+    // One message streams SEVERAL blocks — thinking, text, tool-call arguments — and
+    // each delta names its own block with `contentIndex` (pi-ai's
+    // AssistantMessageEvent). Without it a post-mortem of a run that died before
+    // its `message_end` has deltas with nowhere to go: nothing says which block
+    // each one belonged to.
+    const blocks: Array<[string, number]> = [
+      ["thinking_delta", 0],
+      ["text_delta", 1],
+      ["toolcall_delta", 2],
+    ];
+    for (const [kind, contentIndex] of blocks) {
+      const record = projectRunLogRecord({
+        type: "message_update",
+        assistantMessageEvent: { type: kind, contentIndex, delta: "d", partial: bigPayload() },
+        message: bigPayload(),
+      });
+      expect(record).toEqual({ type: "message_update", kind, contentIndex, delta: "d" });
+    }
+    // The kind and the block index are what place a delta; the payload that came
+    // with it is still gone, and a delta that carries no index is logged as it is.
+    expect(
+      projectRunLogRecord({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "d", partial: bigPayload() },
+      }),
+    ).toEqual({ type: "message_update", kind: "text_delta", delta: "d" });
   });
 });
 
@@ -641,6 +774,61 @@ describe("run-log one-per-run + never-throw (issue #146, round 5)", () => {
     expect(rawB).toContain("marker-b");
     expect(rawB).not.toContain("marker-a");
   });
+
+  it.skipIf(IS_ROOT)(
+    "writes NO log at all when the lock cannot be created (no lock, no log)",
+    async () => {
+      // An active log with no lock is the one log retention may delete: it cannot be
+      // told from a crashed run's, so a sweep would remove it under its writer. The
+      // lock is therefore taken BEFORE the log file exists, and a run that cannot
+      // take it writes no log at all — one warning naming the step that failed.
+      // (A read-only runs dir is how a write fails for a non-root uid; see skipIf.)
+      mkdirSync(runsDir(), { recursive: true });
+      chmodSync(runsDir(), 0o500);
+      try {
+        let exitCode: number | undefined;
+        let stdout: string | undefined;
+        const stderr = await captureStderr(async () => {
+          const res = await runAgent({
+            name: "testbot",
+            prompt: "go",
+            agentsRoot,
+            captureStdout: true,
+            sessionFactory: factoryReturning(
+              fakeSession([
+                {
+                  type: "message_update",
+                  assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" },
+                },
+                {
+                  type: "message_end",
+                  message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+                },
+              ]),
+            ),
+          });
+          exitCode = res.exitCode;
+          stdout = res.stdout;
+        });
+
+        // The run itself is unaffected: it ran, returned its text, exited 0.
+        expect(exitCode).toBe(0);
+        expect(stdout).toBe("hi");
+        // One warning, naming the lock it could not create and the real cause — and
+        // no log path announced, because no log exists.
+        const warnings = stderr.split("\n").filter((l) => l.includes("run log unavailable"));
+        expect(warnings.length).toBe(1);
+        expect(warnings[0]).toContain("lock");
+        expect(warnings[0]).toMatch(/EACCES|EPERM/);
+        expect(stderr).not.toContain("run log: ");
+        // NO LOCK, NO LOG: neither this run's log nor its lock is on disk.
+        expect(jsonlFiles()).toEqual([]);
+        expect(lockFiles()).toEqual([]);
+      } finally {
+        chmodSync(runsDir(), 0o755);
+      }
+    },
+  );
 
   it("completes and warns ONCE when the runs directory cannot be created", async () => {
     // A file where the runs directory belongs: creating the dir throws, which is
