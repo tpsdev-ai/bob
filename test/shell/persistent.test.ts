@@ -261,22 +261,31 @@ describe("runPersistent / startPersistent", () => {
     expect(fake.disposed()).toBe(true);
   });
 
-  it("cli#145: a compaction re-injects the standing contract into the persistent session", async () => {
-    // A resident agent that hits the context threshold must be handed its
-    // standing contract back, on the SAME event seam the discord capability uses
-    // for agent_end — without disturbing that capability's reply routing.
+  it("cli#145 round 2: a post-run compaction starts NO turn — the pinned block rides the NEXT prompt", async () => {
+    // pi compacts AFTER a run, once the capability has consumed that turn's reply
+    // destination; a steered continuation would drive a turn whose reply has
+    // nowhere to go. The block is attached to the session instead, for the NEXT
+    // prompt (Discord, cron or mail), which keeps its own reply routing.
     const listeners: Array<(event: unknown) => void> = [];
     const prompts: string[] = [];
+    const custom: Array<{
+      message: { customType: string; content: string; display: boolean };
+      options?: { deliverAs?: string; triggerTurn?: boolean };
+    }> = [];
     const session: RunSession = {
       subscribe(listener) {
-        listeners.push(listener as (event: unknown) => void);
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
         return () => {
-          const i = listeners.indexOf(listener as (event: unknown) => void);
+          const i = listeners.indexOf(l);
           if (i >= 0) listeners.splice(i, 1);
         };
       },
       async prompt(text: string) {
         prompts.push(text);
+      },
+      async sendCustomMessage(message, options) {
+        custom.push({ message, options });
       },
       dispose() {},
     };
@@ -298,9 +307,20 @@ describe("runPersistent / startPersistent", () => {
       });
     }
 
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain("STANDING CONTRACT");
-    expect(prompts[0]).toContain("You are pulse");
+    // NO turn starts…
+    expect(prompts, "a post-run compaction starts no turn").toHaveLength(0);
+    // …the pinned block is attached to the next turn instead…
+    expect(custom, "the standing contract is attached for the next prompt").toHaveLength(1);
+    const first = custom.at(0);
+    expect(first?.message.content).toContain("STANDING CONTRACT");
+    expect(first?.message.content).toContain("You are pulse");
+    expect(first?.options?.deliverAs).toBe("nextTurn");
+    expect(first?.options?.triggerTurn, "and it must NOT trigger a turn").toBeFalsy();
+    // …and the runtime does NOT rewrite the next inbound prompt: pi delivers the
+    // attached block WITH it, so whatever drives it (Discord, cron, mail) keeps
+    // its own reply destination.
+    await handle.session.prompt("inbound from discord");
+    expect(prompts).toEqual(["inbound from discord"]);
 
     await handle.shutdown();
   });

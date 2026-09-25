@@ -81,6 +81,8 @@ function factoryReturning(session: RunSession): {
 function scriptedSession(
   script: Array<{
     textDeltas?: string[];
+    /** Text streamed BEFORE this prompt's compaction (if it emits one). */
+    textDeltasBefore?: string[];
     compact?: "threshold" | "overflow" | "manual";
     aborted?: boolean;
   }>,
@@ -102,6 +104,14 @@ function scriptedSession(
     async prompt(text, options) {
       calls.push({ text, streamingBehavior: options?.streamingBehavior });
       const step = options?.streamingBehavior === undefined ? (script[topLevelCall++] ?? {}) : {};
+      for (const delta of step.textDeltasBefore ?? []) {
+        for (const listener of listeners) {
+          listener({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+          });
+        }
+      }
       if (step.compact) {
         for (const listener of listeners) {
           listener({
@@ -499,6 +509,33 @@ describe("runAgent", () => {
   });
 
   // ── cli#145: the compaction contract ──────────────────────────────
+
+  it("cli#145 round 2: text streamed BEFORE a compaction is not the final message — a silent settle retries once and exits non-zero", async () => {
+    // The exact #145 shape: the agent says "review, then commit" and the context
+    // then compacts; the run settles with no further message. The pre-compaction
+    // text must NOT satisfy the completion contract.
+    const s = scriptedSession([
+      { textDeltasBefore: ["review, then commit"], compact: "threshold" },
+    ]);
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "finish the release",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // One pinned-block re-injection (a steer), then ONE retry, then the refusal.
+    expect(s.calls).toHaveLength(3);
+    expect(s.calls[1]?.streamingBehavior).toBe("steer");
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("settled_after_compaction");
+    expect(res?.stdout, "the pre-compaction text is not the final message").toBe("");
+    expect(stderr).toContain("settled_after_compaction");
+  });
 
   it("cli#145: a session that compacts mid-task then settles silently re-injects the pinned block, retries ONCE, and exits non-zero", async () => {
     // The exact #145 shape: threshold compaction, then agent_settled with no

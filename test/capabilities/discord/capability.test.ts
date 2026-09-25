@@ -240,6 +240,32 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
     expect(client.replies).toEqual([{ channelId: "channel-B", text: "all green", replyTo: "m42" }]);
   });
 
+  it("round 2 (#145): a pinned-block CUSTOM message riding the turn does not disturb the reply routing", async () => {
+    // The persistent runtime attaches the compaction contract to the next turn as
+    // a `custom`-role message. It must not become the reply: the LAST ASSISTANT
+    // message still goes to the ORIGINATING channel, so the turn that carries the
+    // block keeps its own reply destination.
+    const { pi, client } = setup();
+    client.fire({
+      id: "m9",
+      channelId: "channel-B",
+      content: "<@123> continue",
+      mentionsBot: true,
+    });
+    await pi.agentEndHandler?.({
+      messages: [
+        {
+          role: "custom",
+          content: "[BOB STANDING CONTRACT — re-injected after context compaction]",
+        },
+        { role: "assistant", content: [{ type: "text", text: "continued: committed" }] },
+      ],
+    });
+    expect(client.replies).toEqual([
+      { channelId: "channel-B", text: "continued: committed", replyTo: "m9" },
+    ]);
+  });
+
   it("routes to channel C when the inbound message came from channel C (the spec's mocked proof)", async () => {
     const { pi, client } = setup({ channelIds: ["channel-C", "channel-A"] });
     client.fire({ id: "mC", channelId: "channel-C", content: "<@1> ping", mentionsBot: true });

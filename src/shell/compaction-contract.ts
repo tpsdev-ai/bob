@@ -38,7 +38,29 @@ export const DEFAULT_RECENT_TOOL_CALLS = 5;
 export const DEFAULT_WORKTREE_STATUS_LINES = 30;
 
 /** The named reasons a one-shot run may refuse to report success. */
-export type SilenceReason = "settled_after_compaction" | "no_final_message";
+export type SilenceReason =
+  | "settled_after_compaction"
+  | "no_final_message"
+  // A final message EXISTS but does not match the declared expected shape — it is
+  // not silence, so it gets its own reason (round 2, item 3).
+  | "final_shape_mismatch";
+
+/** How much of the block's variable budget is RESERVED for "what remains".
+ *  "What remains" is the point of the block (round 2, item 2), so it is budgeted
+ *  first and the task portion is truncated to fit around it. */
+export const REMAINING_BUDGET_SHARE = 0.5;
+
+/** The pinned block's cap must be a positive number of characters. A cap of 0 or
+ *  less is REJECTED, not treated as "no cap" (round 2, item 2): an uncapped
+ *  re-injection is the thing that would tip the context back over the threshold. */
+export function assertPinnedCap(cap: unknown): number {
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new Error(
+      `compaction contract: the pinned-block cap must be a positive number of characters (got ${String(cap)}); there is no "no cap"`,
+    );
+  }
+  return cap;
+}
 
 /** The explicit continue turn sent as the single retry. */
 export const CONTINUE_TURN =
@@ -107,30 +129,48 @@ export function buildPinnedBlock(opts: {
   /** 1-based compaction counter, for the header. */
   count?: number;
 }): string {
-  const cap = opts.capChars ?? DEFAULT_PINNED_CAP_CHARS;
+  // A cap of 0 or less is REJECTED (round 2, item 2) — never "no cap".
+  const cap = assertPinnedCap(opts.capChars ?? DEFAULT_PINNED_CAP_CHARS);
   const contractLabel = opts.standingContract !== undefined ? "STANDING CONTRACT" : "TASK";
   const contract = (opts.standingContract ?? opts.task ?? "").trim();
   const heading =
     `[BOB ${contractLabel} — re-injected after context compaction` +
     `${opts.count ? ` #${opts.count}` : ""}${opts.reason ? ` (${opts.reason})` : ""}; cap ${cap} chars]`;
+  const intro =
+    "The conversation above was compacted. That is NOT completion — the task is still open.";
+  const footer =
+    "Continue from the state above. Finish the task, then end with a final message stating what you did.";
 
   const plan = (opts.state.lastStatedPlan ?? "").trim();
-  const remaining =
-    plan.length > 0 ? `Last plan you stated:\n${plan}` : renderWorktreeNote(opts.state);
+  const remaining = (
+    plan.length > 0 ? `Last plan you stated:\n${plan}` : renderWorktreeNote(opts.state)
+  ).trim();
 
-  const body = [
-    heading,
-    "The conversation above was compacted. That is NOT completion — the task is still open.",
-    "",
-    `${contractLabel}:`,
-    contract.length > 0 ? contract : "(none recorded)",
-    "",
-    "WHAT REMAINS:",
-    remaining,
-    "",
-    "Continue from the state above. Finish the task, then end with a final message stating what you did.",
-  ].join("\n");
-  return capText(body, cap);
+  // Compose with the two variable sections as arguments, so the FIXED skeleton's
+  // length can be measured once (with placeholders — conservative).
+  const compose = (taskShown: string, remainingShown: string): string =>
+    [
+      heading,
+      intro,
+      "",
+      `${contractLabel}:`,
+      taskShown.length > 0 ? taskShown : "(none recorded)",
+      "",
+      "WHAT REMAINS:",
+      remainingShown.length > 0 ? remainingShown : "(nothing captured)",
+      "",
+      footer,
+    ].join("\n");
+
+  const overhead = compose("", "").length;
+  const bodyBudget = Math.max(0, cap - overhead);
+
+  // "What remains" is budgeted FIRST — it is the point of the block — and the
+  // TASK portion is truncated to fit around it (round 2, item 2).
+  const remainingShown = capText(remaining, Math.floor(bodyBudget * REMAINING_BUDGET_SHARE));
+  const taskShown = capText(contract, Math.max(0, bodyBudget - remainingShown.length));
+  const block = compose(taskShown, remainingShown);
+  return block.length <= cap ? block : capText(block, cap);
 }
 
 /** Build the standing contract for the PERSISTENT runtime from the agent's
@@ -210,6 +250,22 @@ export interface CompactionReinjector {
   compactions(): number;
   /** The last pinned block injected (for tests/telemetry). */
   lastBlock(): string | undefined;
+  /**
+   * Start of a turn: the FINAL message is per-turn, so the capture starts fresh
+   * (round 2, item 1). Call before every prompt the runtime issues.
+   */
+  startTurn(): void;
+  /**
+   * The last assistant text that ENDED since the last compaction (or the last
+   * startTurn) — the completion contract's "final message" (round 2, item 1).
+   */
+  finalText(): string;
+  /**
+   * True when at least one assistant message has ENDED since the boundary, so an
+   * empty `finalText()` means the agent went silent rather than that the
+   * transport omitted its message.
+   */
+  assistantEnded(): boolean;
 }
 
 /**
@@ -217,6 +273,10 @@ export interface CompactionReinjector {
  * non-aborted `compaction_end`. Captures "what remains" as it goes: the agent's
  * last stated plan (the last assistant text) and the last few tool calls, plus a
  * `git status --short` probe taken at re-injection time.
+ *
+ * It also tracks the FINAL MESSAGE boundary (round 2, item 1): text streamed
+ * before a compaction must never satisfy the completion contract, so the capture
+ * is cleared on every `compaction_end` and at every `startTurn()`.
  */
 export function createCompactionReinjector(
   opts: CompactionReinjectorOptions,
@@ -225,7 +285,7 @@ export function createCompactionReinjector(
     throw new Error("compaction contract: pass task OR standingContract, not both");
   }
   const log = opts.log ?? (() => {});
-  const capChars = opts.capChars ?? DEFAULT_PINNED_CAP_CHARS;
+  const capChars = assertPinnedCap(opts.capChars ?? DEFAULT_PINNED_CAP_CHARS);
   const recentToolCalls = opts.recentToolCalls ?? DEFAULT_RECENT_TOOL_CALLS;
 
   let compactions = 0;
@@ -235,10 +295,25 @@ export function createCompactionReinjector(
   let deltaBuffer = "";
   let lastStatedPlan: string | undefined;
   const toolCalls: string[] = [];
+  // The final-message boundary: text the LAST assistant message emitted since
+  // the last compaction / turn start.
+  let finalMessage = "";
+  let sawAssistantEnd = false;
+
+  const clearCapture = (): void => {
+    finalMessage = "";
+    sawAssistantEnd = false;
+    deltaBuffer = "";
+  };
 
   return {
     compactions: () => compactions,
     lastBlock: () => lastBlock,
+    startTurn: () => clearCapture(),
+    // The last message that ENDED, else the deltas of a message still in flight
+    // (a test fake, or a transport whose message_end has not arrived yet).
+    finalText: () => (finalMessage || deltaBuffer).trim(),
+    assistantEnded: () => sawAssistantEnd,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -258,6 +333,9 @@ export function createCompactionReinjector(
             count: compactions,
           });
           lastBlock = block;
+          // The boundary: everything streamed BEFORE this compaction is not the
+          // run's final message (round 2, item 1).
+          clearCapture();
           log(
             `bob: context compacted${e.reason ? ` (${e.reason})` : ""}; re-injecting the pinned ` +
               `${opts.standingContract !== undefined ? "standing contract" : "task"} block (${block.length} chars)`,
@@ -284,11 +362,15 @@ export function createCompactionReinjector(
           return;
         }
         case "message_end": {
-          // The last assistant message's text is the best "what remains" we can
-          // capture without understanding the agent's plan ourselves.
+          // A message that ENDED. Its text is the best "what remains" we can
+          // capture without understanding the agent's plan ourselves — and, when
+          // it is an ASSISTANT message, it is also the run's current final
+          // message (until another one ends, or a compaction moves the boundary).
           if (e.message?.role === "assistant") {
             const text = textFromContent(e.message.content).trim() || deltaBuffer.trim();
             if (text.length > 0) lastStatedPlan = text;
+            finalMessage = text;
+            sawAssistantEnd = true;
           }
           deltaBuffer = "";
           return;
@@ -309,9 +391,10 @@ export function createCompactionReinjector(
 
 /**
  * The one-shot completion contract. `ok` only when the final assistant text is
- * non-empty AND (when an expected shape is declared) matches it. On silence the
- * reason names whether a compaction was seen, so the caller can retry once and
- * then exit non-zero with `settled_after_compaction` / `no_final_message`.
+ * non-empty AND (when an expected shape is declared) matches it. Silence names
+ * whether a compaction was seen (`settled_after_compaction` / `no_final_message`);
+ * a message that EXISTS but does not match gets its OWN reason
+ * (`final_shape_mismatch`, round 2 item 3) — it is not silence.
  */
 export function evaluateCompletion(opts: {
   capturedText: string;
@@ -319,12 +402,16 @@ export function evaluateCompletion(opts: {
   expectedFinal?: (text: string) => boolean;
 }): { ok: boolean; reason?: SilenceReason } {
   const text = opts.capturedText.trim();
-  const meetsShape = text.length > 0 && (opts.expectedFinal ? opts.expectedFinal(text) : true);
-  if (meetsShape) return { ok: true };
-  return {
-    ok: false,
-    reason: opts.compactions > 0 ? "settled_after_compaction" : "no_final_message",
-  };
+  if (text.length === 0) {
+    return {
+      ok: false,
+      reason: opts.compactions > 0 ? "settled_after_compaction" : "no_final_message",
+    };
+  }
+  if (opts.expectedFinal && !opts.expectedFinal(text)) {
+    return { ok: false, reason: "final_shape_mismatch" };
+  }
+  return { ok: true };
 }
 
 /**

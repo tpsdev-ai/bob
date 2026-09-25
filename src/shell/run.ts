@@ -66,6 +66,18 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
+  /**
+   * PERSISTENT runtime only (round 2, item 4): attach the pinned block to the
+   * NEXT turn instead of steering a new one. pi appends it to the session as a
+   * custom message and delivers it with the next user turn, so a post-run
+   * compaction starts no turn — and does not consume the reply destination the
+   * capability already used for the turn that just ended. Optional, so a
+   * one-shot test fake need not provide it.
+   */
+  sendCustomMessage?(
+    message: { customType: string; content: string; display: boolean },
+    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+  ): Promise<void>;
   dispose(): void;
 }
 
@@ -207,17 +219,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     }
   };
 
-  let captured = "";
   const unsubscribe = session.subscribe((event) => {
-    // Post-mortem trail first: record EVERY event (tool calls, results, errors,
-    // retries), not just text — that's what makes a death diagnosable.
+    // Post-mortem trail: record EVERY event (tool calls, results, errors,
+    // retries), not just text — that's what makes a death diagnosable. The
+    // FINAL-MESSAGE capture is NOT here: it lives on the compaction contract
+    // below, which knows the compaction boundary (round 2, item 1).
     appendRunLog({ t: new Date().toISOString(), event });
-    // Stream the assistant's text deltas — same event shape the SDK
-    // quickstart and every examples/sdk/*.ts use. UNCHANGED: the captured
-    // accumulation stays byte-identical so the returned final text is stable.
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      captured += event.assistantMessageEvent.delta;
-    }
   });
 
   let exitCode = 0;
@@ -236,12 +243,22 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   });
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
 
-  // The best final text available right now: streamed deltas, else the last
-  // assistant message in session state (non-streaming transports).
-  const finalTextNow = (): string =>
-    captured.length > 0 ? captured : (lastAssistantText(session) ?? "");
+  // The FINAL message is the text of the LAST assistant message that ENDED
+  // since the last compaction (round 2, item 1): text streamed BEFORE a
+  // compaction can never satisfy the completion contract, and the contract
+  // tracker clears its capture on `compaction_end` and at every `startTurn()`.
+  const finalTextNow = (): string => {
+    const tracked = reinjector.finalText();
+    if (tracked.length > 0) return tracked;
+    // NOTHING ended since the boundary. Only a transport that emitted neither
+    // deltas nor a message_end may fall back to session state — and NEVER after a
+    // compaction, whose boundary the session's message list cannot express.
+    if (reinjector.compactions() > 0 || reinjector.assistantEnded()) return "";
+    return lastAssistantText(session) ?? "";
+  };
 
   try {
+    reinjector.startTurn();
     await session.prompt(opts.prompt);
 
     // cli#145, item 2: the completion contract. Before this, a run settled
@@ -253,13 +270,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       compactions: reinjector.compactions(),
       expectedFinal: opts.expectedFinal,
     });
-    if (!outcome.ok && reinjector.compactions() > 0) {
+    if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
       // explicit "continue from the state above" turn before giving up.
       process.stderr.write(
         `bob run ${opts.name}: settled after a context compaction with no final message — retrying once with a continue turn\n`,
       );
       try {
+        reinjector.startTurn(); // the retry is its own turn: its final message counts
         await session.prompt(CONTINUE_TURN);
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
@@ -280,7 +298,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         `bob run ${opts.name}: REFUSING to report success — ${reason}` +
           (reason === "settled_after_compaction"
             ? " (the session settled after a context compaction without a final message)"
-            : " (the session settled without a final message)") +
+            : reason === "final_shape_mismatch"
+              ? " (the final message did not match the declared shape)"
+              : " (the session settled without a final message)") +
           "\n",
       );
       const status = readWorktreeStatus(config.cwd);
@@ -312,12 +332,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // Final record so a reader can tell a clean completion from a truncated log.
   appendRunLog({ done: true, exitCode });
 
-  // Fallback: if no text_delta events were observed (some transports don't
-  // stream), pull the last assistant text from session state.
-  if (captured.length === 0) {
-    const fromState = lastAssistantText(session);
-    if (fromState !== undefined) captured = fromState;
-  }
+  // The run's final text — the last assistant message that ended since the last
+  // compaction (or the session-state fallback for a non-streaming transport).
+  const finalStdout = finalTextNow();
 
   session.dispose();
 
@@ -326,7 +343,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     agentDir,
     provider,
     model,
-    ...(opts.captureStdout ? { stdout: captured } : {}),
+    ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
   };
 }

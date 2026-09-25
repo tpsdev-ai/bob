@@ -73,6 +73,34 @@ describe("compaction contract — the pinned block", () => {
     expect(note).toContain("(none observed)");
   });
 
+  it("reserves budget for 'what remains' and truncates the TASK first (round 2, item 2)", () => {
+    // The task comes first in the block; a naive whole-block truncation would
+    // leave no plan or worktree note at all. The remaining section is budgeted
+    // FIRST, and the task is cut to fit around it.
+    const cap = 1200;
+    const block = buildPinnedBlock({
+      task: "x".repeat(cap * 3),
+      state: { lastStatedPlan: "next: commit the two files, then push" },
+      capChars: cap,
+    });
+    expect(block.length, "the block fits the cap").toBeLessThanOrEqual(cap);
+    expect(block, "and it still carries its 'what remains' section").toContain("WHAT REMAINS:");
+    expect(block).toContain("next: commit the two files, then push");
+    expect(block, "the task portion was the part truncated").toContain("[truncated]");
+  });
+
+  it("rejects a pinned-block cap of 0 or less — there is no 'no cap' (round 2, item 2)", () => {
+    expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: 0 })).toThrow(
+      /positive number/,
+    );
+    expect(() => buildPinnedBlock({ task: "t", state: {}, capChars: -10 })).toThrow(
+      /positive number/,
+    );
+    expect(() => createCompactionReinjector({ task: "t", capChars: 0, inject: () => {} })).toThrow(
+      /positive number/,
+    );
+  });
+
   it("buildStandingContract renders the agent and its scheduled duties", () => {
     const s = buildStandingContract({
       name: "pulse",
@@ -164,6 +192,40 @@ describe("compaction contract — the reinjector", () => {
       createCompactionReinjector({ task: "a", standingContract: "b", inject: () => {} }),
     ).toThrow(/task OR standingContract/);
   });
+
+  it("clears the final-message capture at the compaction boundary (round 2, item 1)", () => {
+    const r = createCompactionReinjector({ task: "t", worktreeStatus: () => "", inject: () => {} });
+    r.startTurn();
+    r.observe({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "review, then commit" },
+    });
+    expect(r.finalText()).toContain("review, then commit");
+
+    r.observe({ type: "compaction_end", reason: "threshold", aborted: false });
+    expect(r.finalText(), "text streamed BEFORE the compaction is not the final message").toBe("");
+
+    // …and a new turn starts with an empty capture too.
+    r.observe({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "after" },
+    });
+    r.startTurn();
+    expect(r.finalText()).toBe("");
+  });
+
+  it("tracks whether an assistant message ENDED since the boundary (round 2, item 1)", () => {
+    const r = createCompactionReinjector({ task: "t", inject: () => {} });
+    r.startTurn();
+    expect(r.assistantEnded()).toBe(false);
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "" }] },
+    });
+    expect(r.assistantEnded()).toBe(true);
+    r.observe({ type: "compaction_end", aborted: false });
+    expect(r.assistantEnded(), "the boundary resets it").toBe(false);
+  });
 });
 
 describe("compaction contract — the completion contract", () => {
@@ -195,6 +257,17 @@ describe("compaction contract — the completion contract", () => {
     expect(evaluateCompletion({ capturedText: "MERGED", compactions: 0, expectedFinal }).ok).toBe(
       true,
     );
+  });
+
+  it("a message that does not match the shape gets its OWN reason — not silence (round 2, item 3)", () => {
+    const expectedFinal = (t: string) => t.includes("MERGED");
+    expect(
+      evaluateCompletion({ capturedText: "I could not finish", compactions: 0, expectedFinal }),
+    ).toEqual({ ok: false, reason: "final_shape_mismatch" });
+    // Even after a compaction: a message EXISTS, so it is not settled_after_compaction.
+    expect(
+      evaluateCompletion({ capturedText: "wrong shape", compactions: 2, expectedFinal }).reason,
+    ).toBe("final_shape_mismatch");
   });
 });
 

@@ -136,7 +136,24 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       duties: cron,
     }),
     worktreeStatus: () => readWorktreeStatus(config.cwd),
-    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    inject: (text) => {
+      // cli#145 round 2, item 4: pi compacts AFTER a run, once the capability has
+      // already consumed that turn's reply destination, so a STEERED continuation
+      // would drive a turn whose reply has nowhere to go. Attach the pinned block
+      // to the NEXT turn instead — pi appends it to the session and delivers it
+      // with the next prompt (Discord, cron or mail), which keeps its own reply
+      // routing. The one-shot runtime keeps the steer.
+      if (typeof session.sendCustomMessage === "function") {
+        return session.sendCustomMessage(
+          { customType: "bob-compaction-contract", content: text, display: false },
+          { deliverAs: "nextTurn" },
+        );
+      }
+      log(
+        "[bob] this session cannot attach the pinned block (no sendCustomMessage) — the block is dropped",
+      );
+      return Promise.resolve();
+    },
     log,
   });
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
