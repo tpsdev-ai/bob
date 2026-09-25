@@ -712,14 +712,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // coming, and exactly one line records that the DELTA cap was hit.
     const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_DELTA_CAP_BYTES;
     let logBytes = 0; // running total of bytes committed to this log
-    let deltaCapHit = false; // set once the marker below is on disk; then deltas stop
+    let deltaCapHit = false; // set once the marker below is written; then deltas stop
 
     // Synchronous writer: appendFileSync puts each record in the page cache when it
     // returns: every reader sees it and it survives the process dying, but power
     // loss or a kernel panic can still lose the tail, because nothing calls fsync.
-    // This is the post-mortem property this log exists for — a hard crash leaves
-    // every record written before it in the cache, readable until a power loss or a panic. Each record is projected to a
-    // bounded shape (`projectRunLogRecord`), so there is no per-write cost worth
+    // That is the post-mortem property this log exists for: after the process
+    // crashes, every record written before the crash is still readable. Each record
+    // is projected to a bounded shape (`projectRunLogRecord`), so there is no per-write cost worth
     // buffering and no accumulated payload in it. A failed append (disk full, race,
     // perms) is swallowed: logging is best-effort and never throws into the run.
     writeRunLog = (record: unknown, isDelta: boolean): void => {
