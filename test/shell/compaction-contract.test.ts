@@ -281,8 +281,18 @@ describe("the note's building blocks", () => {
     expect(note).toContain("last 3 tool call(s): d, e, f");
   });
 
+  it("buildRemainingNote quotes the last thing the agent said — and calls it that, not a plan", () => {
+    // Any ENDED assistant message lands here: a plan, a question, an
+    // acknowledgement. Gauge's probe had it label "Hello." as a plan (#145
+    // round 2), so the note names what it actually is.
+    const note = buildRemainingNote({ lastSaidText: "Hello." });
+    expect(note).toContain("The last thing you said:");
+    expect(note).toContain("Hello.");
+    expect(note).not.toContain("Last plan");
+  });
+
   it("buildRemainingNote never exceeds its cap, marker included", () => {
-    const note = buildRemainingNote({ lastStatedPlan: "p".repeat(5000) }, 400);
+    const note = buildRemainingNote({ lastSaidText: "p".repeat(5000) }, 400);
     expect(note.length).toBeLessThanOrEqual(400);
     expect(note.startsWith("[BOB WHAT REMAINS")).toBe(true);
     expect(note.length).toBeLessThanOrEqual(DEFAULT_REMAINING_NOTE_CAP_CHARS);

@@ -17,7 +17,7 @@ import { assertCapabilitiesLoaded, runAgent } from "../../src/shell/run.js";
 // text via text_delta events and then the `message_end` a real pi turn ends
 // with (the assembled message), so tests exercise the capture path without an
 // LLM call. The ENDED message is what the completion contract reads; the
-// streamed deltas are only "the last plan the agent stated".
+// streamed deltas are only "the last thing the agent said".
 function fakeSession(opts: {
   textDeltas?: string[];
   // Last-assistant-message fallback (used when no message_end is emitted).

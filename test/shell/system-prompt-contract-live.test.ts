@@ -1,8 +1,8 @@
 // The #145 guarantee at the REQUEST boundary, against a REAL pi session.
 //
 // The unit tests pin the pieces; this file stands up pi's own session (through
-// bob's ONE factory) with a STUB model and proves the three claims that only a
-// real session can prove:
+// bob's ONE factory) with a STUB model and proves the claims that only a real
+// session can prove:
 //
 //   1. the contract is in the SYSTEM PROMPT of every agent request — including
 //      the request after a real pi compaction, which rewrites the message
@@ -11,8 +11,15 @@
 //      `before_agent_start`, or by rewriting the outgoing provider payload in
 //      `before_provider_request` — fails the turn exactly like a failed audit
 //      (the session is disposed, the process is ended, the reason is named);
-//   3. pi's own summarization request is EXCLUDED by name: it carries pi's
-//      summarization prompt and must not fail the guard.
+//   3. pi's own summarization request is EXEMPT — and it is exempt because pi
+//      is compacting (`AgentSession.isCompacting`), never because of text in
+//      the payload: pasting pi's prompt into an agent request is refused
+//      (round 2's defect), while the same text on pi's own compaction request
+//      passes;
+//   4. the block is there for a session REPLACED through the runtime factory
+//      (pi's /new path) and for the PERSISTENT runtime's standing contract
+//      after a compaction — the two paths a resident agent actually takes;
+//      overflow recovery and a reload remain follow-ups (named in the report).
 //
 // The stub provider is bob's own: it builds an Anthropic-shaped payload, calls
 // `options.onPayload` like every real provider API does (the compaction summary
@@ -32,12 +39,24 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSessionRuntime,
+  ModelRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../src/shell/init.js";
-import type { RunSession } from "../../src/shell/run.js";
+import { startPersistent } from "../../src/shell/persistent.js";
+import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
 import { resolveRunConfig } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
-import { PI_SUMMARIZATION_MARKER } from "../../src/shell/system-prompt-contract.js";
+
+/** pi's own summarization system prompt, VERBATIM (pi 0.84.3,
+ *  core/compaction/utils.js `SUMMARIZATION_SYSTEM_PROMPT`; pi does not export
+ *  it). The stub uses it to label pi's summarization requests — and the guard
+ *  must NOT key on it (round 2's borrowable exemption): it keys on
+ *  `AgentSession.isCompacting`. */
+const PI_SUMMARIZATION_PROMPT =
+  "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
 const STUB_PROVIDER = "bob-stub";
 const STUB_MODEL = "stub-1";
@@ -50,6 +69,9 @@ interface RecordedRequest {
   payloadSystemPrompt: string;
   /** True when this was pi's own summarization call. */
   summarization: boolean;
+  /** True when the request carried the agent turn's `onPayload` — the seam pi
+   *  routes to `before_provider_request`. */
+  onPayload: boolean;
 }
 
 /** Every request the stub provider saw, in order. */
@@ -104,8 +126,14 @@ function stubProvider(scripted: (call: number, systemPrompt: string) => string) 
         const next = await options?.onPayload?.(payload, model);
         if (next !== undefined) payload = next as Record<string, unknown>;
         const payloadSystemPrompt = payloadSystemText(payload);
-        const summarization = payloadSystemPrompt.includes(PI_SUMMARIZATION_MARKER);
-        requests.push({ call, contextSystemPrompt, payloadSystemPrompt, summarization });
+        const summarization = payloadSystemPrompt.includes(PI_SUMMARIZATION_PROMPT);
+        requests.push({
+          call,
+          contextSystemPrompt,
+          payloadSystemPrompt,
+          summarization,
+          onPayload: typeof options?.onPayload === "function",
+        });
         const text = summarization
           ? "Summary: the conversation so far, condensed."
           : scripted(call, contextSystemPrompt);
@@ -227,14 +255,19 @@ async function stubRuntime(contextWindow = 200_000) {
   return { runtime, stub };
 }
 
-/** Build a REAL pi session through bob's factory, with the stub model. */
-async function contractSession(opts: {
+/** The stub runtime + bob's ONE factory for a test config, so a test can build
+ *  a session directly, through pi's RUNTIME (a replaced session), or through
+ *  the PERSISTENT runtime — the paths a resident agent actually takes. */
+async function bobFactoryFor(opts: {
   /** A capability extension source written to disk (order: before the guard). */
   capabilityText?: string;
   contextWindow?: number;
   taskContract?: string;
   standingContract?: string;
   contractCapChars?: number;
+  /** A config resolved elsewhere (the persistent runtime resolves its own and
+   *  sets the standing contract before it calls its factory). */
+  fromConfig?: RunSessionConfig;
 }) {
   const { runtime, stub } = await stubRuntime(opts.contextWindow);
   const extensionSources: string[] = [];
@@ -243,13 +276,12 @@ async function contractSession(opts: {
     writeFileSync(extPath, opts.capabilityText);
     extensionSources.push(extPath);
   }
-  const { config } = resolveRunConfig({ name: "testbot", agentsRoot });
+  const base = opts.fromConfig ?? resolveRunConfig({ name: "testbot", agentsRoot }).config;
   const logs: string[] = [];
   const exits: number[] = [];
-  let disposals = 0;
   const factory = createBobRuntimeFactory({
     config: {
-      ...config,
+      ...base,
       provider: STUB_PROVIDER,
       model: STUB_MODEL,
       extensionSources,
@@ -264,26 +296,39 @@ async function contractSession(opts: {
     deps: { log: (m) => logs.push(m), exit: (code) => exits.push(code) },
     modelRuntime: runtime,
   });
+  return { factory, logs, exits, stub };
+}
+
+type LiveSession = RunSession & {
+  prompt(text: string, options?: unknown): Promise<void>;
+  subscribe(listener: (event: unknown) => void): () => void;
+  dispose(): void;
+};
+
+/** Build a REAL pi session through bob's factory, with the stub model. */
+async function contractSession(opts: {
+  /** A capability extension source written to disk (order: before the guard). */
+  capabilityText?: string;
+  contextWindow?: number;
+  taskContract?: string;
+  standingContract?: string;
+  contractCapChars?: number;
+}) {
+  const { factory, logs, exits, stub } = await bobFactoryFor(opts);
   const result = await factory({
     cwd,
     agentDir: piAgentDir,
     sessionManager: SessionManager.inMemory(cwd) as never,
   });
-  const session = result.session as unknown as {
-    prompt(text: string, options?: unknown): Promise<void>;
-    subscribe(listener: (event: unknown) => void): () => void;
-    dispose(): void;
-  };
+  const session = result.session as unknown as LiveSession;
+  let disposals = 0;
   const dispose = session.dispose.bind(session);
   session.dispose = () => {
     disposals += 1;
     dispose();
   };
   return {
-    session: session as unknown as RunSession & {
-      prompt(text: string, options?: unknown): Promise<void>;
-      subscribe(listener: (event: unknown) => void): () => void;
-    },
+    session,
     loader: result.services.resourceLoader,
     logs,
     exits,
@@ -331,6 +376,8 @@ describe("#145 — the contract survives a real pi compaction (stub model)", () 
       for (const request of requests.filter((r) => !r.summarization)) {
         expect(request.payloadSystemPrompt).toContain("TASK");
         expect(request.contextSystemPrompt).toContain(HEAD_MARKER);
+        // Agent requests are the ones the guard checks: they carry the seam.
+        expect(request.onPayload, "an agent request carries the guard's seam").toBe(true);
       }
 
       // And the proof it is the SYSTEM PROMPT carrying it: compaction removed
@@ -454,7 +501,29 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
     }
   });
 
-  it("does NOT fail pi's own summarization request (excluded by name)", async () => {
+  it("fails a capability that pastes pi's OWN summarization prompt where the contract should be", async () => {
+    // Round 2's defect, live: the exemption used to be keyed on text IN THE
+    // PROMPT, so a capability could paste pi's summarization prompt in and drop
+    // the contract. The exemption is pi's compaction flag now, and a capability
+    // cannot make pi compact — so this request is refused.
+    const live = await contractSession({
+      taskContract: "the one-shot task",
+      capabilityText: `export default function (pi) {
+  pi.on("before_agent_start", () => ({ systemPrompt: ${JSON.stringify(PI_SUMMARIZATION_PROMPT)} }));
+}
+`,
+    });
+    try {
+      await live.session.prompt("do the task").catch(() => {});
+      expect(live.disposals(), "the session is disposed").toBeGreaterThanOrEqual(1);
+      expect(live.exits, "the process is ended").toEqual([1]);
+      expect(live.logs.join("\n")).toContain("contract_missing_from_system_prompt");
+    } finally {
+      live.session.dispose();
+    }
+  });
+
+  it("never refuses pi's own summarization request — it is exempt while PI IS COMPACTING", async () => {
     const live = await contractSession({ taskContract: headTask() });
     try {
       await runThreeTurns(live.session);
@@ -462,16 +531,124 @@ describe("#145 — the guard fails a turn whose request lost the contract", () =
       await session.compact();
       const summarization = requests.filter((r) => r.summarization);
       expect(summarization.length, "pi made its summarization request").toBeGreaterThanOrEqual(1);
-      // The summarization request does NOT carry the contract (it carries pi's
-      // summarization prompt by design), and the guard — which saw it — did not
-      // fail the turn: no exit, no dispose.
       for (const request of summarization) {
-        expect(request.payloadSystemPrompt).toContain(PI_SUMMARIZATION_MARKER);
+        // It carries pi's summarization prompt and NOT the contract.
+        expect(request.payloadSystemPrompt).toContain(PI_SUMMARIZATION_PROMPT);
+        expect(request.payloadSystemPrompt).not.toContain("[BOB TASK");
+        // And in pi 0.84.3 it does not even reach the guard: the agent turn's
+        // `onPayload` (which pi routes to before_provider_request) is attached
+        // to the agent's OWN requests, while pi's summarization call hands the
+        // stream function its own options. Pinned, because the day pi attaches
+        // the hook here too, the exemption below becomes load-bearing instead of
+        // insurance — see the guard's `compacting` flag.
+        expect(request.onPayload, "pi's summary call carries no onPayload").toBe(false);
       }
+      // Nothing refused them: no dispose, no exit.
       expect(live.exits).toEqual([]);
       expect(live.disposals()).toBe(0);
     } finally {
       live.session.dispose();
+    }
+  });
+});
+
+describe("#145 — the contract survives the paths a resident agent takes", () => {
+  it("carries the TASK in a session REPLACED through the runtime factory (pi's /new path)", async () => {
+    const { factory, exits } = await bobFactoryFor({ taskContract: "the one-shot task" });
+    // pi's own runtime, built from bob's ONE factory: newSession() tears the
+    // current session down and asks the factory for the next one, which is how
+    // /new, /resume, /fork, /clone and /import all work.
+    const runtime = await createAgentSessionRuntime(factory, {
+      cwd,
+      agentDir: piAgentDir,
+      sessionManager: SessionManager.inMemory(cwd) as never,
+    });
+    try {
+      await (runtime.session as unknown as LiveSession).prompt("first turn");
+      const before = requests.filter((request) => !request.summarization).length;
+      expect(before, "the first session made a request").toBeGreaterThanOrEqual(1);
+
+      await runtime.newSession();
+      const replaced = runtime.session as unknown as LiveSession;
+      await replaced.prompt("a turn in the replaced session");
+
+      const after = requests.filter((request) => !request.summarization);
+      expect(after.length, "the replaced session made a request").toBeGreaterThan(before);
+      for (const request of after) {
+        expect(request.payloadSystemPrompt).toContain("TASK");
+        expect(request.payloadSystemPrompt).toContain("the one-shot task");
+      }
+      expect(exits, "no guard failure").toEqual([]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("carries the STANDING CONTRACT after a real compaction in the PERSISTENT runtime", async () => {
+    let exits: number[] = [];
+    const sessionFactory: RunSessionFactory = async (config) => {
+      // The SAME factory every path uses; the standing contract is already in
+      // the config the persistent runtime resolved (persistent.ts).
+      const built = await bobFactoryFor({ fromConfig: config, contextWindow: 40_000 });
+      exits = built.exits;
+      const result = await built.factory({
+        cwd: config.cwd,
+        agentDir: config.piAgentDir,
+        sessionManager: SessionManager.inMemory(config.cwd) as never,
+      });
+      return result.session as unknown as RunSession;
+    };
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot,
+      installSignalHandlers: false,
+      keepAlive: async () => {},
+      log: () => {},
+      sessionFactory,
+    });
+    try {
+      const compactions: number[] = [];
+      handle.session.subscribe((event) => {
+        const e = event as { type?: string; aborted?: boolean };
+        if (e.type === "compaction_end" && !e.aborted) compactions.push(1);
+      });
+
+      let callsBefore = 0;
+      handle.session.subscribe((event) => {
+        const e = event as { type?: string; aborted?: boolean };
+        if (e.type === "compaction_end" && !e.aborted && callsBefore === 0) {
+          callsBefore = requests.length;
+        }
+      });
+      await runThreeTurns(handle.session);
+      expect(
+        compactions.length,
+        "pi compacted inside the persistent runtime",
+      ).toBeGreaterThanOrEqual(1);
+      expect(callsBefore, "the compaction happened after a first request").toBeGreaterThan(0);
+
+      const agentRequests = requests.filter((request) => !request.summarization);
+      expect(agentRequests.length, "the persistent runtime made requests").toBeGreaterThanOrEqual(
+        2,
+      );
+      // Not merely "a request carried it": the requests made AFTER the
+      // compaction did — the ones that would lose a message-history task.
+      const afterCompaction = agentRequests.filter((request) => request.call > callsBefore);
+      expect(
+        afterCompaction.length,
+        "a request was made after the compaction",
+      ).toBeGreaterThanOrEqual(1);
+      for (const request of agentRequests) {
+        expect(request.payloadSystemPrompt).toContain("STANDING CONTRACT");
+        expect(request.payloadSystemPrompt).toContain("on duty as ea");
+      }
+      // It is the SYSTEM PROMPT carrying it, not the history: the standing
+      // contract never appears in the message list at all.
+      const messages = (handle.session as unknown as { messages?: unknown }).messages;
+      expect(JSON.stringify(messages ?? {})).not.toContain("STANDING CONTRACT");
+      expect(exits, "no guard failure on pi's summarization request").toEqual([]);
+    } finally {
+      await handle.shutdown();
     }
   });
 });
