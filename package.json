@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "test": "bun test",
+    "test": "bun run build && bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
