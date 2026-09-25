@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type BobRole,
+  boolFlag,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
   down,
@@ -86,13 +87,13 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   const role = (flags.role ?? "custom") as BobRole;
   const provider = String(flags.provider ?? "ollama-cloud");
   const model = String(flags.model ?? "kimi-k2.6");
-  const dryRun = flags["dry-run"] === true;
-  const force = flags.force === true;
-  const noInteractive = flags["no-interactive"] === true;
+  const dryRun = boolFlag(flags, "dry-run");
+  const force = boolFlag(flags, "force");
+  const noInteractive = boolFlag(flags, "no-interactive");
   // --no-flair is an EXPLICIT opt-out, not a fallback. When Flair is in play
   // (the default) a missing admin credential FAILS the command; the way to
   // scaffold without an identity is to say so.
-  const noFlair = flags["no-flair"] === true;
+  const noFlair = boolFlag(flags, "no-flair");
   const flairUrl =
     flags["flair-url"] !== undefined && flags["flair-url"] !== true
       ? String(flags["flair-url"])
@@ -242,7 +243,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // hand since the last align), and that divergence is the case worth
   // surfacing. syncFlairSoul verifies registration first — no admin
   // credential required, because align only ever writes the agent's own soul.
-  if (flags["no-flair"] === true) return;
+  if (boolFlag(flags, "no-flair")) return;
   const flair = readFlairBlock(agentDir);
   const synced = await syncFlairSoul({
     name,
@@ -284,7 +285,7 @@ async function run(
 ): Promise<number> {
   const model = stringFlag(flags, "model");
   // The interactive REPL on the SDK lands in a later phase-1 PR.
-  if (flags.interactive === true) {
+  if (boolFlag(flags, "interactive")) {
     console.error(
       "bob run: --interactive is not yet supported on the embedded-SDK path (give a task prompt for now)",
     );

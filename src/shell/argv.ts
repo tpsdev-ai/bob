@@ -22,6 +22,32 @@ export function stringFlag(
   return value !== undefined && value !== true ? String(value) : undefined;
 }
 
+// A `--key=value` flag that takes NO value, or only `=true` / `=false`.
+//
+// `parseArgs` yields the boolean `true` for the bare form (`--dry-run` alone,
+// or `--dry-run` followed by another flag, or the `--dry-run=` empty-value
+// form) and the STRING value for the `--key=value` form. The boolean
+// consumers used to read that as `flags.x === true`, which is FALSE for the
+// string "true" — so `--dry-run=true` silently skipped the dry-run branch
+// and scaffolded + provisioned the Flair identity for real, the exact
+// opposite of what the user asked (`--no-flair=true` likewise registered
+// with Flair). `boolFlag` whitelists the accepted spellings instead:
+//   * absent, or the bare form `parseArgs` yields as `true`  -> false / true
+//   * `--flag=true` / `--flag=false`                         -> true / false
+//   * any other string (`--flag=yes`, `--flag=1`, …)         -> UsageError
+// No looser coercion (`String(v) === "true"`, truthiness of a non-empty
+// string) — a whitelist keeps every boolean consumer's "on" identical.
+export class UsageError extends Error {}
+
+export function boolFlag(flags: Readonly<Record<string, string | boolean>>, name: string): boolean {
+  const value = flags[name];
+  if (value === undefined) return false;
+  if (value === true) return true;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new UsageError(`--${name} takes no value, or =true / =false (got '${value}')`);
+}
+
 // `parseArgs` produces the shape `cli.ts` consumes: the subcommand, the
 // positional arguments, and the flag map. A flag with a value (`--model x`,
 // or the `--model=x` form) is the string value; a valueless flag

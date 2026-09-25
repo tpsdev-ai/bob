@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
@@ -106,5 +108,81 @@ describe("bob CLI", () => {
       const e = err as { stdout?: string; message?: string };
       expect(e.stdout || e.message).toContain(`bob ${cmd}: missing <name>`);
     }
+  });
+});
+
+// The `--key=value` boolean-flag path, end to end (#173). A valueless form
+// (`--dry-run` alone) parses to the boolean true, but the `--key=value` form
+// (`--dry-run=true`) parses to the STRING "true". The boolean consumers used to
+// read that with `=== true`, which is false for the string — so `--dry-run=true`
+// silently skipped the dry-run branch and scaffolded + provisioned the Flair
+// identity for real (the opposite of the request); `--no-flair=true` likewise
+// still registered. `boolFlag` whitelists only `=true` / `=false` (and the bare
+// form) and rejects other spellings with a UsageError. These drive the CLI (not
+// parseArgs alone), so the whole path is covered, with HOME isolated to a
+// scratch dir so no test writes into a real agent tree.
+describe("--key=value boolean flags (parser-to-CLI)", () => {
+  function scratchHome(): string {
+    return mkdtempSync(join(tmpdir(), "bob-boolflag-"));
+  }
+  // Run a CLI subcommand with HOME pointed at a scratch dir; `2>&1` folds
+  // stderr (console.error) into the output bun:test captures on a non-zero exit.
+  function runCli(args: string, home: string): string {
+    try {
+      return execSync(`node ${CLI} ${args} 2>&1`, {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home },
+      });
+    } catch (err: unknown) {
+      const e = err as { stdout?: string; message?: string };
+      return e.stdout || e.message || "";
+    }
+  }
+
+  it("--dry-run=true takes the dry-run branch — shows the plan, writes nothing, no Flair call", () => {
+    const home = scratchHome();
+    const out = runCli("onboard testbot --role ea --dry-run=true", home);
+    expect(out).toContain("PLAN (--dry-run)");
+    // The dry-run branch returns before initAgent, so no agent dir was written:
+    // `--dry-run=true` can no longer scaffold, let alone provision, for real.
+    expect(existsSync(join(home, "agents", "testbot"))).toBe(false);
+  });
+
+  it("--dry-run=false does NOT take the dry-run branch — it scaffolds for real", () => {
+    const home = scratchHome();
+    // --no-flair + --no-interactive keep the real branch filesystem-only (no
+    // network, no interview), so the assert is deterministic instead of a hang.
+    const out = runCli(
+      "onboard testbot --role ea --dry-run=false --no-flair=true --no-interactive=true",
+      home,
+    );
+    expect(out).not.toContain("PLAN (--dry-run)");
+    expect(out).toContain("scaffolded testbot");
+    expect(existsSync(join(home, "agents", "testbot"))).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("--dry-run=yes fails with a usage error on a non-zero exit BEFORE any side effect", () => {
+    const home = scratchHome();
+    let out = "";
+    let threw = false;
+    // execSync throws on a non-zero exit, which is the signal we expect here.
+    try {
+      out = execSync(`node ${CLI} onboard testbot --role ea --dry-run=yes 2>&1`, {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home },
+      });
+    } catch (err: unknown) {
+      threw = true;
+      const e = err as { stdout?: string; message?: string };
+      out = e.stdout || e.message || out || "";
+    }
+    expect(threw).toBe(true); // a non-zero exit
+    expect(out).toContain("takes no value"); // names the flag + the accepted values
+    expect(out).toContain("yes"); // names the offending value
+    // No side effect: the UsageError is thrown before initAgent runs, so no
+    // agent dir exists — the fix refuses the bad spelling before touching disk.
+    expect(existsSync(join(home, "agents", "testbot"))).toBe(false);
+    rmSync(home, { recursive: true, force: true });
   });
 });
