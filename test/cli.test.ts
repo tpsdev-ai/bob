@@ -207,6 +207,30 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it("an empty --model= / --provider= on onboard means the default, never an empty id in bob.yaml", () => {
+    const home = scratchHome();
+    const out = runCli(
+      "onboard testbot --role ea --model= --provider= --no-flair --no-interactive",
+      home,
+    );
+    expect(out).toContain("scaffolded testbot");
+    const yaml = readFileSync(join(home, "agents", "testbot", "bob.yaml"), "utf8");
+    expect(yaml).toContain("name: ollama-cloud");
+    expect(yaml).toContain("model: kimi-k2.6");
+    expect(yaml).not.toMatch(/model:\s*$/m);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("a bare --model on onboard means the default too — never the literal id 'true'", () => {
+    const home = scratchHome();
+    const out = runCli("onboard testbot --role ea --model --no-flair --no-interactive", home);
+    expect(out).toContain("scaffolded testbot");
+    const yaml = readFileSync(join(home, "agents", "testbot", "bob.yaml"), "utf8");
+    expect(yaml).toContain("model: kimi-k2.6");
+    expect(yaml).not.toContain("model: true");
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("bob align refuses a bad --no-flair spelling BEFORE its session can rewrite soul.md", () => {
     const home = scratchHome();
     // A real (filesystem-only) agent to align: no Flair, no interview.

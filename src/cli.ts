@@ -86,9 +86,12 @@ credential for the target instance — FLAIR_ADMIN_PASS in the environment, or t
 }
 
 async function onboard(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const role = (flags.role ?? "custom") as BobRole;
-  const provider = String(flags.provider ?? "ollama-cloud");
-  const model = String(flags.model ?? "kimi-k2.6");
+  // Value flags go through stringFlag: a bare `--model`, or the empty
+  // `--model=` form, means "not given" — the default applies — never the
+  // literal id "true" or an empty id written into bob.yaml and models.json.
+  const role = (stringFlag(flags, "role") ?? "custom") as BobRole;
+  const provider = stringFlag(flags, "provider") ?? "ollama-cloud";
+  const model = stringFlag(flags, "model") ?? "kimi-k2.6";
   const dryRun = boolFlag(flags, "dry-run");
   const force = boolFlag(flags, "force");
   const noInteractive = boolFlag(flags, "no-interactive");
@@ -96,10 +99,7 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   // (the default) a missing admin credential FAILS the command; the way to
   // scaffold without an identity is to say so.
   const noFlair = boolFlag(flags, "no-flair");
-  const flairUrl =
-    flags["flair-url"] !== undefined && flags["flair-url"] !== true
-      ? String(flags["flair-url"])
-      : DEFAULT_FLAIR_URL;
+  const flairUrl = stringFlag(flags, "flair-url") ?? DEFAULT_FLAIR_URL;
 
   if (dryRun) {
     const template = loadRole(role);
@@ -327,10 +327,7 @@ async function installServiceCmd(
 ): Promise<number> {
   // launchd + systemd both use a minimal PATH, so the unit needs an absolute
   // path to `bob`. Default to the current executable's path when not overridden.
-  const bobBin =
-    flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
-      ? String(flags["bob-bin"])
-      : process.argv[1] || "bob";
+  const bobBin = stringFlag(flags, "bob-bin") ?? (process.argv[1] || "bob");
   const model = stringFlag(flags, "model");
   const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
