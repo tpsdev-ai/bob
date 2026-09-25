@@ -356,4 +356,61 @@ describe("run-log sizing + retention (issue #146)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  it("keeps a session's run log LINEAR in the number of turns (issue #139)", async () => {
+    const turns = 100;
+    const body = "x".repeat(50);
+    const events: unknown[] = [];
+    for (let k = 1; k <= turns; k++) {
+      // Turn k sees exactly k messages — a monotonic, growing history like pi's.
+      const messages: unknown[] = [];
+      for (let i = 0; i < k; i++) {
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: `${body}-${i}` }],
+        });
+      }
+      events.push({ type: "agent_end", messages });
+    }
+
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(fakeSession(events)),
+      // Huge cap: this test is about per-turn growth, not the per-run cap.
+      runLogCapBytes: 1 << 30,
+    });
+    expect(res.exitCode).toBe(0);
+
+    const log = readRunLog("testbot");
+    const logBytes = statSync(log.path).size;
+
+    // LINEAR: the log grows with the number of turns, not the number of
+    // messages ever seen. A quadratic log (old behaviour — the whole history
+    // each turn, ~turns^2/2 * 60B ~ 360KB for 100 turns) fails this bound.
+    expect(logBytes).toBeLessThan(300 * turns);
+
+    // One agent_end record per turn, each holding only that turn's own
+    // (delta) message — exactly one per turn — not the whole history. If the
+    // whole history were logged, the sum of logged messages would be ~5050.
+    const agentEnds = log.lines.filter((l) => eventType(l) === "agent_end");
+    expect(agentEnds.length).toBe(turns);
+    let totalLoggedMessages = 0;
+    let maxPrior = 0;
+    for (const e of agentEnds) {
+      // biome-ignore lint/suspicious/noExplicitAny: log records are untyped
+      const ev = (e as any).event;
+      const msgs = Array.isArray(ev?.messages) ? (ev.messages as unknown[]).length : 0;
+      // Each turn logs only its one delta message, never the accumulated history.
+      expect(msgs).toBe(1);
+      totalLoggedMessages += msgs;
+      if (typeof ev?.priorMessageCount === "number") {
+        maxPrior = Math.max(maxPrior, ev.priorMessageCount);
+      }
+    }
+    expect(totalLoggedMessages).toBe(turns);
+    // The final turn recorded the full prior history (turns - 1) as a bare
+    // count without re-serialising it — the property that keeps the log linear.
+    expect(maxPrior).toBe(turns - 1);
+  });
 });

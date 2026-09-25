@@ -354,6 +354,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_CAP_BYTES;
   let logBytes = 0; // running total of bytes committed to this log
   let capHit = false; // set once we cross the cap; then deltas stop
+  let lastAgentEndCount = 0; // # messages the previous agent_end already logged;
+  // agent_end carries the WHOLE history — each turn logs only its own delta (#139)
 
   // Write one log record.
   // - `isDelta` marks streamed message_update events: the only kind the cap drops,
@@ -365,18 +367,36 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   //   ALWAYS written, even past the cap, so the log stays a faithful post-mortem.
   const writeRunLog = (record: unknown, isDelta: boolean): void => {
     try {
+      const rec = record as Record<string, unknown>;
+      const ev = rec.event as Record<string, unknown> | undefined;
       let out: unknown = record;
-      if (isDelta) {
-        const rec = record as Record<string, unknown>;
-        const ev = rec.event as Record<string, unknown> | undefined;
-        if (ev) {
-          const stripped = scrubPartial(ev) as Record<string, unknown>;
-          // message_update also carries a growing shallow-copy `message` (its
-          // content grows in place); drop it too — message_end carries the final
-          // message once, so the log line keeps only the small delta.
-          delete stripped.message;
-          out = { ...rec, event: stripped };
-        }
+      if (isDelta && ev) {
+        // message_update: the delta alone reconstructs the message; message_end
+        // carries the final one, so drop the growing partial and the in-place
+        // growing shallow-copy message — keeps the log linear (issue #146).
+        const stripped = scrubPartial(ev) as Record<string, unknown>;
+        delete stripped.message;
+        out = { ...rec, event: stripped };
+      } else if (!isDelta && ev && ev.type === "agent_end") {
+        // agent_end carries the WHOLE message history. In a long session every
+        // turn re-serialises everything before it (issue #139). Log only this
+        // turn's own messages — those added since the previous agent_end — plus a
+        // count of the prior history, so the run log stays linear in the number
+        // of turns.
+        const all = Array.isArray(ev.messages) ? (ev.messages as unknown[]) : [];
+        const prior = lastAgentEndCount;
+        const ownMessages = all.slice(lastAgentEndCount);
+        lastAgentEndCount = all.length;
+        out = {
+          ...rec,
+          event: {
+            ...ev,
+            messages: ownMessages,
+            // priorMessageCount: how many messages already existed before this turn,
+            // so a reader knows the run's total without re-serialising the history.
+            priorMessageCount: prior,
+          },
+        };
       }
       // Past the cap: drop deltas, keep everything else.
       if (isDelta && capHit) return;
