@@ -354,6 +354,11 @@ export interface BobFactoryInput {
   // in production, where the runtime is built from the agent's own
   // auth.json/models.json.
   modelRuntime?: unknown;
+  // Test seam: the pi session builder (createAgentSessionFromServices). Omitted
+  // in production, where pi builds the session from the services above; a test
+  // can substitute one that returns a scripted "built" session so it can drive
+  // the factory's dispose-on-refusal catch without a process-global module mock.
+  buildSession?: typeof createAgentSessionFromServices;
 }
 
 // Fail the session if bob's OWN guard extension did not load (#145). pi records
@@ -413,6 +418,11 @@ export function contractBlockFor(
 export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSessionRuntimeFactory {
   const { config, policy } = input;
   const deps = input.deps;
+  // pi builds the session from the services above, unless a test injects its own
+  // builder. Injectable so a test drives the dispose-on-refusal path with a
+  // scripted session instead of a process-global module mock; production passes
+  // nothing and gets pi's own builder, exactly as before.
+  const buildSession = input.buildSession ?? createAgentSessionFromServices;
   // The #145 contract, built ONCE: the same literal block is appended to the
   // system prompt (through the loader's override) and handed to the guard, so
   // "the request carries the contract" is one string compared with itself.
@@ -488,7 +498,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       );
     }
 
-    const result = await createAgentSessionFromServices({
+    const result = await buildSession({
       services,
       sessionManager,
       model,
