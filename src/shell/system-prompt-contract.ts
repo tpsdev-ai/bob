@@ -34,34 +34,48 @@
 //      visible truncation marker;
 //   2. bob's guard is registered LAST on `before_provider_request`, so it sees
 //      the payload after every other capability has had its turn: an agent
-//      response request whose payload does not carry the contract fails the
-//      turn exactly like a failed audit — dispose the session, end the
-//      process, and name the reason. A capability can still replace the prompt
-//      per turn (`before_agent_start` returning `systemPrompt`) or rewrite the
-//      outgoing provider payload (`before_provider_request`), both AFTER the
-//      factory's creation/reload audit, so the request itself is the last
-//      place the guarantee can be checked. The check does NOT parse provider
-//      payload shapes: layouts differ per API and change between pi releases,
-//      and a reader that knows a few of them fails a legitimate request the
-//      moment a provider differs. It asks whether the SERIALIZED payload
-//      contains the block verbatim (systemPromptFromRequestPayload used to read
-//      a few shapes and missed the Responses APIs' `input` and Google's
-//      `config.systemInstruction` outright — round 2);
-//   3. the guarantee is stated for AGENT RESPONSE requests, and in pi 0.84.3
-//      that is also all the hook sees: the agent turn's `onPayload` is attached
-//      to the agent's own requests, while pi's compaction and branch-summary
-//      calls pass the stream function their OWN options (apiKey/headers/…, no
-//      onPayload), so pi's summaries never reach `before_provider_request` at
-//      all — proven live. They are excluded anyway, on pi's own
-//      `AgentSession.isCompacting` flag, as insurance for a pi that DOES route
-//      them through the hook: without it such a request (which carries pi's
-//      summarization prompt, never the contract) would dispose the session and
-//      end the process. The exemption is the FLAG and never a string in the
-//      payload — an exemption keyed on a marker in the prompt can be borrowed by
-//      anything that pastes the marker in while dropping the contract (round
-//      2's defect), and pi's full summarization prompt is no better, since it is
-//      still text a capability can reproduce. pi refuses a new prompt while a
-//      compaction is running, so no agent request can enter that window.
+//      request that does not carry the contract block fails the turn exactly
+//      like a failed audit — dispose the session, end the process, and name the
+//      reason. A capability can still replace the prompt per turn
+//      (`before_agent_start` returning `systemPrompt`) or rewrite the outgoing
+//      provider payload (`before_provider_request`), both AFTER the factory's
+//      creation/reload audit, so the request itself is the last place the
+//      guarantee can be checked.
+//
+//      What the guard proves is that EVERY AGENT REQUEST CARRIES THE CONTRACT
+//      BLOCK. The system prompt is where bob PUTS it — the mechanism above, and
+//      it is tested — while the guard proves it is still SENT. A capability that
+//      copies the block into a user message and replaces the system field
+//      passes, deliberately: the block still reaches the model in that request.
+//      The erasure #145 is about is a request that goes out WITHOUT it.
+//
+//      The check does NOT parse provider payload shapes: layouts differ per API
+//      and change between pi releases, and a reader that knows a few of them
+//      fails a legitimate request the moment a provider differs. It does not
+//      search a SERIALIZATION either (round 3): it walks the payload's DECODED
+//      string values and asks whether any of them contains the block. A
+//      substring of a JSON text is not the text a provider sends — a client that
+//      writes a character escaped (`é` as `\u00e9`) or an adapter that sanitizes
+//      the system prompt makes the bytes differ from the block while the value
+//      the model receives is the block, and a serialized search false-fails
+//      that request. The block itself is built from WELL-FORMED text (unpaired
+//      surrogates removed the way pi-ai's adapters remove them,
+//      `utils/sanitize-unicode.ts`), so an adapter's own sanitizing is a no-op
+//      on it and the block the guard compares IS the block the provider sends;
+//   3. there is NO exemption (round 3), because this hook never sees pi's own
+//      calls: in pi 0.84.3 the agent turn's `onPayload` — the seam pi routes to
+//      `before_provider_request` — is attached to the agent's own requests,
+//      while pi's compaction and branch-summary calls pass the stream function
+//      their OWN options (apiKey/headers/…, no onPayload), so pi's summaries
+//      never reach this hook at all — proven live, and the live test fails if a
+//      future pi routes them here. Round 2's exemption on pi's
+//      `AgentSession.isCompacting` flag is not safe insurance for that day: the
+//      flag is ALSO true during branch summarization (`navigateTree`), where a
+//      capability's `sendMessage` with `triggerTurn` can start an agent turn
+//      (`sendMessage`, agent-session.js) — so the flag could exempt a REAL
+//      agent request that carries no block. With the exemption gone there is
+//      nothing to borrow: every request that reaches this hook must carry the
+//      block.
 
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 
@@ -129,6 +143,24 @@ export function assertContractText(text: string | undefined, what: string): stri
   return text as string;
 }
 
+/** Unpaired surrogates removed, exactly as pi-ai's adapters do it — the same
+ *  regex as `utils/sanitize-unicode.ts` `sanitizeSurrogates` (pi-ai 0.84.3),
+ *  which every payload builder applies to the system prompt and to message
+ *  content before it builds a request (api/openai-completions.js,
+ *  anthropic-messages.js, google-*.js, bedrock-converse-stream.js, …).
+ *
+ *  An unpaired surrogate is not a character a provider ever receives, so a
+ *  block that carried one would differ from the block in the payload and the
+ *  guard would refuse a legitimate request. Mirroring the adapters here is what
+ *  makes the block the guard compares and the block the provider sends the SAME
+ *  text. */
+export function wellFormedContractText(text: string): string {
+  return text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    "",
+  );
+}
+
 /**
  * The literal block appended to the system prompt.
  *
@@ -144,7 +176,11 @@ export function buildContractBlock(opts: {
   capChars?: number;
 }): string {
   const cap = assertContractCap(opts.capChars ?? DEFAULT_CONTRACT_CAP_CHARS);
-  const text = assertContractText(opts.text, opts.label === "TASK" ? "task" : "standing contract");
+  const what = opts.label === "TASK" ? "task" : "standing contract";
+  // Well-formed FIRST, then refuse a blank: a task that is nothing but
+  // unpaired surrogates says nothing once they are gone, and the block is built
+  // from the text the provider will actually be sent.
+  const text = assertContractText(wellFormedContractText(opts.text ?? ""), what);
   const heading = `${CONTRACT_SENTINEL_PREFIX}${opts.label} — carried in the system prompt; a context compaction never removes it; cap ${cap} chars]`;
   const intro =
     opts.label === "TASK"
@@ -171,90 +207,115 @@ export function appendContractOverride(block: string): (base: string[]) => strin
   return (base: string[]) => [...base, block];
 }
 
-/**
- * The payload as the provider will send it: JSON text. Some adapters hand the
- * guard a body that is already a string, and then that text IS the
- * serialization. undefined when the payload cannot be serialized at all (a
- * cycle, a BigInt) — a payload the guard cannot read is a check it cannot
- * vouch for, never a pass.
- */
-export function serializeRequestPayload(payload: unknown): string | undefined {
-  if (typeof payload === "string") return payload;
-  if (payload === undefined) return undefined;
+/** The payload's DECODED value. Some adapters hand the guard a body that is
+ *  already a string, and that string is a serialization: parse it, because the
+ *  decoded value is what the provider's own client sends and what its escaping
+ *  no longer hides. A string that is not JSON is its own value. */
+export function decodedRequestPayload(payload: unknown): unknown {
+  if (typeof payload !== "string") return payload;
   try {
-    return JSON.stringify(payload);
+    return JSON.parse(payload);
   } catch {
-    return undefined;
+    return payload;
   }
 }
 
-/** `text` as it appears INSIDE a JSON payload: `JSON.stringify` with its
- *  surrounding quotes removed. A block carried in a provider payload is escaped
- *  exactly this way, whatever the provider's layout. */
-export function jsonEscapedRequestText(text: string): string {
-  return JSON.stringify(text).slice(1, -1);
+/** How the payload was read, for the failure message: whether it could be read
+ *  at all, and how many string values it carried. */
+export interface RequestPayloadScan {
+  carries: boolean;
+  /** String values walked. Zero on a payload that carries none. */
+  stringValues: number;
+  /** false for a payload that cannot be read at all (undefined). */
+  readable: boolean;
+}
+
+/** Walk one value: a string leaf is the ONLY thing that can carry the block. */
+function scanStringValue(
+  value: unknown,
+  text: string,
+  seen: Set<object>,
+  count: { n: number },
+): boolean {
+  if (typeof value === "string") {
+    count.n += 1;
+    return value.includes(text);
+  }
+  if (value === null || typeof value !== "object") return false;
+  // A cycle cannot appear in a payload a provider builds; walking one would
+  // loop, so a value already walked is not descended into again.
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (scanStringValue(entry, text, seen, count)) return true;
+    }
+    return false;
+  }
+  for (const entry of Object.values(value)) {
+    if (scanStringValue(entry, text, seen, count)) return true;
+  }
+  return false;
 }
 
 /**
- * Whether a request payload carries `text` — the whole of the guard's check.
+ * Read the payload for `text` — the whole of the guard's check.
  *
- * It does NOT parse provider shapes. Payload layouts differ per API (pi-ai
- * 0.84.3: Anthropic's `system` blocks, OpenAI chat-completions' `messages`, the
- * Responses APIs' `input`/`instructions`, Google's `config.systemInstruction`,
- * Bedrock's `system`, Mistral's `messages`, Codex's `instructions`) and change
- * between pi releases, so a reader that knows a few of them fails a legitimate
- * request the moment a provider differs — which is exactly what a
- * shape-reading guard did to the Responses and Google layouts. The question it
- * can answer for EVERY layout is the one asked here: does the serialized
- * payload contain this text, verbatim? A capability that replaced or dropped
- * the system prompt removes the block from the payload entirely, which is the
- * capability loss this catches.
+ * It asks whether a string VALUE in the payload contains the block, walking the
+ * decoded object (objects and arrays), never whether a serialization of it
+ * contains the block as a substring. The difference is the difference between
+ * "the model is sent the block" and "some JSON text spells it": a client may
+ * write a character escaped (`é` as `\u00e9`) and pi-ai's adapters sanitize the
+ * system prompt, so a serialized search false-fails a legitimate request. Nor
+ * does it parse provider SHAPES — layouts differ per API (pi-ai 0.84.3:
+ * Anthropic's `system` blocks, chat-completions' `messages`, the Responses APIs'
+ * `input`/`instructions`, Google's `config.systemInstruction`, Bedrock's
+ * `system`, Mistral's `messages`, Codex's `instructions`) and change between pi
+ * releases — and EVERY layout carries its text in string values, whatever its
+ * keys are, which is why this needs no shape. A capability that replaced or
+ * dropped the system prompt removes the block from the payload entirely, which
+ * is the capability loss this catches.
  */
+export function scanRequestPayload(payload: unknown, text: string): RequestPayloadScan {
+  if (payload === undefined) return { carries: false, stringValues: 0, readable: false };
+  const count = { n: 0 };
+  const carries = scanStringValue(decodedRequestPayload(payload), text, new Set<object>(), count);
+  return { carries, stringValues: count.n, readable: true };
+}
+
+/** Whether the request payload carries `text` in one of its DECODED string
+ *  values. */
 export function payloadCarriesRequestText(payload: unknown, text: string): boolean {
-  const serialized = serializeRequestPayload(payload);
-  if (serialized === undefined) return false;
-  return serialized.includes(text) || serialized.includes(jsonEscapedRequestText(text));
+  return scanRequestPayload(payload, text).carries;
 }
 
 export type ContractVerdict =
-  /** The request carries the contract, or is pi's own summarization call. */
-  | { allowed: true; kind: "carries-contract" | "pi-summarization" }
-  /** An AGENT RESPONSE request whose system prompt does not carry it. */
-  | { allowed: false; reason: "contract_missing_from_system_prompt"; detail: string };
+  /** The request carries the contract block — the only way it goes out. */
+  | { allowed: true; kind: "carries-contract" }
+  /** An AGENT REQUEST that does not carry the contract block. */
+  | { allowed: false; reason: "contract_missing_from_request"; detail: string };
 
 /**
  * The guard's decision for ONE outgoing provider request. Pure, so the guard
  * itself is a thin wiring layer and the decision is testable without pi.
  *
- * Order matters, and the first check is pi's own flag. WHILE PI IS COMPACTING
- * (`AgentSession.isCompacting`: threshold and overflow recovery, a manual
- * `/compact`, and branch summarization — pi 0.84.3 core/agent-session.js), the
- * only requests on the wire are pi's summarization calls: the agent is not
- * answering, and pi refuses a new prompt for the duration
- * ("Cannot submit a prompt while compaction is in progress"). Those calls are
- * passed. The check is the FLAG and never a string in the payload: any text
- * exemption (a short marker, or pi's full summarization prompt) is text a
- * capability can paste into its own prompt while dropping the contract.
- *
- * Everything else must carry the contract in its serialized payload.
+ * There is ONE question and NO exemption: does this request carry the contract
+ * block? Every request that reaches bob's guard is an agent request — pi's own
+ * summarization calls never get here (see the header) — so a request that does
+ * not carry the contract fails, whatever else is true of the session. There is
+ * no flag to consult and no text to match that a capability could borrow.
  */
-export function contractVerdictForRequest(
-  payload: unknown,
-  contract: string,
-  opts: { compacting?: () => boolean } = {},
-): ContractVerdict {
-  if (opts.compacting?.() === true) return { allowed: true, kind: "pi-summarization" };
-  if (payloadCarriesRequestText(payload, contract)) {
-    return { allowed: true, kind: "carries-contract" };
-  }
-  const serialized = serializeRequestPayload(payload);
+export function contractVerdictForRequest(payload: unknown, contract: string): ContractVerdict {
+  const scan = scanRequestPayload(payload, contract);
+  if (scan.carries) return { allowed: true, kind: "carries-contract" };
   return {
     allowed: false,
-    reason: "contract_missing_from_system_prompt",
-    detail:
-      serialized === undefined
-        ? "the outgoing provider request payload could not be serialized, so the contract could not be found in it"
-        : `the outgoing provider request's ${serialized.length}-char payload does not contain the session's contract block (${contract.length} chars)`,
+    reason: "contract_missing_from_request",
+    detail: !scan.readable
+      ? "the outgoing provider request payload could not be read, so the contract could not be found in it"
+      : scan.stringValues === 0
+        ? `the outgoing provider request carries no string value at all, so the session's contract block (${contract.length} chars) is not in it`
+        : `none of the outgoing provider request's ${scan.stringValues} string value(s) contains the session's contract block (${contract.length} chars)`,
   };
 }
 
@@ -285,19 +346,15 @@ export function createContractGuardExtension(input: {
   /** Read lazily: the deps hold the session, which exists only after the
    *  factory has built it. */
   deps: () => ContractGuardDeps;
-  /** pi's own "a compaction or branch summary is running" flag, read per
-   *  request (`AgentSession.isCompacting`). Lazy for the same reason as deps:
-   *  the session does not exist until the factory has built it. Omitted (or
-   *  false) means the request must carry the contract. */
-  compacting?: () => boolean;
 }): InlineExtension {
   const factory = (pi: {
     on(event: "before_provider_request", handler: (event: { payload: unknown }) => unknown): void;
   }): void => {
     pi.on("before_provider_request", (event) => {
-      const verdict = contractVerdictForRequest(event.payload, input.contract, {
-        ...(input.compacting !== undefined ? { compacting: input.compacting } : {}),
-      });
+      // No options and no exemption: the payload decides. pi's own summaries do
+      // not reach this handler (the header, and the live test pins it), so a
+      // request that lacks the contract is an agent request that lost it.
+      const verdict = contractVerdictForRequest(event.payload, input.contract);
       if (verdict.allowed) return undefined;
       const deps = input.deps();
       // Dispose FIRST: describing the failure can itself throw, and nothing may
@@ -310,10 +367,10 @@ export function createContractGuardExtension(input: {
       }
       const message =
         `bob: ${verdict.reason}; disposing the session and ending the process before another turn can run. ` +
-        `${verdict.detail}. The contract is appended to the system prompt through the resource loader, so it ` +
-        `reaches the model in every provider layout; a capability that replaces the prompt (before_agent_start) ` +
-        `or rewrites the outgoing provider payload (before_provider_request) takes it away, and no turn may run ` +
-        `without it.`;
+        `${verdict.detail}. Every agent request must carry the contract block: bob appends it to the system ` +
+        `prompt through the resource loader, so it reaches the model in every provider layout, and a capability ` +
+        `that replaces the prompt (before_agent_start) or rewrites the outgoing provider payload ` +
+        `(before_provider_request) takes it away — no turn may run without it.`;
       try {
         deps.log(message);
       } finally {

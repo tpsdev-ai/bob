@@ -420,15 +420,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // The guard's deps. The session exists only after the factory has built it,
   // so the holder is filled in below; a guard that fires before then (it cannot
   // — no request is made before the session exists) still ends the process,
-  // just without a session to dispose.
-  //
-  // The holder also carries pi's "a compaction or branch summary is running"
-  // flag (`AgentSession.isCompacting`, pi 0.84.3 agent-session.d.ts): the guard
-  // exempts pi's own summarization calls on THAT, not on any text in the
-  // payload (#145 round 2 — a marker in the prompt could be borrowed). It is
-  // read through the holder so it is the flag of the session the request
-  // belongs to, and `=== true` so a session without the getter exempts nothing.
-  const guardTarget: { session?: { dispose(): void; isCompacting?: boolean } } = {};
+  // just without a session to dispose. The holder carries ONLY the dispose
+  // target: the guard has no exemption to feed (round 3 deleted the
+  // `isCompacting` one, which could pass a real agent request during branch
+  // summarization), so there is no per-request session state to read.
+  const guardTarget: { session?: { dispose(): void } } = {};
   const guardDeps: ContractGuardDeps = {
     dispose: () => {
       try {
@@ -446,7 +442,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       : createContractGuardExtension({
           contract: contractBlock,
           deps: () => guardDeps,
-          compacting: () => guardTarget.session?.isCompacting === true,
         });
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
@@ -501,12 +496,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       ...(policy.excludeTools.length > 0 ? { excludeTools: policy.excludeTools } : {}),
     });
 
-    // The guard's dispose target AND its compaction flag source: the session is
-    // now the thing a failed contract check must take down, and the thing whose
-    // `isCompacting` says whether a request is pi's own summarization call.
+    // The guard's dispose target: the session is now the thing a failed
+    // contract check must take down.
     guardTarget.session = result.session as unknown as {
       dispose(): void;
-      isCompacting?: boolean;
     };
 
     const assertActive = (session: AuditSession) => {

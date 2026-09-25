@@ -100,7 +100,7 @@ change one, the named test is what tells you.
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
   narrow it. *(`test/shell/doctor.test.ts`)*
-- **The task survives compaction, and every AGENT RESPONSE request is checked.**
+- **The task survives compaction, and every agent request is checked for it.**
   A one-shot `bob run` carries its TASK, and the persistent runtime carries the
   agent's STANDING CONTRACT (its role and cron duties), in the session's SYSTEM
   PROMPT, appended as literal text through the resource loader's
@@ -114,19 +114,26 @@ change one, the named test is what tells you.
   (a bind or a reload rebuilds only through one of those), reading the same
   loader append text each time — so the block is identical across those
   rebuilds — while compaction rewrites only the message history. bob's guard is
-  registered LAST on `before_provider_request`, so it sees the payload after
+  registered LAST on `before_provider_request`, so it sees the request after
   every declared capability, whatever layout that provider uses: it asks whether
-  the SERIALIZED payload contains the block verbatim (it does not parse provider
-  shapes, so a legitimate request cannot fail because an API differs), and an
-  agent response request whose payload does not carry the block fails the turn
-  exactly like a failed audit — the session is disposed, the process ends, and
-  the reason is named. A blank task is refused before the session starts.
-  **The guarantee is stated for AGENT RESPONSE requests:** pi's own compaction
-  and branch-summary calls are exempt, and the exemption is pi's own
-  `isCompacting` flag on the session — never text in the payload, which a
-  capability could paste in while dropping the contract.
-  *(`test/shell/system-prompt-contract.test.ts` — the real payload of every
-  provider pi-ai ships, `system-prompt-contract-live.test.ts` — a real pi
+  a DECODED string value in the payload carries the block — no provider shapes,
+  so a legitimate request cannot fail because an API differs, and no search of a
+  serialization, which an escaped character or an adapter's own sanitizing would
+  false-fail — and an AGENT REQUEST that does not carry the block fails the turn
+  exactly like a failed audit: the session is disposed, the process ends, and
+  the reason is named. **The guard's guarantee is that every agent request
+  carries the contract block.** The system prompt is where bob PUTS it (the
+  mechanism above, and it is tested); the guard proves it is still SENT. A
+  capability that moves the block into the conversation still passes, because
+  the model is still sent it — what must never happen is a request that goes out
+  without it. There is no exemption to state: pi's own compaction and
+  branch-summary calls never reach the guard at all (pi attaches the hook to the
+  agent's own requests) and the live test pins that, which is what lets the guard
+  refuse everything else — including an agent turn started during a branch
+  summary, the window a flag-based exemption would have covered. A blank task is
+  refused before the session starts.
+  *(`test/shell/system-prompt-contract.test.ts` — the real payload of the seven
+  providers the test covers, `system-prompt-contract-live.test.ts` — a real pi
   session on a stub model: a real mid-turn threshold compaction, both loss
   paths, a session replaced through the runtime factory, and the persistent
   runtime's standing contract after a compaction, `run.test.ts`)*
