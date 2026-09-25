@@ -7,7 +7,7 @@
 // produces (a bare flag leaves the agent's bob.yaml fields alone) without either
 // file re-stating the rule.
 import { describe, expect, it } from "bun:test";
-import { stringFlag } from "../../src/shell/argv.js";
+import { parseArgs, stringFlag } from "../../src/shell/argv.js";
 
 describe("stringFlag", () => {
   it("reads a flag that carries a value", () => {
@@ -36,5 +36,44 @@ describe("stringFlag", () => {
       "exe-dev-gateway",
     );
     expect(stringFlag({ provider: "exe-dev-gateway", model: true }, "model")).toBeUndefined();
+  });
+});
+
+// `parseArgs` (moved out of cli.ts so a unit can import it WITHOUT running the
+// CLI's top-level main()) — the CLI argument parser the subcommands all share.
+describe("parseArgs", () => {
+  // --- The --key=value fix (#170) ---
+  it("reads --key=value as the key's value without consuming the next token", () => {
+    // The bug: `--model=foo` was parsed as a flag literally named
+    // `model=foo`, and when the next token was not a flag it was taken as the
+    // value — so `bob run --model=foo ember "task"` swallowed the agent name
+    // `ember`. With the fix the positional survives.
+    const parsed = parseArgs(["run", "--model=foo", "ember", "task"]);
+    expect(parsed.command).toBe("run");
+    expect(parsed.flags.model).toBe("foo");
+    expect(parsed.positional).toEqual(["ember", "task"]);
+  });
+
+  it("parses several --key=value forms, none eating the next token", () => {
+    const parsed = parseArgs(["run", "--model=foo", "--provider=bar", "ember", "task"]);
+    expect(parsed.flags).toEqual({ model: "foo", provider: "bar" });
+    expect(parsed.positional).toEqual(["ember", "task"]);
+  });
+
+  it("treats --key= (empty value) as a bare flag, exactly like --key alone", () => {
+    expect(parseArgs(["align", "testbot", "--model="]).flags.model).toBe(true);
+    expect(parseArgs(["run", "--model"]).flags.model).toBe(true);
+  });
+
+  // --- Today's behaviour (pinned; NO code change) ---
+  it("an empty-string VALUE after a flag is a bare flag (the !next rule: the empty string is falsy)", () => {
+    // `--provider ""`: the empty string is a token, and `""` is falsy, so the
+    // valueless-flag branch stores the boolean true. This is what main does, and
+    // the fix does not change it.
+    expect(parseArgs(["align", "testbot", "--provider", ""]).flags.provider).toBe(true);
+  });
+
+  it("a repeated flag keeps the LAST value (the object key is overwritten)", () => {
+    expect(parseArgs(["run", "--model", "a", "--model", "b"]).flags.model).toBe("b");
   });
 });

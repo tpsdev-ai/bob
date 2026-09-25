@@ -16,7 +16,7 @@ import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[] };
-  config: { appendSystemPrompt: string; provider: string; model: string };
+  config: { appendSystemPrompt: string; provider: string; model: string; piAgentDir: string };
   initialMessage: string;
 }
 
@@ -32,6 +32,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
         appendSystemPrompt: input.config.appendSystemPrompt,
         provider: input.config.provider,
         model: input.config.model,
+        piAgentDir: input.config.piAgentDir,
       },
       initialMessage: input.initialMessage,
     };
@@ -289,5 +290,38 @@ describe("runAlign — the agent's own provider and model (#155)", () => {
     });
     expect(runs[0].config.provider).toBe("ollama-cloud");
     expect(runs[0].config.model).toBe("kimi-k2.6");
+  });
+});
+
+// #170 follow-up: an --provider / --model override may change ONLY the provider
+// and model it names. It must NOT move the credential source: pi reads its
+// auth.json from the agent's own .pi-agent dir (RunSessionConfig.piAgentDir),
+// which is fixed to the agent's directory and is never a field the override
+// touches. (An override that redirected the credential dir would let `bob align`
+// sign in as a different principal than the agent it was aligning.)
+describe("runAlign — an override cannot change the credential source (#170)", () => {
+  afterEach(() => {
+    rmSync(dirname(agentDir), { recursive: true, force: true });
+  });
+
+  it("keeps the agent's own piAgentDir even under a --provider + --model override", async () => {
+    // bob.yaml's own provider is ollama-cloud (a pass-through), but the override
+    // names a DIFFERENT bob provider (exe-dev-gateway -> anthropic) and a
+    // different model. The provider + model fields must follow the override, while
+    // piAgentDir must stay the agent's own dir — the credential source is fixed.
+    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    const { runner, runs } = fakeRunner({});
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      provider: "exe-dev-gateway",
+      model: "claude-opus-4-7",
+      sessionRunner: runner,
+    });
+    // The override took effect on the provider (mapped once to pi's id) and model.
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-opus-4-7");
+    // But the credential source is still the agent's own .pi-agent dir.
+    expect(runs[0].config.piAgentDir).toBe(join(agentDir, ".pi-agent"));
   });
 });

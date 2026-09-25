@@ -21,3 +21,59 @@ export function stringFlag(
   const value = flags[name];
   return value !== undefined && value !== true ? String(value) : undefined;
 }
+
+// `parseArgs` produces the shape `cli.ts` consumes: the subcommand, the
+// positional arguments, and the flag map. A flag with a value (`--model x`,
+// or the `--model=x` form) is the string value; a valueless flag
+// (`--model` alone, `--model` followed by another flag, or the `--model=`
+// empty-value form) is the boolean `true`, which `stringFlag` reads as
+// "not given". `--` ends flag parsing and makes everything after it positional.
+//
+// The `--key=value` form is consumed in ONE token and NEVER takes the next
+// token as its value: `bob run --model=foo ember "task"` keeps `ember` as the
+// agent name and `task` as the prompt, instead of swallowing the name. An empty
+// value (`--key=`) is a bare flag, exactly like `--key` alone.
+export interface Args {
+  command: string;
+  positional: string[];
+  flags: Record<string, string | boolean>;
+}
+
+export function parseArgs(argv: string[]): Args {
+  const [command = "help", ...rest] = argv;
+  const positional: string[] = [];
+  const flags: Record<string, string | boolean> = {};
+  for (let i = 0; i < rest.length; i++) {
+    const tok = rest[i];
+    if (tok === "--") {
+      // Everything after `--` is positional. The generated launcher forwards
+      // its own args this way (`bob launch <name> -- "$@"`), so a pi flag
+      // cannot be swallowed as a bob flag.
+      positional.push(...rest.slice(i + 1));
+      break;
+    }
+    if (tok.startsWith("--")) {
+      const eq = tok.indexOf("=");
+      if (eq > 2) {
+        // `--key=value`: the flag is `key` with `value`; it does NOT consume
+        // the next token. `--key=` (empty value) is a bare flag.
+        const value = tok.slice(eq + 1);
+        flags[tok.slice(2, eq)] = value.length === 0 ? true : value;
+      } else {
+        // `--key` (no `=`): a trailing non-flag token is its value, else it is
+        // the bare boolean form.
+        const key = tok.slice(2);
+        const next = rest[i + 1];
+        if (!next || next.startsWith("--")) {
+          flags[key] = true;
+        } else {
+          flags[key] = next;
+          i++;
+        }
+      }
+    } else {
+      positional.push(tok);
+    }
+  }
+  return { command, positional, flags };
+}

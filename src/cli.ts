@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type Args,
   type BobRole,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
@@ -19,6 +20,7 @@ import {
   installService,
   LaunchArgError,
   loadRole,
+  parseArgs,
   parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
@@ -34,41 +36,6 @@ import {
   syncFlairSoul,
   up,
 } from "./shell/index.js";
-
-interface Args {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): Args {
-  const [command = "help", ...rest] = argv;
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < rest.length; i++) {
-    const tok = rest[i];
-    if (tok === "--") {
-      // Everything after `--` is positional. The generated launcher forwards
-      // its own args this way (`bob launch <name> -- "$@"`), so a pi flag
-      // cannot be swallowed as a bob flag.
-      positional.push(...rest.slice(i + 1));
-      break;
-    }
-    if (tok.startsWith("--")) {
-      const key = tok.slice(2);
-      const next = rest[i + 1];
-      if (!next || next.startsWith("--")) {
-        flags[key] = true;
-      } else {
-        flags[key] = next;
-        i++;
-      }
-    } else {
-      positional.push(tok);
-    }
-  }
-  return { command, positional, flags };
-}
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
