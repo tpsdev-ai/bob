@@ -652,7 +652,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   try {
     // (1) Create the runs directory. This is the setup step that can throw into the
     // run; the outer catch turns a failure into one warning line + the no-op logger.
-    mkdirSync(runsDir, { recursive: true });
+    // Owner-only: the log carries assistant text, tool arguments and tool results.
+    // A directory an older bob created keeps its mode; the files below are 0600.
+    mkdirSync(runsDir, { recursive: true, mode: 0o700 });
 
     // (2) Retention first (best-effort): keep the newest few logs and delete older
     // ones oldest-first past a total budget, so a full disk can't silently kill a
@@ -680,7 +682,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // too. Removed at run end.
     runLogLockPath = `${runLogPath}.lock`;
     try {
-      writeFileSync(runLogLockPath, String(process.pid), { flag: "wx" });
+      writeFileSync(runLogLockPath, String(process.pid), { flag: "wx", mode: 0o600 });
     } catch (err) {
       // NO LOCK, NO LOG (issue #146, round 7): this used to be swallowed and the log
       // kept being written, which produced the one log retention is allowed to
@@ -701,7 +703,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // (5) The log file itself, created EXCLUSIVELY (`wx`) so an existing path is
     // never clobbered; the line naming it comes after it exists, so the path is
     // announced only for a log that is really there.
-    closeSync(openSync(runLogPath, "wx"));
+    closeSync(openSync(runLogPath, "wx", 0o600));
     process.stderr.write(`run log: ${runLogPath}\n`);
 
     // (6) The DELTA cap: the per-run limit on the STREAMED DELTA events

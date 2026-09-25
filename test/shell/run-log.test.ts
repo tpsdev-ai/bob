@@ -235,7 +235,7 @@ describe("run-log sizing + retention (issue #146)", () => {
     for (let i = 0; i < 6; i++) {
       acc += "word";
       const ev = messageUpdate("word", acc);
-      // A nested partial too, to prove stripping works at any depth.
+      // A nested partial too: the projection logs no field it does not name, at any depth.
       (ev as { message: { partial: string } }).message.partial = "nested partial to drop";
       events.push(ev);
     }
@@ -411,6 +411,37 @@ describe("run-log sizing + retention (issue #146)", () => {
     // The death is still recorded, so the log says why it ends there.
     const doneLine = log.lines.find((l) => (l as { done?: boolean }).done === true);
     expect(doneLine).toBeDefined();
+  });
+
+  it("creates the runs directory 0700 and the log and its lock 0600, under a permissive umask", async () => {
+    if (process.platform === "win32") return;
+    // The log carries assistant text, tool arguments and tool results. Under the
+    // common 022 umask the defaults were a 0755 directory and a 0644 log and lock,
+    // readable by every local user.
+    const previous = process.umask(0o022);
+    try {
+      const runsDir = join(agentsRoot, "testbot", "runs");
+      let lockMode = -1;
+      await runAgent({
+        name: "testbot",
+        prompt: "go",
+        agentsRoot,
+        sessionFactory: factoryReturning(
+          fakeSession([messageUpdate("tok", "tok")], {
+            // The lock exists only while the run writes; read it mid-run.
+            onEmit: async () => {
+              const lock = readdirSync(runsDir).find((f) => f.endsWith(".jsonl.lock"));
+              lockMode = statSync(join(runsDir, lock!)).mode & 0o777;
+            },
+          }),
+        ),
+      });
+      expect(statSync(runsDir).mode & 0o777).toBe(0o700);
+      expect(statSync(readRunLog("testbot").path).mode & 0o777).toBe(0o600);
+      expect(lockMode).toBe(0o600);
+    } finally {
+      process.umask(previous);
+    }
   });
 
   it("writes each record to disk when the append returns (read before the next event)", async () => {

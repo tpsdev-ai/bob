@@ -215,8 +215,8 @@ each record is a fixed shape for its event type, bounded like this:
   "keeps a growing extension entry flat: identity and size, never the entry", "a
   run that dies before message_end still records WHICH block each delta came
   from".)
-- **A per-run DELTA cap** (default **50 MB**, override with `runLogCapBytes` for a
-  one-off run). Once the log reaches it, the streamed deltas stop being written;
+- **A per-run DELTA cap** (**50 MB**; `bob run` has no flag or config key that
+  changes it). Once the log reaches it, the streamed deltas stop being written;
   every non-delta event — tool calls and results, errors, lifecycle events, each
   `*_end` final, and the final `done` line — keeps coming, and a single line
   records that the **delta** cap was hit. The consequence, plainly: past the cap
