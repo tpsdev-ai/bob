@@ -24,7 +24,6 @@ import {
   auditOrExit,
   auditToolSources,
   createBobRuntimeFactory,
-  installReloadAudit,
   isolatedLoaderOptions,
   isolatedSettings,
   promptSession,
@@ -33,58 +32,58 @@ import {
 // A module-shaped file pi's auto-discovery would pick up if it were allowed to.
 const AMBIENT_EXTENSION = "export default function ambient(pi) { /* would register a tool */ }\n";
 
+let root: string;
+let agentsRoot: string;
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), "bob-session-iso-"));
+  agentsRoot = join(root, "agents");
+});
+
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+// A real agent (initAgent writes bob.yaml + .pi-agent/{models,auth}.json) with
+// ONE declared capability, plus every ambient resource pi would otherwise
+// consider: a user-level extension, a project .pi extension, a configured
+// package in both settings files, and a project trust decision.
+function scaffold(): { agentDir: string; cwd: string; piAgentDir: string } {
+  const res = initAgent({
+    name: "testbot",
+    role: "ea",
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    agentsRoot,
+    flairKeysDir: join(root, ".flair", "keys"),
+    skipFlair: true,
+  });
+  const agentDir = res.agentDir;
+  const cwd = join(agentDir, "work");
+  const piAgentDir = join(agentDir, ".pi-agent");
+
+  // User-level extension (auto-discovered from the pi agent dir).
+  mkdirSync(join(piAgentDir, "extensions"), { recursive: true });
+  writeFileSync(join(piAgentDir, "extensions", "ambient-user.js"), AMBIENT_EXTENSION);
+  // Project-level extension (auto-discovered from cwd/.pi when trusted).
+  mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "extensions", "ambient-project.js"), AMBIENT_EXTENSION);
+  // A configured package, in the user and the project settings files.
+  writeFileSync(
+    join(piAgentDir, "settings.json"),
+    JSON.stringify({ packages: ["@ambient/user-package"] }),
+  );
+  writeFileSync(
+    join(cwd, ".pi", "settings.json"),
+    JSON.stringify({ packages: ["@ambient/project-package"] }),
+  );
+  // A trust decision that would let the project resources load.
+  writeFileSync(join(piAgentDir, "trust.json"), JSON.stringify({ [cwd]: true }));
+
+  return { agentDir, cwd, piAgentDir };
+}
+
 describe("the session factory is isolated from everything ambient", () => {
-  let root: string;
-  let agentsRoot: string;
-
-  beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "bob-session-iso-"));
-    agentsRoot = join(root, "agents");
-  });
-
-  afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
-
-  // A real agent (initAgent writes bob.yaml + .pi-agent/{models,auth}.json) with
-  // ONE declared capability, plus every ambient resource pi would otherwise
-  // consider: a user-level extension, a project .pi extension, a configured
-  // package in both settings files, and a project trust decision.
-  function scaffold(): { agentDir: string; cwd: string; piAgentDir: string } {
-    const res = initAgent({
-      name: "testbot",
-      role: "ea",
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      agentsRoot,
-      flairKeysDir: join(root, ".flair", "keys"),
-      skipFlair: true,
-    });
-    const agentDir = res.agentDir;
-    const cwd = join(agentDir, "work");
-    const piAgentDir = join(agentDir, ".pi-agent");
-
-    // User-level extension (auto-discovered from the pi agent dir).
-    mkdirSync(join(piAgentDir, "extensions"), { recursive: true });
-    writeFileSync(join(piAgentDir, "extensions", "ambient-user.js"), AMBIENT_EXTENSION);
-    // Project-level extension (auto-discovered from cwd/.pi when trusted).
-    mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
-    writeFileSync(join(cwd, ".pi", "extensions", "ambient-project.js"), AMBIENT_EXTENSION);
-    // A configured package, in the user and the project settings files.
-    writeFileSync(
-      join(piAgentDir, "settings.json"),
-      JSON.stringify({ packages: ["@ambient/user-package"] }),
-    );
-    writeFileSync(
-      join(cwd, ".pi", "settings.json"),
-      JSON.stringify({ packages: ["@ambient/project-package"] }),
-    );
-    // A trust decision that would let the project resources load.
-    writeFileSync(join(piAgentDir, "trust.json"), JSON.stringify({ [cwd]: true }));
-
-    return { agentDir, cwd, piAgentDir };
-  }
-
   it("loads ONLY the declared capability — never user/project extensions or packages", async () => {
     const { cwd, piAgentDir } = scaffold();
     const { config, policy } = resolveRunConfig({ name: "testbot", agentsRoot });
@@ -227,41 +226,110 @@ describe("the audit", () => {
     expect(logs.join("\n")).toContain("required tool vanished: read");
   });
 
-  it("re-runs the audit after EVERY reload — a capability that drops a required tool ends the session", async () => {
-    // The reload hook is what covers "after the mode binds extensions": a
-    // capability that deactivates a required tool after load must not leave a
-    // running session whose policy no longer holds (pi's TUI would show a
-    // reload error and carry on).
-    let active = ["read", "write"];
-    const disposed: number[] = [];
+  // The two tests below run against a REAL pi session, built by the ONE
+  // factory. The defect they pin is an ORDERING defect: pi rebuilds the active
+  // tool list after the resource loader's reload returns, and it never reloads
+  // when the mode binds extensions — so an audit hooked into the LOADER read the
+  // state pi was about to replace, and never ran at all for the mode's bind.
+  // A fake loader cannot see either, which is why round 4 replaced that test.
+  const PROBE_TOOL =
+    'pi.registerTool({ name: "bob_probe_tool", label: "Bob Probe", description: "A probe tool registered by the test capability.", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "ok" }], details: {} }; } });';
+  const probeExtension = (register: boolean) =>
+    `export default function (pi) {${register ? PROBE_TOOL : ""}}\n`;
+  const probeExtensionWithSessionStart = () =>
+    `export default function (pi) {${PROBE_TOOL} pi.on("session_start", () => { pi.setActiveTools(pi.getActiveTools().filter((t) => t !== "bob_probe_tool")); }); }\n`;
+
+  // Build a real session through the factory, with ONE temp capability extension
+  // the test writes, and a policy that requires the tool it registers.
+  async function realProbeSession(extensionText: string) {
+    const { cwd, piAgentDir } = scaffold();
+    const extDir = mkdtempSync(join(tmpdir(), "bob-ext-"));
+    const extPath = join(extDir, "probe.js");
+    writeFileSync(extPath, extensionText);
+
+    const { config, policy } = resolveRunConfig({ name: "testbot", agentsRoot });
+    const logs: string[] = [];
     const exits: number[] = [];
-    const session = {
-      getActiveToolNames: () => active,
-      dispose: () => disposed.push(1),
+    const factory = createBobRuntimeFactory({
+      config: {
+        ...config,
+        extensionSources: [extPath],
+        capabilityBySource: { [extPath]: "probe" },
+      },
+      policy: { ...policy, tools: ["read", "bob_probe_tool"] },
+      deps: { log: (m) => logs.push(m), exit: (code) => exits.push(code) },
+    });
+    const result = await factory({
+      cwd,
+      agentDir: piAgentDir,
+      sessionManager: SessionManager.inMemory(cwd) as never,
+    });
+    const session = result.session as unknown as {
+      getActiveToolNames(): string[];
+      reload(options?: unknown): Promise<void>;
+      bindExtensions(bindings: unknown): Promise<void>;
+      dispose(): void;
     };
-    const loader = { reload: async () => {} };
-    const policy = { tools: ["read", "write"], excludeTools: [] };
+    // Count the factory's dispose, after the factory has built the session.
+    let disposals = 0;
+    const dispose = session.dispose.bind(session);
+    session.dispose = () => {
+      disposals += 1;
+      dispose();
+    };
+    return {
+      session,
+      extPath,
+      logs,
+      exits,
+      disposals: () => disposals,
+      cleanup: () => rmSync(extDir, { recursive: true, force: true }),
+    };
+  }
 
-    installReloadAudit(loader, () =>
-      auditOrExit(
-        () => {
-          // Every reload re-checks the SESSION's active tools.
-          const missing = policy.tools.filter((t) => !active.includes(t));
-          if (missing.length > 0)
-            throw new Error(`allowlisted tool not active: ${missing.join(", ")}`);
-        },
-        session,
-        { exit: (code) => exits.push(code), log: () => {} },
-      ),
-    );
+  it("re-audits AFTER pi rebuilds the tool list — a capability that stops providing a required tool on reload ends the session", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      // Creation: the capability registered the tool, so the policy holds.
+      expect(probe.session.getActiveToolNames()).toContain("bob_probe_tool");
 
-    await loader.reload(); // still fine
-    expect(disposed).toEqual([]);
+      // The capability stops registering the tool, and the reload re-reads it:
+      // pi rebuilds the active list AFTER the loader's reload returns, so only
+      // an audit at session.reload()'s end can see the tool go.
+      writeFileSync(probe.extPath, probeExtension(false));
+      await expect(probe.session.reload()).rejects.toThrow(/bob_probe_tool/);
 
-    active = ["read"]; // a capability deactivated `write` after load
-    await expect(loader.reload()).rejects.toThrow(/write/);
-    expect(disposed, "the session is disposed").toEqual([1]);
-    expect(exits, "the process is ended").toEqual([1]);
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      expect(probe.logs.join("\n")).toContain("bob_probe_tool");
+      expect(
+        probe.session.getActiveToolNames(),
+        "the audit saw the FINAL tool state, not the one pi was about to replace",
+      ).not.toContain("bob_probe_tool");
+    } finally {
+      probe.cleanup();
+    }
+  });
+
+  it("re-audits AFTER the mode binds extensions — a capability that deactivates a required tool on session_start ends the session", async () => {
+    const probe = await realProbeSession(probeExtensionWithSessionStart());
+    try {
+      // Creation: the extension loaded and its tool is active; session_start has
+      // not fired yet, so the policy holds.
+      expect(probe.session.getActiveToolNames()).toContain("bob_probe_tool");
+
+      // The mode's bind emits session_start, where the capability switches the
+      // tool off. pi does not reload here, so only an audit at the end of
+      // bindExtensions sees it.
+      await expect(probe.session.bindExtensions({})).rejects.toThrow(/bob_probe_tool/);
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      expect(probe.logs.join("\n")).toContain("bob_probe_tool");
+      expect(probe.session.getActiveToolNames()).not.toContain("bob_probe_tool");
+    } finally {
+      probe.cleanup();
+    }
   });
 });
 

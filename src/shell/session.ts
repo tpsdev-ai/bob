@@ -1,11 +1,9 @@
 // The ONE bob session factory, adapted to pi's runtime-factory contract.
 //
-// Round 3 of the role-tool-allowlist work deletes the last launch path that
-// built a pi command line. `bob` no longer spawns the pi CLI and no longer
-// assembles argv: every session — `bob run`, the persistent runtime, the
-// launcher with a prompt, the mail consumer, `bob launch` (interactive), the
-// hiring interview and `bob align` — comes from the factory below, through
-// pi's own SDK entry points.
+// `bob` never spawns the pi CLI and never assembles argv: every session —
+// `bob run`, the persistent runtime, the launcher with a prompt, the mail
+// consumer, `bob launch` (interactive), the hiring interview and `bob align` —
+// comes from the factory below, through pi's own SDK entry points.
 //
 // The factory returns the session TOGETHER WITH its matching services (pi's
 // runtime-factory shape), because the session can only be audited against the
@@ -20,11 +18,13 @@
 //       global SYSTEM.md / APPEND_SYSTEM.md. The only extensions are the
 //       declared capabilities' paths. A reload re-reads these same isolated
 //       sources — it cannot reach anything else;
-//   (c) the audit runs at creation, again after the mode binds extensions
-//       (that is an extendResources + reload) and after EVERY reload. pi's TUI
-//       shows a reload error and carries on, so throwing is not enough: a
-//       failed audit disposes the session and ends the process with the named
-//       error before another turn can run.
+//   (c) the audit runs at creation, again after the mode binds extensions (that
+//       is a bindExtensions, which emits session_start and extends resources
+//       from the extensions) and after EVERY session.reload() — NOT from inside
+//       the reload, where pi has not rebuilt the tool list yet. pi's TUI shows
+//       a reload error and carries on, so throwing is not enough: a failed
+//       audit disposes the session and ends the process with the named error
+//       before another turn can run.
 
 import { join } from "node:path";
 import {
@@ -211,18 +211,41 @@ export function auditOrExit(
   }
 }
 
-// Make every reload re-run the audit. The interactive mode binds extensions by
-// extending resources and reloading, so this is the seam that covers "after the
-// mode binds extensions" and "after every reload" with one hook — and because
-// the loader only ever re-reads the isolated sources above, a reload cannot
-// pull in anything it did not have at creation.
-export function installReloadAudit(
-  loader: { reload(options?: unknown): Promise<void> },
+// Run the audit AFTER pi has finished the work that can change the active tool
+// set — not in the middle of it, and not against the loader alone. Two pi
+// session methods rebuild that set:
+//
+//   * `session.reload()` awaits the resource loader's reload and THEN rebuilds
+//     the session's tool registry from the extensions that came back
+//     (agent-session.js: `await this._resourceLoader.reload()` followed by
+//     `this._buildRuntime(...)`). An audit hooked into the LOADER therefore runs
+//     before that rebuild and reads the OLD active list — a capability that
+//     stopped registering a tool is not visible yet;
+//   * `session.bindExtensions()` is how the interactive mode hands the session
+//     its bindings. pi emits `session_start` (where a capability may switch
+//     tools) and then extends its resources from the extensions' discover
+//     handlers. pi does NOT reload here, so a loader hook never fires at all for
+//     the mode's bind.
+//
+// So both are wrapped on the SESSION INSTANCE, and both audit after the original
+// returns. Because the loader only ever re-reads the isolated sources above, a
+// reload cannot pull in anything it did not have at creation.
+export function installSessionAudits(
+  session: {
+    reload(options?: unknown): Promise<void>;
+    bindExtensions(bindings: unknown): Promise<void>;
+  },
   audit: () => void,
 ): void {
-  const original = loader.reload.bind(loader);
-  loader.reload = async (options?: unknown) => {
-    await original(options);
+  const originalReload = session.reload.bind(session);
+  session.reload = async (options?: unknown) => {
+    await originalReload(options);
+    audit();
+  };
+
+  const originalBind = session.bindExtensions.bind(session);
+  session.bindExtensions = async (bindings: unknown) => {
+    await originalBind(bindings);
     audit();
   };
 }
@@ -312,12 +335,18 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       throw err;
     }
 
-    // After the mode binds extensions (an extendResources + reload) and after
-    // EVERY reload: pi's TUI shows a reload error and carries on, so a throw
-    // here would leave a running session whose policy no longer holds. Dispose
-    // it and end the process with the named error instead.
-    installReloadAudit(services.resourceLoader, () =>
-      auditOrExit(runAudit, result.session as unknown as { dispose(): void }, deps),
+    // After the mode binds extensions (a bindExtensions) and after EVERY
+    // session.reload(): pi's TUI shows a reload error and carries on, so a
+    // throw here would leave a running session whose policy no longer holds.
+    // Dispose it and end the process with the named error instead. Wrapped on
+    // the SESSION, not the loader: pi rebuilds the tool list after the loader's
+    // reload returns, so a loader hook audits the state pi is about to replace.
+    installSessionAudits(
+      result.session as unknown as {
+        reload(options?: unknown): Promise<void>;
+        bindExtensions(bindings: unknown): Promise<void>;
+      },
+      () => auditOrExit(runAudit, result.session as unknown as { dispose(): void }, deps),
     );
 
     return {

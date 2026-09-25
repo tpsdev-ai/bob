@@ -198,7 +198,7 @@ export {
   auditOrExit,
   auditToolSources,
   createBobRuntimeFactory,
-  installReloadAudit,
+  installSessionAudits,
   isolatedLoaderOptions,
   isolatedSettings,
   promptSession,
