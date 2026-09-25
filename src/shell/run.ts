@@ -263,6 +263,25 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     return lastAssistantText(session) ?? "";
   };
 
+  // cli#145 round 10: ONE judge. Every evaluation of this run goes through here
+  // — the first, the one after the continue turn, and the one taken when that
+  // turn threw — and it awaits the last re-injection's settle BEFORE evaluating,
+  // so a failure that arrives after a prompt resolved is on record before the
+  // run is judged. The evaluation after the continue turn used to skip that
+  // await (round 8 added it to the first site only): a compaction during the
+  // continue turn whose steer rejected after the prompt had resolved was judged
+  // before the failure existed, and the run settled `exitCode 0` with its task
+  // never restored — the #145 class this whole contract exists to close.
+  const judge = async (): Promise<{ ok: boolean; reason?: SilenceReason }> => {
+    await reinjector.settled();
+    return evaluateCompletion({
+      capturedText: finalTextNow(),
+      compactions: reinjector.compactions(),
+      expectedFinal: opts.expectedFinal,
+      reinjectionFailure: reinjector.reinjectionFailure(),
+    });
+  };
+
   try {
     reinjector.startTurn();
     await session.prompt(opts.prompt);
@@ -272,18 +291,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // compaction that erased the plan. Now it settles 0 ONLY with a final
     // message (matching an expected shape when one is declared).
     //
-    // cli#145 round 8: wait for the last compaction's re-injection to SETTLE
-    // first — a failure that arrives asynchronously must be on record before the
-    // run is judged — and hand that failure to the contract, where it outranks
-    // the text. The retry below is for silence only: a continue turn cannot
-    // restore a task whose re-injection failed, so it must not run for that.
-    await reinjector.settled();
-    let outcome = evaluateCompletion({
-      capturedText: finalTextNow(),
-      compactions: reinjector.compactions(),
-      expectedFinal: opts.expectedFinal,
-      reinjectionFailure: reinjector.reinjectionFailure(),
-    });
+    // cli#145 round 8: a failure that arrives asynchronously must be on record
+    // before the run is judged, and it outranks the text. The retry below is for
+    // silence only: a continue turn cannot restore a task whose re-injection
+    // failed, so it must not run for that.
+    let outcome = await judge();
     if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
       // explicit "continue from the state above" turn before giving up.
@@ -297,12 +309,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
-      outcome = evaluateCompletion({
-        capturedText: finalTextNow(),
-        compactions: reinjector.compactions(),
-        expectedFinal: opts.expectedFinal,
-        reinjectionFailure: reinjector.reinjectionFailure(),
-      });
+      outcome = await judge();
     }
     if (!outcome.ok) {
       // NEVER exit 0 for silence. Name the reason and print what we can (the

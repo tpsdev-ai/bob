@@ -912,6 +912,97 @@ describe("runAgent", () => {
     expect(stderr).toContain("the session refused the re-injection");
     expect(stderr).toContain("reinjection_failed");
   });
+
+  // ── cli#145 round 10: ONE judge for the one-shot run ─────────────────
+
+  it("cli#145 round 10: a compaction during the CONTINUE turn whose steer rejects LATE still refuses with reinjection_failed", async () => {
+    // The evaluation after the continue turn did NOT await reinjector.settled()
+    // (round 8 added that await to the first site only), so a compaction during
+    // that turn whose steer rejected AFTER the prompt had resolved was judged
+    // before the failure existed: the run exited 0 on text produced with its
+    // task never restored. Every evaluation now goes through ONE judge, which
+    // awaits settled() before it evaluates.
+    const calls: Array<{ text: string; streamingBehavior?: string }> = [];
+    // biome-ignore lint/suspicious/noExplicitAny: minimal event listener stub
+    const listeners: Array<(event: any) => void> = [];
+    let steers = 0;
+    const rejectSteer: Array<() => void> = [];
+    const session: RunSession = {
+      subscribe(listener) {
+        listeners.push(listener);
+        return () => {
+          const i = listeners.indexOf(listener);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      prompt(text, options) {
+        calls.push({ text, streamingBehavior: options?.streamingBehavior });
+        if (options?.streamingBehavior !== undefined) {
+          // The mid-run re-injection (the steer). The FIRST attaches cleanly;
+          // the one during the continue turn stays in flight and rejects only
+          // AFTER that prompt has resolved — the ordering the missing await
+          // could not see.
+          steers += 1;
+          if (steers === 1) return Promise.resolve();
+          return new Promise<void>((_resolve, reject) => {
+            rejectSteer.push(() => reject(new Error("the continue-turn steer was rejected")));
+          });
+        }
+        return (async () => {
+          const isContinue = text === CONTINUE_TURN;
+          // Both turns compact. The first settles with no final message (so the
+          // run retries once); the second ends with a final message and leaves
+          // its steer in flight when the prompt resolves.
+          for (const listener of listeners) {
+            listener({
+              type: "compaction_end",
+              reason: isContinue ? "overflow" : "threshold",
+              result: {},
+              aborted: false,
+              willRetry: false,
+            });
+          }
+          if (isContinue) {
+            for (const listener of listeners) {
+              listener({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "continued: all done" }],
+                },
+              });
+            }
+            // The rejection lands on a LATER macrotask — after this prompt's
+            // own await has resumed the run.
+            setTimeout(() => rejectSteer.shift()?.(), 0);
+          }
+        })();
+      },
+      dispose() {},
+    };
+    const { factory } = factoryReturning(session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // task, the steered block, the continue turn, its steered block.
+    expect(calls).toHaveLength(4);
+    expect(calls[2]?.text).toBe(CONTINUE_TURN);
+    expect(calls[3]?.streamingBehavior, "the continue turn's block is a steer").toBe("steer");
+    expect(res?.stdout, "the text WAS produced — it is just not acceptable").toBe(
+      "continued: all done",
+    );
+    expect(res?.exitCode, "a late re-injection failure still refuses the run").not.toBe(0);
+    expect(res?.reason).toBe("reinjection_failed");
+    expect(stderr).toContain("the continue-turn steer was rejected");
+    expect(stderr).toContain("reinjection_failed");
+  });
 });
 
 // pi records extension load failures on the loader and carries on — the agent
