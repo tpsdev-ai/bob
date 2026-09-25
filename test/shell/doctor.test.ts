@@ -19,7 +19,26 @@ function makeHealthyAgent(opts: { home: string; name: string }): {
   mkdirSync(join(opts.home, ".tps", "mail", opts.name, "cur"), { recursive: true });
 
   writeFileSync(join(agentDir, "soul.md"), "stub soul");
-  writeFileSync(join(agentDir, "bob.yaml"), "agent:\n  id: testbot\n");
+  // A healthy agent has a readable role + a tool allowlist: doctor FAILs a
+  // missing policy now, so the healthy fixture must carry one (role ea allows
+  // `read`).
+  writeFileSync(
+    join(agentDir, "bob.yaml"),
+    [
+      "agent:",
+      "  id: testbot",
+      "  name: Testbot",
+      "  role: ea",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "",
+      "tools:",
+      "  allow:",
+      "    - read",
+      "",
+    ].join("\n"),
+  );
 
   const launcher = join(agentDir, "bin", opts.name);
   writeFileSync(launcher, "#!/bin/sh\necho ok\n");
@@ -169,6 +188,57 @@ describe("runDoctor", () => {
     expect(check?.fix).toContain("discord_reply");
   });
 
+  it("FAIL when bob.yaml declares no tools: block at all", () => {
+    // A missing policy is a FAIL, not "ok, pi's defaults apply": pi's defaults
+    // are not a decision the config made, and a session on them holds whatever
+    // pi ships.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      ["agent:", "  id: testbot", "  role: ea", "", "provider:", "  name: anthropic", ""].join(
+        "\n",
+      ),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toMatch(/no tools: block/);
+    expect(check?.fix).toMatch(/allow/);
+  });
+
+  it("FAIL when bob.yaml widens the allowlist past the role", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("bash");
+    expect(check?.detail).toMatch(/role/);
+  });
+
   it("OK on a bob.yaml whose tool allowlist is all real names", () => {
     const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
     writeFileSync(
@@ -197,13 +267,16 @@ describe("runDoctor", () => {
   });
 
   it("WARN when a resident agent's allowlist lists tools the resident policy drops", () => {
+    // qa, not coder: the coder role grants tools.allowResidentShell, so its
+    // allowlist is not dropped. The warning is for a role that does NOT grant
+    // it while its resident allowlist still lists a shell tool.
     const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
     writeFileSync(
       join(agentDir, "bob.yaml"),
       [
         "agent:",
         "  id: testbot",
-        "  role: coder",
+        "  role: qa",
         "",
         "resident: true",
         "",

@@ -27,6 +27,23 @@ describe("runAlign", () => {
     mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
     mkdirSync(join(agentDir, "work"), { recursive: true });
     writeFileSync(join(agentDir, "soul.md"), "current persona\n");
+    // The alignment session gets the agent's resolved tool policy (role.json
+    // ceiling + bob.yaml), so the agent dir needs a bob.yaml — same as the
+    // onboard fixture.
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  name: Testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
   });
 
   afterEach(() => {
@@ -118,5 +135,56 @@ describe("runAlign", () => {
       spawnFn,
     });
     expect(res.soulUpdated).toBe(false);
+  });
+
+  it("hands the alignment session EXACTLY the resolved allowlist", async () => {
+    let capturedArgs: readonly string[] = [];
+    const spawnFn = fakeSpawn({
+      onSpawn: (_cmd, args) => {
+        capturedArgs = args;
+      },
+    });
+    await runAlign({
+      name: "testbot",
+      agentDir,
+      provider: "ollama-cloud",
+      model: "kimi-k2.6",
+      spawnFn,
+    });
+    const i = capturedArgs.indexOf("--tools");
+    expect(i).toBeGreaterThan(-1);
+    expect(capturedArgs[i + 1]).toBe("read");
+  });
+
+  it("REFUSES to start the check-in when the agent has no tool policy", async () => {
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+      ].join("\n"),
+    );
+    let spawned = false;
+    const spawnFn = fakeSpawn({
+      onSpawn: () => {
+        spawned = true;
+      },
+    });
+    await expect(
+      runAlign({
+        name: "testbot",
+        agentDir,
+        provider: "ollama-cloud",
+        model: "kimi-k2.6",
+        spawnFn,
+      }),
+    ).rejects.toThrow(/no tools: block/);
+    expect(spawned).toBe(false);
   });
 });

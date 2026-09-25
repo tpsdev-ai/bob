@@ -29,6 +29,24 @@ describe("runOnboard", () => {
     mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
     mkdirSync(join(agentDir, "work"), { recursive: true });
     writeFileSync(join(agentDir, "soul.md"), "seed persona\n");
+    // Every launch path resolves the agent's tool policy from bob.yaml (with
+    // role.json as the ceiling) and fails closed without it, so an onboardable
+    // agent dir has to carry one. The real flow writes it via initAgent before
+    // runOnboard is called.
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  name: Testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
   });
 
   afterEach(() => {
@@ -166,5 +184,63 @@ describe("runOnboard", () => {
       spawnFn,
     });
     expect(res.exitCode).toBe(130);
+  });
+
+  it("hands the onboarding session EXACTLY the resolved allowlist", async () => {
+    // The interview session is a launch path like any other: it gets the
+    // agent's resolved policy as pi's own flags, so it cannot start wide open.
+    let capturedArgs: readonly string[] = [];
+    const spawnFn = fakeSpawn({
+      onSpawn: (_cmd, args) => {
+        capturedArgs = args;
+      },
+    });
+    await runOnboard({
+      name: "testbot",
+      role: "ea",
+      agentDir,
+      provider: "ollama-cloud",
+      model: "kimi-k2.6",
+      spawnFn,
+    });
+    const i = capturedArgs.indexOf("--tools");
+    expect(i).toBeGreaterThan(-1);
+    expect(capturedArgs[i + 1]).toBe("read");
+    expect(capturedArgs).not.toContain("--no-tools");
+  });
+
+  it("REFUSES to start the interview when the agent has no tool policy", async () => {
+    // Fail closed: no policy, no session. A missing allowlist is a load error
+    // (bob-yaml/tool-allowlist), not pi's defaults.
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+      ].join("\n"),
+    );
+    let spawned = false;
+    const spawnFn = fakeSpawn({
+      onSpawn: () => {
+        spawned = true;
+      },
+    });
+    await expect(
+      runOnboard({
+        name: "testbot",
+        role: "ea",
+        agentDir,
+        provider: "ollama-cloud",
+        model: "kimi-k2.6",
+        spawnFn,
+      }),
+    ).rejects.toThrow(/no tools: block/);
+    expect(spawned).toBe(false);
   });
 });

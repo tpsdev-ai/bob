@@ -52,9 +52,23 @@ function scaffoldAgent(root: string, name: string): void {
   mkdirSync(join(dir, ".pi-agent"), { recursive: true });
   writeFileSync(
     join(dir, "bob.yaml"),
-    ["agent:", `  id: ${name}`, "provider:", "  name: anthropic", "  model: claude-x", ""].join(
-      "\n",
-    ),
+    [
+      "agent:",
+      `  id: ${name}`,
+      `  name: ${name}`,
+      // The persistent runtime resolves the tool policy like every other launch
+      // path (role.json ceiling + bob.yaml), so the fixture needs both.
+      "  role: coder",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "  model: claude-x",
+      "",
+      "tools:",
+      "  allow:",
+      "    - read",
+      "",
+    ].join("\n"),
   );
 }
 

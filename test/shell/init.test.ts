@@ -172,7 +172,10 @@ describe("initAgent", () => {
     const bin = join(res.agentDir, "bin", "testbot");
     const launcher = readFileSync(bin, "utf8");
     expect(launcher).toContain("#!/bin/sh");
-    expect(launcher).toContain("pi --provider ollama-cloud --model kimi-k2.6");
+    // The launcher starts its session through `bob launch` — the path that
+    // resolves the tool policy — not by invoking pi itself.
+    expect(launcher).toContain("launch testbot");
+    expect(launcher).not.toContain("exec pi");
     expect(launcher).toContain("PI_CODING_AGENT_DIR=");
     const mode = statSync(bin).mode & 0o777;
     expect(mode & 0o111).toBeGreaterThan(0);
@@ -265,30 +268,26 @@ describe("initAgent", () => {
     expect(mode).toBe(0o600);
   });
 
-  describe("pi launcher generation", () => {
-    it("appends --append-system-prompt to load soul.md", () => {
+  describe("the generated launcher", () => {
+    it("starts every session through `bob launch` — never pi directly", () => {
+      // The launcher used to `exec pi --provider … --model …` itself, which is a
+      // launch path with no tool policy at all. It now hands off to bob, which
+      // resolves the agent's role allowlist + bob.yaml and passes the result to
+      // pi. A launcher with its own `exec pi` would be that hole again.
       const res = initAgent(baseOpts());
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--append-system-prompt");
-      expect(launcher).toContain('"$(cat $AGENT_DIR/soul.md)"');
+      expect(launcher).toContain('launch testbot -- "$@"');
+      expect(launcher).toContain("BOB_BIN");
+      expect(launcher).not.toContain("--provider");
+      expect(launcher).not.toContain("exec pi");
     });
 
-    it("translates exe-dev-gateway provider to anthropic in the launcher", () => {
-      const res = initAgent({
-        ...baseOpts(),
-        provider: "exe-dev-gateway",
-        model: "claude-opus-4-7",
-      });
+    it("forwards its own args to the session after `--`", () => {
+      // A prompt or a pi flag given to bin/<name> has to survive the hand-off to
+      // bob (and then to pi) instead of being eaten as a bob flag.
+      const res = initAgent(baseOpts());
       const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--provider anthropic");
-      expect(launcher).not.toContain("--provider exe-dev-gateway");
-      expect(launcher).toContain("--model claude-opus-4-7");
-    });
-
-    it("passes other provider names through unchanged", () => {
-      const res = initAgent({ ...baseOpts(), provider: "ollama-cloud", model: "kimi-k2.6" });
-      const launcher = readFileSync(join(res.agentDir, "bin", "testbot"), "utf8");
-      expect(launcher).toContain("--provider ollama-cloud");
+      expect(launcher).toContain('-- "$@"');
     });
 
     it("exports FLAIR_AGENT_ID / FLAIR_URL / FLAIR_KEY_PATH from the flair config (#90)", () => {

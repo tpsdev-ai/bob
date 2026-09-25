@@ -171,7 +171,21 @@ describe("runAgent", () => {
   it("maps the exe-dev-gateway provider to anthropic (mirrors init.ts)", async () => {
     writeFileSync(
       join(agentsRoot, "testbot", "bob.yaml"),
-      ["provider:", "  name: exe-dev-gateway", "  model: claude-opus-4-7", ""].join("\n"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  name: Testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: exe-dev-gateway",
+        "  model: claude-opus-4-7",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
     );
     const fake = fakeSession({ textDeltas: ["ok"] });
     const { factory } = factoryReturning(fake.session);
@@ -276,9 +290,18 @@ describe("runAgent", () => {
     writeFileSync(
       join(agentsRoot, "testbot", "bob.yaml"),
       [
+        "agent:",
+        "  id: testbot",
+        "  name: Testbot",
+        "  role: ea",
+        "",
         "provider:",
         "  name: anthropic",
         "  model: claude-sonnet-4-6",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
         "",
         "capabilities:",
         "  - fixture",
@@ -502,17 +525,25 @@ describe("runAgent — the role tool allowlist binds the session", () => {
 
   // Write the agent's bob.yaml. `allow` renders as the block list `bob init`
   // emits, so the test exercises the real reader, not a hand-built object.
+  //
+  // `role` defaults to "ea". The ROLE is the ceiling on the allowlist, so a
+  // test that wants a shell or a file-writing tool names the role that has one.
   function writeBobYaml(opts: {
     allow?: string[];
     exclude?: string[];
     allowResidentShell?: boolean;
     resident?: boolean;
+    role?: string;
+    // Omit the whole `tools:` block (the fail-closed case).
+    omitToolsBlock?: boolean;
+    // Render the block with no `allow:` key at all.
+    omitAllow?: boolean;
   }): void {
     const lines = [
       "agent:",
       "  id: testbot",
       "  name: Testbot",
-      "  role: ea",
+      `  role: ${opts.role ?? "ea"}`,
       "",
       "provider:",
       "  name: anthropic",
@@ -520,17 +551,19 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       "",
     ];
     if (opts.resident !== undefined) lines.push(`resident: ${opts.resident}`, "");
-    lines.push("tools:");
-    if (opts.allow !== undefined) {
-      lines.push("  allow:");
-      for (const name of opts.allow) lines.push(`    - ${name}`);
-    }
-    if (opts.exclude !== undefined) {
-      lines.push("  exclude:");
-      for (const name of opts.exclude) lines.push(`    - ${name}`);
-    }
-    if (opts.allowResidentShell !== undefined) {
-      lines.push(`  allowResidentShell: ${opts.allowResidentShell}`);
+    if (!opts.omitToolsBlock) {
+      lines.push("tools:");
+      if (!opts.omitAllow && opts.allow !== undefined) {
+        lines.push("  allow:");
+        for (const name of opts.allow) lines.push(`    - ${name}`);
+      }
+      if (opts.exclude !== undefined) {
+        lines.push("  exclude:");
+        for (const name of opts.exclude) lines.push(`    - ${name}`);
+      }
+      if (opts.allowResidentShell !== undefined) {
+        lines.push(`  allowResidentShell: ${opts.allowResidentShell}`);
+      }
     }
     lines.push("");
     writeFileSync(join(agentsRoot, "testbot", "bob.yaml"), lines.join("\n"));
@@ -544,24 +577,9 @@ describe("runAgent — the role tool allowlist binds the session", () => {
     return lastConfig() as TooledConfig;
   }
 
-  it("hands the session EXACTLY the bob.yaml allowlist", async () => {
-    writeBobYaml({ allow: ["read", "flair_search", "flair_write"] });
-    const config = await configFor();
-    expect(config.tools).toEqual(["read", "flair_search", "flair_write"]);
-  });
-
-  it("carries a tools.exclude block through as excludeTools", async () => {
-    writeBobYaml({ allow: ["read", "bash"], exclude: ["bash"] });
-    const config = await configFor();
-    expect(config.tools).toEqual(["read", "bash"]);
-    expect(config.excludeTools).toEqual(["bash"]);
-  });
-
-  it("refuses an allowlisted name that maps to nothing, naming it and the fix", async () => {
-    // "Bash" is the OpenClaw-era casing `bob init` used to stamp into bob.yaml.
-    // pi's registry only knows "bash", so an unmapped name must be a loud load
-    // error rather than a silent drop (pi ignores unknown names).
-    writeBobYaml({ allow: ["read", "Bash"] });
+  // The error a refused run throws. `runAgent` must not resolve: a session with
+  // no resolved policy is the defect, so "it started anyway" is a test failure.
+  async function errorFor(): Promise<Error> {
     const { factory } = factoryReturning(fakeSession({ textDeltas: ["ok"] }).session);
     let err: Error | undefined;
     try {
@@ -569,8 +587,40 @@ describe("runAgent — the role tool allowlist binds the session", () => {
     } catch (e) {
       err = e as Error;
     }
-    expect(err).toBeDefined();
-    const msg = err?.message ?? "";
+    if (!err) throw new Error("expected the run to be refused, but it resolved");
+    return err;
+  }
+
+  it("hands the session EXACTLY the bob.yaml allowlist", async () => {
+    writeBobYaml({ allow: ["read", "flair_search", "flair_write"] });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "flair_search", "flair_write"]);
+  });
+
+  it("carries a tools.exclude block through as excludeTools", async () => {
+    writeBobYaml({ role: "qa", allow: ["read", "bash"], exclude: ["bash"] });
+    const config = await configFor();
+    expect(config.tools).toEqual(["read", "bash"]);
+    expect(config.excludeTools).toEqual(["bash"]);
+  });
+
+  it("keeps an EXPLICIT empty allow list as [] — that is 'no tools'", async () => {
+    // `allow:` with no items is a decision (this agent holds no tools), which is
+    // a different thing from a missing block. The session gets an empty strict
+    // allowlist, not pi's defaults.
+    writeBobYaml({ allow: [] });
+    const config = await configFor();
+    expect(config.tools).toEqual([]);
+    expect(config.excludeTools).toEqual([]);
+  });
+
+  it("refuses an allowlisted name that maps to nothing, naming it and the fix", async () => {
+    // "Bash" is the OpenClaw-era casing `bob init` used to stamp into bob.yaml.
+    // pi's registry only knows "bash", so an unmapped name must be a loud load
+    // error rather than a silent drop (pi ignores unknown names).
+    writeBobYaml({ allow: ["read", "Bash"] });
+    const err = await errorFor();
+    const msg = err.message;
     expect(msg).toContain("Bash");
     expect(msg).toContain("bash");
   });
@@ -581,6 +631,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       [
         "agent:",
         "  id: testbot",
+        "  role: ea",
         "",
         "provider:",
         "  name: anthropic",
@@ -592,49 +643,66 @@ describe("runAgent — the role tool allowlist binds the session", () => {
         "",
       ].join("\n"),
     );
-    const { factory } = factoryReturning(fakeSession({ textDeltas: ["ok"] }).session);
-    await expect(
-      runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: factory }),
-    ).rejects.toThrow(/alow/);
+    const err = await errorFor();
+    expect(err.message).toContain("alow");
   });
 
   it("excludes shell + file-writing tools from a RESIDENT agent", async () => {
     // A resident agent runs unattended behind a service unit; the role's
-    // allowlist must not hand it a shell unless the role opts in.
-    writeBobYaml({ allow: ["read", "bash", "edit", "write"], resident: true });
+    // allowlist must not hand it a shell unless the ROLE opts in.
+    writeBobYaml({ role: "qa", allow: ["read", "bash", "edit", "write"], resident: true });
     const config = await configFor();
     expect(config.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(config.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
   });
 
-  it("keeps shell + file-writing tools when the role opts in with allowResidentShell", async () => {
-    writeBobYaml({
-      allow: ["read", "bash", "edit", "write"],
-      resident: true,
-      allowResidentShell: true,
-    });
+  it("keeps a resident CODER's shell — the opt-in lives in the role now", async () => {
+    // The coder role grants tools.allowResidentShell, so a persistent builder
+    // keeps bash/write/edit. bob.yaml does not repeat it: the role is the
+    // ceiling, and a permission the role grants does not have to be re-declared
+    // in a file the agent can edit.
+    writeBobYaml({ role: "coder", allow: ["read", "bash", "edit", "write"], resident: true });
     const config = await configFor();
     expect(config.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(config.excludeTools).toEqual([]);
   });
 
-  it("does not invent an allowlist when bob.yaml has no tools block", async () => {
-    // No `tools:` block = pi's own defaults; the run must not silently narrow
-    // an agent that never declared a policy.
-    writeFileSync(
-      join(agentsRoot, "testbot", "bob.yaml"),
-      [
-        "agent:",
-        "  id: testbot",
-        "",
-        "provider:",
-        "  name: anthropic",
-        "  model: claude-sonnet-4-6",
-        "",
-      ].join("\n"),
-    );
-    const config = await configFor();
-    expect(config.tools).toBeUndefined();
-    expect(config.excludeTools).toEqual([]);
+  it("refuses a bob.yaml that widens the allowlist beyond the role", async () => {
+    // `bash` is not in the ea role's role.json, and bob.yaml is the file the
+    // agent can edit — so a name the role does not allow is a widening, not a
+    // default. Refused by name, with the role that would have to change.
+    writeBobYaml({ role: "ea", allow: ["read", "bash"] });
+    const err = await errorFor();
+    expect(err.message).toContain("bash");
+    expect(err.message).toContain("ea");
+    expect(err.message).toContain("role");
+  });
+
+  it("refuses allowResidentShell in bob.yaml when the ROLE does not grant it", async () => {
+    // The opt-in moved into the role schema; a bob.yaml that re-adds it to a
+    // role without it is the same widening, by another key.
+    writeBobYaml({
+      role: "qa",
+      allow: ["read", "bash"],
+      resident: true,
+      allowResidentShell: true,
+    });
+    const err = await errorFor();
+    expect(err.message).toContain("allowResidentShell");
+    expect(err.message).toContain("qa");
+  });
+
+  it("refuses a bob.yaml with NO tools block (a missing policy is not a default)", async () => {
+    // The whole point: an absent allowlist used to mean "pi's defaults", so a
+    // role's tools never bound anything. It is now a load error.
+    writeBobYaml({ omitToolsBlock: true });
+    const err = await errorFor();
+    expect(err.message).toMatch(/no tools: block/);
+  });
+
+  it("refuses a tools: block with no allow: list", async () => {
+    writeBobYaml({ omitAllow: true, exclude: ["bash"] });
+    const err = await errorFor();
+    expect(err.message).toMatch(/no allow: list/);
   });
 });

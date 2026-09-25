@@ -10,12 +10,12 @@
 // session factory receives; this file asserts what that config does to a
 // session.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { capabilityConfigEnv, resolveCapabilities } from "../../src/shell/capability-loader.js";
 import type { RunSessionConfig } from "../../src/shell/run.js";
-import { createPiRunSession } from "../../src/shell/run.js";
+import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
 
 // The config gains `tools`/`excludeTools` with the change; spelling them
 // structurally keeps this file honest whichever way the field is declared.
@@ -72,10 +72,49 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
     ]);
   });
 
-  it("leaves pi's defaults in place when the agent declared no allowlist", async () => {
-    // No `tools:` block = pi's defaults. Passing an empty allowlist instead
-    // would mean "no tools at all", which is a different agent.
+  it("leaves pi's defaults in place when no allowlist is passed AT ALL", async () => {
+    // Factory-level tolerance only: resolveAgentToolPolicy refuses a bob.yaml
+    // without `tools.allow`, so no launch path gets here empty — a caller that
+    // builds a session by hand can still omit the list, and pi's defaults then
+    // apply. Passing an empty list instead means "no tools at all".
     expect(await activeTools({ tools: undefined, excludeTools: [] })).toEqual(PI_DEFAULT_TOOLS);
+  });
+
+  it("REFUSES a session whose allowlist names a tool no loaded capability provides", async () => {
+    // flint #151 item 4: the EA role's allowlist names discord_reply. On an
+    // agent that does not declare the discord capability, pi IGNORES the name
+    // ("Unknown tool names are ignored") and the session comes up without the
+    // tool its role asked for. That silent drop is a load error now, naming the
+    // tool — the catalog cannot catch it, because the name is real in bob.
+    const agentsRoot = mkdtempSync(join(tmpdir(), "bob-ea-no-discord-"));
+    try {
+      const agentDir = join(agentsRoot, "assistant");
+      mkdirSync(join(agentDir, "work"), { recursive: true });
+      mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+      writeFileSync(
+        join(agentDir, "bob.yaml"),
+        [
+          "agent:",
+          "  id: assistant",
+          "  role: ea",
+          "",
+          "provider:",
+          "  name: anthropic",
+          "  model: claude-sonnet-4-6",
+          "",
+          "tools:",
+          "  allow:",
+          "    - read",
+          "    - discord_reply",
+          "",
+        ].join("\n"),
+      );
+      const { config } = resolveRunConfig({ name: "assistant", agentsRoot });
+      expect(config.tools).toEqual(["read", "discord_reply"]);
+      await expect(createPiRunSession(config)).rejects.toThrow(/discord_reply/);
+    } finally {
+      rmSync(agentsRoot, { recursive: true, force: true });
+    }
   });
 
   it("applies excludeTools after the allowlist (pi's documented order)", async () => {

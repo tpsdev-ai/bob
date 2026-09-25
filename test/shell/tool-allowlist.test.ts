@@ -8,6 +8,7 @@ import { loadRole } from "../../src/shell/role-loader.js";
 import {
   auditToolNames,
   knownToolNames,
+  type RoleToolCeiling,
   residentDroppedTools,
   resolveToolNames,
   resolveToolPolicy,
@@ -146,18 +147,72 @@ describe("resolveToolNames", () => {
 });
 
 describe("resolveToolPolicy", () => {
-  const policy = (yamlText: string, resident = false, persistent = false) =>
+  const policy = (yamlText: string, resident = false, persistent = false, role?: RoleToolCeiling) =>
     resolveToolPolicy({
       yamlText,
       tools: readTools(yamlText),
+      role,
       resident,
       persistent,
     });
 
-  it("leaves tools undefined when the agent declared no allowlist", () => {
-    const p = policy("agent:\n  id: testbot\n");
-    expect(p.tools).toBeUndefined();
+  it("REFUSES a missing allowlist — a missing policy is a load error", () => {
+    // The old reading ("no block = pi's own defaults") is what made the
+    // allowlist inert: pi's defaults are not something bob.yaml decided.
+    expect(() => policy("agent:\n  id: testbot\n")).toThrow(/no tools: block/);
+  });
+
+  it("REFUSES a tools: block with no allow: list", () => {
+    expect(() => policy("tools:\n  exclude:\n    - bash\n")).toThrow(/no allow: list/);
+  });
+
+  it("keeps the role's grant of allowResidentShell when bob.yaml is silent", () => {
+    const yaml = "resident: true\ntools:\n  allow:\n    - read\n    - bash\n";
+    const p = policy(yaml, true, false, {
+      name: "coder",
+      allow: ["read", "bash"],
+      allowResidentShell: true,
+    });
+    expect(p.allowResidentShell).toBe(true);
     expect(p.excludeTools).toEqual([]);
+  });
+
+  it("lets bob.yaml NARROW the role's shell grant away", () => {
+    // Narrowing is always allowed — holding fewer tools than the role permits
+    // is a decision the agent's own config may make.
+    const yaml =
+      "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  allowResidentShell: false\n";
+    const p = policy(yaml, true, false, {
+      name: "coder",
+      allow: ["read", "bash"],
+      allowResidentShell: true,
+    });
+    expect(p.allowResidentShell).toBe(false);
+    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+  });
+
+  it("REFUSES allowResidentShell: true when the role does not grant it", () => {
+    const yaml = "tools:\n  allow:\n    - read\n    - bash\n  allowResidentShell: true\n";
+    expect(() => policy(yaml, true, false, { name: "qa", allow: ["read", "bash"] })).toThrow(
+      /allowResidentShell/,
+    );
+  });
+
+  it("REFUSES a name the role does not allow (widening, named)", () => {
+    expect(() =>
+      policy("tools:\n  allow:\n    - read\n    - bash\n", false, false, {
+        name: "ea",
+        allow: ["read", "flair_search"],
+      }),
+    ).toThrow(/bash/);
+  });
+
+  it("allows a strict SUBSET of the role's list", () => {
+    const p = policy("tools:\n  allow:\n    - read\n", false, false, {
+      name: "ea",
+      allow: ["read", "flair_search"],
+    });
+    expect(p.tools).toEqual(["read"]);
   });
 
   it("carries the allowlist through unchanged", () => {
@@ -215,6 +270,16 @@ describe("shipped roles", () => {
   it("the coder (builder) role holds the shell + file-writing tools", () => {
     const { tools } = loadRole("coder");
     for (const tool of ["read", "bash", "edit", "write"]) expect(tools.allow).toContain(tool);
+  });
+
+  it("only the coder role opts into the resident shell (allowResidentShell)", () => {
+    // The opt-in is a ROLE property now: a resident agent loses bash/write/edit
+    // unless the role grants them. Only the builder role grants them — the
+    // others are meant to run unattended without a shell.
+    expect(loadRole("coder").tools.allowResidentShell).toBe(true);
+    for (const role of ["ea", "writer", "reviewer", "qa", "custom"] as const) {
+      expect(loadRole(role).tools.allowResidentShell).toBeUndefined();
+    }
   });
 
   it("knownToolNames includes pi's built-ins and the capabilities' tools", () => {
