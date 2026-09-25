@@ -49,11 +49,11 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
-| `bob up` / `bob down` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
+| `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (identity, mail, channels, provider auth)                                          |
 | `bob help`                 | Show this usage                                                                               |
 
-Per-call model override is the lightweight version of dynamic routing — bake the right model into each cron command (opus for strategy, sonnet for briefings, kimi for digests) without standing up multiple agents.
+A `cron:` entry fires into the one live `bob run <name>` session, which runs on that agent's configured model. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task — it does not, and cannot, pick a model per `cron:` command.
 
 ## Operator guarantees, and the tests that pin them
 

@@ -75,8 +75,37 @@ function cliAccepts(cmd: string): boolean {
   return !/unknown command/i.test(out);
 }
 
+// Control probe, added after a review round caught a vacuous-pass mode: if
+// dist/cli.js is missing or crashes before dispatch, Node prints no "unknown
+// command" line, and cliAccepts would then return true for *every* command, so
+// the assertion below would pass while proving nothing. Running a made-up
+// command that the dispatcher MUST refuse — and requiring the "unknown command"
+// answer — proves the probe actually reached the command dispatcher before any
+// cliAccepts result is trusted.
+const CONTROL_CMD = "definitely-not-a-command";
+
+function cliProbeOk(): { ok: boolean; out: string } {
+  let out = "";
+  try {
+    out = execSync(`node ${CLI} ${CONTROL_CMD} 2>&1`, { encoding: "utf8" });
+  } catch (e) {
+    out =
+      (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
+  }
+  return { ok: /unknown command/i.test(out), out };
+}
+
 describe("README usage names only commands/flags the CLI accepts (#149)", () => {
   it("rejects `bob <command>` names the CLI does not accept", () => {
+    const probe = cliProbeOk();
+    if (!probe.ok) {
+      throw new Error(
+        "could not probe the CLI dispatcher: a made-up command did not yield " +
+          "'unknown command', so dist/cli.js is missing or crashed before dispatch. " +
+          "cliAccepts results cannot be trusted. Output:\n" +
+          probe.out,
+      );
+    }
     const rejected = commandsNamedIn(readFileSync(README, "utf8")).filter((c) => !cliAccepts(c));
     if (rejected.length) {
       throw new Error(
