@@ -44,7 +44,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `bob onboard <name>`     | Scaffold + register the Flair identity + write its soul + hiring interview   |
-| `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair          |
+| `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair. Runs on the agent's own bob.yaml provider + model; `--provider`/`--model` override one field each |
 | `bob run <name>`         | Run the agent on duty (persistent session)                                   |
 | `bob run <name> <prompt>`| Run ONE task and print the answer. `--model X` overrides per call            |
 | `bob launch <name>`      | The agent's session, with its resolved tool allowlist. No prompt opens the interactive TUI; ONE prompt (quoted if multi-word) runs it as a task. This is what `bin/<name>` runs |
