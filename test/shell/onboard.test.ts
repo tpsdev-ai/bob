@@ -118,6 +118,7 @@ describe("runOnboard", () => {
     // `bob onboard` through a shell tool, and a shell can already write files
     // (the reviewer role has bash and no write tool, as asserted below).
     expect(loadRole("reviewer").tools.allow).not.toContain("write");
+    expect(loadRole("reviewer").tools.allow).toContain("bash");
     scaffoldAgent("reviewer");
     const { runner, runs } = fakeRunner({ writeSoul: "refined\n" });
     await runOnboard(options({ role: "reviewer", sessionRunner: runner }));
