@@ -65,7 +65,8 @@ type LoaderOptions = Omit<
 // It may exceed the role's ceiling on purpose: a `reviewer` agent is hired by
 // a human at the keyboard who is already allowed to edit that human's files,
 // and the tool that would let the MODEL reach the interview is the shell tool,
-// which no role has without write anyway. A model cannot open this path.
+// which can already write files (the reviewer role has bash and no write tool),
+// so read + write grants a model that reaches it nothing new.
 export const SETUP_TOOL_POLICY: ToolPolicy = {
   tools: ["read", "write"],
   excludeTools: [],
@@ -286,6 +287,14 @@ export function installSessionAudits(
   },
   audit: (outcome: AuditOutcome) => void,
 ): void {
+  // pi 0.84.3's contract: both are instance methods every mode calls through
+  // the instance (agent-session.js :2142, :1831). If a pi upgrade renames
+  // either, refuse loudly here rather than wrap nothing.
+  if (typeof session.reload !== "function" || typeof session.bindExtensions !== "function") {
+    throw new Error(
+      "bob: this pi session has no reload()/bindExtensions() to audit after (the pi 0.84.3 contract bob wraps); refusing to start a session whose reloads and binds would go unaudited",
+    );
+  }
   const runThenAudit = async (work: () => Promise<void>): Promise<void> => {
     try {
       await work();
@@ -401,23 +410,35 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // Round 6: a rejection value of `undefined` takes that same path too — the
     // wrapper tags the outcome, so no rejection value can read as success.
     const disposeSession = () => (result.session as unknown as { dispose(): void }).dispose();
-    installSessionAudits(
-      result.session as unknown as {
-        reload(options?: unknown): Promise<void>;
-        bindExtensions(bindings: unknown): Promise<void>;
-      },
-      (outcome) =>
-        outcome.ok
-          ? auditOrExit(runAudit, { dispose: disposeSession }, deps)
-          : auditOrExit(
-              () => {
-                throw outcome.error;
-              },
-              { dispose: disposeSession },
-              deps,
-              "the session could not be reloaded or bound",
-            ),
-    );
+    // Installing the audits can itself refuse (a pi without the entry points it
+    // wraps); dispose the session the factory built before propagating, as the
+    // creation audit above does.
+    try {
+      installSessionAudits(
+        result.session as unknown as {
+          reload(options?: unknown): Promise<void>;
+          bindExtensions(bindings: unknown): Promise<void>;
+        },
+        (outcome) =>
+          outcome.ok
+            ? auditOrExit(runAudit, { dispose: disposeSession }, deps)
+            : auditOrExit(
+                () => {
+                  throw outcome.error;
+                },
+                { dispose: disposeSession },
+                deps,
+                "the session could not be reloaded or bound",
+              ),
+      );
+    } catch (err) {
+      try {
+        disposeSession();
+      } catch {
+        // the refusal is the error that matters
+      }
+      throw err;
+    }
 
     return {
       ...result,
@@ -436,9 +457,19 @@ export function assertAllowedToolsActive(
   policy: Pick<ToolPolicy, "tools" | "excludeTools">,
 ): void {
   const allowed = policy.tools;
-  if (allowed.length === 0) return;
   const active = new Set(session.getActiveToolNames());
   const excluded = new Set(policy.excludeTools);
+  // The other direction too: an ACTIVE tool outside the effective policy fails
+  // the audit. pi's registry filter is what keeps the ceiling today; this makes
+  // bob's audit a second line rather than a check that trusts it.
+  const effective = new Set(allowed.filter((name) => !excluded.has(name)));
+  const extra = [...active].filter((name) => !effective.has(name));
+  if (extra.length > 0) {
+    throw new Error(
+      `bob: ${extra.length} active tool${extra.length === 1 ? "" : "s"} outside the effective policy: ${extra.join(", ")} (policy: ${[...effective].join(", ") || "no tools"}). The session is refused rather than run with more than its role allows.`,
+    );
+  }
+  if (allowed.length === 0) return;
   const missing = allowed.filter((name) => !active.has(name) && !excluded.has(name));
   if (missing.length === 0) return;
   throw new Error(

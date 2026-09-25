@@ -12,8 +12,8 @@
 // (read + write, session.ts SETUP_TOOL_POLICY), which may exceed the role's
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated
-// exceptions"). A model can only reach them through a shell tool, and a role
-// with a shell already has write.
+// exceptions"). A model can only reach them through a shell tool, and a shell
+// can already write files, so read + write grants it nothing new.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";

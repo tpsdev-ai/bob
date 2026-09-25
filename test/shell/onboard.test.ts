@@ -115,8 +115,8 @@ describe("runOnboard", () => {
     // `reviewer`'s ceiling has no `write`: the interview cannot use the role's
     // policy, because writing the refined persona is the job. That is the
     // stated exception, and it is a PRIVILEGED path: a model can only reach
-    // `bob onboard` through a shell tool, and a role with a shell already has
-    // write.
+    // `bob onboard` through a shell tool, and a shell can already write files
+    // (the reviewer role has bash and no write tool, as asserted below).
     expect(loadRole("reviewer").tools.allow).not.toContain("write");
     scaffoldAgent("reviewer");
     const { runner, runs } = fakeRunner({ writeSoul: "refined\n" });

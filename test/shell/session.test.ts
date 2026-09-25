@@ -21,9 +21,11 @@ import {
 import { initAgent } from "../../src/shell/init.js";
 import { type RunSession, resolveRunConfig } from "../../src/shell/run.js";
 import {
+  assertAllowedToolsActive,
   auditOrExit,
   auditToolSources,
   createBobRuntimeFactory,
+  installSessionAudits,
   isolatedLoaderOptions,
   isolatedSettings,
   promptSession,
@@ -545,5 +547,65 @@ describe("isolated settings", () => {
     expect(opts.noContextFiles).toBe(true);
     expect(opts.additionalExtensionPaths).toEqual(["/cap/fixture"]);
     expect(opts.appendSystemPrompt).toEqual(["soul"]);
+  });
+});
+
+describe("the audit checks both directions (bob#151 K&S review)", () => {
+  const sessionWith = (names: string[]) =>
+    ({ getActiveToolNames: () => names }) as unknown as Parameters<
+      typeof assertAllowedToolsActive
+    >[0];
+
+  it("fails when a tool OUTSIDE the effective policy is active, naming it", () => {
+    expect(() =>
+      assertAllowedToolsActive(sessionWith(["read", "bash", "flair_write"]), {
+        tools: ["read"],
+        excludeTools: [],
+      }),
+    ).toThrow(/2 active tools outside the effective policy: bash, flair_write/);
+  });
+
+  it("treats an excluded name that is still active as outside the policy", () => {
+    expect(() =>
+      assertAllowedToolsActive(sessionWith(["read", "bash"]), {
+        tools: ["read", "bash"],
+        excludeTools: ["bash"],
+      }),
+    ).toThrow(/outside the effective policy: bash/);
+  });
+
+  it("an empty policy with no active tools passes, and one with an active tool fails", () => {
+    expect(() =>
+      assertAllowedToolsActive(sessionWith([]), { tools: [], excludeTools: [] }),
+    ).not.toThrow();
+    expect(() =>
+      assertAllowedToolsActive(sessionWith(["read"]), { tools: [], excludeTools: [] }),
+    ).toThrow(/outside the effective policy: read/);
+  });
+
+  it("passes when the active set is exactly the effective policy", () => {
+    expect(() =>
+      assertAllowedToolsActive(sessionWith(["read"]), {
+        tools: ["read", "bash"],
+        excludeTools: ["bash"],
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("installSessionAudits refuses a session it cannot wrap (bob#151 K&S review)", () => {
+  it("throws, naming the pi contract, when reload or bindExtensions is missing", () => {
+    const noReload = { bindExtensions: async () => {} } as unknown as Parameters<
+      typeof installSessionAudits
+    >[0];
+    expect(() => installSessionAudits(noReload, () => {})).toThrow(
+      /no reload\(\)\/bindExtensions\(\) to audit after/,
+    );
+    const noBind = { reload: async () => {} } as unknown as Parameters<
+      typeof installSessionAudits
+    >[0];
+    expect(() => installSessionAudits(noBind, () => {})).toThrow(
+      /no reload\(\)\/bindExtensions\(\) to audit after/,
+    );
   });
 });

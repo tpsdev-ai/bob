@@ -90,8 +90,9 @@ export function readCapabilities(yamlText: string): string[] {
 // knowledge): tool-allowlist.ts resolves them against the tools that can
 // actually exist. This reader only guarantees the block's shape.
 export interface ToolsBlock {
-  // Tool names to enable — the strict allowlist handed to pi. Absent means the
-  // agent declared none and pi's own defaults apply.
+  // Tool names to enable — the strict allowlist handed to pi. Absent is a load
+  // error (tool-allowlist.ts resolveToolPolicy); an explicit empty list means
+  // no tools.
   allow?: string[];
   // Tool names to disable after the allowlist.
   exclude?: string[];

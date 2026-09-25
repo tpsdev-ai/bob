@@ -73,7 +73,8 @@ change one, the named test is what tells you.
   those. Nothing ambient is ever loaded. *(`test/shell/session.test.ts` —
   including a control proving pi would otherwise load the ambient files)*
 - **The audit.** Every name in the effective policy must be active in the
-  session, and no model-callable tool name — one that is allowlisted and not
+  session, no tool outside the effective policy may be active, and no
+  model-callable tool name — one that is allowlisted and not
   excluded — is provided by two sources (pi's built-ins or a declared
   capability). It runs on the session, at creation, after the mode binds
   extensions (`bindExtensions`) and after every reload (`session.reload`), i.e.
@@ -106,7 +107,7 @@ change one, the named test is what tells you.
    to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
    `read` and `write`, which may exceed the role's ceiling — the interview's job
    is to write `soul.md`. A model can only reach them through a shell tool, and
-   a role with a shell already has write. *(`test/shell/onboard.test.ts`,
+   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
    `align.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
