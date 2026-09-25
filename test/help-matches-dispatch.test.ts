@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { execSync } from "node:child_process";
 import { join } from "node:path";
+import { spawnNode } from "./cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
@@ -15,7 +15,7 @@ const CONTROL_CMD = "definitely-not-a-command";
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {
-    out = execSync(`node ${CLI} ${CONTROL_CMD} 2>&1`, { encoding: "utf8" });
+    out = spawnNode([CLI, CONTROL_CMD]);
   } catch (e) {
     out =
       (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
@@ -51,7 +51,7 @@ function advertisedCommands(help: string): string[] {
 describe("help matches dispatch (#161)", () => {
   // The built CLI's help is the contract under test, so run the compiled
   // dist, not the source.
-  const help = execSync(`node ${CLI} help`, { encoding: "utf8" });
+  const help = spawnNode([CLI, "help"]);
   const commands = advertisedCommands(help);
 
   // Prove the CLI probe reached the dispatcher before trusting any per-command
@@ -82,7 +82,7 @@ describe("help matches dispatch (#161)", () => {
   // commands hit — see test/cli.test.ts).
   it.each(commands)("%s is not rejected as an unknown command", (cmd) => {
     try {
-      execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+      spawnNode([CLI, cmd]);
     } catch (err) {
       const e = err as { stdout?: string; message?: string };
       // A real, dispatched command may still exit non-zero (e.g. a bare

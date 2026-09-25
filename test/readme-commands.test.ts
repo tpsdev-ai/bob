@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnNode } from "./cli-spawn.js";
 
 // Closes tpsdev-ai/bob#149.
 //
@@ -101,7 +101,7 @@ function retiredFlagsNamedIn(md: string): string[] {
 function cliAccepts(cmd: string): boolean {
   let out = "";
   try {
-    out = execFileSync("node", [CLI, cmd], { encoding: "utf8" });
+    out = spawnNode([CLI, cmd]);
   } catch (e) {
     out =
       ((e as { stdout?: string; stderr?: string }).stdout ?? "") +
@@ -122,7 +122,7 @@ const CONTROL_CMD = "definitely-not-a-command";
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {
-    out = execFileSync("node", [CLI, CONTROL_CMD], { encoding: "utf8" });
+    out = spawnNode([CLI, CONTROL_CMD]);
   } catch (e) {
     out =
       ((e as { stdout?: string; stderr?: string }).stdout ?? "") +
