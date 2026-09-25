@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type Args,
   type BobRole,
   boolFlag,
   DEFAULT_FLAIR_URL,
@@ -34,6 +35,7 @@ import {
   servicePath,
   stringFlag,
   syncFlairSoul,
+  UsageError,
   up,
 } from "./shell/index.js";
 
@@ -221,6 +223,9 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   const provider = stringFlag(flags, "provider");
   const model = stringFlag(flags, "model");
   const agentDir = stringFlag(flags, "agent-dir") ?? `${process.env.HOME}/agents/${name}`;
+  // Read every flag BEFORE the session starts: the check-in can rewrite
+  // soul.md, so a bad --no-flair spelling must fail here, not after it.
+  const noFlair = boolFlag(flags, "no-flair");
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -243,7 +248,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // hand since the last align), and that divergence is the case worth
   // surfacing. syncFlairSoul verifies registration first — no admin
   // credential required, because align only ever writes the agent's own soul.
-  if (boolFlag(flags, "no-flair")) return;
+  if (noFlair) return;
   const flair = readFlairBlock(agentDir);
   const synced = await syncFlairSoul({
     name,
@@ -364,8 +369,25 @@ function doctor(name: string): number {
   return report.summary.fail > 0 ? 1 : 0;
 }
 
+function usageError(err: unknown): number | undefined {
+  if (err instanceof UsageError) {
+    console.error(`bob: ${err.message}`);
+    return 2;
+  }
+  return undefined;
+}
+
 async function main(): Promise<number> {
-  const args = parseArgs(process.argv.slice(2));
+  // parseArgs validates every declared boolean flag, so a bad spelling is a
+  // usage error HERE — before any command runs — and never a stack trace.
+  let args: Args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
+    throw err;
+  }
   try {
     switch (args.command) {
       case "onboard": {
@@ -458,6 +480,8 @@ async function main(): Promise<number> {
         return 2;
     }
   } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`bob: ${msg}`);
     return 1;

@@ -52,7 +52,7 @@ export interface BobConfig {
 }
 
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
-export { type Args, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
+export { type Args, BOOLEAN_FLAGS, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
 export {
   BobYamlError,
   lineOf,

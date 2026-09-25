@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -139,7 +139,7 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     }
   }
 
-  it("--dry-run=true takes the dry-run branch — shows the plan, writes nothing, no Flair call", () => {
+  it("--dry-run=true takes the dry-run branch — prints the plan and creates no agent dir", () => {
     const home = scratchHome();
     const out = runCli("onboard testbot --role ea --dry-run=true", home);
     expect(out).toContain("PLAN (--dry-run)");
@@ -180,9 +180,56 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     expect(threw).toBe(true); // a non-zero exit
     expect(out).toContain("takes no value"); // names the flag + the accepted values
     expect(out).toContain("yes"); // names the offending value
-    // No side effect: the UsageError is thrown before initAgent runs, so no
-    // agent dir exists — the fix refuses the bad spelling before touching disk.
+    expect(out).not.toContain("    at "); // a usage error, never a stack trace
+    // No side effect: the UsageError is thrown while parsing, before any
+    // command runs, so no agent dir exists.
     expect(existsSync(join(home, "agents", "testbot"))).toBe(false);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("an empty --dry-run= is a usage error too, exit 2, before any side effect", () => {
+    const home = scratchHome();
+    let status = 0;
+    let out = "";
+    try {
+      execSync(`node ${CLI} onboard testbot --role ea --dry-run= 2>&1`, {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home },
+      });
+    } catch (err: unknown) {
+      const e = err as { status?: number; stdout?: string };
+      status = e.status ?? -1;
+      out = e.stdout ?? "";
+    }
+    expect(status).toBe(2);
+    expect(out).toContain("--dry-run takes no value");
+    expect(existsSync(join(home, "agents", "testbot"))).toBe(false);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("bob align refuses a bad --no-flair spelling BEFORE its session can rewrite soul.md", () => {
+    const home = scratchHome();
+    // A real (filesystem-only) agent to align: no Flair, no interview.
+    runCli("onboard testbot --role ea --no-flair --no-interactive", home);
+    const soul = join(home, "agents", "testbot", "soul.md");
+    expect(existsSync(soul)).toBe(true);
+    const before = readFileSync(soul, "utf8");
+    let status = 0;
+    let out = "";
+    try {
+      execSync(`node ${CLI} align testbot --no-flair=yes 2>&1`, {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home },
+      });
+    } catch (err: unknown) {
+      const e = err as { status?: number; stdout?: string };
+      status = e.status ?? -1;
+      out = e.stdout ?? "";
+    }
+    expect(status).toBe(2);
+    expect(out).toContain("--no-flair takes no value");
+    expect(out).not.toContain("starting alignment check"); // no session was started
+    expect(readFileSync(soul, "utf8")).toBe(before);
     rmSync(home, { recursive: true, force: true });
   });
 });
