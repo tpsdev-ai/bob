@@ -103,6 +103,22 @@ export interface ToolsBlock {
 const TOOLS_KEYS = ["allow", "exclude", "allowResidentShell"] as const;
 
 export function readTools(yamlText: string): ToolsBlock | undefined {
+  // The INLINE form (`tools: {allow: [read]}`) is refused, not ignored.
+  // `readBlock` drops a block key's inline value silently, which on this key
+  // means the block reads as empty — and "empty" is one step away from pi's
+  // defaults, the state this whole reader exists to make impossible. One shape
+  // for the block: `tools:` followed by allow:/exclude:/allowResidentShell: on
+  // indented lines.
+  const inline = /^tools[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "tools",
+      lineOf(yamlText, /^tools[ \t]*:/m),
+      `the inline form is not supported — write the block form: "tools:" on its own line, then allow:/exclude: indented under it.`,
+    );
+  }
+
   const raw = readBlock(yamlText, "tools");
   if (raw === undefined) return undefined;
 
@@ -154,6 +170,26 @@ function toToolNames(value: unknown): string[] | undefined {
     names.push(item.trim());
   }
   return names;
+}
+
+// The role this agent was hired into (bob.yaml `agent.role`). The role is the
+// CEILING on the tool allowlist (tool-allowlist.ts): roles/<role>/role.json
+// ships with bob, while bob.yaml is agent-writable, so bob.yaml may narrow the
+// role's list but never widen it. An absent or non-scalar role is an error — a
+// session cannot apply a ceiling it cannot read.
+export function readAgentRole(yamlText: string): string {
+  const block = readBlock(yamlText, "agent");
+  const raw = block?.role;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new BobYamlError(
+      "agent",
+      lineOfKey(yamlText, "agent", "role"),
+      raw === undefined
+        ? `bob.yaml must declare the agent's role (agent.role) — the role's role.json is the ceiling on the tool allowlist.`
+        : `"role" must be a role name (ea, writer, reviewer, coder, qa, custom).`,
+    );
+  }
+  return raw.trim();
 }
 
 // Read the top-level `resident:` flag. True means the agent runs unattended

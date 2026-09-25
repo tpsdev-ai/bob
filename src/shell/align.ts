@@ -13,6 +13,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SpawnFn } from "./onboard.js";
+import { readAgentToolPolicy } from "./run.js";
+import { toolPolicyArgs } from "./tool-allowlist.js";
 
 // Same path-traversal + prompt-injection defense as runOnboard.
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -71,12 +73,19 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   const soulHashBefore = hashFile(soulPath);
   // TODO(phase1): migrate to SDK — embed pi via createAgentSession instead of
   // spawning the `pi` binary (mirrors run.ts). Kept as a subprocess for now;
-  // PR1 only migrates the non-interactive prompt path in run.ts.
+  // PR1 only migrates the non-interactive prompt path in run.ts. Until then the
+  // session is handed the agent's RESOLVED tool policy as pi's own flags, so
+  // this path starts a session with the same allowlist the SDK paths do.
   const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
   const piBin = opts.piBin ?? "pi";
 
   const sessionDir = join(opts.agentDir, ".pi-agent");
   const workDir = join(opts.agentDir, "work");
+
+  // Resolved from bob.yaml + role.json, throwing rather than defaulting: an
+  // alignment session must not run with a policy the agent's config does not
+  // describe.
+  const policy = readAgentToolPolicy(opts.agentDir);
 
   const args = [
     "--provider",
@@ -87,6 +96,7 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     sessionDir,
     "--append-system-prompt",
     META_PROMPT(opts.name, soulPath),
+    ...toolPolicyArgs(policy),
     `Hi ${opts.name}. Quick alignment check — what feels off, what's drifted, what's new? Read your soul at ${soulPath} first.`,
   ];
 

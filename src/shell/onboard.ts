@@ -14,6 +14,8 @@ import { type ChildProcess, spawn as nodeSpawn, type SpawnOptions } from "node:c
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { readAgentToolPolicy } from "./run.js";
+import { toolPolicyArgs } from "./tool-allowlist.js";
 
 export interface OnboardOptions {
   // Agent identity (must already exist on disk via initAgent).
@@ -90,12 +92,19 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   const soulHashBefore = hashFile(soulPath);
   // TODO(phase1): migrate to SDK — embed pi via createAgentSession instead of
   // spawning the `pi` binary (mirrors run.ts). Kept as a subprocess for now;
-  // PR1 only migrates the non-interactive prompt path in run.ts.
+  // PR1 only migrates the non-interactive prompt path in run.ts. Until then the
+  // session is handed the agent's RESOLVED tool policy as pi's own flags, so
+  // this path starts a session with the same allowlist the SDK paths do.
   const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
   const piBin = opts.piBin ?? "pi";
 
   const sessionDir = join(opts.agentDir, ".pi-agent");
   const workDir = join(opts.agentDir, "work");
+
+  // Resolved from bob.yaml + role.json, and throwing (no allowlist, an
+  // unmappable name, a widening past the role) rather than defaulting: an
+  // onboarding session must not be born without a policy.
+  const policy = readAgentToolPolicy(opts.agentDir);
 
   const args = [
     "--provider",
@@ -106,6 +115,7 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
     sessionDir,
     "--append-system-prompt",
     META_PROMPT(opts.name, opts.role, soulPath),
+    ...toolPolicyArgs(policy),
     `Hello ${opts.name}. We're going to shape your persona for the ${opts.role} role. Start by reading your seed soul at ${soulPath}, then interview me. When you have what you need, write the refined persona back.`,
   ];
 

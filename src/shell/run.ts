@@ -7,9 +7,14 @@
 // via its SDK (`createAgentSession`/`AgentSession`) in-process. One embedded-pi
 // path, no subprocess. The PERSISTENT variant (the agent keeps running) lives in
 // persistent.ts and shares this file's session builder — `bob run` is the
-// short-lived `-p`-style lifespan, persistent is the warm long-lived one. The
-// remaining spawn sites (onboard/align launcher generation) migrate in later
-// PRs — see the `// TODO(phase1): migrate to SDK` markers there.
+// short-lived `-p`-style lifespan, persistent is the warm long-lived one.
+//
+// EVERY launch path resolves the tool policy HERE: the embedded sessions get it
+// through RunSessionConfig, and the paths that start the pi CLI (onboard,
+// align, and the generated `bin/<name>` launcher through `bob launch`) get the
+// same policy as pi's own flags. There is no path that starts an agent session
+// without it — a session without the resolved allowlist is a session with no
+// role.
 //
 // Config resolution mirrors the launcher `init.ts` generates exactly:
 //   - provider + model come from ~/agents/<name>/bob.yaml (`provider:` block)
@@ -23,6 +28,7 @@
 // Model override is per-call (`opts.model`): it replaces the bob.yaml model
 // for this invocation only, same semantics as the old `--model` flag.
 
+import { spawn as nodeSpawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,10 +39,12 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { readCron, readResident, readTools } from "./bob-yaml.js";
+import { readAgentRole, readCron, readResident, readTools } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
-import type { CronEntry } from "./index.js";
-import { resolveToolPolicy } from "./tool-allowlist.js";
+import type { BobRole, CronEntry } from "./index.js";
+import type { SpawnFn } from "./onboard.js";
+import { loadRole } from "./role-loader.js";
+import { resolveToolPolicy, type ToolPolicy, toolPolicyArgs } from "./tool-allowlist.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -100,11 +108,14 @@ export interface RunSessionConfig {
   // falsy (ephemeral run).
   persistent?: boolean;
   // The tool policy resolved from bob.yaml's `tools:` block + top-level
-  // `resident:` flag (see tool-allowlist.ts). `tools` is pi's STRICT allowlist
-  // — undefined means the agent declared none and pi's own defaults apply;
-  // `excludeTools` is the denylist pi applies after it (always an array, and
-  // the resident policy rides in it). Both are handed to createAgentSession,
-  // which is what makes the role actually bind the session.
+  // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
+  // `tools` is pi's STRICT allowlist; `excludeTools` is the denylist pi applies
+  // after it (always an array, and the resident policy rides in it). Both are
+  // handed to createAgentSession, which is what makes the role actually bind
+  // the session. resolveAgentToolPolicy always produces both — a missing
+  // allowlist is a load error, never "pi's defaults" — so a config built by
+  // resolveRunConfig always carries them; the factory still tolerates an absent
+  // `tools` list for a caller that stands up a session directly (tests).
   tools?: string[];
   excludeTools?: string[];
 }
@@ -276,6 +287,126 @@ export interface ResolvedRunConfig {
   // bob.yaml `cron:` entries (validated). Only the PERSISTENT runtime uses
   // these (it schedules them into the live session); `bob run` ignores them.
   cron: CronEntry[];
+  // The resolved tool policy (role ceiling + bob.yaml narrowing + the resident
+  // decision), so a caller that only has the result can still hand the SAME
+  // policy to a session it starts itself (`bob launch` does exactly that).
+  policy: ToolPolicy;
+}
+
+// The tool policy for an agent's bob.yaml. ONE entry point for every launch
+// path, so `bob run`/the persistent runtime (via resolveRunConfig) and the pi
+// CLI paths (onboard, align, `bob launch`) cannot drift:
+//
+//   * role.json is the CEILING — it ships with bob, while bob.yaml is
+//     agent-writable, so bob.yaml may narrow the role's list but never widen it;
+//   * a missing `tools.allow` is a load error, not "pi's defaults";
+//   * every name must be one pi (or a loaded capability) can enable.
+//
+// Throws rather than returning a default, because a session without the
+// resolved policy is the defect this whole area is recovering from.
+export function resolveAgentToolPolicy(
+  yamlText: string,
+  opts?: { persistent?: boolean },
+): ToolPolicy {
+  const roleName = readAgentRole(yamlText);
+  // loadRole validates the name (path traversal) and throws a named error when
+  // bob does not ship the role. The ceiling has to be readable: an agent whose
+  // role.json cannot be found cannot start a session.
+  const role = loadRole(roleName as BobRole);
+  return resolveToolPolicy({
+    yamlText,
+    tools: readTools(yamlText),
+    role: {
+      name: roleName,
+      allow: role.tools.allow,
+      allowResidentShell: role.tools.allowResidentShell,
+    },
+    resident: readResident(yamlText),
+    persistent: opts?.persistent,
+  });
+}
+
+// The policy for an on-disk agent, for the launch paths that only have an
+// agent dir (onboard, align, `bob launch`). Same reader as resolveRunConfig, so
+// a CLI session and an embedded session get the same policy — and fail closed
+// the same way when bob.yaml is missing, roleless, or has no allowlist.
+export function readAgentToolPolicy(agentDir: string): ToolPolicy {
+  const yamlPath = join(agentDir, "bob.yaml");
+  if (!existsSync(yamlPath)) {
+    throw new Error(
+      `config not found at ${yamlPath} (run 'bob onboard <name>' first, or point --agent-dir at the agent)`,
+    );
+  }
+  return resolveAgentToolPolicy(readFileSync(yamlPath, "utf8"));
+}
+
+export interface LaunchOptions {
+  name: string;
+  // Agents root dir. Defaults to ~/agents. Tests override.
+  agentsRoot?: string;
+  // Per-invocation model override (same semantics as `bob run --model`).
+  model?: string;
+  // Args forwarded verbatim to pi — the generated launcher passes its own
+  // "$@" through, so an interactive prompt or a pi flag arrives here.
+  args?: string[];
+  // Override the pi binary (tests). Defaults to "pi".
+  piBin?: string;
+  // Override child_process.spawn (tests).
+  spawnFn?: SpawnFn;
+}
+
+// `bob launch <name> [pi args…]` — an interactive pi session for an agent,
+// started with the agent's RESOLVED tool policy.
+//
+// This is what the generated `bin/<name>` launcher runs, and therefore what the
+// mail consumer reaches when it invokes that launcher. The launcher no longer
+// calls pi on its own: a launcher with its own `exec pi …` is a path that starts
+// a session with no allowlist, which is exactly the gap this closes.
+//
+// Same policy, same capability extensions, same per-capability config env as
+// createPiRunSession — the difference is only which runtime owns the session, so
+// an interactive session cannot be the wide-open one.
+export async function launchAgent(opts: LaunchOptions): Promise<number> {
+  const { config, policy } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
+    model: opts.model,
+  });
+
+  const args = [
+    "--provider",
+    config.provider,
+    "--model",
+    config.model,
+    "--session-dir",
+    config.piAgentDir,
+    ...(config.appendSystemPrompt.length > 0
+      ? ["--append-system-prompt", config.appendSystemPrompt]
+      : []),
+    // The capability extensions, by resolved path, exactly as the SDK path hands
+    // them to pi's resource loader.
+    ...config.extensionSources.flatMap((source) => ["--extension", source]),
+    // pi's own flags for the resolved policy (strict allowlist + denylist).
+    ...toolPolicyArgs(policy),
+    ...(opts.args ?? []),
+  ];
+
+  const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
+  return new Promise<number>((resolve, reject) => {
+    const child = spawnFn(opts.piBin ?? "pi", args, {
+      cwd: config.cwd,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        ...config.capabilityEnv,
+        // A launched CLI session is not the persistent runtime: capabilities
+        // stay outbound-only, the same signal the SDK path sets.
+        BOB_PERSISTENT: "",
+      },
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => resolve(code ?? 0));
+  });
 }
 
 // Parse + validate bob.yaml `cron:` into CronEntry[]. Drops any entry missing
@@ -319,17 +450,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // plus the per-capability config env each extension reads (no secrets).
   const resolution = resolveCapabilities({ yamlText });
 
-  // Resolve the role's tool allowlist. Every name must be one pi can actually
-  // enable (a built-in, or a tool the blessed capabilities register): pi drops
-  // an unknown name SILENTLY, so a stale name would otherwise look like a
-  // working allowlist while the tool is simply absent. Throws naming the
-  // offender and its replacement.
-  const toolPolicy = resolveToolPolicy({
-    yamlText,
-    tools: readTools(yamlText),
-    resident: readResident(yamlText),
-    persistent: opts.persistent,
-  });
+  // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
+  // may only narrow it; a missing allowlist is a load error; every name must be
+  // one pi or a loaded capability can enable (pi drops an unknown name
+  // SILENTLY, so a stale name would otherwise look like a working allowlist
+  // while the tool is simply absent). Throws naming the offender and the fix.
+  const toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
 
   const config: RunSessionConfig = {
     provider,
@@ -342,10 +468,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
       resolution.capabilities.map((c) => [c.piPackage, c.name]),
     ),
     capabilityEnv: capabilityConfigEnv(resolution),
-    ...(toolPolicy.tools ? { tools: toolPolicy.tools } : {}),
+    // Always both: resolveAgentToolPolicy refuses an agent without an
+    // allowlist, so there is no longer a "declared none" case here.
+    tools: toolPolicy.tools,
     excludeTools: toolPolicy.excludeTools,
   };
-  return { agentDir, provider, model, config, cron: parseCron(yamlText) };
+  return { agentDir, provider, model, config, cron: parseCron(yamlText), policy: toolPolicy };
 }
 
 // The minimum of pi's resource loader this check needs. Structural so tests can
@@ -383,6 +511,51 @@ export function assertCapabilitiesLoaded(
       "",
       "The agent would have started without those tools. Fix the capability or remove",
       "it from capabilities: in bob.yaml rather than running under-equipped.",
+    ].join("\n"),
+  );
+}
+
+// The minimum of a session this check needs.
+export interface ActiveToolSource {
+  getActiveToolNames(): string[];
+}
+
+// Fail the session if an allowlisted tool is not actually ACTIVE.
+//
+// tool-allowlist.ts checks a name against the global catalog — the tools that
+// could exist in bob. That is not the same as the tools THIS session has: pi
+// enables only what the loaded capabilities register, and it ignores an unknown
+// name without a word (`setActiveToolsByName`: "Unknown tool names are
+// ignored"). So a role allowlist naming a Discord tool on an agent that never
+// declared the discord capability produced a session quietly missing the tool
+// its role asked for — an allowlist that looks enforced and is not.
+//
+// Called from the real factory after createAgentSession, which is the point
+// where the capabilities are loaded and the session's tool set is final.
+export function assertAllowedToolsActive(
+  session: ActiveToolSource,
+  config: Pick<RunSessionConfig, "tools" | "excludeTools">,
+): void {
+  const allowed = config.tools ?? [];
+  if (allowed.length === 0) return;
+  const active = new Set(session.getActiveToolNames());
+  // A name the denylist removes is absent ON PURPOSE (pi applies excludeTools
+  // after tools), so it is not a silent drop — only an allowlisted name that
+  // nothing removed and nothing registered is.
+  const excluded = new Set(config.excludeTools ?? []);
+  const missing = allowed.filter((name) => !active.has(name) && !excluded.has(name));
+  if (missing.length === 0) return;
+  throw new Error(
+    [
+      `bob: ${missing.length} allowlisted tool${missing.length === 1 ? "" : "s"} not active in the session: ${missing.join(", ")}`,
+      "",
+      "A name can be in tools.allow and still not exist here: pi enables only the tools",
+      "the loaded capabilities register, and it ignores an unknown name silently. The",
+      `${missing.length === 1 ? "name is" : "names are"} real in bob's tool catalog, so the agent is almost certainly missing the capability that provides ${missing.length === 1 ? "it" : "them"} — or that capability's extension did not load.`,
+      "",
+      "Fix: declare the capability in bob.yaml (capabilities:) and configure it, or",
+      "drop the name from tools.allow. A session that silently loses a tool its role",
+      "asked for is the defect this check exists to catch.",
     ].join("\n"),
   );
 }
@@ -471,20 +644,27 @@ export async function createPiRunSession(
     modelRuntime,
     resourceLoader,
     sessionManager: makeSessionManager(config.cwd) as ReturnType<typeof SessionManager.inMemory>,
-    // The role's tool allowlist, resolved from bob.yaml. pi's `tools` is a
-    // STRICT list — passing it is what binds the session to the role; without
-    // it pi enables its defaults (read, bash, edit, write) plus every loaded
-    // capability tool, whatever the role says. Omitted entirely when the agent
-    // declared no allowlist, so pi's defaults still apply there (passing an
-    // empty array would mean "no tools at all").
+    // The role's tool allowlist, resolved from role.json (the ceiling) +
+    // bob.yaml. pi's `tools` is a STRICT list — passing it is what binds the
+    // session to the role; without it pi enables its defaults (read, bash,
+    // edit, write) plus every loaded capability tool, whatever the role says.
+    // resolveAgentToolPolicy always produces it (a missing allowlist is a load
+    // error), so this is present on every path through the resolver; a caller
+    // that stands a session up directly may still omit it, and pi's defaults
+    // then apply.
     ...(config.tools ? { tools: config.tools } : {}),
     // Applied after the allowlist (pi's documented order). Carries the
     // resident policy, which drops the shell + file-writing tools for an agent
-    // running unattended unless the role opted in.
+    // running unattended unless the ROLE opted in (tools.allowResidentShell).
     ...(config.excludeTools && config.excludeTools.length > 0
       ? { excludeTools: config.excludeTools }
       : {}),
   });
+
+  // Every allowlisted name must be a name this session actually has — pi
+  // ignores an unknown tool name silently, so a capability tool named for an
+  // agent without that capability would simply be absent (see the function).
+  assertAllowedToolsActive(session as unknown as ActiveToolSource, config);
 
   return session as unknown as RunSession;
 }

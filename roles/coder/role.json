@@ -10,7 +10,8 @@
       "flair_search",
       "flair_write",
       "flair_get"
-    ]
+    ],
+    "allowResidentShell": true
   },
   "default_provider": "exe-dev-gateway",
   "default_model": "claude-sonnet-4-6"

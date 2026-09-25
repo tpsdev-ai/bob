@@ -17,6 +17,7 @@ import {
   type InitResult,
   initAgent,
   installService,
+  launchAgent,
   loadRole,
   provisionFlairIdentity,
   readBlock,
@@ -43,6 +44,13 @@ function parseArgs(argv: string[]): Args {
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
+    if (tok === "--") {
+      // Everything after `--` is positional. The generated launcher forwards
+      // its own args this way (`bob launch <name> -- "$@"`), so a pi flag
+      // cannot be swallowed as a bob flag.
+      positional.push(...rest.slice(i + 1));
+      break;
+    }
     if (tok.startsWith("--")) {
       const key = tok.slice(2);
       const next = rest[i + 1];
@@ -88,6 +96,9 @@ Commands:
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
   office join <name>  Join an existing branch office
+  launch <name>       Interactive pi session for the agent, with its resolved
+                      role tool allowlist. This is what bin/<name> runs.
+                      Args after -- are passed through to pi.
   help                Show this help
 
 Roles: ea | writer | reviewer | coder | qa | custom
@@ -414,6 +425,16 @@ async function main(): Promise<number> {
         }
         const prompt = args.positional.slice(1).join(" ") || undefined;
         return await run(args.positional[0], prompt, args.flags);
+      }
+      case "launch": {
+        const name = args.positional[0];
+        if (!name) {
+          console.error("bob launch: missing <name>");
+          return 2;
+        }
+        // Everything after the name is forwarded to pi verbatim (the launcher
+        // passes its "$@" through), so a prompt or a pi flag arrives intact.
+        return await launchAgent({ name, args: args.positional.slice(1) });
       }
       case "install-service":
         if (!args.positional[0]) {

@@ -55,6 +55,7 @@ export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
 export {
   BobYamlError,
   lineOf,
+  readAgentRole,
   readBlock,
   readCapabilities,
   readResident,
@@ -144,7 +145,11 @@ export {
 } from "./persistent.js";
 export { loadRole, type RoleTemplate } from "./role-loader.js";
 export {
+  type ActiveToolSource,
+  assertAllowedToolsActive,
   createPiRunSession,
+  type LaunchOptions,
+  launchAgent,
   type ResolvedRunConfig,
   type ResolveRunConfigOptions,
   type RunOptions,
@@ -152,6 +157,8 @@ export {
   type RunSession,
   type RunSessionConfig,
   type RunSessionFactory,
+  readAgentToolPolicy,
+  resolveAgentToolPolicy,
   resolveRunConfig,
   runAgent,
   type SessionManagerLike,
@@ -184,10 +191,12 @@ export {
   PI_BUILTIN_TOOLS,
   RESIDENT_EXCLUDED_TOOLS,
   type ResolveToolPolicyOptions,
+  type RoleToolCeiling,
   residentDroppedTools,
   resolveToolNames,
   resolveToolPolicy,
   type ToolNameAudit,
   type ToolNameProblem,
   type ToolPolicy,
+  toolPolicyArgs,
 } from "./tool-allowlist.js";

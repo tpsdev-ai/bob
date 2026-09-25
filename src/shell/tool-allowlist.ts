@@ -202,9 +202,27 @@ function stripQuotes(s: string): string {
   return s.replace(/^["']|["']$/g, "");
 }
 
+// The role's own tool policy (roles/<role>/role.json `tools`) — the CEILING.
+// role.json ships with bob; bob.yaml is agent-writable. So bob.yaml may narrow
+// this list, never widen it (see resolveToolPolicy).
+export interface RoleToolCeiling {
+  // The role's name, for error text. The ceiling is a file inside bob, not in
+  // the agent's directory, so the message has to say which role.
+  name: string;
+  // Tool names the role allows (role.json `tools.allow`).
+  allow: readonly string[];
+  // True when the role itself opts the agent back into the resident shell +
+  // file-writing tools (role.json `tools.allowResidentShell`).
+  allowResidentShell?: boolean;
+}
+
 export interface ResolveToolPolicyOptions {
   // The parsed `tools:` block (bob-yaml.ts readTools), if bob.yaml has one.
   tools?: ToolsBlock;
+  // The role's ceiling (role.json). Every path that starts a session passes it
+  // (resolveAgentToolPolicy); optional at this level so a unit test can
+  // exercise the block on its own.
+  role?: RoleToolCeiling;
   // bob.yaml's top-level `resident:` flag.
   resident?: boolean;
   // The lifespan the session will run in. The persistent runtime is resident
@@ -216,11 +234,15 @@ export interface ResolveToolPolicyOptions {
 }
 
 // The policy a session gets: pi's strict allowlist, the denylist applied after
-// it, and the residency decision. `tools` is undefined when the agent declared
-// no allowlist — pi's own defaults then apply, which is what a hand-written
-// bob.yaml predating this feature expects. `excludeTools` is always an array.
+// it, and the residency decision.
+//
+// `tools` is ALWAYS an array, never undefined. An agent that declares no
+// allowlist is a load ERROR: pi's own defaults (read, bash, edit, write) are
+// not a policy, they are the absence of one, and this whole area exists
+// because "absent" quietly became "everything pi ships". An explicit empty
+// list is how an agent says "no tools". `excludeTools` is always an array.
 export interface ToolPolicy {
-  tools?: string[];
+  tools: string[];
   excludeTools: string[];
   resident: boolean;
   allowResidentShell: boolean;
@@ -228,13 +250,60 @@ export interface ToolPolicy {
 
 export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
   const block = opts.tools;
-  const resident = opts.resident === true || opts.persistent === true;
-  const allowResidentShell = block?.allowResidentShell === true;
 
-  const tools =
-    block?.allow === undefined ? undefined : resolveToolNames(block.allow, opts.yamlText);
+  // Fail closed on a missing allowlist. Three shapes mean the same thing and
+  // all three are refused: no `tools:` block, a `tools:` block with no
+  // `allow:`, and the inline form (refused in bob-yaml.ts readTools). The old
+  // reading — "no block means pi's defaults" — is what made the allowlist
+  // inert; pi's defaults are not a decision bob.yaml made.
+  if (block === undefined) {
+    throw new BobYamlError(
+      "tools",
+      lineOf(opts.yamlText, /^tools[ \t]*:/m),
+      `bob.yaml has no tools: block — declare the role's allowlist under "tools:" with "allow:" (an explicit empty list means no tools). Without one pi falls back to its own defaults (read, bash, edit, write), which is not a policy.`,
+    );
+  }
+  if (block.allow === undefined) {
+    throw new BobYamlError(
+      "tools",
+      lineOf(opts.yamlText, /^tools[ \t]*:/m),
+      `the tools: block declares no allow: list — an allowlist is required ("allow:" with no items means no tools).`,
+    );
+  }
+
+  const resident = opts.resident === true || opts.persistent === true;
+  const tools = resolveToolNames(block.allow, opts.yamlText);
   const declaredExclusions =
-    block?.exclude === undefined ? [] : resolveToolNames(block.exclude, opts.yamlText);
+    block.exclude === undefined ? [] : resolveToolNames(block.exclude, opts.yamlText);
+
+  // The role is the ceiling. A subset is fine — an agent may always hold fewer
+  // tools than its role allows — but a name the role does not allow is a
+  // widening, and widening is a load error: bob.yaml is the file the agent can
+  // edit, so without this the role would be a default rather than a bound.
+  const ceiling = opts.role;
+  let allowResidentShell = block.allowResidentShell === true;
+  if (ceiling) {
+    const roleAllows = new Set(roleToolNames(ceiling));
+    const widened = tools.filter((name) => !roleAllows.has(name));
+    if (widened.length > 0) {
+      throw new BobYamlError(
+        "tools",
+        toolNameLine(opts.yamlText, widened[0]),
+        `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: ${widened.join(
+          ", ",
+        )} ${widened.length === 1 ? "is" : "are"} not in the role. The role is the ceiling — roles/${ceiling.name}/role.json allows ${[...roleAllows].sort().join(", ")}. Move the name into that role, or drop it here.`,
+      );
+    }
+    if (allowResidentShell && ceiling.allowResidentShell !== true) {
+      throw new BobYamlError(
+        "tools",
+        lineOf(opts.yamlText, /^tools[ \t]*:/m),
+        `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: tools.allowResidentShell is true, but the role does not grant it. A resident agent loses the shell + the file-writing tools unless its ROLE opts back in (roles/${ceiling.name}/role.json).`,
+      );
+    }
+    // The role's grant is inherited; bob.yaml may still narrow it away.
+    allowResidentShell = ceiling.allowResidentShell === true && block.allowResidentShell !== false;
+  }
 
   const residentExclusions = resident && !allowResidentShell ? [...RESIDENT_EXCLUDED_TOOLS] : [];
 
@@ -248,10 +317,39 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
   };
 }
 
+// The role ceiling's names, resolved through the same audit as bob.yaml's. A
+// role is a bob-shipped file, so a bad name in it is a bob fault: the error
+// says which role instead of pointing a line number into the agent's bob.yaml.
+function roleToolNames(ceiling: RoleToolCeiling): string[] {
+  const { resolved, problems } = auditToolNames(ceiling.allow);
+  if (problems.length > 0) {
+    throw new Error(
+      `role "${ceiling.name}" allows tool ${problems.length === 1 ? "name" : "names"} pi cannot enable: ` +
+        `${problems.map((p) => `${p.name} (${p.hint})`).join("; ")}. ` +
+        `Known names: ${knownToolNames().join(", ")}.`,
+    );
+  }
+  return resolved;
+}
+
+// pi's own flags for a resolved policy. Every launch path that starts the pi
+// CLI — bin/<name> (through `bob launch`), onboard, align — passes these, so a
+// CLI session gets the SAME policy the embedded SDK session does.
+export function toolPolicyArgs(policy: ToolPolicy): string[] {
+  // An explicit empty allowlist means "no tools at all". pi spells that
+  // --no-tools; `--tools ""` would be an empty name list, which pi reads as
+  // "no allowlist given" and leaves its defaults in place — the fail-open
+  // shape this policy exists to close.
+  const allow = policy.tools.length === 0 ? ["--no-tools"] : ["--tools", policy.tools.join(",")];
+  const exclude =
+    policy.excludeTools.length === 0 ? [] : ["--exclude-tools", policy.excludeTools.join(",")];
+  return [...allow, ...exclude];
+}
+
 // The tools a resident agent's own allowlist asked for that the resident policy
 // drops — doctor's warning, so the drop is never silent either.
 export function residentDroppedTools(policy: ToolPolicy): string[] {
   if (!policy.resident || policy.allowResidentShell) return [];
-  const allowed = new Set(policy.tools ?? []);
+  const allowed = new Set(policy.tools);
   return policy.excludeTools.filter((tool) => allowed.has(tool));
 }
