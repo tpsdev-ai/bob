@@ -317,7 +317,16 @@ describe("runAlign — an override cannot change the credential source (#170)", 
     // not empty and the comparison below can fail.
     appendFileSync(
       join(agentDir, "bob.yaml"),
-      ["capabilities:", "  - flair", "", "flair:", "  url: http://127.0.0.1:9", "  agentId: testbot", "  keyFile: /dev/null", ""].join("\n"),
+      [
+        "capabilities:",
+        "  - flair",
+        "",
+        "flair:",
+        "  url: http://127.0.0.1:9",
+        "  agentId: testbot",
+        "  keyFile: /dev/null",
+        "",
+      ].join("\n"),
     );
     const { runner, runs } = fakeRunner({});
     await runAlign({
