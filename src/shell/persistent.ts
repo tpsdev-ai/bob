@@ -257,6 +257,40 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   });
   const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
 
+  // cli#145 round 10: ONE prompt path. Every prompt this runtime issues goes
+  // through here, and `stopped` is re-read IMMEDIATELY before session.prompt —
+  // after EVERY await. A fire used to check `stopped`, then wait for idle, then
+  // prompt regardless: a session that fail-closed DURING that wait (its standing
+  // contract could not be attached, so the runtime is disposing it) would still
+  // be driven a turn — exactly the silent service round 9 exists to prevent.
+  // The final check is the last thing before the prompt; nothing runs between
+  // them.
+  const issuePrompt = async (prompt: string): Promise<void> => {
+    const refuse = (when: string): void => {
+      log(
+        `[bob] ${REINJECTION_FAILURE_REASON}: not issuing a scheduled prompt — this session stopped serving${when}`,
+      );
+    };
+    if (stopped !== undefined) {
+      // The session lost its standing contract and is being disposed: a prompt
+      // now is exactly the silent service this round exists to prevent (and pi
+      // would reject the prompt — the session is disposed).
+      refuse("");
+      return;
+    }
+    try {
+      await session.waitForIdle?.();
+    } catch {
+      // proceed — pi serializes turns regardless
+    }
+    if (stopped !== undefined) {
+      // The attach failed WHILE this prompt waited for the session to go idle.
+      refuse(" (it stopped while this prompt waited to go idle)");
+      return;
+    }
+    await session.prompt(prompt);
+  };
+
   // Scheduled work: fire each bob.yaml `cron:` prompt INTO this live session on
   // its cadence (one gateway, no second `bob run` process). Await the idle
   // barrier first so a tick doesn't cut into an in-flight inbound turn; fires
@@ -265,23 +299,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     log(`[bob] scheduling ${cron.length} cron job(s) for ${opts.name}`);
     cronScheduler = startCronScheduler({
       entries: cron,
-      fire: async (entry) => {
-        if (stopped !== undefined) {
-          // The session lost its standing contract and is being disposed: a fire
-          // now is exactly the silent service this round exists to prevent (and
-          // pi would reject the prompt — the session is disposed).
-          log(
-            `[bob] ${REINJECTION_FAILURE_REASON}: not firing a scheduled prompt — this session stopped serving`,
-          );
-          return;
-        }
-        try {
-          await session.waitForIdle?.();
-        } catch {
-          // proceed — pi serializes turns regardless
-        }
-        await session.prompt(entry.prompt);
-      },
+      fire: (entry) => issuePrompt(entry.prompt),
       log,
     });
   }

@@ -633,4 +633,115 @@ describe("runPersistent / startPersistent", () => {
 
     await handle.shutdown();
   });
+
+  // ── cli#145 round 10: ONE prompt path ──────────────────────────────
+
+  it("cli#145 round 10: a cron fire parked on the idle barrier never prompts a session that fail-closed during that wait", async () => {
+    // The fire checked `stopped`, then awaited the idle barrier, then prompted
+    // regardless — so a session that fail-closed DURING that wait (its standing
+    // contract could not be attached, and the runtime is disposing it) was still
+    // driven a turn. That is the silent service round 9 exists to prevent. Every
+    // prompt the runtime issues now goes through one function that re-reads
+    // `stopped` IMMEDIATELY before session.prompt, after EVERY await.
+
+    // A schedule due within a second: croner takes an optional seconds field, and
+    // the scheduler clamps the delay to >= 1s, so the REAL scheduler delivers a
+    // tick without a test-only seam.
+    writeFileSync(
+      join(root, "pulse", "bob.yaml"),
+      [
+        "agent:",
+        "  id: pulse",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "cron:",
+        "  - name: heartbeat",
+        '    schedule: "* * * * * *"',
+        '    prompt: "post the brief"',
+        "",
+      ].join("\n"),
+    );
+
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const logs: string[] = [];
+    const exits: number[] = [];
+    let disposed = false;
+    let idleWaits = 0;
+    // EVERY waiter that parked on idle, so releasing the barrier resumes ALL of
+    // them — releasing only the newest would leave the fire parked and make the
+    // "never prompts" assertion pass for the wrong reason.
+    const idleReleases: Array<() => void> = [];
+    const session: RunSession = {
+      subscribe(listener) {
+        const l = listener as (event: unknown) => void;
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      // Recorded UNCONDITIONALLY (and never throwing on a disposed session): the
+      // defect under test is a prompt REACHING the session, whatever it then
+      // does with it.
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      waitForIdle() {
+        idleWaits += 1;
+        return new Promise<void>((resolve) => {
+          idleReleases.push(resolve);
+        });
+      },
+      sendCustomMessage() {
+        return Promise.reject(new Error("the gateway dropped the attach"));
+      },
+      dispose() {
+        disposed = true;
+      },
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+
+    // Wait for the real tick to park on the idle barrier. Bounded, so a missed
+    // tick fails loudly instead of reading as a pass.
+    const deadline = Date.now() + 15_000;
+    while (idleWaits < 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(
+      idleWaits,
+      `the cron tick reached the idle barrier (logs: ${JSON.stringify(logs)})`,
+    ).toBeGreaterThanOrEqual(1);
+
+    // The attach fails WHILE the fire sits on the barrier.
+    for (const listener of listeners) {
+      listener({ type: "compaction_end", reason: "threshold", result: {}, aborted: false });
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    expect(exits, "the fail-closed shutdown is itself parked on the idle barrier").toHaveLength(0);
+
+    // Release it: the fire resumes, and the runtime finishes disposing.
+    for (const release of idleReleases.splice(0)) release();
+    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(prompts, "no prompt reaches a session that stopped serving").toEqual([]);
+    expect(exits, "the runtime still ends itself, non-zero").toEqual([1]);
+    expect(disposed, "and the session is disposed").toBe(true);
+    const joined = logs.join("\n");
+    expect(joined, "the named reason is logged").toContain("reinjection_failed");
+    expect(joined, "the stop was seen BEFORE the prompt, not after it").toContain(
+      "it stopped while this prompt waited to go idle",
+    );
+    await handle.shutdown();
+  });
 });
