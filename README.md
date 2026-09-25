@@ -45,7 +45,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `bob onboard <name>`       | Scaffold + register the Flair identity + write its soul + open the hiring interview              |
 | `bob align <name>`         | Recurring drift check — refines the persona and mirrors it back into Flair                       |
-| `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). This is what the service unit runs |
+| `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). `--model X` overrides bob.yaml's model for the whole session. This is what the service unit runs |
 | `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
@@ -53,7 +53,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
 | `bob help`                 | Show this usage                                                                               |
 
-A `cron:` entry fires into the one live `bob run <name>` session, which runs on that agent's configured model. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task — it does not, and cannot, pick a model per `cron:` command.
+A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
 ## Operator guarantees, and the tests that pin them
 
