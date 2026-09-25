@@ -271,7 +271,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   let reason: SilenceReason | undefined;
 
   // #145: after every non-aborted compaction the observer sends ONE best-effort
-  // "what remains" note (a steer: the last plan, git status, recent tool calls).
+  // "what remains" note (a steer: the last thing the agent said, git status,
+  // recent tool calls).
   // It is never load-bearing — the task is in the system prompt — so a failed
   // note is logged and nothing else happens. The observer also owns the
   // final-message boundary the judge reads.

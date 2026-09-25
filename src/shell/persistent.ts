@@ -142,8 +142,8 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
   // #145: after every non-aborted compaction, ONE best-effort "what remains"
-  // note (the last plan, git status --short, the last few tool calls) is sent as
-  // a steer. It is useful and it is NEVER load-bearing: the standing contract is
+  // note (the last thing the agent said, git status --short, the last few tool
+  // calls) is sent as a steer. It is useful and it is NEVER load-bearing: the standing contract is
   // in the system prompt, so a note that fails to send is logged and the
   // runtime keeps serving. There is no admission gate and no fail-closed exit
   // here — the shape change removed the need for both.

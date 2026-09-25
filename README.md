@@ -107,19 +107,29 @@ change one, the named test is what tells you.
   `appendSystemPromptOverride` — never as an append-system-prompt *source*,
   which pi would read as a FILE whenever the text happens to name one. The block
   is bounded by a cap its own heading states and is cut with a visible
-  `[truncated: N chars elided]` marker. pi rebuilds the system prompt at session
-  creation, at bind, on every reload and on every tool change, and compaction
-  rewrites only the message history — so no compaction can erase what the run is
-  working on. bob's guard is registered LAST on `before_provider_request`, so it
-  sees the payload after every declared capability: an agent response request
-  whose system prompt does not carry the contract fails the turn exactly like a
-  failed audit — the session is disposed, the process ends, and the reason is
-  named. A blank task is refused before the session starts. **The guarantee is
-  stated for AGENT RESPONSE requests:** pi's own compaction and branch-summary
-  calls carry pi's summarization prompt instead and are excluded by name.
-  *(`test/shell/system-prompt-contract.test.ts`,
-  `system-prompt-contract-live.test.ts` — a real pi session on a stub model with
-  a real mid-turn threshold compaction and both loss paths, `run.test.ts`)*
+  `[truncated: N chars elided]` marker: the block and its cap survive a
+  compaction, and a task longer than the cap keeps only what fit under it —
+  the elided tail does not come back. pi rebuilds the system prompt when it
+  creates the session, on every reload, and whenever the active tool set changes
+  (a bind or a reload rebuilds only through one of those), reading the same
+  loader append text each time — so the block is identical across those
+  rebuilds — while compaction rewrites only the message history. bob's guard is
+  registered LAST on `before_provider_request`, so it sees the payload after
+  every declared capability, whatever layout that provider uses: it asks whether
+  the SERIALIZED payload contains the block verbatim (it does not parse provider
+  shapes, so a legitimate request cannot fail because an API differs), and an
+  agent response request whose payload does not carry the block fails the turn
+  exactly like a failed audit — the session is disposed, the process ends, and
+  the reason is named. A blank task is refused before the session starts.
+  **The guarantee is stated for AGENT RESPONSE requests:** pi's own compaction
+  and branch-summary calls are exempt, and the exemption is pi's own
+  `isCompacting` flag on the session — never text in the payload, which a
+  capability could paste in while dropping the contract.
+  *(`test/shell/system-prompt-contract.test.ts` — the real payload of every
+  provider pi-ai ships, `system-prompt-contract-live.test.ts` — a real pi
+  session on a stub model: a real mid-turn threshold compaction, both loss
+  paths, a session replaced through the runtime factory, and the persistent
+  runtime's standing contract after a compaction, `run.test.ts`)*
 - **A one-shot run reports success only with a real final message.** `bob run`
   settles exit 0 only when the last assistant message that ENDED after the last
   compaction carries text — exactly the text of that message, never rebuilt from
@@ -140,17 +150,20 @@ change one, the named test is what tells you.
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
 3. **The contract costs tokens, per request.** The task is sent in the first
-   user message AND in every agent request's system prompt. Within a run the
-   system prompt is stable, so a provider's prompt cache can cover it; it is not
+   user message AND in every agent request's system prompt. The block is
+   identical on every request of a run — pi rebuilds the prompt around it when
+   the active tool set changes or on a reload, and the appended block is the
+   same text each time — so a provider's prompt cache can cover it; it is not
    shared across runs. The cap is printed in the block's own heading, and a long
-   task is truncated with a marker that states how much was elided.
+   task is truncated with a marker that states how much was elided: the elided
+   tail is gone for that run.
 4. **The "what remains" note is best-effort, and the judge judges the message.**
-   After a compaction bob sends one note — the last plan the agent stated, or
-   `git status --short` plus the recent tool calls — as a steer. If that send
-   fails it is logged and nothing else happens: the TASK is not lost (it is in
-   the system prompt), but the plan the note would have quoted can be. And the
-   completion judge checks for a real final MESSAGE, not that the work it
-   describes was done.
+   After a compaction bob sends one note — the last thing the agent said,
+   whatever it was, or `git status --short` plus the recent tool calls — as a
+   steer. If that send fails it is logged and nothing else happens: the TASK is
+   not lost (it is in the system prompt), but the text the note would have
+   quoted can be. And the completion judge checks for a real final MESSAGE, not
+   that the work it describes was done.
 
 ## Where Bob fits
 

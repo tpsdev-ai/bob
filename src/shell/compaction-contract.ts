@@ -16,7 +16,7 @@
 //     or not (`no_final_message`); a message that exists but misses a declared
 //     shape gets its own reason (`final_shape_mismatch`);
 //   * a BEST-EFFORT "what remains" note, injected once after each non-aborted
-//     compaction: the last plan the agent stated, or a generated note about the
+//     compaction: the last thing the agent said, or a generated note about the
 //     worktree (git status --short, the last few tool calls). It is useful and
 //     it is NEVER load-bearing: it is a steer, its failure is logged and
 //     nothing else happens, and no exit code depends on it. (The machinery that
@@ -65,11 +65,14 @@ export function capText(text: string, cap: number): string {
   return text.slice(0, cap - marker.length) + marker;
 }
 
-/** The "what remains" inputs: the last plan the agent stated, and/or the
+/** The "what remains" inputs: the last thing the agent said, and/or the
  *  generated worktree state (git status + recent tool calls). */
 export interface RemainingState {
-  /** The agent's own last stated plan/todo, when bob captured one. */
-  lastStatedPlan?: string;
+  /** The text of the last assistant message that ENDED before the compaction,
+   *  when bob captured one. It is whatever the agent last said — a plan, a
+   *  question, a one-word acknowledgement — so the note does not call it a
+   *  plan. */
+  lastSaidText?: string;
   /** `git status --short` output for the agent's worktree ("" outside a repo). */
   gitStatus?: string;
   /** The most recent tool calls, oldest → newest, as short labels. */
@@ -112,8 +115,8 @@ export function renderWorktreeNote(
  */
 export function buildRemainingNote(state: RemainingState, capChars?: number): string {
   const cap = capChars ?? DEFAULT_REMAINING_NOTE_CAP_CHARS;
-  const plan = (state.lastStatedPlan ?? "").trim();
-  const body = plan.length > 0 ? `Last plan you stated:\n${plan}` : renderWorktreeNote(state);
+  const said = (state.lastSaidText ?? "").trim();
+  const body = said.length > 0 ? `The last thing you said:\n${said}` : renderWorktreeNote(state);
   const skeleton = [
     "[BOB WHAT REMAINS — context was compacted; this note is best-effort]",
     "The conversation above was compacted. That is NOT completion. Your task/contract is in your system prompt.",
@@ -219,9 +222,9 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
 
   let compactions = 0;
   // Assistant text accumulated from text_delta since the last message_end —
-  // the "last plan the agent stated" when the provider streams.
+  // the last thing the agent said, when the provider streams.
   let deltaBuffer = "";
-  let lastStatedPlan: string | undefined;
+  let lastSaidText: string | undefined;
   const toolCalls: string[] = [];
   let finalMessage = "";
   let sawAssistantEnd = false;
@@ -235,7 +238,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   const noteFor = (): string =>
     buildRemainingNote(
       {
-        lastStatedPlan,
+        lastSaidText,
         gitStatus: opts.worktreeStatus?.() ?? "",
         recentToolCalls: toolCalls.slice(-recentToolCalls),
       },
@@ -282,16 +285,16 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
         }
         case "message_end": {
           // A message that ENDED. When it is an ASSISTANT message its own text
-          // is (a) the best "what remains" we can capture without understanding
-          // the agent's plan ourselves, and (b) the run's current final message.
+          // is the best "what remains" bob can capture without understanding
+          // the agent's intent, and it is the run's current final message.
           if (e.message?.role === "assistant") {
             const ended = textFromContent(e.message.content);
             const failed = isFailureStopReason(e.message.stopReason);
             // "What remains" is display text and is trimmed; a FAILED stream's
-            // partial text is not a plan the agent stated.
+            // partial text is not something the agent said.
             if (!failed) {
-              const plan = ended.trim() || deltaBuffer.trim();
-              if (plan.length > 0) lastStatedPlan = plan;
+              const said = ended.trim() || deltaBuffer.trim();
+              if (said.length > 0) lastSaidText = said;
             }
             // The final message: exactly this message's text, and never an
             // empty or failure-ended one.
