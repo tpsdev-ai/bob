@@ -97,7 +97,6 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
-  office join <name>  Join an existing branch office
   launch <name>       The agent's session, with its resolved role tool
                       allowlist. This is what bin/<name> runs.
                       Takes at most ONE prompt (a multi-word one needs quotes).

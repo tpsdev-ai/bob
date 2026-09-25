@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "test": "bun test",
+    "test": "bun run build && bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
@@ -33,6 +33,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.10",
+    "@earendil-works/pi-ai": "0.84.3",
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2"
   },
