@@ -946,12 +946,25 @@ describe("runPersistent / startPersistent", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(events, "the message is waiting on the attach, not prompted").toEqual([]);
 
+    // A DIRECT prompt (a cron fire, a mail) that arrives while the SAME attach is
+    // still pending. It must wait too, and — because the capability's path passes
+    // the gate a second time when its `sendUserMessage` delegates to `prompt`, so
+    // that path would be caught by the inner pass even without the gate's own
+    // re-check — THIS is the call that pins the re-check: without it, a prompt
+    // that waited out a failed attach would be driven into the stopped session.
+    const direct = handle.session.prompt("a scheduled turn");
+    await new Promise((r) => setTimeout(r, 5));
+    expect(events, "and a directly issued prompt waits as well").toEqual([]);
+
     // The attach FAILS: the runtime stops serving and the gate closes.
     failAttach?.();
     await new Promise((r) => setTimeout(r, 10));
     await new Promise((r) => setTimeout(r, 10));
+    await direct; // the queued prompt settles — refused, not prompted
 
-    expect(events, "the inbound message never reaches a prompt").toEqual([]);
+    expect(events, "neither the inbound message nor the direct prompt reaches a prompt").toEqual(
+      [],
+    );
     expect(exits, "the runtime still ends itself, non-zero").toEqual([1]);
     expect(disposeCount, "and the session is disposed").toBe(1);
     const joined = logs.join("\n");
