@@ -79,7 +79,9 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
   });
 
   it("applies excludeTools after the allowlist (pi's documented order)", async () => {
-    expect(await activeTools({ tools: ["read", "bash"], excludeTools: ["bash"] })).toEqual(["read"]);
+    expect(await activeTools({ tools: ["read", "bash"], excludeTools: ["bash"] })).toEqual([
+      "read",
+    ]);
   });
 
   // A real capability's extension source + config env, resolved through the

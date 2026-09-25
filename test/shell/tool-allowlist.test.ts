@@ -91,7 +91,12 @@ describe("readResident", () => {
 
 describe("auditToolNames", () => {
   it("resolves pi built-ins and capability tools", () => {
-    const { resolved, problems } = auditToolNames(["read", "bash", "flair_search", "discord_reply"]);
+    const { resolved, problems } = auditToolNames([
+      "read",
+      "bash",
+      "flair_search",
+      "discord_reply",
+    ]);
     expect(problems).toEqual([]);
     expect(resolved).toEqual(["read", "bash", "flair_search", "discord_reply"]);
   });
@@ -190,7 +195,8 @@ describe("resolveToolPolicy", () => {
   });
 
   it("unions a declared exclude with the resident exclusions, without duplicates", () => {
-    const yaml = "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  exclude:\n    - bash\n";
+    const yaml =
+      "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  exclude:\n    - bash\n";
     expect(policy(yaml, true).excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
   });
 });
