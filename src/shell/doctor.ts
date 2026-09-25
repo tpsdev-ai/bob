@@ -15,9 +15,16 @@
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readResident, readTools, type ToolsBlock } from "./bob-yaml.js";
+import {
+  auditToolNames,
+  residentDroppedTools,
+  resolveToolPolicy,
+  type ToolPolicy,
+} from "./tool-allowlist.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
@@ -87,6 +94,12 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       onMissing: `re-run 'bob onboard ${opts.name} --force'`,
     }),
   );
+
+  // The role's tool allowlist. pi ignores an unknown tool name SILENTLY, so a
+  // bob.yaml carrying a name pi cannot enable (the OpenClaw-era casings bob
+  // used to stamp) leaves the agent without a tool its role asked for and says
+  // nothing. Report every offender with the fix.
+  checks.push(toolAllowlistCheck(join(agentDir, "bob.yaml")));
 
   // Launcher — exists + executable
   const launcherPath = join(agentDir, "bin", opts.name);
@@ -200,6 +213,90 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   }
 
   return finalize(opts.name, agentDir, checks);
+}
+
+// The `tools:` allowlist check. Audits every name in the agent's bob.yaml
+// against the tools pi and the blessed capabilities can actually enable, and
+// reports a resident agent whose allowlist asks for a tool the resident policy
+// drops. NEVER throws: a malformed block or a bad `resident:` value is a FAIL
+// with a fix, not a doctor crash (doctor is what you run when something is
+// wrong).
+function toolAllowlistCheck(yamlPath: string): DoctorCheck {
+  const name = "tool allowlist";
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(yamlPath, "utf8");
+  } catch {
+    return { name, status: "skip", detail: `${yamlPath} unreadable` };
+  }
+
+  let block: ToolsBlock | undefined;
+  try {
+    block = readTools(yamlText);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "fix the shape of the tools: block in bob.yaml",
+    };
+  }
+
+  // Audit the names before resolving so EVERY offender gets its own fix, rather
+  // than the resolver's single throw.
+  const declared = [...(block?.allow ?? []), ...(block?.exclude ?? [])];
+  const problems = auditToolNames(declared).problems;
+  if (problems.length > 0) {
+    return {
+      name,
+      status: "fail",
+      detail: `unmapped tool name${problems.length === 1 ? "" : "s"}: ${problems
+        .map((p) => p.name)
+        .join(", ")}`,
+      fix: problems.map((p) => `${p.name}: ${p.hint}`).join("; "),
+    };
+  }
+
+  let resident: boolean;
+  try {
+    resident = readResident(yamlText);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "set resident: true or false in bob.yaml",
+    };
+  }
+
+  if (block?.allow === undefined) {
+    return {
+      name,
+      status: "ok",
+      detail: "no tools: block — pi's own defaults apply",
+    };
+  }
+
+  const policy: ToolPolicy = resolveToolPolicy({
+    yamlText,
+    tools: block,
+    resident,
+    persistent: false,
+  });
+  const dropped = residentDroppedTools(policy);
+  if (dropped.length > 0) {
+    return {
+      name,
+      status: "warn",
+      detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
+      fix: "set tools.allowResidentShell: true to keep them, or drop them from the allowlist",
+    };
+  }
+  return {
+    name,
+    status: "ok",
+    detail: `${block.allow.length} name${block.allow.length === 1 ? "" : "s"}: ${block.allow.join(", ")}`,
+  };
 }
 
 function fileCheck(name: string, path: string, opts: { onMissing: string }): DoctorCheck {

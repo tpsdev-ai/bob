@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Every role's tool allowlist now actually binds the agent session.** `bob init` stamped role.json's `tools.allow` into bob.yaml, but nothing read the block back: every agent came up with pi's defaults (`read`, `bash`, `edit`, `write`) plus its capability tools whatever its role said, and the shipped roles carried names (`Bash`, `Read`, `WebFetch`, `mcp__plugin_discord_discord__reply`) that pi's registry does not know — which pi ignores silently, so the allowlist was inert twice over. `tools:` is now read with a schema (an unknown key is refused; a declared `exclude:` is honored), every name is resolved against the tools that can actually exist — pi's built-ins plus the tools the blessed capabilities register — and a name that maps to nothing is a load error naming the offender and its replacement instead of a silent drop. The resolved allowlist and denylist reach the session as `createAgentSession({ tools, excludeTools })`. A `resident: true` agent (or any agent under the persistent runtime) also drops `bash`, `write`, `edit` and `powershell` unless its role opts back in with `tools.allowResidentShell: true`, and `bob doctor` reports an unmapped name with the fix, plus a resident agent whose allowlist asks for a tool the resident policy drops.
+
 ## [0.2.0] - 2026-05-23
 
 Intel-gathering ergonomics for Bob agents. The launcher template now wires up GitHub-authenticated reads by default — no hand-patching when a Bob agent needs to poll releases.atom or hit the REST API.

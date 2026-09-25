@@ -33,9 +33,10 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { readCron } from "./bob-yaml.js";
+import { readCron, readResident, readTools } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
 import type { CronEntry } from "./index.js";
+import { resolveToolPolicy } from "./tool-allowlist.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -98,6 +99,14 @@ export interface RunSessionConfig {
   // one-shot `bob run` stays minimal (outbound tools, no gateway). Defaults
   // falsy (ephemeral run).
   persistent?: boolean;
+  // The tool policy resolved from bob.yaml's `tools:` block + top-level
+  // `resident:` flag (see tool-allowlist.ts). `tools` is pi's STRICT allowlist
+  // — undefined means the agent declared none and pi's own defaults apply;
+  // `excludeTools` is the denylist pi applies after it (always an array, and
+  // the resident policy rides in it). Both are handed to createAgentSession,
+  // which is what makes the role actually bind the session.
+  tools?: string[];
+  excludeTools?: string[];
 }
 
 // The injectable seam. Production builds a real pi AgentSession; tests inject a
@@ -251,6 +260,12 @@ export interface ResolveRunConfigOptions {
   agentsRoot: string;
   // Optional per-invocation model override (wins over bob.yaml).
   model?: string;
+  // True when the caller is the PERSISTENT runtime, which is resident by
+  // definition: an agent kept up by its service unit runs unattended, so the
+  // resident tool policy (no shell, no file-writing tools, unless the role opts
+  // in) applies even when bob.yaml does not say `resident: true`. The one-shot
+  // `bob run` path leaves this falsy.
+  persistent?: boolean;
 }
 
 export interface ResolvedRunConfig {
@@ -304,6 +319,18 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // plus the per-capability config env each extension reads (no secrets).
   const resolution = resolveCapabilities({ yamlText });
 
+  // Resolve the role's tool allowlist. Every name must be one pi can actually
+  // enable (a built-in, or a tool the blessed capabilities register): pi drops
+  // an unknown name SILENTLY, so a stale name would otherwise look like a
+  // working allowlist while the tool is simply absent. Throws naming the
+  // offender and its replacement.
+  const toolPolicy = resolveToolPolicy({
+    yamlText,
+    tools: readTools(yamlText),
+    resident: readResident(yamlText),
+    persistent: opts.persistent,
+  });
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -315,6 +342,8 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
       resolution.capabilities.map((c) => [c.piPackage, c.name]),
     ),
     capabilityEnv: capabilityConfigEnv(resolution),
+    ...(toolPolicy.tools ? { tools: toolPolicy.tools } : {}),
+    excludeTools: toolPolicy.excludeTools,
   };
   return { agentDir, provider, model, config, cron: parseCron(yamlText) };
 }
@@ -442,6 +471,19 @@ export async function createPiRunSession(
     modelRuntime,
     resourceLoader,
     sessionManager: makeSessionManager(config.cwd) as ReturnType<typeof SessionManager.inMemory>,
+    // The role's tool allowlist, resolved from bob.yaml. pi's `tools` is a
+    // STRICT list — passing it is what binds the session to the role; without
+    // it pi enables its defaults (read, bash, edit, write) plus every loaded
+    // capability tool, whatever the role says. Omitted entirely when the agent
+    // declared no allowlist, so pi's defaults still apply there (passing an
+    // empty array would mean "no tools at all").
+    ...(config.tools ? { tools: config.tools } : {}),
+    // Applied after the allowlist (pi's documented order). Carries the
+    // resident policy, which drops the shell + file-writing tools for an agent
+    // running unattended unless the role opted in.
+    ...(config.excludeTools && config.excludeTools.length > 0
+      ? { excludeTools: config.excludeTools }
+      : {}),
   });
 
   return session as unknown as RunSession;

@@ -6,7 +6,10 @@ describe("role-loader", () => {
     const t = loadRole("ea");
     expect(t.role).toBe("ea");
     expect(t.soul.length).toBeGreaterThan(0);
-    expect(t.tools.allow).toContain("Bash");
+    expect(t.tools.allow).toContain("read");
+    // The Discord tools come from the capability's REAL names (the mcp__
+    // plugin_discord_discord__* spellings pi's registry never knew).
+    expect(t.tools.allow).toContain("discord_reply");
     expect(t.tools.allow).toContain("flair_search");
   });
 

@@ -106,6 +106,11 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    // The persistent runtime is resident by definition: this process stays up
+    // behind the agent's service unit with nobody at the keyboard, which is
+    // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
+    // `resident: true` says the same thing for the one-shot path.
+    persistent: true,
   });
 
   // Mark this as the persistent runtime so "serving" capabilities (discord's

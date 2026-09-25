@@ -1,14 +1,12 @@
 {
   "tools": {
     "allow": [
-      "Bash",
-      "Read",
-      "Write",
-      "Edit",
-      "Grep",
-      "Glob",
-      "WebFetch",
-      "WebSearch",
+      "read",
+      "bash",
+      "write",
+      "edit",
+      "grep",
+      "find",
       "flair_search",
       "flair_write",
       "flair_get"

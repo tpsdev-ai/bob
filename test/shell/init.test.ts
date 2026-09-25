@@ -108,7 +108,7 @@ describe("initAgent", () => {
     expect(yaml).toContain("role: ea");
     expect(yaml).toContain("name: exe-dev-gateway");
     expect(yaml).toContain("model: claude-opus-4-7");
-    expect(yaml).toContain("- Bash");
+    expect(yaml).toContain("- read");
     // Memory tools come from the flair capability (not the dead mcp__flair__* names).
     expect(yaml).toContain("- flair_write");
     expect(yaml).toContain("- flair_search");
@@ -121,7 +121,7 @@ describe("initAgent", () => {
     // every role's allowlist was inert. Assert against the whole set, per role,
     // so a bad rename names the role it came from.
     for (const role of ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const) {
-      const res = initAgent({ ...baseOpts(), role });
+      const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
       const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
       expect(names.length).toBeGreaterThan(0);
       const unknown = names.filter((n) => !REAL_TOOL_NAMES.has(n));
@@ -132,7 +132,7 @@ describe("initAgent", () => {
   it("keeps read, bash, edit and write for the coder (builder) role", () => {
     // The builder role writes code and opens PRs; it cannot do that without
     // shell + file-writing tools.
-    const res = initAgent({ ...baseOpts(), role: "coder" });
+    const res = initAgent({ ...baseOpts(), name: "bot-coder-check", role: "coder" });
     const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
     for (const tool of ["read", "bash", "edit", "write"]) {
       expect(names).toContain(tool);
@@ -140,7 +140,7 @@ describe("initAgent", () => {
   });
 
   it("gives the ea role the capabilities' real tool names, not the mcp__ ones", () => {
-    const res = initAgent({ ...baseOpts(), role: "ea" });
+    const res = initAgent({ ...baseOpts(), name: "bot-ea-check", role: "ea" });
     const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
     for (const tool of [
       "flair_search",

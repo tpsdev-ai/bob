@@ -1,90 +1,119 @@
 // The ONE place a pi session is handed its tool policy is createPiRunSession's
-// createAgentSession call. That call is the contract: before this change it
-// passed no `tools`, so every agent got pi's defaults (read, bash, edit, write)
-// plus capability tools no matter what its role said, and bob.yaml's `tools:`
-// block was written but never read back. Mock the SDK here so the test can read
-// the options createPiRunSession actually passes.
+// createAgentSession call. Before this change that call passed no `tools`, so
+// every agent got pi's defaults (read, bash, edit, write) plus capability tools
+// no matter what its role said, and bob.yaml's `tools:` block was written but
+// never read back.
 //
-// (run.test.ts asserts the resolved config a session factory receives — this
-// file asserts the SDK call that config is threaded into.)
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+// These tests drive the REAL pi session (no SDK mock — a module mock here would
+// leak into every other test file in the run) and read back the tool set the
+// session actually came up with. run.test.ts asserts the resolved config a
+// session factory receives; this file asserts what that config does to a
+// session.
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { capabilityConfigEnv, resolveCapabilities } from "../../src/shell/capability-loader.js";
 import type { RunSessionConfig } from "../../src/shell/run.js";
-
-const sessionCalls: Array<Record<string, unknown>> = [];
-
-mock.module("@earendil-works/pi-coding-agent", () => ({
-  createAgentSession: async (opts: Record<string, unknown>) => {
-    sessionCalls.push(opts);
-    return { session: { dispose() {} } };
-  },
-  DefaultResourceLoader: class {
-    constructor(_opts: unknown) {}
-    async reload(): Promise<void> {}
-    getExtensions() {
-      return { errors: [] as Array<{ path: string; error: string }> };
-    }
-  },
-  ModelRuntime: {
-    create: async () => ({
-      getModel: () => ({ provider: "anthropic", id: "claude-sonnet-4-6" }),
-    }),
-  },
-  SessionManager: {
-    inMemory: (cwd: string) => ({ kind: "in-memory", cwd }),
-    create: (cwd: string) => ({ kind: "durable", cwd }),
-  },
-}));
-
-const { createPiRunSession } = await import("../../src/shell/run.js");
+import { createPiRunSession } from "../../src/shell/run.js";
 
 // The config gains `tools`/`excludeTools` with the change; spelling them
 // structurally keeps this file honest whichever way the field is declared.
 type TooledConfig = RunSessionConfig & { tools?: string[]; excludeTools?: string[] };
 
-function baseConfig(overrides: Partial<TooledConfig>): TooledConfig {
-  return {
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-    appendSystemPrompt: "",
-    cwd: "/tmp/bob-toolpolicy-work",
-    piAgentDir: "/tmp/bob-toolpolicy-pi",
-    extensionSources: [],
-    capabilityEnv: {},
-    ...overrides,
-  };
-}
+// pi's own defaults, as the installed SDK documents them (sdk.d.ts: "the
+// default built-in tools (read, bash, edit, write)").
+const PI_DEFAULT_TOOLS = ["bash", "edit", "read", "write"];
 
-describe("createPiRunSession — the tool policy reaches createAgentSession", () => {
+describe("createPiRunSession — the tool policy reaches the session", () => {
+  let cwd: string;
+  let piAgentDir: string;
+
   beforeEach(() => {
-    sessionCalls.length = 0;
+    cwd = mkdtempSync(join(tmpdir(), "bob-toolpolicy-cwd-"));
+    piAgentDir = mkdtempSync(join(tmpdir(), "bob-toolpolicy-pi-"));
   });
 
-  it("passes the allowlist as `tools` and the exclusions as `excludeTools`", async () => {
-    await createPiRunSession(
-      baseConfig({
-        tools: ["read", "flair_search"],
-        excludeTools: ["bash", "write", "edit", "powershell"],
-      }),
-    );
-    expect(sessionCalls).toHaveLength(1);
-    expect(sessionCalls[0]?.tools).toEqual(["read", "flair_search"]);
-    expect(sessionCalls[0]?.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(piAgentDir, { recursive: true, force: true });
   });
 
-  it("omits both arguments when the agent declared no tool policy", async () => {
-    // No `tools:` block in bob.yaml = pi's own defaults. Passing an empty
-    // allowlist would mean "no tools at all", which is a different agent.
-    await createPiRunSession(baseConfig({ tools: undefined, excludeTools: [] }));
-    expect(sessionCalls).toHaveLength(1);
-    const opts = sessionCalls[0] ?? {};
-    expect("tools" in opts).toBe(false);
-    expect("excludeTools" in opts).toBe(false);
+  function baseConfig(overrides: Partial<TooledConfig>): TooledConfig {
+    return {
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      appendSystemPrompt: "",
+      cwd,
+      piAgentDir,
+      extensionSources: [],
+      capabilityEnv: {},
+      ...overrides,
+    };
+  }
+
+  // The tool set the session actually came up with, sorted for comparison.
+  async function activeTools(overrides: Partial<TooledConfig>): Promise<string[]> {
+    const session = (await createPiRunSession(baseConfig(overrides))) as unknown as {
+      getActiveToolNames(): string[];
+      dispose(): void;
+    };
+    try {
+      return session.getActiveToolNames().slice().sort();
+    } finally {
+      session.dispose();
+    }
+  }
+
+  it("enables EXACTLY the allowlist", async () => {
+    expect(await activeTools({ tools: ["read", "grep"], excludeTools: [] })).toEqual([
+      "grep",
+      "read",
+    ]);
   });
 
-  it("omits excludeTools when nothing is excluded", async () => {
-    await createPiRunSession(baseConfig({ tools: ["read"], excludeTools: [] }));
-    expect(sessionCalls[0]?.tools).toEqual(["read"]);
-    const opts = sessionCalls[0] ?? {};
-    expect("excludeTools" in opts).toBe(false);
+  it("leaves pi's defaults in place when the agent declared no allowlist", async () => {
+    // No `tools:` block = pi's defaults. Passing an empty allowlist instead
+    // would mean "no tools at all", which is a different agent.
+    expect(await activeTools({ tools: undefined, excludeTools: [] })).toEqual(PI_DEFAULT_TOOLS);
+  });
+
+  it("applies excludeTools after the allowlist (pi's documented order)", async () => {
+    expect(await activeTools({ tools: ["read", "bash"], excludeTools: ["bash"] })).toEqual(["read"]);
+  });
+
+  // A real capability's extension source + config env, resolved through the
+  // catalog exactly as resolveRunConfig does it.
+  function fixtureCapability(): Pick<TooledConfig, "extensionSources" | "capabilityEnv"> {
+    const resolution = resolveCapabilities({
+      yamlText: ["capabilities:", "  - fixture", "", "fixture:", "  greeting: hi", ""].join("\n"),
+    });
+    expect(resolution.extensionSources).toHaveLength(1);
+    return {
+      extensionSources: resolution.extensionSources,
+      capabilityEnv: capabilityConfigEnv(resolution),
+    };
+  }
+
+  it("enables a capability tool named in the allowlist", async () => {
+    // Role allowlists name capability tools (flair_search, discord_reply, …).
+    // pi's `tools` is a strict list over built-ins AND extension tools, so a
+    // named capability tool must come up — otherwise every shipped role would
+    // lose its memory/discord tools.
+    const tools = await activeTools({
+      tools: ["read", "bob_fixture_noop"],
+      excludeTools: [],
+      ...fixtureCapability(),
+    });
+    expect(tools).toEqual(["bob_fixture_noop", "read"]);
+  });
+
+  it("drops a tool excluded by name even when it is a capability tool", async () => {
+    const tools = await activeTools({
+      tools: ["read", "bob_fixture_noop"],
+      excludeTools: ["bob_fixture_noop"],
+      ...fixtureCapability(),
+    });
+    expect(tools).toEqual(["read"]);
   });
 });

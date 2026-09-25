@@ -52,7 +52,15 @@ export interface BobConfig {
 }
 
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
-export { BobYamlError, readBlock, readCapabilities } from "./bob-yaml.js";
+export {
+  BobYamlError,
+  lineOf,
+  readBlock,
+  readCapabilities,
+  readResident,
+  readTools,
+  type ToolsBlock,
+} from "./bob-yaml.js";
 export type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 export { BLESSED_CATALOG, lookupCapability } from "./capability-catalog.js";
 export {
@@ -170,3 +178,16 @@ export {
   systemdUnitPath,
   up,
 } from "./service.js";
+export {
+  auditToolNames,
+  knownToolNames,
+  PI_BUILTIN_TOOLS,
+  RESIDENT_EXCLUDED_TOOLS,
+  type ResolveToolPolicyOptions,
+  residentDroppedTools,
+  resolveToolNames,
+  resolveToolPolicy,
+  type ToolNameAudit,
+  type ToolNameProblem,
+  type ToolPolicy,
+} from "./tool-allowlist.js";
