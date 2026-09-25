@@ -113,7 +113,13 @@ function scriptedSession(
   // undefined by every older test, because an EMPTY list is what the old mock
   // modelled — and round 5's finding 1 needs a POPULATED one, since a real
   // session's list is never empty and cannot express the compaction boundary.
-  opts: { messages?: ReadonlyArray<unknown> } = {},
+  opts: {
+    messages?: ReadonlyArray<unknown>;
+    /** How the mid-run re-injection (the steer) fails, if it does (round 8):
+     *  "reject" = the call returns a rejected promise (pi's shape), "throw" =
+     *  the call throws SYNCHRONOUSLY (a session that refuses it outright). */
+    steerFailure?: "reject" | "throw";
+  } = {},
 ): { session: RunSession; calls: Array<{ text: string; streamingBehavior?: string }> } {
   const calls: Array<{ text: string; streamingBehavior?: string }> = [];
   // biome-ignore lint/suspicious/noExplicitAny: minimal event listener stub
@@ -129,51 +135,60 @@ function scriptedSession(
         if (i >= 0) listeners.splice(i, 1);
       };
     },
-    async prompt(text, options) {
+    // Deliberately NOT an async function: the synchronous-throw re-injection
+    // shape (round 8) must be able to throw from the call itself, not from a
+    // returned promise. Every other path returns a promise as before.
+    prompt(text, options) {
       calls.push({ text, streamingBehavior: options?.streamingBehavior });
-      const step = options?.streamingBehavior === undefined ? (script[topLevelCall++] ?? {}) : {};
-      if (step.throwOnPrompt) throw new Error("simulated continue-turn failure");
-      for (const delta of step.textDeltasBefore ?? []) {
-        for (const listener of listeners) {
-          listener({
-            type: "message_update",
-            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
-          });
-        }
+      if (options?.streamingBehavior !== undefined && opts.steerFailure !== undefined) {
+        if (opts.steerFailure === "throw") throw new Error("the session refused the re-injection");
+        return Promise.reject(new Error("the session rejected the re-injection"));
       }
-      if (step.compact) {
-        for (const listener of listeners) {
-          listener({
-            type: "compaction_end",
-            reason: step.compact,
-            result: {},
-            aborted: step.aborted === true,
-            willRetry: false,
-          });
+      return (async () => {
+        const step = options?.streamingBehavior === undefined ? (script[topLevelCall++] ?? {}) : {};
+        if (step.throwOnPrompt) throw new Error("simulated continue-turn failure");
+        for (const delta of step.textDeltasBefore ?? []) {
+          for (const listener of listeners) {
+            listener({
+              type: "message_update",
+              assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+            });
+          }
         }
-      }
-      for (const delta of step.textDeltas ?? []) {
-        for (const listener of listeners) {
-          listener({
-            type: "message_update",
-            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
-          });
+        if (step.compact) {
+          for (const listener of listeners) {
+            listener({
+              type: "compaction_end",
+              reason: step.compact,
+              result: {},
+              aborted: step.aborted === true,
+              willRetry: false,
+            });
+          }
         }
-      }
-      // pi ends each assistant message with `message_end`; a failed stream ends
-      // it EMPTY with stopReason "error" (round 3, item 1). A step with neither
-      // text nor a failure models a silent settle: no message_end at all.
-      const deltas = step.textDeltas ?? [];
-      if (deltas.length > 0 || step.failAtEnd) {
-        for (const listener of listeners) {
-          listener({
-            type: "message_end",
-            message: step.failAtEnd
-              ? { role: "assistant", content: [], stopReason: "error" }
-              : { role: "assistant", content: [{ type: "text", text: deltas.join("") }] },
-          });
+        for (const delta of step.textDeltas ?? []) {
+          for (const listener of listeners) {
+            listener({
+              type: "message_update",
+              assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+            });
+          }
         }
-      }
+        // pi ends each assistant message with `message_end`; a failed stream ends
+        // it EMPTY with stopReason "error" (round 3, item 1). A step with neither
+        // text nor a failure models a silent settle: no message_end at all.
+        const deltas = step.textDeltas ?? [];
+        if (deltas.length > 0 || step.failAtEnd) {
+          for (const listener of listeners) {
+            listener({
+              type: "message_end",
+              message: step.failAtEnd
+                ? { role: "assistant", content: [], stopReason: "error" }
+                : { role: "assistant", content: [{ type: "text", text: deltas.join("") }] },
+            });
+          }
+        }
+      })();
     },
     get messages() {
       return opts.messages;
@@ -830,6 +845,72 @@ describe("runAgent", () => {
     expect(res?.stdout).toBe("");
     expect(stderr, "the inner catch names the failure").toContain("the continue turn failed");
     expect(stderr).toContain("settled_after_compaction");
+  });
+
+  // ── cli#145 round 8: a failed re-injection is NOT a completion ─────
+
+  it("cli#145 round 8: a REJECTED re-injection refuses the run even when the agent then produces nonempty text", async () => {
+    // CodeRabbit's outside-diff finding: the one-shot reinjector's
+    // `session.prompt(text, { streamingBehavior: "steer" })` could reject, and
+    // only a log line was emitted. The run then continued without its task and
+    // ANY nonempty text — including the CONTINUE_TURN retry, which does not
+    // resend the task — exited 0. The completion boundary must refuse instead.
+    const s = scriptedSession(
+      [{ compact: "threshold", textDeltas: ["all done, nothing left to do"] }],
+      { steerFailure: "reject" },
+    );
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    // The task prompt and the steered block; NO retry — a continue turn cannot
+    // restore a task whose re-injection failed.
+    expect(s.calls).toHaveLength(2);
+    expect(s.calls[1]?.streamingBehavior).toBe("steer");
+    expect(s.calls.some((c) => c.text === CONTINUE_TURN)).toBe(false);
+    expect(res?.stdout, "the text WAS captured — it is just not acceptable").toBe(
+      "all done, nothing left to do",
+    );
+    expect(res?.exitCode, "a run whose task was never restored is not a success").not.toBe(0);
+    expect(res?.reason).toBe("reinjection_failed");
+    expect(stderr).toContain("could not re-inject the pinned block");
+    expect(stderr).toContain("the session rejected the re-injection");
+    expect(stderr).toContain("reinjection_failed");
+  });
+
+  it("cli#145 round 8: a SYNCHRONOUSLY thrown re-injection refuses the run the same way", async () => {
+    // The other half of the same finding: `inject` throwing synchronously (not
+    // returning a rejected promise). Caught inside the reinjector, recorded, and
+    // the run still refuses — the throw must not escape and become an unnamed
+    // "run failed" either.
+    const s = scriptedSession([{ compact: "overflow", textDeltas: ["finished"] }], {
+      steerFailure: "throw",
+    });
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(s.calls).toHaveLength(2);
+    expect(s.calls.some((c) => c.text === CONTINUE_TURN)).toBe(false);
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason, "the throw is named, not a generic failure").toBe("reinjection_failed");
+    expect(stderr).toContain("could not re-inject the pinned block");
+    expect(stderr).toContain("the session refused the re-injection");
+    expect(stderr).toContain("reinjection_failed");
   });
 });
 

@@ -297,6 +297,107 @@ describe("compaction contract — the reinjector", () => {
     ).toThrow(/task OR standingContract/);
   });
 
+  it("records a REJECTED re-injection and reports it only for the LAST compaction (round 8)", async () => {
+    const logged: string[] = [];
+    // Compaction #1 rejects, compaction #2 succeeds: the run's last compaction
+    // left the task restored, so nothing is reported.
+    const r = createCompactionReinjector({
+      task: "finish the release notes",
+      inject: (t) => {
+        if (t.includes("compaction #1")) return Promise.reject(new Error("steer refused"));
+        return undefined;
+      },
+      log: (m) => logged.push(m),
+    });
+    r.observe({ type: "compaction_end", reason: "threshold", aborted: false });
+    await r.settled();
+    expect(r.reinjectionFailure()).toBe("steer refused");
+    expect(logged.join("\n")).toContain("could not re-inject the pinned block: steer refused");
+
+    r.observe({ type: "compaction_end", reason: "overflow", aborted: false });
+    await r.settled();
+    expect(r.reinjectionFailure(), "the newer injection restores the task").toBeUndefined();
+  });
+
+  it("a late rejection from an OLDER compaction cannot speak for a newer one (round 8)", async () => {
+    // Ordering hazard: attempt #1's promise is still pending when #2 lands and
+    // fails. The failure that must be reported is #2's, not the stale one.
+    let releaseFirst: (() => void) | undefined;
+    const r = createCompactionReinjector({
+      task: "task",
+      inject: (t) => {
+        if (t.includes("compaction #1")) {
+          return new Promise<void>((_res, rej) => {
+            releaseFirst = () => rej(new Error("stale failure"));
+          });
+        }
+        return Promise.reject(new Error("current failure"));
+      },
+      log: () => {},
+    });
+    r.observe({ type: "compaction_end", reason: "threshold", aborted: false });
+    r.observe({ type: "compaction_end", reason: "overflow", aborted: false });
+    // #1 is still pending, so `settled()` would block on it: let the microtask
+    // queue drain instead, which is enough for #2's rejection to be recorded.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(r.reinjectionFailure()).toBe("current failure");
+    releaseFirst?.();
+    await r.settled();
+    expect(r.reinjectionFailure(), "a stale attempt cannot outvote the last one").toBe(
+      "current failure",
+    );
+  });
+
+  it("records a SYNCHRONOUSLY thrown re-injection without letting it escape (round 8)", () => {
+    const logged: string[] = [];
+    const r = createCompactionReinjector({
+      task: "task",
+      inject: () => {
+        throw new Error("the session refused the re-injection");
+      },
+      log: (m) => logged.push(m),
+    });
+    // observe() must not rethrow: the throw is the reinjector's to record.
+    expect(() => r.observe({ type: "compaction_end", aborted: false })).not.toThrow();
+    expect(r.reinjectionFailure()).toBe("the session refused the re-injection");
+    expect(logged.join("\n")).toContain(
+      "could not re-inject the pinned block: the session refused the re-injection",
+    );
+  });
+
+  it("reports no failure for a re-injection that resolves (round 8)", async () => {
+    const r = createCompactionReinjector({
+      task: "task",
+      inject: () => Promise.resolve(),
+      log: () => {},
+    });
+    r.observe({ type: "compaction_end", aborted: false });
+    await r.settled();
+    expect(r.reinjectionFailure()).toBeUndefined();
+  });
+
+  it("settled() resolves once an in-flight re-injection settles — no failure is judged early (round 8)", async () => {
+    let release: ((err?: Error) => void) | undefined;
+    const r = createCompactionReinjector({
+      task: "task",
+      inject: () =>
+        new Promise<void>((res, rej) => {
+          release = (err) => (err ? rej(err) : res());
+        }),
+      log: () => {},
+    });
+    r.observe({ type: "compaction_end", aborted: false });
+    let done = false;
+    const waiting = r.settled().then(() => {
+      done = true;
+    });
+    await Promise.resolve();
+    expect(done, "still pending: nothing to judge yet").toBe(false);
+    release?.(new Error("late rejection"));
+    await waiting;
+    expect(r.reinjectionFailure()).toBe("late rejection");
+  });
+
   it("clears the final-message capture at the compaction boundary, and deltas alone are never the final message (round 2 + round 3, item 1)", () => {
     const r = createCompactionReinjector({ task: "t", worktreeStatus: () => "", inject: () => {} });
     r.startTurn();
@@ -486,6 +587,33 @@ describe("compaction contract — the completion contract", () => {
     expect(
       evaluateCompletion({ capturedText: "wrong shape", compactions: 2, expectedFinal }).reason,
     ).toBe("final_shape_mismatch");
+  });
+
+  it("a failed re-injection OUTRANKS a nonempty final message (round 8)", () => {
+    // The whole point of the finding: text alone is not evidence of completion
+    // once the task was never re-injected — the agent continued without it.
+    expect(
+      evaluateCompletion({
+        capturedText: "all done, nothing left to do",
+        compactions: 1,
+        reinjectionFailure: "the session rejected the re-injection",
+      }),
+    ).toEqual({ ok: false, reason: "reinjection_failed" });
+    // It also outranks an expected shape (that predicate would have matched)…
+    expect(
+      evaluateCompletion({
+        capturedText: "MERGED",
+        compactions: 1,
+        expectedFinal: (t) => t.includes("MERGED"),
+        reinjectionFailure: "steer exploded",
+      }),
+    ).toEqual({ ok: false, reason: "reinjection_failed" });
+    // …and it is NOT silence: the empty-text branch never gets to speak.
+    expect(
+      evaluateCompletion({ capturedText: "", compactions: 1, reinjectionFailure: "x" }).reason,
+    ).toBe("reinjection_failed");
+    // A run that never failed to re-inject is unaffected.
+    expect(evaluateCompletion({ capturedText: "MERGED", compactions: 1 }).ok).toBe(true);
   });
 });
 

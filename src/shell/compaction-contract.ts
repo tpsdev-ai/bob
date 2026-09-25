@@ -65,7 +65,11 @@ export type SilenceReason =
   | "no_final_message"
   // A final message EXISTS but does not match the declared expected shape — it is
   // not silence, so it gets its own reason (round 2, item 3).
-  | "final_shape_mismatch";
+  | "final_shape_mismatch"
+  // The LAST compaction's re-injection FAILED, so the run continued without its
+  // task (round 8). Not silence either — the run may well end with text — which
+  // is exactly why the text cannot be accepted as completion.
+  | "reinjection_failed";
 
 /** The pinned block's cap: a finite number of characters, at least
  *  MIN_PINNED_CAP_CHARS. A cap of 0 or less is REJECTED, not treated as "no cap"
@@ -327,6 +331,19 @@ export interface CompactionReinjector {
    * transport omitted its message.
    */
   assistantEnded(): boolean;
+  /**
+   * The error message of the LAST compaction's failed re-injection, or undefined
+   * when that block was injected (or no compaction happened yet) (round 8).
+   * Only the last compaction counts: a later compaction is a fresh attempt, and
+   * a rejection that arrives late from an OLDER attempt must not outvote it.
+   */
+  reinjectionFailure(): string | undefined;
+  /**
+   * Resolves once every re-injection handed to `inject` has settled (fulfilled
+   * or rejected), so a caller judges the completion contract only after a
+   * failure that arrives asynchronously has been recorded (round 8).
+   */
+  settled(): Promise<void>;
 }
 
 /**
@@ -356,6 +373,42 @@ export function createCompactionReinjector(
   let deltaBuffer = "";
   let lastStatedPlan: string | undefined;
   const toolCalls: string[] = [];
+  // ── re-injection outcomes (round 8) ──────────────────────────────────
+  // A re-injection that REJECTS (or throws) is recorded, not merely logged: the
+  // one-shot completion boundary refuses a run whose last compaction left the
+  // task un-restored. `failureSeq` pins the record to the compaction it belongs
+  // to, so a late rejection from an older attempt cannot speak for a newer one.
+  let failureSeq = 0;
+  let failureMessage: string | undefined;
+  let inFlight = 0;
+  const settleWaiters: Array<() => void> = [];
+  const recordFailure = (seq: number, err: unknown): void => {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`bob: could not re-inject the pinned block: ${message}`);
+    // Every failure is logged; only a failure of the NEWEST attempt is recorded,
+    // so a rejection that arrives late from an older attempt cannot replace the
+    // verdict on the compaction that came after it (round 8).
+    if (seq >= failureSeq) {
+      failureSeq = seq;
+      failureMessage = message;
+    }
+  };
+  const finishInjection = (): void => {
+    inFlight -= 1;
+    if (inFlight === 0) {
+      for (const waiter of settleWaiters.splice(0)) waiter();
+    }
+  };
+  const settleInjection = (injected: Promise<void>, seq: number): void => {
+    inFlight += 1;
+    void injected.then(
+      () => finishInjection(),
+      (err) => {
+        recordFailure(seq, err);
+        finishInjection();
+      },
+    );
+  };
   // The final-message boundary: text the LAST assistant message emitted since
   // the last compaction / turn start.
   let finalMessage = "";
@@ -371,6 +424,13 @@ export function createCompactionReinjector(
     compactions: () => compactions,
     lastBlock: () => lastBlock,
     startTurn: () => clearCapture(),
+    reinjectionFailure: () =>
+      failureSeq === compactions && failureMessage !== undefined ? failureMessage : undefined,
+    settled: async () => {
+      while (inFlight > 0) {
+        await new Promise<void>((resolve) => settleWaiters.push(resolve));
+      }
+    },
     // The LAST message that ENDED, EXACTLY as it ended (round 4, item 1): the
     // text is kept VERBATIM — an exact `expectedFinal` predicate must see the
     // content the message ended with, whitespace and all; only EMPTINESS is
@@ -405,19 +465,16 @@ export function createCompactionReinjector(
             `bob: context compacted${e.reason ? ` (${e.reason})` : ""}; re-injecting the pinned ` +
               `${opts.standingContract !== undefined ? "standing contract" : "task"} block (${block.length} chars)`,
           );
+          // cli#145 round 8: record the outcome of THIS attempt. A failure is
+          // not merely logged — the completion boundary (see `reinjectionFailure`)
+          // refuses the run, because an agent that continued without its task can
+          // still end with nonempty text, and the CONTINUE_TURN retry does not
+          // resend the task either.
+          const injectionSeq = compactions;
           try {
-            const r = opts.inject(block);
-            if (r && typeof (r as Promise<void>).catch === "function") {
-              (r as Promise<void>).catch((err) =>
-                log(
-                  `bob: could not re-inject the pinned block: ${err instanceof Error ? err.message : String(err)}`,
-                ),
-              );
-            }
+            settleInjection(Promise.resolve(opts.inject(block)), injectionSeq);
           } catch (err) {
-            log(
-              `bob: could not re-inject the pinned block: ${err instanceof Error ? err.message : String(err)}`,
-            );
+            recordFailure(injectionSeq, err);
           }
           return;
         }
@@ -484,13 +541,22 @@ export function createCompactionReinjector(
  * whitespace. Silence names whether a compaction was seen
  * (`settled_after_compaction` / `no_final_message`); a message that EXISTS but
  * does not match gets its OWN reason (`final_shape_mismatch`, round 2 item 3) —
- * it is not silence.
+ * it is not silence. A failed re-injection after the last compaction OUTRANKS
+ * all of that (`reinjection_failed`, round 8): the text cannot be trusted as
+ * completion at all when the task it was supposed to answer was never restored.
  */
 export function evaluateCompletion(opts: {
   capturedText: string;
   compactions: number;
   expectedFinal?: (text: string) => boolean;
+  /** The error of the LAST compaction's failed re-injection, when it failed
+   *  (round 8). Checked FIRST, before the text: the agent continued without its
+   *  task, so no final text — however long — is evidence of completion. */
+  reinjectionFailure?: string;
 }): { ok: boolean; reason?: SilenceReason } {
+  if (opts.reinjectionFailure !== undefined) {
+    return { ok: false, reason: "reinjection_failed" };
+  }
   const text = opts.capturedText;
   if (text.trim().length === 0) {
     return {

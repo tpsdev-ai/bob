@@ -271,10 +271,18 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // `exitCode 0` whenever the prompt promise resolved — including after a
     // compaction that erased the plan. Now it settles 0 ONLY with a final
     // message (matching an expected shape when one is declared).
+    //
+    // cli#145 round 8: wait for the last compaction's re-injection to SETTLE
+    // first — a failure that arrives asynchronously must be on record before the
+    // run is judged — and hand that failure to the contract, where it outranks
+    // the text. The retry below is for silence only: a continue turn cannot
+    // restore a task whose re-injection failed, so it must not run for that.
+    await reinjector.settled();
     let outcome = evaluateCompletion({
       capturedText: finalTextNow(),
       compactions: reinjector.compactions(),
       expectedFinal: opts.expectedFinal,
+      reinjectionFailure: reinjector.reinjectionFailure(),
     });
     if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
@@ -293,6 +301,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         capturedText: finalTextNow(),
         compactions: reinjector.compactions(),
         expectedFinal: opts.expectedFinal,
+        reinjectionFailure: reinjector.reinjectionFailure(),
       });
     }
     if (!outcome.ok) {
@@ -306,7 +315,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
             ? " (the session settled after a context compaction without a final message)"
             : reason === "final_shape_mismatch"
               ? " (the final message did not match the declared shape)"
-              : " (the session settled without a final message)") +
+              : reason === "reinjection_failed"
+                ? " (the task could not be re-injected after a context compaction — the session carried on without it, so its final message cannot be accepted)"
+                : " (the session settled without a final message)") +
           "\n",
       );
       const status = readWorktreeStatus(config.cwd);
