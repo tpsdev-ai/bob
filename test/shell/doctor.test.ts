@@ -310,6 +310,105 @@ describe("runDoctor", () => {
     expect(check?.fix).not.toMatch(/set tools\.allowResidentShell: true to keep them/);
   });
 
+  it("FAIL — not WARN — when a resident agent trips both the drop and an undeclared capability tool", () => {
+    // Both conditions at once: the resident policy drops `bash`, AND
+    // `flair_search` needs a capability this agent does not declare. The
+    // missing capability is the FAILURE — the session refuses it at load — so
+    // it must not be buried under the resident warning, which is only advice.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: qa",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "    - flair_search",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("flair_search");
+    expect(check?.detail).toContain("flair");
+    expect(check?.fix).toContain("capabilities:");
+  });
+
+  it("does not require a capability for a tool bob.yaml removes (the session drops it first)", () => {
+    // `flair_search` is allowlisted AND excluded: the session's audit skips a
+    // name the denylist removes (absent on purpose), so doctor must not fail a
+    // valid narrowed policy for a capability the agent does not need.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - flair_search",
+        "  exclude:",
+        "    - flair_search",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("ok");
+  });
+
+  it("names the explicit bob.yaml denial in the resident-shell fix", () => {
+    // The coder role GRANTS tools.allowResidentShell, so the resolver would keep
+    // `bash` — except bob.yaml sets the flag `false`, which narrows the grant
+    // away. Setting the role's grant to true would not restore the tools, so
+    // the fix has to name the denial too.
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: coder",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "    - bash",
+        "  allowResidentShell: false",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("bash");
+    expect(check?.fix).toContain("roles/coder/role.json");
+    expect(check?.fix, "the bob.yaml denial is named").toContain("tools.allowResidentShell: false");
+    expect(check?.fix).toContain("bob.yaml");
+  });
+
   it("FAIL when an allowlisted capability tool's capability is not declared", () => {
     // A name can be real in bob's catalog and still not exist for THIS agent:
     // pi enables only what the loaded capabilities register, and a session

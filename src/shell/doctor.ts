@@ -307,29 +307,22 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
       fix: "fix the tools: block (or the agent.role it widens past) in bob.yaml",
     };
   }
-  const dropped = residentDroppedTools(policy);
-  if (dropped.length > 0) {
-    // The grant lives in the ROLE (roles/<role>/role.json), not in bob.yaml:
-    // bob.yaml may only narrow the role's list, so setting
-    // tools.allowResidentShell: true there would widen past the role and be
-    // refused at load. Name the file the permission is actually in.
-    const role = readAgentRole(yamlText) ?? "<role>";
-    return {
-      name,
-      status: "warn",
-      detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
-      fix: `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
-    };
-  }
-
   // A name can be real in bob's catalog and still not exist for THIS agent: pi
   // enables only the tools the loaded capabilities register, and the session
   // REFUSES an allowlisted name that nothing provides, at load. Report that
   // here, before any session, naming the capability to declare — otherwise
   // doctor says OK for a config whose next run fails.
+  //
+  // BEFORE the resident-drop warning below: a resident agent can trip both, and
+  // the missing capability is the FAILURE (it stops the session) while the drop
+  // is a warning. Reporting the warning first would bury it. And a name the
+  // denylist removes is absent ON PURPOSE — the session audit skips those, so
+  // this check must too, or a valid narrowed policy fails doctor.
   const declaredCapabilities = new Set(readCapabilities(yamlText));
+  const excludedTools = new Set(policy.excludeTools);
   const missingByCapability = new Map<string, string[]>();
   for (const tool of policy.tools) {
+    if (excludedTools.has(tool)) continue;
     const capability = capabilityForTool(tool);
     if (capability === undefined || declaredCapabilities.has(capability)) continue;
     const names = missingByCapability.get(capability) ?? [];
@@ -345,6 +338,27 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
       status: "fail",
       detail: `allowlisted tool${policy.tools.length === 1 ? "" : "s"} from a capability this agent does not declare: ${summary}`,
       fix: `declare it in bob.yaml (capabilities:) and configure its block — a session refuses an allowlisted tool nothing provides — or drop ${[...missingByCapability.values()].flat().join(", ")} from tools.allow`,
+    };
+  }
+
+  const dropped = residentDroppedTools(policy);
+  if (dropped.length > 0) {
+    // The grant lives in the ROLE (roles/<role>/role.json), not in bob.yaml:
+    // bob.yaml may only narrow the role's list, so setting
+    // tools.allowResidentShell: true there would widen past the role and be
+    // refused at load. Name the file the permission is actually in — and when
+    // bob.yaml ALSO carries an explicit denial, name it too: the resolver keeps
+    // the agent's explicit `false`, so granting it in the role alone would
+    // still leave the tools dropped.
+    const role = readAgentRole(yamlText) ?? "<role>";
+    const denial = block.allowResidentShell === false;
+    return {
+      name,
+      status: "warn",
+      detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
+      fix: denial
+        ? `grant it in roles/${role}/role.json (tools.allowResidentShell: true) AND remove tools.allowResidentShell: false from bob.yaml — the grant lives in the role, and bob.yaml may only narrow it, but the explicit false in bob.yaml denies the grant even once the role gives it — or drop ${dropped.join(", ")} from tools.allow`
+        : `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
     };
   }
 
