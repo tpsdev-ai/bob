@@ -64,6 +64,17 @@ export {
   resolveCapabilities,
 } from "./capability-loader.js";
 export { resolveExtensionSource } from "./capability-resolve.js";
+export {
+  buildPinnedBlock,
+  buildStandingContract,
+  type CompactionReinjector,
+  type CompactionReinjectorOptions,
+  createCompactionReinjector,
+  DEFAULT_PINNED_CAP_CHARS,
+  evaluateCompletion,
+  readWorktreeStatus,
+  type SilenceReason,
+} from "./compaction-contract.js";
 export type { DiscordClient, DiscordMessage } from "./discord-types.js";
 export {
   type CheckStatus,

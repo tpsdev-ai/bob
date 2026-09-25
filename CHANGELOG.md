@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A `bob run` no longer settles silently after a context compaction** (#145). A one-shot run that hit pi's context threshold could lose its own plan and then finish `done: true, exitCode 0` with the work left uncommitted and no final message — indistinguishable from a clean completion, and for a resident agent the same class reads as silent mid-task abandonment. Now, after every compaction the run re-injects one bounded pinned block into the session (the original task, or the persistent runtime's standing contract, plus "what remains" — the last plan the agent stated, or a generated note with `git status --short` and the last few tool calls). And a one-shot run ends `exitCode 0` only when its completion contract is met (a non-empty final assistant message, matching an expected shape when one is declared): a run that settles after a compaction with no final message retries once with an explicit "continue from the state above" turn, and if it still settles silently it exits non-zero with a named reason (`settled_after_compaction` / `no_final_message`) and prints the dirty paths instead of reporting success.
+
 ## [0.2.0] - 2026-05-23
 
 Intel-gathering ergonomics for Bob agents. The launcher template now wires up GitHub-authenticated reads by default — no hand-patching when a Bob agent needs to poll releases.atom or hit the REST API.

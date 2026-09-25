@@ -260,4 +260,48 @@ describe("runPersistent / startPersistent", () => {
     expect(exited).toBe(0);
     expect(fake.disposed()).toBe(true);
   });
+
+  it("cli#145: a compaction re-injects the standing contract into the persistent session", async () => {
+    // A resident agent that hits the context threshold must be handed its
+    // standing contract back, on the SAME event seam the discord capability uses
+    // for agent_end — without disturbing that capability's reply routing.
+    const listeners: Array<(event: unknown) => void> = [];
+    const prompts: string[] = [];
+    const session: RunSession = {
+      subscribe(listener) {
+        listeners.push(listener as (event: unknown) => void);
+        return () => {
+          const i = listeners.indexOf(listener as (event: unknown) => void);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      dispose() {},
+    };
+
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => session,
+      log: () => {},
+    });
+
+    for (const listener of listeners) {
+      listener({
+        type: "compaction_end",
+        reason: "threshold",
+        result: {},
+        aborted: false,
+        willRetry: false,
+      });
+    }
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("STANDING CONTRACT");
+    expect(prompts[0]).toContain("You are pulse");
+
+    await handle.shutdown();
+  });
 });

@@ -33,8 +33,15 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { readCron } from "./bob-yaml.js";
+import { readBlock, readCron } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
+import {
+  CONTINUE_TURN,
+  createCompactionReinjector,
+  evaluateCompletion,
+  readWorktreeStatus,
+  type SilenceReason,
+} from "./compaction-contract.js";
 import type { CronEntry } from "./index.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
@@ -46,7 +53,10 @@ const AGENT_NAME = /^[a-z0-9-]+$/;
 // inject a fake session without standing up the whole SDK.
 export interface RunSession {
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
-  prompt(text: string): Promise<void>;
+  // Send a turn. pi queues a message sent while streaming as a `steer`
+  // (interrupt + deliver) or `followUp` (deliver when idle) — the compaction
+  // contract re-injects its pinned block as a steer (issue #145).
+  prompt(text: string, options?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
   // Best-effort final assistant text, used as a fallback when no text_delta
   // events were observed (e.g. providers/transports that don't stream).
   readonly messages?: ReadonlyArray<unknown>;
@@ -127,6 +137,14 @@ export interface RunOptions {
   agentsRoot?: string;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
+  // Optional completion-contract predicate (issue #145): when the caller (or
+  // bob.yaml) declares an expected final-assistant-message shape, a run only
+  // settles exit 0 when the captured final text matches it. Omitted → the
+  // contract is "the final message is non-empty".
+  expectedFinal?: (text: string) => boolean;
+  // Cap on the re-injected pinned block (issue #145). Defaults to
+  // DEFAULT_PINNED_CAP_CHARS.
+  pinnedCapChars?: number;
 }
 
 export interface RunResult {
@@ -141,6 +159,9 @@ export interface RunResult {
   // Captured assistant final text, populated only when captureStdout=true.
   // Undefined otherwise.
   stdout?: string;
+  // The named reason a one-shot run refused to report success (issue #145):
+  // `settled_after_compaction` or `no_final_message`. Undefined on exit 0.
+  reason?: SilenceReason;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -200,8 +221,78 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   });
 
   let exitCode = 0;
+  let reason: SilenceReason | undefined;
+
+  // cli#145: subscribe to the SAME event seam the discord capability uses for
+  // agent_end. After every compaction the reinjector re-injects ONE pinned block
+  // (the task, plus "what remains") as a steer, so the agent gets its own plan
+  // back instead of treating the erased context as completion.
+  const reinjector = createCompactionReinjector({
+    task: opts.prompt,
+    capChars: opts.pinnedCapChars,
+    worktreeStatus: () => readWorktreeStatus(config.cwd),
+    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    log: (m) => process.stderr.write(`${m}\n`),
+  });
+  const unsubscribeContract = session.subscribe((event) => reinjector.observe(event));
+
+  // The best final text available right now: streamed deltas, else the last
+  // assistant message in session state (non-streaming transports).
+  const finalTextNow = (): string =>
+    captured.length > 0 ? captured : (lastAssistantText(session) ?? "");
+
   try {
     await session.prompt(opts.prompt);
+
+    // cli#145, item 2: the completion contract. Before this, a run settled
+    // `exitCode 0` whenever the prompt promise resolved — including after a
+    // compaction that erased the plan. Now it settles 0 ONLY with a final
+    // message (matching an expected shape when one is declared).
+    let outcome = evaluateCompletion({
+      capturedText: finalTextNow(),
+      compactions: reinjector.compactions(),
+      expectedFinal: opts.expectedFinal,
+    });
+    if (!outcome.ok && reinjector.compactions() > 0) {
+      // Settled after a compaction with no final message: retry ONCE with an
+      // explicit "continue from the state above" turn before giving up.
+      process.stderr.write(
+        `bob run ${opts.name}: settled after a context compaction with no final message — retrying once with a continue turn\n`,
+      );
+      try {
+        await session.prompt(CONTINUE_TURN);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
+      }
+      outcome = evaluateCompletion({
+        capturedText: finalTextNow(),
+        compactions: reinjector.compactions(),
+        expectedFinal: opts.expectedFinal,
+      });
+    }
+    if (!outcome.ok) {
+      // NEVER exit 0 for silence. Name the reason and print what we can (the
+      // dirty paths, if the agent's cwd is a git worktree).
+      exitCode = 1;
+      reason = outcome.reason;
+      process.stderr.write(
+        `bob run ${opts.name}: REFUSING to report success — ${reason}` +
+          (reason === "settled_after_compaction"
+            ? " (the session settled after a context compaction without a final message)"
+            : " (the session settled without a final message)") +
+          "\n",
+      );
+      const status = readWorktreeStatus(config.cwd);
+      if (status.length > 0) {
+        process.stderr.write(`bob run ${opts.name}: uncommitted paths in ${config.cwd}:\n`);
+        for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
+      } else {
+        process.stderr.write(
+          `bob run ${opts.name}: no dirty paths in ${config.cwd} (nothing to commit there)\n`,
+        );
+      }
+    }
   } catch (err) {
     exitCode = 1;
     // Surface the error instead of swallowing it: an underscore-ignored catch
@@ -215,6 +306,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     );
   } finally {
     unsubscribe();
+    unsubscribeContract();
   }
 
   // Final record so a reader can tell a clean completion from a truncated log.
@@ -235,6 +327,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     provider,
     model,
     ...(opts.captureStdout ? { stdout: captured } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
 }
 
@@ -261,6 +354,9 @@ export interface ResolvedRunConfig {
   // bob.yaml `cron:` entries (validated). Only the PERSISTENT runtime uses
   // these (it schedules them into the live session); `bob run` ignores them.
   cron: CronEntry[];
+  // bob.yaml `agent:` block (id/name/role) — the persistent runtime's standing
+  // contract is built from it (issue #145).
+  agent: { id?: string; name?: string; role?: string };
 }
 
 // Parse + validate bob.yaml `cron:` into CronEntry[]. Drops any entry missing
@@ -304,6 +400,21 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // plus the per-capability config env each extension reads (no secrets).
   const resolution = resolveCapabilities({ yamlText });
 
+  // The agent block (id/name/role). Read through readBlock, but a malformed
+  // agent: block must not stop the agent from running — it is only used to
+  // render the persistent standing contract.
+  let agentBlock: Record<string, unknown> | undefined;
+  try {
+    agentBlock = readBlock(yamlText, "agent");
+  } catch {
+    agentBlock = undefined;
+  }
+  const agent = {
+    ...(typeof agentBlock?.id === "string" ? { id: agentBlock.id } : {}),
+    ...(typeof agentBlock?.name === "string" ? { name: agentBlock.name } : {}),
+    ...(typeof agentBlock?.role === "string" ? { role: agentBlock.role } : {}),
+  };
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -316,7 +427,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     ),
     capabilityEnv: capabilityConfigEnv(resolution),
   };
-  return { agentDir, provider, model, config, cron: parseCron(yamlText) };
+  return { agentDir, provider, model, config, cron: parseCron(yamlText), agent };
 }
 
 // The minimum of pi's resource loader this check needs. Structural so tests can

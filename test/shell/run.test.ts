@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
 import { assertCapabilitiesLoaded, runAgent } from "../../src/shell/run.js";
 
@@ -69,6 +71,79 @@ function factoryReturning(session: RunSession): {
     return session;
   };
   return { factory, lastConfig: () => lastConfig };
+}
+
+// A fake session whose prompt() is SCRIPTED per call, so a test can drive the
+// #145 shape: the first prompt emits `compaction_end` (the context threshold)
+// and then settles with NO final message. The re-injection and the retry arrive
+// as further prompt() calls — the re-injection carries streamingBehavior
+// "steer" (it lands mid-run), the retry does not.
+function scriptedSession(
+  script: Array<{
+    textDeltas?: string[];
+    compact?: "threshold" | "overflow" | "manual";
+    aborted?: boolean;
+  }>,
+): { session: RunSession; calls: Array<{ text: string; streamingBehavior?: string }> } {
+  const calls: Array<{ text: string; streamingBehavior?: string }> = [];
+  // biome-ignore lint/suspicious/noExplicitAny: minimal event listener stub
+  const listeners: Array<(event: any) => void> = [];
+  // The script advances only on TOP-LEVEL prompts; the mid-run re-injection is
+  // a steer and must not consume a script step.
+  let topLevelCall = 0;
+  const session: RunSession = {
+    subscribe(listener) {
+      listeners.push(listener);
+      return () => {
+        const i = listeners.indexOf(listener);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    },
+    async prompt(text, options) {
+      calls.push({ text, streamingBehavior: options?.streamingBehavior });
+      const step = options?.streamingBehavior === undefined ? (script[topLevelCall++] ?? {}) : {};
+      if (step.compact) {
+        for (const listener of listeners) {
+          listener({
+            type: "compaction_end",
+            reason: step.compact,
+            result: {},
+            aborted: step.aborted === true,
+            willRetry: false,
+          });
+        }
+      }
+      for (const delta of step.textDeltas ?? []) {
+        for (const listener of listeners) {
+          listener({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+          });
+        }
+      }
+    },
+    get messages() {
+      return undefined;
+    },
+    dispose() {},
+  };
+  return { session, calls };
+}
+
+// Make `dir` a git repo with one committed file and one uncommitted change, so
+// a run's dirty-path report has something to show.
+function initDirtyRepo(dir: string): void {
+  const git = (...args: string[]) => {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+  };
+  git("init", "-q");
+  git("config", "user.email", "t@example.invalid");
+  git("config", "user.name", "t");
+  writeFileSync(join(dir, "core.ts"), "export const a = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
+  writeFileSync(join(dir, "core.ts"), "export const a = 2;\n");
 }
 
 describe("runAgent", () => {
@@ -421,6 +496,103 @@ describe("runAgent", () => {
     );
     expect(doneLine).toBeDefined();
     expect(doneLine?.exitCode).toBe(0);
+  });
+
+  // ── cli#145: the compaction contract ──────────────────────────────
+
+  it("cli#145: a session that compacts mid-task then settles silently re-injects the pinned block, retries ONCE, and exits non-zero", async () => {
+    // The exact #145 shape: threshold compaction, then agent_settled with no
+    // tool call and no final message. Before #145 this returned exit 0.
+    const s = scriptedSession([{ compact: "threshold" }]);
+    initDirtyRepo(join(agentsRoot, "testbot", "work"));
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "commit the two core files and push",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+
+    // 1. ONE pinned block was re-injected on compaction_end — as a STEER, so it
+    //    lands on the RUNNING turn rather than waiting for idle.
+    expect(s.calls).toHaveLength(3);
+    expect(s.calls[0].text).toBe("commit the two core files and push");
+    expect(s.calls[0].streamingBehavior).toBeUndefined();
+    expect(s.calls[1].streamingBehavior).toBe("steer");
+    expect(s.calls[1].text).toContain("commit the two core files and push");
+    expect(s.calls[1].text).toContain("WHAT REMAINS");
+
+    // 2. exactly ONE retry, the explicit "continue from the state above" turn.
+    expect(s.calls[2].text).toBe(CONTINUE_TURN);
+
+    // 3. non-zero exit with the NAMED reason, and the dirty paths printed.
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("settled_after_compaction");
+    expect(stderr).toContain("settled_after_compaction");
+    expect(stderr).toContain("M core.ts");
+
+    // The run log's final record stays truthful about the non-zero exit.
+    const { lines } = readRunLog("testbot");
+    const doneLine = lines.find(
+      (l): l is { done: boolean; exitCode: number } =>
+        typeof l === "object" && l !== null && (l as { done?: unknown }).done === true,
+    );
+    expect(doneLine?.exitCode).toBe(1);
+  });
+
+  it("cli#145: a normal run with a final message exits 0 and never retries (unchanged)", async () => {
+    const s = scriptedSession([{ textDeltas: ["done: committed and pushed"] }]);
+    const { factory } = factoryReturning(s.session);
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factory,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.reason).toBeUndefined();
+    expect(s.calls).toHaveLength(1); // no re-injection, no retry
+    expect(res.stdout).toBe("done: committed and pushed");
+  });
+
+  it("cli#145: a silent run with NO compaction exits non-zero with no_final_message and does not retry", async () => {
+    const s = scriptedSession([{}]); // settles with no text and no compaction
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "do the thing",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("no_final_message");
+    expect(s.calls).toHaveLength(1); // silence without a compaction is not retried
+    expect(stderr).toContain("no_final_message");
+  });
+
+  it("cli#145: the retry rescues the run when it produces a final message", async () => {
+    const s = scriptedSession([{ compact: "threshold" }, { textDeltas: ["continued: committed"] }]);
+    const { factory } = factoryReturning(s.session);
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "finish it",
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factory,
+    });
+    expect(s.calls).toHaveLength(3); // task, re-injection, retry
+    expect(res.exitCode).toBe(0);
+    expect(res.reason).toBeUndefined();
+    expect(res.stdout).toBe("continued: committed");
   });
 });
 
