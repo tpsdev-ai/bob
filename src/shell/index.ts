@@ -194,6 +194,7 @@ export {
 } from "./service.js";
 export {
   type AuditExtensions,
+  type AuditOutcome,
   type AuditSession,
   auditOrExit,
   auditToolSources,

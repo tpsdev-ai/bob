@@ -395,6 +395,81 @@ describe("the audit", () => {
       probe.cleanup();
     }
   });
+
+  // Round 6: `undefined` is a legal rejection value, so the wrapper's outcome
+  // must be TAGGED, not signalled by an absent argument. With the old
+  // error-or-undefined sentinel, `Promise.reject(undefined)` from a reload or a
+  // bind took the SUCCESS branch: the policy was re-audited as though the work
+  // had succeeded, nothing was disposed and the process was never ended.
+  it("round 6: a reload that rejects with UNDEFINED ends the session — undefined is not the success signal", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      const loader = probe.loader as unknown as { reload(...args: unknown[]): Promise<void> };
+      const originalLoaderReload = loader.reload.bind(loader);
+      loader.reload = () => Promise.reject(undefined);
+
+      let rejected: unknown = "sentinel: reload() never settled";
+      await probe.session.reload().then(
+        () => {
+          throw new Error("reload() resolved: a rejected reload must not read as success");
+        },
+        (err) => {
+          rejected = err;
+        },
+      );
+      expect(rejected, "the original rejection value comes back (undefined)").toBeUndefined();
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      const logs = probe.logs.join("\n");
+      expect(logs, "the failure is named even with no error value").toContain(
+        "the session could not be reloaded or bound",
+      );
+      expect(logs, "the log says what actually arrived").toContain(
+        "no error value (rejected with undefined)",
+      );
+
+      loader.reload = originalLoaderReload;
+    } finally {
+      probe.cleanup();
+    }
+  });
+
+  it("round 6: a bind that rejects with UNDEFINED ends the session — undefined is not the success signal", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      const session = probe.session as unknown as {
+        extendResourcesFromExtensions(reason: string): Promise<void>;
+      };
+      const originalExtend = session.extendResourcesFromExtensions.bind(session);
+      session.extendResourcesFromExtensions = () => Promise.reject(undefined);
+
+      let rejected: unknown = "sentinel: bindExtensions() never settled";
+      await probe.session.bindExtensions({}).then(
+        () => {
+          throw new Error("bindExtensions() resolved: a rejected bind must not read as success");
+        },
+        (err) => {
+          rejected = err;
+        },
+      );
+      expect(rejected, "the original rejection value comes back (undefined)").toBeUndefined();
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      const logs = probe.logs.join("\n");
+      expect(logs, "the failure is named even with no error value").toContain(
+        "the session could not be reloaded or bound",
+      );
+      expect(logs, "the log says what actually arrived").toContain(
+        "no error value (rejected with undefined)",
+      );
+
+      session.extendResourcesFromExtensions = originalExtend;
+    } finally {
+      probe.cleanup();
+    }
+  });
 });
 
 describe("the prompt entry point", () => {

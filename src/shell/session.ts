@@ -14,12 +14,14 @@
 //       created with (resolved by run.ts; it is REQUIRED, see RunSessionConfig);
 //   (b) pi's settings and resource sources are built HERE, isolated: project
 //       trust off, no configured package installed, and the ambient user and
-//       project extension, skill, prompt-template, theme and context-file paths
-//       are never LOADED (pi still enumerates them while resolving its package
-//       sources) — no global SYSTEM.md / APPEND_SYSTEM.md either. The only
-//       extensions that load are the declared capabilities' paths. A reload
-//       re-reads exactly these isolated sources — it cannot reach anything
-//       else;
+//       project extension, skill, prompt-template and theme paths are never
+//       LOADED (package resolution still enumerates those before the flags that
+//       drop them apply). Context files are not enumerated at all: pi skips
+//       context-file discovery outright under `noContextFiles`, so no ambient
+//       context file is read either — and no global SYSTEM.md / APPEND_SYSTEM.md
+//       either. The only extensions that load are the declared capabilities'
+//       paths. A reload re-reads exactly these isolated sources — it cannot reach
+//       anything else;
 //   (c) the audit runs at creation, again after the mode binds extensions (that
 //       is a bindExtensions, which emits session_start and extends resources
 //       from the extensions) and after EVERY session.reload() — NOT from inside
@@ -194,6 +196,12 @@ export function auditCreatedSession(
 // `what` names the situation for the log line, because a reload or a bind that
 // THROWS takes this same path (round 5) and is not literally a policy that
 // stopped holding.
+//
+// The thrown value IS the message when it is not an Error: `undefined` and
+// `null` are legal rejection values, and the bare strings "undefined"/"null"
+// would name nothing, so those are described instead of stringified (round 6 — a
+// promise can reject with `undefined`, and this path must still say what
+// arrived).
 export function auditOrExit(
   audit: () => void,
   session: { dispose(): void },
@@ -203,7 +211,14 @@ export function auditOrExit(
   try {
     audit();
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg =
+      err instanceof Error
+        ? err.message
+        : err === undefined
+          ? "the failure arrived with no error value (rejected with undefined)"
+          : err === null
+            ? "the failure arrived with no error value (rejected with null)"
+            : String(err);
     try {
       session.dispose();
     } catch {
@@ -244,21 +259,28 @@ export function auditOrExit(
 // and the caller puts it on the same path as a failed audit (dispose + end the
 // process with the ORIGINAL error named). Nothing is audited after a throw: the
 // state is unknown, so no reading of it can be trusted.
+// Round 6: the outcome is a TAG, not an error-or-undefined sentinel. JavaScript
+// can reject with `undefined` (`Promise.reject(undefined)`), so "called with no
+// argument" and "rejected with undefined" are indistinguishable — the old shape
+// took the SUCCESS branch on a failed reload or bind, disposing nothing and
+// ending nothing. The wrapper now always states which it is.
+export type AuditOutcome = { ok: true } | { ok: false; error: unknown };
+
 export function installSessionAudits(
   session: {
     reload(options?: unknown): Promise<void>;
     bindExtensions(bindings: unknown): Promise<void>;
   },
-  audit: (failure?: unknown) => void,
+  audit: (outcome: AuditOutcome) => void,
 ): void {
   const runThenAudit = async (work: () => Promise<void>): Promise<void> => {
     try {
       await work();
     } catch (err) {
-      audit(err);
+      audit({ ok: false, error: err });
       return;
     }
-    audit();
+    audit({ ok: true });
   };
 
   const originalReload = session.reload.bind(session);
@@ -363,18 +385,20 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // Round 5: a reload or a bind that THROWS is a failed audit too. The session
     // may be half-rebuilt and the mode stays open on it, so the original error
     // takes the same path (dispose + end the process, naming THAT error).
+    // Round 6: a rejection value of `undefined` takes that same path too — the
+    // wrapper tags the outcome, so no rejection value can read as success.
     const disposeSession = () => (result.session as unknown as { dispose(): void }).dispose();
     installSessionAudits(
       result.session as unknown as {
         reload(options?: unknown): Promise<void>;
         bindExtensions(bindings: unknown): Promise<void>;
       },
-      (failure?: unknown) =>
-        failure === undefined
+      (outcome) =>
+        outcome.ok
           ? auditOrExit(runAudit, { dispose: disposeSession }, deps)
           : auditOrExit(
               () => {
-                throw failure;
+                throw outcome.error;
               },
               { dispose: disposeSession },
               deps,
