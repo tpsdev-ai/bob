@@ -111,16 +111,17 @@ describe("bob CLI", () => {
   });
 });
 
-// The `--key=value` boolean-flag path, end to end (#173). A valueless form
-// (`--dry-run` alone) parses to the boolean true, but the `--key=value` form
-// (`--dry-run=true`) parses to the STRING "true". The boolean consumers used to
-// read that with `=== true`, which is false for the string — so `--dry-run=true`
+// The `--key=value` boolean-flag path, end to end (#173). The `--key=value` form
+// (`--dry-run=true`) USED TO parse to the STRING "true", and the boolean consumers
+// read it with `=== true`, which is false for a string — so `--dry-run=true`
 // silently skipped the dry-run branch and scaffolded + provisioned the Flair
 // identity for real (the opposite of the request); `--no-flair=true` likewise
-// still registered. `boolFlag` whitelists only `=true` / `=false` (and the bare
-// form) and rejects other spellings with a UsageError. These drive the CLI (not
-// parseArgs alone), so the whole path is covered, with HOME isolated to a
-// scratch dir so no test writes into a real agent tree.
+// still registered. parseArgs now validates every declared boolean as it parses
+// (bare / `=true` / `=false` only; anything else is a UsageError before any
+// command runs) and yields booleans; `boolFlag` keeps the same whitelist as a
+// second guard. These drive the CLI (not parseArgs alone), so the whole path is
+// covered, with HOME isolated to a scratch dir so no test writes into a real
+// agent tree.
 describe("--key=value boolean flags (parser-to-CLI)", () => {
   function scratchHome(): string {
     return mkdtempSync(join(tmpdir(), "bob-boolflag-"));

@@ -36,10 +36,11 @@ export function stringFlag(
 //   * `--dry-run=true` / `--dry-run=false`     -> true / false
 //   * anything else — `--dry-run=yes`, `--dry-run=1`, an empty `--dry-run=`,
 //     or the space form `--force false`        -> UsageError, naming the flag
-// The consumers used to read `flags.x === true`, which is FALSE for the string
-// "true" the `--key=value` form yields — so `--dry-run=true` silently skipped the
-// dry-run branch and scaffolded + provisioned the Flair identity for real
-// (`--no-flair=true` likewise registered). No looser coercion anywhere: the
+// The consumers used to read `flags.x === true`, which was FALSE for the string
+// "true" the `--key=value` form used to yield — so `--dry-run=true` silently
+// skipped the dry-run branch and scaffolded + provisioned the Flair identity for
+// real (`--no-flair=true` likewise registered). A declared boolean now reaches
+// the consumers as a boolean, validated here. No looser coercion anywhere: the
 // whitelist keeps every boolean consumer's "on" identical.
 export class UsageError extends Error {}
 
