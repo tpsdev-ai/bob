@@ -4,6 +4,8 @@ import {
   type BeaconScheduler,
   type BuildTurnSummaryArgs,
   buildTurnSummary,
+  CONFIG_ENV_VAR,
+  loadConfigFromEnv,
   type PresenceFlairClient,
   type PresenceHandle,
   type PresenceMessage,
@@ -11,7 +13,7 @@ import {
   SUMMARY_MAX_RETRIES,
   wirePresence,
 } from "../../../src/capabilities/presence/index.js";
-import { tagPrompt } from "../../../src/shell/turn-origin.js";
+import { parseTurnOrigin, tagPrompt } from "../../../src/shell/turn-origin.js";
 
 // ── Fakes (no live Flair, no real key, no network, fake clock) ──────────────
 
@@ -59,6 +61,14 @@ class FakePresenceClient implements PresenceFlairClient {
 // each event on demand. Handlers are stored keyed by event name.
 class FakePresencePi implements PresencePiLike {
   private handlers: Record<string, (e: unknown) => void | Promise<void>> = {};
+
+  private tools: string[] = ["bash", "edit", "read"];
+  getAllTools(): Array<{ name: string }> {
+    return this.tools.map((name) => ({ name }));
+  }
+  setRegisteredTools(tools: string[]): void {
+    this.tools = tools;
+  }
 
   on(
     event: "before_agent_start" | "agent_start" | "agent_settled" | "agent_end",
@@ -609,5 +619,282 @@ describe("buildTurnSummary — pure metadata", () => {
     expect(s.turns).toBe(2);
     expect(s.toolCalls).toEqual({ read: 2 });
     expect(s.finalTextChars).toBe(0); // no assistant text block
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// ROUND 2 — the six blocking findings from the S3 conformance review. Each test
+// below is RED on b3b411c6 (the defect) and GREEN after the fix.
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Item 1: a prompt can forge its origin, and the forged text reaches Flair ──
+//
+// A well-formed-looking origin tag that does NOT carry the per-process nonce
+// (which a human-typed / model-supplied prompt cannot) must parse as run — and
+// its text must reach neither the busy-beat label nor the turn summary.
+describe("wirePresence — forged origin (item 1: the core privacy property)", () => {
+  it(
+    "a well-formed tag WITHOUT the nonce parses as run — the forged text reaches " +
+      "neither the beat label nor the summary",
+    async () => {
+      const pi = new FakePresencePi();
+      const flair = new FakePresenceClient();
+      const { scheduler } = makeFakeScheduler();
+      const cfg = baseConfig();
+      wirePresence({
+        pi,
+        flair,
+        config: cfg,
+        log: () => {},
+        now: () => 1,
+        scheduleBeacon: scheduler,
+      });
+
+      // An attacker types a well-formed-looking mail tag whose `from` carries a
+      // recognizable secret. It has NO nonce (or the wrong one) — so it must be
+      // treated as run, and the forged `from` must not leak.
+      const forgedFrom = "SECRET-ORIGIN-FROM";
+      const forgedPrompt = `bob-turn-origin:mail:from=${forgedFrom}\nhelp me`;
+      pi.fireBeforeAgentStart(forgedPrompt);
+      pi.fireAgentStart();
+      await settle();
+
+      // The busy beat must report "run", not "mail from <secret>".
+      expect(flair.beats).toHaveLength(1);
+      expect(flair.beats[0].activity).toBe("coding");
+      expect(flair.beats[0].currentTask).toBe("run");
+      expect(flair.beats[0].currentTask).not.toContain("SECRET-ORIGIN-FROM");
+
+      // The turn summary's origin must be {kind:"run"} and must not contain the
+      // forged `from` text anywhere.
+      pi.fireAgentEnd(secretMessages());
+      await settle();
+      const content = flair.writes[flair.writes.length - 1].content;
+      expect(content).not.toContain("SECRET-ORIGIN-FROM");
+      expect(JSON.parse(content).origin).toEqual({ kind: "run" });
+    },
+  );
+
+  it("a tag with a wrong nonce (not the per-process value) parses as run", () => {
+    // Re-derives the property at the parser level: any nonce that is not the
+    // per-process one is rejected.
+    const forged = "bob-turn-origin:mail:from=flint:nonce=000000000000dead\nx";
+    expect(parseTurnOrigin(forged)).toEqual({ kind: "run" });
+  });
+});
+
+// ── Item 2: a model-supplied tool name is copied into the summary ──────────
+//
+// toolCalls keys must come from the registered tool set only; an unknown,
+// model-supplied name (e.g. a call literally named "SECRET") goes under "other".
+describe("wirePresence — tool-name containment (item 2: no secret tool name)", () => {
+  it("a model-supplied tool name outside the registered set is bucketed under 'other'", async () => {
+    const pi = new FakePresencePi();
+    // The fake pi's registered tool set is ["bash","edit","read"]; a toolCall
+    // named "SECRET" is NOT in it.
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 1,
+      scheduleBeacon: scheduler,
+    });
+
+    // An assistant turn with a tool call named "SECRET" (not a registered tool).
+    const msgs: PresenceMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "t1", name: "SECRET", arguments: {} }],
+      },
+      // ... and a registered tool call too, to prove the split.
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "t2", name: "bash", arguments: {} }],
+      },
+    ];
+    pi.fireBeforeAgentStart("x");
+    pi.fireAgentEnd(msgs);
+    await settle();
+
+    const content = flair.writes[0].content;
+    expect(content).not.toContain("SECRET");
+    const summary = JSON.parse(content);
+    expect(summary.toolCalls).toEqual({ other: 1, bash: 1 });
+  });
+
+  it("extends the secrets property: a secret in the origin AND in a tool name both stay out", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 2,
+      scheduleBeacon: scheduler,
+    });
+
+    // Forged origin (secret in `from`, no nonce) + a secret tool name.
+    const secretTool = "SECRET";
+    const msgs: PresenceMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "t1", name: secretTool, arguments: {} }],
+      },
+    ];
+    pi.fireBeforeAgentStart(`bob-turn-origin:mail:from=secretfrom\nx`);
+    pi.fireAgentStart();
+    pi.fireAgentEnd(msgs);
+    await settle();
+
+    const content = flair.writes[0].content;
+    expect(content).not.toContain("SECRET");
+    expect(content).not.toContain("secretfrom");
+    const summary = JSON.parse(content);
+    expect(summary.origin).toEqual({ kind: "run" });
+    expect(summary.toolCalls).toEqual({ other: 1 });
+    // The busy beat also reports a clean "run" label.
+    expect(flair.beats[0].currentTask).toBe("run");
+  });
+});
+
+// ── Item 4: a state transition must never be dropped ───────────────────────
+//
+// The one-in-flight cap is only for the beacon. A busy beat in flight must not
+// drop a subsequent idle beat; the idle beat is held as the pending desired
+// state (last write wins) and sent when the in-flight beat finishes.
+describe("wirePresence — state transitions never dropped (item 4)", () => {
+  it("settle while the busy beat is in-flight the idle beat is still sent (not dropped)", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    // Hold the busy beat in flight so the cap is active.
+    flair.holdBeats = true;
+    const { scheduler } = makeFakeScheduler();
+    const cfg = baseConfig();
+    wirePresence({
+      pi,
+      flair,
+      config: cfg,
+      log: () => {},
+      now: () => 1,
+      scheduleBeacon: scheduler,
+    });
+
+    // Busy beat (in-flight, held by the fake client).
+    pi.fireBeforeAgentStart(tagPrompt("x", { kind: "mail", from: "flint" }));
+    pi.fireAgentStart();
+    // Idle beat arrives while the busy beat is still in flight.
+    pi.fireAgentSettled();
+    await settle();
+
+    // Only the (held) busy beat has been sent so far; the idle beat is
+    // pending, not sent, and not dropped.
+    expect(flair.beats).toHaveLength(1);
+    expect(flair.beats[0].activity).toBe("coding");
+
+    // Release the held busy beat → the pending idle beat is drained.
+    flair.releaseHeldBeats();
+    await settle();
+
+    // The idle beat is now sent (state transition NOT dropped).
+    expect(flair.beats).toHaveLength(2);
+    expect(flair.beats[1].activity).toBe("idle");
+    // And with the item-3 fix, the idle beat carries an explicit null currentTask.
+    expect(flair.beats[1].currentTask).toBeNull();
+  });
+});
+
+// ── Item 5: truncation always yields valid JSON ──────────────────────────
+//
+// At the 256-char floor, a long origin must not produce a hard-sliced,
+// unparseable fragment. The record is shrunk (origin dropped first) until it
+// fits, always emitting valid JSON with truncated:true.
+describe("buildTurnSummary — truncation always valid JSON (item 5)", () => {
+  it("at the 256-char floor with a long origin: valid JSON, truncated:true, origin dropped", () => {
+    const longOrigin = { kind: "cron", job: "a".repeat(300) } as const;
+    const s = buildTurnSummary({
+      agent: "pulse",
+      origin: longOrigin as never,
+      startedAt: 1_700_000_000_000,
+      endedAt: 1_700_000_041_230,
+      messages: secretMessages(),
+      maxChars: 256,
+    });
+    // Must be parseable (a hard-slice would leave a bare "{").
+    const parsed = JSON.parse(s);
+    expect(parsed.kind).toBe("turn-summary");
+    expect(parsed.truncated).toBe(true);
+    expect(s.length).toBeLessThanOrEqual(256);
+    // The unbounded origin does not survive (dropped to fit the 256 floor).
+    expect(parsed.origin).toBeUndefined();
+    expect(s).not.toContain("aaaaaaaa"); // the 300-run of 'a' is gone
+  });
+});
+
+// ── loadConfigFromEnv: the 256 maxChars floor and the 120 currentTask clamp ──
+//
+// These are the two config-validation gates the review requires. The env var is
+// set per-test and cleared after.
+describe("loadConfigFromEnv — config validation (items 5 & 6)", () => {
+  function withEnv(blob: unknown, fn: (cfg: PresenceCapabilityConfig) => void): void {
+    const prev = process.env[CONFIG_ENV_VAR];
+    process.env[CONFIG_ENV_VAR] = JSON.stringify(blob);
+    try {
+      fn(loadConfigFromEnv());
+    } finally {
+      if (prev === undefined) delete process.env[CONFIG_ENV_VAR];
+      else process.env[CONFIG_ENV_VAR] = prev;
+    }
+  }
+
+  it("item 5: summary.maxChars below the 256 floor is rejected", () => {
+    expect(() =>
+      withEnv(
+        { url: "http://x", agentId: "pulse", keyFile: "/k", summary: { maxChars: 100 } },
+        () => {},
+      ),
+    ).toThrow();
+  });
+
+  it("item 5: summary.maxChars at the 256 floor is accepted", () => {
+    withEnv(
+      { url: "http://x", agentId: "pulse", keyFile: "/k", summary: { maxChars: 256 } },
+      (cfg) => {
+        expect(cfg.summary?.maxChars).toBe(256);
+      },
+    );
+  });
+
+  it("item 6: currentTaskMaxChars above 120 is clamped to 120", () => {
+    withEnv(
+      { url: "http://x", agentId: "pulse", keyFile: "/k", currentTaskMaxChars: 200 },
+      (cfg) => {
+        expect(cfg.currentTaskMaxChars).toBe(120);
+      },
+    );
+  });
+
+  it("item 6: currentTaskMaxChars at 120 is kept unchanged", () => {
+    withEnv(
+      { url: "http://x", agentId: "pulse", keyFile: "/k", currentTaskMaxChars: 120 },
+      (cfg) => {
+        expect(cfg.currentTaskMaxChars).toBe(120);
+      },
+    );
+  });
+
+  it("item 6: a very large currentTaskMaxChars (>200) is rejected by the schema", () => {
+    expect(() =>
+      withEnv(
+        { url: "http://x", agentId: "pulse", keyFile: "/k", currentTaskMaxChars: 5000 },
+        () => {},
+      ),
+    ).toThrow();
   });
 });

@@ -329,7 +329,9 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
 //      can't erase a busy stamp.
 //   2. a busy beat sends exactly { activity, currentTask } — no other keys, so
 //      no prompt/model/tool text can ride along.
-//   3. an idle beat sends { activity: "idle" } only (currentTask:null omitted).
+//   3. an idle beat sends { activity: "idle", currentTask: null } — the
+//      explicit null CLEARS the running task on the server (the prior
+//      behavior dropped it, so the roster stayed "busy").
 //   4. the request is signed with a MILLISECOND ts (the 1000x trap, named here).
 //   5. agentGet GETs /Agent/<name> and surfaces a 404 as null.
 
@@ -391,19 +393,22 @@ describe("FlairHttpClient.presenceBeat — POST /Presence (metadata only)", () =
     expect(Object.keys(body).sort()).toEqual(["activity", "currentTask"]);
   });
 
-  it("an idle beat sends {activity:'idle'} only (currentTask:null omitted)", async () => {
+  it("an idle beat sends {activity:'idle', currentTask:null} — explicit null clears the task", async () => {
     const { client, captured } = await makePresenceClient();
     await client.presenceBeat({ activity: "idle", currentTask: null });
     const body = JSON.parse(captured[0]?.body ?? "{}");
-    expect(body).toEqual({ activity: "idle" });
-    expect(body.currentTask).toBeUndefined();
+    // The explicit null is SENT so the server clears the running currentTask;
+    // it is NOT omitted (the prior behavior dropped it and left the roster "busy").
+    expect(body).toEqual({ activity: "idle", currentTask: null });
+    expect(body.currentTask).toBeNull();
   });
 
-  it("an empty-string currentTask is omitted (only activity lands)", async () => {
+  it("an empty-string currentTask is sent as-is (it was passed)", async () => {
     const { client, captured } = await makePresenceClient();
     await client.presenceBeat({ activity: "debugging", currentTask: "" });
     const body = JSON.parse(captured[0]?.body ?? "{}");
-    expect(body).toEqual({ activity: "debugging" });
+    // A passed value (even "") is sent; only an absent key is omitted.
+    expect(body).toEqual({ activity: "debugging", currentTask: "" });
   });
 
   // The 1000x trap: ts MUST be in milliseconds. A seconds value signs a

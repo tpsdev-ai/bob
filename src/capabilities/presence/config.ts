@@ -79,7 +79,8 @@ export const CONFIG_SCHEMA = Type.Object(
         minimum: 1,
         maximum: 200,
         default: 120,
-        description: "Max length of the runtime-authored currentTask label (default 120).",
+        description:
+          "Max length of the runtime-authored currentTask label (default 120; clamped to at most 120 in validation, item 6).",
       }),
     ),
     // Turn-end summary settings.
@@ -104,9 +105,13 @@ export const CONFIG_SCHEMA = Type.Object(
           // truncated safety net (a compact, self-identifying record).
           maxChars: Type.Optional(
             Type.Integer({
-              minimum: 1,
+              minimum: 256,
               default: 2048,
-              description: "Max serialized turn-summary length.",
+              // Floor of 256: the most-compact valid record (kind/v/truncated) is ~48
+              // chars, so any maxChars >= 256 always yields a parseable, self-
+              // identifying record after truncation. Values below the floor are
+              // rejected here in config validation (item 5).
+              description: "Max serialized turn-summary length (floor 256 in validation).",
             }),
           ),
         },
@@ -144,5 +149,15 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Presenc
       `presence capability: config is invalid${where}: ${first?.message ?? "schema check failed"}`,
     );
   }
-  return parsed as PresenceCapabilityConfig;
+  const config = parsed as PresenceCapabilityConfig;
+  // Item 6: clamp the runtime-authored currentTask label cap to at most 120.
+  // The Flair server allows up to 200, but the presence contract caps it tighter
+  // (120) so a long origin id cannot inflate the busy-beat label past the 120-
+  // char contract. A value in (120, 200] passes the schema and is clamped down
+  // to 120 here in config validation; a value > 200 is rejected by the schema
+  // maximum. (Defense in depth: wirePresence also clamps to 120.)
+  if (config.currentTaskMaxChars !== undefined && config.currentTaskMaxChars > 120) {
+    config.currentTaskMaxChars = 120;
+  }
+  return config;
 }

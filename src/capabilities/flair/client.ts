@@ -270,7 +270,15 @@ export class FlairHttpClient implements FlairClient {
   }): Promise<void> {
     const body: Record<string, unknown> = {};
     if (opts.activity !== undefined) body.activity = opts.activity;
-    if (opts.currentTask != null && opts.currentTask !== "") body.currentTask = opts.currentTask;
+    // Send currentTask whenever the caller passes it — INCLUDING an explicit
+    // `null`, which the idle beat uses to CLEAR the running task on the server.
+    // Omit it ONLY when the caller did not pass it at all (the liveness-only
+    // beacon), so an empty body (no currentTask key) is the only thing that
+    // lets the server preserve the prior activity stamp (natural presence).
+    // The prior `!= null && !== ""` guard dropped the explicit idle `null`, so
+    // settled never cleared `currentTask` and the roster stayed "busy" until the
+    // next turn started.
+    if (opts.currentTask !== undefined) body.currentTask = opts.currentTask;
     await this.signedFetch("POST", "/Presence", body);
   }
 

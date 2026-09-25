@@ -108,6 +108,10 @@ export interface PresencePiLike {
     event: "agent_end",
     handler: (e: { messages: PresenceMessage[] }) => void | Promise<void>,
   ): void;
+  // Returns the registered tool names. A model-supplied toolCall whose name is
+  // NOT in this set is bucketed under "other" in the turn summary, so a crafted
+  // tool name (e.g. "SECRET") can never surface verbatim.
+  getAllTools(): Array<{ name: string }>;
 }
 
 // A beacon timer seam. The production default wraps setInterval (unref'd); a
@@ -192,10 +196,18 @@ function countAssistantMessages(messages: PresenceMessage[]): number {
   return n;
 }
 
-// Count tool calls by tool *name*. Only toolCall content blocks in assistant
-// messages are counted; tool-result messages (the *outputs*) are never counted
-// (and never read). So the counts carry no tool-output content.
-function countToolCallsByTool(messages: PresenceMessage[]): Record<string, number> {
+// Count tool calls by tool *name*. When `registeredTools` is provided, only
+// names in that set are counted by name; any other tool name — a model-supplied
+// name outside the registered set (e.g. "SECRET") — is bucketed under the "other"
+// key so a crafted tool name can never surface verbatim in the summary. Without
+// `registeredTools` (pure-function tests without a pi context) the count falls
+// back to counting by name, preserving backward compatibility. Neither path ever
+// reads a tool-result (the *output*) message — only toolCall *names* are counted,
+// so the counts carry no tool-output content.
+function countToolCallsByTool(
+  messages: PresenceMessage[],
+  registeredTools?: Set<string>,
+): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const m of messages) {
     if (m?.role !== "assistant") continue;
@@ -204,7 +216,11 @@ function countToolCallsByTool(messages: PresenceMessage[]): Record<string, numbe
       if (typeof block !== "object" || block === null) continue;
       const b = block as { type?: string; name?: string };
       if (b.type === "toolCall" && typeof b.name === "string") {
-        counts[b.name] = (counts[b.name] ?? 0) + 1;
+        const name = b.name;
+        // Count only registered tool names; an unknown, model-supplied name is
+        // bucketed under "other" (item 2) so it cannot surface verbatim.
+        const key = registeredTools && !registeredTools.has(name) ? "other" : name;
+        counts[key] = (counts[key] ?? 0) + 1;
       }
     }
   }
@@ -225,6 +241,10 @@ export interface BuildTurnSummaryArgs {
   endedAt: number; // epoch millis
   messages: PresenceMessage[];
   maxChars: number;
+  // Registered tool set (from pi.getAllTools()). A model-supplied tool name
+  // outside this set is bucketed under "other" (item 2: no crafted tool name
+  // can surface verbatim in the summary).
+  registeredTools?: Set<string>;
 }
 
 // Build the turn summary JSON string. The output is guaranteed to be at most
@@ -233,10 +253,10 @@ export interface BuildTurnSummaryArgs {
 // the record is still self-identifying and parseable, then hard-sliced to
 // maxChars as a final safety net.
 export function buildTurnSummary(args: BuildTurnSummaryArgs): string {
-  const { agent, origin, startedAt, endedAt, messages, maxChars } = args;
+  const { agent, origin, startedAt, endedAt, messages, maxChars, registeredTools } = args;
   const final = finalAssistantText(messages);
   const turns = countAssistantMessages(messages);
-  const toolCalls = countToolCallsByTool(messages);
+  const toolCalls = countToolCallsByTool(messages, registeredTools);
   const base = {
     kind: "turn-summary",
     v: 1,
@@ -253,21 +273,32 @@ export function buildTurnSummary(args: BuildTurnSummaryArgs): string {
   const json = JSON.stringify(base);
   if (json.length <= maxChars) return json;
 
-  // Truncation safety net: emit a compact record that still self-identifies
-  // (kind/v/truncated/agent/origin) and fits within maxChars. The full
-  // summary's counts/timestamps are not recoverable, but the record still
-  // marks which agent + origin this was, which is the load-bearing forensic
-  // field.
-  const compact = {
-    kind: "turn-summary",
-    v: 1,
-    truncated: true,
-    agent,
-    origin,
-  };
-  let cjson = JSON.stringify(compact);
-  if (cjson.length > maxChars) cjson = cjson.slice(0, maxChars);
-  return cjson;
+  // Truncation (item 5): NEVER hard-slice serialized JSON (that can leave an
+  // unparseable fragment like "{"). Instead emit a progressively smaller, self-
+  // identifying record — each a complete, valid JSON object — dropping the
+  // unbounded `origin` first, then `agent`, until one fits within maxChars. The
+  // floor record {kind,v,truncated} is ~48 chars, which fits any maxChars >= the
+  // 256 config floor, so the output is ALWAYS valid JSON with truncated:true.
+  return truncateSummary(agent, origin, maxChars);
+}
+
+// Item 5 truncation helper: try progressively smaller self-identifying records,
+// each a complete valid JSON object (never a sliced fragment), until one fits.
+// Fields are dropped widest-first: `origin` (unbounded — a long agent/channel
+// id), then `agent`, then the bare {kind,v,truncated}. Never a .slice().
+function truncateSummary(agent: string, origin: TurnOrigin, maxChars: number): string {
+  const tiers: Array<Record<string, unknown>> = [
+    { kind: "turn-summary", v: 1, truncated: true, agent, origin },
+    { kind: "turn-summary", v: 1, truncated: true, agent },
+    { kind: "turn-summary", v: 1, truncated: true },
+  ];
+  for (const tier of tiers) {
+    const s = JSON.stringify(tier);
+    if (s.length <= maxChars) return s;
+  }
+  // Fallback (should not trigger with the 256 floor): the minimal record is
+  // ~48 chars and always fits; return it anyway so the result is valid JSON.
+  return JSON.stringify(tiers[tiers.length - 1]);
 }
 
 // ─── wirePresence ──────────────────────────────────────────────────────────
@@ -302,7 +333,9 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
 
   // ── Resolve config defaults ────────────────────────────────────────
   const beaconIntervalMs = config.beaconIntervalMs ?? DEFAULT_BEACON_INTERVAL_MS;
-  const currentTaskMax = config.currentTaskMaxChars ?? DEFAULT_CURRENT_TASK_MAX;
+  // Item 6 (defense in depth): clamp to at most 120 even if a caller builds
+  // the config object directly (bypassing loadConfigFromEnv validation).
+  const currentTaskMax = Math.min(config.currentTaskMaxChars ?? DEFAULT_CURRENT_TASK_MAX, 120);
   const busyActivity: PresenceActivity = config.busyActivity ?? "coding";
   const summaryEnabled = !(config.summary && config.summary.enabled === false);
   const summaryDurability: Durability = config.summary?.durability ?? DEFAULT_SUMMARY_DURABILITY;
@@ -316,10 +349,17 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   let currentOrigin: TurnOrigin = { kind: "run" };
   let turnStartedAt = now();
 
-  // ── Beat in-flight cap: at most ONE presence beat in flight at a time ──
-  // Extra beats are dropped (beacon, not queue). The cap is shared across
-  // all three beat sources (agent_start busy, agent_settled idle, beacon).
+  // ── Beat in-flight cap + state-never-dropped (item 4) ─────────────
+  // At most ONE presence beat is in flight at a time. Beacon (liveness-only)
+  // beats are droppable when a beat is already in flight. But STATE transitions
+  // (the busy and idle beats) are NEVER dropped: if a beat is in flight when a
+  // state transition arrives, the latest desired state is held as pending (last
+  // write wins) and sent when the in-flight beat finishes. This is why the
+  // in-flight cap is only for the beacon, not for state transitions.
   let beatInFlight = false;
+  // Pending desired state (last write wins): set by beatState while a beat is
+  // in flight; drained by sendNow's finally.
+  let pendingState: PresenceBeatOpts | null = null;
   // ── Collapsed-failure logging: one line per distinct failure ─────────
   // If a beat fails and the prior failure had the same signature, we do not
   // log again. The flag is reset on success, so a recovery + a *new* failure
@@ -340,18 +380,44 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
     lastBeatFailureSig = null;
   };
 
-  // Fire one presence beat. Fire-and-forget: a beat must never throw into
-  // pi, never block, and never stack (one in flight at a time).
-  const beat = (opts2: PresenceBeatOpts): void => {
-    if (beatInFlight) return; // drop extras
+  // ── sendNow: occupy the in-flight lane, send one beat, drain pending state
+  // Fire-and-forget: a beat must never throw into pi, never block. On settle
+  // (success, failure, or timeout), if a state transition arrived while this beat
+  // was in flight, send it now. Recursion is bounded: each sendNow can only
+  // queue the single latest pending state (set by beatState); it terminates.
+  const sendNow = (o: PresenceBeatOpts): void => {
     beatInFlight = true;
     void flair
-      .presenceBeat(opts2)
+      .presenceBeat(o)
       .then(onBeatSuccess)
       .catch((err: unknown) => logBeatFailure(err))
       .finally(() => {
         beatInFlight = false;
+        // Drain any pending state transition (item 4): last write captured.
+        if (pendingState !== null) {
+          const next = pendingState;
+          pendingState = null;
+          sendNow(next);
+        }
       });
+  };
+
+  // Liveness-only (beacon) beat: droppable. If a beat is already in flight,
+  // drop it - a beacon is a liveness ping, not a transition that must land.
+  const beatBeacon = (): void => {
+    if (beatInFlight) return;
+    sendNow({});
+  };
+
+  // State transition (busy / idle beat): NEVER dropped (item 4). If a beat is
+  // in flight, hold this as pendingState (last write wins); when the in-flight
+  // beat finishes, sendNow's finally drains it.
+  const beatState = (o: PresenceBeatOpts): void => {
+    if (beatInFlight) {
+      pendingState = o; // last write wins
+      return;
+    }
+    sendNow(o);
   };
 
   // ── before_agent_start: parse origin + stamp turn start ─────────────
@@ -367,7 +433,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // the origin (capped at currentTaskMax). This also stamps the server's
   // lastHeartbeatAt so the 10-min offline TTL starts from the turn.
   pi.on("agent_start", () => {
-    beat({
+    beatState({
       activity: busyActivity,
       currentTask: originLabel(currentOrigin, currentTaskMax),
     });
@@ -378,7 +444,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // means no retry/compaction/queued continuation will run — so idle does not
   // flap busy→idle→busy between queued mails.
   pi.on("agent_settled", () => {
-    beat({ activity: "idle", currentTask: null });
+    beatState({ activity: "idle", currentTask: null });
   });
 
   // ── agent_end: turn summary (fire-and-forget) ────────────────────────
@@ -387,6 +453,9 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   pi.on("agent_end", (e) => {
     if (!summaryEnabled) return;
     const messages = e.messages;
+    // Item 2: the registered tool set; a model-supplied toolCall whose name is
+    // not in this set is bucketed under "other" so a crafted name cannot surface.
+    const registeredTools = new Set(pi.getAllTools().map((t) => t.name));
     void (async (): Promise<void> => {
       let content: string;
       try {
@@ -397,6 +466,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
           endedAt: now(),
           messages,
           maxChars: summaryMaxChars,
+          registeredTools,
         });
       } catch (err) {
         const reason = err instanceof Error ? err.message : "build failed";
@@ -435,7 +505,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // idle threshold keys off lastHeartbeatAt, which the busy beat set once
   // at turn start and the beacon keeps fresh).
   const beacon = (opts.scheduleBeacon ?? defaultBeaconScheduler)(beaconIntervalMs, () => {
-    beat({});
+    beatBeacon();
   });
 
   return {
