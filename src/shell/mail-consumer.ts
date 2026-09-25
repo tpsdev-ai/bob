@@ -13,10 +13,11 @@
 // body as the prompt. The agent's launcher decides how to interpret it.
 //
 // The launcher is also where the tool policy binds: it runs `bob launch`, which
-// resolves the agent's role allowlist + bob.yaml and hands the result to pi as
-// its own flags. So a mail-driven turn starts with the same policy as `bob
-// run`, and this class never starts pi on its own — there is no mail path that
-// opens a session with no allowlist.
+// resolves the agent's role allowlist + bob.yaml and stands up the session from
+// bob's own factory. So a mail-driven turn starts with the same policy as `bob
+// run`, and this class never starts a session on its own — there is no mail
+// path that opens a session with no allowlist, and (round 3) no pi command line
+// for a mail body to add a flag to.
 
 import { spawn } from "node:child_process";
 import {
@@ -152,12 +153,9 @@ export class MailConsumer {
     if (this.opts.dispatch) {
       return this.opts.dispatch(msg);
     }
-    // Default: spawn the agent's launcher with body as stdin prompt arg. The
-    // launcher runs `bob launch`, so the session gets the agent's resolved tool
-    // policy (see the module comment).
-    // TODO(phase1): migrate to SDK — route mail through runAgent's embedded
-    // pi session (run.ts) instead of spawning the generated launcher; either
-    // way the policy comes from resolveRunConfig.
+    // Default: spawn the agent's launcher with body as the prompt argument.
+    // The launcher runs `bob launch`, so the session comes from bob's own
+    // factory with the agent's resolved tool policy (see the module comment).
     return new Promise<void>((resolve, reject) => {
       const child = spawn(this.opts.launcherPath, [msg.body], {
         stdio: ["ignore", "pipe", "pipe"],

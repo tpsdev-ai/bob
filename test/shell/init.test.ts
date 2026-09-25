@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initAgent } from "../../src/shell/init.js";
+import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
+import { knownToolNames } from "../../src/shell/tool-allowlist.js";
 
 // Pull the `tools:` block's list out of a generated bob.yaml. Deliberately
 // hand-parsed (same shape `bob init` emits) so the test does not depend on the
@@ -139,20 +141,73 @@ describe("initAgent", () => {
     }
   });
 
-  it("gives the ea role the capabilities' real tool names, not the mcp__ ones", () => {
+  it("stamps the tools of the capabilities it declares — and only those", () => {
+    // The stamped allowlist is the role's CEILING intersected with what can
+    // actually be enabled for this agent: pi's built-ins plus the tools of the
+    // capabilities bob init stamps. `flair` is stamped, so the flair tools are
+    // in; `discord_*` is in the ea role's ceiling but NOT stamped here, so a
+    // fresh ea agent never carries a name nothing can register (round 3).
     const res = initAgent({ ...baseOpts(), name: "bot-ea-check", role: "ea" });
     const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
-    for (const tool of [
-      "flair_search",
-      "flair_write",
-      "flair_get",
-      "discord_reply",
-      "discord_fetch",
-      "discord_react",
-    ]) {
+    for (const tool of ["read", "flair_search", "flair_write", "flair_get"]) {
       expect(names).toContain(tool);
     }
+    expect(names).not.toContain("discord_reply");
+    expect(names).not.toContain("discord_fetch");
+    expect(names).not.toContain("discord_react");
     expect(names.join(",")).not.toContain("mcp__");
+  });
+
+  it("loads a freshly initialised agent of EVERY role (allowlist ⊆ what can exist)", () => {
+    // The consequence the round-3 spec names: every role's stamped agent must
+    // resolve a policy that holds. Anything the role's ceiling allows but no
+    // stamped capability provides is dropped, so the stamped list is always a
+    // subset of pi's built-ins + the stamped capabilities' tools.
+    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    for (const role of roles) {
+      const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
+      const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+      expect(names.length, `${role}: a stamped agent has a policy`).toBeGreaterThan(0);
+      const { config } = resolveRunConfig({ name: `bot-${role}`, agentsRoot: tmpRoot });
+      // The policy resolves, and every name in it is one the agent can have:
+      // a pi built-in or a tool of the capability bob stamps.
+      expect(config.tools, `${role}: stamped = resolved`).toEqual(names);
+      for (const name of names) {
+        expect(knownToolNames(), `${role}: ${name} is a known tool`).toContain(name);
+      }
+    }
+  });
+
+  it("LOADS a freshly initialised agent of EVERY role (a real session, not just a policy)", async () => {
+    // The consequence the round-3 spec names. "Loads" is the operative word:
+    // build the real session for a freshly stamped agent of each role and check
+    // that every name in its stamped policy is actually ACTIVE — the audit that
+    // runs at creation is the same check, so a stamped agent that could not
+    // hold its policy would fail here.
+    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    for (const role of roles) {
+      const res = initAgent({
+        ...baseOpts(),
+        name: `load-${role}`,
+        role,
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+      const { config } = resolveRunConfig({ name: `load-${role}`, agentsRoot: tmpRoot });
+      const session = (await createPiRunSession(config)) as unknown as {
+        getActiveToolNames(): string[];
+        dispose(): void;
+      };
+      try {
+        const active = new Set(session.getActiveToolNames());
+        for (const name of config.tools) {
+          expect(active, `${role}: ${name} is active`).toContain(name);
+        }
+      } finally {
+        session.dispose();
+      }
+      expect(res.agentDir.endsWith(`load-${role}`)).toBe(true);
+    }
   });
 
   it("scaffolds the flair memory capability + config block", () => {

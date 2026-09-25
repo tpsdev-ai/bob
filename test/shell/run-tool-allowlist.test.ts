@@ -17,13 +17,9 @@ import { capabilityConfigEnv, resolveCapabilities } from "../../src/shell/capabi
 import type { RunSessionConfig } from "../../src/shell/run.js";
 import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
 
-// The config gains `tools`/`excludeTools` with the change; spelling them
-// structurally keeps this file honest whichever way the field is declared.
+// The config REQUIRES `tools` with round 3; spelling it structurally keeps this
+// file honest whichever way the field is declared.
 type TooledConfig = RunSessionConfig & { tools?: string[]; excludeTools?: string[] };
-
-// pi's own defaults, as the installed SDK documents them (sdk.d.ts: "the
-// default built-in tools (read, bash, edit, write)").
-const PI_DEFAULT_TOOLS = ["bash", "edit", "read", "write"];
 
 describe("createPiRunSession — the tool policy reaches the session", () => {
   let cwd: string;
@@ -72,12 +68,21 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
     ]);
   });
 
-  it("leaves pi's defaults in place when no allowlist is passed AT ALL", async () => {
-    // Factory-level tolerance only: resolveAgentToolPolicy refuses a bob.yaml
-    // without `tools.allow`, so no launch path gets here empty — a caller that
-    // builds a session by hand can still omit the list, and pi's defaults then
-    // apply. Passing an empty list instead means "no tools at all".
-    expect(await activeTools({ tools: undefined, excludeTools: [] })).toEqual(PI_DEFAULT_TOOLS);
+  it("REFUSES a config with no allowlist at all (the type and the runtime)", async () => {
+    // Round 3: `tools` is REQUIRED. A session built without it would come up on
+    // pi's defaults (read, bash, edit, write) — the absence of a policy is the
+    // defect this area recovers from, so the factory refuses it rather than
+    // falling back. Passing an empty list instead means "no tools at all".
+    const config = baseConfig({ tools: undefined, excludeTools: [] });
+    // The runtime refuses it even though the type would not (a caller can reach
+    // here through `any`).
+    await expect(createPiRunSession(config as unknown as RunSessionConfig)).rejects.toThrow(
+      /without a resolved tool policy/,
+    );
+  });
+
+  it("treats an explicit EMPTY allowlist as 'no tools'", async () => {
+    expect(await activeTools({ tools: [], excludeTools: [] })).toEqual([]);
   });
 
   it("REFUSES a session whose allowlist names a tool no loaded capability provides", async () => {

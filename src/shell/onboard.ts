@@ -1,36 +1,51 @@
 // `bob onboard` interactive flow.
 //
-// The Office Space "restructuring consultants" pattern: spawn pi-coding-agent
-// with a meta-system-prompt that frames the session as a hiring interview.
-// The agent interviews the human about the role, then writes its own
-// persona to soul.md. When the human exits the session, Bob reads back
-// soul.md and reports whether it was updated.
+// The Office Space "restructuring consultants" pattern: start pi's interactive
+// TUI with a meta-system-prompt that frames the session as a hiring interview.
+// The agent interviews the human about the role, then writes its own persona to
+// soul.md. When the human exits the session, bob reads back soul.md and reports
+// whether it was updated.
 //
-// We delegate the entire conversation to pi — Bob is just the dispatcher
-// that arms the right system prompt, points pi at the right session dir,
-// and observes the soul.md before/after.
+// Round 3: the session comes from bob's ONE factory through pi's InteractiveMode
+// (session.ts) — bob no longer spawns the pi CLI, so there is no argv for a
+// caller to add a flag to. The interview runs under the FIXED setup policy
+// (read + write, session.ts SETUP_TOOL_POLICY), which may exceed the role's
+// ceiling: onboarding and alignment are privileged local setup commands
+// available to whoever runs bob as that OS user (see README "Stated
+// exceptions"). A model can only reach them through a shell tool, and a role
+// with a shell already has write.
 
-import { type ChildProcess, spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { readAgentToolPolicy } from "./run.js";
-import { toolPolicyArgs } from "./tool-allowlist.js";
+import { dirname, join } from "node:path";
+import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
+import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
+import type { ToolPolicy } from "./tool-allowlist.js";
 
 export interface OnboardOptions {
   // Agent identity (must already exist on disk via initAgent).
   name: string;
   role: string;
   agentDir: string;
-  // Provider + model passed through to pi. Defaults pulled from the role
-  // template if not given. Caller wires this.
+  // Provider + model for the interview. bob.yaml is stamped from these at init
+  // time; when given here they override the file for this session only (the
+  // same per-call semantics as `bob run --model`).
   provider: string;
   model: string;
-  // Override the pi binary (tests). Defaults to "pi".
-  piBin?: string;
-  // Override child_process.spawn (tests).
-  spawnFn?: SpawnFn;
+  // Test seam: run the interactive session. Defaults to pi's InteractiveMode
+  // over bob's session runtime.
+  sessionRunner?: SessionRunner;
+  deps?: SessionDeps;
 }
+
+// The interactive-session seam. Defaults to pi's InteractiveMode; tests inject
+// one that drives a fake session (no TTY, no model).
+export type SessionRunner = (input: {
+  config: RunSessionConfig;
+  policy: ToolPolicy;
+  initialMessage: string;
+  deps?: SessionDeps;
+}) => Promise<number>;
 
 export interface OnboardResult {
   exitCode: number;
@@ -39,12 +54,6 @@ export interface OnboardResult {
   soulHashBefore: string;
   soulHashAfter: string;
 }
-
-export type SpawnFn = (
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-) => ChildProcess;
 
 // Mirror of init.ts AGENT_NAME — agent names are filesystem paths AND get
 // embedded in system prompts, so the regex doubles as path-traversal +
@@ -81,6 +90,9 @@ The conversation should feel like a real interview — short turns, real curiosi
 and ending with a persona that's recognizably ${name}, not a template.
 `.trim();
 
+const FIRST_MESSAGE = (name: string, role: string, soulPath: string) =>
+  `Hello ${name}. We're going to shape your persona for the ${role} role. Start by reading your seed soul at ${soulPath}, then interview me. When you have what you need, write the refined persona back.`;
+
 export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -90,39 +102,28 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   }
   const soulPath = join(opts.agentDir, "soul.md");
   const soulHashBefore = hashFile(soulPath);
-  // TODO(phase1): migrate to SDK — embed pi via createAgentSession instead of
-  // spawning the `pi` binary (mirrors run.ts). Kept as a subprocess for now;
-  // PR1 only migrates the non-interactive prompt path in run.ts. Until then the
-  // session is handed the agent's RESOLVED tool policy as pi's own flags, so
-  // this path starts a session with the same allowlist the SDK paths do.
-  const spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
-  const piBin = opts.piBin ?? "pi";
 
-  const sessionDir = join(opts.agentDir, ".pi-agent");
-  const workDir = join(opts.agentDir, "work");
+  // The interview session runs the agent's OWN config (bob.yaml capabilities,
+  // cwd, credentials) with the interview meta-prompt appended, and the fixed
+  // setup policy — never the role's ceiling, which is what makes the interview
+  // able to write soul.md at all.
+  const { config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: dirname(opts.agentDir),
+  });
+  const sessionConfig: RunSessionConfig = {
+    ...config,
+    provider: mapBobProviderToPi(opts.provider),
+    model: opts.model,
+    appendSystemPrompt: META_PROMPT(opts.name, opts.role, soulPath),
+  };
 
-  // Resolved from bob.yaml + role.json, and throwing (no allowlist, an
-  // unmappable name, a widening past the role) rather than defaulting: an
-  // onboarding session must not be born without a policy.
-  const policy = readAgentToolPolicy(opts.agentDir);
-
-  const args = [
-    "--provider",
-    opts.provider,
-    "--model",
-    opts.model,
-    "--session-dir",
-    sessionDir,
-    "--append-system-prompt",
-    META_PROMPT(opts.name, opts.role, soulPath),
-    ...toolPolicyArgs(policy),
-    `Hello ${opts.name}. We're going to shape your persona for the ${opts.role} role. Start by reading your seed soul at ${soulPath}, then interview me. When you have what you need, write the refined persona back.`,
-  ];
-
-  const exitCode = await spawnAndWait(spawnFn, piBin, args, {
-    cwd: workDir,
-    stdio: "inherit",
-    env: process.env,
+  const runner = opts.sessionRunner ?? runInteractiveSession;
+  const exitCode = await runner({
+    config: sessionConfig,
+    policy: SETUP_TOOL_POLICY,
+    initialMessage: FIRST_MESSAGE(opts.name, opts.role, soulPath),
+    deps: opts.deps,
   });
 
   const soulHashAfter = hashFile(soulPath);
@@ -133,19 +134,6 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
     soulHashBefore,
     soulHashAfter,
   };
-}
-
-function spawnAndWait(
-  spawnFn: SpawnFn,
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const child = spawnFn(command, args, options);
-    child.on("error", reject);
-    child.on("exit", (code) => resolve(code ?? 0));
-  });
 }
 
 function hashFile(path: string): string {

@@ -18,7 +18,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readResident, readTools, type ToolsBlock } from "./bob-yaml.js";
+import { readAgentRole, readResident, readTools, type ToolsBlock } from "./bob-yaml.js";
 import { resolveAgentToolPolicy } from "./run.js";
 import { auditToolNames, residentDroppedTools, type ToolPolicy } from "./tool-allowlist.js";
 
@@ -298,11 +298,16 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   }
   const dropped = residentDroppedTools(policy);
   if (dropped.length > 0) {
+    // The grant lives in the ROLE (roles/<role>/role.json), not in bob.yaml:
+    // bob.yaml may only narrow the role's list, so setting
+    // tools.allowResidentShell: true there would widen past the role and be
+    // refused at load. Name the file the permission is actually in.
+    const role = readAgentRole(yamlText) ?? "<role>";
     return {
       name,
       status: "warn",
       detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
-      fix: "set tools.allowResidentShell: true to keep them, or drop them from the allowlist",
+      fix: `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
     };
   }
   return {

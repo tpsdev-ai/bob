@@ -36,6 +36,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
+import { promptSession } from "./session.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -138,7 +139,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
         } catch {
           // proceed — pi serializes turns regardless
         }
-        await session.prompt(entry.prompt);
+        // bob's prompt entry point: the text is the prompt, no command /
+        // template / skill expansion (session.ts promptSession).
+        await promptSession(session, entry.prompt);
       },
       log,
     });

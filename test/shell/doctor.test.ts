@@ -296,7 +296,13 @@ describe("runDoctor", () => {
     const check = report.checks.find((c) => c.name === "tool allowlist");
     expect(check?.status).toBe("warn");
     expect(check?.detail).toContain("bash");
+    // The grant lives in the ROLE, not in bob.yaml (round 3): bob.yaml may only
+    // narrow the role, so an advice line telling the user to set
+    // tools.allowResidentShell: true in bob.yaml would send them into a load
+    // error. Name roles/<role>/role.json.
     expect(check?.fix).toContain("allowResidentShell");
+    expect(check?.fix).toContain("roles/qa/role.json");
+    expect(check?.fix).not.toMatch(/set tools\.allowResidentShell: true to keep them/);
   });
 
   it("WARN on pi auth.json mode != 0600 (contains API key)", () => {

@@ -332,20 +332,6 @@ function roleToolNames(ceiling: RoleToolCeiling): string[] {
   return resolved;
 }
 
-// pi's own flags for a resolved policy. Every launch path that starts the pi
-// CLI — bin/<name> (through `bob launch`), onboard, align — passes these, so a
-// CLI session gets the SAME policy the embedded SDK session does.
-export function toolPolicyArgs(policy: ToolPolicy): string[] {
-  // An explicit empty allowlist means "no tools at all". pi spells that
-  // --no-tools; `--tools ""` would be an empty name list, which pi reads as
-  // "no allowlist given" and leaves its defaults in place — the fail-open
-  // shape this policy exists to close.
-  const allow = policy.tools.length === 0 ? ["--no-tools"] : ["--tools", policy.tools.join(",")];
-  const exclude =
-    policy.excludeTools.length === 0 ? [] : ["--exclude-tools", policy.excludeTools.join(",")];
-  return [...allow, ...exclude];
-}
-
 // The tools a resident agent's own allowlist asked for that the resident policy
 // drops — doctor's warning, so the drop is never silent either.
 export function residentDroppedTools(policy: ToolPolicy): string[] {

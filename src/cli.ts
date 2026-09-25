@@ -17,14 +17,16 @@ import {
   type InitResult,
   initAgent,
   installService,
-  launchAgent,
+  LaunchArgError,
   loadRole,
+  parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
   restart,
   runAgent,
   runAlign,
   runDoctor,
+  runLaunch,
   runOnboard,
   runPersistent,
   servicePath,
@@ -96,9 +98,12 @@ Commands:
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check (identity, mail, channels, provider auth)
   office join <name>  Join an existing branch office
-  launch <name>       Interactive pi session for the agent, with its resolved
-                      role tool allowlist. This is what bin/<name> runs.
-                      Args after -- are passed through to pi.
+  launch <name>       The agent's session, with its resolved role tool
+                      allowlist. This is what bin/<name> runs.
+                      Takes at most ONE prompt (a multi-word one needs quotes).
+                      No prompt opens the interactive TUI. Any other argument is
+                      refused by name — a pi flag cannot be passed at all.
+                      To send a prompt that starts with "-", use: launch <name> -- --tools
   help                Show this help
 
 Roles: ea | writer | reviewer | coder | qa | custom
@@ -427,14 +432,19 @@ async function main(): Promise<number> {
         return await run(args.positional[0], prompt, args.flags);
       }
       case "launch": {
-        const name = args.positional[0];
-        if (!name) {
-          console.error("bob launch: missing <name>");
-          return 2;
+        // At most one prompt, and nothing else: the whitelist is enforced in
+        // parseLaunchArgs, which refuses a pi flag BY NAME (there is no argv to
+        // forward it to any more).
+        try {
+          const launch = parseLaunchArgs(args.positional, args.flags);
+          return await runLaunch(launch);
+        } catch (err: unknown) {
+          if (err instanceof LaunchArgError) {
+            console.error(err.message);
+            return 2;
+          }
+          throw err;
         }
-        // Everything after the name is forwarded to pi verbatim (the launcher
-        // passes its "$@" through), so a prompt or a pi flag arrives intact.
-        return await launchAgent({ name, args: args.positional.slice(1) });
       }
       case "install-service":
         if (!args.positional[0]) {

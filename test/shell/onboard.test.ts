@@ -1,217 +1,183 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { EventEmitter } from "node:events";
+// `bob onboard` — the hiring interview.
+//
+// Round 3: the interview is bob's OWN session (the ONE factory in session.ts)
+// handed to pi's InteractiveMode. bob no longer spawns the pi CLI, so the test
+// seam is a session runner, not a fake child process.
+//
+// The exception this file pins: onboarding and alignment run under the FIXED
+// setup policy (read + write) — which may EXCEED the role's ceiling. They are
+// privileged local setup commands available to whoever runs bob as that OS
+// user, and the interview's whole job is to WRITE the persona (see README
+// "Stated exceptions").
+import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { runOnboard, type SpawnFn } from "../../src/shell/onboard.js";
+import { dirname, join } from "node:path";
+import { runOnboard, type SessionRunner } from "../../src/shell/onboard.js";
+import { loadRole } from "../../src/shell/role-loader.js";
+import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
-// Fake ChildProcess that emits 'exit' on next tick. The test controls
-// what soul.md looks like before vs. after the "child" runs by writing
-// to soul.md from inside the spawn callback.
-function fakeSpawn(opts: {
-  exitCode?: number;
-  onSpawn?: (cmd: string, args: readonly string[]) => void;
-}): SpawnFn {
-  return (cmd, args) => {
-    const ee = new EventEmitter() as EventEmitter & { on: EventEmitter["on"] };
-    opts.onSpawn?.(cmd, args as readonly string[]);
-    queueMicrotask(() => ee.emit("exit", opts.exitCode ?? 0));
-    // biome-ignore lint/suspicious/noExplicitAny: minimal ChildProcess stub
-    return ee as any;
+interface Run {
+  policy: { tools: string[]; excludeTools: string[] };
+  config: { provider: string; model: string; cwd: string; appendSystemPrompt: string };
+  initialMessage: string;
+}
+
+// A session runner that records what it was handed and (optionally) does what
+// the interview does to soul.md: overwrite it with the refined persona.
+function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run: Run) => void }): {
+  runner: SessionRunner;
+  runs: Run[];
+} {
+  const runs: Run[] = [];
+  const runner: SessionRunner = async (input) => {
+    const run: Run = {
+      policy: { tools: [...input.policy.tools], excludeTools: [...input.policy.excludeTools] },
+      config: {
+        provider: input.config.provider,
+        model: input.config.model,
+        cwd: input.config.cwd,
+        appendSystemPrompt: input.config.appendSystemPrompt,
+      },
+      initialMessage: input.initialMessage,
+    };
+    runs.push(run);
+    opts.onRun?.(run);
+    if (opts.writeSoul !== undefined) {
+      writeFileSync(join(agentDir, "soul.md"), opts.writeSoul);
+    }
+    return opts.exitCode ?? 0;
+  };
+  return { runner, runs };
+}
+
+let agentDir: string;
+
+function scaffoldAgent(role = "ea"): void {
+  const root = mkdtempSync(join(tmpdir(), "bob-onboard-"));
+  agentDir = join(root, "testbot");
+  mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+  mkdirSync(join(agentDir, "work"), { recursive: true });
+  writeFileSync(join(agentDir, "soul.md"), "seed persona\n");
+  writeFileSync(
+    join(agentDir, "bob.yaml"),
+    [
+      "agent:",
+      "  id: testbot",
+      "  name: Testbot",
+      `  role: ${role}`,
+      "",
+      "provider:",
+      "  name: anthropic",
+      "  model: claude-sonnet-4-6",
+      "",
+      "tools:",
+      "  allow:",
+      "    - read",
+      "",
+    ].join("\n"),
+  );
+}
+
+function options(overrides: Partial<Parameters<typeof runOnboard>[0]> = {}) {
+  return {
+    name: "testbot",
+    role: "ea",
+    agentDir,
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    ...overrides,
   };
 }
 
 describe("runOnboard", () => {
-  let agentDir: string;
-
-  beforeEach(() => {
-    agentDir = mkdtempSync(join(tmpdir(), "bob-onboard-"));
-    mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
-    mkdirSync(join(agentDir, "work"), { recursive: true });
-    writeFileSync(join(agentDir, "soul.md"), "seed persona\n");
-    // Every launch path resolves the agent's tool policy from bob.yaml (with
-    // role.json as the ceiling) and fails closed without it, so an onboardable
-    // agent dir has to carry one. The real flow writes it via initAgent before
-    // runOnboard is called.
-    writeFileSync(
-      join(agentDir, "bob.yaml"),
-      [
-        "agent:",
-        "  id: testbot",
-        "  name: Testbot",
-        "  role: ea",
-        "",
-        "tools:",
-        "  allow:",
-        "    - read",
-        "",
-      ].join("\n"),
-    );
-  });
-
   afterEach(() => {
-    rmSync(agentDir, { recursive: true, force: true });
+    rmSync(dirname(agentDir), { recursive: true, force: true });
   });
 
-  it("spawns pi with the onboarding meta-prompt", async () => {
-    let capturedArgs: readonly string[] = [];
-    const spawnFn = fakeSpawn({
-      onSpawn: (_cmd, args) => {
-        capturedArgs = args;
-      },
-    });
-    await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "ollama-cloud",
-      model: "kimi-k2.6",
-      spawnFn,
-    });
-    expect(capturedArgs).toContain("--append-system-prompt");
-    const sysIdx = capturedArgs.indexOf("--append-system-prompt");
-    expect(capturedArgs[sysIdx + 1]).toContain("hiring interview");
-    expect(capturedArgs[sysIdx + 1]).toContain("testbot");
-    expect(capturedArgs[sysIdx + 1]).toContain("ea");
-  });
-
-  it("passes provider + model + session-dir through to pi", async () => {
-    let capturedArgs: readonly string[] = [];
-    const spawnFn = fakeSpawn({
-      onSpawn: (_cmd, args) => {
-        capturedArgs = args;
-      },
-    });
-    await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "anthropic",
-      model: "claude-opus-4-7",
-      spawnFn,
-    });
-    expect(capturedArgs).toContain("--provider");
-    expect(capturedArgs[capturedArgs.indexOf("--provider") + 1]).toBe("anthropic");
-    expect(capturedArgs).toContain("--model");
-    expect(capturedArgs[capturedArgs.indexOf("--model") + 1]).toBe("claude-opus-4-7");
-    expect(capturedArgs).toContain("--session-dir");
-    expect(capturedArgs[capturedArgs.indexOf("--session-dir") + 1]).toBe(
-      join(agentDir, ".pi-agent"),
-    );
-  });
-
-  it("reports soulUpdated=true when soul.md changes during the session", async () => {
-    const spawnFn = fakeSpawn({
-      onSpawn: () => {
-        // Simulate the agent rewriting soul.md
-        writeFileSync(join(agentDir, "soul.md"), "refined persona\n");
-      },
-    });
-    const res = await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "ollama-cloud",
-      model: "kimi-k2.6",
-      spawnFn,
-    });
+  it("reports soulUpdated=true when the interview writes soul.md", async () => {
+    scaffoldAgent();
+    const { runner } = fakeRunner({ writeSoul: "# Testbot\n\nRefined persona.\n" });
+    const res = await runOnboard(options({ sessionRunner: runner }));
     expect(res.soulUpdated).toBe(true);
-    expect(res.exitCode).toBe(0);
     expect(res.soulHashBefore).not.toBe(res.soulHashAfter);
   });
 
   it("reports soulUpdated=false when the agent never touched soul.md", async () => {
-    const spawnFn = fakeSpawn({});
-    const res = await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "ollama-cloud",
-      model: "kimi-k2.6",
-      spawnFn,
-    });
+    scaffoldAgent();
+    const { runner } = fakeRunner({});
+    const res = await runOnboard(options({ sessionRunner: runner }));
     expect(res.soulUpdated).toBe(false);
     expect(res.soulHashBefore).toBe(res.soulHashAfter);
   });
 
-  it("rejects path-traversal in name (regex defense)", async () => {
-    await expect(
-      runOnboard({
-        name: "../../etc",
-        role: "ea",
-        agentDir,
-        provider: "ollama-cloud",
-        model: "kimi-k2.6",
-        spawnFn: fakeSpawn({}),
-      }),
-    ).rejects.toThrow(/invalid agent name/);
+  it("runs the interview under the FIXED setup policy — read + write, even past the role ceiling", async () => {
+    // `reviewer`'s ceiling has no `write`: the interview cannot use the role's
+    // policy, because writing the refined persona is the job. That is the
+    // stated exception, and it is a PRIVILEGED path: a model can only reach
+    // `bob onboard` through a shell tool, and a role with a shell already has
+    // write.
+    expect(loadRole("reviewer").tools.allow).not.toContain("write");
+    scaffoldAgent("reviewer");
+    const { runner, runs } = fakeRunner({ writeSoul: "refined\n" });
+    await runOnboard(options({ role: "reviewer", sessionRunner: runner }));
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0].policy.tools).toEqual([...SETUP_TOOL_POLICY.tools]);
+    expect(runs[0].policy.tools).toEqual(["read", "write"]);
   });
 
-  it("rejects newline-injection in name (prompt-injection defense)", async () => {
-    await expect(
-      runOnboard({
-        name: "foo\nIGNORE ALL PRIOR",
-        role: "ea",
-        agentDir,
-        provider: "ollama-cloud",
-        model: "kimi-k2.6",
-        spawnFn: fakeSpawn({}),
-      }),
-    ).rejects.toThrow(/invalid agent name/);
+  it("hands the interview the agent's own config and the interview meta-prompt", async () => {
+    scaffoldAgent();
+    const { runner, runs } = fakeRunner({});
+    await runOnboard(options({ sessionRunner: runner }));
+    const run = runs[0];
+    // The session is the agent's: its cwd is the agent's work dir, and the
+    // system prompt carries the interview framing (which points at soul.md).
+    expect(run.config.cwd).toBe(join(agentDir, "work"));
+    expect(run.config.appendSystemPrompt).toContain("hiring interview");
+    expect(run.config.appendSystemPrompt).toContain(join(agentDir, "soul.md"));
+    expect(run.initialMessage).toContain("testbot");
   });
 
-  it("rejects newline-injection in role", async () => {
-    await expect(
-      runOnboard({
-        name: "testbot",
-        role: "ea\nIGNORE",
-        agentDir,
-        provider: "ollama-cloud",
-        model: "kimi-k2.6",
-        spawnFn: fakeSpawn({}),
-      }),
-    ).rejects.toThrow(/invalid role/);
+  it("maps a bob provider name to pi's provider id", async () => {
+    scaffoldAgent();
+    const { runner, runs } = fakeRunner({});
+    await runOnboard(
+      options({ provider: "exe-dev-gateway", model: "claude-x", sessionRunner: runner }),
+    );
+    expect(runs[0].config.provider).toBe("anthropic");
+    expect(runs[0].config.model).toBe("claude-x");
   });
 
-  it("propagates non-zero exit codes from pi", async () => {
-    const spawnFn = fakeSpawn({ exitCode: 130 }); // SIGINT exit code
-    const res = await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "ollama-cloud",
-      model: "kimi-k2.6",
-      spawnFn,
-    });
+  it("propagates a non-zero exit code from the session", async () => {
+    scaffoldAgent();
+    const { runner } = fakeRunner({ exitCode: 130 }); // SIGINT
+    const res = await runOnboard(options({ sessionRunner: runner }));
     expect(res.exitCode).toBe(130);
   });
 
-  it("hands the onboarding session EXACTLY the resolved allowlist", async () => {
-    // The interview session is a launch path like any other: it gets the
-    // agent's resolved policy as pi's own flags, so it cannot start wide open.
-    let capturedArgs: readonly string[] = [];
-    const spawnFn = fakeSpawn({
-      onSpawn: (_cmd, args) => {
-        capturedArgs = args;
-      },
-    });
-    await runOnboard({
-      name: "testbot",
-      role: "ea",
-      agentDir,
-      provider: "ollama-cloud",
-      model: "kimi-k2.6",
-      spawnFn,
-    });
-    const i = capturedArgs.indexOf("--tools");
-    expect(i).toBeGreaterThan(-1);
-    expect(capturedArgs[i + 1]).toBe("read");
-    expect(capturedArgs).not.toContain("--no-tools");
+  it("rejects path-traversal in name (regex defense)", async () => {
+    scaffoldAgent();
+    await expect(runOnboard(options({ name: "../../etc" }))).rejects.toThrow(/invalid agent name/);
+  });
+
+  it("rejects newline-injection in name (prompt-injection defense)", async () => {
+    scaffoldAgent();
+    await expect(runOnboard(options({ name: "foo\nIGNORE ALL PRIOR" }))).rejects.toThrow(
+      /invalid agent name/,
+    );
+  });
+
+  it("rejects newline-injection in role", async () => {
+    scaffoldAgent();
+    await expect(runOnboard(options({ role: "ea\nIGNORE" }))).rejects.toThrow(/invalid role/);
   });
 
   it("REFUSES to start the interview when the agent has no tool policy", async () => {
-    // Fail closed: no policy, no session. A missing allowlist is a load error
-    // (bob-yaml/tool-allowlist), not pi's defaults.
+    // Fail closed: no policy, no session — and no session is even built, so the
+    // runner is never called.
+    scaffoldAgent();
     writeFileSync(
       join(agentDir, "bob.yaml"),
       [
@@ -225,22 +191,8 @@ describe("runOnboard", () => {
         "",
       ].join("\n"),
     );
-    let spawned = false;
-    const spawnFn = fakeSpawn({
-      onSpawn: () => {
-        spawned = true;
-      },
-    });
-    await expect(
-      runOnboard({
-        name: "testbot",
-        role: "ea",
-        agentDir,
-        provider: "ollama-cloud",
-        model: "kimi-k2.6",
-        spawnFn,
-      }),
-    ).rejects.toThrow(/no tools: block/);
-    expect(spawned).toBe(false);
+    const { runner, runs } = fakeRunner({});
+    await expect(runOnboard(options({ sessionRunner: runner }))).rejects.toThrow(/no tools: block/);
+    expect(runs).toEqual([]);
   });
 });

@@ -75,6 +75,47 @@ describe("readTools (the tools: block schema)", () => {
   });
 });
 
+describe("readTools: the refused inline form", () => {
+  // A dedicated test for the inline shape, because it is the one form that
+  // reads as an empty block and therefore as "no policy": `readBlock` drops a
+  // block key's inline value silently, so `tools: {allow: [read]}` would leave
+  // the block empty — and empty is one step away from pi's defaults, the state
+  // this whole reader exists to make impossible. One shape for the block.
+  const inlineForms = [
+    "tools: {allow: [read]}",
+    'tools: { allow: ["read", "grep"] }',
+    "tools: []",
+    "tools: read",
+  ];
+
+  it("refuses EVERY inline value, naming the block shape to use", () => {
+    for (const line of inlineForms) {
+      let error: unknown;
+      try {
+        readTools(["agent:", "  id: testbot", "", line, ""].join("\n"));
+      } catch (err) {
+        error = err;
+      }
+      expect(error, `inline form: ${line}`).toBeInstanceOf(BobYamlError);
+      expect((error as Error).message).toContain("inline form is not supported");
+    }
+  });
+
+  it("still accepts the block form, and a trailing comment on tools:", () => {
+    const block = readTools(["tools: # the allowlist", "  allow:", "    - read", ""].join("\n"));
+    expect(block?.allow).toEqual(["read"]);
+  });
+
+  it("refuses the inline form through the whole policy resolution too", () => {
+    expect(() =>
+      resolveToolPolicy({
+        tools: readTools(["tools: {allow: [read]}", ""].join("\n")),
+        yamlText: "tools: {allow: [read]}\n",
+      }),
+    ).toThrow(/inline form is not supported/);
+  });
+});
+
 describe("readResident", () => {
   it("defaults false when absent", () => {
     expect(readResident(YAML)).toBe(false);

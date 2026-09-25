@@ -124,6 +124,8 @@ export {
   type InitOptions,
   type InitResult,
   initAgent,
+  STAMPED_CAPABILITIES,
+  stampedToolAllowlist,
 } from "./init.js";
 export {
   MailConsumer,
@@ -135,7 +137,7 @@ export {
   type OnboardOptions,
   type OnboardResult,
   runOnboard,
-  type SpawnFn,
+  type SessionRunner,
 } from "./onboard.js";
 export {
   type PersistentHandle,
@@ -147,9 +149,13 @@ export { loadRole, type RoleTemplate } from "./role-loader.js";
 export {
   type ActiveToolSource,
   assertAllowedToolsActive,
+  assertCapabilitiesLoaded,
   createPiRunSession,
+  type ExtensionErrorSource,
+  LaunchArgError,
   type LaunchOptions,
-  launchAgent,
+  mapBobProviderToPi,
+  parseLaunchArgs,
   type ResolvedRunConfig,
   type ResolveRunConfigOptions,
   type RunOptions,
@@ -161,6 +167,7 @@ export {
   resolveAgentToolPolicy,
   resolveRunConfig,
   runAgent,
+  runLaunch,
   type SessionManagerLike,
 } from "./run.js";
 export {
@@ -186,6 +193,20 @@ export {
   up,
 } from "./service.js";
 export {
+  type AuditExtensions,
+  type AuditSession,
+  auditOrExit,
+  auditToolSources,
+  createBobRuntimeFactory,
+  installReloadAudit,
+  isolatedLoaderOptions,
+  isolatedSettings,
+  promptSession,
+  runInteractiveSession,
+  SETUP_TOOL_POLICY,
+  type SessionDeps,
+} from "./session.js";
+export {
   auditToolNames,
   knownToolNames,
   PI_BUILTIN_TOOLS,
@@ -198,5 +219,4 @@ export {
   type ToolNameAudit,
   type ToolNameProblem,
   type ToolPolicy,
-  toolPolicyArgs,
 } from "./tool-allowlist.js";

@@ -15,13 +15,39 @@
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
 import type { BobRole } from "./index.js";
 import { loadRole } from "./role-loader.js";
+import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
 
 // Same character class loadRole uses — agent names are filesystem paths,
 // keep them strict-safe.
 const AGENT_NAME = /^[a-z0-9-]+$/;
+
+// The capabilities `bob init` stamps into every new agent's bob.yaml. One
+// constant, so the capabilities: list and the allowlist computed from it cannot
+// drift apart.
+export const STAMPED_CAPABILITIES: readonly string[] = ["flair"];
+
+// The allowlist a fresh agent is stamped with: the role's ceiling INTERSECTED
+// with the tools that can actually exist for this agent — pi's built-ins plus
+// the tools of the capabilities being stamped. Anything the role allows that no
+// stamped capability provides (or pi ships) is dropped, so a fresh agent of
+// every role starts with a policy that loads: a stamped agent never boots with
+// an allowlisted name nothing can register.
+export function stampedToolAllowlist(
+  roleCeiling: readonly string[],
+  capabilities: readonly string[] = STAMPED_CAPABILITIES,
+): string[] {
+  const resolvable = new Set<string>(PI_BUILTIN_TOOLS);
+  for (const name of capabilities) {
+    for (const tool of lookupCapability(name)?.manifest.provides?.tools ?? []) {
+      resolvable.add(tool);
+    }
+  }
+  return roleCeiling.filter((name) => resolvable.has(name));
+}
 
 // Flair connection defaults shared by bob.yaml and the launcher. Stock
 // `flair init` serves HTTP on 19926 (flair cli.ts DEFAULT_PORT) — the old
@@ -109,9 +135,12 @@ export function initAgent(opts: InitOptions): InitResult {
   writeFileSync(soulPath, renderSoulIdentityHeader(opts) + template.soul);
   written.push(soulPath);
 
-  // bob.yaml — canonical config
+  // bob.yaml — canonical config. The tools: allowlist is the role's ceiling
+  // intersected with the tools that can actually exist here (pi's built-ins +
+  // the stamped capabilities' tools), so a freshly initialised agent of EVERY
+  // role loads with a policy that holds.
   const yamlPath = join(agentDir, "bob.yaml");
-  writeFileSync(yamlPath, renderBobYaml(opts, template.tools.allow));
+  writeFileSync(yamlPath, renderBobYaml(opts, stampedToolAllowlist(template.tools.allow)));
   written.push(yamlPath);
 
   // .pi-agent/{models.json,auth.json} — required for pi 0.75+ to find
@@ -193,7 +222,7 @@ tools:
 ${tools}
 
 capabilities:
-  - flair
+${STAMPED_CAPABILITIES.map((c) => `  - ${c}`).join("\n")}
 
 flair:
   url: ${flairUrlFor(opts)}
@@ -246,11 +275,15 @@ fi
 
 cd "$AGENT_DIR/work"
 # EVERY session starts through \`bob launch\`, which resolves THIS agent's tool
-# policy (role.json is the ceiling, bob.yaml narrows it; pi receives the result
-# as its own --tools/--exclude-tools) and loads the agent's capability
-# extensions with their config. The launcher deliberately does NOT invoke the pi
-# binary itself: a launch path that starts pi without bob resolving the policy
-# is a session with no allowlist.
+# policy (role.json is the ceiling, bob.yaml narrows it) and builds the session
+# itself — pi's SDK, in this process. The launcher deliberately does NOT invoke
+# the pi binary: a launch path that assembled its own pi command line would let
+# the arguments below reach pi's parser, and the session's tools would stop
+# being the role's allowlist.
+#
+# bob launch takes at most ONE prompt and nothing else. "$@" is passed after
+# --, so a prompt (even one starting with "-") arrives intact and a pi flag is
+# refused by name.
 #
 # BOB_BIN picks which bob runs the session (a service unit with a minimal PATH,
 # or a test). It defaults to \`bob\` on PATH; if that is missing the exec fails
