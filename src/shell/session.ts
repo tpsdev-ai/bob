@@ -15,8 +15,9 @@
 //   (b) pi's settings and resource sources are built HERE, isolated: project
 //       trust off, no configured package installed, and the ambient user and
 //       project extension, skill, prompt-template and theme paths are never
-//       LOADED (package resolution still enumerates those before the flags that
-//       drop them apply). Context files are not enumerated at all: pi skips
+//       LOADED (package resolution still enumerates the user-level ones before the
+//       flags that drop them apply; with project trust off, project resource
+//       directories are not scanned). Context files are not enumerated at all: pi skips
 //       context-file discovery outright under `noContextFiles`, so no ambient
 //       context file is read either — and no global SYSTEM.md / APPEND_SYSTEM.md
 //       either. The only extensions that load are the declared capabilities'
@@ -211,23 +212,35 @@ export function auditOrExit(
   try {
     audit();
   } catch (err) {
-    const msg =
-      err instanceof Error
-        ? err.message
-        : err === undefined
-          ? "the failure arrived with no error value (rejected with undefined)"
-          : err === null
-            ? "the failure arrived with no error value (rejected with null)"
-            : String(err);
+    // Dispose FIRST, before anything that can itself throw: describing the
+    // failure can (a rejection value whose String() throws, or an Error whose
+    // message getter does), and nothing may stand between a failed audit and
+    // the dispose and exit below.
     try {
       session.dispose();
     } catch {
       // The audit failure is the error that matters; a dispose failure here
       // must not replace it.
     }
-    const log = deps?.log ?? ((m: string) => console.error(m));
-    log(`bob: ${what}; disposing it and ending the process before another turn can run.\n${msg}`);
-    (deps?.exit ?? ((code: number) => process.exit(code)))(1);
+    let msg: string;
+    try {
+      msg =
+        err instanceof Error
+          ? err.message
+          : err === undefined
+            ? "the failure arrived with no error value (rejected with undefined)"
+            : err === null
+              ? "the failure arrived with no error value (rejected with null)"
+              : String(err);
+    } catch {
+      msg = "the failure arrived with a value that cannot be described";
+    }
+    try {
+      const log = deps?.log ?? ((m: string) => console.error(m));
+      log(`bob: ${what}; disposing it and ending the process before another turn can run.\n${msg}`);
+    } finally {
+      (deps?.exit ?? ((code: number) => process.exit(code)))(1);
+    }
     throw err;
   }
 }

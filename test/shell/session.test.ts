@@ -435,6 +435,40 @@ describe("the audit", () => {
     }
   });
 
+  // A rejection value that cannot be described (String() throws on a
+  // null-prototype object) must not stand between a failed reload and the
+  // dispose and exit: the failure path disposes FIRST and describes after.
+  it("a reload that rejects with an UNDESCRIBABLE value still disposes and ends the session", async () => {
+    const probe = await realProbeSession(probeExtension(true));
+    try {
+      const loader = probe.loader as unknown as { reload(...args: unknown[]): Promise<void> };
+      const originalLoaderReload = loader.reload.bind(loader);
+      const undescribable = Object.create(null);
+      loader.reload = () => Promise.reject(undescribable);
+
+      let rejected: unknown = "sentinel: reload() never settled";
+      await probe.session.reload().then(
+        () => {
+          throw new Error("reload() resolved: a rejected reload must not read as success");
+        },
+        (err) => {
+          rejected = err;
+        },
+      );
+      expect(rejected, "the original rejection value comes back").toBe(undescribable);
+
+      expect(probe.disposals(), "the session is disposed").toBe(1);
+      expect(probe.exits, "the process is ended").toEqual([1]);
+      expect(probe.logs.join("\n"), "the log still says a failure arrived").toContain(
+        "a value that cannot be described",
+      );
+
+      loader.reload = originalLoaderReload;
+    } finally {
+      probe.cleanup();
+    }
+  });
+
   it("round 6: a bind that rejects with UNDEFINED ends the session — undefined is not the success signal", async () => {
     const probe = await realProbeSession(probeExtension(true));
     try {
