@@ -9,6 +9,7 @@ import {
   createCompactionReinjector,
   DEFAULT_PINNED_CAP_CHARS,
   evaluateCompletion,
+  MAX_HEADER_REASON_CHARS,
   MIN_PINNED_CAP_CHARS,
   readWorktreeStatus,
   renderWorktreeNote,
@@ -112,6 +113,54 @@ describe("compaction contract — the pinned block", () => {
     expect(block).toContain("[truncated]");
     expect(block, "the truncated portion is the remains body").toContain("PLAN-START");
     expect(block, "the task was shrunk away entirely").toContain("(none recorded)");
+  });
+
+  it("bounds the reason in the header and counts the whole header against the cap (round 4, item 2)", () => {
+    // The reason goes in the HEADER, and the header is part of the cap. An
+    // unbounded reason overflowed it: a 1,000-character reason produced a
+    // 1,315-character block under a 512-character cap.
+    const cap = MIN_PINNED_CAP_CHARS;
+    const body = { task: "T".repeat(5000), state: { lastStatedPlan: "P".repeat(2000) } };
+    const block = buildPinnedBlock({ ...body, capChars: cap, reason: "R".repeat(1000), count: 1 });
+    expect(block.length, "never exceeds the cap, whatever the reason says").toBeLessThanOrEqual(
+      cap,
+    );
+    expect(block, "and it still carries WHAT REMAINS").toContain("WHAT REMAINS:");
+    expect(block, "and its TASK header").toContain("TASK:");
+    const shown = block.slice(block.indexOf("(") + 1, block.indexOf(")"));
+    expect(shown.length, "the reason is BOUNDED in the header").toBeLessThanOrEqual(
+      MAX_HEADER_REASON_CHARS,
+    );
+    expect(shown.startsWith("R"), "the reason is still what the header shows").toBe(true);
+    expect(shown.endsWith("…"), "and its elision is marked").toBe(true);
+    // A reason short enough to fit is carried as-is, and a line break cannot
+    // split the header into extra lines.
+    expect(buildPinnedBlock({ task: "t", state: {}, reason: "threshold", count: 2 })).toContain(
+      "(threshold)",
+    );
+    const multiline = buildPinnedBlock({
+      task: "t",
+      state: {},
+      reason: "threshold\noverflow",
+      count: 2,
+    });
+    expect(multiline.split("\n")[0], "the header stays ONE line").toContain("(threshold overflow)");
+    // The header is not free space: at the same cap, a max-length reason leaves
+    // the "what remains" body LESS room than no reason does, and the block is
+    // within the cap either way.
+    const withReason = buildPinnedBlock({
+      ...body,
+      capChars: cap,
+      reason: "R".repeat(MAX_HEADER_REASON_CHARS),
+    });
+    const withoutReason = buildPinnedBlock({ ...body, capChars: cap });
+    const afterRemains = (b: string): number => (b.split("WHAT REMAINS:")[1] ?? "").length;
+    expect(withReason.length).toBeLessThanOrEqual(cap);
+    expect(withoutReason.length).toBeLessThanOrEqual(cap);
+    expect(
+      afterRemains(withoutReason),
+      "the header's reason is COUNTED against the cap",
+    ).toBeGreaterThan(afterRemains(withReason));
   });
 
   it("renderWorktreeNote handles a clean tree and no tool calls", () => {
@@ -339,6 +388,48 @@ describe("compaction contract — the reinjector", () => {
       message: { role: "assistant", content: [{ type: "text", text: "done: committed" }] },
     });
     expect(r.finalText()).toBe("done: committed");
+  });
+
+  it("keeps the final text EXACTLY as it ended, and judges emptiness on trim() only (round 4, item 1)", () => {
+    const r = createCompactionReinjector({ task: "t", inject: () => {} });
+    r.startTurn();
+    // The message ENDS with leading spaces and a trailing blank line: the
+    // completion text is the content that ended, whitespace included — not a
+    // trimmed rewrite of it.
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "  done: shipped\n\n" }] },
+    });
+    expect(r.finalText(), "kept verbatim, as it ended").toBe("  done: shipped\n\n");
+    // An exact expectedFinal must MATCH the verbatim text…
+    expect(
+      evaluateCompletion({
+        capturedText: r.finalText(),
+        compactions: 1,
+        expectedFinal: (t) => t === "  done: shipped\n\n",
+      }),
+      "an exact predicate sees the text as it ended",
+    ).toEqual({ ok: true });
+    // …and the trimmed copy is genuinely different, so this is a real contract:
+    expect(
+      evaluateCompletion({
+        capturedText: r.finalText().trim(),
+        compactions: 1,
+        expectedFinal: (t) => t === "  done: shipped\n\n",
+      }),
+    ).toEqual({ ok: false, reason: "final_shape_mismatch" });
+    // Emptiness is still judged on the TRIMMED text: whitespace-only is no
+    // final message, even though it is kept as it ended.
+    r.startTurn();
+    r.observe({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "  \n\t " }] },
+    });
+    expect(r.finalText(), "whitespace-only is still kept as it ended…").toBe("  \n\t ");
+    expect(
+      evaluateCompletion({ capturedText: r.finalText(), compactions: 1 }),
+      "…but it is NO final message",
+    ).toEqual({ ok: false, reason: "settled_after_compaction" });
   });
 
   it("tracks whether an assistant message ENDED since the boundary (round 2, item 1)", () => {

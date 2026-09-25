@@ -688,6 +688,45 @@ describe("runAgent", () => {
     expect(res.stdout).toBe("done: committed and pushed");
   });
 
+  it("cli#145 round 4: the final text is kept EXACTLY as it ended — a whitespace-padded ending matches an exact expectedFinal and exits 0", async () => {
+    // The message ends with leading spaces and a trailing blank line. The
+    // completion contract must see that text VERBATIM (only emptiness is judged
+    // on trim()), or an exact predicate fails on whitespace the run did not add.
+    const exact = "  done: shipped\n\n";
+    const s = scriptedSession([{ textDeltas: [exact] }]);
+    const { factory } = factoryReturning(s.session);
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      captureStdout: true,
+      agentsRoot,
+      expectedFinal: (t) => t === exact,
+      sessionFactory: factory,
+    });
+    expect(res.exitCode, "the exact shape matches, so the run is done").toBe(0);
+    expect(res.reason).toBeUndefined();
+    expect(res.stdout, "kept verbatim, not trimmed").toBe(exact);
+    expect(s.calls).toHaveLength(1); // no retry: the contract was met
+  });
+
+  it("cli#145 round 4: a whitespace-ONLY ending is still no final message", async () => {
+    const s = scriptedSession([{ textDeltas: ["  \n\t "] }]);
+    const { factory } = factoryReturning(s.session);
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "do the thing",
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factory,
+      });
+    });
+    expect(res?.exitCode).not.toBe(0);
+    expect(res?.reason).toBe("no_final_message");
+    expect(stderr).toContain("no_final_message");
+  });
+
   it("cli#145: a silent run with NO compaction exits non-zero with no_final_message and does not retry", async () => {
     const s = scriptedSession([{}]); // settles with no text and no compaction
     const { factory } = factoryReturning(s.session);
