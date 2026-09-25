@@ -93,7 +93,8 @@ export interface RunSessionConfig {
   // The agent's pi config dir (~/agents/<name>/.pi-agent) — holds
   // auth.json/models.json. pi's ModelRuntime reads from here.
   piAgentDir: string;
-  // pi extension sources for the agent's declared capabilities, in order.  // Each is an npm:/git:/local-path spec handed to pi's resource loader as an
+  // pi extension sources for the agent's declared capabilities, in order.
+  // Each is an npm:/git:/local-path spec handed to pi's resource loader as an
   // `additionalExtensionPaths` entry. Resolved from bob.yaml `capabilities:`
   // against the blessed catalog before the factory runs, so a fake factory in
   // tests doesn't need the catalog or filesystem. Empty when the agent
@@ -327,7 +328,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       );
       try {
         observer.startTurn(); // the retry is its own turn: its final message counts
-        await session.prompt(CONTINUE_TURN);
+        // Through the one non-interactive prompt entry point, so template and
+        // command expansion stay off by construction (not because of the text).
+        await promptSession(session, CONTINUE_TURN);
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);

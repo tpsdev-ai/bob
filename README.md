@@ -100,8 +100,10 @@ change one, the named test is what tells you.
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
   narrow it. *(`test/shell/doctor.test.ts`)*
-- **The task survives compaction, and every agent request is checked for it.**
-  A one-shot `bob run` carries its TASK, and the persistent runtime carries the
+- **The task survives compaction, and every agent request is checked for it**
+  (in `bob run`, one-shot or persistent; an interactive `bob launch` with no
+  prompt has no task and carries no contract or guard). A one-shot `bob run`
+  carries its TASK, and the persistent runtime carries the
   agent's STANDING CONTRACT (its role and cron duties), in the session's SYSTEM
   PROMPT, appended as literal text through the resource loader's
   `appendSystemPromptOverride` — never as an append-system-prompt *source*,
@@ -122,7 +124,7 @@ change one, the named test is what tells you.
   false-fail — and an AGENT REQUEST that does not carry the block fails the turn
   exactly like a failed audit: the session is disposed, the process ends, and
   the reason is named. **The guard's guarantee is that every agent request
-  carries the contract block.** The system prompt is where bob PUTS it (the
+  of a `bob run` session carries the contract block.** The system prompt is where bob PUTS it (the
   mechanism above, and it is tested); the guard proves it is still SENT. A
   capability that moves the block into the conversation still passes, because
   the model is still sent it — what must never happen is a request that goes out

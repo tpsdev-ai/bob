@@ -775,6 +775,7 @@ describe("runAgent — the completion contract (#145)", () => {
   /** A session that emits scripted events per prompt, then ends. */
   function scriptedSession(eventsForPrompt: (text: string, call: number) => unknown[]) {
     const prompts: string[] = [];
+    const promptOptions: unknown[] = [];
     const listeners: Array<(event: unknown) => void> = [];
     const session = {
       subscribe(listener: (event: unknown) => void) {
@@ -791,13 +792,14 @@ describe("runAgent — the completion contract (#145)", () => {
           ?.streamingBehavior;
         if (streaming !== undefined) return;
         prompts.push(text);
+        promptOptions.push(options);
         for (const event of eventsForPrompt(text, prompts.length)) {
           for (const listener of listeners) listener(event);
         }
       },
       dispose() {},
     } as unknown as RunSession;
-    return { session, prompts };
+    return { session, prompts, promptOptions };
   }
 
   /** Capture what a run writes to stderr, without touching the real stream. */
@@ -886,6 +888,9 @@ describe("runAgent — the completion contract (#145)", () => {
     expect(res?.reason).toBe("settled_after_compaction");
     expect(scripted.prompts).toHaveLength(2);
     expect(scripted.prompts[1]).toContain("BOB CONTINUE");
+    // The retry goes through the one non-interactive prompt entry point, so
+    // template and command expansion are off by construction.
+    expect(scripted.promptOptions[1]).toEqual({ expandPromptTemplates: false });
     expect(stderr).toContain("retrying once with a continue turn");
   });
 
