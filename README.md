@@ -184,6 +184,92 @@ change one, the named test is what tells you.
    send): capabilities are trusted code running in the same process as the
    session, and a hostile one could disable the guard outright.
 
+## `run` logs and retention
+
+Every `bob run` (but **not** `bob serve` — its persistent session never calls this
+logger) tees each session event to a per-run JSONL log at
+`~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
+(a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
+Because the log exists for post-mortems — not for replaying a growing message —
+each record is a fixed shape for its event type, bounded like this:
+
+- **A projection, not a copy.** Each event is logged as a fixed set of fields for
+  its type. Of the streamed updates, `message_update` logs the inner event's kind,
+  the content block it belongs to and its delta, and `bash_execution_update` its
+  per-chunk delta; `tool_execution_update` logs the call's identifiers only — no
+  `partialResult`, the cumulative tool output — and `queue_update` the counts, not
+  the steering/follow-up text. `entry_appended` logs a bounded summary of the
+  entry an extension appended — its type (and a custom entry's `customType`), its
+  id, and the entry's serialized size — and never the entry itself: that payload
+  is an extension's own, and a session-state snapshot in it grows with the
+  session. An event type bob does not know is logged as `{type, unknownEvent:
+  true}` with none of its payload. That is what stops a record from growing with
+  the EVENTS BEFORE IT; the log used to grow quadratically with message length
+  (15 GB of logs on a 40 GB builder disk). It does not make every record small:
+  the records that finalize something — `message_end`, `turn_end`, `agent_end`'s
+  per-run `messages`, a tool's `result` — each carry their payload once, and are
+  as large as that payload (see the closing note below).
+  (`test/shell/run-log-projection.test.ts`
+  — "projects EVERY event type in pi 0.84.3's unions to a fixed, non-growing
+  record", "logs NO payload for an event type the projection does not name", "logs
+  a growing extension entry as its identity and size — flat across events";
+  `test/shell/run-log.test.ts` — "keeps a 5,000-token streamed message's log
+  linear, not quadratic", "never logs `partial` on a message_update event",
+  "keeps a growing extension entry flat: identity and size, never the entry", "a
+  run that dies before message_end still records WHICH block each delta came
+  from".)
+- **A per-run DELTA cap** (**50 MB**; `bob run` has no flag or config key that
+  changes it). Once the log reaches it, the streamed deltas stop being written;
+  every non-delta event — tool calls and results, errors, lifecycle events, each
+  `*_end` final, and the final `done` line — keeps coming, and a single line
+  records that the **delta** cap was hit. The consequence, plainly: past the cap
+  the deltas are dropped, `message_end` still records each final message once, and
+  a crash before a `message_end` loses that message's post-cap tail.
+  ("past the per-run DELTA cap: drops streamed deltas but keeps tool/error events;
+  one delta-cap marker", "past the delta cap: message_end still records the final
+  message, in full", "a crash past the cap before any message_end leaves no
+  post-cap content".)
+- **One log per run, even in the same millisecond.** The name carries the start
+  timestamp, the run's pid and a random suffix, and the file is created
+  exclusively, so two runs that start in the same millisecond get distinct files —
+  and each file's sidecar lock belongs to that file alone. The lock is taken
+  BEFORE the log file is created, so an active log always has one.
+  ("gives two runs started in the same millisecond distinct logs — and distinct
+  locks".)
+- **A run that cannot take its lock writes no log at all.** While a run holds
+  `<log>.lock` retention leaves its log alone; without it an active log is
+  indistinguishable from a crashed run's, and a later sweep would delete it under
+  its writer. So a run whose lock cannot be created warns once — naming the lock
+  and the cause — and runs unlogged: no log file is created for it at all.
+  ("writes NO log at all when the lock cannot be created (no lock, no log)".)
+- **Retention on run start.** Before writing its own log, a run keeps the
+  **newest 5** logs untouched and then, for the older ones, deletes the
+  oldest-first until their combined size is back under a **500 MB** budget. The
+  logs left OUTSIDE that budget are exactly: the newest five, and any log
+  retention cannot show is finished — one whose lock names a live PID, and one
+  whose lock exists but cannot be read, or does not name a PID. It fails safe:
+  never prune what it cannot show is dead. A PID means the WHOLE lock content as
+  digits, so a lock reading `123garbage` is not one — `parseInt` would read it as
+  123 and decide the log's fate on a number the lock never named. A log with no
+  lock, or a lock naming a dead PID, is prunable like any other. ("retention
+  leaves an older run whose sidecar lock is live untouched", "retention fails
+  safe: a lock it cannot read or parse KEEPS the log".)
+- **Logging never throws into the run** — including creating the runs directory.
+  If the run log cannot be set up at all, the run still completes and warns once.
+  ("completes and warns ONCE when the runs directory cannot be created".)
+
+What these bounds cover, and what they leave open. Bounded: the streamed deltas,
+which stop once the log passes the cap, and retention's budget, which deletes old
+logs at run start until a series of runs is back under it. NOT bounded: every
+record that is not a streamed delta. Tool calls and results, errors, lifecycle
+records and each `*_end` final are written however many of them a run produces,
+so a run with hundreds of thousands of non-delta events has no per-run ceiling,
+and one run can pass the budget before any later sweep sees it — retention is a
+start-time sweep over old logs, not a limit on the run in front of it. The
+original failure, a log that grew with the LENGTH of the messages it recorded, is
+fixed at the source by the projection above; the cap and the budget bound what is
+left.
+
 ## Where Bob fits
 
 Bob is for small teams who want a handful of named, role-specific agents — a strategist, an EA, a reviewer — and want them to show up in mail and chat as themselves.
