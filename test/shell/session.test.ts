@@ -22,6 +22,7 @@ import { initAgent } from "../../src/shell/init.js";
 import { type RunSession, resolveRunConfig } from "../../src/shell/run.js";
 import {
   assertAllowedToolsActive,
+  assertContractGuardLoaded,
   auditOrExit,
   auditToolSources,
   createBobRuntimeFactory,
@@ -607,5 +608,45 @@ describe("installSessionAudits refuses a session it cannot wrap (bob#151 K&S rev
     expect(() => installSessionAudits(noBind, () => {})).toThrow(
       /no reload\(\)\/bindExtensions\(\) to audit after/,
     );
+  });
+});
+
+describe("assertContractGuardLoaded fails closed (bob#158 K&S review)", () => {
+  const guard = {
+    name: "bob-contract-guard",
+    factory: () => {},
+    hidden: true,
+  } as unknown as Parameters<typeof assertContractGuardLoaded>[1];
+  const loaderWith = (errors: Array<{ path: string; error: string }>) =>
+    ({ getExtensions: () => ({ extensions: [], errors }) }) as unknown as Parameters<
+      typeof assertContractGuardLoaded
+    >[0];
+
+  it("refuses the session when bob's inline guard did not load, naming it", () => {
+    expect(() =>
+      assertContractGuardLoaded(
+        loaderWith([{ path: "<inline:bob-contract-guard>", error: "boom" }]),
+        guard,
+      ),
+    ).toThrow(/inline extension did not load:[\s\S]*<inline:bob-contract-guard>: boom/);
+  });
+
+  it("does nothing when the session carries no guard", () => {
+    expect(() =>
+      assertContractGuardLoaded(
+        loaderWith([{ path: "<inline:bob-contract-guard>", error: "boom" }]),
+        undefined,
+      ),
+    ).not.toThrow();
+  });
+
+  it("ignores a declared capability's own load error (that is assertCapabilitiesLoaded's job)", () => {
+    expect(() =>
+      assertContractGuardLoaded(loaderWith([{ path: "/cap/discord", error: "no token" }]), guard),
+    ).not.toThrow();
+  });
+
+  it("passes a clean load", () => {
+    expect(() => assertContractGuardLoaded(loaderWith([]), guard)).not.toThrow();
   });
 });

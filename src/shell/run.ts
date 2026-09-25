@@ -29,8 +29,15 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
-import { readAgentRole, readCron, readResident, readTools } from "./bob-yaml.js";
+import { readAgentRole, readBlock, readCron, readResident, readTools } from "./bob-yaml.js";
 import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
+import {
+  CONTINUE_TURN,
+  createCompactionObserver,
+  evaluateCompletion,
+  readWorktreeStatus,
+  type SilenceReason,
+} from "./compaction-contract.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { loadRole } from "./role-loader.js";
 import {
@@ -123,6 +130,20 @@ export interface RunSessionConfig {
   // in it).
   tools: string[];
   excludeTools?: string[];
+  // #145 — the CONTRACT carried in the system prompt. A one-shot `bob run`
+  // carries its TASK (`taskContract`); the persistent runtime carries the
+  // agent's STANDING CONTRACT (`standingContract`). They are mutually
+  // exclusive, and the factory refuses a config with both. The contract is
+  // appended to the system prompt as LITERAL TEXT through the loader's
+  // `appendSystemPromptOverride`, so it is present on every model call and no
+  // context compaction can remove it — which is why neither field is a message.
+  // A blank value is refused (see assertContractText).
+  taskContract?: string;
+  standingContract?: string;
+  // Cap on the appended contract block, in characters (default
+  // DEFAULT_CONTRACT_CAP_CHARS). The block is cut with a visible truncation
+  // marker; the heading is never the part that is cut.
+  contractCapChars?: number;
 }
 
 // The injectable seam. Production builds a real pi AgentSession through bob's
@@ -152,6 +173,15 @@ export interface RunOptions {
   agentsRoot?: string;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
+  // #145: the ONE completion contract this run is judged by. When the caller
+  // (or bob.yaml) declares an expected final-assistant-message shape, a run only
+  // settles exit 0 when the captured final text matches it. Omitted → the
+  // contract is "the final message is non-empty".
+  expectedFinal?: (text: string) => boolean;
+  // #145: cap on the contract block appended to the system prompt. Defaults to
+  // DEFAULT_CONTRACT_CAP_CHARS. A blank task is refused before the session
+  // starts, whatever this is.
+  contractCapChars?: number;
 }
 
 export interface RunResult {
@@ -166,6 +196,10 @@ export interface RunResult {
   // Captured assistant final text, populated only when captureStdout=true.
   // Undefined otherwise.
   stdout?: string;
+  // #145: the named reason a one-shot run refused to report success
+  // (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
+  // Undefined on exit 0.
+  reason?: SilenceReason;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -183,6 +217,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       "runAgent: a prompt is required (the SDK prompt path sends one prompt and exits)",
     );
   }
+  // #145: a BLANK task is refused here, BEFORE the session starts. The task is
+  // carried in the session's system prompt for its whole life, so an empty one
+  // would spend a whole run on nothing while looking like a real one.
+  if (opts.prompt.trim().length === 0) {
+    throw new Error(
+      "runAgent: refusing to start a session with a blank task — the task is carried in the session's system prompt, and an empty one guarantees nothing",
+    );
+  }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
   const { agentDir, provider, model, config } = resolveRunConfig({
@@ -192,7 +234,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
-  const session = await factory(config);
+  // #145: the task is the session's CONTRACT, carried in its system prompt
+  // through the factory. (It is ALSO the first user message below, so a provider
+  // that shows only messages still sees it; see the README's stated limits.)
+  const session = await factory({
+    ...config,
+    taskContract: opts.prompt,
+    ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
+  });
 
   // Tee every session event to a per-run JSONL log so a mid-run death (e.g. an
   // ollama rate-limit/cap) is post-mortem-able instead of leaving no trace.
@@ -211,24 +260,107 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     }
   };
 
-  let captured = "";
-  const unsubscribe = session.subscribe((event) => {
-    // Post-mortem trail first: record EVERY event (tool calls, results, errors,
-    // retries), not just text — that's what makes a death diagnosable.
+  const unsubscribeLog = session.subscribe((event) => {
+    // Post-mortem trail: record EVERY event (tool calls, results, errors,
+    // retries), not just text — that's what makes a death diagnosable. The
+    // FINAL-MESSAGE capture is NOT here: it lives on the compaction observer
+    // below, which knows the compaction boundary.
     appendRunLog({ t: new Date().toISOString(), event });
-    // Stream the assistant's text deltas — same event shape the SDK
-    // quickstart and every examples/sdk/*.ts use. UNCHANGED: the captured
-    // accumulation stays byte-identical so the returned final text is stable.
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      captured += event.assistantMessageEvent.delta;
-    }
   });
 
   let exitCode = 0;
+  let reason: SilenceReason | undefined;
+
+  // #145: after every non-aborted compaction the observer sends ONE best-effort
+  // "what remains" note (a steer: the last thing the agent said, git status,
+  // recent tool calls).
+  // It is never load-bearing — the task is in the system prompt — so a failed
+  // note is logged and nothing else happens. The observer also owns the
+  // final-message boundary the judge reads.
+  const observer = createCompactionObserver({
+    worktreeStatus: () => readWorktreeStatus(config.cwd),
+    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    log: (m) => process.stderr.write(`${m}\n`),
+  });
+  const unsubscribeContract = session.subscribe((event) => observer.observe(event));
+
+  // The FINAL message is the text of the LAST assistant message that ENDED since
+  // the last compaction (or the last startTurn): text streamed before a
+  // compaction can never satisfy the completion contract, streamed deltas are
+  // never substituted for the ended message's own content, and the observer
+  // clears its capture on `compaction_end` and at every `startTurn()`.
+  const finalTextNow = (): string => {
+    const tracked = observer.finalText();
+    if (tracked.length > 0) return tracked;
+    // NOTHING ended with text since the boundary. Only a transport that ended no
+    // assistant message at all may fall back to session state — and NEVER after
+    // a compaction, whose boundary the session's message list cannot express.
+    if (observer.compactions() > 0 || observer.assistantEnded()) return "";
+    return lastAssistantText(session) ?? "";
+  };
+
+  // ONE judge: the first evaluation and the one after the continue turn are the
+  // same call, so the run cannot be judged by two different rules.
+  const judge = (): { ok: boolean; reason?: SilenceReason } =>
+    evaluateCompletion({
+      capturedText: finalTextNow(),
+      compactions: observer.compactions(),
+      expectedFinal: opts.expectedFinal,
+    });
+
   try {
+    observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
     // expansion — see session.ts promptSession).
     await promptSession(session, opts.prompt);
+
+    // #145: the completion contract. Before this, a run settled `exitCode 0`
+    // whenever the prompt promise resolved — including after a compaction that
+    // erased the plan. Now it settles 0 ONLY with a final message (matching an
+    // expected shape when one is declared).
+    let outcome = judge();
+    if (!outcome.ok && outcome.reason === "settled_after_compaction") {
+      // Settled after a compaction with no final message: retry ONCE with an
+      // explicit "continue from the state above" turn. This retry is meaningful
+      // because the task is still in the system prompt.
+      process.stderr.write(
+        `bob run ${opts.name}: settled after a context compaction with no final message — retrying once with a continue turn\n`,
+      );
+      try {
+        observer.startTurn(); // the retry is its own turn: its final message counts
+        // Through the one non-interactive prompt entry point, so template and
+        // command expansion stay off by construction (not because of the text).
+        await promptSession(session, CONTINUE_TURN);
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
+      }
+      outcome = judge();
+    }
+    if (!outcome.ok) {
+      // NEVER exit 0 for silence. Name the reason and print what we can (the
+      // dirty paths, if the agent's cwd is a git worktree).
+      exitCode = 1;
+      reason = outcome.reason;
+      process.stderr.write(
+        `bob run ${opts.name}: REFUSING to report success — ${reason}` +
+          (reason === "settled_after_compaction"
+            ? " (the session settled after a context compaction without a final message)"
+            : reason === "final_shape_mismatch"
+              ? " (the final message did not match the declared shape)"
+              : " (the session settled without a final message)") +
+          "\n",
+      );
+      const status = readWorktreeStatus(config.cwd);
+      if (status.length > 0) {
+        process.stderr.write(`bob run ${opts.name}: uncommitted paths in ${config.cwd}:\n`);
+        for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
+      } else {
+        process.stderr.write(
+          `bob run ${opts.name}: no dirty paths in ${config.cwd} (nothing to commit there)\n`,
+        );
+      }
+    }
   } catch (err) {
     exitCode = 1;
     // Surface the error instead of swallowing it: an underscore-ignored catch
@@ -241,18 +373,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
     );
   } finally {
-    unsubscribe();
+    unsubscribeLog();
+    unsubscribeContract();
   }
 
   // Final record so a reader can tell a clean completion from a truncated log.
   appendRunLog({ done: true, exitCode });
 
-  // Fallback: if no text_delta events were observed (some transports don't
-  // stream), pull the last assistant text from session state.
-  if (captured.length === 0) {
-    const fromState = lastAssistantText(session);
-    if (fromState !== undefined) captured = fromState;
-  }
+  // The run's final text — exactly the content of the last assistant message
+  // that ended since the last compaction (or the session-state fallback for a
+  // transport that ended no message at all).
+  const finalStdout = finalTextNow();
 
   session.dispose();
 
@@ -261,7 +392,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     agentDir,
     provider,
     model,
-    ...(opts.captureStdout ? { stdout: captured } : {}),
+    ...(opts.captureStdout ? { stdout: finalStdout } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
 }
 
@@ -294,6 +426,9 @@ export interface ResolvedRunConfig {
   // bob.yaml `cron:` entries (validated). Only the PERSISTENT runtime uses
   // these (it schedules them into the live session); `bob run` ignores them.
   cron: CronEntry[];
+  // bob.yaml `agent:` block (id/name/role). The persistent runtime's standing
+  // contract — the text carried in its system prompt — is built from it.
+  agent: { id?: string; name?: string; role?: string };
   // The resolved tool policy (role ceiling + bob.yaml narrowing + the resident
   // decision), so a caller that only has the result can still hand the SAME
   // policy to a session it starts itself (`bob launch` does exactly that).
@@ -498,6 +633,22 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // while the tool is simply absent). Throws naming the offender and the fix.
   const toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
 
+  // The agent block (id/name/role). Read through readBlock, but a malformed
+  // `agent:` block must not stop the agent from running: it is only used to
+  // render the persistent runtime's standing contract, which falls back to the
+  // agent's directory name.
+  let agentBlock: Record<string, unknown> | undefined;
+  try {
+    agentBlock = readBlock(yamlText, "agent");
+  } catch {
+    agentBlock = undefined;
+  }
+  const agent = {
+    ...(typeof agentBlock?.id === "string" ? { id: agentBlock.id } : {}),
+    ...(typeof agentBlock?.name === "string" ? { name: agentBlock.name } : {}),
+    ...(typeof agentBlock?.role === "string" ? { role: agentBlock.role } : {}),
+  };
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -514,7 +665,15 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     tools: toolPolicy.tools,
     excludeTools: toolPolicy.excludeTools,
   };
-  return { agentDir, provider, model, config, cron: parseCron(yamlText), policy: toolPolicy };
+  return {
+    agentDir,
+    provider,
+    model,
+    config,
+    cron: parseCron(yamlText),
+    agent,
+    policy: toolPolicy,
+  };
 }
 
 // The capability-load and active-tool checks live in session.ts, next to the
