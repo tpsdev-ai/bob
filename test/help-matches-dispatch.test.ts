@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { execSync } from "node:child_process";
 import { join } from "node:path";
+import { type SpawnError, spawnNode } from "./cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
@@ -12,10 +12,15 @@ const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 // per-command result is trusted.
 const CONTROL_CMD = "definitely-not-a-command";
 
+/**
+ * Probes that dist/cli.js reached the command dispatcher (and did not miss or
+ * crash before it), so the per-command "unknown command" checks below are
+ * trusted rather than passing vacuously.
+ */
 function cliProbeOk(): { ok: boolean; out: string } {
   let out = "";
   try {
-    out = execSync(`node ${CLI} ${CONTROL_CMD} 2>&1`, { encoding: "utf8" });
+    out = spawnNode([CLI, CONTROL_CMD]);
   } catch (e) {
     out =
       (e as { stdout?: string; stderr?: string }).stdout ?? (e as { stderr?: string }).stderr ?? "";
@@ -51,7 +56,7 @@ function advertisedCommands(help: string): string[] {
 describe("help matches dispatch (#161)", () => {
   // The built CLI's help is the contract under test, so run the compiled
   // dist, not the source.
-  const help = execSync(`node ${CLI} help`, { encoding: "utf8" });
+  const help = spawnNode([CLI, "help"]);
   const commands = advertisedCommands(help);
 
   // Prove the CLI probe reached the dispatcher before trusting any per-command
@@ -81,14 +86,25 @@ describe("help matches dispatch (#161)", () => {
   // distinct name in the report (the same race a single test spawning several
   // commands hit — see test/cli.test.ts).
   it.each(commands)("%s is not rejected as an unknown command", (cmd) => {
+    let output = "";
+    let killed = false;
     try {
-      execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+      output = spawnNode([CLI, cmd]);
     } catch (err) {
-      const e = err as { stdout?: string; message?: string };
-      // A real, dispatched command may still exit non-zero (e.g. a bare
-      // `node dist/cli.js onboard` prints "missing <name>"). What we assert is
-      // only that it is not refused as unknown — the help-vs-dispatch gap #161.
-      expect(e.stdout || e.message).not.toContain("unknown command");
+      const cause = err as SpawnError;
+      // A kill/timeout (a termination signal, or killed) means the command
+      // never completed: fail here rather than reading partial captured
+      // output as "not unknown" (accepted).
+      killed = cause.killed || Boolean(cause.signal);
+      output = cause.stdout;
     }
+    // A command that timed out (killed) never completed; the test must fail.
+    if (killed) {
+      throw new Error(`spawn for command '${cmd}' was killed (timed out)`);
+    }
+    // A real, dispatched command may still exit non-zero (e.g. a bare `bob
+    // onboard` prints "missing <name>"). We assert only that it is not
+    // refused as unknown — the help-vs-dispatch gap #161.
+    expect(output).not.toContain("unknown command");
   });
 });

@@ -1,20 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type SpawnError, spawnNode } from "./cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
 describe("bob CLI", () => {
   it("prints help on `bob help`", () => {
-    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "help"]);
     expect(out).toContain("Bob — moldable office-agent shell");
     expect(out).toContain("Commands:");
   });
 
   it("onboard --dry-run shows the plan without writing", () => {
-    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
     expect(out).toContain("[bob onboard] PLAN (--dry-run)");
     expect(out).toContain("agent.id        = testbot");
     expect(out).toContain("agent.role      = ea");
@@ -22,9 +22,7 @@ describe("bob CLI", () => {
 
   it("onboard fails for unknown role", () => {
     try {
-      execSync(`node ${CLI} onboard testbot --role nonexistent --dry-run 2>&1`, {
-        encoding: "utf8",
-      });
+      spawnNode([CLI, "onboard", "testbot", "--role", "nonexistent", "--dry-run"]);
       throw new Error("expected non-zero exit");
     } catch (err: any) {
       expect(err.stdout || err.message).toContain("unknown role");
@@ -32,33 +30,37 @@ describe("bob CLI", () => {
   });
 
   it("init is a soft alias for onboard (with deprecation hint)", () => {
-    const out = execSync(`node ${CLI} init testbot --role ea --dry-run 2>&1`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "init", "testbot", "--role", "ea", "--dry-run"]);
     expect(out).toContain("renamed to `bob onboard`");
     expect(out).toContain("[bob onboard] PLAN (--dry-run)");
   });
 
   it("onboard --dry-run states that it will provision the Flair identity (#93/#94)", () => {
-    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
     expect(out).toContain("flair identity  = Agent record + soul at http://127.0.0.1:19926");
   });
 
   it("onboard --dry-run --no-flair states the identity is SKIPPED", () => {
-    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run --no-flair`, {
-      encoding: "utf8",
-    });
+    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run", "--no-flair"]);
     expect(out).toContain("flair identity  = SKIPPED (--no-flair)");
   });
 
   it("onboard --dry-run honours --flair-url", () => {
-    const out = execSync(
-      `node ${CLI} onboard testbot --role ea --dry-run --flair-url http://hub.example:19926`,
-      { encoding: "utf8" },
-    );
+    const out = spawnNode([
+      CLI,
+      "onboard",
+      "testbot",
+      "--role",
+      "ea",
+      "--dry-run",
+      "--flair-url",
+      "http://hub.example:19926",
+    ]);
     expect(out).toContain("Agent record + soul at http://hub.example:19926");
   });
 
   it("help documents the admin credential channel — and that it is never a flag", () => {
-    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "help"]);
     expect(out).toContain("FLAIR_ADMIN_PASS");
     expect(out).toContain("Never pass it as a flag");
     expect(out).toContain("--no-flair");
@@ -68,25 +70,31 @@ describe("bob CLI", () => {
   });
 
   it("onboard --no-interactive renders the plan with interview SKIPPED", () => {
-    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run --no-interactive`, {
-      encoding: "utf8",
-    });
+    const out = spawnNode([
+      CLI,
+      "onboard",
+      "testbot",
+      "--role",
+      "ea",
+      "--dry-run",
+      "--no-interactive",
+    ]);
     expect(out).toContain("interview       = SKIPPED");
   });
 
   it("onboard --dry-run plans an interactive pi session by default", () => {
-    const out = execSync(`node ${CLI} onboard testbot --role ea --dry-run`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
     expect(out).toContain("interview       = interactive pi session");
   });
 
   it("help advertises align flags", () => {
-    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "help"]);
     expect(out).toContain("align <name>");
     expect(out).toContain("--agent-dir");
   });
 
   it("help advertises persistent run + lifecycle commands", () => {
-    const out = execSync(`node ${CLI} help`, { encoding: "utf8" });
+    const out = spawnNode([CLI, "help"]);
     expect(out).toContain("run <name>");
     expect(out).toContain("PERSISTENTLY"); // run-with-no-prompt = persistent on-duty
     expect(out).not.toContain("serve <name>"); // serve is retired
@@ -102,7 +110,7 @@ describe("bob CLI", () => {
   // own name in the report — the shape test/shell/role-loader.test.ts uses.
   it.each(["up", "down", "restart", "install-service"] as const)("%s requires a <name>", (cmd) => {
     try {
-      execSync(`node ${CLI} ${cmd} 2>&1`, { encoding: "utf8" });
+      spawnNode([CLI, cmd]);
       throw new Error(`expected non-zero exit for bare '${cmd}'`);
     } catch (err) {
       const e = err as { stdout?: string; message?: string };
@@ -130,12 +138,9 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   // stderr (console.error) into the output bun:test captures on a non-zero exit.
   function runCli(args: string, home: string): string {
     try {
-      return execSync(`node ${CLI} ${args} 2>&1`, {
-        encoding: "utf8",
-        env: { ...process.env, HOME: home },
-      });
+      return spawnNode([CLI, ...args.split(" ")], { env: { ...process.env, HOME: home } });
     } catch (err: unknown) {
-      const e = err as { stdout?: string; message?: string };
+      const e = err as SpawnError;
       return e.stdout || e.message || "";
     }
   }
@@ -167,10 +172,9 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     const home = scratchHome();
     let out = "";
     let threw = false;
-    // execSync throws on a non-zero exit, which is the signal we expect here.
+    // spawnNode throws on a non-zero exit, which is the signal we expect here.
     try {
-      out = execSync(`node ${CLI} onboard testbot --role ea --dry-run=yes 2>&1`, {
-        encoding: "utf8",
+      out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run=yes"], {
         env: { ...process.env, HOME: home },
       });
     } catch (err: unknown) {
@@ -193,13 +197,12 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     let status = 0;
     let out = "";
     try {
-      execSync(`node ${CLI} onboard testbot --role ea --dry-run= 2>&1`, {
-        encoding: "utf8",
+      spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run="], {
         env: { ...process.env, HOME: home },
       });
     } catch (err: unknown) {
-      const e = err as { status?: number; stdout?: string };
-      status = e.status ?? -1;
+      const e = err as SpawnError;
+      status = e.code ?? -1;
       out = e.stdout ?? "";
     }
     expect(status).toBe(2);
@@ -242,13 +245,12 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     let status = 0;
     let out = "";
     try {
-      execSync(`node ${CLI} align testbot --no-flair=yes 2>&1`, {
-        encoding: "utf8",
+      spawnNode([CLI, "align", "testbot", "--no-flair=yes"], {
         env: { ...process.env, HOME: home },
       });
     } catch (err: unknown) {
-      const e = err as { status?: number; stdout?: string };
-      status = e.status ?? -1;
+      const e = err as SpawnError;
+      status = e.code ?? -1;
       out = e.stdout ?? "";
     }
     expect(status).toBe(2);

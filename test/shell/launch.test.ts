@@ -27,6 +27,7 @@ import {
   type RunSessionConfig,
   runLaunch,
 } from "../../src/shell/run.js";
+import { CLI_SPAWN_TIMEOUT_MS } from "../cli-spawn.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const AGENT = "testbot";
@@ -144,6 +145,8 @@ describe("bob launch through the real CLI", () => {
   it("refuses a pi flag by name, with exit 2", () => {
     const cli = makeCli(root);
     const run = spawnSync(cli.bobShim, ["launch", AGENT, "--tools", "read,bash"], {
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
       env: cli.env,
       encoding: "utf8",
     });
@@ -155,6 +158,8 @@ describe("bob launch through the real CLI", () => {
   it("refuses an unknown flag by name, with exit 2", () => {
     const cli = makeCli(root);
     const run = spawnSync(cli.bobShim, ["launch", AGENT, "--totally-made-up"], {
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
       env: cli.env,
       encoding: "utf8",
     });
@@ -169,6 +174,8 @@ describe("bob launch through the real CLI", () => {
     // — which is well past the argument whitelist. If `--tools` had been treated
     // as a flag, the refusal would fire first.
     const run = spawnSync(cli.bobShim, ["launch", "no-such-agent", "--", "--tools"], {
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
       env: cli.env,
       encoding: "utf8",
     });
@@ -373,13 +380,23 @@ describe("the generated launcher", () => {
   });
 
   it("reaches `bob launch <name> -- <prompt>` with the caller's single argument", () => {
-    const run = spawnSync(launcher, ["hello"], { env, encoding: "utf8" });
+    const run = spawnSync(launcher, ["hello"], {
+      env,
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     expect(run.status).toBe(0);
     expect(recordedArgv()).toEqual(["launch", AGENT, "--", "hello"]);
   });
 
   it("reaches `bob launch <name> --` with NO prompt when called with no arguments", () => {
-    const run = spawnSync(launcher, [], { env, encoding: "utf8" });
+    const run = spawnSync(launcher, [], {
+      env,
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     expect(run.status).toBe(0);
     expect(recordedArgv()).toEqual(["launch", AGENT, "--"]);
   });
