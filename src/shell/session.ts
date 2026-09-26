@@ -33,6 +33,7 @@
 //       audit too — the session may be half-rebuilt, and the mode would
 //       otherwise stay open on a tool state nobody audited.
 
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type AgentSessionRuntime,
@@ -80,6 +81,112 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
   resident: false,
   allowResidentShell: false,
 };
+
+// ── openrouter: bob OWNS the provider (bob#183 round 3) ────────────────────────
+//
+// Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
+// a check that has to enumerate pi's precedence rules will always lag them (a
+// selected model entry's own `baseUrl`, or `providers.openrouter.apiKey`, is
+// resolved by pi from the file just the same). Round 3 changes the SHAPE: for
+// `openrouter`, bob CONSTRUCTS the effective provider in memory at session
+// creation and hands it to pi's session services, so nothing pi could read from
+// the on-disk files takes effect — and any on-disk `openrouter` entry is refused
+// rather than merged.
+
+/** The one endpoint an openrouter session may reach. */
+export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+
+/** pi's extension provider-definition shape (not exported by pi at the root). */
+export type OpenrouterProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
+
+/**
+ * The provider definition bob builds IN MEMORY for `openrouter`: the FIXED
+ * endpoint, the API key passed EXPLICITLY (never read from disk), the
+ * openai-completions api, and the declared model with NO per-model `baseUrl`.
+ */
+export function buildOpenrouterProvider(input: {
+  model: string;
+  apiKey: string;
+}): OpenrouterProviderConfig {
+  return {
+    name: "openrouter",
+    baseUrl: OPENROUTER_BASE_URL,
+    apiKey: input.apiKey,
+    api: "openai-completions",
+    models: [
+      {
+        id: input.model,
+        name: input.model,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 16384,
+      },
+    ],
+  };
+}
+
+/**
+ * Refuse when the on-disk pi config carries ANY `openrouter` entry: bob owns the
+ * provider, and an entry in the editable `models.json` (a provider block, a
+ * per-model `baseUrl`, a `providers.openrouter.apiKey`) or a stored credential
+ * in `auth.json` is never merged. Names the file. Absent/unparseable files are
+ * treated as no entry (there is nothing to find).
+ */
+export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
+  const read = (path: string): Record<string, unknown> => {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+  const modelsPath = join(piAgentDir, "models.json");
+  const providers = (read(modelsPath).providers ?? {}) as Record<string, unknown>;
+  if (Object.hasOwn(providers, "openrouter")) {
+    throw new Error(
+      `bob: refusing to start an openrouter session — ${modelsPath} carries a providers.openrouter entry; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
+    );
+  }
+  const authPath = join(piAgentDir, "auth.json");
+  if (Object.hasOwn(read(authPath), "openrouter")) {
+    throw new Error(
+      `bob: refusing to start an openrouter session — ${authPath} carries a stored openrouter credential; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
+    );
+  }
+}
+
+/** The env key, or a refusal naming the variable (never read from disk). */
+export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): string {
+  const key = (env.OPENROUTER_API_KEY ?? "").trim();
+  if (!key) {
+    throw new Error(
+      "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk.",
+    );
+  }
+  return key;
+}
+
+/**
+ * The whole openrouter step, run inside the ONE factory (every entry path goes
+ * through it): refuse an on-disk openrouter entry, require the env key, then
+ * REGISTER bob's in-memory provider so pi resolves openrouter from bob, not the
+ * file. Returns the constructed definition (for a test to assert on).
+ */
+export function registerOpenrouterProvider(
+  modelRuntime: ModelRuntime,
+  input: { model: string; piAgentDir: string; env?: NodeJS.ProcessEnv },
+): OpenrouterProviderConfig {
+  assertNoOnDiskOpenrouter(input.piAgentDir);
+  const provider = buildOpenrouterProvider({
+    model: input.model,
+    apiKey: requireOpenrouterApiKey(input.env),
+  });
+  modelRuntime.registerProvider("openrouter", provider);
+  return provider;
+}
 
 // Diagnostics + the process-exit seam, injectable so a test can watch a failed
 // audit end the session without killing the test runner.
@@ -474,6 +581,12 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         authPath: join(agentDir, "auth.json"),
         modelsPath: join(agentDir, "models.json"),
       }));
+    // openrouter is bob's OWN provider (round 3): construct it in memory and
+    // refuse any on-disk entry, so no `models.json`/`auth.json` field can
+    // redirect the endpoint or the key. Runs BEFORE any session exists.
+    if (config.provider === "openrouter") {
+      registerOpenrouterProvider(modelRuntime, { model: config.model, piAgentDir: agentDir });
+    }
     const services = await createAgentSessionServices({
       cwd,
       agentDir,

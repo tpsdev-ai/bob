@@ -355,40 +355,37 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
 
   const piProvider = resolvePiProvider(opts.provider);
   const isGateway = opts.provider === "exe-dev-gateway";
+  // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
+  // is NEVER written here (bob#183) — so its auth.json carries no key entry.
+  const isEnvKeyProvider = opts.provider === "openrouter";
   const baseUrl = knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
 
   const modelsPath = join(piDir, "models.json");
   const authPath = join(piDir, "auth.json");
 
-  writeFileSync(
-    modelsPath,
-    `${JSON.stringify(
-      {
-        providers: {
-          [piProvider]: {
-            ...(baseUrl ? { baseUrl } : {}),
-            models: [{ id: opts.model, name: opts.model }],
-          },
+  // openrouter is bob's OWN provider (bob#183 round 3): its endpoint and its
+  // model declaration are constructed IN MEMORY at session creation, and an
+  // on-disk openrouter entry is REFUSED — so bob writes NO openrouter provider
+  // block here. Every other provider still declares its model on disk.
+  const providers = isEnvKeyProvider
+    ? {}
+    : {
+        [piProvider]: {
+          ...(baseUrl ? { baseUrl } : {}),
+          models: [{ id: opts.model, name: opts.model }],
         },
-      },
-      null,
-      2,
-    )}\n`,
-  );
+      };
+  writeFileSync(modelsPath, `${JSON.stringify({ providers }, null, 2)}\n`);
   writeFileSync(
     authPath,
-    `${JSON.stringify(
-      {
-        [piProvider]: { type: "api_key", key },
-      },
-      null,
-      2,
-    )}\n`,
+    `${JSON.stringify(isEnvKeyProvider ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`,
   );
   chmodSync(authPath, 0o600);
 
-  if (!isGateway) {
+  if (isEnvKeyProvider) {
+    console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
+  } else if (!isGateway) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );

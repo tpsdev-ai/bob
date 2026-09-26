@@ -1322,7 +1322,16 @@ function resolveProviderAndModel(
   if (!bobProvider || !model) {
     throw new Error(`bob run ${name}: bob.yaml is missing provider.name and/or provider.model`);
   }
-  return { provider: mapBobProviderToPi(bobProvider), model };
+  const provider = mapBobProviderToPi(bobProvider);
+  // The openrouter key is read from the environment AT RUN TIME and never written
+  // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
+  // request is made (bob#183).
+  if (provider === "openrouter" && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
+    throw new Error(
+      `bob run ${name}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+    );
+  }
+  return { provider, model };
 }
 
 // Read a scalar `key: value` field from inside the top-level `provider:` block.
