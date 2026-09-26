@@ -379,6 +379,83 @@ stay textual, like a Discord snowflake.
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
 
+### `reachy` (jarvis) — S3 skeleton
+
+The `reachy` capability is the jarvis office agent's body, built as a **skeleton on
+a stub sidecar** (no hardware, no model, no network). Operator guarantees, each
+naming its test (`test/capabilities/reachy/`):
+
+- **A malformed sidecar line does nothing, and the wire is STRICT.** Every wire
+  type — including the outer envelope — has `additionalProperties: false`; lines
+  are decoded and schema-checked before policy. An unknown field, a bad shape, or
+  an oversized line is dropped with an OrgEvent `reachy.malformed`. The line bound
+  (64 KiB) applies PER COMPLETE LINE and is counted in **UTF-8 BYTES**, not
+  characters: bytes are buffered as they arrive and a line is decoded only once it
+  is complete and under the bound, so a multi-byte transcript that is over the
+  bound in bytes is refused even when its character count is under it. An oversized
+  line is discarded up to AND including its newline (one malformed), so a payload
+  on the same line cannot slip through, the next line parses, and a large chunk of
+  short lines is fully retained. The stub's health line carries exactly the fields
+  the schema defines. (`round5.test.ts`; `round4.test.ts`; `sidecar-stub.test.ts`.)
+- **Record ids are unique ACROSS processes.** Every default record id is
+  `<agentId>-<random UUID>` — no per-process counter, no wall clock — and the
+  reachy MEMORY and OrgEvent writes use the same construction, so two bob
+  processes with one agentId never overwrite each other. (`capability.test.ts`
+  round 4.)
+- **The replay proof and the key proof measure what they claim.** Completion is
+  the stub's explicit end-of-replay marker, and the expected event count and
+  outcomes are pinned CONSTANTS independent of the fixture (a truncated replay
+  fails); the key-read proof makes the fixture dir traversable (0711) and asserts
+  a 0644 control file IS readable while the 0600 fixtures are NOT, so it isolates
+  the file mode. (`sidecar-stub.test.ts`.)
+- **`reachy_state` is a PLACEHOLDER** (declared in the manifest as
+  `placeholderTools`): the command channel has no request/response correlation
+  yet, so it returns no sidecar state. (`round4.test.ts`.)
+- **A memory is written only when addressed AND speakerVerified** — `private`,
+  author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
+  (`reachy.test.ts` (a)/(b)/(c)/(d).)
+- **No memory without its audit, and the audit is durable, exact-id and honest
+  about the OUTCOME.** The OrgEvent is the SAME record shape the observatory emits
+  (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
+  record id; the MEMORY then carries the id of the OUTCOME event — the `written`
+  event, NEVER the attempt. SUCCESS is returned only when the `written` event is
+  persisted under that EXACT pre-generated id AND read back as the `written` outcome
+  whose targetIds contain this memory (the store's reported id must match the
+  pre-generated id, and `getById` must return that event). If the memory exists and
+  its `written` audit failed — a thrown write, a mismatched id, or a null readback —
+  the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
+  and the memory is RETAINED (bob's flair client cannot delete it); "why do you know
+  this" then returns NOTHING for it, because the read side explains a memory only
+  from a `written` event that TARGETS it. A memory write that fails outright is
+  `reachy.memory.failed` too (with the error class, linked to the attempt and
+  logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
+  `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a
+  full UUID (never a timestamp plus a short suffix), so two events never collide.
+  (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
+- **Every command goes through the gate** — `reachy_look` / `reachy_say` /
+  `reachy_frame` share the admit path with proposals (mute, rate gate, one
+  OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
+  **`reachy_say` accepts NO memory reference at all** — the tool's SCHEMA rejects an
+  extra argument (`additionalProperties: false`), and pi validates tool arguments
+  BEFORE `execute`, so a live pi call never reaches the refusal; a DIRECT caller of
+  `execute` still gets an audited OrgEvent `reachy.refused`. `answer` is OFF (fail
+  closed). (`reachy.test.ts` items 2a/2b/3; `round4.test.ts`.)
+- **The visitor acknowledgement rate slot is reserved SYNCHRONOUSLY.** The socket
+  path runs line handlers concurrently, so the one-per-minute acknowledge slot is
+  taken before any awaited audit write (and rolled back if the audit fails) — two
+  visitor lines arriving while the store is slow cannot both acknowledge.
+  (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
+- **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
+  `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
+  the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub
+  running as that user — that is S2's sandbox slice.) `sidecar-stub.test.ts`.
+
+What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),
+any body/head motion on real hardware, or memory-backed speech. **Trust model:** a
+sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-member
+mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
+by bob's gate (bob#180 §4).
+
 ## Status
 
 `0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.

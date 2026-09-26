@@ -53,7 +53,14 @@ export interface FlairClient {
   search(query: string, limit?: number): Promise<FlairSearchHit[]>;
   write(
     content: string,
-    opts?: { durability?: Durability; supersedes?: string },
+    opts?: {
+      id?: string;
+      durability?: Durability;
+      supersedes?: string;
+      visibility?: string;
+      authorId?: string;
+      metadata?: Record<string, unknown>;
+    },
   ): Promise<{ id: string }>;
   get(id: string): Promise<FlairMemory | null>;
 }
@@ -221,17 +228,33 @@ export class FlairHttpClient implements FlairClient {
 
   async write(
     content: string,
-    opts: { durability?: Durability; supersedes?: string } = {},
+    opts: {
+      id?: string;
+      durability?: Durability;
+      supersedes?: string;
+      visibility?: string;
+      authorId?: string;
+      metadata?: Record<string, unknown>;
+    } = {},
   ): Promise<{ id: string }> {
-    const id = `${this.agentId}-${this.now()}`;
+    // A record id is UNIQUE PER WRITE, across PROCESSES too: an explicit `id`,
+    // else agent + a random UUID. NEVER a per-process counter and NEVER the
+    // wall clock — two processes with the same agentId both started a counter at
+    // 0, so their first records deterministically collided and overwrote each
+    // other (bob#180 round 4).
+    const id = opts.id ?? `${this.agentId}-${this.uuid()}`;
     const body: Record<string, unknown> = {
       id,
-      agentId: this.agentId,
+      agentId: opts.authorId ?? this.agentId,
       content,
       durability: opts.durability ?? "standard",
       createdAt: new Date(this.now()).toISOString(),
     };
     if (opts.supersedes) body.supersedes = opts.supersedes;
+    // Optional provenance (reachy S3): visibility / author label / metadata.
+    // The signature is still over the agent's own key — authorId is a label.
+    if (opts.visibility) body.visibility = opts.visibility;
+    if (opts.metadata) body.metadata = opts.metadata;
     await this.signedFetch("PUT", `/Memory/${encodeURIComponent(id)}`, body);
     return { id };
   }
