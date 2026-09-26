@@ -1,6 +1,7 @@
 // reachy/query.ts — "why do you know this" (spec §3.4). For a memory jarvis wrote,
-// return the PERSISTED OrgEvent that created it — durable across a restart, read
-// by the memory's correlation id. A library function with a test; S3 adds no tool.
+// return the PERSISTED OrgEvent that created it — the `written` OUTCOME event, never
+// the attempt — durable across a restart, read by the memory's correlation id.
+// A library function with a test; S3 adds no tool.
 
 import type { OrgEventStore } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
@@ -30,12 +31,14 @@ export async function explainMemory(
   if (typeof orgEventId !== "string") return null;
   const event = await deps.store.getById(orgEventId);
   if (!event) return null;
+  // The memory's metadata carries the speakerId (the `written` event's targetIds
+  // carry the memory id, not the speaker).
+  const speakerId = mem?.metadata?.speakerId;
   return {
     memoryId,
     orgEvent: event,
     authorId: event.authorId,
     createdAtMs: event.tsMs,
-    // The reachy events carry the speakerId in targetIds.
-    speakerId: event.targetIds?.[0],
+    ...(typeof speakerId === "string" ? { speakerId } : {}),
   };
 }

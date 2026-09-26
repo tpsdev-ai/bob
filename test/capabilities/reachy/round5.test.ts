@@ -25,7 +25,9 @@ class NoCommands implements ReachyCommands {
 class SlowStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
   delayMs = 0;
+  fail = false;
   async write(event: OrgEvent): Promise<{ id: string }> {
+    if (this.fail) throw new Error("event store unavailable");
     if (this.delayMs > 0) await new Promise((r) => setTimeout(r, this.delayMs));
     this.all.push(event);
     return { id: event.id };
@@ -146,6 +148,22 @@ describe("reachy round 5 item 2: two concurrent visitor lines cannot both acknow
     expect(acks.length).toBe(1);
     expect(store.all.filter((e) => e.kind === "reachy.acknowledge").length).toBe(1);
   });
+
+  it("a FAILED audit write ROLLS THE SLOT BACK, so the next visitor line can acknowledge", async () => {
+    const store = new SlowStore();
+    const h = harness({ store, enrolment: {} });
+    // The reservation is taken synchronously; the audit then FAILS.
+    store.fail = true;
+    const first = await h.wired.handleLine(visitorLine);
+    expect(first).toEqual({ kind: "refused", action: "acknowledge", reason: "audit write failed" });
+    // The slot is RELEASED (rolled back), not left reserved by a write that never landed.
+    expect(h.state.lastAcknowledgeAtMs).toBeUndefined();
+    // The very next line is therefore admitted rather than blocked by a stale slot.
+    store.fail = false;
+    const second = await h.wired.handleLine(visitorLine);
+    expect(second).toEqual({ kind: "ephemeral", acknowledged: true });
+    expect(store.all.filter((e) => e.kind === "reachy.acknowledge").length).toBe(1);
+  });
 });
 
 // ── item 3: attempt → written/failed, never an unqualified "wrote" ────────────
@@ -251,12 +269,25 @@ describe("reachy round 5 item 4: event ids are full UUIDs, not a time + short su
       nowMs: () => 1,
       memory: { writePrivate: async () => ({ id: "m" }) } as MemoryWriter,
     });
-    // Two refusals at the SAME fixed clock.
+    // Two refusals at the SAME fixed clock (a valid `say` shape, refused because
+    // the transcript is not addressed).
     await h.wired.handleLine(
-      JSON.stringify({ type: "proposal", action: "say", args: {}, confidence: 0.5, inputs: [] }),
+      JSON.stringify({
+        type: "proposal",
+        action: "say",
+        args: { text: "hi" },
+        confidence: 0.5,
+        inputs: [],
+      }),
     );
     await h.wired.handleLine(
-      JSON.stringify({ type: "proposal", action: "say", args: {}, confidence: 0.5, inputs: [] }),
+      JSON.stringify({
+        type: "proposal",
+        action: "say",
+        args: { text: "hi" },
+        confidence: 0.5,
+        inputs: [],
+      }),
     );
     const refused = h.store.all.filter((e) => e.kind === "reachy.refused").map((e) => e.id);
     expect(refused.length).toBe(2);

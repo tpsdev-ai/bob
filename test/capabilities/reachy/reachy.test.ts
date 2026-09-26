@@ -211,8 +211,9 @@ describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", ()
       store: h2.store,
     });
     expect(why).not.toBeNull();
-    // The ATTEMPT event is what explainMemory reads back by exact id (round 5).
-    expect(why!.orgEvent.kind).toBe("reachy.memory.attempt");
+    // The `written` OUTCOME event is what explainMemory reads back by exact id
+    // (round 6 item 1): a memory resolves to its outcome, NEVER to the attempt.
+    expect(why!.orgEvent.kind).toBe("reachy.memory.written");
   });
 
   it("item 2a: reachy_say refuses ANY memory reference (any name), and audits reachy.refused", async () => {

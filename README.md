@@ -417,13 +417,17 @@ naming its test (`test/capabilities/reachy/`):
 - **No memory without its audit, and the audit is durable, exact-id and honest
   about the OUTCOME.** The OrgEvent is the SAME record shape the observatory emits
   (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
-  record id, then the memory carries that id, then a SECOND correlated event records
-  the outcome — `reachy.memory.written` (with the memory id) or `reachy.memory.failed`
-  (with the error class, linked to the attempt, and logged) — so a failed write never
-  leaves an unqualified "wrote". A failed audit write means no memory; "why do you
-  know this" reads the event back by EXACT id (`GET /Memory/<id>`). Every reachy event
-  id is a full UUID (never a timestamp plus a short suffix), so two events never
-  collide. (`round5.test.ts`; `reachy.test.ts` item 2.)
+  record id; the MEMORY then carries the id of the OUTCOME event — the `written`
+  event, NEVER the attempt — and that `written` event is persisted BEFORE any success
+  is returned. So a memory always resolves to its `written` event, and an unaudited
+  memory is never a success: if the `written` audit write fails after the memory
+  exists, the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED
+  refusal. A memory write that fails outright is `reachy.memory.failed` too (with the
+  error class, linked to the attempt and logged) — never an unqualified "wrote". A
+  failed audit write means no memory; "why do you know this" reads the `written` event
+  back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a full UUID (never a
+  timestamp plus a short suffix), so two events never collide. (`round5.test.ts`;
+  `round6.test.ts`; `reachy.test.ts` item 2.)
 - **Every command goes through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one
   OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
@@ -436,7 +440,7 @@ naming its test (`test/capabilities/reachy/`):
   path runs line handlers concurrently, so the one-per-minute acknowledge slot is
   taken before any awaited audit write (and rolled back if the audit fails) — two
   visitor lines arriving while the store is slow cannot both acknowledge.
-  (`round5.test.ts`; `reachy.test.ts`.)
+  (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
 - **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
   `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
   the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub

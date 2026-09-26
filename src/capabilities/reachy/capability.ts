@@ -9,6 +9,7 @@ import { type TSchema, Type } from "typebox";
 import {
   admitAction,
   decideTranscript,
+  isValidActionArgs,
   type OrgEvent,
   type PolicyState,
   type ProposalAction,
@@ -129,6 +130,23 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     return { kind: "refused", action, reason };
   }
 
+  /** A malformed line/proposal is itself audited as `reachy.malformed`, FULL
+   *  UUID id, and NEVER sent (round 6 item 2). */
+  async function malformed(reason: string): Promise<DecisionSummary> {
+    const tsMs = state.nowMs();
+    await audit({
+      id: `evt_reachy.malformed_${uuid()}`,
+      kind: "reachy.malformed",
+      authorId: "jarvis",
+      summary: `dropped a malformed sidecar line: ${reason}`,
+      targetIds: [],
+      createdAt: new Date(tsMs).toISOString(),
+      nonce: uuid(),
+      tsMs,
+    });
+    return { kind: "malformed", reason };
+  }
+
   /** Admit ONE action (proposal or tool) — one OrgEvent per admitted command. */
   async function admitAndRun(
     action: ProposalAction,
@@ -136,6 +154,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     confidence: number,
     inputs: string[],
   ): Promise<DecisionSummary> {
+    // The args are untrusted: validate them BY ACTION before the policy runs, so
+    // a string yaw / extra field / prose-shaped arg is `reachy.malformed` and is
+    // NEVER sent (round 6 item 2). `ask` is one of the speech actions.
+    if (!isValidActionArgs(action, args)) {
+      return malformed(`proposal action '${action}' failed its argument schema`);
+    }
     const decision = admitAction(action, args, confidence, inputs, state, lastTranscript);
     if (decision.kind === "drop") return { kind: "drop" };
     if (decision.kind === "none") return { kind: "none" };
@@ -250,18 +274,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     if (state.mute) return { kind: "drop" };
 
     if (decoded.kind === "malformed") {
-      const tsMs = state.nowMs();
-      await audit({
-        id: `evt_reachy.malformed_${uuid()}`,
-        kind: "reachy.malformed",
-        authorId: "jarvis",
-        summary: `dropped a malformed sidecar line: ${decoded.reason}`,
-        targetIds: [],
-        createdAt: new Date(tsMs).toISOString(),
-        nonce: uuid(),
-        tsMs,
-      });
-      return { kind: "malformed", reason: decoded.reason };
+      return malformed(decoded.reason);
     }
     if (decoded.kind === "health" || decoded.kind === "presence") return { kind: "none" };
 
@@ -271,15 +284,35 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       if (decision.kind === "drop") return { kind: "drop" };
       if (decision.kind === "none") return { kind: "none" };
       if (decision.kind === "memory") {
-        // THREE correlated events (round 5 item 3): the ATTEMPT (intent) is
-        // written first with an exact id, the memory carries that id, and a
-        // SECOND event records the OUTCOME — `written` (with the memory id) or
-        // `failed` (with the error class) — so a failed write never leaves an
-        // unqualified "wrote", and the failure is LOGGED, never swallowed.
+        // THREE correlated events (round 5 item 3 / round 6 item 1): the ATTEMPT
+        // (intent) is written first with an exact id; the memory then carries the
+        // id of the OUTCOME event — the `written` event, NEVER the attempt — and
+        // that `written` event is persisted BEFORE any success is returned. If the
+        // `written` write fails after the memory exists, there is NO success: a
+        // linked `reachy.memory.failed` is logged and the result is an UNAUDITED
+        // refusal. bob's flair client has no delete, so the memory stays (carrying
+        // the now-missing `written` id) and `explainMemory` returns nothing.
         const attempt = decision.orgEvent;
         const attemptId = orgEventRecordId(attempt);
         const persisted = await audit(attempt);
         if (!persisted) return refuse("memory", "audit write failed — memory NOT written");
+
+        // Pre-generate the OUTCOME event so the memory can carry ITS record id: a
+        // memory must resolve to a `written` event, never the attempt.
+        const tsMs = state.nowMs();
+        const written: OrgEvent = {
+          id: `evt_reachy.memory.written_${uuid()}`,
+          kind: "reachy.memory.written",
+          authorId: "jarvis",
+          summary: "", // filled once the memory id is known
+          refId: attemptId,
+          targetIds: [],
+          createdAt: new Date(tsMs).toISOString(),
+          nonce: uuid(),
+          tsMs,
+        };
+        const writtenId = orgEventRecordId(written);
+
         let id: string;
         try {
           ({ id } = await memory.writePrivate({
@@ -287,7 +320,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
             metadata: {
               speakerId: decoded.transcript.speakerId as string,
               correlationId: `corr_${uuid()}`,
-              orgEventId: attemptId,
+              orgEventId: writtenId,
             },
           }));
         } catch (err) {
@@ -307,17 +340,41 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           log(`reachy: memory write failed after attempt ${attemptId} (${klass}): ${detail}`);
           return refuse("memory", `memory write failed after attempt: ${detail}`, attemptId);
         }
-        await audit({
-          id: `evt_reachy.memory.written_${uuid()}`,
-          kind: "reachy.memory.written",
-          authorId: "jarvis",
-          summary: `wrote the private memory ${id} for the verified speaker ${decoded.transcript.speakerId as string}`,
-          refId: attemptId,
-          targetIds: [id],
-          createdAt: new Date(state.nowMs()).toISOString(),
-          nonce: uuid(),
-          tsMs: state.nowMs(),
-        });
+
+        written.summary = `wrote the private memory ${id} for the verified speaker ${decoded.transcript.speakerId as string}`;
+        written.targetIds = [id];
+
+        // SUCCESS only after the `written` event is PERSISTED (round 6 item 1).
+        // A memory without its `written` audit is UNAUDITED, never a success.
+        let outcomePersisted = true;
+        try {
+          await store.write(written);
+        } catch (err) {
+          outcomePersisted = false;
+          const klass = err instanceof Error ? err.name : "Error";
+          const detail = err instanceof Error ? err.message : String(err);
+          await audit({
+            id: `evt_reachy.memory.failed_${uuid()}`,
+            kind: "reachy.memory.failed",
+            authorId: "jarvis",
+            summary: `memory ${id} written but its 'written' audit FAILED (${klass}): ${detail} — UNAUDITED`,
+            refId: attemptId,
+            targetIds: [id],
+            createdAt: new Date(state.nowMs()).toISOString(),
+            nonce: uuid(),
+            tsMs: state.nowMs(),
+          });
+          log(
+            `reachy: the 'written' audit for memory ${id} failed after the memory was created (${klass}): ${detail} — refusing (unaudited)`,
+          );
+        }
+        if (!outcomePersisted) {
+          return refuse(
+            "memory",
+            "the memory exists but its written-event audit failed — unaudited",
+            attemptId,
+          );
+        }
         return { kind: "memory", memoryId: id };
       }
       if (decision.orgEvent) {

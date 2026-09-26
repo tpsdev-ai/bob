@@ -19,7 +19,7 @@
 //     OrgEvents.
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 
 export type ProposalAction =
@@ -56,6 +56,31 @@ export const PROPOSAL_SCHEMA = Type.Object(
 /** True when `p` is a valid typed proposal (never prose). */
 export function isValidProposal(p: unknown): boolean {
   return Value.Check(PROPOSAL_SCHEMA, p);
+}
+
+/**
+ * Per-action ARGUMENT schemas (spec §3.3, round 6 item 2). The proposal's `args`
+ * is untrusted sidecar input, so it is validated BY ACTION before anything is
+ * admitted: `look` takes TYPED numbers (a string yaw is malformed, not admitted),
+ * and every schema is `additionalProperties: false` so an extra field is dropped.
+ * In v1 NO speech action carries a memory input — and `ask` IS speech (the speech
+ * gate on `inputs` lives in `admitAction`).
+ */
+const ACTION_ARG_SCHEMAS: Record<ProposalAction, TSchema> = {
+  ignore: Type.Object({}, { additionalProperties: false }),
+  look: Type.Object({ yaw: Type.Number(), pitch: Type.Number() }, { additionalProperties: false }),
+  acknowledge: Type.Object({}, { additionalProperties: false }),
+  frame: Type.Object({}, { additionalProperties: false }),
+  answer: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  think: Type.Object({}, { additionalProperties: false }),
+  ask: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  say: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+};
+
+/** True when `args` matches the schema for `action` (an extra field is rejected). */
+export function isValidActionArgs(action: ProposalAction, args: unknown): boolean {
+  const schema = ACTION_ARG_SCHEMAS[action];
+  return schema !== undefined && Value.Check(schema, args);
 }
 
 export interface Proposal {
@@ -228,8 +253,11 @@ export function admitAction(
   const isAddressed = transcript ? addressed(transcript.text, state.wakeName) : false;
   const proposal: Proposal = { action, args, confidence, inputs };
 
-  if (action === "answer" || (action === "say" && inputs.length > 0)) {
-    // v1: `say` accepts NO memory reference at all — any input is a refusal.
+  // v1: NO speech action accepts a memory reference — and `ask` IS speech (round 6
+  // item 2), so an `ask` proposal carrying a memory input is refused, never sent
+  // as a `say`.
+  const isSpeech = action === "say" || action === "ask";
+  if (action === "answer" || (isSpeech && inputs.length > 0)) {
     return { kind: "refused", action, reason: "memory-backed speech is off in v1 (fail closed)" };
   }
   if (action === "think") return { kind: "refused", action, reason: "think injects no turn in S3" };

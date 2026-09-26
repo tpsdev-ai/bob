@@ -2,8 +2,9 @@
 //
 // The extension reads its RESOLVED config from one env var the Bob loader sets
 // (BOB_CAP_REACHY, a JSON blob) — config only, never a secret. The capability
-// holds no keys and reads no key files; the sidecar runs as its own user and
-// talks to bob only through the socket.
+// holds no keys and reads no key files, and it talks to the sidecar only through
+// the socket. In S3 the sidecar is a STUB launched as the agent's OWN user; it is
+// NOT run as its own OS user here (that is S2 — see index.ts).
 
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
