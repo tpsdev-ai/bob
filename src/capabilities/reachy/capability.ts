@@ -290,8 +290,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         // that `written` event is persisted BEFORE any success is returned. If the
         // `written` write fails after the memory exists, there is NO success: a
         // linked `reachy.memory.failed` is logged and the result is an UNAUDITED
-        // refusal. bob's flair client has no delete, so the memory stays (carrying
-        // the now-missing `written` id) and `explainMemory` returns nothing.
+        // refusal. bob's flair client has no delete, so the memory stays, carrying
+        // the pre-generated `written` id; `explainMemory` reads exactly that id, so
+        // it explains the memory only if that event was persisted anyway (a store
+        // that persists and then throws) and targets the memory.
         const attempt = decision.orgEvent;
         const attemptId = orgEventRecordId(attempt);
         const persisted = await audit(attempt);

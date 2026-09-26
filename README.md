@@ -425,7 +425,8 @@ naming its test (`test/capabilities/reachy/`):
   the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
   and the memory is RETAINED (bob's flair client cannot delete it); a refusal does
   NOT assert that no written event targeting it exists — the query explains a memory
-  exactly when a `written` event targeting it is present in the store, so a store
+  when the `written` id in its metadata resolves to a `written` event whose `targetIds`
+  contain that memory (an exact-id read, not a search), so a store
   that persists the `written` event and then throws is refused yet still explains the
   memory (the persist-then-throw case is `round7.test.ts` item 3c). A memory write
   that fails outright is
