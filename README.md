@@ -423,14 +423,17 @@ naming its test (`test/capabilities/reachy/`):
   that reports none is accepted on readback). If the memory exists and
   its `written` audit failed — a thrown write, a mismatched id, or a null readback —
   the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
-  and the memory is RETAINED (bob's flair client cannot delete it); "why do you know
-  this" then returns nothing for it — a refusal does not assert that no
-  written event targeting it exists; the query explains a memory exactly when
-  such an event is present in the store. A memory write that fails outright is
+  and the memory is RETAINED (bob's flair client cannot delete it); a refusal does
+  NOT assert that no written event targeting it exists — the query explains a memory
+  exactly when a `written` event targeting it is present in the store, so a store
+  that persists the `written` event and then throws is refused yet still explains the
+  memory (the persist-then-throw case is `round7.test.ts` item 3c). A memory write
+  that fails outright is
   `reachy.memory.failed` too (with the error class, linked to the attempt and
   logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
   `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a
   full UUID (never a timestamp plus a short suffix), so two events never collide.
+  Every reachy event id is `evt_<kind>_<uuid>` (the record id is `orgevent-<event id>`).
   (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
 - **Every command goes through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one

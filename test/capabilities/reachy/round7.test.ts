@@ -9,6 +9,7 @@ import {
   type ReachyCommands,
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
+import { flairOrgEventStore } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
 
@@ -272,28 +273,31 @@ class BadTargetIdsStore implements OrgEventStore {
   async getById(id: string): Promise<OrgEvent | null> {
     const e = this.byId.get(id);
     if (!e) return null;
-    // Buggy shaped readback: targetIds is a string (substring-matches in includes).
-    return { ...e, targetIds: "mem-1-other" } as unknown as OrgEvent;
+    // Buggy shaped readback: targetIds is a string that CONTAINS the event's
+    // REAL target ids — so a bare `.includes(id)` substring match would wrongly
+    // succeed, and ONLY the Array.isArray guard rejects it (round 9 item 2:
+    // built from the id the store saw, so removing the guard turns (b) RED).
+    const real = Array.isArray(e.targetIds) ? e.targetIds.join(" ") : "";
+    return { ...e, targetIds: `mem-1-other ${real}` } as unknown as OrgEvent;
   }
 }
 /**
- * A store whose write PERSISTs then THROWS — the event is stored but the
- * write call throws after successfully persisting.
+ * A store whose write PERSISTS the event and THEN THROWS — for the `written`
+ * OUTCOME event only (round 9 item 3): the store holds it but the handler never
+ * sees the success. Every OTHER event (the attempt, the linked `failed`) is
+ * persisted normally, so the memory IS created and the refusal is the UNAUDITED
+ * kind, not the "audit write failed — memory NOT written" kind.
  */
 class PersistThenThrowStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
   readonly byId = new Map<string, OrgEvent>();
-  throwAfterWrite = false;
   async write(event: OrgEvent): Promise<{ id: string }> {
-    if (this.throwAfterWrite) {
-      const id = orgEventRecordId(event);
-      this.byId.set(id, event);
-      this.all.push(event);
-      throw new Error("boom after persist");
-    }
     const id = orgEventRecordId(event);
     this.byId.set(id, event);
     this.all.push(event);
+    if (event.kind === "reachy.memory.written") {
+      throw new Error("boom after persisting the written outcome event");
+    }
     return { id };
   }
   async getById(id: string): Promise<OrgEvent | null> {
@@ -341,35 +345,78 @@ describe("reachy round 7 item 2b: a string targetIds in readback → ReadbackTar
   });
 });
 
-describe("reachy round 7 item 2c: a write that persists then throws", () => {
-  it("is a refusal AND explainMemory still returns the persisted event", async () => {
+describe("reachy round 9 item 3c: a store whose write PERSISTS the written outcome then THROWS", () => {
+  it("is the UNAUDITED refusal, and explainMemory on the SAME store still returns the persisted event", async () => {
+    // ONE store: it persists EVERY event, then throws on the `written` outcome.
     const store = new PersistThenThrowStore();
-    store.throwAfterWrite = true;
     const h = harness(store);
     const r = await h.wired.handleLine(speakerLine);
-    expect(r.kind).toBe("refused");
+    expect(r.kind).toBe("refused"); // assertion: the handler refuses
+    expect("reason" in r && r.reason).toContain("unaudited"); // assertion: UNAUDITED, not "NOT written"
+    // The memory WAS created (the attempt audit succeeded; only `written` threw).
+    expect(h.memory.last).toBeDefined();
+    const written = store.all.find((e) => e.kind === "reachy.memory.written");
+    expect(written).toBeDefined(); // assertion: the written outcome IS persisted
 
-    // Test explainMemory: use a store that can actually read.
-    const store2 = new PersistThenThrowStore();
-    store2.throwAfterWrite = false; // normal mode for reads
-    const writtenEvent = {
-      id: "evt_mine",
-      kind: "reachy.memory.written",
-      authorId: "jarvis",
-      summary: "wrote the private memory",
-      targetIds: ["mem-1"],
-      createdAt: new Date(1).toISOString(),
-      nonce: "n",
-      tsMs: 1,
-    };
-    await store2.write(writtenEvent);
-    const why = await explainMemory("mem-1", {
-      getMemory: () =>
-        Promise.resolve({ metadata: { orgEventId: orgEventRecordId(writtenEvent) } }),
-      store: store2,
+    // The SAME store the handler used: explainMemory returns the persisted event
+    // for the handler-created memory (id "mem-written-1").
+    const why = await explainMemory("mem-written-1", {
+      getMemory: () => Promise.resolve({ metadata: h.memory.last!.metadata }),
+      store,
     });
-    // The persist-then-throw case: a memory can exist even when write throws.
-    expect(why).not.toBeNull();
+    expect(why).not.toBeNull(); // assertion: the persisted event explains the memory
     expect(why!.orgEvent.kind).toBe("reachy.memory.written");
+    expect(why!.orgEvent.targetIds).toContain("mem-written-1");
+  });
+});
+
+describe("reachy round 9 item 1a2: the ADAPTER requires a present targetIds array", () => {
+  /** A fake flair client: `get` returns the given JSON content, verbatim. */
+  const fakeClient = (content: unknown) => ({
+    async write(): Promise<{ id: string }> {
+      return { id: "x" };
+    },
+    async get(): Promise<{ content?: string } | null> {
+      return { content: JSON.stringify(content) };
+    },
+  });
+
+  it("returns null from the ADAPTER when the readback has NO targetIds", async () => {
+    // Drive the adapter's parse (flairOrgEventStore), NOT a fake store: a well
+    // formed record apart from a MISSING targetIds must read back as null.
+    const store = flairOrgEventStore(
+      fakeClient({
+        id: "evt_a2",
+        kind: "reachy.memory.written",
+        authorId: "jarvis",
+        summary: "",
+        createdAt: new Date(1).toISOString(),
+        nonce: "n",
+        tsMs: 1,
+      }),
+    );
+    expect(await store.getById(orgEventRecordId(ev({ id: "evt_a2", kind: "x" })))).toBeNull();
+  });
+
+  it("returns null from the ADAPTER when a targetIds element is not a string", async () => {
+    const store = flairOrgEventStore(
+      fakeClient(
+        ev({
+          id: "evt_a2b",
+          kind: "reachy.memory.written",
+          targetIds: ["ok", 7 as unknown as string],
+        }),
+      ),
+    );
+    expect(await store.getById(orgEventRecordId(ev({ id: "evt_a2b", kind: "x" })))).toBeNull();
+  });
+
+  it("CONTROL: returns the event from the ADAPTER when targetIds IS an array of strings", async () => {
+    const store = flairOrgEventStore(
+      fakeClient(ev({ id: "evt_a2c", kind: "reachy.memory.written", targetIds: ["mem-1"] })),
+    );
+    const got = await store.getById(orgEventRecordId(ev({ id: "evt_a2c", kind: "x" })));
+    expect(got).not.toBeNull();
+    expect(got!.targetIds).toEqual(["mem-1"]);
   });
 });

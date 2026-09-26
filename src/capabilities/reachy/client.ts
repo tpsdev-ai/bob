@@ -189,24 +189,16 @@ export function flairOrgEventStore(client: {
       if (!record || typeof record.content !== "string") return null;
       try {
         const parsed: unknown = JSON.parse(record.content);
-        // Shape validation: kind is string, id is string, targetIds if
-        // present is an array of strings — anything else → null (both
-        // callers see "no event").
-        if (
-          typeof parsed !== "object" ||
-          parsed === null ||
-          !("id" in parsed) ||
-          !("kind" in parsed) ||
-          typeof (parsed as { kind: unknown }).kind !== "string" ||
-          typeof (parsed as { id: unknown }).id !== "string" ||
-          ("targetIds" in parsed && !Array.isArray((parsed as { targetIds: unknown }).targetIds)) ||
-          ("targetIds" in parsed
-            ? ((parsed as { targetIds: unknown[] }).targetIds as unknown[])
-            : []
-          ).some((t) => typeof t !== "string")
-        ) {
-          return null;
-        }
+        // The adapter contract (round 9 item 1): a parsed OrgEvent is accepted
+        // ONLY when kind is a string, id is a string, AND targetIds is PRESENT
+        // as an array of strings. A record with no targetIds is not an OrgEvent
+        // (the membership sites read targetIds), so both callers see "no event".
+        if (typeof parsed !== "object" || parsed === null) return null;
+        const candidate = parsed as { kind?: unknown; id?: unknown; targetIds?: unknown };
+        if (typeof candidate.kind !== "string") return null;
+        if (typeof candidate.id !== "string") return null;
+        if (!Array.isArray(candidate.targetIds)) return null;
+        if (candidate.targetIds.some((t) => typeof t !== "string")) return null;
         return parsed as OrgEvent;
       } catch {
         return null;
