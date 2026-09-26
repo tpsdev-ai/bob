@@ -53,7 +53,13 @@ export interface FlairClient {
   search(query: string, limit?: number): Promise<FlairSearchHit[]>;
   write(
     content: string,
-    opts?: { durability?: Durability; supersedes?: string },
+    opts?: {
+      durability?: Durability;
+      supersedes?: string;
+      visibility?: string;
+      authorId?: string;
+      metadata?: Record<string, unknown>;
+    },
   ): Promise<{ id: string }>;
   get(id: string): Promise<FlairMemory | null>;
 }
@@ -221,17 +227,27 @@ export class FlairHttpClient implements FlairClient {
 
   async write(
     content: string,
-    opts: { durability?: Durability; supersedes?: string } = {},
+    opts: {
+      durability?: Durability;
+      supersedes?: string;
+      visibility?: string;
+      authorId?: string;
+      metadata?: Record<string, unknown>;
+    } = {},
   ): Promise<{ id: string }> {
     const id = `${this.agentId}-${this.now()}`;
     const body: Record<string, unknown> = {
       id,
-      agentId: this.agentId,
+      agentId: opts.authorId ?? this.agentId,
       content,
       durability: opts.durability ?? "standard",
       createdAt: new Date(this.now()).toISOString(),
     };
     if (opts.supersedes) body.supersedes = opts.supersedes;
+    // Optional provenance (reachy S3): visibility / author label / metadata.
+    // The signature is still over the agent's own key — authorId is a label.
+    if (opts.visibility) body.visibility = opts.visibility;
+    if (opts.metadata) body.metadata = opts.metadata;
     await this.signedFetch("PUT", `/Memory/${encodeURIComponent(id)}`, body);
     return { id };
   }

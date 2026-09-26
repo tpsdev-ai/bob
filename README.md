@@ -379,6 +379,27 @@ stay textual, like a Discord snowflake.
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
 
+### `reachy` (jarvis) — S3 skeleton
+
+The `reachy` capability is the jarvis office agent's body, built here as a
+skeleton on a **stub sidecar** (no hardware, no model, no network): it registers
+the four tools (`reachy_look`, `reachy_say`, `reachy_state`, `reachy_frame`),
+consumes the sidecar's JSON-line events, and applies the memory + audit policy in
+bob. A transcript that is addressed (`jarvis` — a string compare in bob, never
+the sidecar's flag) AND speakerVerified (the speaker id maps to a member in
+bob's own enrolment) is written as a `private` memory authored by `jarvis` with
+the speakerId in metadata, through the flair capability client; every admitted
+action (`look`, `acknowledge`, `ask`) emits an OrgEvent carrying the proposal's
+confidence and its inputs' ids, and "why do you know this" returns that event.
+Non-member speech is ephemeral — never stored, never recalled.
+
+S3 does **not** do: any turn injection into the pi session (that is S1, behind
+bob#147), any body/head motion on real hardware, or memory-backed speech —
+`answer` is OFF and `say` refuses a memory input, fail-closed, because the v1
+enrolment is empty and a sidecar `speakerId` is an untrusted assertion. The
+sidecar runs as its own unprivileged user and cannot read a 0600 key fixture
+(proven by a test that runs when the host can create the user).
+
 ## Status
 
 `0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
