@@ -436,7 +436,7 @@ naming its test (`test/capabilities/reachy/`):
   full UUID (never a timestamp plus a short suffix), so two events never collide.
   Every reachy event id is `evt_<kind>_<uuid>` (the record id is `orgevent-<event id>`).
   (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
-- **Every command goes through the gate** — `reachy_look` / `reachy_say` /
+- **The actuation tools go through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one
   OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
   **`reachy_say` accepts NO memory reference at all** — the tool's SCHEMA rejects an
@@ -444,6 +444,8 @@ naming its test (`test/capabilities/reachy/`):
   BEFORE `execute`, so a live pi call never reaches the refusal; a DIRECT caller of
   `execute` still gets an audited OrgEvent `reachy.refused`. `answer` is OFF (fail
   closed). (`reachy.test.ts` items 2a/2b/3; `round4.test.ts`.)
+  The placeholder `reachy_state` sends an ungated `state` request (no admit path, no
+  OrgEvent).
 - **The visitor acknowledgement rate slot is reserved SYNCHRONOUSLY.** The socket
   path runs line handlers concurrently, so the one-per-minute acknowledge slot is
   taken before any awaited audit write (and rolled back if the audit fails) — two
