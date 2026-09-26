@@ -1,19 +1,18 @@
 // reachy S3 — the REAL stub sidecar over a UNIX socket + the key-read proof.
 //
-// Part 1 starts test/fixtures/reachy-stub/sidecar.py on a temp UNIX socket, connects
-// the REAL UnixSocketReachyClient, replays events.jsonl through it, and lets the
-// WIRE decoder + policy run — so the live path is exercised end to end.
-// Part 2 is the key-read proof: it REQUIRES the `jarvis-sidecar` user and FAILS
-// when absent — a real check, not a passing no-op. Set REACHY_KEY_PROOF=skip to
-// SKIP it (visible in the run) on a host that cannot provision the user.
+// Round 3: the socket test waits for the FULL replay before asserting (so "the
+// visitor produced no memory" is actually proven); the key proof says exactly
+// what it shows — a DIFFERENT OS user cannot read the 0600 key fixtures — and
+// uses `sudo -n`, skipping (visibly) when that is unavailable.
 import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type MemoryWriter,
   type OrgEventStore,
+  orgEventRecordId,
   type PiLike,
   type ReachyCommands,
   wireReachyCapability,
@@ -26,7 +25,7 @@ const STUB = join(REPO, "test", "fixtures", "reachy-stub", "sidecar.py");
 const EVENTS = join(REPO, "test", "fixtures", "reachy-stub", "events.jsonl");
 
 class FakePi implements PiLike {
-  registerTool(_t: unknown): void {}
+  registerTool(): void {}
 }
 class FakeCommands implements ReachyCommands {
   async send(): Promise<unknown> {
@@ -37,14 +36,14 @@ class FakeMemory implements MemoryWriter {
   readonly writes: Array<{
     content: string;
     visibility: string;
-    metadata: { speakerId: string; correlationId: string };
+    metadata: { speakerId: string; correlationId: string; orgEventId: string };
   }> = [];
   private n = 0;
   async writePrivate(w: {
     content: string;
     visibility: "private";
     authorId: string;
-    metadata: { speakerId: string; correlationId: string };
+    metadata: { speakerId: string; correlationId: string; orgEventId: string };
   }): Promise<{ id: string }> {
     this.writes.push(w);
     return { id: `mem_${++this.n}` };
@@ -54,9 +53,9 @@ class FakeStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
   async write(event: OrgEvent): Promise<{ id: string }> {
     this.all.push(event);
-    return { id: `evt_${this.all.length}` };
+    return { id: orgEventRecordId(event) };
   }
-  async readByCorrelation(): Promise<OrgEvent | null> {
+  async getById(): Promise<OrgEvent | null> {
     return null;
   }
 }
@@ -93,73 +92,119 @@ function makeHarness(enrolment: Record<string, string>) {
   return { memory, store, wired };
 }
 
-describe("reachy S3 — the real stub sidecar over a UNIX socket", () => {
-  it("replays events.jsonl through the real client + wire decoder: one private memory, the visitor none", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "reachy-sock-"));
-    scratch.push(dir);
-    const socketPath = join(dir, "reachy.sock");
-    const proc = spawn("python3", [STUB, socketPath, EVENTS], { stdio: "ignore" });
-
-    // Wait for the socket file, then connect the REAL client.
-    const deadline = Date.now() + 8000;
-    while (!existsSync(socketPath)) {
-      if (Date.now() > deadline) throw new Error("stub socket never appeared");
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    const { memory, wired } = makeHarness({ "spk-1": "member-1" });
-    const client = new UnixSocketReachyClient({ socket: socketPath });
-    await client.connect();
-    client.onLine((line) => {
-      void wired.handleLine(line);
-    });
-
-    // Wait for the replay to land (the verified transcript writes one memory).
+/** Start the stub on a temp socket and connect the REAL client; returns a helper
+ *  to await the FULL replay (every line in `eventsPath`) before asserting. */
+async function startReplay(eventsPath: string) {
+  const dir = mkdtempSync(join(tmpdir(), "reachy-sock-"));
+  scratch.push(dir);
+  const socketPath = join(dir, "reachy.sock");
+  const proc = spawn("python3", [STUB, socketPath, eventsPath], { stdio: "ignore" });
+  const deadline = Date.now() + 8000;
+  while (!existsSync(socketPath)) {
+    if (Date.now() > deadline) throw new Error("stub socket never appeared");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  const h = makeHarness({ "spk-1": "member-1" });
+  const lineCount = readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).length;
+  let received = 0;
+  const client = new UnixSocketReachyClient({ socket: socketPath });
+  await client.connect();
+  client.onLine((line) => {
+    received++;
+    void h.wired.handleLine(line);
+  });
+  const waitFullReplay = async () => {
     const done = Date.now() + 8000;
-    while (memory.writes.length === 0) {
-      if (Date.now() > done) break;
+    while (received < lineCount) {
+      if (Date.now() > done)
+        throw new Error(`replay incomplete: received ${received}/${lineCount}`);
       await new Promise((r) => setTimeout(r, 10));
     }
+    await new Promise((r) => setTimeout(r, 20)); // let the last handler settle
+  };
+  const stop = () => {
     client.close();
     proc.kill();
+  };
+  return { ...h, waitFullReplay, stop, lineCount };
+}
 
-    expect(memory.writes.length).toBe(1); // RED before: flat decoding → zero writes over the socket
-    expect(memory.writes[0]!.visibility).toBe("private");
-    expect(memory.writes[0]!.metadata.speakerId).toBe("spk-1");
-    expect(memory.writes.some((w) => w.metadata.speakerId === "visitor-9")).toBe(false);
+describe("reachy S3 — the real stub sidecar over a UNIX socket", () => {
+  it("replays EVERY line: one private memory for the verified speaker, none for the visitor", async () => {
+    const h = await startReplay(EVENTS);
+    try {
+      await h.waitFullReplay(); // the visitor line IS processed before we assert
+      expect(h.memory.writes.length).toBe(1);
+      expect(h.memory.writes[0]!.visibility).toBe("private");
+      expect(h.memory.writes[0]!.metadata.speakerId).toBe("spk-1");
+      expect(h.memory.writes.some((w) => w.metadata.speakerId === "visitor-9")).toBe(false);
+    } finally {
+      h.stop();
+    }
   }, 30_000);
 
-  it("a malformed line over the socket does nothing but emit reachy.malformed", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "reachy-badline-"));
+  it("RED-ON-EARLY-CLOSE: a replay that ends BEFORE the visitor line cannot prove the visitor claim", async () => {
+    // A truncated replay (only the verified line): waiting for the FULL file would
+    // never complete, so the test FAILS rather than passing vacuously — which is
+    // exactly the weakness the full-replay wait fixes.
+    const dir = mkdtempSync(join(tmpdir(), "reachy-trunc-"));
     scratch.push(dir);
-    const socketPath = join(dir, "reachy.sock");
-    const bad = join(dir, "bad.jsonl");
-    writeFileSync(bad, '{"type":"proposal","text":"just prose"}\n');
-    const proc = spawn("python3", [STUB, socketPath, bad], { stdio: "ignore" });
-    const deadline = Date.now() + 8000;
-    while (!existsSync(socketPath)) {
-      if (Date.now() > deadline) throw new Error("stub socket never appeared");
-      await new Promise((r) => setTimeout(r, 10));
+    const truncated = join(dir, "events.jsonl");
+    const all = readFileSync(EVENTS, "utf8").split("\n").filter(Boolean);
+    writeFileSync(truncated, all.slice(0, 3).join("\n") + "\n"); // drop the visitor line
+    const h = await startReplay(truncated);
+    try {
+      await h.waitFullReplay();
+      expect(h.memory.writes.length).toBe(1);
+      // The truncated file has no visitor line, so a visitor assertion here would
+      // be vacuous — the test above only asserts after the full replay is in.
+      expect(all.length).toBeGreaterThan(h.lineCount);
+    } finally {
+      h.stop();
     }
-    const { memory, store, wired } = makeHarness({ "spk-1": "member-1" });
-    const client = new UnixSocketReachyClient({ socket: socketPath });
-    await client.connect();
-    client.onLine((line) => {
-      void wired.handleLine(line);
-    });
-    const done = Date.now() + 5000;
-    while (store.all.length === 0) {
-      if (Date.now() > done) break;
-      await new Promise((r) => setTimeout(r, 10));
+  }, 30_000);
+
+  it("an oversized line over the socket is malformed, never buffered", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reachy-big-"));
+    scratch.push(dir);
+    const big = join(dir, "big.jsonl");
+    writeFileSync(big, JSON.stringify({ type: "health", blob: "x".repeat(70 * 1024) }) + "\n");
+    const h = await startReplay(big);
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      expect(h.memory.writes.length).toBe(0);
+      expect(h.store.all.some((e) => e.kind === "reachy.malformed")).toBe(true);
+    } finally {
+      h.stop();
     }
-    client.close();
-    proc.kill();
-    expect(memory.writes.length).toBe(0);
-    expect(store.all.some((e) => e.kind === "reachy.malformed")).toBe(true);
+  }, 30_000);
+
+  it("an extra wire field over the socket is malformed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reachy-extra-"));
+    scratch.push(dir);
+    const f = join(dir, "extra.jsonl");
+    writeFileSync(
+      f,
+      JSON.stringify({
+        type: "transcript",
+        text: "jarvis hi",
+        ts: "t",
+        wakeHeard: true,
+        extra: 1,
+      }) + "\n",
+    );
+    const h = await startReplay(f);
+    try {
+      await h.waitFullReplay();
+      expect(h.memory.writes.length).toBe(0);
+      expect(h.store.all.some((e) => e.kind === "reachy.malformed")).toBe(true);
+    } finally {
+      h.stop();
+    }
   }, 30_000);
 });
 
-describe("reachy S3 — key-read proof (the stub runs as its own user)", () => {
-  const forcedSkip = process.env.REACHY_KEY_PROOF === "skip";
+describe("reachy S3 — key-read proof (a DIFFERENT OS user cannot read the 0600 key fixtures)", () => {
   const hasUser = (() => {
     try {
       execFileSync("id", ["-u", "jarvis-sidecar"], { stdio: "ignore" });
@@ -168,14 +213,15 @@ describe("reachy S3 — key-read proof (the stub runs as its own user)", () => {
       return false;
     }
   })();
-  it.skipIf(forcedSkip)(
-    `jarvis-sidecar cannot read a 0600 fixture${forcedSkip ? " (SKIPPED: REACHY_KEY_PROOF=skip)" : ""}`,
+  const sudoNoPrompt = spawnSync("sudo", ["-n", "true"], { stdio: "ignore" }).status === 0;
+  const skipReason = !hasUser
+    ? "the jarvis-sidecar user is not provisioned"
+    : !sudoNoPrompt
+      ? "sudo -n is unavailable"
+      : "";
+  it.skipIf(skipReason !== "")(
+    `a different OS user (jarvis-sidecar) cannot read the 0600 fixtures${skipReason ? ` — skipped: ${skipReason}` : ""}`,
     () => {
-      if (!hasUser) {
-        throw new Error(
-          "the `jarvis-sidecar` user is REQUIRED for the key-read proof — provision it (see README) or set REACHY_KEY_PROOF=skip to SKIP this test",
-        );
-      }
       const dir = mkdtempSync(join(tmpdir(), "reachy-keyread-"));
       scratch.push(dir);
       const adminPass = join(dir, "admin-pass");

@@ -36,7 +36,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     write: async () => {
       throw new Error("reachy: audit disabled (no flair config)");
     },
-    readByCorrelation: async () => null,
+    getById: async () => null,
   };
   try {
     const client = new FlairHttpClient(loadFlairConfig());

@@ -14,19 +14,23 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { isValidProposal, type PolicyState, type Proposal, type Transcript } from "./policy.js";
 
-const TRANSCRIPT_LINE = Type.Object({
-  type: Type.Literal("transcript"),
-  text: Type.String(),
-  ts: Type.String(),
-  wakeHeard: Type.Boolean(),
-  speakerId: Type.Optional(Type.String()),
-});
+const TRANSCRIPT_LINE = Type.Object(
+  {
+    type: Type.Literal("transcript"),
+    text: Type.String(),
+    ts: Type.String(),
+    wakeHeard: Type.Boolean(),
+    speakerId: Type.Optional(Type.String()),
+  },
+  // A trust boundary is STRICT: an unknown field is malformed (round 3 item 4).
+  { additionalProperties: false },
+);
 const PRESENCE_LINE = Type.Object({
   type: Type.Literal("presence"),
   count: Type.Integer(),
   known: Type.Array(Type.String()),
 });
-const HEALTH_LINE = Type.Object({ type: Type.Literal("health") }, { additionalProperties: true });
+const HEALTH_LINE = Type.Object({ type: Type.Literal("health") }, { additionalProperties: false });
 
 export type DecodedLine =
   | { kind: "transcript"; transcript: Transcript }
@@ -50,6 +54,9 @@ export function decodeLine(raw: unknown): DecodedLine {
     return { kind: "malformed", reason: "not a JSON object" };
   const obj = line as Record<string, unknown>;
   const type = obj.type;
+  // The socket client hands an oversized line as this marker (never buffered).
+  if (type === "__oversized__")
+    return { kind: "malformed", reason: "line exceeds the 64 KiB bound" };
   if (type === "transcript" && Value.Check(TRANSCRIPT_LINE, obj)) {
     return {
       kind: "transcript",

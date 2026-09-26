@@ -4,8 +4,16 @@
 // tests drive a fake and never open a socket or touch a real Flair.
 
 import { createConnection, type Socket } from "node:net";
-import type { MemoryWriter, OrgEventStore, ReachyCommands } from "./capability.js";
+import {
+  type MemoryWriter,
+  type OrgEventStore,
+  orgEventRecordId,
+  type ReachyCommands,
+} from "./capability.js";
 import type { OrgEvent } from "./policy.js";
+
+/** The inbound line bound (64 KiB); a longer line is malformed, never buffered. */
+export const MAX_LINE_BYTES = 64 * 1024;
 
 export interface SidecarLine {
   type: "transcript" | "proposal" | "presence" | "health";
@@ -38,6 +46,13 @@ export class UnixSocketReachyClient implements ReachyCommands {
 
   private ingest(text: string): void {
     this.buffer += text;
+    if (this.buffer.length > MAX_LINE_BYTES) {
+      // A line longer than the bound is never grown without limit: drop the
+      // buffer and hand the decoder a marker so it is a `reachy.malformed` line.
+      this.buffer = "";
+      for (const l of this.listeners) l({ type: "__oversized__" });
+      return;
+    }
     let idx = this.buffer.indexOf("\n");
     while (idx !== -1) {
       const line = this.buffer.slice(0, idx);
@@ -110,39 +125,36 @@ export function flairOrgEventStore(client: {
   write(
     content: string,
     opts?: {
+      id?: string;
       durability?: string;
       visibility?: string;
       authorId?: string;
       metadata?: Record<string, unknown>;
     },
   ): Promise<{ id: string }>;
-  search(query: string, limit?: number): Promise<Array<{ id: string; content: string }>>;
+  /** The exact-id read: GET /Memory/<id> (bob's FlairHttpClient.get). */
+  get(id: string): Promise<{ content?: string } | null>;
 }): OrgEventStore {
   return {
     async write(event) {
-      const correlationId = String(event.metadata.correlationId ?? "");
+      const recordId = orgEventRecordId(event);
       const { id } = await client.write(JSON.stringify(event), {
+        id: recordId,
         durability: "persistent",
         visibility: "private",
         authorId: "jarvis",
-        metadata: { kind: event.kind, correlationId },
+        metadata: { kind: event.kind, orgEventId: recordId },
       });
       return { id };
     },
-    async readByCorrelation(correlationId) {
-      const hits = await client.search(correlationId, 5);
-      for (const h of hits) {
-        try {
-          const ev = JSON.parse(h.content) as OrgEvent;
-          if (
-            (ev?.metadata as Record<string, unknown> | undefined)?.correlationId === correlationId
-          )
-            return ev;
-        } catch {
-          /* not our record */
-        }
+    async getById(id) {
+      const record = await client.get(id);
+      if (!record || typeof record.content !== "string") return null;
+      try {
+        return JSON.parse(record.content) as OrgEvent;
+      } catch {
+        return null;
       }
-      return null;
     },
   };
 }

@@ -54,6 +54,7 @@ export interface FlairClient {
   write(
     content: string,
     opts?: {
+      id?: string;
       durability?: Durability;
       supersedes?: string;
       visibility?: string;
@@ -130,6 +131,8 @@ export function tpsEd25519AuthHeader(args: {
 }
 
 export class FlairHttpClient implements FlairClient {
+  // Per-process monotonic suffix so two same-millisecond writes never collide.
+  private writeSeq = 0;
   private readonly url: string;
   private readonly agentId: string;
   private readonly keyFile: string;
@@ -228,6 +231,7 @@ export class FlairHttpClient implements FlairClient {
   async write(
     content: string,
     opts: {
+      id?: string;
       durability?: Durability;
       supersedes?: string;
       visibility?: string;
@@ -235,7 +239,11 @@ export class FlairHttpClient implements FlairClient {
       metadata?: Record<string, unknown>;
     } = {},
   ): Promise<{ id: string }> {
-    const id = `${this.agentId}-${this.now()}`;
+    // A record id is UNIQUE PER WRITE: an explicit `id`, else agent + counter.
+    // NEVER wall-clock alone — two writes in the same millisecond (e.g. a reachy
+    // OrgEvent and the memory it audits) would share an id and overwrite each
+    // other (bob#180 round 3).
+    const id = opts.id ?? `${this.agentId}-${++this.writeSeq}`;
     const body: Record<string, unknown> = {
       id,
       agentId: opts.authorId ?? this.agentId,

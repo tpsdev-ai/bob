@@ -22,7 +22,15 @@ import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
-export type ProposalAction = "ignore" | "look" | "acknowledge" | "answer" | "think" | "ask" | "say";
+export type ProposalAction =
+  | "ignore"
+  | "look"
+  | "acknowledge"
+  | "frame"
+  | "answer"
+  | "think"
+  | "ask"
+  | "say";
 
 /** The typed proposal schema (spec §3.3): constrained decoding, NEVER prose. A
  *  prose-only proposal (a free-text field, no action) fails this schema. */
@@ -32,6 +40,7 @@ export const PROPOSAL_SCHEMA = Type.Object(
       Type.Literal("ignore"),
       Type.Literal("look"),
       Type.Literal("acknowledge"),
+      Type.Literal("frame"),
       Type.Literal("answer"),
       Type.Literal("think"),
       Type.Literal("ask"),
@@ -77,15 +86,9 @@ export interface PolicyState {
   lastAcknowledgeAtMs?: number;
 }
 
-export interface OrgEvent {
-  id: string;
-  kind: string;
-  authorId: string;
-  summary: string;
-  refId?: string;
-  metadata: Record<string, unknown>;
-  tsMs: number;
-}
+import type { OrgEventRecord } from "../observatory/snapshot.js";
+/** The reachy audit event IS the record the rest of bob emits (observatory). */
+export type OrgEvent = OrgEventRecord;
 
 export interface MemoryWrite {
   content: string;
@@ -124,15 +127,19 @@ function orgEvent(
   state: PolicyState,
   refId?: string,
 ): OrgEvent {
+  const tsMs = state.nowMs();
   return {
-    id: `evt_${kind}_${state.nowMs()}_${randomBytes(4).toString("hex")}`,
+    id: `evt_${kind}_${tsMs}_${randomBytes(4).toString("hex")}`,
     kind,
     authorId: "jarvis",
-    summary,
+    // The record shape carries no free metadata: the inputs' ids go in targetIds
+    // and the proposal's confidence is stated in the summary.
+    summary: `${summary} (confidence ${proposal.confidence})`,
     refId,
-    // Every admitted action carries the proposal's confidence and its inputs' ids.
-    metadata: { confidence: proposal.confidence, inputs: proposal.inputs },
-    tsMs: state.nowMs(),
+    targetIds: proposal.inputs,
+    createdAt: new Date(tsMs).toISOString(),
+    nonce: randomBytes(8).toString("hex"),
+    tsMs,
   };
 }
 
@@ -166,16 +173,17 @@ export function decideTranscript(
     return {
       kind: "memory",
       write,
-      orgEvent: (() => {
-        const ev = orgEvent(
-          "reachy.memory",
-          "wrote a private memory from a verified speaker",
-          { action: "think", args: {}, confidence: 1, inputs: [] },
-          state,
-        );
-        ev.metadata.speakerId = transcript.speakerId;
-        return ev;
-      })(),
+      orgEvent: orgEvent(
+        "reachy.memory",
+        `wrote a private memory from a verified speaker ${transcript.speakerId}`,
+        {
+          action: "think",
+          args: {},
+          confidence: 1,
+          inputs: transcript.speakerId ? [transcript.speakerId] : [],
+        },
+        state,
+      ),
     };
   }
 
@@ -216,14 +224,21 @@ export function admitAction(
   const isAddressed = transcript ? addressed(transcript.text, state.wakeName) : false;
   const proposal: Proposal = { action, args, confidence, inputs };
 
-  if (action === "answer" || (action === "say" && inputs.some((i) => i.startsWith("mem_")))) {
+  if (action === "answer" || (action === "say" && inputs.length > 0)) {
+    // v1: `say` accepts NO memory reference at all — any input is a refusal.
     return { kind: "refused", action, reason: "memory-backed speech is off in v1 (fail closed)" };
   }
   if (action === "think") return { kind: "refused", action, reason: "think injects no turn in S3" };
   if (action === "ignore") return { kind: "none" };
   if (action === "say" && !isAddressed) return { kind: "refused", action, reason: "not addressed" };
-  if (action === "look" || action === "acknowledge" || action === "say" || action === "ask") {
-    if (!verified && (action === "look" || action === "acknowledge")) {
+  if (
+    action === "look" ||
+    action === "acknowledge" ||
+    action === "frame" ||
+    action === "say" ||
+    action === "ask"
+  ) {
+    if (!verified && (action === "look" || action === "acknowledge" || action === "frame")) {
       const last = state.lastAcknowledgeAtMs ?? -Infinity;
       if (state.nowMs() - last < ACKNOWLEDGE_MIN_INTERVAL_MS) {
         return {
@@ -239,9 +254,11 @@ export function admitAction(
         ? "reachy.look"
         : action === "acknowledge"
           ? "reachy.acknowledge"
-          : action === "say"
-            ? "reachy.say"
-            : "reachy.ask";
+          : action === "frame"
+            ? "reachy.frame"
+            : action === "say"
+              ? "reachy.say"
+              : "reachy.ask";
     return {
       kind: "admitted",
       action,

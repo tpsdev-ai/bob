@@ -6,9 +6,9 @@ import type { OrgEventStore } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
 
 export interface ExplainDeps {
-  /** Read a memory's metadata (the correlation id lives there). */
+  /** Exact read of a memory by id (the orgEventId lives in its metadata). */
   getMemory: (id: string) => Promise<{ metadata?: Record<string, unknown> } | null>;
-  /** The same durable store the audit was written to. */
+  /** The same durable store the audit was written to (a binary exact-id read). */
   store: OrgEventStore;
 }
 
@@ -26,15 +26,16 @@ export async function explainMemory(
   deps: ExplainDeps,
 ): Promise<MemoryExplanation | null> {
   const mem = await deps.getMemory(memoryId);
-  const correlationId = mem?.metadata?.correlationId;
-  if (typeof correlationId !== "string") return null;
-  const event = await deps.store.readByCorrelation(correlationId);
+  const orgEventId = mem?.metadata?.orgEventId;
+  if (typeof orgEventId !== "string") return null;
+  const event = await deps.store.getById(orgEventId);
   if (!event) return null;
   return {
     memoryId,
     orgEvent: event,
     authorId: event.authorId,
     createdAtMs: event.tsMs,
-    speakerId: (event.metadata.speakerId as string | undefined) ?? undefined,
+    // The reachy events carry the speakerId in targetIds.
+    speakerId: event.targetIds?.[0],
   };
 }

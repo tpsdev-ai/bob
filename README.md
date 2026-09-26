@@ -385,35 +385,35 @@ The `reachy` capability is the jarvis office agent's body, built as a **skeleton
 a stub sidecar** (no hardware, no model, no network). Operator guarantees, each
 naming its test (`test/capabilities/reachy/`):
 
-- **A malformed sidecar line does nothing.** Inbound JSON lines are decoded and
-  schema-checked before policy; a line that does not match is dropped with an
-  OrgEvent `reachy.malformed`, never thrown into the handler. (`sidecar-stub.test.ts`.)
-- **A memory is written only when addressed AND speakerVerified**, as a `private`
-  memory authored by `jarvis` with the speakerId in metadata, over the flair
-  client; non-member speech is ephemeral — never stored, never recalled.
+- **A malformed sidecar line does nothing, and the wire is STRICT.** Lines are
+  decoded and schema-checked before policy; an unknown field, an oversized line
+  (bounded at 64 KiB, never buffered) or a bad shape is dropped with an OrgEvent
+  `reachy.malformed`. (`reachy.test.ts` item 4; `sidecar-stub.test.ts`.)
+- **A memory is written only when addressed AND speakerVerified** — `private`,
+  author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
   (`reachy.test.ts` (a)/(b)/(c)/(d).)
-- **No memory without its audit, and the audit is durable.** The OrgEvent is
-  persisted (over the same flair client) FIRST with a correlation id, then the
-  memory carrying it; if the event write fails the memory is NOT written, and
-  "why do you know this" reads the persisted event by that id across a restart.
-  (`reachy.test.ts` item 2.)
-- **Every command goes through the gate.** `reachy_look`/`reachy_say`/`reachy_frame`
-  use the same admit path as proposals — mute, the rate gate (admitting an
-  unverified physical action advances it), and one OrgEvent per admitted command;
-  `answer` is OFF and a `say` with any memory-derived content is refused (fail
-  closed). (`reachy.test.ts` item 3 / (e).)
-- **The stub runs as its own unprivileged user and cannot read a 0600 key
-  fixture.** (`sidecar-stub.test.ts` key-read proof — it REQUIRES the
-  `jarvis-sidecar` user and fails when absent; CI provisions it in the test job.
-  Locally: `sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar`, or set
-  `REACHY_KEY_PROOF=skip` to SKIP the test visibly.)
+- **No memory without its audit, and the audit is durable and exact-id.** The
+  OrgEvent is the SAME record shape the observatory emits
+  (`src/capabilities/observatory/snapshot.ts`), written FIRST with a record id,
+  then the memory carrying that id; a failed audit write means no memory; "why do
+  you know this" reads the event back by EXACT id (`GET /Memory/<id>`), so it
+  answers across a restart. (`reachy.test.ts` item 2.)
+- **Every command goes through the gate** — `reachy_look` / `reachy_say` /
+  `reachy_frame` share the admit path with proposals (mute, rate gate, one
+  OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
+  **`reachy_say` accepts NO memory reference at all** — a memory id is a refusal
+  with an OrgEvent `reachy.refused`; `answer` is OFF (fail closed).
+  (`reachy.test.ts` items 2a/2b/3.)
+- **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
+  `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
+  the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub
+  running as that user — that is S2's sandbox slice.) `sidecar-stub.test.ts`.
 
-What S3 does NOT do: any turn injection into the pi session (that is S1, behind
-bob#147), any body/head motion on real hardware, or memory-backed speech — `answer`
-is OFF and `say` refuses a memory input, fail-closed, because the v1 enrolment is
-empty. **Trust model:** a sidecar `speakerId` is an UNTRUSTED assertion; bob
-verifies the id → enrolled-member mapping (empty in v1), and a forged id is bounded
-by the sidecar's isolation — not by bob's gate (bob#180 §4).
+What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),
+any body/head motion on real hardware, or memory-backed speech. **Trust model:** a
+sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-member
+mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
+by bob's gate (bob#180 §4).
 
 ## Status
 

@@ -1,16 +1,8 @@
 // reachy/capability.ts — the testable core of the `reachy` capability.
 //
-// Decoupled from pi's real ExtensionAPI, the real UNIX socket and the real Flair
-// client so it is unit-testable with fakes. `index.ts` is the thin factory.
-//
-// Round 2 (Gauge): (1) inbound lines are DECODED here by wire.ts (one shape,
-// schema-checked); a malformed line is an OrgEvent `reachy.malformed`, never a
-// throw. (2) the OrgEvent trail is PERSISTED through the same store the memory
-// goes through, and ORDERED — the event is written FIRST with a correlation id,
-// then the memory carrying that id; if the event write fails, the memory is NOT
-// written. (3) the tools go through the SAME admit path as proposals.
-//
-// S3 registers tools and consumes events; it injects NO turns (that is S1).
+// Round 3 (Gauge): the audit event IS the observatory record shape; the OrgEvent
+// store reads back by EXACT id; `reachy_say` accepts no memory reference at all;
+// `reachy_frame` sends a `frame` command with its own audit event.
 
 import { randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
@@ -42,10 +34,11 @@ export interface ReachyCommands {
   send(command: string, args?: Record<string, unknown>): Promise<unknown>;
 }
 
-/** The DURABLE OrgEvent store (real: the flair client; test: a fake, persistent). */
+/** The DURABLE OrgEvent store (real: the flair client; test: a fake, id-keyed). */
 export interface OrgEventStore {
   write(event: OrgEvent): Promise<{ id: string }>;
-  readByCorrelation(correlationId: string): Promise<OrgEvent | null>;
+  /** EXACT read by the record id (never a semantic search). */
+  getById(id: string): Promise<OrgEvent | null>;
 }
 
 /** The memory write seam (real: the flair client; test: a fake). */
@@ -54,7 +47,7 @@ export interface MemoryWriter {
     content: string;
     visibility: "private";
     authorId: string;
-    metadata: { speakerId: string; correlationId: string };
+    metadata: { speakerId: string; correlationId: string; orgEventId: string };
   }): Promise<{ id: string }>;
 }
 
@@ -85,12 +78,16 @@ function ok(text: string) {
   return { content: [{ type: "text" as const, text }], details: {} };
 }
 
+/** The record id a reachy OrgEvent is stored under (exact-fetchable). */
+export function orgEventRecordId(event: OrgEvent): string {
+  return `orgevent-${event.id}`;
+}
+
 export function wireReachyCapability(opts: WireOptions): WiredReachy {
   const { pi, commands, memory, store, state } = opts;
   const log = opts.log ?? ((m: string) => console.error(m));
   let lastTranscript: Transcript | null = null;
 
-  /** Write the audit event; true iff it was persisted. */
   async function audit(event: OrgEvent): Promise<boolean> {
     try {
       await store.write(event);
@@ -103,6 +100,22 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
   }
 
+  /** A refusal is itself audited as `reachy.refused`. */
+  async function refuse(action: string, reason: string): Promise<DecisionSummary> {
+    const tsMs = state.nowMs();
+    await audit({
+      id: `evt_reachy.refused_${tsMs}_${randomUUID().slice(0, 8)}`,
+      kind: "reachy.refused",
+      authorId: "jarvis",
+      summary: `refused ${action}: ${reason}`,
+      targetIds: [],
+      createdAt: new Date(tsMs).toISOString(),
+      nonce: randomUUID(),
+      tsMs,
+    });
+    return { kind: "refused", action, reason };
+  }
+
   /** Admit ONE action (proposal or tool) — one OrgEvent per admitted command. */
   async function admitAndRun(
     action: ProposalAction,
@@ -113,9 +126,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     const decision = admitAction(action, args, confidence, inputs, state, lastTranscript);
     if (decision.kind === "drop") return { kind: "drop" };
     if (decision.kind === "none") return { kind: "none" };
-    if (decision.kind === "refused")
-      return { kind: "refused", action: decision.action, reason: decision.reason };
-    // ORDER: persist the audit BEFORE acting; a lost audit means the command is not sent.
+    if (decision.kind === "refused") return refuse(decision.action, decision.reason);
     if (!(await audit(decision.orgEvent)))
       return { kind: "refused", action: decision.action, reason: "audit write failed" };
     const cmd =
@@ -123,19 +134,23 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         ? "look_at"
         : decision.action === "acknowledge"
           ? "acknowledge"
-          : "say";
+          : decision.action === "frame"
+            ? "frame"
+            : "say";
     await commands.send(cmd, args);
     return { kind: "admitted", action: decision.action };
   }
 
-  // --- the four tools (spec §3.1). look / say / frame are ACTING commands and go
-  // through admitAndRun; state is a plain health READ and is not an action. ---
+  // --- tools ---
   pi.registerTool({
     name: "reachy_look",
     label: "Reachy Look",
     description:
       "Turn the Reachy Mini's head to a yaw/pitch (degrees). Goes through the policy gate.",
-    parameters: Type.Object({ yaw: Type.Number(), pitch: Type.Number() }),
+    parameters: Type.Object(
+      { yaw: Type.Number(), pitch: Type.Number() },
+      { additionalProperties: false },
+    ),
     async execute(_id, params) {
       const r = await admitAndRun("look", { yaw: params.yaw, pitch: params.pitch }, 1, []);
       return ok(
@@ -149,17 +164,19 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     name: "reachy_say",
     label: "Reachy Say",
     description:
-      "Speak a line through the Reachy Mini's speaker. Memory-backed speech is off in v1.",
-    parameters: Type.Object({
-      text: Type.String({ minLength: 1 }),
-      // Any memory-derived content is refused in v1 (fail closed).
-      memoryId: Type.Optional(
-        Type.String({ description: "A memory id this line would speak — refused in v1." }),
-      ),
-    }),
+      "Speak a line through the speaker. v1: NO memory reference — a memory id makes it a refusal.",
+    // NO memoryId field: any extra property is rejected by the schema and refused.
+    parameters: Type.Object(
+      { text: Type.String({ minLength: 1 }) },
+      { additionalProperties: false },
+    ),
     async execute(_id, params) {
-      const inputs = params.memoryId ? [String(params.memoryId)] : [];
-      const r = await admitAndRun("say", { text: params.text }, 1, inputs);
+      const extra = Object.keys(params).filter((k) => k !== "text");
+      if (extra.length > 0) {
+        const r = await refuse("say", `unexpected parameter(s): ${extra.join(", ")}`);
+        return ok(`refused: ${"reason" in r ? r.reason : r.kind}`);
+      }
+      const r = await admitAndRun("say", { text: params.text }, 1, []);
       return ok(
         r.kind === "admitted"
           ? `say: ${params.text}`
@@ -171,7 +188,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     name: "reachy_state",
     label: "Reachy State",
     description: "Read the sidecar's health/state (a read; not an action).",
-    parameters: Type.Object({}),
+    parameters: Type.Object({}, { additionalProperties: false }),
     async execute() {
       const st = await commands.send("state");
       return ok(JSON.stringify(st ?? {}));
@@ -180,10 +197,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   pi.registerTool({
     name: "reachy_frame",
     label: "Reachy Frame",
-    description: "Capture one JPEG frame (on demand only). Goes through the policy gate.",
-    parameters: Type.Object({}),
+    description:
+      "Capture one JPEG frame (on demand only). Sends a `frame` command; goes through the gate.",
+    parameters: Type.Object({}, { additionalProperties: false }),
     async execute() {
-      const r = await admitAndRun("acknowledge", {}, 1, []); // frame is a physical capture, gated like an acknowledge
+      const r = await admitAndRun("frame", {}, 1, []);
       return ok(
         r.kind === "admitted" ? "frame requested" : `refused: ${"reason" in r ? r.reason : r.kind}`,
       );
@@ -195,14 +213,16 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     if (state.mute) return { kind: "drop" };
 
     if (decoded.kind === "malformed") {
-      // A malformed line does NOTHING to policy; it is recorded as an audit event.
+      const tsMs = state.nowMs();
       await audit({
-        id: `evt_reachy.malformed_${Date.now()}_${randomUUID().slice(0, 8)}`,
+        id: `evt_reachy.malformed_${tsMs}_${randomUUID().slice(0, 8)}`,
         kind: "reachy.malformed",
         authorId: "jarvis",
         summary: `dropped a malformed sidecar line: ${decoded.reason}`,
-        metadata: {},
-        tsMs: Date.now(),
+        targetIds: [],
+        createdAt: new Date(tsMs).toISOString(),
+        nonce: randomUUID(),
+        tsMs,
       });
       return { kind: "malformed", reason: decoded.reason };
     }
@@ -214,33 +234,21 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       if (decision.kind === "drop") return { kind: "drop" };
       if (decision.kind === "none") return { kind: "none" };
       if (decision.kind === "memory") {
-        // ORDER: event first (with the correlation id), then the memory carrying it.
-        const correlationId = `corr_${randomUUID()}`;
-        const persisted = await audit({
-          ...decision.orgEvent,
-          metadata: {
-            ...decision.orgEvent.metadata,
-            speakerId: decoded.transcript.speakerId,
-            correlationId,
-          },
-        });
-        if (!persisted)
-          return {
-            kind: "refused",
-            action: "memory",
-            reason: "audit write failed — memory NOT written",
-          };
+        // ORDER: event first (exact id), then the memory carrying that id.
+        const persisted = await audit(decision.orgEvent);
+        if (!persisted) return refuse("memory", "audit write failed — memory NOT written");
         const { id } = await memory.writePrivate({
           ...decision.write,
-          metadata: { speakerId: decoded.transcript.speakerId as string, correlationId },
+          metadata: {
+            speakerId: decoded.transcript.speakerId as string,
+            correlationId: `corr_${randomUUID()}`,
+            orgEventId: orgEventRecordId(decision.orgEvent),
+          },
         });
         return { kind: "memory", memoryId: id };
       }
       if (decision.orgEvent) {
-        if (
-          !(await audit({ ...decision.orgEvent, refId: decoded.transcript.speakerId ?? undefined }))
-        )
-          return { kind: "refused", action: "acknowledge", reason: "audit write failed" };
+        if (!(await audit(decision.orgEvent))) return refuse("acknowledge", "audit write failed");
         state.lastAcknowledgeAtMs = state.nowMs();
         return { kind: "ephemeral", acknowledged: true };
       }
