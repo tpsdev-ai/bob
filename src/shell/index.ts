@@ -11,7 +11,14 @@
 export type BobRole = "ea" | "writer" | "reviewer" | "coder" | "qa" | "custom";
 
 export interface ProviderConfig {
-  name: "ollama-cloud" | "ollama-newton" | "exe-dev-gateway" | "anthropic" | "openai" | "omlx";
+  name:
+    | "ollama-cloud"
+    | "ollama-newton"
+    | "exe-dev-gateway"
+    | "anthropic"
+    | "openai"
+    | "openrouter"
+    | "omlx";
   model: string;
   fallbacks?: string[];
 }

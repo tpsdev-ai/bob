@@ -342,6 +342,8 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
     case "ollama-cloud":
     case "ollama":
       return "https://ollama.com/v1";
+    case "openrouter":
+      return "https://openrouter.ai/api/v1";
     default:
       return undefined;
   }
@@ -355,6 +357,9 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
 
   const piProvider = resolvePiProvider(opts.provider);
   const isGateway = opts.provider === "exe-dev-gateway";
+  // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
+  // is NEVER written here (bob#183) — so its auth.json carries no key entry.
+  const isEnvKeyProvider = opts.provider === "openrouter";
   const baseUrl = knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
 
@@ -378,17 +383,13 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   );
   writeFileSync(
     authPath,
-    `${JSON.stringify(
-      {
-        [piProvider]: { type: "api_key", key },
-      },
-      null,
-      2,
-    )}\n`,
+    `${JSON.stringify(isEnvKeyProvider ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`,
   );
   chmodSync(authPath, 0o600);
 
-  if (!isGateway) {
+  if (isEnvKeyProvider) {
+    console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
+  } else if (!isGateway) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );

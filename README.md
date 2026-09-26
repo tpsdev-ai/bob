@@ -379,6 +379,15 @@ stay textual, like a Discord snowflake.
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
 
+## Providers
+
+Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider.model`). `openrouter`
+is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
+passed through verbatim — for example `bob onboard orr --provider openrouter --model
+deepseek/deepseek-v4.1-flash`. Its API key is read from the **`OPENROUTER_API_KEY`** environment
+variable at run time and is never written to `bob.yaml` or the rendered pi config, so `bob run`
+refuses (naming the variable) when it is unset.
+
 ## Status
 
 `0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
