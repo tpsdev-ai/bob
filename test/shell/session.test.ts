@@ -658,12 +658,10 @@ describe("assertContractGuardLoaded fails closed (bob#158 K&S review)", () => {
 // itself is unit-tested above; this is the call site around it.
 //
 // Round 2: the session builder is INJECTED (createBobRuntimeFactory's
-// "buildSession" dependency), never module-mocked. bun's mock.module is
-// process-global and does not auto-unregister, so a stub left in place by an
-// earlier -- or a concurrent -- test leaks into every test file that runs after
-// it, and an afterEach that restores the exports only hides the stub, it does
-// not remove the mock. A dependency received by name is test-local: production
-// passes nothing and gets pi's own builder, exactly as before.
+// "buildSession" dependency), never module-mocked, so the seam is test-local
+// by construction: each test supplies its own buildSession and nothing about how
+// a runner scopes module mocks enters the picture. Production passes nothing and
+// gets pi's own builder, exactly as before.
 describe("the one factory disposes the session when installSessionAudits refuses (bob#157 K&S follow-up)", () => {
   // Build a factory exactly as run.ts and the launcher do, but route the
   // session build through an INJECTED builder whose output is a scripted "built"
