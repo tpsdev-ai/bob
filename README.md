@@ -385,8 +385,11 @@ Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider
 is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
 passed through verbatim — for example `bob onboard orr --provider openrouter --model
 deepseek/deepseek-v4.1-flash`. Its API key is read from the **`OPENROUTER_API_KEY`** environment
-variable at run time and is never written to `bob.yaml` or the rendered pi config, so `bob run`
-refuses (naming the variable) when it is unset.
+variable at run time and is never written to `bob.yaml` or the rendered pi config; no stored
+credential is honoured — a stored `auth.json` entry for openrouter is refused. `bob run` also
+pins the EFFECTIVE endpoint: the editable `.pi-agent/models.json` must resolve to exactly
+`https://openrouter.ai/api/v1`, and `bob run` refuses (naming the variable or the file and its
+value) when the key is unset or the endpoint differs, before any request is sent.
 
 ## Status
 

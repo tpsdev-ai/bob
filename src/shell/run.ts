@@ -623,6 +623,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model: opts.model,
   });
 
+  // Pin the endpoint + credential BEFORE any session exists (bob#183 r2).
+  assertOpenrouterSecurity(join(agentDir, ".pi-agent"), provider);
+
   const factory = opts.sessionFactory ?? createPiRunSession;
   // #145: the task is the session's CONTRACT, carried in its system prompt
   // through the factory. (It is ALSO the first user message below, so a provider
@@ -1107,6 +1110,8 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
     model: opts.model,
   });
+  // The interactive shape skips runAgent, so it pins the endpoint here too.
+  assertOpenrouterSecurity(config.piAgentDir, config.provider);
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
   return interactive({ config, policy, deps: opts.deps });
 }
@@ -1308,6 +1313,55 @@ function readBobYaml(agentDir: string, name: string): string {
     );
   }
   return readFileSync(yamlPath, "utf8");
+}
+
+/** The one endpoint an openrouter session may reach (bob#183 round 2). */
+export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+
+/**
+ * Pin the EFFECTIVE endpoint and credential for `openrouter`, before any session
+ * exists (bob#183 round 2). pi takes a replacement `baseUrl` from the editable
+ * `.pi-agent/models.json` and sends the resolved key there, and it prefers a
+ * stored `auth.json` credential over the environment — so bob enforces both:
+ * the resolved baseUrl must equal the OpenRouter URL exactly, and NO stored
+ * openrouter credential may exist (the env var is the sole credential).
+ * Refuses naming the file and the value; no request is ever sent.
+ */
+export function assertOpenrouterSecurity(
+  piAgentDir: string,
+  provider: string,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (provider !== "openrouter") return;
+  const modelsPath = join(piAgentDir, "models.json");
+  let baseUrl: unknown;
+  try {
+    baseUrl = JSON.parse(readFileSync(modelsPath, "utf8"))?.providers?.openrouter?.baseUrl;
+  } catch {
+    baseUrl = undefined;
+  }
+  if (baseUrl !== OPENROUTER_BASE_URL) {
+    throw new Error(
+      `bob: refusing to start an openrouter session — ${modelsPath} resolves the endpoint to ${JSON.stringify(baseUrl)}, not ${OPENROUTER_BASE_URL}. Fix providers.openrouter.baseUrl in that file.`,
+    );
+  }
+  const authPath = join(piAgentDir, "auth.json");
+  let auth: Record<string, unknown> = {};
+  try {
+    auth = JSON.parse(readFileSync(authPath, "utf8")) ?? {};
+  } catch {
+    auth = {};
+  }
+  if (Object.hasOwn(auth, "openrouter")) {
+    throw new Error(
+      `bob: a stored credential for openrouter is present at ${authPath}; remove it — the key comes from OPENROUTER_API_KEY only.`,
+    );
+  }
+  if (!(env.OPENROUTER_API_KEY ?? "").trim()) {
+    throw new Error(
+      "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk.",
+    );
+  }
 }
 
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
