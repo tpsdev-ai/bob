@@ -89,7 +89,7 @@ describe("help matches dispatch (#161)", () => {
     let output = "";
     let killed = false;
     try {
-      spawnNode([CLI, cmd]);
+      output = spawnNode([CLI, cmd]);
     } catch (err) {
       const cause = err as SpawnError;
       // A kill/timeout (a termination signal, or killed) means the command
