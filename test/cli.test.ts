@@ -134,11 +134,13 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   function scratchHome(): string {
     return mkdtempSync(join(tmpdir(), "bob-boolflag-"));
   }
-  // Run a CLI subcommand with HOME pointed at a scratch dir; `2>&1` folds
-  // stderr (console.error) into the output bun:test captures on a non-zero exit.
-  function runCli(args: string, home: string): string {
+  // Run a CLI subcommand with HOME pointed at a scratch dir. `args` is an argv
+  // array (no shell, no splitting) passed straight to spawnNode, so a value with
+  // a space is one literal argument; spawnNode returns the merged stdout+stderr
+  // on a clean exit and throws a SpawnError on a non-zero exit, a timeout/kill.
+  function runCli(args: string[], home: string): string {
     try {
-      return spawnNode([CLI, ...args.split(" ")], { env: { ...process.env, HOME: home } });
+      return spawnNode([CLI, ...args], { env: { ...process.env, HOME: home } });
     } catch (err: unknown) {
       const e = err as SpawnError;
       return e.stdout || e.message || "";
@@ -147,7 +149,7 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
 
   it("--dry-run=true takes the dry-run branch — prints the plan and creates no agent dir", () => {
     const home = scratchHome();
-    const out = runCli("onboard testbot --role ea --dry-run=true", home);
+    const out = runCli(["onboard", "testbot", "--role", "ea", "--dry-run=true"], home);
     expect(out).toContain("PLAN (--dry-run)");
     // The dry-run branch returns before initAgent, so no agent dir was written:
     // `--dry-run=true` can no longer scaffold, let alone provision, for real.
@@ -159,7 +161,15 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     // --no-flair + --no-interactive keep the real branch filesystem-only (no
     // network, no interview), so the assert is deterministic instead of a hang.
     const out = runCli(
-      "onboard testbot --role ea --dry-run=false --no-flair=true --no-interactive=true",
+      [
+        "onboard",
+        "testbot",
+        "--role",
+        "ea",
+        "--dry-run=false",
+        "--no-flair=true",
+        "--no-interactive=true",
+      ],
       home,
     );
     expect(out).not.toContain("PLAN (--dry-run)");
@@ -214,7 +224,16 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   it("an empty --model= / --provider= on onboard means the default, never an empty id in bob.yaml", () => {
     const home = scratchHome();
     const out = runCli(
-      "onboard testbot --role ea --model= --provider= --no-flair --no-interactive",
+      [
+        "onboard",
+        "testbot",
+        "--role",
+        "ea",
+        "--model=",
+        "--provider=",
+        "--no-flair",
+        "--no-interactive",
+      ],
       home,
     );
     expect(out).toContain("scaffolded testbot");
@@ -227,7 +246,10 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
 
   it("a bare --model on onboard means the default too — never the literal id 'true'", () => {
     const home = scratchHome();
-    const out = runCli("onboard testbot --role ea --model --no-flair --no-interactive", home);
+    const out = runCli(
+      ["onboard", "testbot", "--role", "ea", "--model", "--no-flair", "--no-interactive"],
+      home,
+    );
     expect(out).toContain("scaffolded testbot");
     const yaml = readFileSync(join(home, "agents", "testbot", "bob.yaml"), "utf8");
     expect(yaml).toContain("model: kimi-k2.6");
@@ -238,7 +260,7 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   it("bob align refuses a bad --no-flair spelling BEFORE its session can rewrite soul.md", () => {
     const home = scratchHome();
     // A real (filesystem-only) agent to align: no Flair, no interview.
-    runCli("onboard testbot --role ea --no-flair --no-interactive", home);
+    runCli(["onboard", "testbot", "--role", "ea", "--no-flair", "--no-interactive"], home);
     const soul = join(home, "agents", "testbot", "soul.md");
     expect(existsSync(soul)).toBe(true);
     const before = readFileSync(soul, "utf8");
