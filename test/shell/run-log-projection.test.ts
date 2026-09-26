@@ -39,7 +39,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
 import { projectRunLogRecord, runAgent } from "../../src/shell/run.js";
 
@@ -53,38 +53,53 @@ const REPO_ROOT = join(import.meta.dir, "..", "..");
 // is a normal one; the skip says so instead of hiding it.
 const IS_ROOT = (process.getuid?.() ?? 0) === 0;
 
+// The two declaration files pi 0.84.3 installs for its event unions, and the union
+// type-alias each one declares. This is the single source of truth, shared by
+// unionTypeNames() below (which reads the member names out of them) and the
+// declaration-file guard (which asserts that NO OTHER .d.ts in the pi dist trees
+// declares one of these unions). When a future pi declares an event union in a
+// third .d.ts, or moves a union to a new file, that guard goes red naming the
+// extra file, and this list must be updated on the pi bump (#136 holds 0.85.1).
+const UNION_SOURCES: Array<{ file: string; decl: string; union: string }> = [
+  {
+    file: join(REPO_ROOT, "node_modules", "@earendil-works", "pi-agent-core", "dist", "types.d.ts"),
+    decl: "export type AgentEvent =",
+    union: "AgentEvent",
+  },
+  {
+    file: join(
+      REPO_ROOT,
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "dist",
+      "core",
+      "agent-session.d.ts",
+    ),
+    decl: "export type AgentSessionEvent =",
+    union: "AgentSessionEvent",
+  },
+];
+
+// Recursively list the `.d.ts` files (excluding `.d.ts.map` source maps) under a
+// dist root.
+function walkDts(root: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const full = join(root, entry.name);
+    if (entry.isDirectory()) out.push(...walkDts(full));
+    else if (entry.name.endsWith(".d.ts") && !entry.name.endsWith(".d.ts.map")) out.push(full);
+  }
+  return out;
+}
+
 // The event type names pi 0.84.3's two event unions actually declare, read out of
 // the INSTALLED `.d.ts` files rather than copied into this test: "every event type
 // in the unions" has to mean what the installed pi says, not what a list here
 // remembers.
 function unionTypeNames(): string[] {
-  const sources: Array<{ file: string; decl: string }> = [
-    {
-      file: join(
-        REPO_ROOT,
-        "node_modules",
-        "@earendil-works",
-        "pi-agent-core",
-        "dist",
-        "types.d.ts",
-      ),
-      decl: "export type AgentEvent =",
-    },
-    {
-      file: join(
-        REPO_ROOT,
-        "node_modules",
-        "@earendil-works",
-        "pi-coding-agent",
-        "dist",
-        "core",
-        "agent-session.d.ts",
-      ),
-      decl: "export type AgentSessionEvent =",
-    },
-  ];
   const names = new Set<string>();
-  for (const { file, decl } of sources) {
+  for (const { file, decl } of UNION_SOURCES) {
     const text = readFileSync(file, "utf8");
     const start = text.indexOf(decl);
     expect(start, `${file} declares ${decl}`).toBeGreaterThan(-1);
@@ -460,6 +475,38 @@ describe("run-log projection (issue #146, round 5)", () => {
       expect(grew, `${c.type}: size does not grow`).toBeLessThanOrEqual(c.sizeSlack ?? 0);
       expect(JSON.stringify(big), `${c.type}: no leaked payload`).not.toContain("extraPayload");
     }
+  });
+
+  it("names EXACTLY the .d.ts files that declare pi's event unions", () => {
+    // The installed pi declares its event unions in a fixed, small set of
+    // declaration files. If a future pi declares a union in a new file, or moves
+    // one to a new file, that set grows and this goes red naming the extra file —
+    // so the hard-coded UNION_SOURCES list above is forced to be updated on the pi
+    // bump, and a moved or new union can no longer slip past the "every event type"
+    // assertion. A file that only imports a union, re-exports it
+    // (`export { type AgentEvent } from ...`), or inlines a single discriminant
+    // (`type: "turn_start"`) is not itself a declaration and is correctly excluded,
+    // which keeps this set equal to UNION_SOURCES on current pi 0.84.3.
+    const unionNames = UNION_SOURCES.map((d) => d.union);
+    const declared = new Set<string>();
+    for (const root of [
+      join(REPO_ROOT, "node_modules", "@earendil-works", "pi-agent-core", "dist"),
+      join(REPO_ROOT, "node_modules", "@earendil-works", "pi-coding-agent", "dist"),
+    ]) {
+      for (const file of walkDts(root)) {
+        const text = readFileSync(file, "utf8");
+        if (unionNames.some((name) => new RegExp(`export\\s+type\\s+${name}\\b`).test(text)))
+          declared.add(file);
+      }
+    }
+    const found = [...declared].sort();
+    const expected = UNION_SOURCES.map((d) => d.file).sort();
+    expect(
+      found,
+      `pi event-union declaration files (globbed) differ from the hard-coded list: ${found
+        .map((f) => relative(REPO_ROOT, f))
+        .join(", ")}`,
+    ).toEqual(expected);
   });
 
   it("logs NO payload for an event type the projection does not name", () => {
