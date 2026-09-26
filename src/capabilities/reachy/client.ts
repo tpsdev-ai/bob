@@ -27,7 +27,7 @@ export interface SidecarLine {
  */
 export class UnixSocketReachyClient implements ReachyCommands {
   private socket: Socket | null = null;
-  private buffer = "";
+  private buffer = Buffer.alloc(0);
   private discarding = false;
   private listeners: Array<(line: unknown) => void> = [];
 
@@ -40,7 +40,9 @@ export class UnixSocketReachyClient implements ReachyCommands {
       sock.once("error", reject);
       // A socket error AFTER connect must not become an unhandled 'error' event.
       sock.on("error", (err: Error) => console.error(`reachy: socket error: ${err.message}`));
-      sock.on("data", (chunk: Buffer) => this.ingest(chunk.toString("utf8")));
+      // Feed RAW BYTES: the bound is counted in UTF-8 bytes, and a line is
+      // decoded only once it is complete AND under the bound (round 5 item 1).
+      sock.on("data", (chunk: Buffer) => this.ingest(chunk));
       this.socket = sock;
     });
   }
@@ -49,44 +51,53 @@ export class UnixSocketReachyClient implements ReachyCommands {
    *  discarded up to AND INCLUDING its newline (one `reachy.malformed`), so the
    *  next line parses normally and an oversized prefix cannot smuggle a payload
    *  on the same line; a chunk holding several short lines is fully retained. */
-  ingest(text: string): void {
-    this.buffer += text;
+  ingest(chunk: Buffer | string): void {
+    // The bound is UTF-8 BYTES, not characters (round 5 item 1): a transcript of
+    // 80,058 bytes of multi-byte characters is over the bound even though its
+    // JavaScript string length is under it. Bytes are buffered and counted as
+    // they arrive; a line is DECODED only once it is complete and under the bound.
+    this.buffer = Buffer.concat([
+      this.buffer,
+      Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"),
+    ]);
+    const NL = 0x0a;
     for (;;) {
-      const nl = this.buffer.indexOf("\n");
+      const nl = this.buffer.indexOf(NL);
       if (this.discarding) {
-        // We are inside a line already known to be oversized: consume through
-        // its newline (or wait, dropping bytes, until one arrives).
+        // Inside a line already known to be oversized: consume through its
+        // newline (or keep dropping bytes until one arrives).
         if (nl === -1) {
-          if (this.buffer.length > MAX_LINE_BYTES) this.buffer = "";
+          if (this.buffer.length > MAX_LINE_BYTES) this.buffer = Buffer.alloc(0);
           return;
         }
-        this.buffer = this.buffer.slice(nl + 1);
+        this.buffer = this.buffer.subarray(nl + 1);
         this.discarding = false;
         continue;
       }
       if (nl === -1) {
-        // No complete line yet. Only the PENDING line can be oversized here.
+        // No complete line yet: only the PENDING line can be oversized here.
         if (this.buffer.length > MAX_LINE_BYTES) {
-          this.buffer = "";
+          this.buffer = Buffer.alloc(0);
           this.discarding = true;
           this.emitMalformed();
         }
         return;
       }
-      const line = this.buffer.slice(0, nl);
-      this.buffer = this.buffer.slice(nl + 1);
+      const line = this.buffer.subarray(0, nl);
+      this.buffer = this.buffer.subarray(nl + 1);
       if (line.length > MAX_LINE_BYTES) {
         this.emitMalformed();
         continue;
       }
-      if (line.trim()) {
+      const text = line.toString("utf8");
+      if (text.trim()) {
         try {
-          const parsed = JSON.parse(line);
+          const parsed = JSON.parse(text);
           for (const l of this.listeners) l(parsed);
         } catch {
           // A line that is not JSON at all still reaches the decoder as a raw
           // string, so a malformed line is audited rather than dropped silently.
-          for (const l of this.listeners) l(line);
+          for (const l of this.listeners) l(text);
         }
       }
     }

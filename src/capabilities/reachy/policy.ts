@@ -176,8 +176,10 @@ export function decideTranscript(
       kind: "memory",
       write,
       orgEvent: orgEvent(
-        "reachy.memory",
-        `wrote a private memory from a verified speaker ${transcript.speakerId}`,
+        // INTENT, not outcome: the write has not happened yet. A second,
+        // correlated event records written/failed (round 5 item 3).
+        "reachy.memory.attempt",
+        `attempting a private memory write from a verified speaker ${transcript.speakerId}`,
         {
           action: "think",
           args: {},

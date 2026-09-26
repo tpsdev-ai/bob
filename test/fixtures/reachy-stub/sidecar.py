@@ -4,7 +4,9 @@
 Replays a scripted JSON-line event file over a UNIX socket, then answers
 commands with a canned JSON line. It is UNTRUSTED (spec §3.2): bob applies
 policy to everything it emits. No hardware, no model, no network. It reads no
-key material — it is run as its own unprivileged user in the key-read proof.
+key material, and it does NOT run as its own user (S2): the KEY-READ proof runs
+only a READ of the fixtures as a different OS user; the stub itself runs as the
+agent's own user.
 """
 import json
 import os

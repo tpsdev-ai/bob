@@ -234,7 +234,7 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
     expect(refused).toBeDefined();
     // The failure is NAMED in the audit, so the (audit-first) memory event is
     // explicable rather than silently orphaned.
-    expect(refused!.summary).toContain("memory write failed after audit");
+    expect(refused!.summary).toContain("memory write failed after attempt");
   });
 
   it("reachy_state sends a `state` command and returns the (no-correlation) reply", async () => {

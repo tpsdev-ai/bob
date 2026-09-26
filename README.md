@@ -389,11 +389,14 @@ naming its test (`test/capabilities/reachy/`):
   type — including the outer envelope — has `additionalProperties: false`; lines
   are decoded and schema-checked before policy. An unknown field, a bad shape, or
   an oversized line is dropped with an OrgEvent `reachy.malformed`. The line bound
-  (64 KiB) applies PER COMPLETE LINE: an oversized line is discarded up to AND
-  including its newline (one malformed), so a payload on the same line cannot slip
-  through, the next line parses, and a large chunk of short lines is fully
-  retained. The stub's health line carries exactly the fields the schema defines.
-  (`round4.test.ts`; `sidecar-stub.test.ts`.)
+  (64 KiB) applies PER COMPLETE LINE and is counted in **UTF-8 BYTES**, not
+  characters: bytes are buffered as they arrive and a line is decoded only once it
+  is complete and under the bound, so a multi-byte transcript that is over the
+  bound in bytes is refused even when its character count is under it. An oversized
+  line is discarded up to AND including its newline (one malformed), so a payload
+  on the same line cannot slip through, the next line parses, and a large chunk of
+  short lines is fully retained. The stub's health line carries exactly the fields
+  the schema defines. (`round5.test.ts`; `round4.test.ts`; `sidecar-stub.test.ts`.)
 - **Record ids are unique ACROSS processes.** Every default record id is
   `<agentId>-<random UUID>` — no per-process counter, no wall clock — and the
   reachy MEMORY and OrgEvent writes use the same construction, so two bob
@@ -411,18 +414,29 @@ naming its test (`test/capabilities/reachy/`):
 - **A memory is written only when addressed AND speakerVerified** — `private`,
   author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
   (`reachy.test.ts` (a)/(b)/(c)/(d).)
-- **No memory without its audit, and the audit is durable and exact-id.** The
-  OrgEvent is the SAME record shape the observatory emits
-  (`src/capabilities/observatory/snapshot.ts`), written FIRST with a record id,
-  then the memory carrying that id; a failed audit write means no memory; "why do
-  you know this" reads the event back by EXACT id (`GET /Memory/<id>`), so it
-  answers across a restart. (`reachy.test.ts` item 2.)
+- **No memory without its audit, and the audit is durable, exact-id and honest
+  about the OUTCOME.** The OrgEvent is the SAME record shape the observatory emits
+  (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
+  record id, then the memory carries that id, then a SECOND correlated event records
+  the outcome — `reachy.memory.written` (with the memory id) or `reachy.memory.failed`
+  (with the error class, linked to the attempt, and logged) — so a failed write never
+  leaves an unqualified "wrote". A failed audit write means no memory; "why do you
+  know this" reads the event back by EXACT id (`GET /Memory/<id>`). Every reachy event
+  id is a full UUID (never a timestamp plus a short suffix), so two events never
+  collide. (`round5.test.ts`; `reachy.test.ts` item 2.)
 - **Every command goes through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one
   OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
-  **`reachy_say` accepts NO memory reference at all** — a memory id is a refusal
-  with an OrgEvent `reachy.refused`; `answer` is OFF (fail closed).
-  (`reachy.test.ts` items 2a/2b/3.)
+  **`reachy_say` accepts NO memory reference at all** — the tool's SCHEMA rejects an
+  extra argument (`additionalProperties: false`), and pi validates tool arguments
+  BEFORE `execute`, so a live pi call never reaches the refusal; a DIRECT caller of
+  `execute` still gets an audited OrgEvent `reachy.refused`. `answer` is OFF (fail
+  closed). (`reachy.test.ts` items 2a/2b/3; `round4.test.ts`.)
+- **The visitor acknowledgement rate slot is reserved SYNCHRONOUSLY.** The socket
+  path runs line handlers concurrently, so the one-per-minute acknowledge slot is
+  taken before any awaited audit write (and rolled back if the audit fails) — two
+  visitor lines arriving while the store is slow cannot both acknowledge.
+  (`round5.test.ts`; `reachy.test.ts`.)
 - **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
   `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
   the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub

@@ -61,6 +61,8 @@ export interface WireOptions {
   store: OrgEventStore;
   state: PolicyState;
   log?: (msg: string) => void;
+  /** Id seam (tests): every generated id and nonce comes from here. */
+  uuid?: () => string;
 }
 
 export type DecisionSummary =
@@ -94,6 +96,7 @@ export function orgEventRecordId(event: OrgEvent): string {
 export function wireReachyCapability(opts: WireOptions): WiredReachy {
   const { pi, commands, memory, store, state } = opts;
   const log = opts.log ?? ((m: string) => console.error(m));
+  const uuid = opts.uuid ?? (() => randomUUID());
   let lastTranscript: Transcript | null = null;
 
   async function audit(event: OrgEvent): Promise<boolean> {
@@ -108,17 +111,19 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
   }
 
-  /** A refusal is itself audited as `reachy.refused`. */
-  async function refuse(action: string, reason: string): Promise<DecisionSummary> {
+  /** A refusal is itself audited as `reachy.refused`, FULL UUID id, optionally
+   *  LINKED to the event it refuses (`refId`). */
+  async function refuse(action: string, reason: string, refId?: string): Promise<DecisionSummary> {
     const tsMs = state.nowMs();
     await audit({
-      id: `evt_reachy.refused_${tsMs}_${randomUUID().slice(0, 8)}`,
+      id: `evt_reachy.refused_${uuid()}`,
       kind: "reachy.refused",
       authorId: "jarvis",
       summary: `refused ${action}: ${reason}`,
+      ...(refId !== undefined ? { refId } : {}),
       targetIds: [],
       createdAt: new Date(tsMs).toISOString(),
-      nonce: randomUUID(),
+      nonce: uuid(),
       tsMs,
     });
     return { kind: "refused", action, reason };
@@ -228,13 +233,13 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     if (decoded.kind === "malformed") {
       const tsMs = state.nowMs();
       await audit({
-        id: `evt_reachy.malformed_${tsMs}_${randomUUID().slice(0, 8)}`,
+        id: `evt_reachy.malformed_${uuid()}`,
         kind: "reachy.malformed",
         authorId: "jarvis",
         summary: `dropped a malformed sidecar line: ${decoded.reason}`,
         targetIds: [],
         createdAt: new Date(tsMs).toISOString(),
-        nonce: randomUUID(),
+        nonce: uuid(),
         tsMs,
       });
       return { kind: "malformed", reason: decoded.reason };
@@ -247,8 +252,14 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       if (decision.kind === "drop") return { kind: "drop" };
       if (decision.kind === "none") return { kind: "none" };
       if (decision.kind === "memory") {
-        // ORDER: event first (exact id), then the memory carrying that id.
-        const persisted = await audit(decision.orgEvent);
+        // THREE correlated events (round 5 item 3): the ATTEMPT (intent) is
+        // written first with an exact id, the memory carries that id, and a
+        // SECOND event records the OUTCOME — `written` (with the memory id) or
+        // `failed` (with the error class) — so a failed write never leaves an
+        // unqualified "wrote", and the failure is LOGGED, never swallowed.
+        const attempt = decision.orgEvent;
+        const attemptId = orgEventRecordId(attempt);
+        const persisted = await audit(attempt);
         if (!persisted) return refuse("memory", "audit write failed — memory NOT written");
         let id: string;
         try {
@@ -256,23 +267,52 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
             ...decision.write,
             metadata: {
               speakerId: decoded.transcript.speakerId as string,
-              correlationId: `corr_${randomUUID()}`,
-              orgEventId: orgEventRecordId(decision.orgEvent),
+              correlationId: `corr_${uuid()}`,
+              orgEventId: attemptId,
             },
           }));
         } catch (err) {
-          // A rejected memory write must not leave an OrgEvent for a memory that
-          // does not exist, nor escape as an unhandled rejection (round 4).
-          return refuse(
-            "memory",
-            `memory write failed after audit: ${err instanceof Error ? err.message : err}`,
-          );
+          const klass = err instanceof Error ? err.name : "Error";
+          const detail = err instanceof Error ? err.message : String(err);
+          await audit({
+            id: `evt_reachy.memory.failed_${uuid()}`,
+            kind: "reachy.memory.failed",
+            authorId: "jarvis",
+            summary: `memory write FAILED (${klass}): ${detail}`,
+            refId: attemptId,
+            targetIds: [],
+            createdAt: new Date(state.nowMs()).toISOString(),
+            nonce: uuid(),
+            tsMs: state.nowMs(),
+          });
+          log(`reachy: memory write failed after attempt ${attemptId} (${klass}): ${detail}`);
+          return refuse("memory", `memory write failed after attempt: ${detail}`, attemptId);
         }
+        await audit({
+          id: `evt_reachy.memory.written_${uuid()}`,
+          kind: "reachy.memory.written",
+          authorId: "jarvis",
+          summary: `wrote the private memory ${id} for the verified speaker ${decoded.transcript.speakerId as string}`,
+          refId: attemptId,
+          targetIds: [id],
+          createdAt: new Date(state.nowMs()).toISOString(),
+          nonce: uuid(),
+          tsMs: state.nowMs(),
+        });
         return { kind: "memory", memoryId: id };
       }
       if (decision.orgEvent) {
-        if (!(await audit(decision.orgEvent))) return refuse("acknowledge", "audit write failed");
-        state.lastAcknowledgeAtMs = state.nowMs();
+        // RESERVE the rate slot SYNCHRONOUSLY, before the awaited audit (round 5
+        // item 2): the socket path runs handlers concurrently, so advancing the
+        // limit only after an await let two visitor lines BOTH acknowledge while
+        // the store was slow. Roll the reservation back if the audit fails.
+        const reservedAt = state.nowMs();
+        const previous = state.lastAcknowledgeAtMs;
+        state.lastAcknowledgeAtMs = reservedAt;
+        if (!(await audit(decision.orgEvent))) {
+          state.lastAcknowledgeAtMs = previous;
+          return refuse("acknowledge", "audit write failed");
+        }
         return { kind: "ephemeral", acknowledged: true };
       }
       return { kind: "ephemeral", acknowledged: false };
