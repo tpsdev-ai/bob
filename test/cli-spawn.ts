@@ -65,6 +65,10 @@ export function spawnNode(args: string[], opts: SpawnOptions = {}): string {
   try {
     return execFileSync(INTERPRETER, args, {
       timeout: timeoutMs,
+      // killSignal SIGKILL so the timeout bounds even a child that traps
+      // SIGTERM; the default SIGTERM can leave execFileSync waiting past the
+      // budget instead of terminating the child (CodeRabbit review).
+      killSignal: "SIGKILL",
       encoding: "utf8",
     });
   } catch (e) {
@@ -74,19 +78,25 @@ export function spawnNode(args: string[], opts: SpawnOptions = {}): string {
       killed?: boolean;
       signal?: string | null;
       code?: number | null;
+      status?: number | null;
     };
     const rawStdout = String(cause.stdout ?? "");
     const rawStderr = String(cause.stderr ?? "");
-    // Expose the merged stdout+stderr on `.stdout` (matching the old `2>&1`
-    // behaviour the callers expect): a caller reading e.stdout sees whatever
-    // the child wrote to either stream.
-    const merged = rawStdout + rawStderr;
+    // A non-zero synchronous result carries its exit code in `status`, not
+    // `code` (the synchronous result does not expose `code` for a killed
+    // child). A kill/timeout leaves no code but a termination `signal`, from
+    // which `killed` is derived.
+    const code = Number.isFinite(cause.status)
+      ? (cause.status as number)
+      : Number.isFinite(cause.code)
+        ? (cause.code as number)
+        : null;
     throw new SpawnError({
-      stdout: merged,
+      stdout: rawStdout + rawStderr,
       stderr: rawStderr,
-      killed: Boolean(cause.killed),
+      killed: Boolean(cause.killed) || Boolean(cause.signal),
       signal: cause.signal ?? null,
-      code: cause.code ?? null,
+      code,
     });
   }
 }

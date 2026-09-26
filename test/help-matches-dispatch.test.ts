@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
-import { spawnNode } from "./cli-spawn.js";
+import { type SpawnError, spawnNode } from "./cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
@@ -86,14 +86,25 @@ describe("help matches dispatch (#161)", () => {
   // distinct name in the report (the same race a single test spawning several
   // commands hit — see test/cli.test.ts).
   it.each(commands)("%s is not rejected as an unknown command", (cmd) => {
+    let output = "";
+    let killed = false;
     try {
       spawnNode([CLI, cmd]);
     } catch (err) {
-      const e = err as { stdout?: string; message?: string };
-      // A real, dispatched command may still exit non-zero (e.g. a bare
-      // `node dist/cli.js onboard` prints "missing <name>"). What we assert is
-      // only that it is not refused as unknown — the help-vs-dispatch gap #161.
-      expect(e.stdout || e.message).not.toContain("unknown command");
+      const cause = err as SpawnError;
+      // A kill/timeout (a termination signal, or killed) means the command
+      // never completed: fail here rather than reading partial captured
+      // output as "not unknown" (accepted).
+      killed = cause.killed || Boolean(cause.signal);
+      output = cause.stdout;
     }
+    // A command that timed out (killed) never completed; the test must fail.
+    if (killed) {
+      throw new Error(`spawn for command '${cmd}' was killed (timed out)`);
+    }
+    // A real, dispatched command may still exit non-zero (e.g. a bare `bob
+    // onboard` prints "missing <name>"). We assert only that it is not
+    // refused as unknown — the help-vs-dispatch gap #161.
+    expect(output).not.toContain("unknown command");
   });
 });

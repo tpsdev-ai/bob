@@ -39,7 +39,24 @@ describe("CLI spawn helper bounds and path handling (#163)", () => {
     expect(thrown).toBeInstanceOf(SpawnError);
     const cause = thrown as SpawnError;
     expect(["SIGTERM", "SIGKILL"]).toContain(cause.signal ?? "");
+    expect(cause.killed).toBe(true);
   }, 2000);
+  // A non-zero, non-killed exit carries its numeric code from `status`;
+  // there is no kill signal, so `killed` is false. Asserts both SpawnError
+  // fields (code + killed) for a completed non-zero exit (CodeRabbit ask).
+  it("captures the numeric exit code of a non-zero, non-killed spawn", () => {
+    let thrown: unknown;
+    try {
+      spawnNode(["-e", "process.exit(30)"]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(SpawnError);
+    const cause = thrown as SpawnError;
+    expect(cause.code).toBe(30);
+    expect(cause.killed).toBe(false);
+    expect(cause.signal ?? "").toBe("");
+  });
 
   // If the spawn used a shell string, a path with a space would be split
   // into multiple arguments and the wrong program (or nothing) would run.

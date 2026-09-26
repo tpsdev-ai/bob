@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawnNode } from "./cli-spawn.js";
+import { type SpawnError, spawnNode } from "./cli-spawn.js";
 
 // Closes tpsdev-ai/bob#149.
 //
@@ -98,16 +98,24 @@ function retiredFlagsNamedIn(md: string): string[] {
 // The CLI prints "unknown command 'X'" (and exits non-zero) for a command it
 // does not accept; every accepted command — even one missing its <name> — runs
 // past that gate, so "unknown command" is the acceptance signal.
+//
+// A command that times out (its spawn is killed) never completed, so it cannot
+// be classified as "accepted" from partial or empty captured output; such a
+// result makes this check fail rather than pass vacuously (CodeRabbit review).
 function cliAccepts(cmd: string): boolean {
-  let out = "";
   try {
-    out = spawnNode([CLI, cmd]);
+    return !/unknown command/i.test(spawnNode([CLI, cmd]));
   } catch (e) {
-    out =
-      ((e as { stdout?: string; stderr?: string }).stdout ?? "") +
-      ((e as { stderr?: string }).stderr ?? "");
+    // A kill/timeout (a termination signal, or killed) means the command never
+    // completed: do not let its partial captured output read as "not unknown"
+    // (accepted).
+    const cause = e as SpawnError;
+    if (cause.killed || cause.signal) return false;
+    // A normal non-zero exit (e.g. a bare `bob onboard` prints "missing
+    // <name>") is a real, dispatched response; classify on the captured,
+    // merged output only.
+    return !/unknown command/i.test(cause.stdout);
   }
-  return !/unknown command/i.test(out);
 }
 
 // Control probe, added after a review round caught a vacuous-pass mode: if
