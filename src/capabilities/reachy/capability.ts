@@ -150,7 +150,20 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           : decision.action === "frame"
             ? "frame"
             : "say";
-    await commands.send(cmd, args);
+    // The audit said ADMITTED, so a send that then fails must not look like a
+    // delivered command: catch it, log it, and return a LINKED refusal so the
+    // caller gets a refusal rather than a rejected promise (round 5 review).
+    try {
+      await commands.send(cmd, args);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      log(`reachy: command '${decision.action}' admitted but the sidecar send failed: ${detail}`);
+      return refuse(
+        decision.action,
+        `sidecar send failed: ${detail}`,
+        orgEventRecordId(decision.orgEvent),
+      );
+    }
     return { kind: "admitted", action: decision.action };
   }
 
@@ -208,8 +221,14 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       "PLACEHOLDER: the command channel has no request/response correlation yet, so this returns no sidecar state. Declared as a placeholder in the manifest and README.",
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute() {
-      const st = await commands.send("state");
-      return ok(JSON.stringify(st ?? {}));
+      // A failed send is a sentence, not a thrown tool call: the tool stays
+      // registered even when the sidecar is down (round 5 review).
+      try {
+        const st = await commands.send("state");
+        return ok(JSON.stringify(st ?? {}));
+      } catch (err) {
+        return ok(`state unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   });
   pi.registerTool({

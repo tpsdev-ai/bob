@@ -193,6 +193,52 @@ describe("reachy round 5 item 3: a memory write is audited as intent then outcom
   });
 });
 
+// ── round 5 review: a failed sidecar SEND after the audit is a refusal, not a reject ──
+describe("reachy round 5 review: a failed commands.send is handled, never swallowed", () => {
+  class FailingCommands implements ReachyCommands {
+    async send(): Promise<unknown> {
+      throw new Error("sidecar not connected");
+    }
+  }
+  function wiredWithFailingSend() {
+    const store = new SlowStore();
+    const logs: string[] = [];
+    const wired = wireReachyCapability({
+      pi: new NoPi(),
+      commands: new FailingCommands(),
+      memory: new RecordingMemory(),
+      store,
+      state: {
+        wakeName: "jarvis",
+        enrolment: {},
+        mute: false,
+        nowMs: () => 1,
+        lastAcknowledgeAtMs: undefined,
+      },
+      log: (m) => logs.push(m),
+    });
+    return { wired, store, logs };
+  }
+
+  it("an admitted command whose send fails returns a LINKED refusal and is logged", async () => {
+    const { wired, store, logs } = wiredWithFailingSend();
+    const r = await wired.handleLine(
+      JSON.stringify({
+        type: "proposal",
+        action: "look",
+        args: { yaw: 1, pitch: 2 },
+        confidence: 0.9,
+        inputs: [],
+      }),
+    );
+    expect(r.kind).toBe("refused");
+    const refused = store.all.find((e) => e.kind === "reachy.refused");
+    expect(refused).toBeDefined();
+    expect(refused!.summary).toContain("sidecar send failed");
+    expect(logs.some((m) => m.includes("sidecar send failed"))).toBe(true);
+  });
+});
+
 // ── item 4: full-UUID event ids ───────────────────────────────────────────────
 describe("reachy round 5 item 4: event ids are full UUIDs, not a time + short suffix", () => {
   it("uuids sharing their first 8 characters still yield DISTINCT ids (fixed clock)", async () => {
