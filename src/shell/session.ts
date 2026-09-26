@@ -135,25 +135,104 @@ export function buildOpenrouterProvider(input: {
  * treated as no entry (there is nothing to find).
  */
 export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
-  const read = (path: string): Record<string, unknown> => {
+  const modelsPath = join(piAgentDir, "models.json");
+  const authPath = join(piAgentDir, "auth.json");
+  // ENOENT is "absent" (no entry). Any OTHER read or parse failure — unreadable,
+  // or JSON that does not parse after stripping a leading UTF-8 BOM — is a
+  // REFUSAL: bob cannot PROVE the file carries no openrouter entry. pi accepts a
+  // BOM in both files and comments in models.json, so we strip the BOM before
+  // parsing (a BOM-prefixed file WITH an entry is still caught), and a commented
+  // models.json fails the parse and refuses rather than reading as "no entry".
+  const load = (path: string): Record<string, unknown> => {
+    let raw: string;
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      raw = readFileSync(path, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+      throw new Error(
+        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not read it: ${err instanceof Error ? err.message : String(err)}).`,
+      );
+    }
+    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    try {
+      const parsed = JSON.parse(text);
       return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-    } catch {
-      return {};
+    } catch (err) {
+      throw new Error(
+        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not parse it: ${err instanceof Error ? err.message : String(err)}).`,
+      );
     }
   };
-  const modelsPath = join(piAgentDir, "models.json");
-  const providers = (read(modelsPath).providers ?? {}) as Record<string, unknown>;
+  const providers = (load(modelsPath).providers ?? {}) as Record<string, unknown>;
   if (Object.hasOwn(providers, "openrouter")) {
     throw new Error(
       `bob: refusing to start an openrouter session — ${modelsPath} carries a providers.openrouter entry; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
     );
   }
-  const authPath = join(piAgentDir, "auth.json");
-  if (Object.hasOwn(read(authPath), "openrouter")) {
+  if (Object.hasOwn(load(authPath), "openrouter")) {
     throw new Error(
       `bob: refusing to start an openrouter session — ${authPath} carries a stored openrouter credential; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
+    );
+  }
+}
+
+/**
+ * After the session services EXIST (capabilities have loaded and may have called
+ * pi's `registerProvider`), resolve the openrouter provider/model the way pi will
+ * use it and refuse unless it is still bob's definition (round 4, item 2). bob
+ * registers before `createAgentSessionServices`; a later `registerProvider` would
+ * silently move the endpoint or the key, so the EFFECTIVE result is asserted, not
+ * the registration intent.
+ */
+export async function assertOpenrouterRuntimeUnchanged(
+  modelRuntime: ModelRuntime,
+  input: { model: string; expected: OpenrouterProviderConfig; apiKey: string },
+): Promise<void> {
+  const providerId = "openrouter";
+  const problems: string[] = [];
+  const model = modelRuntime.getModel(providerId, input.model);
+  if (!model) {
+    problems.push(`no model ${providerId}/${input.model}`);
+  } else {
+    if (model.baseUrl !== input.expected.baseUrl) {
+      problems.push(
+        `the selected model's baseUrl is ${model.baseUrl}, not ${input.expected.baseUrl}`,
+      );
+    }
+    if (model.api !== input.expected.api) {
+      problems.push(
+        `the selected model's api is ${JSON.stringify(model.api)}, not ${JSON.stringify(input.expected.api)}`,
+      );
+    }
+  }
+  const reg = modelRuntime.getRegisteredProviderConfig?.(providerId);
+  if (!reg) {
+    problems.push("there is no registered openrouter provider config");
+  } else {
+    if (reg.baseUrl !== input.expected.baseUrl) {
+      problems.push(
+        `the registered baseUrl is ${JSON.stringify(reg.baseUrl)}, not ${input.expected.baseUrl}`,
+      );
+    }
+    if (reg.api !== input.expected.api) {
+      problems.push(
+        `the registered api is ${JSON.stringify(reg.api)}, not ${JSON.stringify(input.expected.api)}`,
+      );
+    }
+    const m0 = (reg.models ?? [])[0] as { baseUrl?: string } | undefined;
+    if (m0 && m0.baseUrl !== undefined) {
+      problems.push(`the model entry carries a per-model baseUrl (${m0.baseUrl})`);
+    }
+  }
+  // The key the request would carry. pi resolves it through the composed auth.
+  const auth = await modelRuntime.getAuth(providerId).catch(() => undefined);
+  const resolvedKey = auth?.auth?.apiKey;
+  if (resolvedKey !== undefined && resolvedKey !== input.apiKey) {
+    problems.push("the resolved apiKey is not the OPENROUTER_API_KEY value");
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `bob: refusing to start an openrouter session — after the session services were built, the effective openrouter provider is no longer bob's: ${problems.join("; ")}. Something registered openrouter during session creation.`,
     );
   }
 }
@@ -584,8 +663,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // openrouter is bob's OWN provider (round 3): construct it in memory and
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
     // redirect the endpoint or the key. Runs BEFORE any session exists.
+    let openrouterProvider: OpenrouterProviderConfig | undefined;
+    let openrouterKey = "";
     if (config.provider === "openrouter") {
-      registerOpenrouterProvider(modelRuntime, { model: config.model, piAgentDir: agentDir });
+      openrouterProvider = registerOpenrouterProvider(modelRuntime, {
+        model: config.model,
+        piAgentDir: agentDir,
+      });
+      openrouterKey = requireOpenrouterApiKey();
     }
     const services = await createAgentSessionServices({
       cwd,
@@ -603,6 +688,16 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
+    // Round 4, item 2: assert the EFFECTIVE openrouter provider AFTER the
+    // services exist — a capability's own `registerProvider` during load would
+    // otherwise move the endpoint or the key without bob noticing.
+    if (config.provider === "openrouter" && openrouterProvider !== undefined) {
+      await assertOpenrouterRuntimeUnchanged(modelRuntime as ModelRuntime, {
+        model: config.model,
+        expected: openrouterProvider,
+        apiKey: openrouterKey,
+      });
+    }
 
     const model = services.modelRuntime.getModel(config.provider, config.model);
     if (!model) {

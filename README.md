@@ -389,16 +389,19 @@ deepseek/deepseek-v4.1-flash`.
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint, the
 `OPENROUTER_API_KEY` value passed explicitly, the `openai-completions` api, and the declared model
-with no per-model `baseUrl` — and hands it to pi's session services, so no `models.json`/`auth.json`
-field can redirect the endpoint or supply the key, and every entry path (`bob run`, the persistent
-runtime, `bob onboard`, `bob align`) goes through that factory (`openrouter-provider-183.test.ts`
-(a2), (b1)–(b6)). `bob init` writes NO `openrouter` entry to the pi config, and any on-disk
-`openrouter` entry — a `providers.openrouter` block in `.pi-agent/models.json` (including a per-model
-`baseUrl` or a `providers.openrouter.apiKey`) or a stored openrouter credential in
-`.pi-agent/auth.json` — is REFUSED before the session exists, naming the file, never merged
-(`openrouter-provider-183.test.ts` (2a), (2a-listener), (2b), (2d)). An unset `OPENROUTER_API_KEY`
-refuses before any session too, and the key is never written to disk
-(`openrouter-provider-183.test.ts` (c), (2d)).
+with no per-model `baseUrl` — and hands it to pi's session services; every entry path (`bob run`, the
+persistent runtime, `bob onboard`, `bob align`) goes through that factory
+(`openrouter-provider-183.test.ts` (a2), (b1)–(b6)). What is REFUSED before the session exists,
+naming the file: a `providers.openrouter` block in `.pi-agent/models.json` — a per-model `baseUrl`, a
+`providers.openrouter.apiKey` — (`(2a), (2a-listener), (2b), (2d)`); a stored openrouter credential in
+`.pi-agent/auth.json` (`(a)`); and an unreadable or unparseable pi config, where a missing file is
+"absent" but any other read or parse failure refuses because bob cannot prove the file carries no
+entry (`(a)–(d)`). A provider declared under ANOTHER name is not bob's concern: the selected
+`openrouter` model resolves from bob's in-memory provider, and that EFFECTIVE provider/model (baseUrl,
+api, no per-model baseUrl, the key) is ASSERTED after the session services are built, so a capability
+that re-registers `openrouter` during load is refused naming what changed (`(post-services)`). An
+unset `OPENROUTER_API_KEY` refuses before any session too, and the key is never written by the run
+path's persisted files (`(c), (2d)`).
 
 ## Status
 
