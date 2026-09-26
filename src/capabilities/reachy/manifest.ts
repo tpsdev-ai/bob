@@ -10,6 +10,8 @@ export const reachyManifest: BobCapabilityManifest = {
   configSchema: CONFIG_SCHEMA,
   provides: {
     tools: ["reachy_look", "reachy_say", "reachy_state", "reachy_frame"],
+    // reachy_state is a PLACEHOLDER: no request/response correlation yet.
+    placeholderTools: ["reachy_state"],
     // serves: true — in S1 the capability injects inbound turns (speech
     // addressed to jarvis). S3 registers the tools and consumes events.
     serves: true,

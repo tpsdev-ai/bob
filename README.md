@@ -385,10 +385,29 @@ The `reachy` capability is the jarvis office agent's body, built as a **skeleton
 a stub sidecar** (no hardware, no model, no network). Operator guarantees, each
 naming its test (`test/capabilities/reachy/`):
 
-- **A malformed sidecar line does nothing, and the wire is STRICT.** Lines are
-  decoded and schema-checked before policy; an unknown field, an oversized line
-  (bounded at 64 KiB, never buffered) or a bad shape is dropped with an OrgEvent
-  `reachy.malformed`. (`reachy.test.ts` item 4; `sidecar-stub.test.ts`.)
+- **A malformed sidecar line does nothing, and the wire is STRICT.** Every wire
+  type — including the outer envelope — has `additionalProperties: false`; lines
+  are decoded and schema-checked before policy. An unknown field, a bad shape, or
+  an oversized line is dropped with an OrgEvent `reachy.malformed`. The line bound
+  (64 KiB) applies PER COMPLETE LINE: an oversized line is discarded up to AND
+  including its newline (one malformed), so a payload on the same line cannot slip
+  through, the next line parses, and a large chunk of short lines is fully
+  retained. The stub's health line carries exactly the fields the schema defines.
+  (`round4.test.ts`; `sidecar-stub.test.ts`.)
+- **Record ids are unique ACROSS processes.** Every default record id is
+  `<agentId>-<random UUID>` — no per-process counter, no wall clock — and the
+  reachy MEMORY and OrgEvent writes use the same construction, so two bob
+  processes with one agentId never overwrite each other. (`capability.test.ts`
+  round 4.)
+- **The replay proof and the key proof measure what they claim.** Completion is
+  the stub's explicit end-of-replay marker, and the expected event count and
+  outcomes are pinned CONSTANTS independent of the fixture (a truncated replay
+  fails); the key-read proof makes the fixture dir traversable (0711) and asserts
+  a 0644 control file IS readable while the 0600 fixtures are NOT, so it isolates
+  the file mode. (`sidecar-stub.test.ts`.)
+- **`reachy_state` is a PLACEHOLDER** (declared in the manifest as
+  `placeholderTools`): the command channel has no request/response correlation
+  yet, so it returns no sidecar state. (`round4.test.ts`.)
 - **A memory is written only when addressed AND speakerVerified** — `private`,
   author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
   (`reachy.test.ts` (a)/(b)/(c)/(d).)

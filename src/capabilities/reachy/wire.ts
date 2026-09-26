@@ -25,12 +25,37 @@ const TRANSCRIPT_LINE = Type.Object(
   // A trust boundary is STRICT: an unknown field is malformed (round 3 item 4).
   { additionalProperties: false },
 );
-const PRESENCE_LINE = Type.Object({
-  type: Type.Literal("presence"),
-  count: Type.Integer(),
-  known: Type.Array(Type.String()),
-});
-const HEALTH_LINE = Type.Object({ type: Type.Literal("health") }, { additionalProperties: false });
+const PRESENCE_LINE = Type.Object(
+  {
+    type: Type.Literal("presence"),
+    count: Type.Integer(),
+    known: Type.Array(Type.String()),
+  },
+  // Strict outer envelope: an unknown field is malformed (round 4 item 3).
+  { additionalProperties: false },
+);
+// The proposal envelope is strict too. `args` is deliberately open — the policy
+// owns the per-action argument shape (`isValidProposal`), not the wire.
+const PROPOSAL_LINE = Type.Object(
+  {
+    type: Type.Literal("proposal"),
+    action: Type.String(),
+    args: Type.Unknown(),
+    confidence: Type.Number(),
+    inputs: Type.Array(Type.String()),
+  },
+  { additionalProperties: false },
+);
+// The health fields the STUB actually sends: `ok`, plus `replayEnd` on the
+// end-of-replay marker. Nothing else — an unknown field is malformed.
+const HEALTH_LINE = Type.Object(
+  {
+    type: Type.Literal("health"),
+    ok: Type.Boolean(),
+    replayEnd: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
 
 export type DecodedLine =
   | { kind: "transcript"; transcript: Transcript }
@@ -68,7 +93,7 @@ export function decodeLine(raw: unknown): DecodedLine {
       },
     };
   }
-  if (type === "proposal") {
+  if (type === "proposal" && Value.Check(PROPOSAL_LINE, obj)) {
     const proposal = {
       action: obj.action,
       args: obj.args,

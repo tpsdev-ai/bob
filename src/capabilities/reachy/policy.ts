@@ -18,7 +18,7 @@
 //   * `mute` drops every event — no transcripts, no proposals, no frames, no
 //     OrgEvents.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -129,7 +129,9 @@ function orgEvent(
 ): OrgEvent {
   const tsMs = state.nowMs();
   return {
-    id: `evt_${kind}_${tsMs}_${randomBytes(4).toString("hex")}`,
+    // A UUID, never a time + short suffix: OrgEvent ids must be unique across
+    // processes, not just within one (round 4).
+    id: `evt_${kind}_${randomUUID()}`,
     kind,
     authorId: "jarvis",
     // The record shape carries no free metadata: the inputs' ids go in targetIds

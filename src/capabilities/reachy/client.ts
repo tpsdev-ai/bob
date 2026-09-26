@@ -28,6 +28,7 @@ export interface SidecarLine {
 export class UnixSocketReachyClient implements ReachyCommands {
   private socket: Socket | null = null;
   private buffer = "";
+  private discarding = false;
   private listeners: Array<(line: unknown) => void> = [];
 
   constructor(private readonly opts: { socket: string }) {}
@@ -44,19 +45,40 @@ export class UnixSocketReachyClient implements ReachyCommands {
     });
   }
 
-  private ingest(text: string): void {
+  /** The bound applies PER COMPLETE LINE (round 4 item 2): an oversized line is
+   *  discarded up to AND INCLUDING its newline (one `reachy.malformed`), so the
+   *  next line parses normally and an oversized prefix cannot smuggle a payload
+   *  on the same line; a chunk holding several short lines is fully retained. */
+  ingest(text: string): void {
     this.buffer += text;
-    if (this.buffer.length > MAX_LINE_BYTES) {
-      // A line longer than the bound is never grown without limit: drop the
-      // buffer and hand the decoder a marker so it is a `reachy.malformed` line.
-      this.buffer = "";
-      for (const l of this.listeners) l({ type: "__oversized__" });
-      return;
-    }
-    let idx = this.buffer.indexOf("\n");
-    while (idx !== -1) {
-      const line = this.buffer.slice(0, idx);
-      this.buffer = this.buffer.slice(idx + 1);
+    for (;;) {
+      const nl = this.buffer.indexOf("\n");
+      if (this.discarding) {
+        // We are inside a line already known to be oversized: consume through
+        // its newline (or wait, dropping bytes, until one arrives).
+        if (nl === -1) {
+          if (this.buffer.length > MAX_LINE_BYTES) this.buffer = "";
+          return;
+        }
+        this.buffer = this.buffer.slice(nl + 1);
+        this.discarding = false;
+        continue;
+      }
+      if (nl === -1) {
+        // No complete line yet. Only the PENDING line can be oversized here.
+        if (this.buffer.length > MAX_LINE_BYTES) {
+          this.buffer = "";
+          this.discarding = true;
+          this.emitMalformed();
+        }
+        return;
+      }
+      const line = this.buffer.slice(0, nl);
+      this.buffer = this.buffer.slice(nl + 1);
+      if (line.length > MAX_LINE_BYTES) {
+        this.emitMalformed();
+        continue;
+      }
       if (line.trim()) {
         try {
           const parsed = JSON.parse(line);
@@ -67,8 +89,12 @@ export class UnixSocketReachyClient implements ReachyCommands {
           for (const l of this.listeners) l(line);
         }
       }
-      idx = this.buffer.indexOf("\n");
     }
+  }
+
+  /** Hand the decoder the oversized marker, so it audits one `reachy.malformed`. */
+  private emitMalformed(): void {
+    for (const l of this.listeners) l({ type: "__oversized__" });
   }
 
   onLine(listener: (line: unknown) => void): void {

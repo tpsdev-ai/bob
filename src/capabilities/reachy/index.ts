@@ -6,7 +6,9 @@
 // decoded by wire.ts (one shape, schema-checked) before policy.
 //
 // SECURITY: the capability holds no keys and reads no key files; it talks to the
-// sidecar only through the socket, and the sidecar runs as its own user.
+// sidecar only through the socket. The STUB sidecar is NOT run as its own user
+// (S2) — the key-read proof runs the read PATH as a different OS user, but the
+// stub itself is launched as the agent's own user.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FlairHttpClient } from "../flair/client.js";

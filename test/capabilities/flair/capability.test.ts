@@ -236,8 +236,9 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
   it("write PUTs /Memory/<id> with durability + a derived id", async () => {
     const { client, captured } = await makeClientWithCapture();
     const { id } = await client.write("note", { durability: "persistent" });
-    // The id is unique PER WRITE (agent + counter), never wall-clock alone (bob#180 r3).
-    expect(id).toMatch(/^pulse-\d+$/);
+    // The default id is `agent + a random UUID` (here the injected uuid seam),
+    // never a counter and never wall-clock alone (bob#180 round 4).
+    expect(id).toBe("pulse-nonce-abc");
     const req = captured[0];
     expect(req?.method).toBe("PUT");
     expect(req?.url).toBe(`http://127.0.0.1:9926/Memory/${id}`);
@@ -322,7 +323,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
   });
 });
 
-describe("FlairHttpClient — record ids are unique per write (bob#180 round 3)", () => {
+describe("FlairHttpClient — record ids are unique per write (bob#180 round 4)", () => {
   it("two writes in the SAME millisecond get distinct ids (never wall-clock alone)", async () => {
     const kp = generateKeyPairSync("ed25519");
     const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
@@ -332,7 +333,10 @@ describe("FlairHttpClient — record ids are unique per write (bob#180 round 3)"
       keyFile: "/unused",
       fetchImpl: async () => ({ ok: true, status: 200, text: async () => "{}" }),
       now: () => 1_700_000_000_000, // FIXED clock
-      uuid: () => "n",
+      uuid: (() => {
+        let i = 0;
+        return () => `u${++i}`;
+      })(),
       readFile: () => pkcs8,
     });
     const a = await client.write("the audit record", { id: "orgevent-evt-1" });
@@ -341,5 +345,45 @@ describe("FlairHttpClient — record ids are unique per write (bob#180 round 3)"
     expect(a.id).toBe("orgevent-evt-1"); // explicit id honoured
     expect(b.id).not.toBe(a.id);
     expect(c.id).not.toBe(b.id); // same fixed clock → still distinct
+  });
+
+  it("TWO PROCESSES with the SAME agentId write distinct records, and BOTH remain readable", async () => {
+    // Two fresh clients = two processes: neither shares the other's state. Both
+    // start from the same agentId and the same clock; ids must still differ, or
+    // A's first record is overwritten by B's first (bob#180 round 4).
+    const kp = generateKeyPairSync("ed25519");
+    const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const store = new Map<string, string>(); // the fake Flair's Memory store
+    const mk = () =>
+      new FlairHttpClient({
+        url: "http://127.0.0.1:9926/",
+        agentId: "jarvis",
+        keyFile: "/unused",
+        now: () => 1_700_000_000_000, // SAME fixed clock in both
+        fetchImpl: async (u, i) => {
+          const url = String(u);
+          if ((i?.method ?? "GET") === "PUT") {
+            const id = decodeURIComponent(url.split("/Memory/")[1] ?? "");
+            store.set(id, String(i?.body ?? ""));
+            return { ok: true, status: 200, text: async () => "{}" };
+          }
+          const id = decodeURIComponent(url.split("/Memory/")[1] ?? "");
+          const body = store.get(id);
+          return {
+            ok: body !== undefined,
+            status: body !== undefined ? 200 : 404,
+            text: async () => body ?? "{}",
+          };
+        },
+        readFile: () => pkcs8,
+      });
+    const a = mk();
+    const b = mk(); // a second "process"
+    const wa = await a.write("A's memory");
+    const wb = await b.write("B's memory");
+    expect(wa.id).not.toBe(wb.id); // NOT a deterministic collision
+    expect((await a.get(wa.id))?.content).toBe("A's memory"); // both remain readable
+    expect((await b.get(wb.id))?.content).toBe("B's memory");
+    expect(store.size).toBe(2);
   });
 });

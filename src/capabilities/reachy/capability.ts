@@ -47,6 +47,9 @@ export interface MemoryWriter {
     content: string;
     visibility: "private";
     authorId: string;
+    // Explicit record id (agent + randomUUID) so the memory is unique across
+    // processes, not just within one (round 4).
+    id?: string;
     metadata: { speakerId: string; correlationId: string; orgEventId: string };
   }): Promise<{ id: string }>;
 }
@@ -77,6 +80,11 @@ export interface WiredReachy {
 function ok(text: string) {
   return { content: [{ type: "text" as const, text }], details: {} };
 }
+
+/** Tools that are declared but not yet wired to a real sidecar reply (round 4):
+ *  the command channel has no request/response correlation, so `reachy_state`
+ *  returns no sidecar state. Named here so the manifest and README can label it. */
+export const PLACEHOLDER_TOOLS = ["reachy_state"] as const;
 
 /** The record id a reachy OrgEvent is stored under (exact-fetchable). */
 export function orgEventRecordId(event: OrgEvent): string {
@@ -165,7 +173,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     label: "Reachy Say",
     description:
       "Speak a line through the speaker. v1: NO memory reference — a memory id makes it a refusal.",
-    // NO memoryId field: any extra property is rejected by the schema and refused.
+    // NO memoryId field: any extra property is rejected by the SCHEMA
+    // (`additionalProperties: false`), which pi validates BEFORE execute — so in
+    // a live pi call an extra argument never reaches execute at all. The check
+    // below is belt-and-braces for a DIRECT caller of execute (a test, or any
+    // code that invokes the tool without pi's validation).
     parameters: Type.Object(
       { text: Type.String({ minLength: 1 }) },
       { additionalProperties: false },
@@ -187,7 +199,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   pi.registerTool({
     name: "reachy_state",
     label: "Reachy State",
-    description: "Read the sidecar's health/state (a read; not an action).",
+    description:
+      "PLACEHOLDER: the command channel has no request/response correlation yet, so this returns no sidecar state. Declared as a placeholder in the manifest and README.",
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute() {
       const st = await commands.send("state");

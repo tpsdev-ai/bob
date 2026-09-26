@@ -38,8 +38,9 @@ def main() -> int:
                     cmd = json.loads(line)
                 except Exception:
                     continue
-                # The stub answers every command with one canned line.
-                conn.sendall((json.dumps({"type": "health", "ok": True, "ack": cmd.get("command")}) + "\n").encode())
+                # The stub answers every command with one canned health line,
+                # carrying EXACTLY the fields the strict health schema defines.
+                conn.sendall((json.dumps({"type": "health", "ok": True}) + "\n").encode())
 
     threading.Thread(target=pump_commands, daemon=True).start()
 
@@ -48,6 +49,9 @@ def main() -> int:
             if line.strip():
                 conn.sendall(line.encode() if line.endswith("\n") else (line + "\n").encode())
                 time.sleep(0.01)
+    # An EXPLICIT end-of-replay marker, so a consumer can tell a complete replay
+    # from a truncated one without counting the fixture's own lines (round 4).
+    conn.sendall((json.dumps({"type": "health", "ok": True, "replayEnd": True}) + "\n").encode())
     time.sleep(0.05)
     conn.close()
     server.close()
