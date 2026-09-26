@@ -1,9 +1,13 @@
 // Shared CLI-spawn helper for the test suite.
 //
 // One place that:
-//    - runs the built CLI (or any script) with execFileSync, i.e. a program +
+//    - runs the built CLI (or any script) with spawnSync, i.e. a program +
 //     argv array and NO shell, so a CLI path containing a space or a shell
 //     metacharacter is a literal argument, not shell syntax;
+//    - gives every caller one result shape: the merged stdout+stderr as a
+//     string on a clean exit, or — on a non-zero exit, a timeout/kill,
+//     or a spawn failure — a SpawnError whose stdout, stderr, code, signal
+//     and killed fields name the failure.
 //    - sets a per-spawn timeout in exactly one spot (CLI_SPAWN_TIMEOUT_MS),
 //     so a future command that blocks hangs at most one spawn, not the whole
 //     suite, before it is killed.
