@@ -384,12 +384,21 @@ stay textual, like a Discord snowflake.
 Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider.model`). `openrouter`
 is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
 passed through verbatim — for example `bob onboard orr --provider openrouter --model
-deepseek/deepseek-v4.1-flash`. Its API key is read from the **`OPENROUTER_API_KEY`** environment
-variable at run time and is never written to `bob.yaml` or the rendered pi config; no stored
-credential is honoured — a stored `auth.json` entry for openrouter is refused. `bob run` also
-pins the EFFECTIVE endpoint: the editable `.pi-agent/models.json` must resolve to exactly
-`https://openrouter.ai/api/v1`, and `bob run` refuses (naming the variable or the file and its
-value) when the key is unset or the endpoint differs, before any request is sent.
+deepseek/deepseek-v4.1-flash`.
+
+**bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
+memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint, the
+`OPENROUTER_API_KEY` value passed explicitly, the `openai-completions` api, and the declared model
+with no per-model `baseUrl` — and hands it to pi's session services, so no `models.json`/`auth.json`
+field can redirect the endpoint or supply the key, and every entry path (`bob run`, the persistent
+runtime, `bob onboard`, `bob align`) goes through that factory (`openrouter-provider-183.test.ts`
+(a2), (b1)–(b6)). `bob init` writes NO `openrouter` entry to the pi config, and any on-disk
+`openrouter` entry — a `providers.openrouter` block in `.pi-agent/models.json` (including a per-model
+`baseUrl` or a `providers.openrouter.apiKey`) or a stored openrouter credential in
+`.pi-agent/auth.json` — is REFUSED before the session exists, naming the file, never merged
+(`openrouter-provider-183.test.ts` (2a), (2a-listener), (2b), (2d)). An unset `OPENROUTER_API_KEY`
+refuses before any session too, and the key is never written to disk
+(`openrouter-provider-183.test.ts` (c), (2d)).
 
 ## Status
 

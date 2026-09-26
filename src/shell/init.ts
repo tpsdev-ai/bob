@@ -342,8 +342,6 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
     case "ollama-cloud":
     case "ollama":
       return "https://ollama.com/v1";
-    case "openrouter":
-      return "https://openrouter.ai/api/v1";
     default:
       return undefined;
   }
@@ -366,21 +364,19 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const modelsPath = join(piDir, "models.json");
   const authPath = join(piDir, "auth.json");
 
-  writeFileSync(
-    modelsPath,
-    `${JSON.stringify(
-      {
-        providers: {
-          [piProvider]: {
-            ...(baseUrl ? { baseUrl } : {}),
-            models: [{ id: opts.model, name: opts.model }],
-          },
+  // openrouter is bob's OWN provider (bob#183 round 3): its endpoint and its
+  // model declaration are constructed IN MEMORY at session creation, and an
+  // on-disk openrouter entry is REFUSED — so bob writes NO openrouter provider
+  // block here. Every other provider still declares its model on disk.
+  const providers = isEnvKeyProvider
+    ? {}
+    : {
+        [piProvider]: {
+          ...(baseUrl ? { baseUrl } : {}),
+          models: [{ id: opts.model, name: opts.model }],
         },
-      },
-      null,
-      2,
-    )}\n`,
-  );
+      };
+  writeFileSync(modelsPath, `${JSON.stringify({ providers }, null, 2)}\n`);
   writeFileSync(
     authPath,
     `${JSON.stringify(isEnvKeyProvider ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`,
