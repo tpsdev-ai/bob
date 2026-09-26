@@ -198,6 +198,45 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
     expect(reachyManifest.provides?.tools).toContain("reachy_state");
   });
 
+  it("a memory write FAILURE on the socket path is handled: a refusal, no unhandled rejection", async () => {
+    const pi = new CapturingPi();
+    const store = new NoStore();
+    const failing = {
+      async writePrivate(): Promise<{ id: string }> {
+        throw new Error("flair is down");
+      },
+    } as unknown as MemoryWriter;
+    const state: PolicyState = {
+      wakeName: "jarvis",
+      enrolment: { "spk-1": "member-1" }, // addressed + verified → tries to write
+      mute: false,
+      nowMs: () => 1,
+      lastAcknowledgeAtMs: undefined,
+    };
+    const wired = wireReachyCapability({
+      pi,
+      commands: new NoCommands(),
+      memory: failing,
+      store,
+      state,
+      log: () => {},
+    });
+    const line = JSON.stringify({
+      type: "transcript",
+      text: "jarvis, remember this",
+      ts: "t",
+      wakeHeard: true,
+      speakerId: "spk-1",
+    });
+    const summary = await wired.handleLine(line); // must NOT reject
+    expect(summary.kind).toBe("refused");
+    const refused = store.all.find((e) => e.kind === "reachy.refused");
+    expect(refused).toBeDefined();
+    // The failure is NAMED in the audit, so the (audit-first) memory event is
+    // explicable rather than silently orphaned.
+    expect(refused!.summary).toContain("memory write failed after audit");
+  });
+
   it("reachy_state sends a `state` command and returns the (no-correlation) reply", async () => {
     const { pi, commands } = wire();
     const out = await pi.tools.get("reachy_state")!.execute("tc", {});

@@ -70,7 +70,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     try {
       await commands.connect();
       commands.onLine((line) => {
-        void wired.handleLine(line);
+        // Never fire-and-forget: a rejected handler would be an unhandled
+        // rejection. Log it; the run continues.
+        void wired.handleLine(line).catch((err: unknown) => {
+          console.error(`reachy: line handler failed: ${err instanceof Error ? err.message : err}`);
+        });
       });
     } catch (err) {
       console.error(

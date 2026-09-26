@@ -250,14 +250,24 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         // ORDER: event first (exact id), then the memory carrying that id.
         const persisted = await audit(decision.orgEvent);
         if (!persisted) return refuse("memory", "audit write failed — memory NOT written");
-        const { id } = await memory.writePrivate({
-          ...decision.write,
-          metadata: {
-            speakerId: decoded.transcript.speakerId as string,
-            correlationId: `corr_${randomUUID()}`,
-            orgEventId: orgEventRecordId(decision.orgEvent),
-          },
-        });
+        let id: string;
+        try {
+          ({ id } = await memory.writePrivate({
+            ...decision.write,
+            metadata: {
+              speakerId: decoded.transcript.speakerId as string,
+              correlationId: `corr_${randomUUID()}`,
+              orgEventId: orgEventRecordId(decision.orgEvent),
+            },
+          }));
+        } catch (err) {
+          // A rejected memory write must not leave an OrgEvent for a memory that
+          // does not exist, nor escape as an unhandled rejection (round 4).
+          return refuse(
+            "memory",
+            `memory write failed after audit: ${err instanceof Error ? err.message : err}`,
+          );
+        }
         return { kind: "memory", memoryId: id };
       }
       if (decision.orgEvent) {
