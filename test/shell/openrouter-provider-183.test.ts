@@ -44,7 +44,7 @@ describe("openrouter provider (bob#183)", () => {
   });
 
   it("(b) `bob run` refuses BEFORE any request when OPENROUTER_API_KEY is unset, naming the variable", () => {
-    const r = initAgent({
+    initAgent({
       name: "orr2",
       role: "coder",
       provider: "openrouter",
