@@ -61,20 +61,32 @@ export function isValidProposal(p: unknown): boolean {
 /**
  * Per-action ARGUMENT schemas (spec §3.3, round 6 item 2). The proposal's `args`
  * is untrusted sidecar input, so it is validated BY ACTION before anything is
- * admitted: `look` takes TYPED numbers (a string yaw is malformed, not admitted),
- * and every schema is `additionalProperties: false` so an extra field is dropped.
- * In v1 NO speech action carries a memory input — and `ask` IS speech (the speech
- * gate on `inputs` lives in `admitAction`).
+ * admitted: `look` takes TYPED, BOUNDED numbers (a string yaw — or an unbounded
+ * one like 1e100 — is malformed, not admitted), and every schema is
+ * `additionalProperties: false` so an extra field is dropped. In v1 NO speech
+ * action carries a memory input — and `ask` IS speech (the speech gate on
+ * `inputs` lives in `admitAction`).
+ *
+ * BOUNDS (round 7 item 3): spec §3.3 names no range for `look_at{yaw,pitch}`, so
+ * these are the v1 bounds — yaw in [-180, 180], pitch in [-90, 90], matching a
+ * head's physical travel. A speech line is ONE line (no CR/LF) at most 500 chars.
  */
+const SPEECH_TEXT = Type.String({ minLength: 1, maxLength: 500, pattern: "^[^\\r\\n]*$" });
 const ACTION_ARG_SCHEMAS: Record<ProposalAction, TSchema> = {
   ignore: Type.Object({}, { additionalProperties: false }),
-  look: Type.Object({ yaw: Type.Number(), pitch: Type.Number() }, { additionalProperties: false }),
+  look: Type.Object(
+    {
+      yaw: Type.Number({ minimum: -180, maximum: 180 }),
+      pitch: Type.Number({ minimum: -90, maximum: 90 }),
+    },
+    { additionalProperties: false },
+  ),
   acknowledge: Type.Object({}, { additionalProperties: false }),
   frame: Type.Object({}, { additionalProperties: false }),
-  answer: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  answer: Type.Object({ text: SPEECH_TEXT }, { additionalProperties: false }),
   think: Type.Object({}, { additionalProperties: false }),
-  ask: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
-  say: Type.Object({ text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  ask: Type.Object({ text: SPEECH_TEXT }, { additionalProperties: false }),
+  say: Type.Object({ text: SPEECH_TEXT }, { additionalProperties: false }),
 };
 
 /** True when `args` matches the schema for `action` (an extra field is rejected). */

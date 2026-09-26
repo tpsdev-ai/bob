@@ -31,6 +31,12 @@ export async function explainMemory(
   if (typeof orgEventId !== "string") return null;
   const event = await deps.store.getById(orgEventId);
   if (!event) return null;
+  // The event the memory names must be the OUTCOME that TARGETS this memory
+  // (round 7 item 1): the ATTEMPT, or another memory's `written` event, is NOT
+  // an explanation — the read side explains a memory only from a `written`
+  // event whose targetIds contain it.
+  if (event.kind !== "reachy.memory.written") return null;
+  if (!(event.targetIds ?? []).includes(memoryId)) return null;
   // The memory's metadata carries the speakerId (the `written` event's targetIds
   // carry the memory id, not the speaker).
   const speakerId = mem?.metadata?.speakerId;

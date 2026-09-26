@@ -4,6 +4,7 @@ import { describe, expect, it } from "bun:test";
 import {
   type MemoryWriter,
   type OrgEventStore,
+  orgEventRecordId,
   type PiLike,
   type ReachyCommands,
   wireReachyCapability,
@@ -24,16 +25,19 @@ class NoCommands implements ReachyCommands {
 /** A store whose write can be DELAYED, to expose a race between two handlers. */
 class SlowStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
+  readonly byId = new Map<string, OrgEvent>();
   delayMs = 0;
   fail = false;
   async write(event: OrgEvent): Promise<{ id: string }> {
     if (this.fail) throw new Error("event store unavailable");
     if (this.delayMs > 0) await new Promise((r) => setTimeout(r, this.delayMs));
+    const id = orgEventRecordId(event);
+    this.byId.set(id, event);
     this.all.push(event);
-    return { id: event.id };
+    return { id };
   }
-  async getById(): Promise<OrgEvent | null> {
-    return null;
+  async getById(id: string): Promise<OrgEvent | null> {
+    return this.byId.get(id) ?? null;
   }
 }
 

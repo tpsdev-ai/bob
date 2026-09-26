@@ -344,20 +344,54 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         written.summary = `wrote the private memory ${id} for the verified speaker ${decoded.transcript.speakerId as string}`;
         written.targetIds = [id];
 
-        // SUCCESS only after the `written` event is PERSISTED (round 6 item 1).
-        // A memory without its `written` audit is UNAUDITED, never a success.
-        let outcomePersisted = true;
+        // SUCCESS only when the store holds THIS event under the EXACT
+        // pre-generated id (round 7 item 2): the write must REPORT that id (when
+        // it reports one at all) AND the event must READ BACK as the `written`
+        // outcome that TARGETS this memory. Any mismatch, or a null readback, is
+        // the SAME path as a failed `written` write — never a success.
+        let persistError: { klass: string; detail: string } | null = null;
         try {
-          await store.write(written);
+          const writtenResult = (await store.write(written)) as { id?: unknown } | undefined;
+          if (
+            writtenResult &&
+            typeof writtenResult.id === "string" &&
+            writtenResult.id !== writtenId
+          ) {
+            persistError = {
+              klass: "IdMismatch",
+              detail: `store persisted id ${JSON.stringify(writtenResult.id)}, not ${JSON.stringify(writtenId)}`,
+            };
+          } else {
+            const readback = await store.getById(writtenId);
+            if (!readback) {
+              persistError = {
+                klass: "ReadbackMissing",
+                detail: `no event at ${writtenId} after the write`,
+              };
+            } else if (readback.kind !== "reachy.memory.written") {
+              persistError = {
+                klass: "ReadbackKind",
+                detail: `event at ${writtenId} has kind ${JSON.stringify(readback.kind)}`,
+              };
+            } else if (!(readback.targetIds ?? []).includes(id)) {
+              persistError = {
+                klass: "ReadbackTargets",
+                detail: `event at ${writtenId} does not target the memory ${id}`,
+              };
+            }
+          }
         } catch (err) {
-          outcomePersisted = false;
-          const klass = err instanceof Error ? err.name : "Error";
-          const detail = err instanceof Error ? err.message : String(err);
+          persistError = {
+            klass: err instanceof Error ? err.name : "Error",
+            detail: err instanceof Error ? err.message : String(err),
+          };
+        }
+        if (persistError) {
           await audit({
             id: `evt_reachy.memory.failed_${uuid()}`,
             kind: "reachy.memory.failed",
             authorId: "jarvis",
-            summary: `memory ${id} written but its 'written' audit FAILED (${klass}): ${detail} — UNAUDITED`,
+            summary: `memory ${id} written but its 'written' audit FAILED (${persistError.klass}): ${persistError.detail} — UNAUDITED`,
             refId: attemptId,
             targetIds: [id],
             createdAt: new Date(state.nowMs()).toISOString(),
@@ -365,10 +399,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
             tsMs: state.nowMs(),
           });
           log(
-            `reachy: the 'written' audit for memory ${id} failed after the memory was created (${klass}): ${detail} — refusing (unaudited)`,
+            `reachy: the 'written' audit for memory ${id} failed after the memory was created (${persistError.klass}): ${persistError.detail} — refusing (unaudited)`,
           );
-        }
-        if (!outcomePersisted) {
           return refuse(
             "memory",
             "the memory exists but its written-event audit failed — unaudited",

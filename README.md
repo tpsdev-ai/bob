@@ -418,16 +418,20 @@ naming its test (`test/capabilities/reachy/`):
   about the OUTCOME.** The OrgEvent is the SAME record shape the observatory emits
   (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
   record id; the MEMORY then carries the id of the OUTCOME event — the `written`
-  event, NEVER the attempt — and that `written` event is persisted BEFORE any success
-  is returned. So a memory always resolves to its `written` event, and an unaudited
-  memory is never a success: if the `written` audit write fails after the memory
-  exists, the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED
-  refusal. A memory write that fails outright is `reachy.memory.failed` too (with the
-  error class, linked to the attempt and logged) — never an unqualified "wrote". A
-  failed audit write means no memory; "why do you know this" reads the `written` event
-  back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a full UUID (never a
-  timestamp plus a short suffix), so two events never collide. (`round5.test.ts`;
-  `round6.test.ts`; `reachy.test.ts` item 2.)
+  event, NEVER the attempt. SUCCESS is returned only when the `written` event is
+  persisted under that EXACT pre-generated id AND read back as the `written` outcome
+  whose targetIds contain this memory (the store's reported id must match the
+  pre-generated id, and `getById` must return that event). If the memory exists and
+  its `written` audit failed — a thrown write, a mismatched id, or a null readback —
+  the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
+  and the memory is RETAINED (bob's flair client cannot delete it); "why do you know
+  this" then returns NOTHING for it, because the read side explains a memory only
+  from a `written` event that TARGETS it. A memory write that fails outright is
+  `reachy.memory.failed` too (with the error class, linked to the attempt and
+  logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
+  `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a
+  full UUID (never a timestamp plus a short suffix), so two events never collide.
+  (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
 - **Every command goes through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one
   OrgEvent per admitted command; `reachy_frame` sends a `frame` command).

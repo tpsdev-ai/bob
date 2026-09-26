@@ -69,12 +69,15 @@ class FakeMemory implements MemoryWriter {
 }
 class FakeStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
+  private readonly byId = new Map<string, OrgEvent>();
   async write(event: OrgEvent): Promise<{ id: string }> {
+    const id = orgEventRecordId(event);
+    this.byId.set(id, event);
     this.all.push(event);
-    return { id: orgEventRecordId(event) };
+    return { id };
   }
-  async getById(): Promise<OrgEvent | null> {
-    return null;
+  async getById(id: string): Promise<OrgEvent | null> {
+    return this.byId.get(id) ?? null;
   }
 }
 
