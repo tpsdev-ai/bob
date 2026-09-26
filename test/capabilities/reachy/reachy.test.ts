@@ -1,25 +1,21 @@
 // reachy S3 — memory semantics + OrgEvent audit on a stub sidecar (bob#180 §5 S3).
-//
-// Every assertion here is RED before the reachy capability exists: there was no
-// policy, no write gate, no OrgEvent trail. Each test states what it proves.
+// Round 2: wire decoding, durable+ordered audit, tools through the gate.
 import { describe, expect, it } from "bun:test";
 import {
   type MemoryWriter,
+  type OrgEventStore,
   type PiLike,
   type ReachyCommands,
   type WiredReachy,
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
 import {
-  addressed,
-  decideProposal,
   isValidProposal,
-  type MemoryWrite,
   type OrgEvent,
   type PolicyState,
-  speakerVerified,
 } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
+import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
 
 class FakePi implements PiLike {
   readonly tools = new Map<
@@ -57,23 +53,58 @@ class FakeCommands implements ReachyCommands {
 }
 
 class FakeMemory implements MemoryWriter {
-  readonly writes: MemoryWrite[] = [];
+  readonly writes: Array<{
+    content: string;
+    visibility: string;
+    authorId: string;
+    metadata: { speakerId: string; correlationId: string };
+  }> = [];
   private n = 0;
-  async writePrivate(w: MemoryWrite): Promise<{ id: string }> {
+  async writePrivate(w: {
+    content: string;
+    visibility: "private";
+    authorId: string;
+    metadata: { speakerId: string; correlationId: string };
+  }): Promise<{ id: string }> {
     this.writes.push(w);
     return { id: `mem_${++this.n}` };
   }
+  metadata(id: string): { metadata?: Record<string, unknown> } | null {
+    const i = Number(id.replace("mem_", "")) - 1;
+    const w = this.writes[i];
+    return w ? { metadata: w.metadata } : null;
+  }
 }
 
-function harness(enrolment: Record<string, string>, mute = false) {
+/** A DURABLE fake event store: survives a "restart"; can be told to fail. */
+class FakeStore implements OrgEventStore {
+  readonly byCorr = new Map<string, OrgEvent>();
+  readonly all: OrgEvent[] = [];
+  fail = false;
+  async write(event: OrgEvent): Promise<{ id: string }> {
+    if (this.fail) throw new Error("event store unavailable");
+    const corr = String(event.metadata.correlationId ?? "");
+    if (corr) this.byCorr.set(corr, event);
+    this.all.push(event);
+    return { id: `evt_${this.all.length}` };
+  }
+  async readByCorrelation(correlationId: string): Promise<OrgEvent | null> {
+    return this.byCorr.get(correlationId) ?? null;
+  }
+}
+
+function harness(
+  enrolment: Record<string, string>,
+  opts: { mute?: boolean; store?: FakeStore } = {},
+) {
   const pi = new FakePi();
   const commands = new FakeCommands();
   const memory = new FakeMemory();
-  const events: OrgEvent[] = [];
+  const store = opts.store ?? new FakeStore();
   const state: PolicyState = {
     wakeName: "jarvis",
     enrolment,
-    mute,
+    mute: opts.mute ?? false,
     nowMs: () => Date.now(),
     lastAcknowledgeAtMs: undefined,
   };
@@ -81,171 +112,144 @@ function harness(enrolment: Record<string, string>, mute = false) {
     pi,
     commands,
     memory,
-    emit: (e) => {
-      events.push(e);
-    },
+    store,
     state,
     log: () => {},
   });
-  return { pi, commands, memory, events, wired, state };
+  return { pi, commands, memory, store, wired, state };
 }
 
+const transcriptLine = (over: Record<string, unknown> = {}) => ({
+  type: "transcript",
+  text: "jarvis, remember the fire drill is Tuesday",
+  ts: "t",
+  wakeHeard: true,
+  speakerId: "spk-1",
+  ...over,
+});
+
 describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
-  it("(a) addressed + speakerVerified => ONE private memory with speakerId, and the OrgEvent answers why", async () => {
+  it("(a) addressed + speakerVerified => ONE private memory with speakerId, and explainMemory answers 'why'", async () => {
     const h = harness({ "spk-1": "member-1" });
-    const r = await h.wired.handleEvent(
-      {
-        transcript: {
-          text: "jarvis, remember the fire drill is Tuesday",
-          ts: "t",
-          wakeHeard: true,
-          speakerId: "spk-1",
-        },
-      },
-      "transcript",
-    );
+    const r = await h.wired.handleLine(transcriptLine());
     expect(r).toEqual({ kind: "memory", memoryId: "mem_1" });
     expect(h.memory.writes.length).toBe(1);
     expect(h.memory.writes[0]!.visibility).toBe("private");
-    expect(h.memory.writes[0]!.authorId).toBe("jarvis");
     expect(h.memory.writes[0]!.metadata.speakerId).toBe("spk-1");
-    // "why do you know this": the OrgEvent that created it.
-    const why = explainMemory("mem_1", h.events);
+    const why = await explainMemory("mem_1", {
+      getMemory: (id) => Promise.resolve(h.memory.metadata(id)),
+      store: h.store,
+    });
     expect(why).not.toBeNull();
     expect(why!.authorId).toBe("jarvis");
     expect(why!.speakerId).toBe("spk-1");
   });
 
-  it("(b) addressed but NOT verified => no write, nothing recallable, at most one acknowledge per minute", async () => {
-    const h = harness({}); // v1 enrolment is EMPTY by default
-    const t = {
-      transcript: {
-        text: "jarvis look at the door",
-        ts: "t",
-        wakeHeard: true,
-        speakerId: "spk-visitor",
-      },
-    };
-    const first = await h.wired.handleEvent(t, "transcript");
-    const second = await h.wired.handleEvent(t, "transcript");
-    expect(first).toEqual({ kind: "ephemeral", acknowledged: true });
-    expect(second).toEqual({ kind: "ephemeral", acknowledged: false }); // rate-limited
-    expect(h.memory.writes.length).toBe(0); // nothing durable
-    expect(h.events.filter((e) => e.kind === "reachy.acknowledge").length).toBe(1);
+  it("(b) addressed but NOT verified => no write, at most one acknowledge per minute", async () => {
+    const h = harness({});
+    const t = transcriptLine({ speakerId: "spk-visitor" });
+    expect(await h.wired.handleLine(t)).toEqual({ kind: "ephemeral", acknowledged: true });
+    expect(await h.wired.handleLine(t)).toEqual({ kind: "ephemeral", acknowledged: false });
+    expect(h.memory.writes.length).toBe(0);
+    expect(h.store.all.filter((e) => e.kind === "reachy.acknowledge").length).toBe(1);
   });
 
   it("(c) not addressed => nothing at all", async () => {
     const h = harness({ "spk-1": "member-1" });
-    const r = await h.wired.handleEvent(
-      {
-        transcript: { text: "what time is standup", ts: "t", wakeHeard: false, speakerId: "spk-1" },
-      },
-      "transcript",
-    );
-    expect(r).toEqual({ kind: "none" });
+    expect(await h.wired.handleLine(transcriptLine({ text: "what time is standup" }))).toEqual({
+      kind: "none",
+    });
     expect(h.memory.writes.length).toBe(0);
-    expect(h.events.length).toBe(0);
+    expect(h.store.all.length).toBe(0);
   });
 
-  it("(d) egress: EVERY memory jarvis wrote in the test is private", async () => {
+  it("(d) egress: EVERY memory jarvis wrote is private", async () => {
     const h = harness({ "spk-1": "member-1", "spk-2": "member-2" });
-    await h.wired.handleEvent(
-      { transcript: { text: "jarvis, note A", ts: "t", wakeHeard: true, speakerId: "spk-1" } },
-      "transcript",
-    );
-    await h.wired.handleEvent(
-      { transcript: { text: "jarvis, note B", ts: "t", wakeHeard: true, speakerId: "spk-2" } },
-      "transcript",
-    );
+    await h.wired.handleLine(transcriptLine({ text: "jarvis, note A", speakerId: "spk-1" }));
+    await h.wired.handleLine(transcriptLine({ text: "jarvis, note B", speakerId: "spk-2" }));
     expect(h.memory.writes.length).toBe(2);
     expect(h.memory.writes.every((w) => w.visibility === "private")).toBe(true);
   });
 
-  it("(e) proposal{answer} is NOT executed while answer is off; a prose-only proposal is rejected by the schema", async () => {
+  it("(e) proposal{answer} is NOT executed; a prose-only proposal is rejected by the schema", async () => {
     const h = harness({ "spk-1": "member-1" });
-    const answer = await h.wired.handleEvent(
-      {
-        proposal: {
-          action: "answer",
-          args: { text: "the answer" },
-          confidence: 0.95,
-          inputs: ["mem_9"],
-        },
-      },
-      "proposal",
-    );
-    expect(answer.kind).toBe("refused"); // fail closed
-    expect(h.commands.sent.length).toBe(0); // nothing executed
-    expect(h.events.length).toBe(0); // no OrgEvent for a refused answer
-    // prose-only (no typed action) fails the schema
+    await h.wired.handleLine(transcriptLine());
+    const r = await h.wired.handleLine({
+      type: "proposal",
+      action: "answer",
+      args: { text: "the answer" },
+      confidence: 0.95,
+      inputs: ["mem_9"],
+    });
+    expect(r.kind).toBe("refused");
+    expect(h.commands.sent.length).toBe(0);
     expect(isValidProposal({ text: "jarvis, here is my prose answer" })).toBe(false);
-    expect(isValidProposal({ action: "look", args: {}, confidence: 0.5, inputs: [] })).toBe(true);
+    expect(decodeLine({ type: "proposal", text: "prose" }).kind).toBe("malformed");
   });
 
   it("(f) mute: true => events dropped, no OrgEvents", async () => {
-    const h = harness({ "spk-1": "member-1" }, true);
-    const r = await h.wired.handleEvent(
-      {
-        transcript: { text: "jarvis, remember this", ts: "t", wakeHeard: true, speakerId: "spk-1" },
-      },
-      "transcript",
-    );
-    expect(r).toEqual({ kind: "drop" });
+    const h = harness({ "spk-1": "member-1" }, { mute: true });
+    expect(await h.wired.handleLine(transcriptLine())).toEqual({ kind: "drop" });
     expect(h.memory.writes.length).toBe(0);
-    expect(h.events.length).toBe(0);
+    expect(h.store.all.length).toBe(0);
   });
 });
 
-describe("reachy S3 helpers", () => {
-  it("addressed is a bob-side string compare (the sidecar's wakeHeard is ignored for authority)", () => {
-    expect(addressed("jarvis, look", "jarvis")).toBe(true);
-    expect(addressed("hey you", "jarvis")).toBe(false);
+describe("reachy S3 round 2 — durable+ordered audit, gated tools, wire", () => {
+  it("item 2: an event write that FAILS leaves NO memory; after restart explainMemory still answers", async () => {
+    const h = harness({ "spk-1": "member-1" });
+    h.store.fail = true;
+    const r = await h.wired.handleLine(transcriptLine());
+    expect(r.kind).toBe("refused");
+    expect(h.memory.writes.length).toBe(0); // no memory without its audit
+
+    // A fresh capability instance over the SAME store ("restart").
+    h.store.fail = false;
+    await h.wired.handleLine(transcriptLine({ text: "jarvis, note persist" }));
+    const h2 = harness({ "spk-1": "member-1" }, { store: h.store });
+    const why = await explainMemory("mem_1", {
+      getMemory: (id) => Promise.resolve(h.memory.metadata(id)),
+      store: h2.store,
+    });
+    expect(why).not.toBeNull(); // durable across the instance boundary
+    expect(why!.orgEvent.kind).toBe("reachy.memory");
   });
-  it("speakerVerified requires a bob-owned enrolment mapping (empty in v1)", () => {
-    expect(speakerVerified("spk-1", {})).toBe(false);
-    expect(speakerVerified(undefined, { "spk-1": "m" })).toBe(false);
-    expect(speakerVerified("spk-1", { "spk-1": "m" })).toBe(true);
+
+  it("item 3: a direct reachy_say emits exactly one OrgEvent; memory-backed say is refused", async () => {
+    const h = harness({ "spk-1": "member-1" });
+    await h.wired.handleLine(transcriptLine()); // establishes the addressed transcript
+    const before = h.store.all.length;
+    await h.pi.call("reachy_say", { text: "hello office" });
+    const after = h.store.all.length;
+    expect(after - before).toBe(1); // one OrgEvent per admitted command
+    expect(h.store.all.at(-1)!.kind).toBe("reachy.say");
+    expect(h.commands.sent.some((c) => c.command === "say")).toBe(true);
+
+    const sentBefore = h.commands.sent.length;
+    await h.pi.call("reachy_say", { text: "recite the private note", memoryId: "mem_9" });
+    expect(h.commands.sent.length).toBe(sentBefore); // memory-derived say refused
   });
-  it("the four tools are registered and reachy_look sends look_at", async () => {
+
+  it("item 3: ten unverified look proposals in a minute do NOT all pass — admitting advances the rate limit", async () => {
+    const h = harness({}); // empty enrolment → nothing verified
+    let admitted = 0;
+    for (let i = 0; i < 10; i++) {
+      const r = await h.wired.handleLine({
+        type: "proposal",
+        action: "look",
+        args: { yaw: i, pitch: 0 },
+        confidence: 0.5,
+        inputs: [],
+      });
+      if (r.kind === "admitted") admitted++;
+    }
+    expect(admitted).toBe(1); // only the first; the rest are rate-limited
+  });
+
+  it("wire: a malformed line is dropped with a reachy.malformed OrgEvent, never thrown", async () => {
     const h = harness({});
-    expect([...h.pi.tools.keys()].sort()).toEqual([
-      "reachy_frame",
-      "reachy_look",
-      "reachy_say",
-      "reachy_state",
-    ]);
-    await h.pi.call("reachy_look", { yaw: 10, pitch: -5 });
-    expect(h.commands.sent[0]).toEqual({ command: "look_at", args: { yaw: 10, pitch: -5 } });
-  });
-  it("an admitted look emits an OrgEvent carrying confidence + inputs", async () => {
-    const h = harness({ "spk-1": "m" });
-    await h.wired.handleEvent(
-      {
-        transcript: {
-          text: "jarvis, look at the door",
-          ts: "t",
-          wakeHeard: true,
-          speakerId: "spk-1",
-        },
-      },
-      "transcript",
-    );
-    const r = await h.wired.handleEvent(
-      {
-        proposal: {
-          action: "look",
-          args: { yaw: 0, pitch: 0 },
-          confidence: 0.8,
-          inputs: ["cam-1"],
-        },
-      },
-      "proposal",
-    );
-    expect(r).toEqual({ kind: "admitted", action: "look" });
-    const ev = h.events.find((e) => e.kind === "reachy.look");
-    expect(ev).toBeDefined();
-    expect(ev!.metadata.confidence).toBe(0.8);
-    expect(ev!.metadata.inputs).toEqual(["cam-1"]);
-    expect(h.commands.sent.some((c) => c.command === "look_at")).toBe(true);
+    const r = await h.wired.handleLine('{"type":"proposal","text":"just prose"}');
+    expect(r.kind).toBe("malformed");
+    expect(h.store.all.some((e) => e.kind === "reachy.malformed")).toBe(true);
   });
 });

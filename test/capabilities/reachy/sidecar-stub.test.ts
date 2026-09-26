@@ -1,166 +1,194 @@
-// reachy S3 — the stub sidecar replay + the key-read proof (bob#180 §5 S3).
+// reachy S3 — the REAL stub sidecar over a UNIX socket + the key-read proof.
 //
-// Part 1 drives the capability with the STUB sidecar's scripted event file
-// (test/fixtures/reachy-stub/events.jsonl) — no hardware, no model.
-// Part 2 is the S1 key-read proof run here too: the stub runs as its OWN
-// unprivileged user and cannot read a 0600 fixture; skipped (with the reason
-// printed) when the host cannot create the user — never silently green.
-import { describe, expect, it } from "bun:test";
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+// Part 1 starts test/fixtures/reachy-stub/sidecar.py on a temp UNIX socket, connects
+// the REAL UnixSocketReachyClient, replays events.jsonl through it, and lets the
+// WIRE decoder + policy run — so the live path is exercised end to end.
+// Part 2 is the key-read proof: it REQUIRES the `jarvis-sidecar` user and FAILS
+// when absent — a real check, not a passing no-op. Set REACHY_KEY_PROOF=skip to
+// SKIP it (visible in the run) on a host that cannot provision the user.
+import { afterAll, describe, expect, it } from "bun:test";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type MemoryWriter,
+  type OrgEventStore,
   type PiLike,
   type ReachyCommands,
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
-import type {
-  MemoryWrite,
-  OrgEvent,
-  PolicyState,
-} from "../../../src/capabilities/reachy/policy.js";
+import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
+import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 
-const STUB_EVENTS = join(
-  import.meta.dirname,
-  "..",
-  "..",
-  "fixtures",
-  "reachy-stub",
-  "events.jsonl",
-);
+const REPO = join(import.meta.dirname, "..", "..", "..");
+const STUB = join(REPO, "test", "fixtures", "reachy-stub", "sidecar.py");
+const EVENTS = join(REPO, "test", "fixtures", "reachy-stub", "events.jsonl");
 
 class FakePi implements PiLike {
-  readonly tools = new Map<
-    string,
-    {
-      name: string;
-      execute: (
-        id: string,
-        p: Record<string, unknown>,
-      ) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
-    }
-  >();
-  registerTool(tool: {
-    name: string;
-    execute: (
-      id: string,
-      p: Record<string, unknown>,
-    ) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
-  }): void {
-    this.tools.set(tool.name, tool);
-  }
+  registerTool(_t: unknown): void {}
 }
 class FakeCommands implements ReachyCommands {
-  readonly sent: Array<{ command: string; args?: Record<string, unknown> }> = [];
-  async send(command: string, args?: Record<string, unknown>): Promise<unknown> {
-    this.sent.push({ command, args });
+  async send(): Promise<unknown> {
     return null;
   }
 }
 class FakeMemory implements MemoryWriter {
-  readonly writes: MemoryWrite[] = [];
+  readonly writes: Array<{
+    content: string;
+    visibility: string;
+    metadata: { speakerId: string; correlationId: string };
+  }> = [];
   private n = 0;
-  async writePrivate(w: MemoryWrite): Promise<{ id: string }> {
+  async writePrivate(w: {
+    content: string;
+    visibility: "private";
+    authorId: string;
+    metadata: { speakerId: string; correlationId: string };
+  }): Promise<{ id: string }> {
     this.writes.push(w);
     return { id: `mem_${++this.n}` };
   }
 }
+class FakeStore implements OrgEventStore {
+  readonly all: OrgEvent[] = [];
+  async write(event: OrgEvent): Promise<{ id: string }> {
+    this.all.push(event);
+    return { id: `evt_${this.all.length}` };
+  }
+  async readByCorrelation(): Promise<OrgEvent | null> {
+    return null;
+  }
+}
 
-describe("reachy S3 — the stub sidecar's scripted events drive the capability", () => {
-  it("replays events.jsonl: the verified transcript writes one private memory, the visitor does not, the look is audited", async () => {
-    const pi = new FakePi();
-    const commands = new FakeCommands();
-    const memory = new FakeMemory();
-    const events: OrgEvent[] = [];
-    const state: PolicyState = {
-      wakeName: "jarvis",
-      enrolment: { "spk-1": "member-1" },
-      mute: false,
-      nowMs: () => Date.now(),
-      lastAcknowledgeAtMs: undefined,
-    };
-    const wired = wireReachyCapability({
-      pi,
-      commands,
-      memory,
-      emit: (e) => {
-        events.push(e);
-      },
-      state,
-      log: () => {},
+const scratch: string[] = [];
+afterAll(() => {
+  for (const d of scratch) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+});
+
+function makeHarness(enrolment: Record<string, string>) {
+  const memory = new FakeMemory();
+  const store = new FakeStore();
+  const state: PolicyState = {
+    wakeName: "jarvis",
+    enrolment,
+    mute: false,
+    nowMs: () => Date.now(),
+    lastAcknowledgeAtMs: undefined,
+  };
+  const wired = wireReachyCapability({
+    pi: new FakePi(),
+    commands: new FakeCommands(),
+    memory,
+    store,
+    state,
+    log: () => {},
+  });
+  return { memory, store, wired };
+}
+
+describe("reachy S3 — the real stub sidecar over a UNIX socket", () => {
+  it("replays events.jsonl through the real client + wire decoder: one private memory, the visitor none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reachy-sock-"));
+    scratch.push(dir);
+    const socketPath = join(dir, "reachy.sock");
+    const proc = spawn("python3", [STUB, socketPath, EVENTS], { stdio: "ignore" });
+
+    // Wait for the socket file, then connect the REAL client.
+    const deadline = Date.now() + 8000;
+    while (!existsSync(socketPath)) {
+      if (Date.now() > deadline) throw new Error("stub socket never appeared");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const { memory, wired } = makeHarness({ "spk-1": "member-1" });
+    const client = new UnixSocketReachyClient({ socket: socketPath });
+    await client.connect();
+    client.onLine((line) => {
+      void wired.handleLine(line);
     });
 
-    const lines = readFileSync(STUB_EVENTS, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
-    for (const line of lines) {
-      const type = line.type as "transcript" | "proposal" | "presence" | "health";
-      if (type === "transcript")
-        await wired.handleEvent({ transcript: line as never }, "transcript");
-      else if (type === "proposal")
-        await wired.handleEvent({ proposal: line as never }, "proposal");
-      else await wired.handleEvent(line as never, type);
+    // Wait for the replay to land (the verified transcript writes one memory).
+    const done = Date.now() + 8000;
+    while (memory.writes.length === 0) {
+      if (Date.now() > done) break;
+      await new Promise((r) => setTimeout(r, 10));
     }
+    client.close();
+    proc.kill();
 
-    expect(memory.writes.length).toBe(1); // only the enrolled speaker's sentence is durable
+    expect(memory.writes.length).toBe(1); // RED before: flat decoding → zero writes over the socket
     expect(memory.writes[0]!.visibility).toBe("private");
     expect(memory.writes[0]!.metadata.speakerId).toBe("spk-1");
-    expect(events.some((e) => e.kind === "reachy.memory")).toBe(true);
-    expect(events.some((e) => e.kind === "reachy.look")).toBe(true);
-    // The visitor's addressed sentence is EPHEMERAL — recallable nowhere.
     expect(memory.writes.some((w) => w.metadata.speakerId === "visitor-9")).toBe(false);
-  });
+  }, 30_000);
+
+  it("a malformed line over the socket does nothing but emit reachy.malformed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reachy-badline-"));
+    scratch.push(dir);
+    const socketPath = join(dir, "reachy.sock");
+    const bad = join(dir, "bad.jsonl");
+    writeFileSync(bad, '{"type":"proposal","text":"just prose"}\n');
+    const proc = spawn("python3", [STUB, socketPath, bad], { stdio: "ignore" });
+    const deadline = Date.now() + 8000;
+    while (!existsSync(socketPath)) {
+      if (Date.now() > deadline) throw new Error("stub socket never appeared");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const { memory, store, wired } = makeHarness({ "spk-1": "member-1" });
+    const client = new UnixSocketReachyClient({ socket: socketPath });
+    await client.connect();
+    client.onLine((line) => {
+      void wired.handleLine(line);
+    });
+    const done = Date.now() + 5000;
+    while (store.all.length === 0) {
+      if (Date.now() > done) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    client.close();
+    proc.kill();
+    expect(memory.writes.length).toBe(0);
+    expect(store.all.some((e) => e.kind === "reachy.malformed")).toBe(true);
+  }, 30_000);
 });
 
 describe("reachy S3 — key-read proof (the stub runs as its own user)", () => {
-  it("jarvis-sidecar cannot read a 0600 admin-pass / agent-key fixture; both are 0600", () => {
-    const dir = mkdtempSync(join(tmpdir(), "reachy-keyread-"));
+  const forcedSkip = process.env.REACHY_KEY_PROOF === "skip";
+  const hasUser = (() => {
     try {
+      execFileSync("id", ["-u", "jarvis-sidecar"], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  it.skipIf(forcedSkip)(
+    `jarvis-sidecar cannot read a 0600 fixture${forcedSkip ? " (SKIPPED: REACHY_KEY_PROOF=skip)" : ""}`,
+    () => {
+      if (!hasUser) {
+        throw new Error(
+          "the `jarvis-sidecar` user is REQUIRED for the key-read proof — provision it (see README) or set REACHY_KEY_PROOF=skip to SKIP this test",
+        );
+      }
+      const dir = mkdtempSync(join(tmpdir(), "reachy-keyread-"));
+      scratch.push(dir);
       const adminPass = join(dir, "admin-pass");
       const agentKey = join(dir, "agent-key");
       writeFileSync(adminPass, "fixture-not-a-real-secret\n", { mode: 0o600 });
       writeFileSync(agentKey, "fixture-not-a-real-key\n", { mode: 0o600 });
-
-      // Both must be 0600 for the owner.
-      const mode = (f: string) =>
-        execFileSync("stat", ["-c", "%a", f], { encoding: "utf8" }).trim();
-      expect(mode(adminPass)).toBe("600");
-      expect(mode(agentKey)).toBe("600");
-
-      // Ensure the separate user exists (create once). If the host cannot, SKIP
-      // with the reason printed — never silently green.
-      const hasUser = () => {
-        try {
-          execFileSync("id", ["-u", "jarvis-sidecar"], { stdio: "ignore" });
-          return true;
-        } catch {
-          return false;
-        }
-      };
-      if (!hasUser()) {
-        const created = spawnSync(
-          "sudo",
-          ["-n", "useradd", "-r", "-M", "-s", "/usr/sbin/nologin", "jarvis-sidecar"],
-          { encoding: "utf8" },
-        );
-        if (created.status !== 0) {
-          console.error(
-            `reachy S3 key-read proof: SKIPPED — cannot create the jarvis-sidecar user (${created.stderr?.trim() || created.error?.message || `exit ${created.status}`})`,
-          );
-          return;
-        }
-      }
-
+      expect((statSync(adminPass).mode & 0o777).toString(8)).toBe("600");
+      expect((statSync(agentKey).mode & 0o777).toString(8)).toBe("600");
       for (const f of [adminPass, agentKey]) {
         const r = spawnSync("sudo", ["-n", "-u", "jarvis-sidecar", "cat", f], { encoding: "utf8" });
         expect(r.status, `cat ${f} as jarvis-sidecar should fail`).not.toBe(0);
         expect(r.stderr).toContain("Permission denied");
       }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 });

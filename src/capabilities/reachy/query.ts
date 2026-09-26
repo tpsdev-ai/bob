@@ -1,28 +1,40 @@
-// reachy/query.ts — "why do you know this" (spec §3.4). For a memory jarvis
-// wrote, return the OrgEvent that created it (author, time, speakerId). Exposed
-// as a library function with a test; S3 does not add a tool (the flair
-// capability has no matching tool shape yet).
+// reachy/query.ts — "why do you know this" (spec §3.4). For a memory jarvis wrote,
+// return the PERSISTED OrgEvent that created it — durable across a restart, read
+// by the memory's correlation id. A library function with a test; S3 adds no tool.
 
+import type { OrgEventStore } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
+
+export interface ExplainDeps {
+  /** Read a memory's metadata (the correlation id lives there). */
+  getMemory: (id: string) => Promise<{ metadata?: Record<string, unknown> } | null>;
+  /** The same durable store the audit was written to. */
+  store: OrgEventStore;
+}
 
 export interface MemoryExplanation {
   memoryId: string;
-  // The OrgEvent that created the memory (kind `reachy.memory`).
   orgEvent: OrgEvent;
   authorId: string;
   createdAtMs: number;
   speakerId?: string;
 }
 
-/** The OrgEvent that created `memoryId`, or null when it was not written by jarvis. */
-export function explainMemory(memoryId: string, events: OrgEvent[]): MemoryExplanation | null {
-  const e = events.find((ev) => ev.kind === "reachy.memory" && ev.refId === memoryId);
-  if (!e) return null;
+/** The persisted OrgEvent that created `memoryId`, or null. */
+export async function explainMemory(
+  memoryId: string,
+  deps: ExplainDeps,
+): Promise<MemoryExplanation | null> {
+  const mem = await deps.getMemory(memoryId);
+  const correlationId = mem?.metadata?.correlationId;
+  if (typeof correlationId !== "string") return null;
+  const event = await deps.store.readByCorrelation(correlationId);
+  if (!event) return null;
   return {
     memoryId,
-    orgEvent: e,
-    authorId: e.authorId,
-    createdAtMs: e.tsMs,
-    speakerId: (e.metadata.speakerId as string | undefined) ?? undefined,
+    orgEvent: event,
+    authorId: event.authorId,
+    createdAtMs: event.tsMs,
+    speakerId: (event.metadata.speakerId as string | undefined) ?? undefined,
   };
 }

@@ -381,24 +381,39 @@ stay textual, like a Discord snowflake.
 
 ### `reachy` (jarvis) — S3 skeleton
 
-The `reachy` capability is the jarvis office agent's body, built here as a
-skeleton on a **stub sidecar** (no hardware, no model, no network): it registers
-the four tools (`reachy_look`, `reachy_say`, `reachy_state`, `reachy_frame`),
-consumes the sidecar's JSON-line events, and applies the memory + audit policy in
-bob. A transcript that is addressed (`jarvis` — a string compare in bob, never
-the sidecar's flag) AND speakerVerified (the speaker id maps to a member in
-bob's own enrolment) is written as a `private` memory authored by `jarvis` with
-the speakerId in metadata, through the flair capability client; every admitted
-action (`look`, `acknowledge`, `ask`) emits an OrgEvent carrying the proposal's
-confidence and its inputs' ids, and "why do you know this" returns that event.
-Non-member speech is ephemeral — never stored, never recalled.
+The `reachy` capability is the jarvis office agent's body, built as a **skeleton on
+a stub sidecar** (no hardware, no model, no network). Operator guarantees, each
+naming its test (`test/capabilities/reachy/`):
 
-S3 does **not** do: any turn injection into the pi session (that is S1, behind
-bob#147), any body/head motion on real hardware, or memory-backed speech —
-`answer` is OFF and `say` refuses a memory input, fail-closed, because the v1
-enrolment is empty and a sidecar `speakerId` is an untrusted assertion. The
-sidecar runs as its own unprivileged user and cannot read a 0600 key fixture
-(proven by a test that runs when the host can create the user).
+- **A malformed sidecar line does nothing.** Inbound JSON lines are decoded and
+  schema-checked before policy; a line that does not match is dropped with an
+  OrgEvent `reachy.malformed`, never thrown into the handler. (`sidecar-stub.test.ts`.)
+- **A memory is written only when addressed AND speakerVerified**, as a `private`
+  memory authored by `jarvis` with the speakerId in metadata, over the flair
+  client; non-member speech is ephemeral — never stored, never recalled.
+  (`reachy.test.ts` (a)/(b)/(c)/(d).)
+- **No memory without its audit, and the audit is durable.** The OrgEvent is
+  persisted (over the same flair client) FIRST with a correlation id, then the
+  memory carrying it; if the event write fails the memory is NOT written, and
+  "why do you know this" reads the persisted event by that id across a restart.
+  (`reachy.test.ts` item 2.)
+- **Every command goes through the gate.** `reachy_look`/`reachy_say`/`reachy_frame`
+  use the same admit path as proposals — mute, the rate gate (admitting an
+  unverified physical action advances it), and one OrgEvent per admitted command;
+  `answer` is OFF and a `say` with any memory-derived content is refused (fail
+  closed). (`reachy.test.ts` item 3 / (e).)
+- **The stub runs as its own unprivileged user and cannot read a 0600 key
+  fixture.** (`sidecar-stub.test.ts` key-read proof — it REQUIRES the
+  `jarvis-sidecar` user and fails when absent; CI provisions it in the test job.
+  Locally: `sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar`, or set
+  `REACHY_KEY_PROOF=skip` to SKIP the test visibly.)
+
+What S3 does NOT do: any turn injection into the pi session (that is S1, behind
+bob#147), any body/head motion on real hardware, or memory-backed speech — `answer`
+is OFF and `say` refuses a memory input, fail-closed, because the v1 enrolment is
+empty. **Trust model:** a sidecar `speakerId` is an UNTRUSTED assertion; bob
+verifies the id → enrolled-member mapping (empty in v1), and a forged id is bounded
+by the sidecar's isolation — not by bob's gate (bob#180 §4).
 
 ## Status
 

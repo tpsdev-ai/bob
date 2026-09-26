@@ -18,6 +18,7 @@
 //   * `mute` drops every event — no transcripts, no proposals, no frames, no
 //     OrgEvents.
 
+import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -124,7 +125,7 @@ function orgEvent(
   refId?: string,
 ): OrgEvent {
   return {
-    id: `evt_${kind}_${state.nowMs()}`,
+    id: `evt_${kind}_${state.nowMs()}_${randomBytes(4).toString("hex")}`,
     kind,
     authorId: "jarvis",
     summary,
@@ -194,73 +195,74 @@ export function decideTranscript(
   };
 }
 
-const MEMORY_BACKED_ACTIONS = new Set(["answer", "think"]);
-
 /**
- * Decide what to do with a proposal. Authority stays in bob: `answer` and
- * memory-backed speech are OFF in v1 (fail closed); `look`/`acknowledge` are
- * rate-limited; `ask` is one line; only `presence`-safe, non-memory `say` may
- * emit. `think` injects no turn in S3.
+ * Admit ONE action against the policy — the SAME path a proposal and a tool call
+ * take (round 2, item 3). `answer` and memory-backed speech are OFF in v1 (fail
+ * closed); `think` injects no turn in S3; `look`/`acknowledge` are rate-limited
+ * for an unverified speaker — and ADMITTING one advances the rate limit, so the
+ * next within the minute refuses; `ask` is one line; `say` is admitted only when
+ * addressed. Every admitted action returns exactly one OrgEvent.
  */
+export function admitAction(
+  action: ProposalAction,
+  args: Record<string, unknown>,
+  confidence: number,
+  inputs: string[],
+  state: PolicyState,
+  transcript: Transcript | null,
+): Decision {
+  if (state.mute) return { kind: "drop" };
+  const verified = transcript ? speakerVerified(transcript.speakerId, state.enrolment) : false;
+  const isAddressed = transcript ? addressed(transcript.text, state.wakeName) : false;
+  const proposal: Proposal = { action, args, confidence, inputs };
+
+  if (action === "answer" || (action === "say" && inputs.some((i) => i.startsWith("mem_")))) {
+    return { kind: "refused", action, reason: "memory-backed speech is off in v1 (fail closed)" };
+  }
+  if (action === "think") return { kind: "refused", action, reason: "think injects no turn in S3" };
+  if (action === "ignore") return { kind: "none" };
+  if (action === "say" && !isAddressed) return { kind: "refused", action, reason: "not addressed" };
+  if (action === "look" || action === "acknowledge" || action === "say" || action === "ask") {
+    if (!verified && (action === "look" || action === "acknowledge")) {
+      const last = state.lastAcknowledgeAtMs ?? -Infinity;
+      if (state.nowMs() - last < ACKNOWLEDGE_MIN_INTERVAL_MS) {
+        return {
+          kind: "refused",
+          action,
+          reason: "unverified speaker, already acknowledged within the minute",
+        };
+      }
+      state.lastAcknowledgeAtMs = state.nowMs();
+    }
+    const kind =
+      action === "look"
+        ? "reachy.look"
+        : action === "acknowledge"
+          ? "reachy.acknowledge"
+          : action === "say"
+            ? "reachy.say"
+            : "reachy.ask";
+    return {
+      kind: "admitted",
+      action,
+      orgEvent: orgEvent(kind, `admitted ${action}`, proposal, state),
+    };
+  }
+  return { kind: "none" };
+}
+
+/** Decide a proposal — a thin wrapper over `admitAction`, which the tools also use. */
 export function decideProposal(
   proposal: Proposal,
   state: PolicyState,
   transcript: Transcript | null,
 ): Decision {
-  if (state.mute) return { kind: "drop" };
-
-  const verified = transcript ? speakerVerified(transcript.speakerId, state.enrolment) : false;
-  const isAddressed = transcript ? addressed(transcript.text, state.wakeName) : false;
-
-  // Memory-backed speech OFF outright: a `say`/`answer` that references memory
-  // inputs is refused, whatever the speaker.
-  if (
-    MEMORY_BACKED_ACTIONS.has(proposal.action) ||
-    (proposal.action === "say" && proposal.inputs.some((i) => i.startsWith("mem_")))
-  ) {
-    return {
-      kind: "refused",
-      action: proposal.action,
-      reason: "memory-backed speech is off in v1 (fail closed)",
-    };
-  }
-  if (proposal.action === "think") {
-    return { kind: "refused", action: proposal.action, reason: "think injects no turn in S3" };
-  }
-  if (proposal.action === "ignore") return { kind: "none" };
-  if (proposal.action === "ask") {
-    return {
-      kind: "admitted",
-      action: "ask",
-      orgEvent: orgEvent("reachy.ask", "asked a one-line question", proposal, state),
-    };
-  }
-  if (proposal.action === "say") {
-    if (!isAddressed) return { kind: "refused", action: "say", reason: "not addressed" };
-    return {
-      kind: "admitted",
-      action: "say",
-      orgEvent: orgEvent("reachy.say", "said a non-memory line", proposal, state),
-    };
-  }
-  if (proposal.action === "look" || proposal.action === "acknowledge") {
-    // Physical action: rate-limited for an unverified speaker (one per minute).
-    if (!verified) {
-      const last = state.lastAcknowledgeAtMs ?? -Infinity;
-      if (state.nowMs() - last < ACKNOWLEDGE_MIN_INTERVAL_MS) {
-        return {
-          kind: "refused",
-          action: proposal.action,
-          reason: "unverified speaker, already acknowledged within the minute",
-        };
-      }
-    }
-    const kind = proposal.action === "look" ? "reachy.look" : "reachy.acknowledge";
-    return {
-      kind: "admitted",
-      action: proposal.action,
-      orgEvent: orgEvent(kind, `admitted ${proposal.action}`, proposal, state),
-    };
-  }
-  return { kind: "none" };
+  return admitAction(
+    proposal.action,
+    proposal.args,
+    proposal.confidence,
+    proposal.inputs,
+    state,
+    transcript,
+  );
 }
