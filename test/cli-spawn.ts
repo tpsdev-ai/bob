@@ -11,7 +11,7 @@
 // Mirrors test/shell/flair-fake.ts: a shared, non-`.test.ts` module the
 // CLI-spawning tests import so the timeout lives in one place and the spawn is
 // always shell-free.
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 // The default per-spawn budget. One place sets the timeout so every CLI spawn
 // in the suite is bounded: a blocking command hangs at most this long.
 export const CLI_SPAWN_TIMEOUT_MS = 10_000;
@@ -51,6 +51,8 @@ export class SpawnError extends Error {
 
 export interface SpawnOptions {
   timeoutMs?: number;
+  /** Environment for the child (defaults to this process's). A test that isolates HOME passes it here. */
+  env?: NodeJS.ProcessEnv;
 }
 
 // Run INTERPRETER over `args` (an argv array; the first element is typically
@@ -62,41 +64,28 @@ export interface SpawnOptions {
 // from an ordinary non-zero exit.
 export function spawnNode(args: string[], opts: SpawnOptions = {}): string {
   const timeoutMs = opts.timeoutMs ?? CLI_SPAWN_TIMEOUT_MS;
-  try {
-    return execFileSync(INTERPRETER, args, {
-      timeout: timeoutMs,
-      // killSignal SIGKILL so the timeout bounds even a child that traps
-      // SIGTERM; the default SIGTERM can leave execFileSync waiting past the
-      // budget instead of terminating the child (CodeRabbit review).
-      killSignal: "SIGKILL",
-      encoding: "utf8",
-    });
-  } catch (e) {
-    const cause = e as {
-      stdout?: string;
-      stderr?: string;
-      killed?: boolean;
-      signal?: string | null;
-      code?: number | null;
-      status?: number | null;
-    };
-    const rawStdout = String(cause.stdout ?? "");
-    const rawStderr = String(cause.stderr ?? "");
-    // A non-zero synchronous result carries its exit code in `status`, not
-    // `code` (the synchronous result does not expose `code` for a killed
-    // child). A kill/timeout leaves no code but a termination `signal`, from
-    // which `killed` is derived.
-    const code = Number.isFinite(cause.status)
-      ? (cause.status as number)
-      : Number.isFinite(cause.code)
-        ? (cause.code as number)
-        : null;
+  // spawnSync, not execFileSync: it captures stderr as well as stdout, so the
+  // helper returns the merged output the old shell form's `2>&1` gave every
+  // caller, and it reports the exit `status` and the kill `signal` directly.
+  const run = spawnSync(INTERPRETER, args, {
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+    encoding: "utf8",
+    env: opts.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = String(run.stdout ?? "");
+  const stderr = String(run.stderr ?? "");
+  const merged = stdout + stderr;
+  const timedOut = (run.error as { code?: string } | undefined)?.code === "ETIMEDOUT";
+  if (run.error || run.signal || run.status !== 0) {
     throw new SpawnError({
-      stdout: rawStdout + rawStderr,
-      stderr: rawStderr,
-      killed: Boolean(cause.killed) || Boolean(cause.signal),
-      signal: cause.signal ?? null,
-      code,
+      stdout: merged,
+      stderr,
+      killed: Boolean(run.signal) || timedOut,
+      signal: run.signal ?? (timedOut ? "SIGKILL" : null),
+      code: Number.isFinite(run.status) ? (run.status as number) : null,
     });
   }
+  return merged;
 }
