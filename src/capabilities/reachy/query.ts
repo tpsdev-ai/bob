@@ -36,7 +36,7 @@ export async function explainMemory(
   // an explanation — the read side explains a memory only from a `written`
   // event whose targetIds contain it.
   if (event.kind !== "reachy.memory.written") return null;
-  if (!(event.targetIds ?? []).includes(memoryId)) return null;
+  if (!Array.isArray(event.targetIds) || !event.targetIds.includes(memoryId)) return null;
   // The memory's metadata carries the speakerId (the `written` event's targetIds
   // carry the memory id, not the speaker).
   const speakerId = mem?.metadata?.speakerId;

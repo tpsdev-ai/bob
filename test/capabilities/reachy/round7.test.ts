@@ -258,3 +258,118 @@ describe("reachy round 7 item 3: args are BOUNDED by action", () => {
     ).toBe("admitted");
   });
 });
+
+/** A store whose readback returns a targetIds that is a STRING, not an array. */
+class BadTargetIdsStore implements OrgEventStore {
+  readonly all: OrgEvent[] = [];
+  readonly byId = new Map<string, OrgEvent>();
+  async write(event: OrgEvent): Promise<{ id: string }> {
+    const id = orgEventRecordId(event);
+    this.byId.set(id, event);
+    this.all.push(event);
+    return { id };
+  }
+  async getById(id: string): Promise<OrgEvent | null> {
+    const e = this.byId.get(id);
+    if (!e) return null;
+    // Buggy shaped readback: targetIds is a string (substring-matches in includes).
+    return { ...e, targetIds: "mem-1-other" } as unknown as OrgEvent;
+  }
+}
+/**
+ * A store whose write PERSISTs then THROWS — the event is stored but the
+ * write call throws after successfully persisting.
+ */
+class PersistThenThrowStore implements OrgEventStore {
+  readonly all: OrgEvent[] = [];
+  readonly byId = new Map<string, OrgEvent>();
+  throwAfterWrite = false;
+  async write(event: OrgEvent): Promise<{ id: string }> {
+    if (this.throwAfterWrite) {
+      const id = orgEventRecordId(event);
+      this.byId.set(id, event);
+      this.all.push(event);
+      throw new Error("boom after persist");
+    }
+    const id = orgEventRecordId(event);
+    this.byId.set(id, event);
+    this.all.push(event);
+    return { id };
+  }
+  async getById(id: string): Promise<OrgEvent | null> {
+    return this.byId.get(id) ?? null;
+  }
+}
+
+describe("reachy round 7 item 1b: shape validation at the membership site", () => {
+  it("explainMemory returns null when targetIds is a string (substring trap)", async () => {
+    const bstore = new BadTargetIdsStore();
+    // Put a correctly-shaped written event in the store.
+    const written = ev({
+      id: "evt_str",
+      kind: "reachy.memory.written",
+      targetIds: ["mem-1"],
+    });
+    bstore.byId.set(orgEventRecordId(written), written);
+
+    // Now explainMemory calls getById which returns a string targetIds.
+    const why = await explainMemory("mem-1", {
+      getMemory: () => Promise.resolve({ metadata: { orgEventId: orgEventRecordId(written) } }),
+      store: bstore as unknown as OrgEventStore,
+    });
+    // The Array.isArray check at the membership site rejects the string.
+    expect(why).toBeNull();
+  });
+});
+
+describe("reachy round 7 item 2b: a string targetIds in readback → ReadbackTargets refusal", () => {
+  it("returns UNAUDITED refusal when the readback has string targetIds", async () => {
+    const store = new BadTargetIdsStore();
+    const h = harness(store);
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r.kind).toBe("refused");
+    // The readback had targetIds as a string so the array check failed.
+    const failed = store.all.find((e) => e.kind === "reachy.memory.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.summary).toContain("ReadbackTargets");
+    // No memory success: explainMemory also returns null.
+    const why = await explainMemory("mem-written-1", {
+      getMemory: () => Promise.resolve({ metadata: h.memory.last!.metadata }),
+      store,
+    });
+    expect(why).toBeNull();
+  });
+});
+
+describe("reachy round 7 item 2c: a write that persists then throws", () => {
+  it("is a refusal AND explainMemory still returns the persisted event", async () => {
+    const store = new PersistThenThrowStore();
+    store.throwAfterWrite = true;
+    const h = harness(store);
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r.kind).toBe("refused");
+
+    // Test explainMemory: use a store that can actually read.
+    const store2 = new PersistThenThrowStore();
+    store2.throwAfterWrite = false; // normal mode for reads
+    const writtenEvent = {
+      id: "evt_mine",
+      kind: "reachy.memory.written",
+      authorId: "jarvis",
+      summary: "wrote the private memory",
+      targetIds: ["mem-1"],
+      createdAt: new Date(1).toISOString(),
+      nonce: "n",
+      tsMs: 1,
+    };
+    await store2.write(writtenEvent);
+    const why = await explainMemory("mem-1", {
+      getMemory: () =>
+        Promise.resolve({ metadata: { orgEventId: orgEventRecordId(writtenEvent) } }),
+      store: store2,
+    });
+    // The persist-then-throw case: a memory can exist even when write throws.
+    expect(why).not.toBeNull();
+    expect(why!.orgEvent.kind).toBe("reachy.memory.written");
+  });
+});

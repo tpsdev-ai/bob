@@ -373,7 +373,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
                 klass: "ReadbackKind",
                 detail: `event at ${writtenId} has kind ${JSON.stringify(readback.kind)}`,
               };
-            } else if (!(readback.targetIds ?? []).includes(id)) {
+            } else if (!Array.isArray(readback.targetIds) || !readback.targetIds.includes(id)) {
               persistError = {
                 klass: "ReadbackTargets",
                 detail: `event at ${writtenId} does not target the memory ${id}`,

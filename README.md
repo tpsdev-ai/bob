@@ -414,19 +414,19 @@ naming its test (`test/capabilities/reachy/`):
 - **A memory is written only when addressed AND speakerVerified** — `private`,
   author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
   (`reachy.test.ts` (a)/(b)/(c)/(d).)
-- **No memory without its audit, and the audit is durable, exact-id and honest
-  about the OUTCOME.** The OrgEvent is the SAME record shape the observatory emits
+- **SUCCESS is returned only with a persisted, read-back written event; a memory can exist without it and is reported as an UNAUDITED refusal.** The OrgEvent is the SAME record shape the observatory emits
   (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
   record id; the MEMORY then carries the id of the OUTCOME event — the `written`
   event, NEVER the attempt. SUCCESS is returned only when the `written` event is
   persisted under that EXACT pre-generated id AND read back as the `written` outcome
-  whose targetIds contain this memory (the store's reported id must match the
-  pre-generated id, and `getById` must return that event). If the memory exists and
+  whose targetIds contain this memory (when the store reports an id it must equal the pre-generated one; a store
+  that reports none is accepted on readback). If the memory exists and
   its `written` audit failed — a thrown write, a mismatched id, or a null readback —
   the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
   and the memory is RETAINED (bob's flair client cannot delete it); "why do you know
-  this" then returns NOTHING for it, because the read side explains a memory only
-  from a `written` event that TARGETS it. A memory write that fails outright is
+  this" then returns nothing for it — a refusal does not assert that no
+  written event targeting it exists; the query explains a memory exactly when
+  such an event is present in the store. A memory write that fails outright is
   `reachy.memory.failed` too (with the error class, linked to the attempt and
   logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
   `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a

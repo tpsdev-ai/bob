@@ -188,7 +188,26 @@ export function flairOrgEventStore(client: {
       const record = await client.get(id);
       if (!record || typeof record.content !== "string") return null;
       try {
-        return JSON.parse(record.content) as OrgEvent;
+        const parsed: unknown = JSON.parse(record.content);
+        // Shape validation: kind is string, id is string, targetIds if
+        // present is an array of strings — anything else → null (both
+        // callers see "no event").
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          !("id" in parsed) ||
+          !("kind" in parsed) ||
+          typeof (parsed as { kind: unknown }).kind !== "string" ||
+          typeof (parsed as { id: unknown }).id !== "string" ||
+          ("targetIds" in parsed && !Array.isArray((parsed as { targetIds: unknown }).targetIds)) ||
+          ("targetIds" in parsed
+            ? ((parsed as { targetIds: unknown[] }).targetIds as unknown[])
+            : []
+          ).some((t) => typeof t !== "string")
+        ) {
+          return null;
+        }
+        return parsed as OrgEvent;
       } catch {
         return null;
       }
