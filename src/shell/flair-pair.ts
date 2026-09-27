@@ -141,7 +141,9 @@ function readIfPresent(path: string): Buffer | null {
 // written in full and synced to a unique temporary file first, then published
 // with link(), which never replaces an existing file: the .pub path only ever
 // appears complete, and a crash mid-write leaves no partial .pub. Returns
-// false when a .pub already exists. The temporary file is always removed.
+// false when a .pub already exists. The temporary file is removed on every
+// return and thrown error; a crash can leave a `.tmp` file beside the key,
+// which nothing reads and which can be deleted.
 export function createPubIfAbsent(pubPath: string, publicKeyBase64: string): boolean {
   const tmpPath = `${pubPath}.${process.pid}.${randomUUID()}.tmp`;
   const data = Buffer.from(`${publicKeyBase64}\n`);
