@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deriveEd25519PublicKeyBase64 } from "../../src/lib/ed25519-key.js";
@@ -144,5 +152,16 @@ describe("flairPair derives the public key from the private key (bob#191)", () =
     expect(createPubIfAbsent(pubPath(), pubBase64)).toBe(true);
     expect(readFileSync(pubPath(), "utf8")).toBe(`${pubBase64}\n`);
     expect(statSync(pubPath()).mode & 0o777).toBe(0o644);
+  });
+
+  it("(p8) the .pub repair publishes a complete file and leaves no temporary file", () => {
+    const { seed, pubBase64 } = makePair();
+    writeFileSync(privPath(), seed);
+    flairPair({ name, keysDir: tmpKeys }); // repairs the missing .pub
+    expect(readFileSync(pubPath(), "utf8")).toBe(`${pubBase64}\n`);
+
+    // A .pub already present: nothing is published and the temporary file is still removed.
+    expect(createPubIfAbsent(pubPath(), pubBase64)).toBe(false);
+    expect(readdirSync(tmpKeys).sort()).toEqual([`${name}.key`, `${name}.pub`]);
   });
 });

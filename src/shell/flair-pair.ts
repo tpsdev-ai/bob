@@ -16,15 +16,18 @@
 // placed in an error message or in argv. Every error here names the env var or
 // the FILE PATH, never a value.
 
-import { generateKeyPairSync, webcrypto } from "node:crypto";
+import { generateKeyPairSync, randomUUID, webcrypto } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   existsSync,
   fchmodSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -134,23 +137,34 @@ function readIfPresent(path: string): Buffer | null {
 }
 
 // bob#191: write the derived key as the .pub in bob's own shape, so the pair
-// on disk is complete again (doctor checks the .pub exists). The exclusive
-// create ("wx") never replaces a file; returns false when one already exists.
+// on disk is complete again (doctor checks the .pub exists). The key is
+// written in full and synced to a unique temporary file first, then published
+// with link(), which never replaces an existing file: the .pub path only ever
+// appears complete, and a crash mid-write leaves no partial .pub. Returns
+// false when a .pub already exists. The temporary file is always removed.
 export function createPubIfAbsent(pubPath: string, publicKeyBase64: string): boolean {
-  let fd: number;
+  const tmpPath = `${pubPath}.${process.pid}.${randomUUID()}.tmp`;
+  const data = Buffer.from(`${publicKeyBase64}\n`);
   try {
-    fd = openSync(pubPath, "wx", 0o644);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw err;
-  }
-  try {
-    writeSync(fd, `${publicKeyBase64}\n`);
-    fchmodSync(fd, 0o644);
+    const fd = openSync(tmpPath, "wx", 0o644);
+    try {
+      let written = 0;
+      while (written < data.length) written += writeSync(fd, data, written, data.length - written);
+      fchmodSync(fd, 0o644);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      linkSync(tmpPath, pubPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    }
+    return true;
   } finally {
-    closeSync(fd);
+    rmSync(tmpPath, { force: true });
   }
-  return true;
 }
 
 // ─── Flair connection resolution ────────────────────────────────────────────
