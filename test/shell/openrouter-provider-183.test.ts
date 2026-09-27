@@ -4,7 +4,7 @@
 // openrouter entry in models.json/auth.json. Every entry path goes through the
 // factory, so every entry path gets it. No network.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -33,9 +33,12 @@ import {
   OPENROUTER_API,
   OPENROUTER_API_KEY_PLACEHOLDER,
   OPENROUTER_BASE_URL,
+  OPENROUTER_KEY_CONSUMED_MESSAGE,
+  openrouterKeyWasConsumed,
   openrouterTransport,
   registerOpenrouterProvider,
   runInteractiveSession,
+  takeOpenrouterApiKey,
 } from "../../src/shell/session.js";
 
 const MODEL = "deepseek/deepseek-v4.1-flash";
@@ -920,6 +923,15 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
   // refresh recipe is covered by (r1) in the round-7 block, where the guarantee
   // tested is key containment (the key is not in process.env and not in pi's
   // auth, provider config or model data).
+
+  it("(r6) a SECOND runtime in the same process refuses with a precise message: the key was consumed, never cached at module scope", async () => {
+    process.env.OPENROUTER_API_KEY = KEY;
+    takeOpenrouterApiKey(); // the first runtime reads and deletes it
+    expect(process.env.OPENROUTER_API_KEY).toBeUndefined();
+    expect(openrouterKeyWasConsumed()).toBe(true);
+    // A second read (a second runtime) refuses by NAME, not with "not set".
+    expect(() => takeOpenrouterApiKey()).toThrow(OPENROUTER_KEY_CONSUMED_MESSAGE);
+  });
 
   it("(t7) throw undefined during key resolution is REFUSED, naming the resolution failure", async () => {
     const { rt } = await runtimeFor("or6t7");

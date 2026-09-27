@@ -424,9 +424,28 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
  * (the session factory, for /new and /resume) must cache the result themselves
  * rather than call this again — the environment no longer carries it.
  */
+// Whether this process has already consumed the key (a boolean, never the key).
+// A second runtime in the same process gets a precise refusal instead of the
+// misleading "not set": the key is deliberately NOT cached at module scope, where
+// any importer of this module could read it.
+let openrouterKeyConsumed = false;
+
+/** True once this process's runtime has read and deleted OPENROUTER_API_KEY. */
+export function openrouterKeyWasConsumed(): boolean {
+  return openrouterKeyConsumed;
+}
+
+/** The refusal for a second runtime in a process whose key was already consumed. */
+export const OPENROUTER_KEY_CONSUMED_MESSAGE =
+  "bob: this process already consumed OPENROUTER_API_KEY (bob reads it once and deletes it from the environment, and keeps it only in the runtime that read it). bob builds one openrouter runtime per process. Remedy: start a new bob process for another runtime.";
+
 export function takeOpenrouterApiKey(): string {
+  if (openrouterKeyConsumed && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
+    throw new Error(OPENROUTER_KEY_CONSUMED_MESSAGE);
+  }
   const key = requireOpenrouterApiKey();
   delete process.env.OPENROUTER_API_KEY;
+  openrouterKeyConsumed = true;
   return key;
 }
 
@@ -459,10 +478,7 @@ export function registerOpenrouterProvider(
  * attempted `baseUrl` — every hook path goes through this seam. Wrapped idempotently:
  * a second call is a no-op.
  */
-export function guardOpenrouterRegistration(
-  modelRuntime: ModelRuntime,
-  provider: OpenrouterProviderConfig,
-): void {
+export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   const runtime = modelRuntime as unknown as {
     registerProvider: (id: string, config: OpenrouterProviderConfig) => void;
     unregisterProvider?: (id: string) => void;
@@ -959,7 +975,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // — from session_start, before_agent_start, or a print-mode bind — is
       // refused BEFORE it takes effect. (Refresh is deliberately NOT wrapped;
       // see guardOpenrouterRegistration.)
-      guardOpenrouterRegistration(modelRuntime, openrouterProvider);
+      guardOpenrouterRegistration(modelRuntime);
     }
     const services = await createAgentSessionServices({
       cwd,

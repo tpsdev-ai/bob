@@ -54,6 +54,8 @@ import type { BobRole, CronEntry } from "./index.js";
 import { loadRole } from "./role-loader.js";
 import {
   createBobRuntimeFactory,
+  OPENROUTER_KEY_CONSUMED_MESSAGE,
+  openrouterKeyWasConsumed,
   promptSession,
   runInteractiveSession,
   type SessionDeps,
@@ -1327,6 +1329,8 @@ function resolveProviderAndModel(
   // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
   // request is made (bob#183).
   if (provider === "openrouter" && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
+    if (openrouterKeyWasConsumed())
+      throw new Error(`bob run ${name}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
     throw new Error(
       `bob run ${name}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
     );
