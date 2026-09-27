@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deriveEd25519PublicKeyBase64 } from "../../src/lib/ed25519-key.js";
-import { flairPair } from "../../src/shell/flair-pair.js";
+import { createPubIfAbsent, flairPair } from "../../src/shell/flair-pair.js";
 
 // bob#191: flair-pair must DERIVE the registered public key from the private
 // key, never trust the .pub file's content. A Flair-minted .pub is RAW 32
@@ -132,5 +132,17 @@ describe("flairPair derives the public key from the private key (bob#191)", () =
     expect(() => deriveEd25519PublicKeyBase64(x)).toThrow(
       "cannot derive an Ed25519 public key from a x25519 private key",
     );
+  });
+
+  it("(p7) the .pub repair never replaces an existing file", () => {
+    const { pubBase64 } = makePair();
+    writeFileSync(pubPath(), "existing\n");
+    expect(createPubIfAbsent(pubPath(), pubBase64)).toBe(false);
+    expect(readFileSync(pubPath(), "utf8")).toBe("existing\n");
+
+    rmSync(pubPath());
+    expect(createPubIfAbsent(pubPath(), pubBase64)).toBe(true);
+    expect(readFileSync(pubPath(), "utf8")).toBe(`${pubBase64}\n`);
+    expect(statSync(pubPath()).mode & 0o777).toBe(0o644);
   });
 });

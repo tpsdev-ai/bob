@@ -17,7 +17,17 @@
 // the FILE PATH, never a value.
 
 import { generateKeyPairSync, webcrypto } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadFlairPrivateKey, tpsEd25519AuthHeader } from "../capabilities/flair/client.js";
@@ -75,18 +85,19 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
     // AGREES with the derived key; a mismatch is refused, never registered.
     const privDer = normalizeEd25519PrivateKey(readFileSync(privPath), privPath);
     publicKeyBase64 = deriveEd25519PublicKeyBase64(privDer);
-    if (existsSync(pubPath)) {
-      const fromFile = normalizeEd25519PublicKey(readFileSync(pubPath), pubPath).toString("base64");
-      if (fromFile !== publicKeyBase64) {
-        throw new Error(
-          `public key at ${pubPath} does not match the private key at ${privPath}: refusing to register a key that cannot verify this key's signatures. Delete ${pubPath} and re-run; bob rewrites it from the private key.`,
-        );
-      }
-    } else {
-      // No .pub: write the derived key in bob's own shape, so the pair on
-      // disk is complete again (doctor checks the .pub exists).
-      writeFileSync(pubPath, `${publicKeyBase64}\n`);
-      chmodSync(pubPath, 0o644);
+    const mismatch = new Error(
+      `public key at ${pubPath} does not match the private key at ${privPath}: refusing to register a key that cannot verify this key's signatures. Delete ${pubPath} and re-run; bob rewrites it from the private key.`,
+    );
+    const onDisk = readIfPresent(pubPath);
+    if (onDisk !== null) {
+      if (normalizeEd25519PublicKey(onDisk, pubPath).toString("base64") !== publicKeyBase64)
+        throw mismatch;
+    } else if (!createPubIfAbsent(pubPath, publicKeyBase64)) {
+      // Another process created the .pub between the read and the create:
+      // hold it to the same rule as a .pub that was already there.
+      const raced = readFileSync(pubPath);
+      if (normalizeEd25519PublicKey(raced, pubPath).toString("base64") !== publicKeyBase64)
+        throw mismatch;
     }
     generated = false;
   } else {
@@ -109,6 +120,37 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
     publicKeyBase64,
     generated,
   };
+}
+
+// bob#191: read a file's bytes, or null when it does not exist. One syscall,
+// no separate existence check to race against.
+function readIfPresent(path: string): Buffer | null {
+  try {
+    return readFileSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+// bob#191: write the derived key as the .pub in bob's own shape, so the pair
+// on disk is complete again (doctor checks the .pub exists). The exclusive
+// create ("wx") never replaces a file; returns false when one already exists.
+export function createPubIfAbsent(pubPath: string, publicKeyBase64: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(pubPath, "wx", 0o644);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  try {
+    writeSync(fd, `${publicKeyBase64}\n`);
+    fchmodSync(fd, 0o644);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
 }
 
 // ─── Flair connection resolution ────────────────────────────────────────────
