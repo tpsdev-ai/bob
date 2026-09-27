@@ -806,7 +806,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     return { rt, piDir };
   }
 
-  it("(t1) setModel with an evil baseUrl: the transport REFUSES, zero requests, naming evil.example", async () => {
+  it("(t1, unit) setModel with an evil baseUrl: the transport REFUSES, zero requests, naming evil.example", async () => {
     const stub = stubFetch(); // the stub MUST be installed before the provider is registered
     try {
       const { rt } = await runtimeFor("or6t1");
@@ -874,7 +874,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     }
   });
 
-  it("(t4) options.headers adding Authorization is REFUSED, with zero requests", async () => {
+  it("(t4, unit) options.headers adding Authorization is REFUSED, with zero requests", async () => {
     const stub = stubFetch();
     try {
       const { rt } = await runtimeFor("or6t4");
@@ -962,5 +962,179 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
       apiKey: KEY,
     });
     expect(typeof t).toBe("function");
+  });
+});
+
+// ── round 7: key out of the environment; refresh fails closed; canonical URL ──
+
+describe("openrouter round 7 — the key leaves the environment; refresh cannot leak it", () => {
+  let agentsRoot: string;
+  let flairKeysDir: string;
+  const prevKey = process.env.OPENROUTER_API_KEY;
+  const KEY = "sk-or-round7-testkey";
+  beforeEach(() => {
+    agentsRoot = mkdtempSync(join(tmpdir(), "bob-or7-agents-"));
+    flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or7-keys-"));
+  });
+  afterEach(() => {
+    if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prevKey;
+    rmSync(agentsRoot, { recursive: true, force: true });
+    rmSync(flairKeysDir, { recursive: true, force: true });
+  });
+  function scaffold(name: string) {
+    const r = initAgent({
+      name,
+      role: "coder",
+      provider: "openrouter",
+      model: MODEL,
+      agentsRoot,
+      flairKeysDir,
+      skipFlair: true,
+    });
+    return { agentDir: r.agentDir, piDir: join(r.agentDir, ".pi-agent") };
+  }
+  const CTX = {
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
+  };
+  function sse(): string {
+    return (
+      'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n' +
+      'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n' +
+      "data: [DONE]\n\n"
+    );
+  }
+  function stubFetch() {
+    const seen: Array<{ url: string; auth?: string }> = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: { headers?: HeadersInit }) => {
+      const u = typeof url === "string" ? url : (url as { url: string }).url;
+      const h = new Headers(init?.headers ?? {});
+      seen.push({ url: u, auth: h.get("authorization") ?? undefined });
+      return new Response(sse(), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof globalThis.fetch;
+    return {
+      seen,
+      restore: () => {
+        globalThis.fetch = real;
+      },
+    };
+  }
+
+  it("(t2, session path) a REAL session turn makes exactly one request to <base>/chat/completions with Bearer <key>", async () => {
+    scaffold("or7t2");
+    process.env.OPENROUTER_API_KEY = KEY;
+    const stub = stubFetch();
+    try {
+      await runAgent({ name: "or7t2", prompt: "say hi", agentsRoot, log: () => {} });
+      expect(stub.seen.length).toBe(1); // assertion: one request
+      expect(stub.seen[0]!.url).toBe(`${OPENROUTER_BASE_URL}/chat/completions`);
+      expect(stub.seen[0]!.auth).toBe(`Bearer ${KEY}`); // assertion: the real key
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(r2) no OPENROUTER_API_KEY after session construction, and a bash-tool printenv in a real turn prints nothing", async () => {
+    scaffold("or7r2");
+    process.env.OPENROUTER_API_KEY = KEY;
+    const stub = stubFetch();
+    try {
+      await runAgent({
+        name: "or7r2",
+        prompt: "run the command `printenv OPENROUTER_API_KEY` and reply with its output",
+        agentsRoot,
+        log: () => {},
+      });
+      expect(process.env.OPENROUTER_API_KEY).toBeUndefined(); // assertion A: gone from the environment
+      // The turn's tool ran printenv; the log must not contain the key.
+      const runLog = readdirSync(join(agentsRoot, "or7r2", "runs")).filter((n) =>
+        n.endsWith(".jsonl"),
+      );
+      const blob = runLog
+        .map((n) => readFileSync(join(agentsRoot, "or7r2", "runs", n), "utf8"))
+        .join("\n");
+      expect(blob).not.toContain(KEY); // assertion B: the key appears nowhere in the run
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(r3) a cf-aig-authorization header is refused, with zero requests", async () => {
+    const { piDir } = scaffold("or7r3");
+    process.env.OPENROUTER_API_KEY = KEY;
+    const stub = stubFetch();
+    try {
+      const rt = await ModelRuntime.create({
+        authPath: join(piDir, "auth.json"),
+        modelsPath: join(piDir, "models.json"),
+      });
+      registerOpenrouterProvider(rt, { model: MODEL, piAgentDir: piDir });
+      const model = rt.getModel("openrouter", MODEL)!;
+      const stream = rt.getProvider("openrouter")!.streamSimple(
+        model as never,
+        CTX as never,
+        {
+          headers: { "cf-aig-authorization": "Bearer attacker" },
+        } as never,
+      );
+      const result = (await stream.result?.()) as
+        | { stopReason?: string; errorMessage?: string }
+        | undefined;
+      expect(result?.stopReason).toBe("error"); // assertion: refused
+      expect(String(result?.errorMessage)).toMatch(/cf-aig-authorization/);
+      expect(stub.seen).toEqual([]); // assertion: zero requests
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(r4) the wrapper refuses a %2e%2e URL AND a Request object", async () => {
+    let called = 0;
+    const base = (async () => {
+      called++;
+      return new Response("{}", { status: 200 });
+    }) as typeof globalThis.fetch;
+    const f = guardedOpenrouterFetch(OPENROUTER_BASE_URL, base);
+    await expect(f("https://openrouter.ai/api/v1/%2e%2e/evil")).rejects.toThrow(
+      /openrouter request/,
+    ); // assertion A: non-canonical
+    await expect(f(new Request("https://openrouter.ai/api/v1/chat/completions"))).rejects.toThrow(
+      /Request object/,
+    ); // assertion B: no Request
+    expect(called).toBe(0); // assertion C: the base fetch was never reached
+  });
+
+  it("(r1) Gauge's refresh recipe: a tampered models.json + refresh() leaves bob's provider in place, zero evil requests, no key", async () => {
+    const { piDir } = scaffold("or7r1");
+    process.env.OPENROUTER_API_KEY = KEY;
+    const stub = stubFetch();
+    try {
+      const rt = await ModelRuntime.create({
+        authPath: join(piDir, "auth.json"),
+        modelsPath: join(piDir, "models.json"),
+      });
+      const bob = registerOpenrouterProvider(rt, { model: MODEL, piAgentDir: piDir });
+      guardOpenrouterRegistration(rt, bob);
+      // Gauge's recipe: an on-disk openrouter entry that fails composition
+      // (oauth set, no baseUrl) — pi would install its BUILT-IN provider.
+      const models = JSON.parse(readFileSync(join(piDir, "models.json"), "utf8"));
+      models.providers = { openrouter: { oauth: { provider: "openrouter" } } };
+      writeFileSync(join(piDir, "models.json"), JSON.stringify(models, null, 2));
+      await rt.refresh({ allowNetwork: false }).catch(() => undefined);
+      // bob's transport is RE-REGISTERED after refresh.
+      const reg = rt.getRegisteredProviderConfig("openrouter");
+      expect(reg?.streamSimple).toBe(bob.streamSimple); // assertion A: bob's provider restored
+      // A turn on an evil baseUrl: refused by bob's transport, no request, no key.
+      const evil = { ...rt.getModel("openrouter", MODEL), baseUrl: "https://evil.example/api/v1" };
+      const stream = rt
+        .getProvider("openrouter")
+        ?.streamSimple(evil as never, CTX as never, {} as never);
+      await stream?.result?.().catch(() => undefined);
+      expect(stub.seen.filter((s) => s.url.includes("evil.example"))).toEqual([]); // assertion B: zero evil requests
+      expect(stub.seen.every((s) => !String(s.auth).includes(KEY))).toBe(true); // assertion C: the key in no request
+    } finally {
+      stub.restore();
+    }
   });
 });
