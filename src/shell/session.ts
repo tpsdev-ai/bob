@@ -93,11 +93,14 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // bob's check reads the unchanged registry — or (2) race an async re-assertion
 // that runs on `before_provider_request`. So the KEY IS BOUND TO THE ENDPOINT AT
 // TRANSPORT and pi holds only a NON-SECRET placeholder. Round 7 closes the last
-// path: OPENROUTER_API_KEY is DELETED from process.env at session construction,
+// path: OPENROUTER_API_KEY is DELETED from process.env when the runtime factory
+// first builds a session (after pi's ModelRuntime is created, before capabilities,
+// extensions and tools load),
 // so pi's BUILT-IN openrouter provider (which reads the env) has nothing to send.
-// What holds is KEY CONTAINMENT: the key is in NO in-process source — not the
-// environment, not a pi-owned object — so a provider pi installs in place of
-// bob's has nothing to send. `ModelRuntime.refresh()` CAN replace the effective
+// What holds is KEY CONTAINMENT: the key is not in the environment and not in
+// pi's auth, provider config or model data; bob keeps it in the runtime factory's
+// closure and the transport's closure only, so a provider pi installs in place
+// of bob's has no key to send. `ModelRuntime.refresh()` CAN replace the effective
 // provider: on a composition failure pi falls back to its BUILT-IN openrouter
 // provider (`model-runtime.js` recomposeProvider installs the `base` provider on
 // the catch path), and once it does, bob's transport is NOT on the request path
@@ -107,7 +110,7 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // environment block (/proc/<pid>/environ on Linux, `ps eww` on macOS) —
 // isolating the agent's own tools from that is bob#189.
 
-/** The one endpoint an openrouter session may reach. */
+/** The one endpoint bob's transport sends to. (A refresh fallback can replace the effective provider; see above.) */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 /** The api id pi must resolve for the openrouter model (and the transport). */
@@ -414,10 +417,10 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
- * Read the key at most ONCE per process: read it, then DELETE it from
+ * Read the key ONCE per runtime factory: read it, then DELETE it from
  * process.env so pi's built-in openrouter provider (which reads
- * OPENROUTER_API_KEY from process.env) has nothing to send. The value lives only
- * in the caller's transport closure. Callers that can be invoked more than once
+ * OPENROUTER_API_KEY from process.env) has nothing to send. The value then lives
+ * in the factory's closure and the transport closure built from it. Callers that can be invoked more than once
  * (the session factory, for /new and /resume) must cache the result themselves
  * rather than call this again — the environment no longer carries it.
  */

