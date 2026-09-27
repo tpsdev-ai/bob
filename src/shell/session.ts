@@ -108,7 +108,15 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // containment above is what still holds. STATED LIMIT: this removes the
 // IN-PROCESS path only; a same-user process can still read a process's initial
 // environment block (/proc/<pid>/environ on Linux, `ps eww` on macOS) —
-// isolating the agent's own tools from that is bob#189.
+// isolating the agent's own tools from that is bob#189. The key also lives in
+// the bob process's memory (the runtime-factory and transport closures), so a
+// same-user process that can read another process's memory (a debugger,
+// /proc/<pid>/mem, or a core dump) can recover it; isolating that is bob#189.
+// Operator symptom of the fallback: after a refresh() that breaks composition
+// pi's built-in openrouter provider is effective and has no key, so a turn
+// fails with an auth error while the operator's key is valid — check first
+// whether a .pi-agent/models.json entry defines openrouter (an extension
+// cannot: the registration guard refuses it).
 
 /** The one endpoint bob's transport sends to. (A refresh fallback can replace the effective provider; see above.) */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -176,7 +184,24 @@ export function guardedOpenrouterFetch(
         ),
       );
     }
-    return baseFetch(parsed.href, init as never);
+    return baseFetch(parsed.href, {
+      ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
+      redirect: "error",
+    } as never).catch((err: unknown) => {
+      // bob#192: refuse to FOLLOW a redirect with the key. `redirect: "error"`
+      // (set above, overriding any caller value) makes the runtime reject a 3xx
+      // instead of following it. Re-throw that as a bob error that NAMES the
+      // refused redirect and never the credentials.
+      const text = `${(err as { message?: unknown })?.message ?? ""} ${(err as { cause?: { message?: unknown } })?.cause?.message ?? ""}`;
+      if (/redirect/i.test(text)) {
+        return Promise.reject(
+          new Error(
+            `bob: refusing an openrouter redirect from ${parsed.href} — bob's transport does not follow redirects (redirect: "error")`,
+          ),
+        );
+      }
+      return Promise.reject(err);
+    });
   }) as typeof globalThis.fetch;
 }
 

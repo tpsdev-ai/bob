@@ -917,6 +917,45 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     expect(called).toBe(1); // the allowed URL goes through
   });
 
+  it("(t8) refuses a redirect: no request reaches the redirect target, and the error names it, never the key", async () => {
+    let otherHit = 0;
+    const other = Bun.serve({
+      port: 0,
+      fetch() {
+        otherHit++;
+        return new Response("leaked", { status: 200 });
+      },
+    });
+    const stub = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(null, {
+          status: 302,
+          headers: { location: `http://127.0.0.1:${other.port}/leak` },
+        });
+      },
+    });
+    try {
+      // The stub stands in for the OpenRouter URL: rewrite the canonical URL to
+      // the local 302 endpoint, so the wrapper's URL check still sees openrouter.ai.
+      const base = ((url: unknown, init?: unknown) =>
+        fetch(
+          String(url).replace(OPENROUTER_BASE_URL, `http://127.0.0.1:${stub.port}`),
+          init as RequestInit,
+        )) as typeof globalThis.fetch;
+      const f = guardedOpenrouterFetch(OPENROUTER_BASE_URL, base);
+      const err: any = await f(`${OPENROUTER_BASE_URL}/chat/completions`, {
+        headers: { authorization: `Bearer ${KEY}` },
+      }).catch((e: unknown) => e);
+      expect(String(err?.message)).toMatch(/redirect/i); // assertion: names the refused redirect
+      expect(String(err?.message)).not.toContain(KEY); // assertion: never the key
+      expect(otherHit).toBe(0); // assertion: NO request reached the redirect target
+    } finally {
+      stub.stop(true);
+      other.stop(true);
+    }
+  });
+
   // (t6, round 6) asserted that `ModelRuntime.refresh()` re-registers bob's
   // definition. Round 8 DELETED that wrapper: a refresh can install pi's built-in
   // provider as the effective one, so the wrapper cannot intercept anything. The
