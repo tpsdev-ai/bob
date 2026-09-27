@@ -83,15 +83,6 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
   allowResidentShell: false,
 };
 
-// ── openrouter: bob OWNS the provider (bob#183 round 3) ────────────────────────
-//
-// Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
-// a check that has to enumerate pi's precedence rules will always lag them (a
-// selected model entry's own `baseUrl`, or `providers.openrouter.apiKey`, is
-// resolved by pi from the file just the same). Round 3 changed the SHAPE to a
-// construction-time registration; round 6 moved the key into a transport; round 7
-// (below) takes the key OUT of the environment and fails `refresh()` closed.
-
 // ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
 //
 // Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
@@ -103,11 +94,18 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // that runs on `before_provider_request`. So the KEY IS BOUND TO THE ENDPOINT AT
 // TRANSPORT and pi holds only a NON-SECRET placeholder. Round 7 closes the last
 // path: OPENROUTER_API_KEY is DELETED from process.env at session construction,
-// so pi's BUILT-IN openrouter provider (which reads the env) has nothing to send,
-// and `ModelRuntime.refresh()` re-registers bob's definition. STATED LIMIT: this
-// removes the IN-PROCESS path only; a same-user process can still read a
-// process's initial environment block (/proc/<pid>/environ on Linux, `ps eww` on
-// macOS) — isolating the agent's own tools from that is bob#189.
+// so pi's BUILT-IN openrouter provider (which reads the env) has nothing to send.
+// What holds is KEY CONTAINMENT: the key is in NO in-process source — not the
+// environment, not a pi-owned object — so a provider pi installs in place of
+// bob's has nothing to send. `ModelRuntime.refresh()` CAN replace the effective
+// provider: on a composition failure pi falls back to its BUILT-IN openrouter
+// provider (`model-runtime.js` recomposeProvider installs the `base` provider on
+// the catch path), and once it does, bob's transport is NOT on the request path
+// and NO wrapper around `refresh()` can intercept the request that follows — the
+// containment above is what still holds. STATED LIMIT: this removes the
+// IN-PROCESS path only; a same-user process can still read a process's initial
+// environment block (/proc/<pid>/environ on Linux, `ps eww` on macOS) —
+// isolating the agent's own tools from that is bob#189.
 
 /** The one endpoint an openrouter session may reach. */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -416,10 +414,12 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
- * The ONE time bob reads the key in a process: read it, then DELETE it from
+ * Read the key at most ONCE per process: read it, then DELETE it from
  * process.env so pi's built-in openrouter provider (which reads
  * OPENROUTER_API_KEY from process.env) has nothing to send. The value lives only
- * in the caller's transport closure.
+ * in the caller's transport closure. Callers that can be invoked more than once
+ * (the session factory, for /new and /resume) must cache the result themselves
+ * rather than call this again — the environment no longer carries it.
  */
 export function takeOpenrouterApiKey(): string {
   const key = requireOpenrouterApiKey();
@@ -464,7 +464,6 @@ export function guardOpenrouterRegistration(
     registerProvider: (id: string, config: OpenrouterProviderConfig) => void;
     unregisterProvider?: (id: string) => void;
     registerNativeProvider?: (provider: { id?: string; name?: string; baseUrl?: string }) => void;
-    refresh?: (...args: unknown[]) => Promise<unknown>;
     getRegisteredProviderConfig?: (
       id: string,
     ) => { apiKey?: unknown; streamSimple?: unknown } | undefined;
@@ -516,31 +515,16 @@ export function guardOpenrouterRegistration(
       return originalNative(provider);
     };
   }
-  // (2) REFRESH FAILS CLOSED. `ModelRuntime.refresh()` re-reads models.json and can
-  // REPLACE bob's provider with pi's BUILT-IN openrouter provider (which reads
-  // OPENROUTER_API_KEY from the environment). Chosen: RE-REGISTER bob's definition
-  // after every refresh — so requests keep working on bob's transport — rather than
-  // refusing every later request (a refusal would need a process-global flag and
-  // would strand the agent until restart). If bob's provider is no longer the
-  // registered one, put it back with the ORIGINAL method (bypassing the guard).
-  const reassert = () => {
-    const reg = runtime.getRegisteredProviderConfig?.("openrouter");
-    if (
-      !reg ||
-      reg.streamSimple !== provider.streamSimple ||
-      reg.apiKey !== OPENROUTER_API_KEY_PLACEHOLDER
-    ) {
-      originalRegister("openrouter", provider);
-    }
-  };
-  if (typeof runtime.refresh === "function") {
-    const originalRefresh = runtime.refresh.bind(modelRuntime);
-    runtime.refresh = async (...args: unknown[]) => {
-      const result = await originalRefresh(...args);
-      reassert();
-      return result;
-    };
-  }
+  // REFRESH IS NOT WRAPPED (round 8). `ModelRuntime.refresh()` re-reads models.json
+  // and CAN replace the effective openrouter provider: on a composition failure pi
+  // falls back to its BUILT-IN openrouter provider (`model-runtime.js`
+  // recomposeProvider installs the `base` provider on the catch path). bob's
+  // transport is then NOT on the request path, and NO wrapper around `refresh()`
+  // can intercept the request that follows. The guarantee bob holds is KEY
+  // CONTAINMENT: the key is in no in-process source (round 7 deletes it from
+  // process.env; pi holds only the NON-SECRET placeholder), so a provider pi
+  // installs in its place has nothing to send. The registration seam above
+  // (register / unregister / native) is still a real layer and stays.
 }
 
 // Diagnostics + the process-exit seam, injectable so a test can watch a failed
@@ -917,6 +901,13 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         });
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
+  // (round 8, item 4) pi calls this factory AGAIN for `/new`, `/resume`, `/fork`,
+  // `/clone` and `/import` (agent-session-runtime.js), and the key is consumed
+  // INSIDE each invocation — so a second invocation must NOT re-read the
+  // environment (the first deleted it, and a re-read would refuse). Read it ONCE
+  // into this closure, which outlives a single factory invocation, and never
+  // touch process.env for the key again.
+  let openrouterKey: string | undefined;
   return async ({ sessionManager }) => {
     // PIN the agent's own identity + directory. A resumed or imported session
     // records its own cwd and agent dir; bob's agent is bob's agent.
@@ -944,12 +935,15 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // The on-disk refusal comes FIRST (a config error, before any key read), so a
       // tampered models.json refuses on every entry path without consuming the key.
       assertNoOnDiskOpenrouter(agentDir);
-      // (1) KEY OUT OF THE ENVIRONMENT. Read OPENROUTER_API_KEY ONCE, here, then
-      // DELETE it from process.env before pi, any capability, any extension or any
-      // tool subprocess starts — so pi's BUILT-IN openrouter provider (which reads
-      // the key from process.env) has nothing to send, and nothing in bob reads it
-      // from process.env afterwards. Fail-closed on unset/empty is unchanged.
-      const openrouterKey = takeOpenrouterApiKey();
+      // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
+      // OPENROUTER_API_KEY once, then DELETE it from process.env before pi, any
+      // capability, any extension or any tool subprocess starts — so pi's
+      // BUILT-IN openrouter provider (which reads the key from process.env) has
+      // nothing to send, and nothing in bob reads it from process.env afterwards.
+      // Later invocations (replacement sessions: /new, /resume) reuse the value
+      // read here and NEVER re-read the environment. Fail-closed on unset/empty is
+      // unchanged.
+      if (openrouterKey === undefined) openrouterKey = takeOpenrouterApiKey();
       openrouterProvider = registerOpenrouterProvider(modelRuntime, {
         model: config.model,
         piAgentDir: agentDir,
@@ -958,7 +952,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
       // the runtime's registration verbs so a LATER registerProvider("openrouter")
       // — from session_start, before_agent_start, or a print-mode bind — is
-      // refused BEFORE it takes effect. Also wraps refresh() (round 7, item 2).
+      // refused BEFORE it takes effect. (Refresh is deliberately NOT wrapped;
+      // see guardOpenrouterRegistration.)
       guardOpenrouterRegistration(modelRuntime, openrouterProvider);
     }
     const services = await createAgentSessionServices({
