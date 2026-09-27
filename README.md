@@ -462,6 +462,28 @@ sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-
 mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
 by bob's gate (bob#180 §4).
 
+## Providers
+
+Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider.model`). `openrouter`
+is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
+passed through verbatim — for example `bob onboard orr --provider openrouter --model
+deepseek/deepseek-v4.1-flash`.
+
+**bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
+memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,
+a NON-SECRET placeholder key (the real key stays with bob; see below), the `openai-completions` api, and the declared model
+with no per-model `baseUrl` — and hands it to pi's session services; every entry path (`bob run`, the
+persistent runtime, `bob onboard`, `bob align`) goes through that factory
+(`openrouter-provider-183.test.ts` (a2), (b1)–(b6)). What is REFUSED before the session exists,
+naming the file: a `providers.openrouter` block in `.pi-agent/models.json` — a per-model `baseUrl`, a
+`providers.openrouter.apiKey` — (`(2a), (2a-listener), (2b), (2d)`); a stored openrouter credential in
+`.pi-agent/auth.json` (`(a)`); and an unreadable or unparseable pi config, where a missing file is
+"absent" but any other read or parse failure refuses because bob cannot prove the file carries no
+entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a commented file on purpose: bob cannot parse it, so it cannot prove the file carries no `openrouter` entry (`(b)`). A provider declared under ANOTHER name is not bob's concern: the selected
+`openrouter` model resolves from bob's in-memory provider. **bob holds the OpenRouter key; pi does not.** It lives in bob's runtime-factory closure (so `/new` and `/resume` reuse it) and in the transport function built from it, which sends only to `https://openrouter.ai/api/v1`; pi's auth and registered provider config hold a NON-SECRET placeholder, and pi's model data carries no key. The first session the runtime factory builds reads `OPENROUTER_API_KEY` once and DELETES it from `process.env`, after pi's model runtime is created and before capabilities, extensions and tools load (`(r2)`); the transport refuses a model whose `baseUrl`/`api` is not bob's (`(t1, unit)`), refuses the listed credential header names (`authorization`, `proxy-authorization`, `cf-aig-authorization`, `x-api-key`, `api-key`, `x-auth-token`, `cookie`) (`(t4, unit)`, `(r3)`), and its fetch wrapper refuses a non-canonical URL or a `Request` (`(t5, unit)`, `(r4)`); a real session turn carries `Bearer <the real key>` to `<base>/chat/completions` (`(t2, session path)`); the key is in none of pi's auth, registered provider config or model data (`(t3)`); a `ModelRuntime.refresh()` with a tampered `models.json` can install pi's BUILT-IN provider as the effective one — bob's transport is then not on the request path — so what holds instead is key containment: the key is no longer in `process.env` or in pi's data, so the fallback provider that pi's request path prepares has no key to send and `getAuth("openrouter")` resolves none (`(r1)`, whose control phase shows the same path DOES send the key to another host while the environment still holds it). STATED LIMIT: this removes the IN-PROCESS path only — a same-user process can still read a process's initial environment block (`/proc/<pid>/environ` on Linux, `ps eww` on macOS); isolating the agent's own tools from that is bob#189, not this change. An
+unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
+path's persisted files (`(c)`).
+
 ## Status
 
 `0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
