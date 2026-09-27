@@ -131,8 +131,10 @@ export function buildOpenrouterProvider(input: {
  * Refuse when the on-disk pi config carries ANY `openrouter` entry: bob owns the
  * provider, and an entry in the editable `models.json` (a provider block, a
  * per-model `baseUrl`, a `providers.openrouter.apiKey`) or a stored credential
- * in `auth.json` is never merged. Names the file. Absent/unparseable files are
- * treated as no entry (there is nothing to find).
+ * in `auth.json` is never merged. Names the file. A MISSING file is "absent" (no
+ * entry); any OTHER read or parse failure REFUSES — bob cannot prove the file
+ * carries no openrouter entry. pi accepts comments in `models.json`, so a
+ * commented file is refused here ON PURPOSE as unparseable.
  */
 export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
   const modelsPath = join(piAgentDir, "models.json");
@@ -225,10 +227,29 @@ export async function assertOpenrouterRuntimeUnchanged(
     }
   }
   // The key the request would carry. pi resolves it through the composed auth.
-  const auth = await modelRuntime.getAuth(providerId).catch(() => undefined);
-  const resolvedKey = auth?.auth?.apiKey;
-  if (resolvedKey !== undefined && resolvedKey !== input.apiKey) {
-    problems.push("the resolved apiKey is not the OPENROUTER_API_KEY value");
+  // STRICT (round 5, item 2): a resolution FAILURE or an UNDEFINED key is a
+  // refusal naming the cause — bob must be able to PROVE the key is the
+  // OPENROUTER_API_KEY value, so an undefined resolved key is not accepted.
+  let auth: Awaited<ReturnType<ModelRuntime["getAuth"]>> | undefined;
+  let authError: unknown;
+  try {
+    auth = await modelRuntime.getAuth(providerId);
+  } catch (err) {
+    authError = err;
+  }
+  if (authError !== undefined) {
+    problems.push(
+      `the auth resolution for openrouter threw (${authError instanceof Error ? authError.message : String(authError)}) — bob cannot prove the key is the OPENROUTER_API_KEY value`,
+    );
+  } else {
+    const resolvedKey = auth?.auth?.apiKey;
+    if (typeof resolvedKey !== "string") {
+      problems.push(
+        "the resolved openrouter apiKey is undefined — bob cannot prove the key is the OPENROUTER_API_KEY value",
+      );
+    } else if (resolvedKey !== input.apiKey) {
+      problems.push("the resolved apiKey is not the OPENROUTER_API_KEY value");
+    }
   }
   if (problems.length > 0) {
     throw new Error(
@@ -265,6 +286,121 @@ export function registerOpenrouterProvider(
   });
   modelRuntime.registerProvider("openrouter", provider);
   return provider;
+}
+
+/**
+ * GUARD THE VERB (round 5, item 1). pi makes a LATER `registerProvider("openrouter",
+ * …)` effective IMMEDIATELY — from a capability's `session_start`, from
+ * `before_agent_start`, and from a print-mode bind that loads extensions AFTER the
+ * factory returns. bob registers its own provider FIRST, then wraps the runtime's
+ * registration verbs ONCE, so any later call naming `openrouter` is REFUSED
+ * (throwing, before it takes effect) with an error naming the caller path and the
+ * attempted `baseUrl` — every hook path goes through this seam. Wrapped idempotently:
+ * a second call is a no-op.
+ */
+export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
+  const runtime = modelRuntime as unknown as {
+    registerProvider: (id: string, config: OpenrouterProviderConfig) => void;
+    unregisterProvider?: (id: string) => void;
+    registerNativeProvider?: (provider: { id?: string; name?: string; baseUrl?: string }) => void;
+    __bobOpenrouterGuarded?: boolean;
+  };
+  if (runtime.__bobOpenrouterGuarded) return;
+  runtime.__bobOpenrouterGuarded = true;
+
+  const refuse = (verb: string, id: string, attempted?: unknown): never => {
+    const baseUrl =
+      attempted && typeof attempted === "object" && "baseUrl" in attempted
+        ? (attempted as { baseUrl?: unknown }).baseUrl
+        : undefined;
+    const caller =
+      new Error().stack
+        ?.split("\n")
+        .slice(2, 5)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0 && !l.includes("session.ts"))
+        .slice(0, 2)
+        .join(" <- ") ?? "unknown caller";
+    throw new Error(
+      `bob: refusing a ${verb} of the openrouter provider after bob registered its own — the EFFECTIVE openrouter provider is bob's (fixed ${OPENROUTER_BASE_URL}, OPENROUTER_API_KEY). ` +
+        `Attempted baseUrl ${JSON.stringify(baseUrl)}; caller ${caller}.`,
+    );
+  };
+
+  const originalRegister = runtime.registerProvider.bind(modelRuntime);
+  runtime.registerProvider = (id: string, config: OpenrouterProviderConfig) => {
+    if (id === "openrouter") refuse("registerProvider", id, config);
+    return originalRegister(id, config);
+  };
+  if (typeof runtime.unregisterProvider === "function") {
+    const originalUnregister = runtime.unregisterProvider.bind(modelRuntime);
+    runtime.unregisterProvider = (id: string) => {
+      if (id === "openrouter") refuse("unregisterProvider", id);
+      return originalUnregister(id);
+    };
+  }
+  if (typeof runtime.registerNativeProvider === "function") {
+    const originalNative = runtime.registerNativeProvider.bind(modelRuntime);
+    runtime.registerNativeProvider = (provider: {
+      id?: string;
+      name?: string;
+      baseUrl?: string;
+    }) => {
+      const id = provider?.id ?? provider?.name;
+      if (id === "openrouter") refuse("registerNativeProvider", id, provider);
+      return originalNative(provider);
+    };
+  }
+}
+
+/**
+ * The PER-TURN re-assertion of the openrouter provider, as an INLINE pi extension
+ * (round 5, item 1): it runs on `before_provider_request` — the SAME place the #145
+ * contract guard runs, i.e. before every AGENT request — and re-checks that the
+ * request-effective openrouter provider is still bob's (baseUrl, api, no per-model
+ * `baseUrl`, and the key identical). A failed check does not throw (pi catches an
+ * extension handler's throw and continues); it disposes and ends the process,
+ * naming the reason — the same path a failed audit takes.
+ */
+export function createOpenrouterGuardExtension(input: {
+  modelRuntime: ModelRuntime;
+  model: string;
+  expected: OpenrouterProviderConfig;
+  apiKey: string;
+  deps: () => ContractGuardDeps;
+}): InlineExtension {
+  const factory = (pi: {
+    on(event: "before_provider_request", handler: () => unknown): void;
+  }): void => {
+    pi.on("before_provider_request", () => {
+      const deps = input.deps();
+      void (async () => {
+        try {
+          await assertOpenrouterRuntimeUnchanged(input.modelRuntime, {
+            model: input.model,
+            expected: input.expected,
+            apiKey: input.apiKey,
+          });
+        } catch (err) {
+          const message = `bob: the effective openrouter provider is no longer bob's before a request — ${
+            err instanceof Error ? err.message : String(err)
+          }; disposing the session and ending the process before another turn can run.`;
+          try {
+            deps.dispose();
+          } catch {
+            // the failed check is the error that matters
+          }
+          try {
+            deps.log(message);
+          } finally {
+            deps.exit(1);
+          }
+        }
+      })();
+      return undefined;
+    });
+  };
+  return { name: "bob-openrouter-guard", factory, hidden: true };
 }
 
 // Diagnostics + the process-exit seam, injectable so a test can watch a failed
@@ -319,9 +455,12 @@ export function isolatedLoaderOptions(
   config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir"> & {
     contractBlock?: string;
   },
-  extra?: { guard?: InlineExtension },
+  extra?: { guard?: InlineExtension; openrouterGuard?: InlineExtension },
 ): LoaderOptions {
   const contractBlock = config.contractBlock;
+  const inlineGuards = [extra?.guard, extra?.openrouterGuard].filter(
+    (g): g is InlineExtension => g !== undefined,
+  );
   return {
     // The only extensions are the declared capabilities' paths. With
     // noExtensions the loader uses exactly these (temporary CLI scope) and
@@ -340,7 +479,7 @@ export function isolatedLoaderOptions(
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
       : {}),
-    ...(extra?.guard !== undefined ? { extensionFactories: [extra.guard] } : {}),
+    ...(inlineGuards.length > 0 ? { extensionFactories: inlineGuards } : {}),
   };
 }
 
@@ -665,12 +804,26 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // redirect the endpoint or the key. Runs BEFORE any session exists.
     let openrouterProvider: OpenrouterProviderConfig | undefined;
     let openrouterKey = "";
+    let openrouterGuard: InlineExtension | undefined;
     if (config.provider === "openrouter") {
       openrouterProvider = registerOpenrouterProvider(modelRuntime, {
         model: config.model,
         piAgentDir: agentDir,
       });
       openrouterKey = requireOpenrouterApiKey();
+      // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
+      // the runtime's registration verbs so a LATER registerProvider("openrouter")
+      // — from session_start, before_agent_start, or a print-mode bind — is
+      // refused BEFORE it takes effect. The per-turn re-assertion runs on
+      // `before_provider_request`, the same place the contract guard runs.
+      guardOpenrouterRegistration(modelRuntime);
+      openrouterGuard = createOpenrouterGuardExtension({
+        modelRuntime,
+        model: config.model,
+        expected: openrouterProvider,
+        apiKey: openrouterKey,
+        deps: () => guardDeps,
+      });
     }
     const services = await createAgentSessionServices({
       cwd,
@@ -679,7 +832,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       modelRuntime,
       resourceLoaderOptions: isolatedLoaderOptions(
         { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
-        { ...(guard !== undefined ? { guard } : {}) },
+        {
+          ...(guard !== undefined ? { guard } : {}),
+          ...(openrouterGuard !== undefined ? { openrouterGuard } : {}),
+        },
       ),
     });
     // bob asked for these extensions explicitly: a declared capability whose

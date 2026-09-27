@@ -479,12 +479,10 @@ naming the file: a `providers.openrouter` block in `.pi-agent/models.json` — a
 `providers.openrouter.apiKey` — (`(2a), (2a-listener), (2b), (2d)`); a stored openrouter credential in
 `.pi-agent/auth.json` (`(a)`); and an unreadable or unparseable pi config, where a missing file is
 "absent" but any other read or parse failure refuses because bob cannot prove the file carries no
-entry (`(a)–(d)`). A provider declared under ANOTHER name is not bob's concern: the selected
-`openrouter` model resolves from bob's in-memory provider, and that EFFECTIVE provider/model (baseUrl,
-api, no per-model baseUrl, the key) is ASSERTED after the session services are built, so a capability
-that re-registers `openrouter` during load is refused naming what changed (`(post-services)`). An
+entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a commented file on purpose: bob cannot parse it, so it cannot prove the file carries no `openrouter` entry (`(b)`). A provider declared under ANOTHER name is not bob's concern: the selected
+`openrouter` model resolves from bob's in-memory provider. The registration of the openrouter provider after bob's own is refused at the runtime seam — a later `registerProvider("openrouter", …)` from a capability's `session_start`, from `before_agent_start`, or from a print-mode bind is refused before it takes effect, naming the caller and the attempted `baseUrl` (`(e), (f)`) — and the effective provider is re-asserted before every request (the same hook the contract guard runs on), and again after the session services are built (`(g), (key), (post-services)`). An
 unset `OPENROUTER_API_KEY` refuses before any session too, and the key is never written by the run
-path's persisted files (`(c), (2d)`).
+path's persisted files (`(c)`).
 
 ## Status
 
