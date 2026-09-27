@@ -21,6 +21,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadFlairPrivateKey, tpsEd25519AuthHeader } from "../capabilities/flair/client.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+  normalizeEd25519PublicKey,
+} from "../lib/ed25519-key.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
@@ -62,7 +67,22 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
   let publicKeyBase64: string;
   let generated: boolean;
   if (existsSync(privPath) && !opts.force) {
-    publicKeyBase64 = readFileSync(pubPath, "utf8").trim();
+    // bob#191: DERIVE the registered public key from the loaded private key.
+    // The .pub file's content is never trusted for what gets registered — a
+    // Flair-minted .pub is raw 32 bytes (not base64 text), so reading it as
+    // UTF-8 would register a key that cannot verify the private key's
+    // signatures. If a .pub is present, read it as BYTES and confirm it
+    // AGREES with the derived key; a mismatch is refused, never registered.
+    const privDer = normalizeEd25519PrivateKey(readFileSync(privPath), privPath);
+    publicKeyBase64 = deriveEd25519PublicKeyBase64(privDer);
+    if (existsSync(pubPath)) {
+      const fromFile = normalizeEd25519PublicKey(readFileSync(pubPath), pubPath).toString("base64");
+      if (fromFile !== publicKeyBase64) {
+        throw new Error(
+          `public key at ${pubPath} does not match the private key at ${privPath}: refusing to register a key that cannot verify this key's signatures. Delete ${pubPath} and re-run so bob rewrites it from the private key.`,
+        );
+      }
+    }
     generated = false;
   } else {
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");

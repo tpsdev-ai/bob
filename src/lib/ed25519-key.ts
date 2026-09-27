@@ -14,7 +14,7 @@
 // names only the path and the input's BYTE COUNT — never the bytes, their
 // base64, or any decoded form.
 
-import { createPrivateKey } from "node:crypto";
+import { createPrivateKey, createPublicKey } from "node:crypto";
 
 // RFC 8410 prefix that wraps a bare 32-byte Ed25519 seed into PKCS8 DER
 // (ASN.1: SEQUENCE { INTEGER 0, SEQUENCE { OID 1.3.101.112 }, OCTET STRING {
@@ -106,4 +106,43 @@ function isStrictBase64(s: string): boolean {
   if (s.length === 0 || s.length % 4 !== 0) return false;
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s)) return false;
   return Buffer.from(s, "base64").toString("base64") === s;
+}
+
+// ─── PUBLIC key: derive from the private key, or read a .pub as bytes ───────
+
+// Derive the Ed25519 PUBLIC key from a normalized (PKCS8 DER) private key, as
+// the same 32 raw bytes Flair writes and bob registers (base64, no padding
+// issues). bob#191: the registered key is DERIVED from the private key, so a
+// stale or foreign .pub file cannot make bob register a key that fails to
+// verify the signatures the private key produces.
+export function deriveEd25519PublicKeyBase64(privateKeyDer: Buffer): string {
+  const priv = createPrivateKey({ key: privateKeyDer, format: "der", type: "pkcs8" });
+  const spki = createPublicKey(priv).export({ format: "der", type: "spki" }) as Buffer;
+  // SPKI wraps the 32-byte raw key after a 12-byte header.
+  return spki.subarray(spki.length - 32).toString("base64");
+}
+
+// The accepted PUBLIC-key shapes, in words, reused by the refusal.
+const ACCEPTED_PUB = "a raw 32-byte key (what 'flair agent add' writes) or base64 of a 32-byte key";
+
+/**
+ * Normalize an on-disk Ed25519 PUBLIC key (.pub), given as raw file BYTES, to
+ * its 32 raw key bytes. Accepts, checked in this order:
+ *   (a) exactly 32 bytes — the RAW key Flair's `agent add`/`rotate-key` write;
+ *   (b) otherwise, strict base64 text decoding to exactly 32 bytes — bob's own
+ *       `${base64}\n` shape (the same rule as the private-key normalizer).
+ * Anything else is refused, naming only the path and the input's BYTE COUNT —
+ * never the bytes, their base64, or any decoded form.
+ */
+export function normalizeEd25519PublicKey(bytes: Buffer, path: string): Buffer {
+  const n = bytes.length;
+  if (n === 32) return bytes;
+  const b64 = bytes.toString("utf8").trim().replace(/\s+/g, "");
+  if (isStrictBase64(b64)) {
+    const decoded = Buffer.from(b64, "base64");
+    if (decoded.length === 32) return decoded;
+  }
+  throw new Error(
+    `cannot load Ed25519 public key at ${path} (${n} bytes): expected ${ACCEPTED_PUB}`,
+  );
 }
