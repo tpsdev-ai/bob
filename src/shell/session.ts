@@ -524,9 +524,10 @@ export function guardOpenrouterRegistration(
   // recomposeProvider installs the `base` provider on the catch path). bob's
   // transport is then NOT on the request path, and NO wrapper around `refresh()`
   // can intercept the request that follows. The guarantee bob holds is KEY
-  // CONTAINMENT: the key is in no in-process source (round 7 deletes it from
-  // process.env; pi holds only the NON-SECRET placeholder), so a provider pi
-  // installs in its place has nothing to send. The registration seam above
+  // CONTAINMENT: the key is not in process.env (round 7 deletes it) and not in
+  // pi's auth, provider config or model data (pi holds only the NON-SECRET
+  // placeholder); bob keeps it in its factory and transport closures, so a
+  // provider pi installs in its place has no key to send. The registration seam above
   // (register / unregister / native) is still a real layer and stays.
 }
 
@@ -939,8 +940,9 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // tampered models.json refuses on every entry path without consuming the key.
       assertNoOnDiskOpenrouter(agentDir);
       // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
-      // OPENROUTER_API_KEY once, then DELETE it from process.env before pi, any
-      // capability, any extension or any tool subprocess starts — so pi's
+      // OPENROUTER_API_KEY once, then DELETE it from process.env before any
+      // capability, extension or tool subprocess starts (pi's ModelRuntime is
+      // already created by then) — so pi's
       // BUILT-IN openrouter provider (which reads the key from process.env) has
       // nothing to send, and nothing in bob reads it from process.env afterwards.
       // Later invocations (replacement sessions: /new, /resume) reuse the value

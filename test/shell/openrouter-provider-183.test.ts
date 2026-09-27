@@ -869,7 +869,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
         cfg: rt.getRegisteredProviderConfig("openrouter"),
         model: rt.getModel("openrouter", MODEL),
       });
-      expect(blob).not.toContain(KEY); // assertion: the real key is in no pi-owned object
+      expect(blob).not.toContain(KEY); // assertion: the real key is in none of pi's serialized auth, provider config or model data
       expect(blob).toContain(OPENROUTER_API_KEY_PLACEHOLDER);
     } finally {
       spy.restore();
@@ -918,7 +918,8 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
   // definition. Round 8 DELETED that wrapper: a refresh can install pi's built-in
   // provider as the effective one, so the wrapper cannot intercept anything. The
   // refresh recipe is covered by (r1) in the round-7 block, where the guarantee
-  // tested is key containment (no in-process source carries the key).
+  // tested is key containment (the key is not in process.env and not in pi's
+  // auth, provider config or model data).
 
   it("(t7) throw undefined during key resolution is REFUSED, naming the resolution failure", async () => {
     const { rt } = await runtimeFor("or6t7");
@@ -1033,6 +1034,7 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
       expect(child.error).toBeUndefined(); // the child really ran
       expect(child.status).toBe(1); // assertion B: unset in the child
       expect(child.stdout).toBe(""); // and it printed nothing
+      expect(child.stderr).toBe(""); // and exit 1 was "unset", not an error
     } finally {
       stub.restore();
     }

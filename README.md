@@ -471,7 +471,7 @@ deepseek/deepseek-v4.1-flash`.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint, the
-`OPENROUTER_API_KEY` value passed explicitly, the `openai-completions` api, and the declared model
+a NON-SECRET placeholder key (the real key stays with bob; see below), the `openai-completions` api, and the declared model
 with no per-model `baseUrl` — and hands it to pi's session services; every entry path (`bob run`, the
 persistent runtime, `bob onboard`, `bob align`) goes through that factory
 (`openrouter-provider-183.test.ts` (a2), (b1)–(b6)). What is REFUSED before the session exists,
