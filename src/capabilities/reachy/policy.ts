@@ -71,7 +71,7 @@ export function isValidProposal(p: unknown): boolean {
  * these are the v1 bounds — yaw in [-180, 180], pitch in [-90, 90]. A speech line is ONE line (no CR/LF) at most 500 chars.
  */
 const SPEECH_TEXT = Type.String({ minLength: 1, maxLength: 500, pattern: "^[^\\r\\n]*$" });
-const ACTION_ARG_SCHEMAS: Record<ProposalAction, TSchema> = {
+export const ACTION_ARG_SCHEMAS: Record<ProposalAction, TSchema> = {
   ignore: Type.Object({}, { additionalProperties: false }),
   look: Type.Object(
     {

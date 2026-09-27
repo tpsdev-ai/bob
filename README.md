@@ -432,9 +432,9 @@ naming its test (`test/capabilities/reachy/`):
   that fails outright is
   `reachy.memory.failed` too (with the error class, linked to the attempt and
   logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
-  `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is a
-  full UUID (never a timestamp plus a short suffix), so two events never collide.
-  Every reachy event id is `evt_<kind>_<uuid>` (the record id is `orgevent-<event id>`).
+  `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is
+  `evt_<kind>_<uuid>`, where `<uuid>` is a full UUID (never a timestamp plus a short
+  suffix), so two events never collide; the record id is `orgevent-<event id>`.
   (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
 - **The actuation tools go through the gate** — `reachy_look` / `reachy_say` /
   `reachy_frame` share the admit path with proposals (mute, rate gate, one

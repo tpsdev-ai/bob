@@ -7,6 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
 import {
+  ACTION_ARG_SCHEMAS,
   admitAction,
   decideTranscript,
   isValidActionArgs,
@@ -197,10 +198,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     label: "Reachy Look",
     description:
       "Turn the Reachy Mini's head to a yaw/pitch (degrees). Goes through the policy gate.",
-    parameters: Type.Object(
-      { yaw: Type.Number(), pitch: Type.Number() },
-      { additionalProperties: false },
-    ),
+    // SAME definition as the runtime: the tool parameter schema IS
+    // ACTION_ARG_SCHEMAS.look (round 10), so pi advertises the exact bounds
+    // admitAndRun enforces (yaw [-180,180], pitch [-90,90]) and never presents
+    // an input the runtime rejects as malformed.
+    parameters: ACTION_ARG_SCHEMAS.look,
     async execute(_id, params) {
       const r = await admitAndRun("look", { yaw: params.yaw, pitch: params.pitch }, 1, []);
       return ok(
@@ -220,10 +222,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     // a live pi call an extra argument never reaches execute at all. The check
     // below is belt-and-braces for a DIRECT caller of execute (a test, or any
     // code that invokes the tool without pi's validation).
-    parameters: Type.Object(
-      { text: Type.String({ minLength: 1 }) },
-      { additionalProperties: false },
-    ),
+    //
+    // Round 10: the schema IS ACTION_ARG_SCHEMAS.say — the SAME definition the
+    // runtime validates against — so the advertised bounds (one line, ≤500 chars)
+    // match what admitAndRun accepts, and `additionalProperties: false` still
+    // rejects a memory reference.
+    parameters: ACTION_ARG_SCHEMAS.say,
     async execute(_id, params) {
       const extra = Object.keys(params).filter((k) => k !== "text");
       if (extra.length > 0) {
