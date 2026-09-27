@@ -68,7 +68,7 @@ describe("normalizeEd25519PrivateKey (bob#142)", () => {
     };
     const flairHeaders = Object.values(SHAPES).map(flairAuth);
     expect(new Set(flairHeaders).size, "flair signs all four shapes identically").toBe(1); // assertion: one header
-    expect(flairHeaders[0]?.startsWith("TPS-Ed25519 pulse:1700000000000:nonce-fixed:")).toBe(true); // assertion: bound payload
+    expect(flairHeaders[0]?.startsWith("TPS-Ed25519 pulse:1700000000000:nonce-fixed:")).toBe(true); // assertion: header shape (signature validity is covered by the flair client tests)
 
     // …and through the OBSERVATORY CLIENT's post path (its readFile seam).
     const obsAuth = async (bytes: Buffer): Promise<string> => {
@@ -91,7 +91,7 @@ describe("normalizeEd25519PrivateKey (bob#142)", () => {
     const obsHeaders: string[] = [];
     for (const bytes of Object.values(SHAPES)) obsHeaders.push(await obsAuth(bytes));
     expect(new Set(obsHeaders).size, "observatory signs all four shapes identically").toBe(1); // assertion: one header
-    expect(obsHeaders[0]?.startsWith("TPS-Ed25519 rockit:1700000000000:nonce-fixed:")).toBe(true); // assertion: bound payload
+    expect(obsHeaders[0]?.startsWith("TPS-Ed25519 rockit:1700000000000:nonce-fixed:")).toBe(true); // assertion: header shape (signature validity is covered by the observatory client tests)
   });
 
   it("(t2) a 31-byte file, an empty file and a text file of garbage each throw, naming the path + byte count (never the key)", () => {
@@ -114,14 +114,19 @@ describe("normalizeEd25519PrivateKey (bob#142)", () => {
       expect(message).toContain(path); // assertion: the path is named
       expect(message).toContain(`(${size} bytes)`); // assertion: the byte count is named
       expect(message).toContain("raw 32-byte seed"); // assertion: the accepted shapes are named
-      expect(message).not.toContain(seedB64); // assertion: never the key
-      expect(message).not.toContain(SEED.toString("hex")); // assertion: never the key
+      expect(message).not.toContain(seedB64); // assertion: never the reference key
+      // …and never THIS input's own bytes in any encoding.
+      if (c.bytes.length > 0) {
+        expect(message).not.toContain(c.bytes.toString("base64"));
+        expect(message).not.toContain(c.bytes.toString("hex"));
+      }
     }
   });
 
-  it("(t3) an RSA PKCS8 key throws, because it is not Ed25519", () => {
-    // RSA PKCS8 DER, and the PEM form of the same key — both are valid private
-    // keys, so only the asymmetricKeyType gate rejects them.
+  it("(t3) an RSA PKCS8 key throws: base64 and PEM forms by the Ed25519 type gate, binary DER as not an accepted shape", () => {
+    // base64 PKCS8 and PEM are ACCEPTED SHAPES that parse as valid private keys,
+    // so only the asymmetricKeyType gate rejects them. Binary DER is not one of
+    // the four accepted shapes: it is refused as malformed input.
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const rsaDer = privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
     const rsaPem = Buffer.from(privateKey.export({ format: "pem", type: "pkcs8" }).toString());
@@ -140,6 +145,32 @@ describe("normalizeEd25519PrivateKey (bob#142)", () => {
       expect(message, `${name}: threw`).not.toBe(""); // assertion: it threw
       expect(message).toContain(`/keys/${name}.key`); // assertion: the path is named
       expect(message).toContain("raw 32-byte seed"); // assertion: the accepted shapes are named
+    }
+  });
+  it('(t4) a raw 32-byte seed is accepted whatever its bytes are, including the text "-----BEGIN"', () => {
+    const seed = Buffer.concat([Buffer.from("-----BEGIN"), Buffer.alloc(22, 0x01)]);
+    expect(seed.length).toBe(32);
+    const der = normalizeEd25519PrivateKey(seed, "/keys/pem-looking-seed.key");
+    expect(der.equals(Buffer.concat([PREFIX, seed]))).toBe(true); // assertion: read as a seed
+    expect(createPrivateKey({ key: der, format: "der", type: "pkcs8" }).asymmetricKeyType).toBe(
+      "ed25519",
+    );
+  });
+
+  it("(t5) base64 is STRICT: a valid seed's base64 with a stray suffix, a bad character or broken padding is refused", () => {
+    const good = SEED.toString("base64");
+    for (const [name, text] of [
+      ["suffix", `${good}!ignored`],
+      ["mid-char", `${good.slice(0, 10)}*${good.slice(11)}`],
+      ["no-padding", good.replace(/=+$/, "")],
+    ] as const) {
+      let message = "";
+      try {
+        normalizeEd25519PrivateKey(Buffer.from(text), `/keys/${name}.key`);
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message, `${name}: refused`).toContain(`/keys/${name}.key`);
     }
   });
 });

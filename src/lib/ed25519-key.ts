@@ -34,36 +34,43 @@ function refuse(path: string, bytes: number): never {
 /**
  * Normalize an on-disk Ed25519 private key, given as raw file BYTES, to PKCS8
  * DER. Accepts, checked in this order:
- *   (a) PEM PKCS8   — the bytes contain "-----BEGIN"
- *   (b) a raw 32-byte seed — the bytes ARE the seed
- *   (c) base64 of the text — 32 decoded bytes = a seed (prefixed the same way);
- *       any other non-empty decode = PKCS8 DER
+ *   (a) a raw 32-byte seed — the bytes ARE the seed. Checked FIRST: a PEM file is
+ *       never 32 bytes, and a random seed may contain any byte sequence,
+ *       including the text "-----BEGIN".
+ *   (b) PEM PKCS8   — the text contains "-----BEGIN"
+ *   (c) STRICT base64 of the text (standard alphabet, padded, whitespace allowed
+ *       between characters): 32 decoded bytes = a seed (prefixed the same way);
+ *       any other non-empty decode = PKCS8 DER. Any other character, bad padding
+ *       or a non-canonical encoding is a refusal, never a silently truncated decode.
  * The result is verified with createPrivateKey and its asymmetricKeyType MUST be
  * "ed25519"; anything unparsable or non-Ed25519 throws.
  */
 export function normalizeEd25519PrivateKey(bytes: Buffer, path: string): Buffer {
   const n = bytes.length;
-  const text = bytes.toString("utf8").trim();
 
   let der: Buffer;
-  if (text.includes("-----BEGIN")) {
-    // (a) PEM PKCS8 (also PEM PKCS1/EC/etc — the type check below rejects them).
-    der = extractPkcs8Der(text, path, n);
-  } else if (n === 32) {
-    // (b) the raw seed Flair writes.
+  if (n === 32) {
+    // (a) the raw seed Flair writes.
     der = Buffer.concat([ED25519_PKCS8_SEED_PREFIX, bytes]);
   } else {
-    // (c) base64 text. Buffer.from(…, "base64") ignores whitespace/newlines and
-    // stops at the first invalid character, so a wrapped base64 blob still
-    // decodes. An empty decode (empty file, or text with no base64 at all)
-    // is a refusal.
-    const decoded = Buffer.from(text, "base64");
-    if (decoded.length === 32) {
-      der = Buffer.concat([ED25519_PKCS8_SEED_PREFIX, decoded]);
-    } else if (decoded.length > 0) {
-      der = decoded;
+    const text = bytes.toString("utf8").trim();
+    if (text.includes("-----BEGIN")) {
+      // (b) PEM PKCS8 (also PEM PKCS1/EC/etc — the type check below rejects them).
+      der = extractPkcs8Der(text, path, n);
     } else {
-      return refuse(path, n);
+      // (c) strict base64. Node's own decoder stops at the first invalid
+      // character, so validate first: only the standard alphabet, correct
+      // padding, and an encoding that round-trips exactly.
+      const b64 = text.replace(/\s+/g, "");
+      if (!isStrictBase64(b64)) return refuse(path, n);
+      const decoded = Buffer.from(b64, "base64");
+      if (decoded.length === 32) {
+        der = Buffer.concat([ED25519_PKCS8_SEED_PREFIX, decoded]);
+      } else if (decoded.length > 0) {
+        der = decoded;
+      } else {
+        return refuse(path, n);
+      }
     }
   }
 
@@ -89,4 +96,12 @@ function extractPkcs8Der(pem: string, path: string, bytes: number): Buffer {
   } catch {
     return refuse(path, bytes);
   }
+}
+
+// Standard, padded base64 that re-encodes to exactly itself (so no stray
+// character, no missing or extra padding, no non-canonical trailing bits).
+function isStrictBase64(s: string): boolean {
+  if (s.length === 0 || s.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s)) return false;
+  return Buffer.from(s, "base64").toString("base64") === s;
 }
