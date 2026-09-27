@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **Dependency updates are configured through Renovate on the shared tpsdev-ai preset; Dependabot is retired.** bob keeps its stricter install gate: advisory fixes wait the same 7 days as every update (bunfig refuses younger versions), the whole pi runtime family is excluded, lockfile maintenance is off, and CodeQL's sub-actions update as one PR for every update type.
+- **Dependency updates are configured through Renovate on the shared tpsdev-ai preset; Dependabot is retired.** bob keeps its stricter install gate: advisory fixes wait the same 7 days as every update (bunfig refuses versions younger than 7 days, except @types/node and typescript), the whole pi runtime family is excluded, lockfile maintenance is off, and CodeQL's sub-actions update as one PR for every update type.
 
 ### Added
 

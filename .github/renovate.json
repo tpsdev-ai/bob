@@ -3,7 +3,7 @@
   "extends": [
     "github>tpsdev-ai/flair//.github/renovate-preset"
   ],
-  "description": "bob-specific exceptions to the shared tpsdev-ai preset. bob's bunfig.toml refuses any version younger than 7 days at install time, so advisory fixes wait the same 7 days here (an urgent fresh fix is a deliberate PR that adds the package to bunfig's minimumReleaseAgeExcludes). Lockfile maintenance is off: a lockfile refresh would move the pi runtime's transitive packages, which change only in a deliberate pi upgrade.",
+  "description": "bob-specific exceptions to the shared tpsdev-ai preset. bob's bunfig.toml refuses versions younger than 7 days at install time (except @types/node and typescript), so advisory fixes wait the same 7 days here; an urgent fresh fix is a deliberate PR that adds the package to bunfig's minimumReleaseAgeExcludes. Lockfile maintenance is off: a lockfile refresh could move the pi runtime's transitive packages. Other update PRs regenerate bun.lock too, so review every generated lockfile diff for pi transitive changes.",
   "vulnerabilityAlerts": {
     "minimumReleaseAge": "7 days"
   },
@@ -12,7 +12,7 @@
   },
   "packageRules": [
     {
-      "description": "bob pins the pi runtime at exactly 0.84.3 on purpose: bob builds on its ModelRuntime seam, and a pi upgrade is a deliberate, spec'd PR with its own review, never a Renovate bump. The rule covers the whole @earendil-works family (pi-coding-agent and pi-ai directly; pi-agent-core, pi-client, pi-protocol, pi-telemetry and pi-tui through the lockfile).",
+      "description": "bob pins the pi runtime at exactly 0.84.3 on purpose: bob builds on its ModelRuntime seam, and a pi upgrade is a deliberate, spec'd PR with its own review, never a Renovate bump. The rule matches the whole @earendil-works family, so Renovate proposes no update for any of them; their transitive resolutions (pi-agent-core, pi-client, pi-protocol, pi-telemetry, pi-tui) can still move when another update regenerates bun.lock.",
       "matchPackageNames": [
         "@earendil-works/**"
       ],
