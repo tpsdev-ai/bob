@@ -424,20 +424,21 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
  * (the session factory, for /new and /resume) must cache the result themselves
  * rather than call this again — the environment no longer carries it.
  */
-// Whether this process has already consumed the key (a boolean, never the key).
-// A second runtime in the same process gets a precise refusal instead of the
-// misleading "not set": the key is deliberately NOT cached at module scope, where
-// any importer of this module could read it.
+// Whether a session factory in this process has already read and deleted the key
+// (a boolean, never the key). A later read that finds the variable empty gets a
+// precise refusal instead of the misleading "not set". The key itself is
+// deliberately NOT cached at module scope: an exported cache would let any
+// importer of this module read it.
 let openrouterKeyConsumed = false;
 
-/** True once this process's runtime has read and deleted OPENROUTER_API_KEY. */
+/** True once a session factory in this process has read and deleted OPENROUTER_API_KEY. */
 export function openrouterKeyWasConsumed(): boolean {
   return openrouterKeyConsumed;
 }
 
-/** The refusal for a second runtime in a process whose key was already consumed. */
+/** The refusal for a key read that finds OPENROUTER_API_KEY empty after an earlier read consumed it. */
 export const OPENROUTER_KEY_CONSUMED_MESSAGE =
-  "bob: this process already consumed OPENROUTER_API_KEY (bob reads it once and deletes it from the environment, and keeps it only in the runtime that read it). bob builds one openrouter runtime per process. Remedy: start a new bob process for another runtime.";
+  "bob: OPENROUTER_API_KEY was already read and deleted from the environment by an earlier openrouter session factory in this process, and is not set now; bob does not share one factory's key with another. Remedy: start a new bob process to build another openrouter runtime.";
 
 export function takeOpenrouterApiKey(): string {
   if (openrouterKeyConsumed && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
