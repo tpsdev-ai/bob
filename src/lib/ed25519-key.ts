@@ -117,6 +117,11 @@ function isStrictBase64(s: string): boolean {
 // verify the signatures the private key produces.
 export function deriveEd25519PublicKeyBase64(privateKeyDer: Buffer): string {
   const priv = createPrivateKey({ key: privateKeyDer, format: "der", type: "pkcs8" });
+  if (priv.asymmetricKeyType !== "ed25519") {
+    throw new Error(
+      `cannot derive an Ed25519 public key from a ${priv.asymmetricKeyType ?? "unknown"} private key`,
+    );
+  }
   const spki = createPublicKey(priv).export({ format: "der", type: "spki" }) as Buffer;
   // SPKI wraps the 32-byte raw key after a 12-byte header.
   return spki.subarray(spki.length - 32).toString("base64");

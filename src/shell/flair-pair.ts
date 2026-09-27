@@ -67,8 +67,8 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
   let publicKeyBase64: string;
   let generated: boolean;
   if (existsSync(privPath) && !opts.force) {
-    // bob#191: DERIVE the registered public key from the loaded private key.
-    // The .pub file's content is never trusted for what gets registered — a
+    // bob#191: DERIVE the public key returned for registration from the loaded
+    // private key. The .pub file's content is never used as that key — a
     // Flair-minted .pub is raw 32 bytes (not base64 text), so reading it as
     // UTF-8 would register a key that cannot verify the private key's
     // signatures. If a .pub is present, read it as BYTES and confirm it
@@ -79,9 +79,14 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
       const fromFile = normalizeEd25519PublicKey(readFileSync(pubPath), pubPath).toString("base64");
       if (fromFile !== publicKeyBase64) {
         throw new Error(
-          `public key at ${pubPath} does not match the private key at ${privPath}: refusing to register a key that cannot verify this key's signatures. Delete ${pubPath} and re-run so bob rewrites it from the private key.`,
+          `public key at ${pubPath} does not match the private key at ${privPath}: refusing to register a key that cannot verify this key's signatures. Delete ${pubPath} and re-run; bob rewrites it from the private key.`,
         );
       }
+    } else {
+      // No .pub: write the derived key in bob's own shape, so the pair on
+      // disk is complete again (doctor checks the .pub exists).
+      writeFileSync(pubPath, `${publicKeyBase64}\n`);
+      chmodSync(pubPath, 0o644);
     }
     generated = false;
   } else {

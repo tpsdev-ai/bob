@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deriveEd25519PublicKeyBase64 } from "../../src/lib/ed25519-key.js";
 import { flairPair } from "../../src/shell/flair-pair.js";
 
 // bob#191: flair-pair must DERIVE the registered public key from the private
@@ -36,7 +37,7 @@ describe("flairPair derives the public key from the private key (bob#191)", () =
   const privPath = () => join(tmpKeys, `${name}.key`);
   const pubPath = () => join(tmpKeys, `${name}.pub`);
 
-  it("(p1) a Flair-style raw 32-byte .pub registers the correct public key", () => {
+  it("(p1) a Flair-style raw 32-byte .pub yields the correct public key for registration", () => {
     const { seed, pubRaw, pubBase64 } = makePair();
     writeFileSync(privPath(), seed); // raw seed, as `flair agent add` writes it
     writeFileSync(pubPath(), pubRaw); // RAW 32 bytes, not base64 text
@@ -45,15 +46,15 @@ describe("flairPair derives the public key from the private key (bob#191)", () =
     expect(res.publicKeyBase64).toBe(pubBase64);
   });
 
-  it("(p2) a bob-style base64 .pub registers the same key as p1", () => {
+  it("(p2) a bob-style base64 .pub yields the public key derived from its private key", () => {
     const { seed, pubBase64 } = makePair();
     writeFileSync(privPath(), seed);
     writeFileSync(pubPath(), `${pubBase64}\n`); // bob's own base64 shape
 
     const res = flairPair({ name, keysDir: tmpKeys });
 
-    // Same key as the raw-bytes shape: read the file as BYTES and accept both
-    // shapes. (Re-derive from the seed to prove it equals the .pub content.)
+    // For this pair, the returned key equals the key encoded in its base64 .pub.
+    // (Re-derive from the seed to prove it equals the .pub content.)
     const derived = createPublicKey(
       createPrivateKey({
         key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]),
@@ -97,11 +98,39 @@ describe("flairPair derives the public key from the private key (bob#191)", () =
     expect(message).not.toContain(seed.toString("hex"));
   });
 
-  it("(p4) no .pub file: the derived key is used", () => {
+  it("(p4) no .pub file: the derived key is used and written as the .pub", () => {
     const { seed, pubBase64 } = makePair();
     writeFileSync(privPath(), seed); // no .pub written
 
     const res = flairPair({ name, keysDir: tmpKeys });
     expect(res.publicKeyBase64).toBe(pubBase64);
+    expect(res.generated).toBe(false);
+    expect(existsSync(pubPath())).toBe(true);
+    expect(readFileSync(pubPath(), "utf8")).toBe(`${pubBase64}\n`);
+  });
+
+  it("(p5) the refusal's remedy works: delete the mismatched .pub, re-run, the derived key is used and rewritten", () => {
+    const { seed, pubBase64 } = makePair();
+    writeFileSync(privPath(), seed);
+    writeFileSync(pubPath(), makePair().pubRaw); // foreign public key
+    expect(() => flairPair({ name, keysDir: tmpKeys })).toThrow(
+      "bob rewrites it from the private key",
+    );
+
+    rmSync(pubPath());
+    const res = flairPair({ name, keysDir: tmpKeys });
+    expect(res.publicKeyBase64).toBe(pubBase64);
+    expect(existsSync(pubPath())).toBe(true);
+    expect(readFileSync(pubPath(), "utf8")).toBe(`${pubBase64}\n`);
+  });
+
+  it("(p6) the derivation helper refuses a non-Ed25519 private key", () => {
+    const x = generateKeyPairSync("x25519").privateKey.export({
+      format: "der",
+      type: "pkcs8",
+    }) as Buffer;
+    expect(() => deriveEd25519PublicKeyBase64(x)).toThrow(
+      "cannot derive an Ed25519 public key from a x25519 private key",
+    );
   });
 });
