@@ -21,6 +21,7 @@ import { discordManifest } from "../capabilities/discord/manifest.js";
 import { fixtureManifest } from "../capabilities/fixture/manifest.js";
 import { flairManifest } from "../capabilities/flair/manifest.js";
 import { observatoryManifest } from "../capabilities/observatory/manifest.js";
+import { reachyManifest } from "../capabilities/reachy/manifest.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 
 // Planned capabilities whose extensions don't exist yet (later PRs). Listed so
@@ -50,6 +51,7 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   discord: { manifest: discordManifest },
   flair: { manifest: flairManifest },
   observatory: { manifest: observatoryManifest },
+  reachy: { manifest: reachyManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
   heartbeat: placeholder("heartbeat", { serves: true }),

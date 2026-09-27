@@ -49,6 +49,10 @@ export interface BobCapabilityManifest {
     serves?: boolean;
     // A pi provider id the capability registers, if any.
     provider?: string;
+    // Tool names that are DECLARED but not yet wired to a real reply (e.g. a
+    // read command with no request/response correlation). Labelled so the
+    // manifest and README can say so instead of implying the tool works.
+    placeholderTools?: string[];
   };
 }
 
