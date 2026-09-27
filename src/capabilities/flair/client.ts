@@ -21,6 +21,7 @@
 import { createPrivateKey, type KeyObject, sign as signEd25519, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { normalizeEd25519PrivateKey } from "../../lib/ed25519-key.js";
 
 export interface FlairSearchHit {
   id: string;
@@ -74,15 +75,18 @@ type FetchLike = (
 export interface FlairHttpClientOptions {
   url: string;
   agentId: string;
-  // Path to the Ed25519 private key. Read once, lazily. Accepts either the PEM
-  // PKCS8 form that `bob flair-pair` writes (-----BEGIN PRIVATE KEY-----) or a
-  // raw base64-DER PKCS8 string — createPrivateKey handles both.
+  // Path to the Ed25519 private key. Read once, lazily. The FILE BYTES go
+  // through normalizeEd25519PrivateKey, which accepts the raw 32-byte seed that
+  // `flair agent add` writes, base64 of that seed, base64 PKCS8 DER, and PEM
+  // PKCS8 (the form `bob flair-pair` writes).
   keyFile: string;
   // Seams (tests). Production uses global fetch, Date.now, randomUUID, fs.
   fetchImpl?: FetchLike;
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  // Returns the key file's raw BYTES — the normalizer needs the byte length to
+  // tell a raw seed from text, so this seam must NOT decode to a string.
+  readFile?: (path: string) => Buffer;
 }
 
 // ─── Signing primitives (exported for reuse by the shell) ───────────────────
@@ -94,20 +98,19 @@ export interface FlairHttpClientOptions {
 // A second hand-rolled copy is how the tsMs-in-seconds 1000x defect called out
 // at the top of this file gets reintroduced somewhere else.
 
-// Parse an on-disk Flair private key into a node KeyObject. createPrivateKey is
-// forgiving about input shape: a PEM PKCS8 string (what `bob onboard` writes —
-// `-----BEGIN PRIVATE KEY-----`) is parsed directly, while a raw base64-DER
-// PKCS8 string (the alternate flair convention) is decoded from base64 into DER
-// first. webcrypto's subtle.importKey("pkcs8", …) throws a DataError on the PEM
-// form, which is the bug this replaces.
+// Parse an on-disk Flair private key into a node KeyObject. `bytes` are the raw
+// file CONTENT and `path` is used only to name the file in an error. All shape
+// handling lives in normalizeEd25519PrivateKey (raw 32-byte seed, base64 of the
+// seed, base64 PKCS8 DER, PEM PKCS8); this only re-parses the DER it returns.
 //
 // SECURITY: takes the key MATERIAL, returns an opaque KeyObject. It never
 // stringifies, logs or returns the input.
-export function loadFlairPrivateKey(keyFileContents: string): KeyObject {
-  const raw = keyFileContents.trim();
-  return raw.includes("-----BEGIN")
-    ? createPrivateKey(raw)
-    : createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+export function loadFlairPrivateKey(bytes: Buffer, path: string): KeyObject {
+  return createPrivateKey({
+    key: normalizeEd25519PrivateKey(bytes, path),
+    format: "der",
+    type: "pkcs8",
+  });
 }
 
 // Build the `Authorization: TPS-Ed25519 …` header for one request. tsMs is in
@@ -137,7 +140,7 @@ export class FlairHttpClient implements FlairClient {
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
   private readonly uuid: () => string;
-  private readonly readFile: (path: string) => string;
+  private readonly readFile: (path: string) => Buffer;
   // Parsed once; reused across requests.
   private keyObject?: KeyObject;
 
@@ -157,7 +160,7 @@ export class FlairHttpClient implements FlairClient {
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
-    this.readFile = opts.readFile ?? ((p) => readFileSync(p, "utf8"));
+    this.readFile = opts.readFile ?? ((p) => readFileSync(p));
   }
 
   // Parse the on-disk private key into a node KeyObject. See
@@ -165,7 +168,7 @@ export class FlairHttpClient implements FlairClient {
   // this only adds per-instance caching.
   private loadKey(): KeyObject {
     if (!this.keyObject) {
-      this.keyObject = loadFlairPrivateKey(this.readFile(this.keyFile));
+      this.keyObject = loadFlairPrivateKey(this.readFile(this.keyFile), this.keyFile);
     }
     return this.keyObject;
   }

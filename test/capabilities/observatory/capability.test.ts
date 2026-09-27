@@ -467,7 +467,7 @@ describe("ObservatoryHttpClient protocol + OFFICE-key Ed25519 signing", () => {
       fetchImpl,
       now: () => FIXED_NOW,
       uuid: () => "nonce-abc",
-      readFile: () => pkcs8b64,
+      readFile: () => Buffer.from(pkcs8b64),
     });
     return { client, captured, verifyKey: kp.publicKey };
   }
@@ -546,7 +546,7 @@ describe("ObservatoryHttpClient protocol + OFFICE-key Ed25519 signing", () => {
       uuid: () => "n",
       readFile: (p) => {
         readPath = p;
-        return pkcs8b64;
+        return Buffer.from(pkcs8b64);
       },
     });
     await client.post({ agents: [], events: [] });
@@ -570,7 +570,7 @@ describe("ObservatoryHttpClient protocol + OFFICE-key Ed25519 signing", () => {
       }),
       now: () => 1,
       uuid: () => "n",
-      readFile: () => pkcs8b64,
+      readFile: () => Buffer.from(pkcs8b64),
     });
     await expect(client.post({ agents: [], events: [] })).rejects.toThrow("429");
   });

@@ -201,7 +201,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
       fetchImpl,
       now: () => 1_700_000_000_000, // fixed ms timestamp
       uuid: () => "nonce-abc",
-      readFile: () => pkcs8b64,
+      readFile: () => Buffer.from(pkcs8b64),
     });
     return { client, captured, verifyKey: kp.publicKey };
   }
@@ -265,7 +265,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
       uuid: () => "n",
       readFile: (p) => {
         readPath = p;
-        return pkcs8b64;
+        return Buffer.from(pkcs8b64);
       },
     });
     await client.get("x");
@@ -296,7 +296,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
       },
       now: () => 1_700_000_000_000,
       uuid: () => "nonce-pem",
-      readFile: () => privPem, // the PEM the cap-flair client used to choke on
+      readFile: () => Buffer.from(privPem), // the PEM the cap-flair client used to choke on
     });
 
     // Before the fix this throws ("Invalid keyData") instead of signing.
@@ -337,7 +337,7 @@ describe("FlairHttpClient — record ids are unique per write (bob#180 round 4)"
         let i = 0;
         return () => `u${++i}`;
       })(),
-      readFile: () => pkcs8,
+      readFile: () => Buffer.from(pkcs8),
     });
     const a = await client.write("the audit record", { id: "orgevent-evt-1" });
     const b = await client.write("the memory it audits");
@@ -375,7 +375,7 @@ describe("FlairHttpClient — record ids are unique per write (bob#180 round 4)"
             text: async () => body ?? "{}",
           };
         },
-        readFile: () => pkcs8,
+        readFile: () => Buffer.from(pkcs8),
       });
     const a = mk();
     const b = mk(); // a second "process"

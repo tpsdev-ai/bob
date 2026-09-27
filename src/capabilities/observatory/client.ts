@@ -26,6 +26,7 @@
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { normalizeEd25519PrivateKey } from "../../lib/ed25519-key.js";
 import { sanitize } from "./sanitize.js";
 import type { AgentStatus, OrgEventRecord } from "./snapshot.js";
 
@@ -60,13 +61,17 @@ type FetchLike = (
 export interface ObservatoryHttpClientOptions {
   url: string;
   officeId: string;
-  // Path to the base64-PKCS8 OFFICE Ed25519 private key. Read once, lazily.
+  // Path to the OFFICE Ed25519 private key. Read once, lazily. The FILE BYTES go
+  // through normalizeEd25519PrivateKey (raw 32-byte seed, base64 of the seed,
+  // base64 PKCS8 DER, or PEM PKCS8), then the PKCS8 DER is imported.
   officeKeyFile: string;
   // Seams (tests). Production uses global fetch, Date.now, randomUUID, fs.
   fetchImpl?: FetchLike;
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  // Returns the key file's raw BYTES — the normalizer needs the byte length to
+  // tell a raw seed from text, so this seam must NOT decode to a string.
+  readFile?: (path: string) => Buffer;
 }
 
 export class ObservatoryHttpClient implements ObservatoryClient {
@@ -76,7 +81,7 @@ export class ObservatoryHttpClient implements ObservatoryClient {
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
   private readonly uuid: () => string;
-  private readonly readFile: (path: string) => string;
+  private readonly readFile: (path: string) => Buffer;
   // Imported once; reused across requests.
   private keyPromise?: Promise<webcrypto.CryptoKey>;
 
@@ -96,19 +101,17 @@ export class ObservatoryHttpClient implements ObservatoryClient {
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
-    this.readFile = opts.readFile ?? ((p) => readFileSync(p, "utf8"));
+    this.readFile = opts.readFile ?? ((p) => readFileSync(p));
   }
 
   private loadKey(): Promise<webcrypto.CryptoKey> {
     if (!this.keyPromise) {
-      const b64 = this.readFile(this.officeKeyFile).trim();
-      this.keyPromise = subtle.importKey(
-        "pkcs8",
-        Buffer.from(b64, "base64"),
-        { name: "Ed25519" },
-        false,
-        ["sign"],
-      );
+      const der = normalizeEd25519PrivateKey(this.readFile(this.officeKeyFile), this.officeKeyFile);
+      // Copy into a plain Uint8Array: subtle.importKey's BufferSource needs an
+      // ArrayBuffer-backed view, and node's Buffer is ArrayBufferLike-typed.
+      this.keyPromise = subtle.importKey("pkcs8", new Uint8Array(der), { name: "Ed25519" }, false, [
+        "sign",
+      ]);
     }
     return this.keyPromise;
   }

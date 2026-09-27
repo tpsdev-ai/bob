@@ -444,14 +444,14 @@ export async function checkFlairRegistration(args: {
   fetchImpl?: FlairFetch;
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  readFile?: (path: string) => Buffer;
 }): Promise<{ state: RegistrationState; detail?: string }> {
   if (!AGENT_NAME.test(args.name)) {
     throw new Error(`invalid agent name: ${args.name} (must match ${AGENT_NAME})`);
   }
   const base = args.flairUrl.replace(/\/+$/, "");
   const path = `/Agent/${encodeURIComponent(args.name)}`;
-  const readFile = args.readFile ?? ((p: string) => readFileSync(p, "utf8"));
+  const readFile = args.readFile ?? ((p: string) => readFileSync(p));
   const keyFile = args.keyFile.startsWith("~/")
     ? join(homedir(), args.keyFile.slice(2))
     : args.keyFile;
@@ -460,7 +460,7 @@ export async function checkFlairRegistration(args: {
   try {
     authorization = tpsEd25519AuthHeader({
       agentId: args.name,
-      key: loadFlairPrivateKey(readFile(keyFile)),
+      key: loadFlairPrivateKey(readFile(keyFile), keyFile),
       method: "GET",
       path,
       tsMs: (args.now ?? Date.now)(),
@@ -504,7 +504,7 @@ export async function verifyRegisteredWithFlair(args: {
   fetchImpl?: FlairFetch;
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  readFile?: (path: string) => Buffer;
 }): Promise<FlairRegistration> {
   const { state, detail } = await checkFlairRegistration(args);
   if (state === "registered") {

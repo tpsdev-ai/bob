@@ -50,7 +50,7 @@ export interface ProvisionFlairIdentityOptions {
   fetchImpl?: FlairFetch;
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  readFile?: (path: string) => Buffer;
   writeFile?: (path: string, contents: string) => void;
   warn?: (message: string) => void;
 }
