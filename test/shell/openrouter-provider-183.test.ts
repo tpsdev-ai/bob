@@ -939,7 +939,10 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
       // The stub stands in for the OpenRouter URL: rewrite the canonical URL to
       // the local 302 endpoint, so the wrapper's URL check still sees openrouter.ai.
       const base = ((url: unknown, init?: unknown) =>
-        fetch(String(url).replace(OPENROUTER_BASE_URL, `http://127.0.0.1:${stub.port}`), init as RequestInit)) as typeof globalThis.fetch;
+        fetch(
+          String(url).replace(OPENROUTER_BASE_URL, `http://127.0.0.1:${stub.port}`),
+          init as RequestInit,
+        )) as typeof globalThis.fetch;
       const f = guardedOpenrouterFetch(OPENROUTER_BASE_URL, base);
       const err: any = await f(`${OPENROUTER_BASE_URL}/chat/completions`, {
         headers: { authorization: `Bearer ${KEY}` },

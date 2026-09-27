@@ -115,8 +115,8 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // Operator symptom of the fallback: after a refresh() that breaks composition
 // pi's built-in openrouter provider is effective and has no key, so a turn
 // fails with an auth error while the operator's key is valid — check first
-// whether a .pi-agent/models.json entry or an extension re-registered
-// openrouter.
+// whether a .pi-agent/models.json entry defines openrouter (an extension
+// cannot: the registration guard refuses it).
 
 /** The one endpoint bob's transport sends to. (A refresh fallback can replace the effective provider; see above.) */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -184,7 +184,10 @@ export function guardedOpenrouterFetch(
         ),
       );
     }
-    return baseFetch(parsed.href, { ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}), redirect: "error" } as never).catch((err: unknown) => {
+    return baseFetch(parsed.href, {
+      ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
+      redirect: "error",
+    } as never).catch((err: unknown) => {
       // bob#192: refuse to FOLLOW a redirect with the key. `redirect: "error"`
       // (set above, overriding any caller value) makes the runtime reject a 3xx
       // instead of following it. Re-throw that as a bob error that NAMES the
