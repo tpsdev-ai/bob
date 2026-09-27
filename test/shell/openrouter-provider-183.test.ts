@@ -21,7 +21,7 @@ import { runAlign } from "../../src/shell/align.js";
 import { initAgent } from "../../src/shell/init.js";
 import { runOnboard } from "../../src/shell/onboard.js";
 import { runPersistent } from "../../src/shell/persistent.js";
-import { createPiRunSession, resolveRunConfig, runAgent, runLaunch } from "../../src/shell/run.js";
+import { createPiRunSession, runAgent, runLaunch } from "../../src/shell/run.js";
 import {
   assertNoOnDiskOpenrouter,
   assertOpenrouterRuntimeUnchanged,
