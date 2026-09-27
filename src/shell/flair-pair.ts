@@ -122,8 +122,8 @@ export function flairPair(opts: FlairPairOptions): FlairPairResult {
   };
 }
 
-// bob#191: read a file's bytes, or null when it does not exist. One syscall,
-// no separate existence check to race against.
+// bob#191: read a file's bytes, or null when it does not exist. One read
+// attempt, with no separate existence check to race against.
 function readIfPresent(path: string): Buffer | null {
   try {
     return readFileSync(path);
