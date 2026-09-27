@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>tpsdev-ai/flair//.github/renovate-preset"],
+  "packageRules": [
+    {
+      "description": "bob pins the pi runtime (@earendil-works/pi-coding-agent and @earendil-works/pi-ai) at exactly 0.84.3 on purpose: bob builds on its ModelRuntime seam, and a pi upgrade is a deliberate, spec'd PR with its own review, never a Renovate bump.",
+      "matchPackageNames": ["@earendil-works/pi-coding-agent", "@earendil-works/pi-ai"],
+      "enabled": false
+    }
+  ]
+}
