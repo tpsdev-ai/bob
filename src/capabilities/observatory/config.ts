@@ -3,7 +3,7 @@
 // SECURITY (Sherlock will scrutinize this file):
 //   * The OFFICE PRIVATE KEY is NEVER inlined in config and NEVER read from an
 //     env var. Config carries a *file path* (`officeKeyFile`); the key is read
-//     from that file by the client at startup, held in memory, and never logged,
+//     from that file by the client on first use, held in memory, and never logged,
 //     echoed, or returned in a tool result / error. See client.ts.
 //   * The capability talks ONLY to the configured `observatoryUrl` and signs
 //     every POST as `officeId` with the OFFICE key — it cannot act as another
@@ -89,7 +89,7 @@ export const CONFIG_SCHEMA = Type.Object(
     }),
     // Path to the OFFICE Ed25519 private key. FOUR shapes are accepted: the raw
     // 32-byte seed, base64 of that seed, base64 PKCS8 DER, or PEM PKCS8. The key
-    // is read as bytes from here at startup; it is never in config/env/logs.
+    // is read as bytes from here on first use; it is never in config/env/logs.
     // NOTE: this is the OFFICE key, distinct from any agent's Flair key.
     officeKeyFile: Type.String({
       minLength: 1,

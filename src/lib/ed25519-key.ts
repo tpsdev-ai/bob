@@ -2,9 +2,10 @@
 // actually occur in the wild. Flair's OWN tooling (`flair agent add`,
 // `flair agent rotate-key`) writes a RAW 32-byte binary seed — no PEM armor, no
 // base64, no PKCS8 wrapper — while bob's `flair-pair` path writes PEM PKCS8 and
-// some operators have base64-wrapped either the seed or the DER. Every one of
-// these used to reach node:crypto as a UTF-8 STRING and only two shapes worked,
-// so a Flair-made key failed at signing time with
+// some operators have base64-wrapped either the seed or the DER. bob read key
+// files as UTF-8 text: the Flair client parsed PEM or decoded base64 DER, and the
+// observatory imported decoded DER, so only those shapes worked and a Flair-made
+// raw-seed key failed at signing time with
 // "error:0680008E:asn1 encoding routines::not enough data". This module turns
 // ALL of them into one canonical thing: PKCS8 DER bytes.
 //
@@ -74,9 +75,10 @@ export function normalizeEd25519PrivateKey(bytes: Buffer, path: string): Buffer 
     }
   }
 
-  // Verify: it must PARSE as a private key AND be Ed25519. This is the single
-  // gate that rejects a 31-byte file, a text file of garbage, an RSA/EC key,
-  // and a truncated base64 blob — all the same way, with the same message.
+  // Verify: it must PARSE as a private key AND be Ed25519. Shape validation
+  // above and this parse/type check all call refuse() with the same message, so
+  // a 31-byte file, garbage text, an RSA/EC key and a truncated or malformed
+  // base64 blob are refused the same way.
   let type: string | undefined;
   try {
     type = createPrivateKey({ key: der, format: "der", type: "pkcs8" }).asymmetricKeyType;

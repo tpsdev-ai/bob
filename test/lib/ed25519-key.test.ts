@@ -115,7 +115,7 @@ describe("normalizeEd25519PrivateKey (bob#142)", () => {
       expect(message).toContain(`(${size} bytes)`); // assertion: the byte count is named
       expect(message).toContain("raw 32-byte seed"); // assertion: the accepted shapes are named
       expect(message).not.toContain(seedB64); // assertion: never the reference key
-      // …and never THIS input's own bytes in any encoding.
+      // …and never THIS input's own bytes in base64 or hex.
       if (c.bytes.length > 0) {
         expect(message).not.toContain(c.bytes.toString("base64"));
         expect(message).not.toContain(c.bytes.toString("hex"));
