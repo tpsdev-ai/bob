@@ -417,28 +417,28 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
- * Read the key ONCE per runtime factory: read it, then DELETE it from
- * process.env so pi's built-in openrouter provider (which reads
- * OPENROUTER_API_KEY from process.env) has nothing to send. The value then lives
- * in the factory's closure and the transport closure built from it. Callers that can be invoked more than once
+ * Read the key, then DELETE it from process.env so pi's built-in openrouter
+ * provider (which reads OPENROUTER_API_KEY from process.env) has nothing to
+ * send. The runtime factory calls this once and keeps the value in its closure
+ * and in the transport closure built from it. Callers that can be invoked more than once
  * (the session factory, for /new and /resume) must cache the result themselves
  * rather than call this again — the environment no longer carries it.
  */
-// Whether a session factory in this process has already read and deleted the key
-// (a boolean, never the key). A later read that finds the variable empty gets a
+// Whether takeOpenrouterApiKey() has already read and deleted the key in this
+// process (a boolean, never the key). A later call that finds the variable empty gets a
 // precise refusal instead of the misleading "not set". The key itself is
 // deliberately NOT cached at module scope: an exported cache would let any
 // importer of this module read it.
 let openrouterKeyConsumed = false;
 
-/** True once a session factory in this process has read and deleted OPENROUTER_API_KEY. */
+/** True once takeOpenrouterApiKey() has read and deleted OPENROUTER_API_KEY in this process. */
 export function openrouterKeyWasConsumed(): boolean {
   return openrouterKeyConsumed;
 }
 
-/** The refusal for a key read that finds OPENROUTER_API_KEY empty after an earlier read consumed it. */
+/** The refusal when OPENROUTER_API_KEY is empty after an earlier takeOpenrouterApiKey() read in this process. */
 export const OPENROUTER_KEY_CONSUMED_MESSAGE =
-  "bob: OPENROUTER_API_KEY was already read and deleted from the environment by an earlier openrouter session factory in this process, and is not set now; bob does not share one factory's key with another. Remedy: start a new bob process to build another openrouter runtime.";
+  "bob: OPENROUTER_API_KEY was already read and deleted from the environment earlier in this process, and is not set now. Remedy: start a new bob process to build another openrouter runtime.";
 
 export function takeOpenrouterApiKey(): string {
   if (openrouterKeyConsumed && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {

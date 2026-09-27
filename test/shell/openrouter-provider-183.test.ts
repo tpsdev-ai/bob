@@ -467,7 +467,7 @@ describe("openrouter provider (bob#183 round 3)", () => {
       return { created, runner };
     };
 
-    // (i) EMPTY KEY on the factory's first invocation → refused before the initial session.
+    // (i) EMPTY KEY → the entry paths refuse it before creating the initial session.
     delete process.env.OPENROUTER_API_KEY;
     {
       const { created, factory } = persistentFactory();
@@ -926,7 +926,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
 
   it('(r6) a second key READ in the same process, with the variable now empty, refuses with the consumed-key message, not "not set"', async () => {
     process.env.OPENROUTER_API_KEY = KEY;
-    takeOpenrouterApiKey(); // the first runtime reads and deletes it
+    takeOpenrouterApiKey(); // a first key read deletes it from the environment
     expect(process.env.OPENROUTER_API_KEY).toBeUndefined();
     expect(openrouterKeyWasConsumed()).toBe(true);
     // A second read refuses with the consumed-key message, not with "not set".
