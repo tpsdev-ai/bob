@@ -923,11 +923,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
   // (round 8, item 4) pi calls this factory AGAIN for `/new`, `/resume`, `/fork`,
-  // `/clone` and `/import` (agent-session-runtime.js), and the key is consumed
-  // INSIDE each invocation — so a second invocation must NOT re-read the
-  // environment (the first deleted it, and a re-read would refuse). Read it ONCE
-  // into this closure, which outlives a single factory invocation, and never
-  // touch process.env for the key again.
+  // `/clone` and `/import` (agent-session-runtime.js). The factory consumes the
+  // key ONCE, when an invocation first reaches takeOpenrouterApiKey(), into this
+  // closure, which outlives a single factory invocation; later invocations reuse
+  // it and this factory never re-reads process.env for the key (the first read
+  // deleted it, and a re-read would refuse).
   let openrouterKey: string | undefined;
   return async ({ sessionManager }) => {
     // PIN the agent's own identity + directory. A resumed or imported session
@@ -961,7 +961,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // capability, extension or tool subprocess starts (pi's ModelRuntime is
       // already created by then) — so pi's
       // BUILT-IN openrouter provider (which reads the key from process.env) has
-      // nothing to send, and nothing in bob reads it from process.env afterwards.
+      // nothing to send, and this factory never reads it from process.env again.
       // Later invocations (replacement sessions: /new, /resume) reuse the value
       // read here and NEVER re-read the environment. Fail-closed on unset/empty is
       // unchanged.

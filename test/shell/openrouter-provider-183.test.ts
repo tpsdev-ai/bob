@@ -850,7 +850,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     }
   });
 
-  it("(t3) pi's auth, registered provider config and model data hold the placeholder, never the key", async () => {
+  it("(t3) pi's auth and registered provider config hold the placeholder, and none of auth, provider config or model data holds the key", async () => {
     scaffold("or6t3");
     process.env.OPENROUTER_API_KEY = KEY;
     const spy = spyRegisterProviderCapture();
