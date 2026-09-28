@@ -13,7 +13,7 @@ describe("role-loader", () => {
     expect(t.tools.allow).toContain("flair_search");
   });
 
-  it.each(["writer", "reviewer", "coder", "qa", "custom"] as const)(
+  it.each(["writer", "reviewer", "coder", "qa", "builder-local", "custom"] as const)(
     "loads the %s role template",
     (role) => {
       const t = loadRole(role);
@@ -25,6 +25,23 @@ describe("role-loader", () => {
       expect(t.tools.allow).toContain("flair_search");
     },
   );
+
+  it("builder-local holds the anchored tools + shell and NO read/edit/write", () => {
+    const t = loadRole("builder-local");
+    // The four anchored tools that replace whole-file editing.
+    for (const tool of ["read_lines", "edit_lines", "insert_after", "write_file"]) {
+      expect(t.tools.allow, tool).toContain(tool);
+    }
+    // The shell + browsing tools it keeps, and Flair memory.
+    for (const tool of ["bash", "grep", "find", "ls", "flair_search"]) {
+      expect(t.tools.allow, tool).toContain(tool);
+    }
+    // NO whole-file edit/write tools — the point of the role.
+    for (const tool of ["read", "edit", "write"]) {
+      expect(t.tools.allow, tool).not.toContain(tool);
+    }
+    expect(t.tools.allowResidentShell).toBe(true);
+  });
 
   it("throws on unknown role", () => {
     // @ts-expect-error — intentionally bad role

@@ -69,6 +69,21 @@ describe("blessed catalog", () => {
     expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/observatory");
   });
 
+  it("blesses the anchored-edit capability as implemented", () => {
+    const entry = lookupCapability("anchored-edit");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("anchored-edit");
+    expect(entry?.manifest.provides?.tools).toEqual([
+      "read_lines",
+      "edit_lines",
+      "insert_after",
+      "write_file",
+    ]);
+    expect(entry?.manifest.provides?.serves).toBe(false);
+    expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/anchored-edit");
+  });
+
   it("lists the still-planned capabilities as not-yet-implemented", () => {
     for (const name of ["mail", "heartbeat"]) {
       const entry = lookupCapability(name);

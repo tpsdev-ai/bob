@@ -17,6 +17,7 @@
 // the same object the extension re-validates at load.
 
 import { Type } from "typebox";
+import { anchoredEditManifest } from "../capabilities/anchored-edit/manifest.js";
 import { discordManifest } from "../capabilities/discord/manifest.js";
 import { fixtureManifest } from "../capabilities/fixture/manifest.js";
 import { flairManifest } from "../capabilities/flair/manifest.js";
@@ -49,6 +50,7 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   // mechanism production uses.
   fixture: { manifest: fixtureManifest },
   discord: { manifest: discordManifest },
+  "anchored-edit": { manifest: anchoredEditManifest },
   flair: { manifest: flairManifest },
   observatory: { manifest: observatoryManifest },
   reachy: { manifest: reachyManifest },
