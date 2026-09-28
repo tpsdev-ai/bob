@@ -1,7 +1,16 @@
 // An edit must keep the target file's permission bits (the capability promises that
 // only the affected byte span changes).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fingerprintOf } from "../../../src/capabilities/anchored-edit/core.js";
 import { type Harness, makeHarness } from "./helpers.js";
@@ -42,4 +51,39 @@ describe("anchored-edit keeps permission bits", () => {
       expect(readFileSync(join(h.root, "f.sh"), "utf8")).toBe("echo one\necho TWO\necho three\n");
     });
   }
+});
+
+describe("anchored-edit leaves no temp file when a step before the rename fails", () => {
+  it("a rename that fails (the target became a non-empty directory mid-write) is refused and cleaned up", async () => {
+    let replaced = false;
+    const harness = makeHarness({
+      writeChunk: (fd, data) => {
+        const n = writeSync(fd, data);
+        if (!replaced) {
+          replaced = true;
+          // Replace the target with a non-empty directory, so renaming the temp over it fails.
+          const f = join(harness.root, "f.txt");
+          rmSync(f);
+          mkdirSync(f);
+          writeFileSync(join(f, "keep"), "x");
+        }
+        return n;
+      },
+    });
+    try {
+      writeFileSync(join(harness.root, "f.txt"), "one\ntwo\n");
+      const res = await harness.call("edit_lines", {
+        path: "f.txt",
+        from: harness.anchor("f.txt", 2),
+        to: harness.anchor("f.txt", 2),
+        new_text: "TWO",
+        fingerprint: `F#${fingerprintOf(readFileSync(join(harness.root, "f.txt")))}`,
+      });
+      expect(res.text).toMatch(/REFUSED/);
+      expect(replaced).toBe(true);
+      expect(readdirSync(harness.root).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      harness.cleanup();
+    }
+  });
 });

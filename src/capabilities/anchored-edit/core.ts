@@ -558,6 +558,9 @@ export class AnchoredEditSession {
   // Fingerprint last seen for each canonical path (from read_lines/edit/write).
   private readonly readFingerprints = new Map<string, string>();
   private readonly budgets = new Map<string, Budget>();
+  // Permission bits of each verified file, taken from fstat on the descriptor that
+  // read it, so an edit's rename keeps exactly those bits.
+  private readonly verifiedModes = new Map<string, number>();
   private readonly locks = new Map<string, Promise<void>>();
   // The trusted canonical root, pinned ONCE per session from pi's first tool
   // execution context. A later replacement of the root path (a swapped symlink,
@@ -688,9 +691,11 @@ export class AnchoredEditSession {
       );
     }
     try {
-      if (!fstatSync(fd).isFile()) {
+      const st = fstatSync(fd);
+      if (!st.isFile()) {
         throw new Refusal(`refusing to read "${p}": it is not a regular file.`);
       }
+      this.verifiedModes.set(t.canonical, st.mode & 0o7777);
       const chunks: Buffer[] = [];
       const buf = Buffer.alloc(65536);
       let read = 0;
@@ -724,6 +729,10 @@ export class AnchoredEditSession {
   // and its I/O is the documented, unguarded race.
   private writeVerified(t: ResolvedTarget, p: string, data: Buffer): void {
     this.verifyParent(t, p);
+    const mode = this.verifiedModes.get(t.canonical);
+    if (mode === undefined) {
+      throw new Refusal(`refusing to edit "${p}": it was not read through the verified path.`);
+    }
     const tmp = join(
       t.parentReal,
       `.${t.base}.anchored-edit.${randomBytes(6).toString("hex")}.tmp`,
@@ -736,33 +745,50 @@ export class AnchoredEditSession {
         `refusing to edit "${p}": could not create a working file in its directory.`,
       );
     }
+    // Every failure before the rename leaves no temp file behind.
+    let open = true;
+    let renamed = false;
     try {
-      this.writeAllBytes(fd, data);
-    } catch {
-      closeSync(fd);
       try {
-        unlinkSync(tmp);
+        this.writeAllBytes(fd, data);
       } catch {
-        /* best effort */
+        throw new Refusal(`refusing to edit "${p}": the write failed and was cleaned up.`);
       }
-      throw new Refusal(`refusing to edit "${p}": the write failed and was cleaned up.`);
-    }
-    // Keep the target's permission bits: the temp was created 0600, and the rename would
-    // otherwise replace the file's mode (an executable would lose its exec bit).
-    try {
-      fchmodSync(fd, lstatSync(t.canonical).mode & 0o7777);
-    } catch {
-      closeSync(fd);
+      // Keep the verified file's permission bits: the temp was created 0600, and the
+      // rename would otherwise replace the file's mode (an executable would lose its
+      // exec bit).
       try {
-        unlinkSync(tmp);
+        fchmodSync(fd, mode);
       } catch {
-        /* best effort */
+        throw new Refusal(`refusing to edit "${p}": could not keep the file's permissions.`);
       }
-      throw new Refusal(`refusing to edit "${p}": could not keep the file's permissions.`);
+      open = false;
+      closeSync(fd);
+      this.verifyParent(t, p);
+      try {
+        renameSync(tmp, t.canonical);
+      } catch {
+        throw new Refusal(
+          `refusing to edit "${p}": it could not be replaced (it changed while it was being edited).`,
+        );
+      }
+      renamed = true;
+    } finally {
+      if (open) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* best effort */
+        }
+      }
+      if (!renamed) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* best effort */
+        }
+      }
     }
-    closeSync(fd);
-    this.verifyParent(t, p);
-    renameSync(tmp, t.canonical);
   }
 
   private budgetFor(canonical: string, size: number): Budget {
