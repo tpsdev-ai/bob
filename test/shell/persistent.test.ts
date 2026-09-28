@@ -274,4 +274,19 @@ describe("runPersistent / startPersistent", () => {
     expect(exited).toBe(0);
     expect(fake.disposed()).toBe(true);
   });
+
+  it("shutdown closes admission before any later turn can start", async () => {
+    const fake = fakeWarmSession();
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => fake.session,
+      log: () => {},
+    });
+    await handle.shutdown();
+    await expect(handle.admitTurn({ kind: "cron", job: "late" }, "late")).rejects.toThrow(
+      "admission is closed",
+    );
+    expect(fake.prompts).toEqual([]);
+  });
 });

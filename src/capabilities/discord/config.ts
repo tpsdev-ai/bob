@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { ORIGIN_FIELD_LIMITS } from "../../shell/origin-limits.js";
 
 // Env var the Bob loader sets to the JSON-encoded resolved config block. Holds
 // config only (paths, channel ids, flags) — never the token itself.
@@ -41,10 +42,13 @@ export const CONFIG_SCHEMA = Type.Object(
     }),
     // Allow-list of channel IDs the bot listens on and may post to. Required,
     // non-empty — the trust boundary. Snowflake-shaped (digits) entries only.
-    channelIds: Type.Array(Type.String({ pattern: "^[0-9]+$" }), {
-      minItems: 1,
-      description: "Allow-listed Discord channel IDs (the trust boundary).",
-    }),
+    channelIds: Type.Array(
+      Type.String({ pattern: "^[0-9]+$", maxLength: ORIGIN_FIELD_LIMITS.discordChannelId }),
+      {
+        minItems: 1,
+        description: "Allow-listed Discord channel IDs (the trust boundary).",
+      },
+    ),
     // The bot's own user ID, used for mention detection + self-message skipping.
     // Optional: discord.js resolves it from the gateway READY event if unset.
     botUserId: Type.Optional(

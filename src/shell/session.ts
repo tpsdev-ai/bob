@@ -57,6 +57,7 @@ import {
   createContractGuardExtension,
 } from "./system-prompt-contract.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
+import { admissionEventBus } from "./turn-admission.js";
 
 // pi does not export DefaultResourceLoaderOptions at the package root, so
 // derive the loader-option shape from the class: cwd/agentDir/settingsManager
@@ -645,6 +646,7 @@ export function isolatedSettings(): SettingsManager {
 export function isolatedLoaderOptions(
   config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir"> & {
     contractBlock?: string;
+    turnAdmission?: RunSessionConfig["turnAdmission"];
   },
   extra?: { guard?: InlineExtension },
 ): LoaderOptions {
@@ -654,6 +656,7 @@ export function isolatedLoaderOptions(
     // noExtensions the loader uses exactly these (temporary CLI scope) and
     // nothing else.
     additionalExtensionPaths: [...config.extensionSources],
+    ...(config.turnAdmission ? { eventBus: admissionEventBus(config.turnAdmission) } : {}),
     // No ambient discovery of anything.
     noExtensions: true,
     noSkills: true,

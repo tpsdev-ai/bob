@@ -41,6 +41,12 @@ describe("MailConsumer", () => {
     );
   });
 
+  it("rejects an agent name beyond the origin limit", () => {
+    expect(() => new MailConsumer({ name: "a".repeat(65), inboxRoot: tmpInbox })).toThrow(
+      /64 characters/,
+    );
+  });
+
   it("processes a new mail message and moves it to cur/", async () => {
     const seen: MailMessage[] = [];
     writeMail("msg1", "hello");

@@ -823,6 +823,76 @@ describe("positions (bob#195) — 3. boot refusals for an ungranted role / capab
     writeFileSync(bobYamlPath("boot1"), good);
     expect(() => resolve("boot1")).not.toThrow();
   });
+
+  it("treats presence as a catalog capability subject to position and grant maxima", async () => {
+    await hireBuilder("presence-denied");
+    const deniedYaml = readFileSync(bobYamlPath("presence-denied"), "utf8");
+    writeFileSync(
+      bobYamlPath("presence-denied"),
+      deniedYaml.replace("capabilities:\n", "capabilities:\n  - presence\n"),
+    );
+    expect(() => resolve("presence-denied")).toThrow(/presence.*position does not permit/);
+
+    candidate("presence-position", {
+      version: "1.0.0",
+      role: "coder",
+      tools: ["read"],
+      capabilities: { permitted: ["presence"], default: [] },
+      files: [{ path: "soul.md", kind: "soul" }],
+    });
+    await hireAgent({
+      name: "presence-allowed",
+      positionName: "presence-position",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: s.positionsRoot,
+      skipFlair: true,
+      interview: noopInterview,
+    });
+    const allowedYaml = readFileSync(bobYamlPath("presence-allowed"), "utf8");
+    writeFileSync(
+      bobYamlPath("presence-allowed"),
+      allowedYaml.replace("capabilities:\n", "capabilities:\n  - presence\n") +
+        "\npresence:\n  url: http://127.0.0.1:9\n  agentId: presence-allowed\n  keyFile: /dev/null\n",
+    );
+    const granted = resolveRunConfig({
+      name: "presence-allowed",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: s.positionsRoot,
+      persistent: true,
+    });
+    expect(granted.config.extensionSources).toHaveLength(1);
+    expect(granted.config.extensionSources[0]).toEndWith("/dist/capabilities/presence/index.js");
+    expect(granted.config.capabilityEnv.BOB_CAP_PRESENCE).toContain('"agentId":"presence-allowed"');
+
+    writeFileSync(
+      join(overridesDir(join(s.agentsRoot, "presence-allowed")), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: ["presence"] }, files: [] })}\n`,
+    );
+    const narrowed = resolveRunConfig({
+      name: "presence-allowed",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: s.positionsRoot,
+      persistent: true,
+    });
+    expect(narrowed.config.extensionSources).toEqual([]);
+    expect(narrowed.config.capabilityEnv.BOB_CAP_PRESENCE).toBeUndefined();
+
+    const grant = readGrant(s.hostRoot, "presence-allowed");
+    if (!grant) throw new Error("no grant");
+    writeGrant(s.hostRoot, { ...grant, maxCapabilities: [] });
+    expect(() =>
+      resolveRunConfig({
+        name: "presence-allowed",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: s.positionsRoot,
+        persistent: true,
+      }),
+    ).toThrow(/maxCapabilities.*presence/);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -86,6 +86,9 @@ are later slices, and a manifest that declares one is REFUSED until it loads).
 `builder-local` (bob#185) ships as a **role**; a `builder-local` position over it is a
 later slice.
 
+Presence follows the same capability rule: a bound agent can request it only if
+its position permits it and the host grant covers it.
+
 The trust layers, from the top down:
 
 1. **Role** — `roles/<role>/role.json` ships with bob and is the tool ceiling.
@@ -158,6 +161,13 @@ the performance review, full jarvis and new comms. Slice 1 loads only positions
 shipped under bob's own `positions/` directory, referenced by a single top-level
 name — a bare name or the `path:<name>` spelling — after realpath confinement to
 that directory.
+
+## Turn origins
+
+Turn origin fields have these limits: mail agent names and cron job names are at
+most 64 characters; Discord channel IDs are at most 20 digits. Cron names use
+lowercase letters, digits, hyphens or underscores. Over-limit origins are
+refused before a turn starts rather than silently relabelled as `run`.
 
 ## Operator guarantees, and the tests that pin them
 

@@ -17,6 +17,7 @@
 // tool result, or placed in the session transcript.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getTurnAdmission } from "../../shell/turn-admission.js";
 import { wireDiscordCapability } from "./capability.js";
 import { loadConfigFromEnv, readToken } from "./config.js";
 import { DiscordJsClient } from "./discord-js-client.js";
@@ -35,6 +36,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     pi: pi as unknown as Parameters<typeof wireDiscordCapability>[0]["pi"],
     client,
     config,
+    admitTurn: getTurnAdmission(pi)?.admitTurn,
   });
 
   // Open the gateway (inbound listener) ONLY in the persistent runtime. A

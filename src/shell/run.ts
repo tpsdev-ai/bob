@@ -62,6 +62,8 @@ import {
   type SessionDeps,
 } from "./session.js";
 import { resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
+import type { TurnAdmission } from "./turn-admission.js";
+import { originValidationError } from "./turn-origin.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -498,6 +500,8 @@ export interface RunSessionConfig {
   // one-shot `bob run` stays minimal (outbound tools, no gateway). Defaults
   // falsy (ephemeral run).
   persistent?: boolean;
+  // Owned by startPersistent; capabilities obtain it from the loader service.
+  turnAdmission?: TurnAdmission;
   // The tool policy resolved from bob.yaml's `tools:` block + top-level
   // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
   // `tools` is pi's STRICT allowlist and is REQUIRED: the type says so, and
@@ -1147,7 +1151,11 @@ function parseCron(yamlText: string): CronEntry[] {
         typeof e.prompt === "string" &&
         e.prompt.length > 0,
     )
-    .map((e) => ({ name: e.name, schedule: e.schedule, prompt: e.prompt }));
+    .map((e) => {
+      const reason = originValidationError({ kind: "cron", job: e.name });
+      if (reason) throw new Error(`bob: invalid cron entry name: ${reason}`);
+      return { name: e.name, schedule: e.schedule, prompt: e.prompt };
+    });
 }
 
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
