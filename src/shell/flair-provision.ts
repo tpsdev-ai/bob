@@ -11,16 +11,13 @@
 // CLI subcommand cannot be tested without a subprocess:
 //
 //   1. register the Agent record   (admin credential; writes)
-//   2. mirror the soul             (agent's own key; requires 1)
+//   2. mirror the soul             (operator Basic auth; requires 1)
 //
 // Step 2 physically cannot run first: pushSoulToFlair takes a
 // FlairRegistration, and the only producers of one are step 1's
 // registerWithFlair and its read-only sibling verifyRegisteredWithFlair. That
-// is deliberate. Flair attributes a Soul row to the SIGNING identity and
-// refuses a signature it cannot resolve to an Agent record, so a soul write in
-// front of registration is not merely out of order — it is a 401 that would
-// have to be reported as a warning and ignored, which is how #93 and #94 were
-// born in the first place.
+// is deliberate. The divergence read and align verification use the agent's
+// key; the writes use the operator credential only in this setup path.
 
 import { basename } from "node:path";
 import {
@@ -39,13 +36,14 @@ export interface ProvisionFlairIdentityOptions {
   flairUrl: string;
   // Public key from flairPair(), base64 raw Ed25519.
   publicKeyBase64: string;
-  // Path to the agent's private key — used to SIGN the soul write as the agent.
+  // Path to the agent's private key for signed verification and divergence reads.
   keyFile: string;
   // Absolute path to the agent's soul.md.
   soulPath: string;
   // Overrides / seams.
   opsUrl?: string;
   adminPassFile?: string;
+  adminUser?: string;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: FlairFetch;
   now?: () => number;
@@ -72,6 +70,7 @@ export async function provisionFlairIdentity(
     flairUrl: opts.flairUrl,
     opsUrl: opts.opsUrl,
     adminPassFile: opts.adminPassFile,
+    adminUser: opts.adminUser,
     keyPath: opts.keyFile,
     env: opts.env,
     fetchImpl: opts.fetchImpl,
@@ -82,13 +81,13 @@ export async function provisionFlairIdentity(
 }
 
 export interface SyncFlairSoulOptions
-  extends Omit<ProvisionFlairIdentityOptions, "publicKeyBase64" | "opsUrl" | "adminPassFile"> {
+  extends Omit<ProvisionFlairIdentityOptions, "publicKeyBase64" | "opsUrl"> {
   publicKeyBase64?: string;
 }
 
 // Align path: the persona changed but the identity already exists. VERIFY
-// registration (signed with the agent's own key — no admin credential needed,
-// and `bob align` should not require one) and then mirror.
+// registration (signed with the agent's own key), then mirror with the
+// operator password file.
 //
 // Verification is not skippable here. Writing a soul for an identity Flair
 // does not know produces a 401 whose only honest handling is to fail, so bob
@@ -115,6 +114,8 @@ function soulOptions(opts: SyncFlairSoulOptions): PushSoulOptions {
     displayName: opts.displayName ?? capitalize(opts.name),
     role: opts.role,
     keyFile: opts.keyFile,
+    adminPassFile: opts.adminPassFile,
+    adminUser: opts.adminUser,
     fetchImpl: opts.fetchImpl as PushSoulOptions["fetchImpl"],
     now: opts.now,
     uuid: opts.uuid,

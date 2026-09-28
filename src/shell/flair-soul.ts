@@ -33,17 +33,14 @@
 //     and re-apply. A local edit reaches Flair on the next onboard/align, not
 //     before, and bob says so.
 //
-// Ordering: every function here takes a FlairRegistration (see flair-pair.ts).
-// That is not decoration. Flair's Soul.put() attributes the row to the SIGNING
-// identity and rejects a body whose agentId does not match, so an unregistered
-// agent's soul write is refused as unknown_agent. Requiring the token makes the
-// dependency structural — a soul write cannot be spelled without a completed
-// registration in front of it.
+// Ordering: every push takes a FlairRegistration (see flair-pair.ts). Onboard
+// registers the agent first; align verifies it first. Soul writes use the
+// operator's credential, while the divergence read uses the agent's key.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { FlairHttpClient } from "../capabilities/flair/client.js";
-import type { FlairRegistration } from "./flair-pair.js";
+import { adminPassPath, type FlairRegistration, flairOperatorBasicAuth } from "./flair-pair.js";
 
 // Soul keys bob owns. Anything else in an agent's soul (set by hand, by
 // `flair soul set`, or promoted from a memory candidate) is left alone —
@@ -77,9 +74,12 @@ export interface PushSoulOptions {
   displayName?: string;
   // Role for the `role` entry (e.g. "ea"). Omitted → not written.
   role?: string;
-  // Path to the agent's Ed25519 private key — the soul write is signed AS the
-  // agent, so this is the agent's own key, never an admin credential.
+  // Path to the agent's Ed25519 private key, used for the divergence read.
   keyFile: string;
+  // Operator credential file for Soul writes. Defaults to ~/.flair/admin-pass.
+  adminPassFile?: string;
+  // Harper's Basic admin username. Defaults to the same "admin" used for registration.
+  adminUser?: string;
   // Seams (tests).
   fetchImpl?: ConstructorParameters<typeof FlairHttpClient>[0]["fetchImpl"];
   now?: () => number;
@@ -141,21 +141,68 @@ export async function pushSoulToFlair(
     );
   }
 
+  // Read only in this local provisioning call, after the divergence check.
+  // Never put the credential in an agent session, config, environment or log.
+  const adminPassFile = adminPassPath(opts.adminPassFile);
+  let adminPass: string;
+  try {
+    adminPass = readFileSync(adminPassFile, "utf8").trim();
+  } catch {
+    throw new Error(
+      `cannot write Flair soul for '${registration.agentId}': operator password file ${adminPassFile} could not be read. ` +
+        `Run 'flair init' or provide --admin-pass-file <path> to a readable admin-pass file (mode 0600), then re-run onboard/align.`,
+    );
+  }
+  if (!adminPass) {
+    throw new Error(
+      `cannot write Flair soul for '${registration.agentId}': operator password file ${adminPassFile} is empty. ` +
+        `Run 'flair init' or provide --admin-pass-file <path> to a nonempty admin-pass file (mode 0600), then re-run onboard/align.`,
+    );
+  }
+  const authorization = flairOperatorBasicAuth(adminPass, opts.adminUser);
+  const doFetch =
+    opts.fetchImpl ??
+    ((u: string, i: { method: string; headers: Record<string, string>; body?: string }) =>
+      fetch(u, i));
+  const base = registration.flairUrl.replace(/\/+$/, "");
+  const soulSet = async (key: string, value: string): Promise<string> => {
+    const id = `${registration.agentId}:${key}`;
+    const res = await doFetch(`${base}/Soul/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id,
+        agentId: registration.agentId,
+        key,
+        value,
+        durability: "permanent",
+        createdAt: new Date((opts.now ?? Date.now)()).toISOString(),
+      }),
+    });
+    if (!res.ok) {
+      // The server's response could echo a header. Never print it or the secret.
+      throw new Error(
+        `flair Soul PUT ${id} -> ${res.status}: operator write failed; check ${adminPassFile} and the target Flair instance.`,
+      );
+    }
+    return id;
+  };
+
   const entries: SoulEntryResult[] = [];
   // Identity keys first, persona last: if the run dies partway, the cheap
   // facts that make an agent findable (name, role) are already in place.
   if (opts.displayName) {
     entries.push({
       key: SOUL_KEY_NAME,
-      id: (await client.soulSet(SOUL_KEY_NAME, opts.displayName)).id,
+      id: await soulSet(SOUL_KEY_NAME, opts.displayName),
     });
   }
   if (opts.role) {
-    entries.push({ key: SOUL_KEY_ROLE, id: (await client.soulSet(SOUL_KEY_ROLE, opts.role)).id });
+    entries.push({ key: SOUL_KEY_ROLE, id: await soulSet(SOUL_KEY_ROLE, opts.role) });
   }
   entries.push({
     key: SOUL_KEY_PERSONA,
-    id: (await client.soulSet(SOUL_KEY_PERSONA, persona)).id,
+    id: await soulSet(SOUL_KEY_PERSONA, persona),
   });
 
   return { agentId: registration.agentId, entries, diverged, backupPath };

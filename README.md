@@ -37,11 +37,13 @@ in the agent's `.pi-agent/models.json`.
 
 ### Flair identity, and where the soul lives
 
-Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Bob reads it from `FLAIR_ADMIN_PASS` in the environment, or from the `0600` `~/.flair/admin-pass` file `flair init` writes — **never from a command-line flag**, because argv is world-readable and lands in shell history. If neither is available, `bob onboard` fails with the exact fix rather than leaving a keypair on disk with no identity behind it. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points it at a hub instead of the local spoke.
+Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Registration reads `FLAIR_ADMIN_PASS` or the `0600` `~/.flair/admin-pass` file `flair init` writes. Soul writes by `bob onboard` and `bob align` use operator Basic auth and read **only that file**, at each push; an environment password alone cannot authorize the Soul step. `--admin-pass-file <path>` overrides the file path and `--admin-user <user>` overrides the default `admin` username for these setup commands. Never pass the password value as a command-line flag, since argv is world-readable and lands in shell history. A missing file stops the Soul push with a path and remedy. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points it at a hub instead of the local spoke.
 
 The persona is mirrored **one way: `soul.md` → Flair**, at the points where bob is already authoring one (`bob onboard`, `bob align`). Flair is the source of truth for *consumers* — it's what `bootstrap` returns, what travels to another machine running that identity, and what federates. `soul.md` is the source of truth for *authoring* — the hiring interview and your editor both write it, and the launcher reads it locally so a Flair outage can never boot a persona-less agent. Launch itself never syncs, in either direction.
 
 If the two diverge (you edited `soul.md` after onboarding, or something else wrote the soul), the local file wins — loudly and losslessly: bob saves Flair's copy to `soul.flair.bak.md` next to `soul.md` and warns, naming both. Nothing is resolved silently.
+
+The divergence read remains signed with the agent's key. Only local onboarding and alignment use the operator password file for the Soul PUT. The `flair_*` runtime tools and self-improvement proposals receive no operator credential and cannot write a Soul entry.
 
 ## What's wired
 

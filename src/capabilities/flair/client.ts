@@ -91,10 +91,9 @@ export interface FlairHttpClientOptions {
 
 // ─── Signing primitives (exported for reuse by the shell) ───────────────────
 //
-// Bob signs Flair requests from TWO places: this capability (the agent's own
-// memory tools at runtime) and the shell's provisioning path (registering the
-// identity + mirroring the soul during `bob onboard` / `bob align`). Both use
-// the SAME protocol, so the protocol lives in exactly one pair of functions.
+// Bob signs Flair requests from this capability (the agent's memory tools at
+// runtime) and the shell's read-only registration and Soul checks. Soul writes
+// in onboard/align use operator Basic auth through the shell provisioning path.
 // A second hand-rolled copy is how the tsMs-in-seconds 1000x defect called out
 // at the top of this file gets reintroduced somewhere else.
 
@@ -273,9 +272,9 @@ export class FlairHttpClient implements FlairClient {
   //
   // Soul rows are keyed `<agentId>:<key>` and are written by PUT on that id —
   // the Soul table resource has no collection POST, so a bare `POST /Soul`
-  // 405s (flair#498). Body carries agentId because flair's Soul.put()
-  // validates it against the SIGNING identity and rejects a mismatch, so this
-  // can only ever write the signing agent's own soul.
+  // 405s (flair#498). Current Flair refuses this agent-signed write with
+  // soul_write_requires_operator. Provisioning uses a separate shell-only
+  // operator write; no runtime tool calls this method.
   //
   // Durability defaults to `permanent` server-side: a soul entry is identity,
   // not working memory, and must not age out of bootstrap.

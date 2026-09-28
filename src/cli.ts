@@ -50,12 +50,14 @@ Commands:
                       into the agent's Flair soul.
                       Flags: --role <r> --provider <p> --model <m>
                              --flair-url <u> --no-flair
+                             --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
   align <name>        Recurring check-in to refine an existing agent. The session
                       runs on the agent's own bob.yaml provider + model (the same
                       pair 'bob run' uses); --provider / --model override just the
                       field each names. Mirrors the revised persona into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
+                             --admin-pass-file <path> --admin-user <user>
                              --no-flair
   run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
                       that stays up, loading bob.yaml capabilities (discord
@@ -81,7 +83,9 @@ Roles: ea | jarvis | writer | reviewer | coder | qa | builder-local | custom
 
 Flair: onboarding registers the agent as a Flair principal, which needs an admin
 credential for the target instance — FLAIR_ADMIN_PASS in the environment, or the
-0600 ~/.flair/admin-pass file 'flair init' writes. Never pass it as a flag. Use
+0600 ~/.flair/admin-pass file 'flair init' writes. Soul writes by onboard/align
+always read that file. --admin-pass-file overrides its path; never pass the
+password itself as a flag. Use
 --no-flair to scaffold an agent with no Flair identity at all.`);
 }
 
@@ -100,6 +104,8 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   // scaffold without an identity is to say so.
   const noFlair = boolFlag(flags, "no-flair");
   const flairUrl = stringFlag(flags, "flair-url") ?? DEFAULT_FLAIR_URL;
+  const adminPassFile = stringFlag(flags, "admin-pass-file");
+  const adminUser = stringFlag(flags, "admin-user");
 
   if (dryRun) {
     const template = loadRole(role);
@@ -132,9 +138,8 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
   for (const f of result.files) console.log(`  ${f}`);
 
   // Identity BEFORE persona (#93 then #94). Both are part of "onboarded" —
-  // a keypair with no Agent record is a scaffold, not an agent, and the soul
-  // write is signed as that identity so it cannot precede it.
-  await provisionOnboard(result, { name, role, flairUrl, noFlair });
+  // a keypair with no Agent record is a scaffold, not an agent.
+  await provisionOnboard(result, { name, role, flairUrl, noFlair, adminPassFile, adminUser });
 
   if (noInteractive) {
     console.log(`\nSkipped interview (--no-interactive). Edit ~/agents/${name}/soul.md by hand,`);
@@ -170,6 +175,8 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
         flairUrl: result.flairConfig.url,
         keyFile: result.flairConfig.keyPath,
         soulPath: outcome.soulPath,
+        adminPassFile,
+        adminUser,
       });
       console.log(`[bob onboard] Flair soul updated with the interviewed persona`);
       console.log(describeProvisioning(again));
@@ -185,7 +192,14 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
 // the --no-flair branch is the only way past it.
 async function provisionOnboard(
   result: InitResult,
-  opts: { name: string; role: string; flairUrl: string; noFlair: boolean },
+  opts: {
+    name: string;
+    role: string;
+    flairUrl: string;
+    noFlair: boolean;
+    adminPassFile?: string;
+    adminUser?: string;
+  },
 ): Promise<void> {
   if (opts.noFlair) {
     console.log(
@@ -211,6 +225,8 @@ async function provisionOnboard(
     publicKeyBase64: result.flair.publicKeyBase64,
     keyFile: result.flairConfig.keyPath,
     soulPath: join(result.agentDir, "soul.md"),
+    adminPassFile: opts.adminPassFile,
+    adminUser: opts.adminUser,
   });
   console.log(describeProvisioning(provisioned));
 }
@@ -226,6 +242,8 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // Read every flag BEFORE the session starts: the check-in can rewrite
   // soul.md, so a bad --no-flair spelling must fail here, not after it.
   const noFlair = boolFlag(flags, "no-flair");
+  const adminPassFile = stringFlag(flags, "admin-pass-file");
+  const adminUser = stringFlag(flags, "admin-user");
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -246,8 +264,8 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // Mirror local → Flair whether or not the interview changed anything: an
   // unchanged soul.md can still differ from Flair (someone edited the file by
   // hand since the last align), and that divergence is the case worth
-  // surfacing. syncFlairSoul verifies registration first — no admin
-  // credential required, because align only ever writes the agent's own soul.
+  // surfacing. syncFlairSoul verifies registration first, then uses the
+  // operator password file for the Soul write.
   if (noFlair) return;
   const flair = readFlairBlock(agentDir);
   const synced = await syncFlairSoul({
@@ -256,6 +274,8 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
     flairUrl: flair.url,
     keyFile: flair.keyFile,
     soulPath: outcome.soulPath,
+    adminPassFile,
+    adminUser,
   });
   console.log(describeProvisioning(synced));
 }

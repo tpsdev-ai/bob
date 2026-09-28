@@ -1,5 +1,5 @@
 // Flair identity — generate an Ed25519 keypair for the agent and register it
-// as a Flair Agent record, so the agent's signed memory/soul requests verify.
+// as a Flair Agent record, so the agent's signed reads and memory requests verify.
 //
 // Keys live at:
 //   ~/.flair/keys/<name>.key   (private, chmod 0600)
@@ -9,10 +9,10 @@
 //   flairPair()              — filesystem only, sync, no network, no creds.
 //   registerWithFlair()      — seeds the Agent record. Needs ADMIN creds.
 //   verifyRegisteredWithFlair() — read-only check signed with the agent's OWN
-//                              key. No admin creds. Used by `bob align`.
+//                              key. Used by `bob align` before operator writes.
 //
-// SECURITY: the admin password is read from a file path or an env var, held
-// only long enough to build one Basic header, and never logged, echoed, or
+// SECURITY: registration's admin password is read from a file path or an env
+// var, held only long enough to build one Basic header, and never logged, echoed, or
 // placed in an error message or in argv. Every error here names the env var or
 // the FILE PATH, never a value.
 
@@ -237,7 +237,7 @@ export class FlairAdminCredentialError extends Error {
         "",
         "Flair's Agent table is admin-only to write, so onboarding cannot register the",
         "identity without one. Until the record exists the agent's Ed25519-signed memory",
-        "and soul requests are rejected as unknown_agent.",
+        "requests are rejected as unknown_agent.",
         "",
         "Provide one of:",
         `  - ${ADMIN_PASS_ENV} in the environment (never as a command-line flag — argv is`,
@@ -288,6 +288,12 @@ export function adminPassPath(override?: string): string {
   return override ?? join(homedir(), ".flair", "admin-pass");
 }
 
+// Harper's default super_user is "admin". Keep the Basic identity shared by
+// Agent registration and the shell-only Soul writer.
+export function flairOperatorBasicAuth(password: string, user = "admin"): string {
+  return `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
+}
+
 // ─── Agent registration ─────────────────────────────────────────────────────
 
 // What happened to the Agent record. Reported, never inferred by the caller.
@@ -326,6 +332,7 @@ export interface RegisterWithFlairArgs {
   flairUrl: string;
   opsUrl?: string;
   adminPassFile?: string;
+  adminUser?: string;
   // Path to the agent's private key. Named only in the missing-credential
   // message so the operator knows what is already done; never read here.
   keyPath?: string;
@@ -360,7 +367,7 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
       args.keyPath ?? join(homedir(), ".flair", "keys", `${args.name}.key`),
     );
   }
-  const post = opsPoster(opsUrl, adminPass, args.fetchImpl);
+  const post = opsPoster(opsUrl, args.adminUser ?? "admin", adminPass, args.fetchImpl);
   const now = args.now ?? (() => Date.now());
 
   const existing = await readAgentRecord(post, args.name);
@@ -409,12 +416,16 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
 
 type OpsPoster = (body: Record<string, unknown>) => Promise<unknown>;
 
-function opsPoster(opsUrl: string, adminPass: string, fetchImpl?: FlairFetch): OpsPoster {
+function opsPoster(
+  opsUrl: string,
+  adminUser: string,
+  adminPass: string,
+  fetchImpl?: FlairFetch,
+): OpsPoster {
   const doFetch: FlairFetch =
     fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FlairFetch>);
-  // Built once, from a value that is never stored anywhere else and never
-  // rendered. `admin` is Harper's super_user, matching flair's DEFAULT_ADMIN_USER.
-  const authorization = `Basic ${Buffer.from(`admin:${adminPass}`).toString("base64")}`;
+  // Built once for this registration call; never rendered in output.
+  const authorization = flairOperatorBasicAuth(adminPass, adminUser);
   return async (body) => {
     const res = await doFetch(`${opsUrl}/`, {
       method: "POST",
@@ -578,8 +589,7 @@ export async function checkFlairRegistration(args: {
 }
 
 // Same check, but yields the FlairRegistration token a soul write requires —
-// or throws. Used by `bob align`, which has the agent's own key but no admin
-// credential and so cannot (and must not need to) create anything.
+// or throws. Used by `bob align` before its operator-authorized Soul write.
 export async function verifyRegisteredWithFlair(args: {
   name: string;
   flairUrl: string;
@@ -597,8 +607,7 @@ export async function verifyRegisteredWithFlair(args: {
   if (state === "not-registered") {
     throw new Error(
       `Flair agent '${args.name}' is not registered at ${args.flairUrl}${because}. ` +
-        `Its soul cannot be written until it is — Flair attributes a soul entry from the ` +
-        `SIGNING identity and rejects an unknown one. Fix with: bob onboard ${args.name} --force ` +
+        `Its soul cannot be written until it is registered. Fix with: bob onboard ${args.name} --force ` +
         `(idempotent), or: flair agent add ${args.name}`,
     );
   }

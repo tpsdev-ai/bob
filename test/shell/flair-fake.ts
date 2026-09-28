@@ -41,6 +41,10 @@ export interface FakeFlairOptions {
   unknownAgentIs401?: boolean;
   // Force every ops-API call to this status (for failure-path tests).
   opsStatus?: number;
+  // Soul PUT enforces flair#1537: agent signatures are refused; only this
+  // operator Basic credential is accepted. GET still accepts agent signatures.
+  adminPassword?: string;
+  adminUser?: string;
 }
 
 export interface FakeFlair {
@@ -135,13 +139,12 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       const id = decodeURIComponent(soulMatch[1]);
       const signerId = signingAgentId(init.headers);
       if (init.method === "PUT") {
-        // Mirror Soul.put()'s enforceWriteAuth: the row is attributed to the
-        // SIGNING identity and a body claiming another agent is refused.
-        if (!signerId) return reply(401, { error: "authentication required" });
-        if (!agents[signerId]) return reply(401, { error: "unknown_agent" });
-        if (body?.agentId !== signerId) {
-          return reply(403, { error: "forbidden: agentId must match authenticated agent" });
-        }
+        const expected = `Basic ${Buffer.from(`${opts.adminUser ?? "admin"}:${opts.adminPassword ?? "placeholder-not-a-real-admin-credential"}`).toString("base64")}`;
+        if (init.headers.Authorization !== expected)
+          return reply(403, { error: "soul_write_requires_operator" });
+        if (!agents[String(body?.agentId)]) return reply(404, { error: "unknown_agent" });
+        if (id !== `${String(body?.agentId)}:${String(body?.key)}`)
+          return reply(400, { error: "soul id mismatch" });
         souls[id] = String(body?.value ?? "");
         return reply(200, { id });
       }

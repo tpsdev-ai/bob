@@ -63,14 +63,14 @@ describe("bob CLI", () => {
     expect(out).toContain("Agent record + soul at http://hub.example:19926");
   });
 
-  it("help documents the admin credential channel — and that it is never a flag", () => {
+  it("help documents the admin credential file without accepting a password value flag", () => {
     const out = spawnNode([CLI, "help"]);
     expect(out).toContain("FLAIR_ADMIN_PASS");
-    expect(out).toContain("Never pass it as a flag");
+    expect(out).toContain("never pass the");
+    expect(out).toContain("--admin-pass-file");
     expect(out).toContain("--no-flair");
-    // There must be no --admin-pass flag to find: a credential in argv is
-    // world-readable and lands in shell history.
-    expect(out).not.toContain("--admin-pass");
+    // A file path is okay in argv; the password value is not.
+    expect(out).not.toMatch(/--admin-pass(?:\s|=|$)/m);
   });
 
   it("onboard --no-interactive renders the plan with interview SKIPPED", () => {
