@@ -43,6 +43,11 @@ describe("loadConfigFromEnv", () => {
     expect(() => loadConfigFromEnv(env)).toThrow(/config is invalid/);
   });
 
+  it("rejects a channel id beyond the admission limit", () => {
+    const env = { [CONFIG_ENV_VAR]: JSON.stringify({ ...valid, channelIds: ["1".repeat(21)] }) };
+    expect(() => loadConfigFromEnv(env)).toThrow(/config is invalid/);
+  });
+
   it("rejects an inlined token field (additionalProperties: false)", () => {
     // A token MUST NOT be carried in config; the schema is closed so a stray
     // `token` field is a hard validation failure rather than a silent leak.

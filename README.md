@@ -72,6 +72,8 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
+Turn origin fields have these limits: mail agent names and cron job names are at most 64 characters; Discord channel IDs are at most 20 digits. Cron names use lowercase letters, digits, hyphens or underscores. Over-limit origins are refused before a turn starts rather than silently relabelled as `run`.
+
 ## Operator guarantees, and the tests that pin them
 
 Each guarantee below is enforced in one place and pinned by a test. If you
@@ -460,6 +462,10 @@ consumer. For each file in `new/`, oldest first by filename:
   reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`, then
   moves the mail to `cur/`; a re-delivery with that marker is acked without a
   second reply.
+- **Presence.** A mail turn is not reflected in the presence roster: it runs
+  in its own process, outside the warm session and its turn admission, so it
+  neither beats busy nor writes a turn summary. The liveness beacon is
+  unaffected.
 - **Failures.** A failed or timed-out turn, an unreachable Flair, or a failed
   send leaves the mail in `new/`, counted and logged, and it is retried with
   backoff. Delivery is at-least-once: only a crash between the CLI's success and

@@ -204,6 +204,19 @@ describe("accepting mail (§2)", () => {
       /invalid agent name/,
     );
   });
+
+  it("rejects an agent name beyond the shared origin limit (bob#147 ORIGIN_FIELD_LIMITS.mailFrom)", () => {
+    expect(
+      () =>
+        new MailConsumer({
+          name: "a".repeat(65),
+          identity: "testbot",
+          inboxRoot: inbox,
+          senders: ["flint"],
+          resolveKey: keyResolver({}),
+        }),
+    ).toThrow(/64 characters/);
+  });
 });
 
 describe("one turn per accepted mail, and the reply (§1, §5)", () => {

@@ -72,6 +72,7 @@ import {
   tpsCliReplySender,
 } from "../capabilities/tps-mail/reply.js";
 import { readBlock } from "./bob-yaml.js";
+import { ORIGIN_FIELD_LIMITS } from "./origin-limits.js";
 
 // A maildir record as TPS writes it. Every field is an unsigned claim; the
 // consumer trusts only the verified inner envelope (envelope.ts).
@@ -316,6 +317,9 @@ export class MailConsumer {
   constructor(opts: MailConsumerOptions) {
     if (!AGENT_NAME.test(opts.name)) {
       throw new Error(`invalid agent name: ${opts.name} (must match ${AGENT_NAME})`);
+    }
+    if (opts.name.length > ORIGIN_FIELD_LIMITS.mailFrom) {
+      throw new Error(`invalid agent name: exceeds ${ORIGIN_FIELD_LIMITS.mailFrom} characters`);
     }
     if (!TPS_AGENT_ID.test(opts.identity)) {
       throw new Error(`tps-mail: invalid agent identity ${JSON.stringify(opts.identity)}`);

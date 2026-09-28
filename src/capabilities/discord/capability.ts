@@ -11,14 +11,15 @@
 //   2. An after_provider_response hook that surfaces 429s (per spec §3/§7).
 //   3. An inbound gateway listener: on a message that passes the channel
 //      allow-list + (optionally) mention filter, strip the bot @-mention and
-//      pi.sendUserMessage(cleaned) to drive the agent. The agent's reply goes
-//      back out via the discord_reply tool.
+//      call bob's admitTurn(origin, cleaned). Route its returned final text
+//      back to that inbound message's channel.
 //   4. A typing-indicator heartbeat spanning that turn, so the channel shows
 //      "<bot> is typing…" for as long as the agent is actually working (see
 //      typing.ts for why it has to repeat).
 
 import { type TSchema, Type } from "typebox";
 import type { DiscordClient, DiscordMessage } from "../../shell/discord-types.js";
+import type { TurnAdmission } from "../../shell/turn-admission.js";
 import { cleanContent } from "./clean.js";
 import type { DiscordCapabilityConfig } from "./config.js";
 import { createTypingHeartbeat } from "./typing.js";
@@ -39,12 +40,6 @@ export interface AssistantMessageLike {
 // so tests pass a tiny fake and the real ExtensionAPI satisfies it. Keeping it
 // minimal also documents exactly which pi primitives the capability touches.
 //
-// REPLY ROUTING (PR4): the listener correlates an inbound Discord message with
-// the turn it drives by remembering the originating channel at inject time and
-// consuming it on `agent_end` (fired once per prompt, carrying that prompt's
-// messages). The final assistant text is posted back to the originating channel
-// — deterministic, not dependent on the LLM choosing discord_reply with the
-// right channel id. So PiLike additionally needs the `agent_end` event.
 export interface PiLike {
   registerTool(tool: {
     name: string;
@@ -60,11 +55,6 @@ export interface PiLike {
     event: "after_provider_response",
     handler: (event: { status: number; headers: Record<string, string> }) => void,
   ): void;
-  on(
-    event: "agent_end",
-    handler: (event: { messages: AssistantMessageLike[] }) => void | Promise<void>,
-  ): void;
-  sendUserMessage(content: string): void;
 }
 
 // Discord caps a single message at 2000 chars; we trim defensively below that.
@@ -106,6 +96,8 @@ export interface WiredCapability {
 }
 
 export interface WireOptions {
+  // Required for inbound service; a one-shot run only registers outbound tools.
+  admitTurn?: TurnAdmission["admitTurn"];
   pi: PiLike;
   client: DiscordClient;
   config: DiscordCapabilityConfig;
@@ -262,93 +254,50 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     }
   });
 
-  // --- Reply routing (PR4) ----------------------------------------------
-  // The originating context for the turn currently being driven by an inbound
-  // Discord message: which channel to post the reply back to, and the inbound
-  // message id to quote-reply to. The persistent session processes one prompt
-  // at a time and `agent_end` fires once per prompt, so a single pending
-  // pointer (set when we inject, consumed on agent_end) is the correct
-  // correlation — no per-message id matching needed, and it can't be steered by
-  // a later inbound message because sendUserMessage on a busy session is queued.
-  let pending: { channelId: string; replyTo: string } | undefined;
-
-  // "The agent is thinking" affordance for the same window: started when we
-  // inject the prompt, stopped when the turn ends. See typing.ts for why a
-  // one-shot call doesn't work.
-  const typing = createTypingHeartbeat({
-    client,
-    intervalMs: opts.typingIntervalMs,
-    maxMs: opts.typingMaxMs,
-    log,
-  });
-
-  // On agent turn completion, post the assistant's final text back to the
-  // channel the inbound message came from. This is the DETERMINISTIC reply path
-  // — it does not rely on the LLM calling discord_reply with the right channel.
-  // If the turn wasn't driven by an inbound Discord message (e.g. a heartbeat
-  // tick or a cron prompt), `pending` is undefined and we post nothing.
-  pi.on("agent_end", async (event) => {
-    const target = pending;
-    pending = undefined; // consume regardless, so a silent turn can't leak into the next
-    try {
-      if (!target) return;
-      const text = finalAssistantText(event.messages);
-      if (text.length === 0) return; // nothing to say (e.g. the agent only ran tools)
-      const trimmed =
-        text.length <= DISCORD_MAX_REPLY_CHARS
-          ? text
-          : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
-      try {
-        await client.reply(target.channelId, trimmed, { replyTo: target.replyTo });
-      } catch (err) {
-        // A failed post must not crash the persistent session — log + continue.
-        // The error from discord.js names the cause, never the token.
-        const reason = err instanceof Error ? err.message : "reply failed";
-        log(`discord: failed to post reply to ${target.channelId}: ${reason}`);
-      }
-    } finally {
-      // The turn is over on EVERY path out of here — the reply landed, there was
-      // nothing to say, or something threw. Stop typing in a `finally` so the
-      // indicator can never outlive the work it describes; a stuck heartbeat is
-      // worse than no heartbeat.
-      typing.stop();
-    }
-  });
-
-  // --- Inbound listener -------------------------------------------------
-  // Drives the agent on an incoming Discord message. ENFORCES the channel
-  // allow-list (and mention filter unless dispatchAll) so an arbitrary user on
-  // a non-allowed channel can never steer the agent. Records the originating
-  // channel so agent_end can route the reply back to it.
+  // Each inbound request owns its reply target and typing heartbeat until its
+  // admission settles. No latest-sender slot can route a cron reply to Discord.
+  const typings = new Set<ReturnType<typeof createTypingHeartbeat>>();
   client.on("message", (msg: DiscordMessage) => {
-    if (!allowed.has(msg.channelId)) return; // trust boundary
+    if (!allowed.has(msg.channelId)) return;
     if (!config.dispatchAll && !msg.mentionsBot) return;
     const cleaned = cleanContent(msg.content);
     if (cleaned.length === 0) return;
-    // Remember where to send the reply. The most recent inbound message wins
-    // if several arrive before a turn completes — they're queued onto the same
-    // session, and the reply goes to whoever spoke last (acceptable: the agent
-    // sees the full queued context and answers the latest).
-    pending = { channelId: msg.channelId, replyTo: msg.id };
-    // Light the typing indicator BEFORE handing the prompt over: the gap this
-    // exists to fill starts at the first token of model latency, not after it.
+    const typing = createTypingHeartbeat({
+      client,
+      intervalMs: opts.typingIntervalMs,
+      maxMs: opts.typingMaxMs,
+      log,
+    });
+    typings.add(typing);
     typing.start(msg.channelId);
-    try {
-      pi.sendUserMessage(cleaned);
-    } catch (err) {
-      // The prompt never reached the agent, so no agent_end will fire to stop
-      // the heartbeat. Clear it here rather than leaving it to the ceiling, then
-      // rethrow — swallowing an injection failure would silently drop the
-      // message.
-      pending = undefined;
-      typing.stop();
-      throw err;
-    }
+    void (async () => {
+      try {
+        if (!opts.admitTurn) throw new Error("bob turn admission is unavailable");
+        const messages = await opts.admitTurn(
+          { kind: "discord", channelId: msg.channelId },
+          cleaned,
+        );
+        const text = finalAssistantText(messages as AssistantMessageLike[]);
+        if (text.length === 0) return;
+        const trimmed =
+          text.length <= DISCORD_MAX_REPLY_CHARS
+            ? text
+            : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
+        await client.reply(msg.channelId, trimmed, { replyTo: msg.id });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "inbound turn failed";
+        log(`discord: inbound turn/reply failed for ${msg.channelId}: ${reason}`);
+      } finally {
+        typing.stop();
+        typings.delete(typing);
+      }
+    })();
   });
 
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   return {
     async start() {
+      if (!opts.admitTurn) throw new Error("discord: bob turn admission is unavailable");
       await withTimeout(
         client.connect(),
         connectTimeoutMs,
@@ -358,7 +307,8 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     async stop() {
       // Clear any live heartbeat BEFORE dropping the gateway — a shutdown must
       // not leave an interval poking a channel we're no longer connected to.
-      typing.stop();
+      for (const typing of typings) typing.stop();
+      typings.clear();
       await client.disconnect();
     },
   };

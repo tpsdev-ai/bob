@@ -5,6 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPersistent, startPersistent } from "../../src/shell/persistent.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 
 // A fake warm AgentSession. Records every prompt, tracks idle/dispose, and
 // emits canned assistant text via the documented agent_end-style flow. Lets us
@@ -274,6 +281,21 @@ describe("runPersistent / startPersistent", () => {
     expect(exited).toBe(0);
     expect(fake.disposed()).toBe(true);
   });
+
+  it("shutdown closes admission before any later turn can start", async () => {
+    const fake = fakeWarmSession();
+    const handle = await startPersistent({
+      name: "pulse",
+      agentsRoot: root,
+      sessionFactory: async () => fake.session,
+      log: () => {},
+    });
+    await handle.shutdown();
+    await expect(handle.admitTurn({ kind: "cron", job: "late" }, "late")).rejects.toThrow(
+      "admission is closed",
+    );
+    expect(fake.prompts).toEqual([]);
+  });
 });
 
 // ─── bob#200: the persistent runtime runs the tps-mail consumer ─────────────
@@ -377,6 +399,70 @@ describe("startPersistent — the tps-mail consumer", () => {
       }),
     ).rejects.toThrow(/model not found/);
     expect(existsSync(join(home, ".bob", "rocky.lock"))).toBe(false);
+  });
+
+  it("a mail turn never enters the warm session or its admission (bob#200 §1 with bob#147)", async () => {
+    const flint = testKey();
+    const inbox = join(root, "inbox");
+    writeRecord(
+      inbox,
+      "1.json",
+      mailRecord(
+        signTestEnvelope({ from: "flint", to: "rocky", body: "ping", messageId: "m1" }, flint),
+      ),
+    );
+    const fake = fakeWarmSession();
+    const turns: unknown[] = [];
+    const replies: unknown[] = [];
+    const handle = await startPersistent({
+      name: "rocky",
+      agentsRoot: root,
+      sessionFactory: async () => fake.session,
+      installSignalHandlers: false,
+      log: () => {},
+      mailHome: home,
+      mailConsumer: {
+        ...mailSeams,
+        resolveKey: keyResolver({ flint }),
+        runTurn: async (input) => {
+          turns.push(input);
+          return { kind: "final", text: "pong" };
+        },
+        sendReply: async (r) => {
+          replies.push(r);
+          return { ok: true };
+        },
+      },
+    });
+    await handle.mailConsumer?.poll();
+    expect(turns).toEqual([{ sender: "flint", messageId: "m1", body: "ping" }]);
+    expect(replies).toEqual([{ to: "flint", inReplyTo: "m1", body: "pong" }]);
+    // The warm session saw no prompt: the mail went through its own turn.
+    expect(fake.prompts).toEqual([]);
+    // The admission is still the warm session's alone, and still serves it.
+    await handle.admitTurn({ kind: "cron", job: "after-mail" }, "tick");
+    expect(fake.prompts).toEqual(["tick"]);
+    await handle.shutdown();
+    expect(existsSync(join(home, ".bob", "rocky.lock"))).toBe(false);
+  });
+
+  it("shutdown stops the mail consumer after closing the admission, then drains", async () => {
+    const fake = fakeWarmSession();
+    const handle = await startPersistent({
+      name: "rocky",
+      agentsRoot: root,
+      sessionFactory: async () => fake.session,
+      installSignalHandlers: false,
+      log: () => {},
+      mailHome: home,
+      mailConsumer: mailSeams,
+    });
+    await handle.shutdown();
+    await expect(handle.admitTurn({ kind: "cron", job: "late" }, "late")).rejects.toThrow(
+      "admission is closed",
+    );
+    expect(existsSync(join(home, ".bob", "rocky.lock"))).toBe(false);
+    expect(fake.disposed()).toBe(true);
   });
 
   it("refuses to start without the agent's Flair identity (it verifies and signs with it)", async () => {
