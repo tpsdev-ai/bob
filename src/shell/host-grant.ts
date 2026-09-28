@@ -130,11 +130,12 @@ const PRESENT_UNREADABLE_MARKER: PositionBindingMarker = {
 };
 
 // Read the binding marker. PRESENCE decides, contents never do: this returns
-// undefined ONLY when the marker's directory entry is ABSENT. Presence is
-// established with lstatSync on the entry itself, so a PRESENT marker whose read
-// then fails (a dangling symlink, unreadable permissions, a directory, invalid
-// UTF-8) is still PRESENT — that is what makes the caller refuse a missing grant
-// rather than fall back to legacy resolution. A marker that exists but is
+// undefined ONLY when the marker's directory entry is ABSENT. Directory-entry
+// presence is established with lstatSync (which does not follow a symlink, on
+// the read-ENOENT path), so a PRESENT marker whose read fails (a dangling
+// symlink, unreadable permissions, a directory, invalid UTF-8) is still PRESENT
+// — that is what makes the caller refuse a missing grant rather than fall back
+// to legacy resolution. A marker that exists but is
 // unreadable, not valid JSON, or valid-but-falsey JSON (`null`, `0`, `false`,
 // `""`, `[]`) is still PRESENT; only an absent directory entry is absent. The
 // parsed marker is returned when the content is a JSON object, so diagnostics
@@ -142,21 +143,21 @@ const PRESENT_UNREADABLE_MARKER: PositionBindingMarker = {
 // unusable".
 export function readBindingMarker(agentDir: string): PositionBindingMarker | undefined {
   const p = bindingMarkerPath(agentDir);
-  // Establish directory-entry presence WITHOUT reading: lstat does not follow a
-  // symlink, so a marker that is a symlink to a nonexistent target is present.
-  try {
-    lstatSync(p);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-    return PRESENT_UNREADABLE_MARKER;
-  }
-  // The entry is present. Any read failure still counts as present-but-unusable
-  // (the caller refuses a previously bound agent whose grant is missing).
+  // Read FIRST. An ENOENT from the READ does not prove the directory ENTRY is
+  // absent: a present marker that is a dangling symlink (or whose target is
+  // otherwise unreadable) also reads ENOENT. So on a read-ENOENT, establish
+  // directory-entry presence with lstatSync — which does NOT follow a symlink —
+  // and treat any present entry as present-but-unusable. Only an absent ENTRY is
+  // absent. (The presence check runs only AFTER the read, so there is no
+  // check-then-use file-system race; the earlier lstat-then-read ordering was
+  // flagged by CodeQL js/file-system-race.)
   let raw: string;
   try {
     raw = readFileSync(p, "utf8");
-  } catch {
-    return PRESENT_UNREADABLE_MARKER;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") return PRESENT_UNREADABLE_MARKER;
+    return entryPresent(p) ? PRESENT_UNREADABLE_MARKER : undefined;
   }
   let parsed: unknown;
   try {
@@ -168,6 +169,19 @@ export function readBindingMarker(agentDir: string): PositionBindingMarker | und
     return parsed as PositionBindingMarker;
   }
   return PRESENT_UNREADABLE_MARKER;
+}
+
+// Does the marker's directory ENTRY exist? lstatSync does not follow a symlink,
+// so a dangling symlink counts as present. Returns false ONLY for a missing
+// entry; any other lstat failure is treated as present (fail closed toward
+// "bound but unreadable").
+function entryPresent(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code !== "ENOENT";
+  }
 }
 
 export function writeBindingMarker(agentDir: string, grant: HostGrant): string {
