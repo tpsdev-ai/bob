@@ -17,11 +17,13 @@
 // the same object the extension re-validates at load.
 
 import { Type } from "typebox";
+import { anchoredEditManifest } from "../capabilities/anchored-edit/manifest.js";
 import { discordManifest } from "../capabilities/discord/manifest.js";
 import { fixtureManifest } from "../capabilities/fixture/manifest.js";
 import { flairManifest } from "../capabilities/flair/manifest.js";
 import { observatoryManifest } from "../capabilities/observatory/manifest.js";
 import { presenceManifest } from "../capabilities/presence/manifest.js";
+import { reachyManifest } from "../capabilities/reachy/manifest.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 
 // Planned capabilities whose extensions don't exist yet (later PRs). Listed so
@@ -49,11 +51,13 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   // mechanism production uses.
   fixture: { manifest: fixtureManifest },
   discord: { manifest: discordManifest },
+  "anchored-edit": { manifest: anchoredEditManifest },
   flair: { manifest: flairManifest },
   observatory: { manifest: observatoryManifest },
   // presence REPLACES the old heartbeat catalog placeholder: presence IS the
   // heartbeat — one liveness system (beacon + activity stamp + turn summary).
   presence: { manifest: presenceManifest },
+  reachy: { manifest: reachyManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
 });

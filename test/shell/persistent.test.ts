@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPersistent, startPersistent } from "../../src/shell/persistent.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
-import { setPendingOrigin, takePendingOrigin } from "../../src/shell/turn-origin-registry.js";
 
 // A fake warm AgentSession. Records every prompt, tracks idle/dispose, and
 // emits canned assistant text via the documented agent_end-style flow. Lets us
@@ -53,9 +52,23 @@ function scaffoldAgent(root: string, name: string): void {
   mkdirSync(join(dir, ".pi-agent"), { recursive: true });
   writeFileSync(
     join(dir, "bob.yaml"),
-    ["agent:", `  id: ${name}`, "provider:", "  name: anthropic", "  model: claude-x", ""].join(
-      "\n",
-    ),
+    [
+      "agent:",
+      `  id: ${name}`,
+      `  name: ${name}`,
+      // The persistent runtime resolves the tool policy like every other launch
+      // path (role.json ceiling + bob.yaml), so the fixture needs both.
+      "  role: coder",
+      "",
+      "provider:",
+      "  name: anthropic",
+      "  model: claude-x",
+      "",
+      "tools:",
+      "  allow:",
+      "    - read",
+      "",
+    ].join("\n"),
   );
 }
 
@@ -262,29 +275,18 @@ describe("runPersistent / startPersistent", () => {
     expect(fake.disposed()).toBe(true);
   });
 
-  it("shutdown clears the pending origin slot (round-4 item 2: no origin survives a restart)", async () => {
+  it("shutdown closes admission before any later turn can start", async () => {
     const fake = fakeWarmSession();
-    const factory: RunSessionFactory = async () => fake.session;
-
-    // An in-flight turn's origin is set in the registry (simulating the injector's set).
-    setPendingOrigin({ kind: "cron", job: "daily-brief" });
-
     const handle = await startPersistent({
       name: "pulse",
       agentsRoot: root,
-      sessionFactory: factory,
+      sessionFactory: async () => fake.session,
       log: () => {},
     });
-
-    // A post-start take returns the set origin (proves the slot is live).
-    expect(takePendingOrigin()).toEqual({ kind: "cron", job: "daily-brief" });
-
-    // A new in-flight turn sets another origin, then the host shuts down. The
-    // shutdown path clears the slot so it cannot survive a session restart.
-    setPendingOrigin({ kind: "mail", from: "flint" });
     await handle.shutdown();
-
-    // Post-shutdown take is run: the slot was cleared by shutdown.
-    expect(takePendingOrigin()).toEqual({ kind: "run" });
+    await expect(handle.admitTurn({ kind: "cron", job: "late" }, "late")).rejects.toThrow(
+      "admission is closed",
+    );
+    expect(fake.prompts).toEqual([]);
   });
 });

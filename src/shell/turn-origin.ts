@@ -1,19 +1,5 @@
-// Turn-origin model + human-facing label.
-//
-// The ORIGIN no longer rides inside the prompt text (round 3 removed the
-// in-prompt nonce-bearing tag grammar — the old tagPrompt / parseTurnOrigin). A
-// trusted injector records the origin OUT OF BAND in the turn-origin registry
-// (see turn-origin-registry.ts) immediately before it calls session.prompt,
-// into a single pending slot (not keyed by prompt text). It is taken back on
-// before_agent_start via takePendingOrigin. No prompt content — whatever it
-// contains, including a perfectly-formed forged tag — can ever set an origin.
-//
-// This module therefore keeps only the origin MODEL (the TurnOrigin union) and
-// the human-facing labelling (originLabel). The field character classes and
-// lengths are enforced at registration by the registry, not here.
-//
-// The consequence of a (structurally impossible) origin reaching a label is a
-// cosmetic currentTask string — never a capability, secret, or control decision.
+// Turn origins are runtime metadata, projected at admission before any await.
+// Prompt, model and tool text cannot supply an origin.
 
 export type TurnOrigin =
   | { kind: "run" }
@@ -51,4 +37,44 @@ export function originLabel(
   // knows the label was cut.
   const budget = Math.max(0, maxChars - 1);
   return `${label.slice(0, budget)}\u2026`;
+}
+
+const AGENT_JOB_RE = /^[a-z0-9-]{1,64}$/;
+// discord `channel` id: digits only, 1..20 chars (a Discord snowflake).
+const CHANNEL_ID_RE = /^[0-9]{1,20}$/;
+
+// Validate an origin's field(s) by character class AND length (round-3 item 2).
+// {kind:"run"} has no field to validate and is always valid. Anything else that
+// is not a clean token is rejected — the turn stays run.
+export function isValidOrigin(o: TurnOrigin): boolean {
+  switch (o.kind) {
+    case "run":
+      return true;
+    case "mail":
+      return AGENT_JOB_RE.test(o.from);
+    case "cron":
+      return AGENT_JOB_RE.test(o.job);
+    case "discord":
+      return CHANNEL_ID_RE.test(o.channelId);
+  }
+}
+
+// Project a caller-supplied origin down to ONLY the approved fields for its kind
+// (round-4 item 3). The caller's object may carry extra fields (e.g.
+// {kind:"cron", job:"valid", extra:"PROMPT_SECRET"}); this discards them and
+// returns a freshly-constructed TurnOrigin (never the caller's object by
+// reference), so an extra field can never reach the presence label or the turn
+// summary.
+export function approvedOrigin(o: TurnOrigin): TurnOrigin {
+  if (!isValidOrigin(o)) return { kind: "run" };
+  switch (o.kind) {
+    case "mail":
+      return { kind: "mail", from: o.from };
+    case "cron":
+      return { kind: "cron", job: o.job };
+    case "discord":
+      return { kind: "discord", channelId: o.channelId };
+    default:
+      return { kind: "run" };
+  }
 }

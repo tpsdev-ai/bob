@@ -8,10 +8,25 @@
 // PR-1 ships the type surface + role loader + a stub mail consumer.
 // PR-2 will wire the Discord bridge + cron scheduler.
 
-export type BobRole = "ea" | "writer" | "reviewer" | "coder" | "qa" | "custom";
+export type BobRole =
+  | "ea"
+  | "jarvis"
+  | "writer"
+  | "reviewer"
+  | "coder"
+  | "qa"
+  | "builder-local"
+  | "custom";
 
 export interface ProviderConfig {
-  name: "ollama-cloud" | "ollama-newton" | "exe-dev-gateway" | "anthropic" | "openai" | "omlx";
+  name:
+    | "ollama-cloud"
+    | "ollama-newton"
+    | "exe-dev-gateway"
+    | "anthropic"
+    | "openai"
+    | "openrouter"
+    | "omlx";
   model: string;
   fallbacks?: string[];
 }
@@ -52,7 +67,17 @@ export interface BobConfig {
 }
 
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
-export { BobYamlError, readBlock, readCapabilities } from "./bob-yaml.js";
+export { type Args, BOOLEAN_FLAGS, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
+export {
+  BobYamlError,
+  lineOf,
+  readAgentRole,
+  readBlock,
+  readCapabilities,
+  readResident,
+  readTools,
+  type ToolsBlock,
+} from "./bob-yaml.js";
 export type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 export { BLESSED_CATALOG, lookupCapability } from "./capability-catalog.js";
 export {
@@ -115,6 +140,8 @@ export {
   type InitOptions,
   type InitResult,
   initAgent,
+  STAMPED_CAPABILITIES,
+  stampedToolAllowlist,
 } from "./init.js";
 export {
   MailConsumer,
@@ -126,7 +153,7 @@ export {
   type OnboardOptions,
   type OnboardResult,
   runOnboard,
-  type SpawnFn,
+  type SessionRunner,
 } from "./onboard.js";
 export {
   type PersistentHandle,
@@ -136,7 +163,15 @@ export {
 } from "./persistent.js";
 export { loadRole, type RoleTemplate } from "./role-loader.js";
 export {
+  type ActiveToolSource,
+  assertAllowedToolsActive,
+  assertCapabilitiesLoaded,
   createPiRunSession,
+  type ExtensionErrorSource,
+  LaunchArgError,
+  type LaunchOptions,
+  mapBobProviderToPi,
+  parseLaunchArgs,
   type ResolvedRunConfig,
   type ResolveRunConfigOptions,
   type RunOptions,
@@ -144,8 +179,11 @@ export {
   type RunSession,
   type RunSessionConfig,
   type RunSessionFactory,
+  readAgentToolPolicy,
+  resolveAgentToolPolicy,
   resolveRunConfig,
   runAgent,
+  runLaunch,
   type SessionManagerLike,
 } from "./run.js";
 export {
@@ -170,3 +208,32 @@ export {
   systemdUnitPath,
   up,
 } from "./service.js";
+export {
+  type AuditExtensions,
+  type AuditOutcome,
+  type AuditSession,
+  auditOrExit,
+  auditToolSources,
+  createBobRuntimeFactory,
+  installSessionAudits,
+  isolatedLoaderOptions,
+  isolatedSettings,
+  promptSession,
+  runInteractiveSession,
+  SETUP_TOOL_POLICY,
+  type SessionDeps,
+} from "./session.js";
+export {
+  auditToolNames,
+  knownToolNames,
+  PI_BUILTIN_TOOLS,
+  RESIDENT_EXCLUDED_TOOLS,
+  type ResolveToolPolicyOptions,
+  type RoleToolCeiling,
+  residentDroppedTools,
+  resolveToolNames,
+  resolveToolPolicy,
+  type ToolNameAudit,
+  type ToolNameProblem,
+  type ToolPolicy,
+} from "./tool-allowlist.js";

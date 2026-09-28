@@ -9,7 +9,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type Args,
   type BobRole,
+  boolFlag,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
   down,
@@ -17,47 +19,25 @@ import {
   type InitResult,
   initAgent,
   installService,
+  LaunchArgError,
   loadRole,
+  parseArgs,
+  parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
   restart,
   runAgent,
   runAlign,
   runDoctor,
+  runLaunch,
   runOnboard,
   runPersistent,
   servicePath,
+  stringFlag,
   syncFlairSoul,
+  UsageError,
   up,
 } from "./shell/index.js";
-
-interface Args {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): Args {
-  const [command = "help", ...rest] = argv;
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < rest.length; i++) {
-    const tok = rest[i];
-    if (tok.startsWith("--")) {
-      const key = tok.slice(2);
-      const next = rest[i + 1];
-      if (!next || next.startsWith("--")) {
-        flags[key] = true;
-      } else {
-        flags[key] = next;
-        i++;
-      }
-    } else {
-      positional.push(tok);
-    }
-  }
-  return { command, positional, flags };
-}
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
@@ -71,8 +51,10 @@ Commands:
                       Flags: --role <r> --provider <p> --model <m>
                              --flair-url <u> --no-flair
                              --dry-run --force --no-interactive
-  align <name>        Recurring check-in to refine an existing agent. Mirrors
-                      the revised persona back into Flair.
+  align <name>        Recurring check-in to refine an existing agent. The session
+                      runs on the agent's own bob.yaml provider + model (the same
+                      pair 'bob run' uses); --provider / --model override just the
+                      field each names. Mirrors the revised persona into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
                              --no-flair
   run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
@@ -80,17 +62,22 @@ Commands:
                       gateway, cron). This is what the service unit runs.
   run <name> <prompt> Run ONE short-lived task (claude -p style) — minimal +
                       ephemeral, no gateway. Prints the response, exits.
-                      Flags: --model <m>  (--interactive: coming in a later PR)
+                      Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
   up <name>           Load + start the agent's service unit
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
-  doctor <name>       Health check (identity, mail, channels, provider auth)
-  office join <name>  Join an existing branch office
+  doctor <name>       Health check of the agent's setup — prints each check
+  launch <name>       The agent's session, with its resolved role tool
+                      allowlist. This is what bin/<name> runs.
+                      Takes at most ONE prompt (a multi-word one needs quotes).
+                      No prompt opens the interactive TUI. Any other argument is
+                      refused by name — a pi flag cannot be passed at all.
+                      To send a prompt that starts with "-", use: launch <name> -- --tools
   help                Show this help
 
-Roles: ea | writer | reviewer | coder | qa | custom
+Roles: ea | jarvis | writer | reviewer | coder | qa | builder-local | custom
 
 Flair: onboarding registers the agent as a Flair principal, which needs an admin
 credential for the target instance — FLAIR_ADMIN_PASS in the environment, or the
@@ -99,20 +86,20 @@ credential for the target instance — FLAIR_ADMIN_PASS in the environment, or t
 }
 
 async function onboard(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const role = (flags.role ?? "custom") as BobRole;
-  const provider = String(flags.provider ?? "ollama-cloud");
-  const model = String(flags.model ?? "kimi-k2.6");
-  const dryRun = flags["dry-run"] === true;
-  const force = flags.force === true;
-  const noInteractive = flags["no-interactive"] === true;
+  // Value flags go through stringFlag: a bare `--model`, or the empty
+  // `--model=` form, means "not given" — the default applies — never the
+  // literal id "true" or an empty id written into bob.yaml and models.json.
+  const role = (stringFlag(flags, "role") ?? "custom") as BobRole;
+  const provider = stringFlag(flags, "provider") ?? "ollama-cloud";
+  const model = stringFlag(flags, "model") ?? "kimi-k2.6";
+  const dryRun = boolFlag(flags, "dry-run");
+  const force = boolFlag(flags, "force");
+  const noInteractive = boolFlag(flags, "no-interactive");
   // --no-flair is an EXPLICIT opt-out, not a fallback. When Flair is in play
   // (the default) a missing admin credential FAILS the command; the way to
   // scaffold without an identity is to say so.
-  const noFlair = flags["no-flair"] === true;
-  const flairUrl =
-    flags["flair-url"] !== undefined && flags["flair-url"] !== true
-      ? String(flags["flair-url"])
-      : DEFAULT_FLAIR_URL;
+  const noFlair = boolFlag(flags, "no-flair");
+  const flairUrl = stringFlag(flags, "flair-url") ?? DEFAULT_FLAIR_URL;
 
   if (dryRun) {
     const template = loadRole(role);
@@ -229,9 +216,16 @@ async function provisionOnboard(
 }
 
 async function align(name: string, flags: Record<string, string | boolean>): Promise<void> {
-  const provider = String(flags.provider ?? "ollama-cloud");
-  const model = String(flags.model ?? "kimi-k2.6");
-  const agentDir = String(flags["agent-dir"] ?? `${process.env.HOME}/agents/${name}`);
+  // #155 — the check-in runs on the agent's OWN provider and model, read from
+  // its bob.yaml by runAlign. A flag replaces only the field it names, and it is
+  // read the way `bob run` and `bob install-service` read one: a bare flag (no
+  // value) means "not given", never the literal text "true".
+  const provider = stringFlag(flags, "provider");
+  const model = stringFlag(flags, "model");
+  const agentDir = stringFlag(flags, "agent-dir") ?? `${process.env.HOME}/agents/${name}`;
+  // Read every flag BEFORE the session starts: the check-in can rewrite
+  // soul.md, so a bad --no-flair spelling must fail here, not after it.
+  const noFlair = boolFlag(flags, "no-flair");
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -254,7 +248,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // hand since the last align), and that divergence is the case worth
   // surfacing. syncFlairSoul verifies registration first — no admin
   // credential required, because align only ever writes the agent's own soul.
-  if (flags["no-flair"] === true) return;
+  if (noFlair) return;
   const flair = readFlairBlock(agentDir);
   const synced = await syncFlairSoul({
     name,
@@ -294,9 +288,9 @@ async function run(
   prompt: string | undefined,
   flags: Record<string, string | boolean>,
 ): Promise<number> {
-  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  const model = stringFlag(flags, "model");
   // The interactive REPL on the SDK lands in a later phase-1 PR.
-  if (flags.interactive === true) {
+  if (boolFlag(flags, "interactive")) {
     console.error(
       "bob run: --interactive is not yet supported on the embedded-SDK path (give a task prompt for now)",
     );
@@ -333,11 +327,8 @@ async function installServiceCmd(
 ): Promise<number> {
   // launchd + systemd both use a minimal PATH, so the unit needs an absolute
   // path to `bob`. Default to the current executable's path when not overridden.
-  const bobBin =
-    flags["bob-bin"] !== undefined && flags["bob-bin"] !== true
-      ? String(flags["bob-bin"])
-      : process.argv[1] || "bob";
-  const model = flags.model !== undefined && flags.model !== true ? String(flags.model) : undefined;
+  const bobBin = stringFlag(flags, "bob-bin") ?? (process.argv[1] || "bob");
+  const model = stringFlag(flags, "model");
   const { path: written } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
   console.log(`  runs:    ${bobBin} run ${name}`);
@@ -375,8 +366,25 @@ function doctor(name: string): number {
   return report.summary.fail > 0 ? 1 : 0;
 }
 
+function usageError(err: unknown): number | undefined {
+  if (err instanceof UsageError) {
+    console.error(`bob: ${err.message}`);
+    return 2;
+  }
+  return undefined;
+}
+
 async function main(): Promise<number> {
-  const args = parseArgs(process.argv.slice(2));
+  // parseArgs validates every declared boolean flag, so a bad spelling is a
+  // usage error HERE — before any command runs — and never a stack trace.
+  let args: Args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
+    throw err;
+  }
   try {
     switch (args.command) {
       case "onboard": {
@@ -414,6 +422,20 @@ async function main(): Promise<number> {
         }
         const prompt = args.positional.slice(1).join(" ") || undefined;
         return await run(args.positional[0], prompt, args.flags);
+      }
+      case "launch": {
+        // At most one prompt, and nothing else: the whitelist is enforced in
+        // parseLaunchArgs, which refuses any other argument BY NAME.
+        try {
+          const launch = parseLaunchArgs(args.positional, args.flags);
+          return await runLaunch(launch);
+        } catch (err: unknown) {
+          if (err instanceof LaunchArgError) {
+            console.error(err.message);
+            return 2;
+          }
+          throw err;
+        }
       }
       case "install-service":
         if (!args.positional[0]) {
@@ -455,6 +477,8 @@ async function main(): Promise<number> {
         return 2;
     }
   } catch (err: unknown) {
+    const usage = usageError(err);
+    if (usage !== undefined) return usage;
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`bob: ${msg}`);
     return 1;

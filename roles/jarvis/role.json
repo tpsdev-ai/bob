@@ -1,0 +1,16 @@
+{
+  "tools": {
+    "allow": [
+      "read",
+      "flair_search",
+      "flair_write",
+      "flair_get",
+      "discord_reply",
+      "discord_fetch",
+      "discord_react"
+    ],
+    "allowResidentShell": false
+  },
+  "default_provider": "ollama",
+  "default_model": "qwen3:8b"
+}

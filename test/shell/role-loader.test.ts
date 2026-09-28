@@ -1,16 +1,20 @@
 import { describe, expect, it } from "bun:test";
 import { loadRole } from "../../src/shell/role-loader.js";
+import { resolveToolNames } from "../../src/shell/tool-allowlist.js";
 
 describe("role-loader", () => {
   it("loads the ea role template", () => {
     const t = loadRole("ea");
     expect(t.role).toBe("ea");
     expect(t.soul.length).toBeGreaterThan(0);
-    expect(t.tools.allow).toContain("Bash");
+    expect(t.tools.allow).toContain("read");
+    // The Discord tools come from the capability's REAL names (the mcp__
+    // plugin_discord_discord__* spellings pi's registry never knew).
+    expect(t.tools.allow).toContain("discord_reply");
     expect(t.tools.allow).toContain("flair_search");
   });
 
-  it.each(["writer", "reviewer", "coder", "qa", "custom"] as const)(
+  it.each(["writer", "reviewer", "coder", "qa", "builder-local", "custom"] as const)(
     "loads the %s role template",
     (role) => {
       const t = loadRole(role);
@@ -22,6 +26,52 @@ describe("role-loader", () => {
       expect(t.tools.allow).toContain("flair_search");
     },
   );
+
+  it("builder-local holds the anchored tools + shell and NO read/edit/write", () => {
+    const t = loadRole("builder-local");
+    // The four anchored tools that replace whole-file editing.
+    for (const tool of ["read_lines", "edit_lines", "insert_after", "write_file"]) {
+      expect(t.tools.allow, tool).toContain(tool);
+    }
+    // The shell + browsing tools it keeps, and Flair memory.
+    for (const tool of ["bash", "grep", "find", "ls", "flair_search"]) {
+      expect(t.tools.allow, tool).toContain(tool);
+    }
+    // NO whole-file edit/write tools — the point of the role.
+    for (const tool of ["read", "edit", "write"]) {
+      expect(t.tools.allow, tool).not.toContain(tool);
+    }
+    expect(t.tools.allowResidentShell).toBe(true);
+  });
+
+  it("loads jarvis with only registered office tools and no shell or file-writing tools", () => {
+    const t = loadRole("jarvis");
+    expect(t.role).toBe("jarvis");
+    expect(t.soul.trim().length).toBeGreaterThan(0);
+    expect(t.tools.allow).toEqual([
+      "read",
+      "flair_search",
+      "flair_write",
+      "flair_get",
+      "discord_reply",
+      "discord_fetch",
+      "discord_react",
+    ]);
+    expect(resolveToolNames(t.tools.allow, "")).toEqual(t.tools.allow);
+    // flair_write stores memories; none of the shell or file mutators belong here.
+    for (const tool of [
+      "bash",
+      "powershell",
+      "write",
+      "edit",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]) {
+      expect(t.tools.allow, tool).not.toContain(tool);
+    }
+    expect(t.tools.allowResidentShell).toBe(false);
+  });
 
   it("throws on unknown role", () => {
     // @ts-expect-error — intentionally bad role

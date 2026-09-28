@@ -16,7 +16,24 @@ bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
 1. **Scaffolds** `~/agents/pulse/` — soul.md (from the role template), bob.yaml config, ed25519 keypair, per-agent pi config (auth + gateway routing), and an executable launcher at `bin/pulse`.
 2. **Provisions the Flair identity** — registers the Ed25519 public key as a Flair **Agent** record and writes the persona into Pulse's Flair **soul**, in that order. Without the Agent record the agent's signed memory/soul calls don't verify; without the soul entry its own `bootstrap` returns no persona. Both are part of "onboarded", not follow-up chores.
 3. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done. Bob mirrors the result back into Flair.
-4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob serve pulse --discord --discord-token-file ~/.tps/secrets/pulse-token --discord-channels 123,456` keeps Pulse listening on Discord and responding to mentions.
+4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob run pulse` keeps Pulse on duty — one warm, persistent session that loads the bob.yaml capabilities: the Discord listener that responds to mentions, plus the in-process `cron:` scheduler that fires the agent's briefings and sweeps into the live session (configure the Discord channel and the `cron:` entries in bob.yaml, not on the command line).
+
+The `jarvis` role is the office's resident agent: memory with receipts, awareness
+from available presence and event information, small help routed to the right
+owner, and Discord conversation. Hire one with
+`bob onboard <name> --role jarvis --provider <provider> --model <model>`; the
+interview gives the class seed an individual persona. The role allows only
+`read`, `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch`
+and `discord_react`, with `allowResidentShell: false`. Onboarding stamps only
+the Flair capability: configure `discord` with its token file and channel
+allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
+conversation there. The body and automatic decision loop come later.
+
+Jarvis's template defaults are `ollama` / `qwen3:8b`, accepted as strings by the
+role loader. Pass your provider and model explicitly: onboarding currently uses
+its own defaults rather than the template's, and its `ollama` configuration
+points to Ollama Cloud. A local Ollama endpoint requires operator configuration
+in the agent's `.pi-agent/models.json`.
 
 ### Flair identity, and where the soul lives
 
@@ -36,20 +53,239 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Memory              | [Flair](https://github.com/tpsdev-ai/flair)                    |
 | Inbound mail        | TPS mail consumer (Bob)                                        |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
-| Cron                | Generated launcher invocations (Bob + system cron)             |
-| Tool allowlist      | Per-role template, passed through to pi                        |
+| Cron                | The persistent `bob run` runtime's in-process scheduler — it fires bob.yaml `cron:` entries into the live session (Bob)             |
+| Tool allowlist      | `roles/<role>/role.json` is the ceiling, `bob.yaml` may only narrow it, and bob's session factory applies the result to every session |
 
 ## Commands
 
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
-| `bob onboard <name>`     | Scaffold + register the Flair identity + write its soul + hiring interview   |
-| `bob align <name>`       | Recurring drift check — refines persona, mirrors it back into Flair          |
-| `bob run <name> [prompt]`| Run one session. `--model X` overrides per call; `--interactive` for a TUI   |
-| `bob serve <name>`       | Daemon: mail consumer + optional `--discord` listener                        |
-| `bob doctor <name>`      | Health check (stubbed — coming with branch-office tooling)                   |
+| `bob onboard <name>`       | Scaffold + register the Flair identity + write its soul + open the hiring interview              |
+| `bob align <name>`         | Recurring drift check — refines the persona and mirrors it back into Flair. Runs on the agent's own bob.yaml provider and model; `--provider`/`--model` override one field each |
+| `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). `--model X` overrides bob.yaml's model for the whole session. This is what the service unit runs |
+| `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
+| `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
+| `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
+| `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
+| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
+| `bob help`                 | Show this usage                                                                               |
 
-Per-call model override is the lightweight version of dynamic routing — bake the right model into each cron command (opus for strategy, sonnet for briefings, kimi for digests) without standing up multiple agents.
+A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
+
+## Operator guarantees, and the tests that pin them
+
+Each guarantee below is enforced in one place and pinned by a test. If you
+change one, the named test is what tells you.
+
+- **One session, one policy.** Every session — `bob run`, the persistent
+  runtime, `bob launch`, the mail consumer, the hiring interview, `bob align` —
+  comes from a single bob factory (`src/shell/session.ts`); bob never spawns the
+  pi CLI and never builds pi argv. The effective tool policy is the role's
+  ceiling intersected with `bob.yaml`, minus `exclude` and the resident
+  exclusions, and it is REQUIRED: a config without it is refused, in the type
+  and at runtime. *(`test/shell/run-tool-allowlist.test.ts`, `run.test.ts`)*
+- **Isolated session resources.** pi's settings and resource sources are built
+  by bob: project trust off, no configured package installed, and no global
+  `SYSTEM.md` / `APPEND_SYSTEM.md`. pi still enumerates the ambient extension,
+  skill, prompt-template and theme paths while resolving its package sources;
+  bob's loader flags stop them LOADING, so the only extensions in the session are
+  the capabilities you declared in `bob.yaml`, and a reload re-reads exactly
+  those. Nothing ambient is ever loaded. *(`test/shell/session.test.ts` —
+  including a control proving pi would otherwise load the ambient files)*
+- **The audit.** Every name in the effective policy must be active in the
+  session, no tool outside the effective policy may be active, and no
+  model-callable tool name — one that is allowlisted and not
+  excluded — is provided by two sources (pi's built-ins or a declared
+  capability). It runs on the session, at creation, after the mode binds
+  extensions (`bindExtensions`) and after every reload (`session.reload`), i.e.
+  once pi has finished rebuilding its tool list; a failure disposes the session
+  and ends the process with the error, and a reload or a bind that itself FAILS
+  ends the session the same way, naming THAT failure rather than the audit's —
+  pi's TUI shows reload errors and carries on, so a half-rebuilt session would
+  otherwise keep serving on a tool state nobody audited.
+  *(`test/shell/session.test.ts`)*
+- **`bob launch` takes at most one prompt and nothing else.** Any other argument
+  is refused BY NAME, so no caller-controlled flag can reach a session.
+  `bob launch a -- --tools` sends the literal prompt `--tools`;
+  `bob launch a --tools` is refused. *(`test/shell/launch.test.ts`)*
+- **`bob init` stamps a policy that loads.** A fresh agent of every role is
+  stamped with the role's ceiling intersected with the tools that can exist for
+  it: pi's built-ins plus the tools of the capabilities bob stamps (currently
+  `flair`). *(`test/shell/init.test.ts`)*
+- **Prompts are prompts.** Non-interactive prompts go through bob's own runner
+  as text, with no command, prompt-template or skill expansion, so nothing bob
+  did not declare can interpret your mail or your task. *(`test/shell/session.test.ts`,
+  `run.test.ts`)*
+- **Doctor points at the right file.** A resident agent whose allowlist names a
+  tool the resident policy drops is a WARN whose fix names
+  `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
+  narrow it. *(`test/shell/doctor.test.ts`)*
+- **The task survives compaction, and every agent request is checked for it**
+  (in `bob run`, one-shot or persistent; an interactive `bob launch` with no
+  prompt has no task and carries no contract or guard). A one-shot `bob run`
+  carries its TASK, and the persistent runtime carries the
+  agent's STANDING CONTRACT (its role and cron duties), in the session's SYSTEM
+  PROMPT, appended as literal text through the resource loader's
+  `appendSystemPromptOverride` — never as an append-system-prompt *source*,
+  which pi would read as a FILE whenever the text happens to name one. The block
+  is bounded by a cap its own heading states and is cut with a visible
+  `[truncated: N chars elided]` marker: the block and its cap survive a
+  compaction, and a task longer than the cap keeps only what fit under it —
+  the elided tail does not come back. pi rebuilds the system prompt when it
+  creates the session, on every reload, and whenever the active tool set changes
+  (a bind or a reload rebuilds only through one of those), reading the same
+  loader append text each time — so the block is identical across those
+  rebuilds — while compaction rewrites only the message history. bob's guard is
+  registered LAST on `before_provider_request`, so it sees the request after
+  every declared capability, whatever layout that provider uses: it asks whether
+  a DECODED string value in the payload carries the block — no provider shapes,
+  so a legitimate request cannot fail because an API differs, and no search of a
+  serialization, which an escaped character or an adapter's own sanitizing would
+  false-fail — and an AGENT REQUEST that does not carry the block fails the turn
+  exactly like a failed audit: the session is disposed, the process ends, and
+  the reason is named. **The guard's guarantee is that every agent request
+  of a `bob run` session carries the contract block.** The system prompt is where bob PUTS it (the
+  mechanism above, and it is tested); the guard proves it is still SENT. A
+  capability that moves the block into the conversation still passes, because
+  the model is still sent it — what must never happen is a request that goes out
+  without it. There is no exemption to state: pi's own compaction and
+  branch-summary calls never reach the guard at all (pi attaches the hook to the
+  agent's own requests) and the live test pins that, which is what lets the guard
+  refuse everything else — including an agent turn started during a branch
+  summary, the window a flag-based exemption would have covered. A blank task is
+  refused before the session starts.
+  *(`test/shell/system-prompt-contract.test.ts` — the real payload of the seven
+  providers the test covers, `system-prompt-contract-live.test.ts` — a real pi
+  session on a stub model: a real mid-turn threshold compaction, both loss
+  paths, a session replaced through the runtime factory, and the persistent
+  runtime's standing contract after a compaction, `run.test.ts`)*
+- **A one-shot run reports success only with a real final message.** `bob run`
+  settles exit 0 only when the last assistant message that ENDED after the last
+  compaction carries text — exactly the text of that message, never rebuilt from
+  streamed deltas; a message that ended empty or on an error is no final
+  message. A silent settlement after a compaction retries ONCE with an explicit
+  continue turn; if it is still silent the run exits non-zero naming the reason
+  (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
+  *(`test/shell/compaction-contract.test.ts`, `run.test.ts`)*
+
+### Stated exceptions
+
+1. **Onboarding and alignment are privileged local setup commands**, available
+   to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
+   `read` and `write`, which may exceed the role's ceiling — the interview's job
+   is to write `soul.md`. A model can only reach them through a shell tool, and
+   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
+   `align.test.ts`)*
+2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
+   `!!` run the operator's own shell and are out of scope.
+3. **The contract costs tokens, per request.** The task is sent in the first
+   user message AND in every agent request's system prompt. The block is
+   identical on every request of a run — pi rebuilds the prompt around it when
+   the active tool set changes or on a reload, and the appended block is the
+   same text each time — so a provider's prompt cache can cover it; it is not
+   shared across runs. The cap is printed in the block's own heading, and a long
+   task is truncated with a marker that states how much was elided: the elided
+   tail is gone for that run.
+4. **The "what remains" note is best-effort, and the judge judges the message.**
+   After a compaction bob sends one note — the last thing the agent said,
+   whatever it was, or `git status --short` plus the recent tool calls — as a
+   steer. If that send fails it is logged and nothing else happens: the TASK is
+   not lost (it is in the system prompt), but the text the note would have
+   quoted can be. And the completion judge checks for a real final MESSAGE, not
+   that the work it describes was done.
+5. **The contract guard catches LOSS, not deception.** It fails an agent
+   request that no longer carries the contract block, which is what a
+   capability that drops or replaces the system prompt produces. It is not a
+   defence against a capability written to deceive it (for example a payload
+   whose serialization changes between the guard's check and the adapter's
+   send): capabilities are trusted code running in the same process as the
+   session, and a hostile one could disable the guard outright.
+
+## `run` logs and retention
+
+Every one-shot `bob run <name> <prompt>` (but **not** the persistent `bob run <name>`:
+its session never calls this logger) tees each session event to a per-run JSONL log at
+`~/agents/<name>/runs/<timestamp>.<pid>.<random>.jsonl`, so a mid-run death
+(a provider cap, an OOM, a crash) leaves a post-mortem trail instead of silence.
+Because the log exists for post-mortems — not for replaying a growing message —
+each record is a fixed shape for its event type, bounded like this:
+
+- **A projection, not a copy.** Each event is logged as a fixed set of fields for
+  its type. Of the streamed updates, `message_update` logs the inner event's kind,
+  the content block it belongs to and its delta, and `bash_execution_update` its
+  per-chunk delta; `tool_execution_update` logs the call's identifiers only — no
+  `partialResult`, the cumulative tool output — and `queue_update` the counts, not
+  the steering/follow-up text. `entry_appended` logs a bounded summary of the
+  entry an extension appended — its type (and a custom entry's `customType`), its
+  id, and the entry's serialized size — and never the entry itself: that payload
+  is an extension's own, and a session-state snapshot in it grows with the
+  session. An event type bob does not know is logged as `{type, unknownEvent:
+  true}` with none of its payload. That is what stops a record from growing with
+  the EVENTS BEFORE IT; the log used to grow quadratically with message length
+  (15 GB of logs on a 40 GB builder disk). It does not make every record small:
+  the records that finalize something — `message_end`, `turn_end`, `agent_end`'s
+  per-run `messages`, a tool's `result` — each carry their payload once, and are
+  as large as that payload (see the closing note below).
+  (`test/shell/run-log-projection.test.ts`
+  — "projects EVERY event type in pi 0.84.3's unions to a fixed, non-growing
+  record", "logs NO payload for an event type the projection does not name", "logs
+  a growing extension entry as its identity and size — flat across events";
+  `test/shell/run-log.test.ts` — "keeps a 5,000-token streamed message's log
+  linear, not quadratic", "never logs `partial` on a message_update event",
+  "keeps a growing extension entry flat: identity and size, never the entry", "a
+  run that dies before message_end still records WHICH block each delta came
+  from".)
+- **A per-run DELTA cap** (**50 MB**; `bob run` has no flag or config key that
+  changes it). Once the log reaches it, the streamed deltas stop being written;
+  every non-delta event — tool calls and results, errors, lifecycle events, each
+  `*_end` final, and the final `done` line — keeps coming, and a single line
+  records that the **delta** cap was hit. The consequence, plainly: past the cap
+  the deltas are dropped, `message_end` still records each final message once, and
+  a crash before a `message_end` loses that message's post-cap tail.
+  ("past the per-run DELTA cap: drops streamed deltas but keeps tool/error events;
+  one delta-cap marker", "past the delta cap: message_end still records the final
+  message, in full", "a crash past the cap before any message_end leaves no
+  post-cap content".)
+- **One log per run, even in the same millisecond.** The name carries the start
+  timestamp, the run's pid and a random suffix, and the file is created
+  exclusively, so two runs that start in the same millisecond get distinct files —
+  and each file's sidecar lock belongs to that file alone. The lock is taken
+  BEFORE the log file is created, so an active log always has one.
+  ("gives two runs started in the same millisecond distinct logs — and distinct
+  locks".)
+- **A run that cannot take its lock writes no log at all.** While a run holds
+  `<log>.lock` retention leaves its log alone; without it an active log is
+  indistinguishable from a crashed run's, and a later sweep would delete it under
+  its writer. So a run whose lock cannot be created warns once — naming the lock
+  and the cause — and runs unlogged: no log file is created for it at all.
+  ("writes NO log at all when the lock cannot be created (no lock, no log)".)
+- **Retention on run start.** Before writing its own log, a run keeps the
+  **newest 5** logs untouched and then, for the older ones, deletes the
+  oldest-first until their combined size is back under a **500 MB** budget. The
+  logs left OUTSIDE that budget are exactly: the newest five, and any log
+  retention cannot show is finished — one whose lock names a live PID, and one
+  whose lock exists but cannot be read, or does not name a PID. It fails safe:
+  never prune what it cannot show is dead. A PID means the WHOLE lock content as
+  digits, so a lock reading `123garbage` is not one — `parseInt` would read it as
+  123 and decide the log's fate on a number the lock never named. A log with no
+  lock, or a lock naming a dead PID, is prunable like any other. ("retention
+  leaves an older run whose sidecar lock is live untouched", "retention fails
+  safe: a lock it cannot read or parse KEEPS the log".)
+- **Logging never throws into the run** — including creating the runs directory.
+  If the run log cannot be set up at all, the run still completes and warns once.
+  ("completes and warns ONCE when the runs directory cannot be created".)
+
+What these bounds cover, and what they leave open. Bounded: the streamed deltas,
+which stop once the log passes the cap, and retention's budget, which deletes old
+logs at run start until a series of runs is back under it. NOT bounded: every
+record that is not a streamed delta. Tool calls and results, errors, lifecycle
+records and each `*_end` final are written however many of them a run produces,
+so a run with hundreds of thousands of non-delta events has no per-run ceiling,
+and one run can pass the budget before any later sweep sees it — retention is a
+start-time sweep over old logs, not a limit on the run in front of it. The
+original failure, a log that grew with the LENGTH of the messages it recorded, is
+fixed at the source by the projection above; the cap and the budget bound what is
+left.
 
 ## Where Bob fits
 
@@ -62,7 +298,7 @@ Bob is one layer of an open stack:
 - **[pi-coding-agent](https://github.com/earendil-works/pi)** — the agent loop, tools, and LLM provider abstraction Bob sits on top of.
 - **Bob** (you are here) — the office shell: identity, mailbox, channels, scheduling, doctor.
 - **[Flair](https://github.com/tpsdev-ai/flair)** — the memory layer Bob's agents talk to by default; orchestrator-agnostic, self-host, federates across hosts.
-- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer Bob's `bob serve` mail consumer plugs into; mail, branch-office bring-up, agent-to-agent dispatch.
+- **[TPS CLI](https://github.com/tpsdev-ai/cli)** — the coordination layer for mail, branch-office bring-up, and agent-to-agent dispatch. Bob's mail consumer is a separate component: it polls the agent's inbox and launches the agent's launcher (`bin/<name>`) as a child process per message — it does not plug into the persistent `bob run` runtime.
 
 Each layer stands alone — use whichever fits your stack, swap out the others. Bob's value is concentrated at the office-shell layer; the rest is composable.
 
@@ -70,7 +306,15 @@ If you already use pi and want each agent to have a name, a key, a mailbox, and 
 
 ### Compatibility
 
-- **Runs any pi extension, skill, prompt template, or theme.** Bob's launcher is a thin wrapper around `pi --provider ... --model ... --append-system-prompt ...`. Anything pi accepts, Bob's agents accept.
+- **A capability is a bob.yaml declaration, not an ambient pi extension.**
+  Ambient pi extensions, skills, prompt templates, themes and configured
+  packages **do not load for bob agents**, and bob never installs anything.
+  Skills and prompt templates are not expanded into prompts either. To give an
+  agent a tool: put the capability's name in `bob.yaml` under `capabilities:`,
+  configure its block, and list its tools within the role's ceiling in
+  `roles/<role>/role.json` (then narrow it in `bob.yaml` if you like). This is
+  deliberate — a session's tools are the role's allowlist, and anything ambient
+  would be a second way to change them.
 - **Memory via Flair, with bridges to others.** Flair ships bridges to mem0, claude-project memory, ChatGPT, and more. A Bob agent can read memory from whichever layer your stack already uses.
 - **LLM provider-neutral.** Bob's `bob.yaml` picks; current production examples use exe.dev's VM-authenticated LLM gateway (anthropic via baseUrl override), but `ollama-cloud`, `ollama-newton`, `anthropic` direct, `openai`, and `omlx` all work.
 
@@ -98,7 +342,7 @@ src/
     flair/              memory search/write/get over the agent's Flair store
     observatory/        team-view producer
     fixture/            a no-op capability that proves the loader end to end
-roles/                  ea, writer, reviewer, coder, qa, custom
+roles/                  ea, jarvis, writer, reviewer, coder, qa, builder-local, custom
 test/                   mirrors src/
 ```
 
@@ -152,9 +396,114 @@ stay textual, like a Discord snowflake.
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
 
+### `reachy` (jarvis) — S3 skeleton
+
+The `reachy` capability is the jarvis office agent's body, built as a **skeleton on
+a stub sidecar** (no hardware, no model, no network). Operator guarantees, each
+naming its test (`test/capabilities/reachy/`):
+
+- **A malformed sidecar line does nothing, and the wire is STRICT.** Every wire
+  type — including the outer envelope — has `additionalProperties: false`; lines
+  are decoded and schema-checked before policy. An unknown field, a bad shape, or
+  an oversized line is dropped with an OrgEvent `reachy.malformed`. The line bound
+  (64 KiB) applies PER COMPLETE LINE and is counted in **UTF-8 BYTES**, not
+  characters: bytes are buffered as they arrive and a line is decoded only once it
+  is complete and under the bound, so a multi-byte transcript that is over the
+  bound in bytes is refused even when its character count is under it. An oversized
+  line is discarded up to AND including its newline (one malformed), so a payload
+  on the same line cannot slip through, the next line parses, and a large chunk of
+  short lines is fully retained. The stub's health line carries exactly the fields
+  the schema defines. (`round5.test.ts`; `round4.test.ts`; `sidecar-stub.test.ts`.)
+- **Record ids are unique ACROSS processes.** Every default record id is
+  `<agentId>-<random UUID>` — no per-process counter, no wall clock — and the
+  reachy MEMORY and OrgEvent writes use the same construction, so two bob
+  processes with one agentId never overwrite each other. (`capability.test.ts`
+  round 4.)
+- **The replay proof and the key proof measure what they claim.** Completion is
+  the stub's explicit end-of-replay marker, and the expected event count and
+  outcomes are pinned CONSTANTS independent of the fixture (a truncated replay
+  fails); the key-read proof makes the fixture dir traversable (0711) and asserts
+  a 0644 control file IS readable while the 0600 fixtures are NOT, so it isolates
+  the file mode. (`sidecar-stub.test.ts`.)
+- **`reachy_state` is a PLACEHOLDER** (declared in the manifest as
+  `placeholderTools`): the command channel has no request/response correlation
+  yet, so it returns no sidecar state. (`round4.test.ts`.)
+- **A memory is written only when addressed AND speakerVerified** — `private`,
+  author `jarvis`, the speakerId in metadata; non-member speech is ephemeral.
+  (`reachy.test.ts` (a)/(b)/(c)/(d).)
+- **SUCCESS is returned only with a persisted, read-back written event; a memory can exist without it and is reported as an UNAUDITED refusal.** The OrgEvent is the SAME record shape the observatory emits
+  (`src/capabilities/observatory/snapshot.ts`). The ATTEMPT is written FIRST with a
+  record id; the MEMORY then carries the id of the OUTCOME event — the `written`
+  event, NEVER the attempt. SUCCESS is returned only when the `written` event is
+  persisted under that EXACT pre-generated id AND read back as the `written` outcome
+  whose targetIds contain this memory (when the store reports an id it must equal the pre-generated one; a store
+  that reports none is accepted on readback). If the memory exists and
+  its `written` audit failed — a thrown write, a mismatched id, or a null readback —
+  the outcome is a linked `reachy.memory.failed` (logged) and an UNAUDITED refusal,
+  and the memory is RETAINED (bob's flair client cannot delete it); a refusal does
+  NOT assert that no written event targeting it exists — the query explains a memory
+  when the `written` id in its metadata resolves to a `written` event whose `targetIds`
+  contain that memory (an exact-id read, not a search), so a store
+  that persists the `written` event and then throws is refused yet still explains the
+  memory (the persist-then-throw case is `round7.test.ts` item 3c). A memory write
+  that fails outright is
+  `reachy.memory.failed` too (with the error class, linked to the attempt and
+  logged) — never an unqualified "wrote". "why do you know this" otherwise reads the
+  `written` event back by EXACT id (`GET /Memory/<id>`). Every reachy event id is
+  `evt_<kind>_<uuid>`, where `<uuid>` is a full UUID (never a timestamp plus a short
+  suffix), so two events never collide; the record id is `orgevent-<event id>`.
+  (`round5.test.ts`; `round6.test.ts`; `round7.test.ts`; `reachy.test.ts` item 2.)
+- **The actuation tools go through the gate** — `reachy_look` / `reachy_say` /
+  `reachy_frame` share the admit path with proposals (mute, rate gate, one
+  OrgEvent per admitted command; `reachy_frame` sends a `frame` command).
+  **`reachy_say` accepts NO memory reference at all** — the tool's SCHEMA rejects an
+  extra argument (`additionalProperties: false`), and pi validates tool arguments
+  BEFORE `execute`, so a live pi call never reaches the refusal; a DIRECT caller of
+  `execute` still gets an audited OrgEvent `reachy.refused`. `answer` is OFF (fail
+  closed). (`reachy.test.ts` items 2a/2b/3; `round4.test.ts`.)
+  The placeholder `reachy_state` sends an ungated `state` request (no admit path, no
+  OrgEvent).
+- **The visitor acknowledgement rate slot is reserved SYNCHRONOUSLY.** The socket
+  path runs line handlers concurrently, so the one-per-minute acknowledge slot is
+  taken before any awaited audit write (and rolled back if the audit fails) — two
+  visitor lines arriving while the store is slow cannot both acknowledge.
+  (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
+- **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
+  `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
+  the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub
+  running as that user — that is S2's sandbox slice.) `sidecar-stub.test.ts`.
+
+What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),
+any body/head motion on real hardware, or memory-backed speech. **Trust model:** a
+sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-member
+mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
+by bob's gate (bob#180 §4).
+
+## Providers
+
+Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider.model`). `openrouter`
+is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
+passed through verbatim — for example `bob onboard orr --provider openrouter --model
+deepseek/deepseek-v4.1-flash`.
+
+**bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
+memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,
+a NON-SECRET placeholder key (the real key stays with bob; see below), the `openai-completions` api, and the declared model
+with no per-model `baseUrl` — and hands it to pi's session services; every entry path (`bob run`, the
+persistent runtime, `bob onboard`, `bob align`) goes through that factory
+(`openrouter-provider-183.test.ts` (a2), (b1)–(b6)). What is REFUSED before the session exists,
+naming the file: a `providers.openrouter` block in `.pi-agent/models.json` — a per-model `baseUrl`, a
+`providers.openrouter.apiKey` — (`(2a), (2a-listener), (2b), (2d)`); a stored openrouter credential in
+`.pi-agent/auth.json` (`(a)`); and an unreadable or unparseable pi config, where a missing file is
+"absent" but any other read or parse failure refuses because bob cannot prove the file carries no
+entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a commented file on purpose: bob cannot parse it, so it cannot prove the file carries no `openrouter` entry (`(b)`). A provider declared under ANOTHER name is not bob's concern: the selected
+`openrouter` model resolves from bob's in-memory provider. **bob holds the OpenRouter key; pi does not.** It lives in bob's runtime-factory closure (so `/new` and `/resume` reuse it) and in the transport function built from it, which sends only to `https://openrouter.ai/api/v1`; pi's auth and registered provider config hold a NON-SECRET placeholder, and pi's model data carries no key. The first session the runtime factory builds reads `OPENROUTER_API_KEY` once and DELETES it from `process.env`, after pi's model runtime is created and before capabilities, extensions and tools load (`(r2)`); the transport refuses a model whose `baseUrl`/`api` is not bob's (`(t1, unit)`), refuses the listed credential header names (`authorization`, `proxy-authorization`, `cf-aig-authorization`, `x-api-key`, `api-key`, `x-auth-token`, `cookie`) (`(t4, unit)`, `(r3)`), and its fetch wrapper refuses a non-canonical URL or a `Request` (`(t5, unit)`, `(r4)`); a real session turn carries `Bearer <the real key>` to `<base>/chat/completions` (`(t2, session path)`); the key is in none of pi's auth, registered provider config or model data (`(t3)`); a `ModelRuntime.refresh()` with a tampered `models.json` can install pi's BUILT-IN provider as the effective one — bob's transport is then not on the request path — so what holds instead is key containment: the key is no longer in `process.env` or in pi's data, so the fallback provider that pi's request path prepares has no key to send and `getAuth("openrouter")` resolves none (`(r1)`, whose control phase shows the same path DOES send the key to another host while the environment still holds it). STATED LIMIT: this removes the IN-PROCESS path only — a same-user process can still read a process's initial environment block (`/proc/<pid>/environ` on Linux, `ps eww` on macOS); isolating the agent's own tools from that is bob#189, not this change. The key also lives in the bob process's memory — the runtime-factory and transport closures — so a same-user process that can read another process's memory (a debugger, `/proc/<pid>/mem`, or a core dump) can recover it; isolating that is likewise bob#189. Operator symptom of the refresh fallback: after a `refresh()` that breaks composition, pi's built-in `openrouter` provider is the effective one and has none of bob's key, so a turn fails with an auth error even though the operator's key is valid — check first whether a `.pi-agent/models.json` entry defines `openrouter` (an extension cannot: bob's registration guard refuses it). An
+unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
+path's persisted files (`(c)`).
+
 ## Status
 
-`0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
+`0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/jarvis/writer/reviewer/coder/qa/builder-local/custom), and `bob doctor` are available. Branch-office docs and richer routing tables are next.
 
 ## License
 

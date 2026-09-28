@@ -1,0 +1,20 @@
+{
+  "tools": {
+    "allow": [
+      "read_lines",
+      "edit_lines",
+      "insert_after",
+      "write_file",
+      "bash",
+      "grep",
+      "find",
+      "ls",
+      "flair_search",
+      "flair_write",
+      "flair_get"
+    ],
+    "allowResidentShell": true
+  },
+  "default_provider": "exe-dev-gateway",
+  "default_model": "claude-sonnet-4-6"
+}

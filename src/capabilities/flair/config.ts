@@ -3,7 +3,7 @@
 // SECURITY (Sherlock will scrutinize this file):
 //   * The agent's PRIVATE KEY is NEVER inlined in config and NEVER read from an
 //     env var. Config carries a *file path* (`keyFile`); the key is read from
-//     that file by the client at startup, held in memory, and never logged,
+//     that file by the client on first use, held in memory, and never logged,
 //     echoed, or returned in a tool result / error. See client.ts.
 //   * The capability talks ONLY to the configured `url` and signs every request
 //     as `agentId` — it cannot act as another agent (the signature is over the
@@ -39,11 +39,14 @@ export const CONFIG_SCHEMA = Type.Object(
       pattern: "^[a-z0-9-]+$",
       description: "This agent's Flair id (e.g. pulse).",
     }),
-    // Path to the agent's Ed25519 private key (base64-encoded PKCS8 DER). The
-    // key is read from here at startup; it is never in config/env/logs.
+    // Path to the agent's Ed25519 private key. FOUR shapes are accepted: the raw
+    // 32-byte seed that `flair agent add` writes, base64 of that seed, base64
+    // PKCS8 DER, or PEM PKCS8 (what `bob flair-pair` writes). Read as bytes from
+    // here on first use; the key is never in config/env/logs.
     keyFile: Type.String({
       minLength: 1,
-      description: "Path to the agent's Ed25519 private key (base64 PKCS8). Never inlined.",
+      description:
+        "Path to the agent's Ed25519 private key (raw 32-byte seed, base64 of that seed, base64 PKCS8 DER, or PEM PKCS8). Never inlined.",
     }),
   },
   { additionalProperties: false },

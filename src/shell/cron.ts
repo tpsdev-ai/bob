@@ -1,6 +1,6 @@
 // Scheduled work for the PERSISTENT runtime — `cron:` in bob.yaml.
 //
-// Bob's persistent session (`bob serve`) can run prompts on a schedule: each
+// Bob's persistent session (`bob run <name>`) can run prompts on a schedule: each
 // bob.yaml `cron:` entry { name, schedule (cron expr), prompt } fires its prompt
 // INTO the live session on its cadence. This is how an agent does proactive work
 // (e.g. Pulse's daily intel brief) without a second process — and crucially
@@ -9,10 +9,8 @@
 // scheduled prompt drives the same warm session that handles inbound, so the
 // agent can use its capabilities (discord_reply, flair_*) to act on the tick.
 //
-// CONCURRENCY: fires are SERIALIZED through a single promise chain so two cron
-// entries never run at once, and `fire` itself (in persistent.ts) awaits the
-// session's idle barrier before prompting so a tick doesn't cut into an in-
-// flight inbound turn. pi's AgentSession processes one turn at a time.
+// CONCURRENCY: the scheduler serializes its callbacks. The persistent runtime's
+// admission additionally serializes cron with every other inbound turn source.
 //
 // TESTABILITY: croner only computes the next fire time; the clock + timers + the
 // fire callback are all injected, so tests drive ticks deterministically with no
@@ -26,9 +24,8 @@ export type TimerHandle = ReturnType<typeof setTimeout>;
 export interface CronSchedulerDeps {
   // The agent's cron entries (from bob.yaml `cron:`).
   entries: CronEntry[];
-  // What to do when an entry fires. In production this awaits the session's
-  // idle barrier then `session.prompt(entry.prompt)`. Serialized by the
-  // scheduler — never called concurrently with itself.
+  // What to do when an entry fires. Production calls bob's admitTurn with the
+  // job's origin and prompt. Serialized here — never concurrent with itself.
   fire: (entry: CronEntry) => Promise<void>;
   // Logger seam. Defaults to console.error.
   log?: (msg: string) => void;

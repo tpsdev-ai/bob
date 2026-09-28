@@ -14,8 +14,8 @@
 // points where bob is already authoring a persona: `bob onboard` and
 // `bob align`. It is the "edit here, publish there" model.
 //
-//   * Why not pull on launch. The launcher is a POSIX sh script whose whole
-//     job is `pi --append-system-prompt "$(cat soul.md)"`. Fetching the soul
+//   * Why not pull on launch. Launch reads the local soul.md and hands it to pi
+//     as the session's appended system prompt, in-process. Fetching the soul
 //     from Flair on every start would put a network round-trip on the hot path
 //     of every agent invocation and make a Flair outage boot a persona-less
 //     agent. A stale local file is a strictly better failure than an agent
@@ -84,7 +84,7 @@ export interface PushSoulOptions {
   fetchImpl?: ConstructorParameters<typeof FlairHttpClient>[0]["fetchImpl"];
   now?: () => number;
   uuid?: () => string;
-  readFile?: (path: string) => string;
+  readFile?: (path: string) => Buffer;
   writeFile?: (path: string, contents: string) => void;
   // Where warnings go. Defaults to console.error.
   warn?: (message: string) => void;
@@ -98,12 +98,12 @@ export async function pushSoulToFlair(
   registration: FlairRegistration,
   opts: PushSoulOptions,
 ): Promise<SoulPushResult> {
-  const readFile = opts.readFile ?? ((p: string) => readFileSync(p, "utf8"));
+  const readFile = opts.readFile ?? ((p: string) => readFileSync(p));
   const writeFile =
     opts.writeFile ?? ((p: string, contents: string) => writeFileSync(p, contents, "utf8"));
   const warn = opts.warn ?? ((m: string) => console.error(m));
 
-  const persona = readFile(opts.soulPath);
+  const persona = readFile(opts.soulPath).toString("utf8");
   if (persona.trim() === "") {
     throw new Error(
       `refusing to write an empty soul for '${registration.agentId}': ${opts.soulPath} is empty. ` +

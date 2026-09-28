@@ -19,6 +19,7 @@
 // stays outbound-only — same gate as discord's gateway (see discord/index.ts).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getTurnAdmission } from "../../shell/turn-admission.js";
 import { FlairHttpClient } from "../flair/client.js";
 import { wirePresence } from "./capability.js";
 import { loadConfigFromEnv } from "./config.js";
@@ -43,6 +44,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     pi: pi as unknown as Parameters<typeof wirePresence>[0]["pi"],
     flair,
     config,
+    admission: getTurnAdmission(pi),
   });
 }
 

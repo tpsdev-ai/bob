@@ -5,7 +5,7 @@
 // prompt. It stands up ONE warm `createAgentSession` (the same builder as
 // `bob run`, only with a DURABLE SessionManager) with the agent's capabilities
 // loaded — including the discord capability, whose gateway listener feeds
-// inbound messages into the session via `pi.sendUserMessage()` over the
+// inbound messages into bob's FIFO admission over the
 // session's whole lifetime, and routes each reply back to the originating
 // channel (see src/capabilities/discord).
 //
@@ -28,6 +28,11 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  buildStandingContract,
+  createCompactionObserver,
+  readWorktreeStatus,
+} from "./compaction-contract.js";
 import { type CronSchedulerHandle, startCronScheduler } from "./cron.js";
 import {
   createPiRunSession,
@@ -36,7 +41,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
-import { clearPendingOrigin, setPendingOrigin } from "./turn-origin-registry.js";
+import { createTurnAdmission, type TurnAdmission } from "./turn-admission.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -49,6 +54,8 @@ export interface RunPersistentOptions {
   // Inject the session factory (tests). Defaults to the real SDK factory with a
   // DURABLE SessionManager (persisted on disk under the agent's cwd).
   sessionFactory?: RunSessionFactory;
+  // Scheduler seam: tests release a real fire callback during shutdown.
+  cronSchedulerFactory?: typeof startCronScheduler;
   // Install OS signal handlers for graceful shutdown. Defaults to true in
   // production; tests pass false and drive `handle.shutdown()` directly.
   installSignalHandlers?: boolean;
@@ -69,6 +76,7 @@ export interface RunPersistentOptions {
 export interface PersistentHandle {
   // The warm session (so tests can assert it stays usable across prompts).
   session: RunSession;
+  admitTurn: TurnAdmission["admitTurn"];
   // Resolved provider/model for diagnostics.
   provider: string;
   model: string;
@@ -103,10 +111,15 @@ function neverResolves(): Promise<void> {
 export async function startPersistent(opts: RunPersistentOptions): Promise<PersistentHandle> {
   const log = opts.log ?? ((m: string) => console.error(m));
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { provider, model, config, cron } = resolveRunConfig({
+  const { provider, model, config, cron, agent } = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    // The persistent runtime is resident by definition: this process stays up
+    // behind the agent's service unit with nobody at the keyboard, which is
+    // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
+    // `resident: true` says the same thing for the one-shot path.
+    persistent: true,
   });
 
   // Mark this as the persistent runtime so "serving" capabilities (discord's
@@ -114,37 +127,53 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // BOB_PERSISTENT before loading extensions. A one-shot `bob run` leaves it
   // falsy and stays outbound-only.
   config.persistent = true;
+  // #145: the STANDING CONTRACT, and it lives in the SYSTEM PROMPT — the one
+  // place pi's compaction cannot reach. It is built from the agent's bob.yaml
+  // `agent:` block plus its declared cron duties, and the factory appends it as
+  // literal text on every session it builds (creation, and again for every
+  // /new, /resume, /fork, /clone and /import), so a resident agent that hits
+  // the context threshold mid-task keeps its role and its duties in front of
+  // the model without any attach step that could fail.
+  config.standingContract = buildStandingContract({
+    name: agent.name ?? opts.name,
+    role: agent.role,
+    duties: cron,
+  });
   const factory = opts.sessionFactory ?? defaultPersistentFactory;
-  const session = await factory(config);
+  const admission = createTurnAdmission();
+  config.turnAdmission = admission;
+  let session: RunSession;
+  try {
+    session = await factory(config);
+    admission.bind(session);
+  } catch (error) {
+    admission.close();
+    throw error;
+  }
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
-  // Scheduled work: fire each bob.yaml `cron:` prompt INTO this live session on
-  // its cadence (one gateway, no second `bob run` process). Await the idle
-  // barrier first so a tick doesn't cut into an in-flight inbound turn; fires
-  // are serialized by the scheduler. No-op when the agent declares no cron.
+  // #145: after every non-aborted compaction, ONE best-effort "what remains"
+  // note (the last thing the agent said, git status --short, the last few tool
+  // calls) is sent as a steer. It is useful and it is NEVER load-bearing: the standing contract is
+  // in the system prompt, so a note that fails to send is logged and the
+  // runtime keeps serving. The note uses pi's steer path; it does not
+  // submit a new bob admission or supply an origin.
+  const observer = createCompactionObserver({
+    worktreeStatus: () => readWorktreeStatus(config.cwd),
+    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    log,
+  });
+  const unsubscribeContract = session.subscribe((event) => observer.observe(event));
+
+  // Every scheduled turn goes through the same admission as inbound Discord.
   let cronScheduler: CronSchedulerHandle | undefined;
   if (cron.length > 0) {
     log(`[bob] scheduling ${cron.length} cron job(s) for ${opts.name}`);
-    cronScheduler = startCronScheduler({
+    cronScheduler = (opts.cronSchedulerFactory ?? startCronScheduler)({
       entries: cron,
       fire: async (entry) => {
-        try {
-          await session.waitForIdle?.();
-        } catch {
-          // proceed — pi serializes turns regardless
-        }
-        // Set the single pending-origin slot immediately before session.prompt; the
-        // presence capability takes + empties it on before_agent_start. An invalid
-        // job name is rejected at the registry (the turn runs). The finally clears
-        // the slot whatever the prompt does -- a rejected / aborted prompt leaves
-        // no stale origin for the next turn (round-4 item 2).
-        try {
-          setPendingOrigin({ kind: "cron", job: entry.name });
-          await session.prompt(entry.prompt);
-        } finally {
-          clearPendingOrigin();
-        }
+        await admission.admitTurn({ kind: "cron", job: entry.name }, entry.prompt);
       },
       log,
     });
@@ -156,13 +185,12 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     if (disposed) return;
     if (disposing) return disposing;
     disposing = (async () => {
-      // Stop scheduling first so a pending cron tick can't fire into a session
-      // we're about to dispose.
+      // Close synchronously FIRST: even a fire already inside its callback
+      // cannot start a prompt after this point. Drain admitted work before dispose.
+      admission.close();
       cronScheduler?.stop();
-      // Clear the pending origin slot on shutdown: a
-      // set-but-unconsumed origin from a last in-flight turn must not
-      // survive a restart (round-4 item 2).
-      clearPendingOrigin();
+      unsubscribeContract();
+      await admission.drain();
       // Await any in-flight turn so we don't cut off a reply mid-stream. The
       // RunSession seam exposes `prompt` but not an idle barrier; production's
       // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
@@ -180,11 +208,11 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     return disposing;
   };
 
-  return { session, provider, model, shutdown };
+  return { session, admitTurn: admission.admitTurn, provider, model, shutdown };
 }
 
 // Run persistently and BLOCK until a shutdown signal (or the injected
-// keepAlive) resolves. This is what the launchd unit / `bob serve` invokes.
+// keepAlive) resolves. `bob run <name>` invokes this; the service unit runs that.
 export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const handle = await startPersistent(opts);

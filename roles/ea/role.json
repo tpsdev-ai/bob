@@ -1,18 +1,13 @@
 {
   "tools": {
     "allow": [
-      "Bash",
-      "Read",
-      "Write",
-      "Edit",
-      "WebFetch",
-      "WebSearch",
+      "read",
       "flair_search",
       "flair_write",
       "flair_get",
-      "mcp__plugin_discord_discord__reply",
-      "mcp__plugin_discord_discord__fetch_messages",
-      "mcp__plugin_discord_discord__react"
+      "discord_reply",
+      "discord_fetch",
+      "discord_react"
     ]
   },
   "default_provider": "exe-dev-gateway",

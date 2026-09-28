@@ -50,6 +50,10 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
+      # Provision the unprivileged user the jarvis key-read proof runs as (the
+      # runner is disposable; that is where useradd belongs).
+      - name: provision jarvis-sidecar (reachy key-read proof)
+        run: sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar
       - run: bun run test
 
   pack:

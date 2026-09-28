@@ -1,6 +1,6 @@
 {
   "tools": {
-    "allow": ["Bash", "Read", "Grep", "WebFetch", "flair_search", "flair_write", "flair_get"]
+    "allow": ["read", "bash", "grep", "flair_search", "flair_write", "flair_get"]
   },
   "default_provider": "exe-dev-gateway",
   "default_model": "claude-opus-4-7"

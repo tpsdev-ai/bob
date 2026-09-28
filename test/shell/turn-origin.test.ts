@@ -1,8 +1,8 @@
 // Unit tests for the turn-origin MODEL + human-facing label (round 3).
 //
 // Round 3 removed the in-prompt nonce-bearing tag (tagPrompt / parseTurnOrigin).
-// The turn's origin now travels OUT OF BAND via a runtime registry
-// (turn-origin-registry.ts), covered by turn-origin-registry.test.ts. This file
+// Turn admission owns the origin; its concurrency and validation are covered
+// by turn-admission.test.ts and turn-admission-validation.test.ts. This file
 // keeps only the originLabel, which renders a TurnOrigin as a short human-facing
 // string (used as the presence currentTask and the turn-summary origin label).
 
