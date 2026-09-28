@@ -54,10 +54,16 @@ export function loadSecretBindings(src: SecretBindingSource = {}): SecretBinding
   }
   if (src.hostRoot) {
     const file = join(src.hostRoot, "secrets.json");
-    if (existsSync(file)) {
+    let raw: string | undefined;
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    }
+    if (raw !== undefined) {
       let parsed: unknown;
       try {
-        parsed = JSON.parse(readFileSync(file, "utf8"));
+        parsed = JSON.parse(raw);
       } catch (err) {
         throw new Error(
           `bob: host secret bindings at ${file} are not valid JSON (${err instanceof Error ? err.message : String(err)}).`,

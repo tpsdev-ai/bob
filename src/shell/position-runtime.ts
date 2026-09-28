@@ -229,12 +229,17 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
 
   const agentDir = join(opts.agentsRoot, opts.name);
   const yamlPath = join(agentDir, "bob.yaml");
-  if (!existsSync(yamlPath)) {
-    refuse(
-      `cannot adopt ${opts.name}: ${yamlPath} not found (run 'bob onboard ${opts.name}' first).`,
-    );
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(yamlPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      refuse(
+        `cannot adopt ${opts.name}: ${yamlPath} not found (run 'bob onboard ${opts.name}' first).`,
+      );
+    }
+    throw err;
   }
-  const yamlText = readFileSync(yamlPath, "utf8");
 
   const position = loadPosition(opts.positionName, { root: positionsRoot });
   const role = loadRole(position.manifest.role as never);

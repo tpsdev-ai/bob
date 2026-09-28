@@ -24,7 +24,7 @@
 // packaged file the resolver uses, so a host grant can pin the exact artifact.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -256,9 +256,17 @@ export function assertRelativeSafe(rel: string, where: string): void {
 // the tree cannot escape.
 export function readPositionFile(dir: string, rel: string): string {
   assertRelativeSafe(rel, `position file "${rel}"`);
-  const target = join(dir, rel);
   const realDir = realpathSync(dir);
-  const realTarget = existsSync(target) ? realpathSync(target) : target;
+  // realpath first: it throws ENOENT for a missing file, so there is no
+  // existsSync-then-read window (CodeQL js/file-system-race).
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(join(dir, rel));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT")
+      fail(`position file "${rel}" is missing.`);
+    throw err;
+  }
   const relToDir = relative(realDir, realTarget);
   if (
     relToDir === "" ||
@@ -268,7 +276,6 @@ export function readPositionFile(dir: string, rel: string): string {
   ) {
     fail(`position file "${rel}" resolves outside the position directory.`);
   }
-  if (!existsSync(realTarget)) fail(`position file "${rel}" is missing.`);
   return readFileSync(realTarget, "utf8");
 }
 
@@ -281,12 +288,18 @@ export function loadPosition(name: string, opts: { root?: string } = {}): Loaded
     fail(`invalid position name ${JSON.stringify(name)} (must match ${POSITION_NAME}).`);
   const dir = join(root, name);
   const manifestPath = join(dir, "position.json");
-  if (!existsSync(manifestPath)) {
-    fail(`unknown position "${name}". Looked in ${root}.`);
+  let raw: string;
+  try {
+    raw = readFileSync(manifestPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      fail(`unknown position "${name}". Looked in ${root}.`);
+    }
+    throw err;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    parsed = JSON.parse(raw);
   } catch (err) {
     fail(`${manifestPath} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
   }

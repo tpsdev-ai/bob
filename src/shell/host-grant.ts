@@ -19,7 +19,7 @@
 // alongside, so `bob position diff` compares the current effective configuration
 // against what the operator ratified.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -71,12 +71,20 @@ function baselinePath(hostRoot: string, agent: string): string {
 // ratified — the state that keeps an ordinary `bob init` agent booting unchanged.
 export function readGrant(hostRoot: string, agent: string): HostGrant | undefined {
   const p = grantPath(hostRoot, agent);
-  if (!existsSync(p)) return undefined;
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as HostGrant;
+    raw = readFileSync(p, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw new Error(
+      `bob: the host grant for "${agent}" at ${p} is unreadable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read.`,
+    );
+  }
+  try {
+    return JSON.parse(raw) as HostGrant;
   } catch (err) {
     throw new Error(
-      `bob: the host grant for "${agent}" at ${p} is unreadable or unparsable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read.`,
+      `bob: the host grant for "${agent}" at ${p} is unparsable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read.`,
     );
   }
 }
@@ -90,8 +98,14 @@ export function writeGrant(hostRoot: string, grant: HostGrant): string {
 
 export function readBaseline(hostRoot: string, agent: string): RatifiedSnapshot | undefined {
   const p = baselinePath(hostRoot, agent);
-  if (!existsSync(p)) return undefined;
-  return JSON.parse(readFileSync(p, "utf8")) as RatifiedSnapshot;
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw err;
+  }
+  return JSON.parse(raw) as RatifiedSnapshot;
 }
 
 export function writeBaseline(hostRoot: string, agent: string, snap: RatifiedSnapshot): string {

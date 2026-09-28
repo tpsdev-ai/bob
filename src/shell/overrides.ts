@@ -109,10 +109,16 @@ export function validateOverrides(raw: unknown, source: string): Overrides {
 export function loadOverrides(agentDir: string): Overrides | undefined {
   const dir = overridesDir(agentDir);
   const docPath = join(dir, "overrides.json");
-  if (!existsSync(docPath)) return undefined;
+  let raw: string;
+  try {
+    raw = readFileSync(docPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw err;
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(docPath, "utf8"));
+    parsed = JSON.parse(raw);
   } catch (err) {
     refuse(`${docPath} is not valid JSON (${err instanceof Error ? err.message : String(err)}).`);
   }
@@ -120,8 +126,10 @@ export function loadOverrides(agentDir: string): Overrides | undefined {
   // Collect override files present in the tree.
   const filesDir = join(dir, "files");
   const present: string[] = [];
-  if (existsSync(filesDir)) {
+  try {
     collectFiles(filesDir, "", present);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
   }
   overrides.files = present;
   return overrides;
@@ -162,8 +170,14 @@ export function resolvePositionFiles(
 
   for (const f of position.manifest.files) {
     const overridePath = join(overridesDir(agentDir), "files", f.path);
-    if (existsSync(overridePath)) {
-      files[f.path] = readFileSync(overridePath, "utf8");
+    let overrideContent: string | undefined;
+    try {
+      overrideContent = readFileSync(overridePath, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    }
+    if (overrideContent !== undefined) {
+      files[f.path] = overrideContent;
       sources[f.path] = "override";
     } else {
       files[f.path] = readPositionFile(position.dir, f.path);
@@ -189,11 +203,16 @@ export function initOverrideRepo(agentDir: string): string {
   const dir = overridesDir(agentDir);
   mkdirSync(join(dir, "files"), { recursive: true, mode: 0o700 });
   const docPath = join(dir, "overrides.json");
-  if (!existsSync(docPath)) {
+  // `wx`: never clobber an existing document, and no existsSync-then-write
+  // window (CodeQL js/file-system-race). An existing document is left as-is.
+  try {
     writeFileSync(
       docPath,
       `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
+      { flag: "wx" },
     );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
   }
   if (!existsSync(join(dir, ".git"))) {
     git(["init", "--quiet"], dir);
