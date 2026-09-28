@@ -18,8 +18,15 @@
 // (host-grant.ts), not a Git ref.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
 
 export interface Overrides {
@@ -27,12 +34,21 @@ export interface Overrides {
     tools: string[];
     capabilities: string[];
   };
-  // Relative paths of override files present in the tree (validated later
-  // against the manifest allow-list).
+  // The override paths DECLARED in overrides.json (`files:`). Validated against
+  // the manifest allow-list at resolution — even when no file is present.
   files: string[];
+  // The override files PRESENT under `overrides/files/` (a directory scan).
+  // Validated against the manifest allow-list TOO. The declaration and the tree
+  // are checked INDEPENDENTLY, so neither a declared path the tree lacks nor an
+  // undeclared file the tree carries can slip through.
+  present: string[];
 }
 
-export const EMPTY_OVERRIDES: Overrides = { disable: { tools: [], capabilities: [] }, files: [] };
+export const EMPTY_OVERRIDES: Overrides = {
+  disable: { tools: [], capabilities: [] },
+  files: [],
+  present: [],
+};
 
 export function overridesDir(agentDir: string): string {
   return join(agentDir, "overrides");
@@ -100,40 +116,55 @@ export function validateOverrides(raw: unknown, source: string): Overrides {
       capabilities: toStringList(disableObj.capabilities, `${source}.disable.capabilities`),
     },
     files,
+    present: [],
   };
 }
 
-// Load the override layer for an agent. Returns undefined when there is no
-// overrides directory (a plain `bob init` agent, or an agent hired before this
-// slice). Throws (refusing boot) when the document is unreadable or carries an
-// unsupported key.
+// Load the override layer for an agent. Returns undefined only when there is NO
+// override layer at all (neither the document nor the files directory exists — a
+// plain `bob init` agent, or an agent hired before this slice). Throws (refusing
+// boot) when the document is unreadable or carries an unsupported key.
+//
+// The DECLARED list and the files PRESENT are kept SEPARATE. A missing document
+// is an empty declaration, not "no override layer": the tree is still scanned and
+// checked, so a file dropped under `overrides/files/` with no declaration is
+// still refused by resolvePositionFiles.
 export function loadOverrides(agentDir: string): Overrides | undefined {
   const dir = overridesDir(agentDir);
   const docPath = join(dir, "overrides.json");
-  let raw: string;
+  let declared: string[] = [];
+  let disable: Overrides["disable"] = { tools: [], capabilities: [] };
+  let raw: string | undefined;
+  let docPresent = false;
   try {
     raw = readFileSync(docPath, "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-    throw err;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    refuse(`${docPath} is not valid JSON (${err instanceof Error ? err.message : String(err)}).`);
-  }
-  const overrides = validateOverrides(parsed, "overrides.json");
-  // Collect override files present in the tree.
-  const filesDir = join(dir, "files");
-  const present: string[] = [];
-  try {
-    collectFiles(filesDir, "", present);
+    docPresent = true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
   }
-  overrides.files = present;
-  return overrides;
+  if (docPresent) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw as string);
+    } catch (err) {
+      refuse(`${docPath} is not valid JSON (${err instanceof Error ? err.message : String(err)}).`);
+    }
+    const validated = validateOverrides(parsed, "overrides.json");
+    declared = validated.files;
+    disable = validated.disable;
+  }
+  // Collect override files present in the tree.
+  const filesDir = join(dir, "files");
+  const present: string[] = [];
+  let filesDirPresent = false;
+  try {
+    collectFiles(filesDir, "", present);
+    filesDirPresent = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
+  if (!docPresent && !filesDirPresent) return undefined;
+  return { disable, files: declared, present };
 }
 
 function collectFiles(baseDir: string, prefix: string, out: string[]): void {
@@ -156,10 +187,47 @@ function readdirEntries(
   }>;
 }
 
+// Read an override file at `rel`, confined to the override files directory by
+// REALPATH — the same containment readPositionFile applies to packaged position
+// files. A symlink (or a path that resolves) outside the override tree is
+// refused rather than followed, so a local override can never make bob read (and
+// apply) a file outside the agent's own override tree.
+function readConfinedOverride(filesDir: string, rel: string): string | undefined {
+  assertRelativeSafe(rel, `override file "${rel}"`);
+  let realFilesDir: string;
+  try {
+    realFilesDir = realpathSync(filesDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw err;
+  }
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(join(filesDir, rel));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw err;
+  }
+  const relToDir = relative(realFilesDir, realTarget);
+  if (
+    relToDir === "" ||
+    relToDir === ".." ||
+    relToDir.startsWith(`..${sep}`) ||
+    isAbsolute(relToDir)
+  ) {
+    refuse(
+      `override file "${rel}" resolves outside the override directory (a symlink or an escaping path). A local override may only replace a packaged file at the same relative path, inside the agent's overrides/files directory.`,
+    );
+  }
+  return readFileSync(realTarget, "utf8");
+}
+
 // Resolve a position's packaged files against the override layer. For each
 // manifest file: an override file at the same relative path replaces it;
-// otherwise the packaged file is used. Override files that no manifest entry
-// allow-lists are REFUSED. Returns { rel -> content } plus the source of each.
+// otherwise the packaged file is used. BOTH the paths DECLARED in overrides.json
+// and the files PRESENT under overrides/files/ are checked against the manifest
+// allow-list, and every override read is realpath-confined. Returns
+// { rel -> content } plus the source of each.
 export function resolvePositionFiles(
   position: LoadedPosition,
   agentDir: string,
@@ -169,14 +237,29 @@ export function resolvePositionFiles(
   const files: Record<string, string> = {};
   const sources: Record<string, "position" | "override"> = {};
 
-  for (const f of position.manifest.files) {
-    const overridePath = join(overridesDir(agentDir), "files", f.path);
-    let overrideContent: string | undefined;
-    try {
-      overrideContent = readFileSync(overridePath, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  if (overrides) {
+    // A DECLARED path must be allow-listed by the manifest — even when the tree
+    // has no such file. The old code dropped the declaration list entirely, so a
+    // declared-but-absent path was invisible.
+    for (const rel of overrides.files) {
+      if (!allowed.has(rel)) {
+        refuse(
+          `override file "${rel}" is declared in overrides.json but is not allow-listed by the "${position.manifest.name}" position. A local file may only replace a packaged file at the same path.`,
+        );
+      }
     }
+    // A PRESENT file must be allow-listed too, whether or not a document exists.
+    for (const rel of overrides.present) {
+      if (!allowed.has(rel)) {
+        refuse(
+          `override file "${rel}" is present in the override tree but is not allow-listed by the "${position.manifest.name}" position. A local file may only replace a packaged file at the same path.`,
+        );
+      }
+    }
+  }
+
+  for (const f of position.manifest.files) {
+    const overrideContent = readConfinedOverride(join(overridesDir(agentDir), "files"), f.path);
     if (overrideContent !== undefined) {
       // The soul is the persona: a local override may replace a skill, prompt
       // or threshold file, but never the soul. Slice 1 ships soul-only
@@ -191,16 +274,6 @@ export function resolvePositionFiles(
     } else {
       files[f.path] = readPositionFile(position.dir, f.path);
       sources[f.path] = "position";
-    }
-  }
-
-  if (overrides) {
-    for (const rel of overrides.files) {
-      if (!allowed.has(rel)) {
-        refuse(
-          `override file "${rel}" is not allow-listed by the "${position.manifest.name}" position. A local file may only replace a packaged file at the same path.`,
-        );
-      }
     }
   }
   return { files, sources };

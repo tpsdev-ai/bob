@@ -16,16 +16,17 @@
 // compares the instance's requests against that frozen grant on every boot.
 //
 // Slice 1 loads only positions shipped under bob's own packaged `positions/`
-// directory. A `path:` spelling is accepted only when its resolved target stays
-// inside that directory. Arbitrary `path:`/`npm:`/`git:` sources are a later
-// slice with its own security review.
+// directory, referenced by a SINGLE top-level name — a bare name (`builder`) or
+// the `path:<name>` spelling — and realpath-confined to that directory, so a
+// symlink that escapes it is refused. Nested references and arbitrary
+// `path:`/`npm:`/`git:` sources are a later slice with its own security review.
 //
 // The position HASH covers the manifest and the path + contents of every
 // packaged file the resolver uses, so a host grant can pin the exact artifact.
 
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Same path-safety class as loadRole: a position name becomes a path segment.
@@ -298,31 +299,34 @@ export function readPositionFile(dir: string, rel: string): string {
 }
 
 // Resolve a position REFERENCE to a directory inside the packaged positions
-// root. Two spellings are accepted:
+// root. Both spellings accept only a SINGLE top-level name:
 //
-//   * a bare name (`builder`) — a single path segment under the root;
-//   * the spec's confined `path:<relative>` form (`path:builder`) — a relative
-//     path resolved under the root and realpath-confined to stay inside it, so
-//     `path:../escape` and a symlink out of the tree are refused.
+//   * a bare name (`builder`);
+//   * the spec's `path:<name>` form (`path:builder`).
 //
-// The directory's basename is the position's declared name (manifest.name must
-// match it), so a grant always pins a bare name that reloads the same position
-// at boot.
+// The name must match POSITION_NAME, so a nested or multi-segment reference
+// (`path:a/b`, `path:../escape`) is refused. The resolved directory is then
+// realpath-confined to the root, so a symlink that escapes the packaged
+// positions directory is refused too. The declared name is the segment itself,
+// which equals the directory's basename (manifest.name must match it), so a
+// grant always pins a name that reloads the same position at boot.
 function resolvePositionDir(root: string, ref: string): { dir: string; name: string } {
-  if (!ref.startsWith("path:")) {
-    if (!POSITION_NAME.test(ref))
-      fail(`invalid position name ${JSON.stringify(ref)} (must match ${POSITION_NAME}).`);
-    return { dir: join(root, ref), name: ref };
+  const isPath = ref.startsWith("path:");
+  const rel = isPath ? ref.slice("path:".length) : ref;
+  if (!POSITION_NAME.test(rel)) {
+    fail(
+      isPath
+        ? `position reference ${JSON.stringify(ref)} must be a single top-level name under the positions directory (e.g. "path:builder"); nested or multi-segment references are not supported in slice 1.`
+        : `invalid position name ${JSON.stringify(ref)} (must match ${POSITION_NAME}).`,
+    );
   }
-  const rel = ref.slice("path:".length);
-  assertRelativeSafe(rel, `position reference ${JSON.stringify(ref)}`);
   const realRoot = realpathSync(root);
   let realDir: string;
   try {
     realDir = realpathSync(join(root, rel));
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT")
-      fail(`unknown position reference ${JSON.stringify(ref)}. Looked in ${root}.`);
+      fail(`unknown position "${rel}". Looked in ${root}.`);
     throw err;
   }
   const relToRoot = relative(realRoot, realDir);
@@ -333,10 +337,10 @@ function resolvePositionDir(root: string, ref: string): { dir: string; name: str
     isAbsolute(relToRoot)
   ) {
     fail(
-      `position reference ${JSON.stringify(ref)} resolves outside the packaged positions directory. A path-form position must stay inside ${root}.`,
+      `position reference ${JSON.stringify(ref)} resolves outside the packaged positions directory (a symlink or an escaping path). A slice-1 position must stay inside ${root}.`,
     );
   }
-  return { dir: realDir, name: basename(realDir) };
+  return { dir: realDir, name: rel };
 }
 
 // Load and validate a packaged position. `root` is injectable so tests can point

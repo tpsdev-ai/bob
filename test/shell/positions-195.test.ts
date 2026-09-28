@@ -10,9 +10,17 @@
 // behaviour on head 3b874cb that the test fails against.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   adoptAgent,
   BINDING_MARKER,
@@ -20,13 +28,17 @@ import {
   DEFAULT_POSITIONS_ROOT,
   hireAgent,
   initAgent,
+  type LoadedPosition,
   loadPosition,
+  overridesDir,
+  type PositionManifest,
   positionDiff,
   type RunSession,
   type RunSessionConfig,
   readBaseline,
   readBindingMarker,
   readGrant,
+  resolvePositionFiles,
   resolveRunConfig,
   runAgent,
   runAlign,
@@ -822,5 +834,251 @@ describe("positions (bob#195) — an un-adopted `bob init` agent boots unchanged
     expect(sink[0].extensionSources.length).toBe(1);
     expect(sink[0].tools).toContain("flair_search");
     expect(existsSync(join(s.agentsRoot, "plain", "overrides"))).toBe(false);
+  });
+});
+
+// ===========================================================================
+// ROUND 3
+// ===========================================================================
+
+// Build a LoadedPosition by hand so a test can name a NON-soul packaged file
+// (slice 1 refuses such a manifest through loadPosition, but resolvePositionFiles
+// itself is kind-agnostic, and that is exactly what the override checks guard).
+function loadedPosition(
+  files: Array<{ path: string; kind: string }>,
+  dirFiles: Record<string, string> = {},
+): LoadedPosition {
+  const dir = mkdtempSync(join(tmpdir(), "bob-pos-dir-"));
+  for (const [rel, content] of Object.entries(dirFiles)) {
+    const p = join(dir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, content);
+  }
+  const manifest = {
+    name: "cand",
+    version: "0.1.0",
+    role: "coder",
+    tools: ["read"],
+    capabilities: { permitted: [], default: [] },
+    files,
+    secrets: [],
+    thresholds: [],
+  } as unknown as PositionManifest;
+  return { manifest, dir, hash: "deadbeef" } as unknown as LoadedPosition;
+}
+
+// A scratch agent dir with an overrides/files tree but nothing inside it yet.
+function scratchAgentDir(name: string): string {
+  const dir = join(s.agentsRoot, name);
+  mkdirSync(join(dir, "overrides", "files"), { recursive: true });
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 3, blocker 1 — the grant is tamper-EVIDENT: a same-user write is detected at boot", () => {
+  it("a plain fs write to the resolved grant path is DETECTED: boot refuses the edited grant", async () => {
+    await hireBuilder("tf1");
+    expect(() => resolve("tf1")).not.toThrow();
+    const g = JSON.parse(readFileSync(grantFile("tf1"), "utf8"));
+    // The exact write a built-in file tool performs when it is handed this
+    // absolute path: the placement is not a wall, so boot must DETECT the edit.
+    writeFileSync(
+      grantFile("tf1"),
+      `${JSON.stringify({ ...g, position: { ...g.position, hash: "0".repeat(64) } }, null, 2)}\n`,
+    );
+    expect(() => resolve("tf1")).toThrow(/ratified hash/);
+  });
+
+  it("a truncated/unparsable grant is a LOUD refusal, never a fallback", async () => {
+    await hireBuilder("tf2");
+    expect(() => resolve("tf2")).not.toThrow();
+    writeFileSync(grantFile("tf2"), "not json at all\n");
+    expect(() => resolve("tf2")).toThrow(/unparsable/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 3, blocker 2 — marker PRESENCE decides, contents never do", () => {
+  const markerPath = (name: string) => bindingMarkerPath(join(s.agentsRoot, name));
+
+  it("a MALFORMED (unparsable) marker still counts as present and refuses boot, naming the file", async () => {
+    await hireBuilder("mk1");
+    rmSync(grantFile("mk1"));
+    writeFileSync(markerPath("mk1"), "{ not json\n");
+    let err: unknown;
+    try {
+      resolve("mk1");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/grant is missing/i);
+    expect(msg).toContain(markerPath("mk1"));
+  });
+
+  it("a FALSEY-JSON marker (`null`) is still PRESENT and refuses boot", async () => {
+    await hireBuilder("mk2");
+    rmSync(grantFile("mk2"));
+    writeFileSync(markerPath("mk2"), "null");
+    let err: unknown;
+    try {
+      resolve("mk2");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(String((err as Error)?.message)).toContain(markerPath("mk2"));
+  });
+
+  it("a well-formed marker with no grant refuses boot, naming the marker file", async () => {
+    await hireBuilder("mk3");
+    rmSync(grantFile("mk3"));
+    let err: unknown;
+    try {
+      resolve("mk3");
+    } catch (e) {
+      err = e;
+    }
+    expect(String((err as Error)?.message)).toContain(markerPath("mk3"));
+  });
+
+  it("no marker and no grant is an ordinary un-adopted agent (it does not refuse)", () => {
+    const agentDir = scratchAgentDir("mk4");
+    writeFileSync(join(agentDir, "bob.yaml"), "agent:\n  role: custom\n\nbob:\n");
+    expect(readBindingMarker(agentDir)).toBeUndefined();
+    expect(existsSync(bindingMarkerPath(agentDir))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 3, blocker 3 — declared and present override paths are BOTH checked; reads are confined", () => {
+  it("refuses a path DECLARED in overrides.json that the manifest does not allow-list (even when absent)", () => {
+    const agentDir = scratchAgentDir("ovd1");
+    writeFileSync(
+      join(overridesDir(agentDir), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [{ path: "ghost.md" }] }, null, 2)}\n`,
+    );
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    let err: unknown;
+    try {
+      resolvePositionFiles(pos, agentDir);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/ghost\.md/);
+    expect(msg).toMatch(/declared/);
+  });
+
+  it("refuses a file PRESENT under overrides/files/ with NO document (the tree is checked regardless)", () => {
+    const agentDir = scratchAgentDir("ovd2");
+    // No overrides.json at all — only the stray file the tree carries.
+    writeFileSync(join(overridesDir(agentDir), "files", "evil.md"), "stray\n");
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    expect(() => resolvePositionFiles(pos, agentDir)).toThrow(/evil\.md/);
+  });
+
+  it("realpath-confines an override read: a symlink that escapes the override tree is refused", () => {
+    const agentDir = scratchAgentDir("ovd3");
+    const outside = join(s.base, "outside-secret.txt");
+    writeFileSync(outside, "OUTSIDE\n");
+    writeFileSync(
+      join(overridesDir(agentDir), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [{ path: "keep.md" }] }, null, 2)}\n`,
+    );
+    symlinkSync(outside, join(overridesDir(agentDir), "files", "keep.md"));
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    let err: unknown;
+    try {
+      resolvePositionFiles(pos, agentDir);
+    } catch (e) {
+      err = e;
+    }
+    expect(String((err as Error)?.message)).toMatch(/resolves outside/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 3, blocker 4 — both reference forms are a single top-level name, stable across hire and boot", () => {
+  it("hires and boots by bare name AND by the `path:` form, resolving the same position each time", async () => {
+    await hireAgent({
+      name: "ref1",
+      positionName: "builder",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+      skipFlair: true,
+      interview: noopInterview,
+    });
+    expect(readGrant(s.hostRoot, "ref1")?.position.name).toBe("builder");
+    const sink1: RunSessionConfig[] = [];
+    await runAgent({
+      name: "ref1",
+      prompt: "go",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+      sessionFactory: capturingFactory(sink1),
+    });
+    expect(sink1[0].tools).toContain("read");
+
+    await hireAgent({
+      name: "ref2",
+      positionName: "path:builder",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+      skipFlair: true,
+      interview: noopInterview,
+    });
+    // The grant pins the TOP-LEVEL name, so boot reloads the same directory.
+    expect(readGrant(s.hostRoot, "ref2")?.position.name).toBe("builder");
+    const sink2: RunSessionConfig[] = [];
+    await runAgent({
+      name: "ref2",
+      prompt: "go",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+      sessionFactory: capturingFactory(sink2),
+    });
+    expect(sink2[0].tools).toContain("read");
+  });
+
+  it("refuses a NESTED `path:` reference at hire, naming the rule, with nothing committed", async () => {
+    const nestedDir = join(s.positionsRoot, "sub", "nested");
+    mkdirSync(nestedDir, { recursive: true });
+    writeFileSync(
+      join(nestedDir, "position.json"),
+      `${JSON.stringify(
+        {
+          name: "nested",
+          version: "0.1.0",
+          role: "coder",
+          tools: ["read"],
+          capabilities: { permitted: [], default: [] },
+          files: [{ path: "soul.md", kind: "soul" }],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    writeFileSync(join(nestedDir, "soul.md"), "nested soul\n");
+    let err: unknown;
+    try {
+      await hireAgent({
+        name: "ref3",
+        positionName: "path:sub/nested",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: s.positionsRoot,
+        skipFlair: true,
+        interview: noopInterview,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(String((err as Error)?.message)).toMatch(/single top-level name/);
+    expect(existsSync(join(s.agentsRoot, "ref3"))).toBe(false);
   });
 });

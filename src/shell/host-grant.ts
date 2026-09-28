@@ -13,15 +13,20 @@
 // any intersection, applies the narrow-only local disables, and only then runs
 // the existing validators.
 //
-// The grant is TAMPER-EVIDENT, NOT tamper-proof. It is stored OUTSIDE every
-// agent-addressable path — never under the agent's directory (~/agents/<name>/)
-// and never under its session cwd — so the tools the position can hand the agent
-// (`write`, `edit`, the anchored-edit tools) cannot address it by path
-// containment, and a grant that is missing or unreadable is a LOUD refusal, not
-// a silent fallback. But an agent running as the SAME OS user with a shell can
-// still edit host files: real isolation is the sandbox work (bob#189), which
-// slice 1 does not ship. That is the whole guarantee: the honest tool authority
-// cannot reach the grant, and the OS user boundary is a later slice.
+// The grant is TAMPER-EVIDENT, NOT tamper-proof. It is stored under the host
+// state root (~/.bob/host) — outside the agent's directory (~/agents/<name>/)
+// and outside its session cwd — but that placement is NOT a containment
+// boundary. Any same-user writer can modify the grant file, and that includes
+// the agent's OWN built-in file tools: pi resolves `write`/`edit` paths outside
+// the session cwd, so a positioned agent (and its setup session) can write the
+// grant path directly. What makes the grant evidence, rather than a wall, is
+// that boot re-reads and checks it: a grant that is missing or unreadable is a
+// LOUD refusal (never a silent fallback), and every boot compares the grant's
+// pinned position name, version and hash and role against the packaged position
+// (and enforces both the packaged role ceiling and the ratified maxima), so a
+// grant edited to disagree with the packaged position fails closed. A same-user
+// writer can still produce a grant that keeps those checks passing: real
+// isolation is the sandbox work (bob#189), which slice 1 does not ship.
 //
 // The "previously bound" guard: hire and adoption also write a small binding
 // marker INTO the agent's directory (`.position-binding.json`). The marker is
@@ -108,9 +113,23 @@ export function bindingMarkerPath(agentDir: string): string {
   return join(agentDir, BINDING_MARKER);
 }
 
-// Read the binding marker. Returns undefined when the agent was never bound.
-// An UNREADABLE marker is treated as present (the conservative reading: a
-// bound-looking agent must not fall back).
+// A present marker whose contents cannot be used. Presence is the evidence;
+// contents never decide, so an unreadable, malformed, or falsey-JSON marker is
+// still PRESENT (it just carries no diagnostic fields).
+const PRESENT_UNREADABLE_MARKER: PositionBindingMarker = {
+  agent: "",
+  position: "",
+  role: "",
+  ratifiedAt: "",
+};
+
+// Read the binding marker. PRESENCE decides, contents never do: this returns
+// undefined ONLY when the marker file is ABSENT. A marker that exists but is
+// unreadable, not valid JSON, or valid-but-falsey JSON (`null`, `0`, `false`,
+// `""`, `[]`) is still PRESENT — that is what makes the caller refuse a missing
+// grant rather than fall back to legacy resolution. The parsed marker is
+// returned when the content is a JSON object, so diagnostics can read its
+// fields; otherwise the sentinel stands in for "present but unusable".
 export function readBindingMarker(agentDir: string): PositionBindingMarker | undefined {
   const p = bindingMarkerPath(agentDir);
   let raw: string;
@@ -118,13 +137,18 @@ export function readBindingMarker(agentDir: string): PositionBindingMarker | und
     raw = readFileSync(p, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-    return { agent: "", position: "", role: "", ratifiedAt: "" };
+    return PRESENT_UNREADABLE_MARKER;
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as PositionBindingMarker;
+    parsed = JSON.parse(raw);
   } catch {
-    return { agent: "", position: "", role: "", ratifiedAt: "" };
+    return PRESENT_UNREADABLE_MARKER;
   }
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed as PositionBindingMarker;
+  }
+  return PRESENT_UNREADABLE_MARKER;
 }
 
 export function writeBindingMarker(agentDir: string, grant: HostGrant): string {

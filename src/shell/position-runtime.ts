@@ -34,6 +34,7 @@ import {
   snapshotForDiff,
 } from "./effective-config.js";
 import {
+  bindingMarkerPath,
   defaultHostRoot,
   type HostGrant,
   type PositionBindingMarker,
@@ -434,7 +435,7 @@ export function resolveAdoptedConfig(input: {
     const marker = readBindingMarker(input.agentDir);
     if (marker) {
       refuse(
-        `${input.name} was bound to a position (binding marker present) but its host grant is missing from the host state root. Refusing to boot an adopted agent whose trust root cannot be read — there is no fallback to legacy, unratified resolution. Re-run 'bob position adopt' with the operator, or restore the grant.`,
+        `${input.name} was bound to a position but its host grant is missing from the host state root (the binding marker ${bindingMarkerPath(input.agentDir)} is present). Refusing to boot an adopted agent whose trust root cannot be read — there is no fallback to legacy, unratified resolution. Restore the grant, or re-run 'bob position adopt ${input.name} --as <position>' with the operator; if the marker is stale, remove it.`,
       );
     }
     return undefined;

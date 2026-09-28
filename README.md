@@ -66,7 +66,8 @@ names an existing **role** (it never carries or edits one), and declares the
 tools it requests, the capabilities it permits (and which are on by default),
 and the packaged files it uses (a seed soul; skill, prompt and threshold files
 are later slices, and a manifest that declares one is REFUSED until it loads).
-`builder-local` (bob#185) becomes a position over its role once that lands.
+`builder-local` (bob#185) ships as a **role**; a `builder-local` position over it is a
+later slice.
 
 The trust layers, from the top down:
 
@@ -82,17 +83,18 @@ The trust layers, from the top down:
    the existing validators. Changing `bob.yaml` cannot select another role or add
    a grant.
 
-   **The grant is TAMPER-EVIDENT, not tamper-proof.** It is stored outside every
-   agent-addressable path — never under the agent's directory or its session cwd
-   — so the tools a position can hand the agent (`write`, `edit`, the
-   anchored-edit tools) cannot address it by path containment. And a previously
-   bound agent whose grant is missing or unreadable REFUSES to boot: hire and
-   adoption write a binding marker into the agent directory, and a marker with no
-   readable grant is a loud refusal, never a silent fallback to unratified legacy
-   resolution. It is NOT a security boundary against the OS user: an agent
-   running as the SAME user with a shell can still edit host files. Real
-   isolation is the sandbox work (bob#189), which slice 1 does not ship — that is
-   the honest guarantee.
+   **The grant is TAMPER-EVIDENT, not tamper-proof.** It is stored under the host
+   state root (`~/.bob/host`), outside the agent's directory and its session cwd
+   — but that placement is NOT a containment boundary. Any same-user writer can
+   modify the grant file, and that includes the agent's own built-in file tools
+   (`write`, `edit`), which resolve paths outside the session cwd; the sandbox
+   work (bob#189) is the real boundary, and slice 1 does not ship it. What the
+   grant gives is **evidence**: every boot re-reads and checks it, so a grant that
+   is missing or unreadable is a loud refusal, and a grant edited to disagree with
+   the packaged position (its pinned name, version, hash or role) fails closed. A
+   previously bound agent is pinned by a binding marker in its directory: if the
+   marker file exists and the grant is missing, boot REFUSES — never a silent
+   fallback to unratified legacy resolution.
 3. **Position** — the declared requests, which the grant must cover.
 4. **Instance** — the agent's `bob.yaml`, which may only narrow within the grant.
 5. **Overrides** — `~/agents/<name>/overrides/`, a per-agent Git repository that
@@ -128,14 +130,17 @@ positions, presented as a local identity. An ADOPTED agent's setup session
 `write` tool the interview needs to write `soul.md`, and nothing else.
 
 An agent with no grant is not adopted: it resolves exactly as before, so every
-existing `bob init` agent keeps booting unchanged.
+existing `bob init` agent keeps booting unchanged. The one exception is the
+binding marker: an agent whose marker file exists but whose grant is missing is
+treated as BOUND, and boot refuses rather than falling back.
 
 **Later slices:** position upgrade (staged, verified, atomic), arbitrary
 `path:`/`npm:`/`git:` sources (with their own security review), host secret
 bindings, skill/prompt/threshold files and their consumers, the model selector,
 the performance review, full jarvis and new comms. Slice 1 loads only positions
-shipped under bob's own `positions/` directory, referenced by bare name or by the
-confined `path:<relative>` spelling (a path that resolves inside that directory).
+shipped under bob's own `positions/` directory, referenced by a single top-level
+name — a bare name or the `path:<name>` spelling — after realpath confinement to
+that directory.
 
 ## Operator guarantees, and the tests that pin them
 
