@@ -1,216 +1,531 @@
+// The tps-mail inbox consumer (bob#200). Temp maildirs, throwaway keys, and
+// injected turn/reply seams — or a fake launcher script where the real spawn
+// path is the thing under test. Never real mail, never the real tps.
+//
+// ACCEPTANCE (each shown RED without its control in the PR's mutation record):
+//   (a2) a sender outside the allow-list lands in refused/ and never reaches a session
+//   (a4) kill the runtime mid-turn: re-delivered, exactly one reply
+//   (a5) kill it after the reply and before the ack: no second reply (marker)
+//   (a6) a tool-only turn sends no reply
+//   (a7) a turn past the timeout is killed and stays in new/
+//   (a8) the lock is not taken from a live pid
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MailConsumer, type MailMessage } from "../../src/shell/mail-consumer.js";
+import type { MailTurnInput } from "../../src/capabilities/tps-mail/prompt.js";
+import type { ReplyRequest, ReplyResult } from "../../src/capabilities/tps-mail/reply.js";
+import {
+  MailConsumer,
+  type MailConsumerOptions,
+  type TurnOutcome,
+} from "../../src/shell/mail-consumer.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  type TestKey,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 
-describe("MailConsumer", () => {
-  let tmpInbox: string;
-  let tmpLock: string;
+let root: string;
+let inbox: string;
+let lockFile: string;
+let statsFile: string;
+let flint: TestKey;
+let mallory: TestKey;
+let clock: number;
+const children: ChildProcess[] = [];
 
-  const writeMail = (name: string, body: string): string => {
-    const path = join(tmpInbox, "new", `${name}.json`);
-    writeFileSync(
-      path,
-      JSON.stringify({
-        id: name,
-        from: "flint",
-        to: "testbot",
-        body,
-        timestamp: new Date().toISOString(),
-      }),
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), "bob-mail-"));
+  inbox = join(root, "inbox");
+  lockFile = join(root, "lock", "testbot.lock");
+  statsFile = join(root, "stats.json");
+  flint = testKey();
+  mallory = testKey();
+  clock = 1_000_000;
+});
+
+afterEach(() => {
+  for (const c of children.splice(0)) c.kill("SIGKILL");
+  rmSync(root, { recursive: true, force: true });
+});
+
+// A signed mail from `from` (key `key`) to testbot, written into new/.
+function deliver(
+  file: string,
+  opts: { from?: string; key?: TestKey; body?: string; messageId?: string; record?: object } = {},
+): string {
+  const from = opts.from ?? "flint";
+  const env = signTestEnvelope(
+    {
+      from,
+      to: "testbot",
+      body: opts.body ?? "SMOKE: reply SMOKE-OK",
+      messageId: opts.messageId ?? `id-${file}`,
+    },
+    opts.key ?? flint,
+  );
+  return writeRecord(inbox, file, { ...mailRecord(env), ...(opts.record ?? {}) });
+}
+
+interface Harness {
+  consumer: MailConsumer;
+  turns: MailTurnInput[];
+  replies: ReplyRequest[];
+  logs: string[];
+}
+
+function harness(
+  overrides: Partial<MailConsumerOptions> & {
+    turn?: (input: MailTurnInput, signal: AbortSignal) => Promise<TurnOutcome>;
+    reply?: (r: ReplyRequest) => Promise<ReplyResult>;
+  } = {},
+): Harness {
+  const turns: MailTurnInput[] = [];
+  const replies: ReplyRequest[] = [];
+  const logs: string[] = [];
+  const { turn, reply, ...rest } = overrides;
+  const consumer = new MailConsumer({
+    name: "testbot",
+    identity: "testbot",
+    inboxRoot: inbox,
+    senders: ["flint"],
+    resolveKey: keyResolver({ flint, mallory }),
+    lockFile,
+    statsFile,
+    pollIntervalMs: 60_000,
+    now: () => clock,
+    log: (m) => logs.push(m),
+    runTurn: async (input, signal) => {
+      turns.push(input);
+      return turn ? turn(input, signal) : { kind: "final", text: "SMOKE-OK" };
+    },
+    sendReply: async (r) => {
+      replies.push(r);
+      return reply ? reply(r) : { ok: true };
+    },
+    ...rest,
+  });
+  return { consumer, turns, replies, logs };
+}
+
+const inDir = (dir: string) =>
+  existsSync(join(inbox, dir))
+    ? readdirSync(join(inbox, dir)).filter((f) => f.endsWith(".json"))
+    : [];
+
+// A pid that is certainly dead: a child that already exited.
+async function deadPid(): Promise<number> {
+  const c = spawn("true");
+  await new Promise((r) => c.on("exit", r));
+  if (c.pid === undefined) throw new Error("no pid");
+  return c.pid;
+}
+
+describe("accepting mail (§2)", () => {
+  it("(a2) a validly signed sender outside the allow-list → refused/, never a turn, never a reply", async () => {
+    deliver("1.json", { from: "mallory", key: mallory });
+    const h = harness();
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(0);
+    expect(h.replies).toHaveLength(0);
+    expect(inDir("refused")).toEqual(["1.json"]);
+    expect(inDir("new")).toEqual([]);
+    expect(inDir("cur")).toEqual([]);
+    expect(readFileSync(join(inbox, "refused", "1.json.reason"), "utf8")).toMatch(
+      /^reason: sender-not-allowed/,
     );
-    return path;
-  };
-
-  beforeEach(() => {
-    tmpInbox = mkdtempSync(join(tmpdir(), "bob-inbox-"));
-    tmpLock = mkdtempSync(join(tmpdir(), "bob-lock-"));
-    mkdirSync(join(tmpInbox, "new"), { recursive: true });
-    mkdirSync(join(tmpInbox, "cur"), { recursive: true });
+    expect(h.consumer.stats.refused["sender-not-allowed"]).toBe(1);
   });
 
-  afterEach(() => {
-    rmSync(tmpInbox, { recursive: true, force: true });
-    rmSync(tmpLock, { recursive: true, force: true });
+  it("an inner/outer from mismatch → refused/ (from-mismatch), never a turn", async () => {
+    deliver("1.json", { record: { from: "flint-impostor" } });
+    const h = harness();
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(0);
+    expect(inDir("refused")).toEqual(["1.json"]);
+    expect(h.consumer.stats.refused["from-mismatch"]).toBe(1);
   });
 
-  it("rejects invalid agent names", () => {
-    expect(() => new MailConsumer({ name: "../etc", inboxRoot: tmpInbox })).toThrow(
+  it("unsigned mail and a bad signature are refused and counted per reason", async () => {
+    writeRecord(inbox, "1.json", mailRecord("plain text body", { from: "flint" }));
+    deliver("2.json", { key: mallory }); // signed as flint with the wrong key
+    writeFileSync(join(inbox, "new", "3.json"), "{not json");
+    const h = harness();
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(0);
+    expect(h.consumer.stats.refused).toMatchObject({
+      unsigned: 1,
+      "bad-signature": 1,
+      malformed: 1,
+    });
+    expect(inDir("refused").sort()).toEqual(["1.json", "2.json", "3.json"]);
+  });
+
+  it("a key lookup Flair cannot answer leaves the mail in new/ (a retry, never a refusal)", async () => {
+    deliver("1.json");
+    const h = harness({
+      resolveKey: async () => {
+        throw new Error("Flair unreachable");
+      },
+    });
+    await h.consumer.poll();
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(inDir("refused")).toEqual([]);
+    expect(h.consumer.stats.verifyUnavailable).toBe(1);
+    expect(h.turns).toHaveLength(0);
+  });
+
+  it("refuses to construct with an empty allow-list or an invalid identity", () => {
+    const base = {
+      name: "testbot",
+      identity: "testbot",
+      inboxRoot: inbox,
+      resolveKey: keyResolver({}),
+    };
+    expect(() => new MailConsumer({ ...base, senders: [] })).toThrow(/empty senders/);
+    expect(() => new MailConsumer({ ...base, senders: ["fl*"] })).toThrow(/exact TPS id/);
+    expect(() => new MailConsumer({ ...base, senders: ["flint"], identity: "-x" })).toThrow();
+    expect(() => new MailConsumer({ ...base, senders: ["flint"], name: "../etc" })).toThrow(
       /invalid agent name/,
     );
   });
+});
 
-  it("processes a new mail message and moves it to cur/", async () => {
-    const seen: MailMessage[] = [];
-    writeMail("msg1", "hello");
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async (msg) => {
-        seen.push(msg);
-      },
-    });
-    consumer.start();
-    await consumer.poll();
-    consumer.stop();
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0].body).toBe("hello");
-    expect(existsSync(join(tmpInbox, "new", "msg1.json"))).toBe(false);
-    expect(existsSync(join(tmpInbox, "cur", "msg1.json"))).toBe(true);
-    expect(consumer.stats.processed).toBe(1);
+describe("one turn per accepted mail, and the reply (§1, §5)", () => {
+  it("runs one turn with the VERIFIED fields and replies to the verified sender, threaded", async () => {
+    deliver("1.json", { body: "hello bob", messageId: "m-1" });
+    const h = harness();
+    await h.consumer.poll();
+    expect(h.turns).toEqual([{ sender: "flint", messageId: "m-1", body: "hello bob" }]);
+    expect(h.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "SMOKE-OK" }]);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    const marker = JSON.parse(readFileSync(join(inbox, "replied", "m-1"), "utf8"));
+    expect(marker).toMatchObject({ inboundId: "m-1", outcome: "replied", to: "flint" });
+    expect(h.consumer.stats).toMatchObject({ processed: 1, replied: 1 });
+    expect(h.logs.join("\n")).toContain("replied to flint (in reply to m-1");
   });
 
-  it("processes mail that arrived BEFORE start (fixes openclaw startup-race bug)", async () => {
-    // openclaw-tps-mail pre-populated seenFiles on boot and stranded
-    // pre-existing mail. Bob must NOT do that.
-    writeMail("existing", "pre-existing message");
-    const seen: MailMessage[] = [];
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async (msg) => {
-        seen.push(msg);
-      },
-    });
-    consumer.start();
-    await consumer.poll();
-    consumer.stop();
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0].id).toBe("existing");
+  it("processes new/ oldest first by filename, whatever order the directory lists", async () => {
+    for (const f of [
+      "2026-09-28T12-00-03.json",
+      "2026-09-28T12-00-01.json",
+      "2026-09-28T12-00-02.json",
+    ]) {
+      deliver(f, { messageId: `m-${f.slice(17, 19)}` });
+    }
+    const h = harness();
+    await h.consumer.poll();
+    expect(h.turns.map((t) => t.messageId)).toEqual(["m-01", "m-02", "m-03"]);
   });
 
-  it("does not double-process a message across multiple polls", async () => {
-    writeMail("once", "process me exactly once");
-    const seen: MailMessage[] = [];
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async (msg) => {
-        seen.push(msg);
-      },
+  it("caps the reply at maxReplyChars", async () => {
+    deliver("1.json");
+    const h = harness({
+      maxReplyChars: 20,
+      turn: async () => ({ kind: "final", text: "y".repeat(100) }),
     });
-    consumer.start();
-    await consumer.poll();
-    await consumer.poll();
-    await consumer.poll();
-    consumer.stop();
-
-    expect(seen).toHaveLength(1);
+    await h.consumer.poll();
+    expect(h.replies[0]?.body).toBe(`${"y".repeat(19)}…`);
   });
 
-  it("picks up mail that arrives after start()", async () => {
-    const seen: MailMessage[] = [];
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async (msg) => {
-        seen.push(msg);
-      },
-    });
-    consumer.start();
-    // Mail arrives AFTER start
-    writeMail("postStart", "arrived after start");
-    await consumer.poll();
-    consumer.stop();
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0].id).toBe("postStart");
+  it("(a6) a tool-only turn (settled, no final message) sends NO reply and is acked", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const h = harness({ turn: async () => ({ kind: "silent" }) });
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(0);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(JSON.parse(readFileSync(join(inbox, "replied", "m-1"), "utf8")).outcome).toBe(
+      "no-reply",
+    );
+    expect(h.consumer.stats.noReply).toBe(1);
   });
 
-  it("counts failed dispatches in stats but doesn't crash", async () => {
-    writeMail("bad", "this will fail");
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async () => {
-        throw new Error("dispatch boom");
-      },
+  it("a FAILED turn sends no reply, stays in new/, and is retried only after its backoff", async () => {
+    deliver("1.json");
+    let fail = true;
+    const h = harness({
+      retryBaseMs: 1000,
+      turn: async () =>
+        fail
+          ? { kind: "failed", reason: "exit", detail: "provider 429" }
+          : { kind: "final", text: "ok" },
     });
-    consumer.start();
-    await consumer.poll();
-    consumer.stop();
-
-    expect(consumer.stats.failed).toBe(1);
-    expect(consumer.stats.processed).toBe(0);
-    // Poison mail stays in new/ (not moved to cur on failure)
-    expect(existsSync(join(tmpInbox, "new", "bad.json"))).toBe(true);
+    await h.consumer.poll();
+    expect(h.replies).toHaveLength(0);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(h.consumer.stats.dispatchFailed).toBe(1);
+    await h.consumer.poll(); // no hot loop: the backoff has not passed
+    expect(h.turns).toHaveLength(1);
+    clock += 1001;
+    fail = false;
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(2);
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("cur")).toEqual(["1.json"]);
   });
 
-  it("does not re-process a previously-failed message in the same session", async () => {
-    writeMail("bad", "fail me");
-    let attempts = 0;
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async () => {
-        attempts += 1;
-        throw new Error("nope");
-      },
+  it("a failed SEND is counted, stays in new/, and the retry resends without a second turn", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    let sendOk = false;
+    const h = harness({
+      retryBaseMs: 1000,
+      reply: async () =>
+        sendOk ? { ok: true } : { ok: false, reason: "cli-missing", detail: "tps not found" },
     });
-    consumer.start();
-    await consumer.poll();
-    await consumer.poll();
-    await consumer.poll();
-    consumer.stop();
-
-    expect(attempts).toBe(1);
+    await h.consumer.poll();
+    expect(h.consumer.stats.replyFailed["cli-missing"]).toBe(1);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(false);
+    expect(h.logs.join("\n")).toMatch(/reply to flint for m-1 FAILED \(cli-missing/);
+    clock += 1001;
+    sendOk = true;
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(2);
+    expect(h.replies[1]).toEqual(h.replies[0]);
+    expect(inDir("cur")).toEqual(["1.json"]);
   });
 
-  it("refuses to start when another instance holds the lock", () => {
-    const lockFile = join(tmpLock, "testbot.lock");
-    const consumer1 = new MailConsumer({
+  it("persists its stats for bob doctor", async () => {
+    deliver("1.json", { from: "mallory", key: mallory });
+    const h = harness();
+    await h.consumer.poll();
+    const stats = JSON.parse(readFileSync(statsFile, "utf8"));
+    expect(stats).toMatchObject({ agent: "testbot", identity: "testbot" });
+    expect(stats.refused["sender-not-allowed"]).toBe(1);
+  });
+});
+
+describe("crash semantics: post-before-ack (§5, Kern 5)", () => {
+  it("(a4) kill the runtime mid-turn: the mail is re-delivered and answered exactly once", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const replies: ReplyRequest[] = [];
+    // Runtime #1: the turn is cut before it ends.
+    let turnStarted!: () => void;
+    const started = new Promise<void>((r) => {
+      turnStarted = r;
+    });
+    const first = harness({
+      turn: () => {
+        turnStarted();
+        return new Promise<TurnOutcome>(() => {}); // never ends on its own
+      },
+      reply: async (r) => {
+        replies.push(r);
+        return { ok: true };
+      },
+    });
+    first.consumer.start();
+    const polling = first.consumer.poll();
+    await started;
+    await first.consumer.stop();
+    await polling;
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(false);
+    // The kill left its lock behind, naming a pid that no longer exists.
+    mkdirSync(join(root, "lock"), { recursive: true });
+    writeFileSync(lockFile, String(await deadPid()));
+
+    // Runtime #2 re-delivers it.
+    const second = harness({
+      reply: async (r) => {
+        replies.push(r);
+        return { ok: true };
+      },
+    });
+    second.consumer.start();
+    await second.consumer.poll();
+    await second.consumer.stop();
+    expect(second.turns).toHaveLength(1);
+    expect(replies).toHaveLength(1);
+    expect(inDir("cur")).toEqual(["1.json"]);
+  });
+
+  it("(a5) kill after the reply and before the ack: the marker stops a second reply", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    // Runtime #1 sends, writes the marker, and dies before the ack lands:
+    // cur/ is not a directory, so the ack fails exactly where a crash would.
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, "cur"), "not a directory");
+    const first = harness();
+    await first.consumer.poll();
+    expect(first.replies).toHaveLength(1);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(true);
+
+    // Runtime #2: acks without a turn and without replying again.
+    rmSync(join(inbox, "cur"));
+    mkdirSync(join(inbox, "cur"));
+    const second = harness();
+    await second.consumer.poll();
+    expect(second.turns).toHaveLength(0);
+    expect(second.replies).toHaveLength(0);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(second.consumer.stats.duplicates).toBe(1);
+  });
+
+  it("a re-delivered copy of an answered signed message is acked with no turn", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const h = harness();
+    await h.consumer.poll();
+    deliver("2.json", { messageId: "m-1" }); // same signed envelope id, new file
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("cur").sort()).toEqual(["1.json", "2.json"]);
+  });
+});
+
+describe("the bounded turn through the REAL launcher spawn (§1, Kern 4)", () => {
+  // A fake launcher: records how it was started, then behaves as `script` says.
+  function fakeLauncher(script: string[]): string {
+    const bin = join(root, "launcher");
+    writeFileSync(
+      bin,
+      [
+        "#!/bin/sh",
+        `echo $$ > ${join(root, "launcher.pid")}`,
+        `echo "$#" > ${join(root, "launcher.argc")}`,
+        `printf "%s" "$BOB_MAIL_TURN" > ${join(root, "launcher.mode")}`,
+        `cat > ${join(root, "launcher.stdin")}`,
+        `echo x >> ${join(root, "launcher.count")}`,
+        ...script,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  function realHarness(launcher: string, turnTimeoutMs = 60_000): Harness {
+    const replies: ReplyRequest[] = [];
+    const logs: string[] = [];
+    const consumer = new MailConsumer({
       name: "testbot",
-      inboxRoot: tmpInbox,
+      identity: "testbot",
+      inboxRoot: inbox,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
       lockFile,
-      dispatch: async () => {},
-    });
-    consumer1.start();
-
-    const consumer2 = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile,
-      dispatch: async () => {},
-    });
-    expect(() => consumer2.start()).toThrow(/already running/);
-    consumer1.stop();
-  });
-
-  it("ignores non-json files in the inbox", async () => {
-    const seen: MailMessage[] = [];
-    writeFileSync(join(tmpInbox, "new", "ignore.txt"), "not a mail");
-    writeMail("good", "real mail");
-
-    const consumer = new MailConsumer({
-      name: "testbot",
-      inboxRoot: tmpInbox,
-      lockFile: join(tmpLock, "testbot.lock"),
-      dispatch: async (msg) => {
-        seen.push(msg);
+      statsFile,
+      launcherPath: launcher,
+      turnTimeoutMs,
+      pollIntervalMs: 60_000,
+      now: () => clock,
+      log: (m) => logs.push(m),
+      sendReply: async (r) => {
+        replies.push(r);
+        return { ok: true };
       },
     });
-    consumer.start();
-    await consumer.poll();
-    consumer.stop();
+    return { consumer, turns: [], replies, logs };
+  }
 
-    expect(seen).toHaveLength(1);
-    expect(seen[0].id).toBe("good");
-    // .txt file untouched
-    expect(existsSync(join(tmpInbox, "new", "ignore.txt"))).toBe(true);
+  it("starts the launcher with NO argument, BOB_MAIL_TURN=1 and the verified fields on stdin", async () => {
+    deliver("1.json", { body: "--tools bash", messageId: "m-1" });
+    const launcher = fakeLauncher([
+      `printf '%s\\n' 'some other output'`,
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"SMOKE-OK"}'`,
+    ]);
+    const h = realHarness(launcher);
+    await h.consumer.poll();
+    expect(readFileSync(join(root, "launcher.argc"), "utf8").trim()).toBe("0");
+    expect(readFileSync(join(root, "launcher.mode"), "utf8")).toBe("1");
+    expect(JSON.parse(readFileSync(join(root, "launcher.stdin"), "utf8"))).toEqual({
+      v: 1,
+      sender: "flint",
+      messageId: "m-1",
+      body: "--tools bash",
+    });
+    expect(h.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "SMOKE-OK" }]);
+  });
+
+  it("a launcher that exits non-zero, or writes no result, is a failed turn (no reply)", async () => {
+    deliver("1.json");
+    const h = realHarness(fakeLauncher(["exit 1"]));
+    await h.consumer.poll();
+    expect(h.replies).toHaveLength(0);
+    expect(h.consumer.stats.dispatchFailed).toBe(1);
+    expect(inDir("new")).toEqual(["1.json"]);
+  });
+
+  it("(a7) a turn past the timeout is KILLED, counted, and stays in new/ — no hot loop", async () => {
+    deliver("1.json");
+    const h = realHarness(fakeLauncher(["exec sleep 30"]), 1500);
+    const t0 = Date.now();
+    await h.consumer.poll();
+    // Bounded by the 1.5 s timeout (+ the kill), never by the 30 s sleep.
+    expect(Date.now() - t0).toBeLessThan(8000);
+    const pid = Number(readFileSync(join(root, "launcher.pid"), "utf8").trim());
+    // The launcher (exec'd into sleep) is gone.
+    const deadline = Date.now() + 5000;
+    let alive = true;
+    while (alive && Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((r) => setTimeout(r, 50));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(h.consumer.stats).toMatchObject({ dispatchFailed: 1, timeouts: 1 });
+    expect(h.replies).toHaveLength(0);
+    await h.consumer.poll(); // backoff: not re-dispatched immediately
+    expect(readFileSync(join(root, "launcher.count"), "utf8").trim().split("\n")).toHaveLength(1);
+  }, 15_000);
+});
+
+describe("the consumer lock (§6, Kern 2)", () => {
+  it("(a8) is NOT taken from a live pid, however old the lock is", async () => {
+    const holder = spawn("sleep", ["30"]);
+    children.push(holder);
+    mkdirSync(join(root, "lock"), { recursive: true });
+    writeFileSync(lockFile, String(holder.pid));
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lockFile, tenMinutesAgo, tenMinutesAgo);
+    const h = harness();
+    expect(() => h.consumer.start()).toThrow(/already running \(pid \d+/);
+    expect(readFileSync(lockFile, "utf8")).toBe(String(holder.pid));
+  });
+
+  it("IS taken over from a dead pid", async () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    writeFileSync(lockFile, String(await deadPid()));
+    const h = harness();
+    h.consumer.start();
+    expect(readFileSync(lockFile, "utf8")).toBe(String(process.pid));
+    await h.consumer.stop();
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  it("refuses a lock that does not name a pid (its holder cannot be shown dead)", () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    writeFileSync(lockFile, "123garbage");
+    expect(() => harness().consumer.start()).toThrow(/does not name a pid/);
+  });
+
+  it("a second consumer in a live process is refused", async () => {
+    const one = harness();
+    one.consumer.start();
+    expect(() => harness().consumer.start()).toThrow(/already running/);
+    await one.consumer.stop();
   });
 });

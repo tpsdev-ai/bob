@@ -28,12 +28,18 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { TPS_MAIL_CAPABILITY } from "../capabilities/tps-mail/config.js";
 import {
   buildStandingContract,
   createCompactionObserver,
   readWorktreeStatus,
 } from "./compaction-contract.js";
 import { type CronSchedulerHandle, startCronScheduler } from "./cron.js";
+import {
+  createTpsMailConsumer,
+  type MailConsumer,
+  type MailConsumerOptions,
+} from "./mail-consumer.js";
 import {
   createPiRunSession,
   type RunSession,
@@ -66,6 +72,11 @@ export interface RunPersistentOptions {
   log?: (msg: string) => void;
   // Process exit seam (tests). Defaults to process.exit.
   exit?: (code: number) => void;
+  // bob#200 test seams for the tps-mail consumer (home dir for ~/.bob and a
+  // `~/` inbox, and consumer overrides such as the turn runner and the reply
+  // sender). Production passes neither.
+  mailHome?: string;
+  mailConsumer?: Partial<MailConsumerOptions>;
 }
 
 // A handle the caller (or a test) can use to drive a clean shutdown without a
@@ -77,6 +88,8 @@ export interface PersistentHandle {
   // Resolved provider/model for diagnostics.
   provider: string;
   model: string;
+  // The tps-mail inbox consumer, when the agent declares the capability.
+  mailConsumer?: MailConsumer;
   // Dispose the session cleanly: wait for any in-flight turn to settle, then
   // session.dispose(). Idempotent. Returns once disposed.
   shutdown(): Promise<void>;
@@ -108,7 +121,7 @@ function neverResolves(): Promise<void> {
 export async function startPersistent(opts: RunPersistentOptions): Promise<PersistentHandle> {
   const log = opts.log ?? ((m: string) => console.error(m));
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { provider, model, config, cron, agent } = resolveRunConfig({
+  const { provider, model, config, cron, agent, capabilities, agentDir } = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
@@ -136,8 +149,34 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     role: agent.role,
     duties: cron,
   });
+  // bob#200: the tps-mail inbox consumer. It answers each accepted mail with
+  // ONE turn in a FRESH session through the agent's launcher, so mail never
+  // enters this warm session. Started BEFORE the warm session so a second
+  // runtime for the same agent fails on the consumer lock before it logs in
+  // anywhere; a failed session start releases the lock again.
+  const mailCapability = capabilities.find((c) => c.name === TPS_MAIL_CAPABILITY);
+  let mailConsumer: MailConsumer | undefined;
+  if (mailCapability) {
+    mailConsumer = createTpsMailConsumer({
+      name: opts.name,
+      agentDir,
+      config: mailCapability.config,
+      log,
+      ...(opts.mailHome ? { home: opts.mailHome } : {}),
+      ...(opts.mailConsumer ? { overrides: opts.mailConsumer } : {}),
+    });
+    mailConsumer.start();
+    log(`[bob] tps-mail consumer up for ${opts.name}: one fresh-session turn per accepted mail`);
+  }
+
   const factory = opts.sessionFactory ?? defaultPersistentFactory;
-  const session = await factory(config);
+  let session: RunSession;
+  try {
+    session = await factory(config);
+  } catch (err) {
+    await mailConsumer?.stop();
+    throw err;
+  }
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
@@ -186,6 +225,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       // Stop scheduling first so a pending cron tick can't fire into a session
       // we're about to dispose.
       cronScheduler?.stop();
+      // Stop the mail consumer: an in-flight mail turn is killed and its mail
+      // stays in new/, so the next runtime re-delivers it (post-before-ack).
+      await mailConsumer?.stop();
       unsubscribeContract();
       // Await any in-flight turn so we don't cut off a reply mid-stream. The
       // RunSession seam exposes `prompt` but not an idle barrier; production's
@@ -204,7 +246,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     return disposing;
   };
 
-  return { session, provider, model, shutdown };
+  return { session, provider, model, shutdown, ...(mailConsumer ? { mailConsumer } : {}) };
 }
 
 // Run persistently and BLOCK until a shutdown signal (or the injected

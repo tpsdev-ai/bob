@@ -204,6 +204,12 @@ export interface CompactionObserver {
    *  an empty `finalText()` means the agent went silent rather than that the
    *  transport omitted its message. */
   assistantEnded(): boolean;
+  /** True when the LAST assistant message that ended since the boundary ended
+   *  on a failure (stopReason "error" or "aborted"). It tells a turn that FAILED
+   *  apart from one that settled with nothing to say — both have an empty
+   *  `finalText()` — which is the difference between "retry this mail" and
+   *  "send no reply" for a mail turn (bob#200). */
+  lastEndFailed(): boolean;
 }
 
 /**
@@ -228,10 +234,12 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   const toolCalls: string[] = [];
   let finalMessage = "";
   let sawAssistantEnd = false;
+  let lastEndFailed = false;
 
   const clearCapture = (): void => {
     finalMessage = "";
     sawAssistantEnd = false;
+    lastEndFailed = false;
     deltaBuffer = "";
   };
 
@@ -250,6 +258,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     startTurn: () => clearCapture(),
     finalText: () => finalMessage,
     assistantEnded: () => sawAssistantEnd,
+    lastEndFailed: () => lastEndFailed,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -300,6 +309,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             // empty or failure-ended one.
             finalMessage = failed ? "" : ended;
             sawAssistantEnd = true;
+            lastEndFailed = failed;
           }
           deltaBuffer = "";
           return;

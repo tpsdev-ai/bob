@@ -21,15 +21,18 @@ import {
   installService,
   LaunchArgError,
   loadRole,
+  MAIL_TURN_ENV,
   parseArgs,
   parseLaunchArgs,
   provisionFlairIdentity,
   readBlock,
+  readMailTurnInput,
   restart,
   runAgent,
   runAlign,
   runDoctor,
   runLaunch,
+  runMailTurnLaunch,
   runOnboard,
   runPersistent,
   servicePath,
@@ -428,6 +431,19 @@ async function main(): Promise<number> {
         // parseLaunchArgs, which refuses any other argument BY NAME.
         try {
           const launch = parseLaunchArgs(args.positional, args.flags);
+          // bob#200: the tps-mail consumer runs each mail as ONE turn through
+          // this launcher, with the verified fields as JSON on STDIN. Mail-turn
+          // mode takes no prompt argument and never opens the TUI.
+          if (process.env[MAIL_TURN_ENV] === "1") {
+            if (launch.prompt !== undefined) {
+              console.error(
+                "bob launch: a mail turn takes its input on stdin, never as an argument",
+              );
+              return 2;
+            }
+            const input = await readMailTurnInput(process.stdin);
+            return await runMailTurnLaunch({ name: launch.name, input });
+          }
           return await runLaunch(launch);
         } catch (err: unknown) {
           if (err instanceof LaunchArgError) {

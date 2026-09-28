@@ -51,7 +51,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Soul / persona      | Flair soul (canonical) ← mirrored from `~/agents/<name>/soul.md` by `bob onboard` / `bob align` |
 | Identity            | Ed25519 keypair + Flair Agent record, both provisioned at onboard (Bob) |
 | Memory              | [Flair](https://github.com/tpsdev-ai/flair)                    |
-| Inbound mail        | TPS mail consumer (Bob)                                        |
+| Inbound mail        | The `tps-mail` capability: `bob run <name>` answers each verified, allow-listed TPS mail with ONE turn in a fresh session and replies to the sender (Bob) |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
 | Cron                | The persistent `bob run` runtime's in-process scheduler — it fires bob.yaml `cron:` entries into the live session (Bob)             |
 | Tool allowlist      | `roles/<role>/role.json` is the ceiling, `bob.yaml` may only narrow it, and bob's session factory applies the result to every session |
@@ -67,7 +67,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
-| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
+| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
 | `bob help`                 | Show this usage                                                                               |
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
@@ -108,6 +108,14 @@ change one, the named test is what tells you.
   is refused BY NAME, so no caller-controlled flag can reach a session.
   `bob launch a -- --tools` sends the literal prompt `--tools`;
   `bob launch a --tools` is refused. *(`test/shell/launch.test.ts`)*
+- **A TPS mail reaches a turn only verified, bound and allow-listed, and the
+  turn holds no filesystem tool.** The `tps-mail` consumer verifies the inner
+  signed envelope, binds its `from` to the record, and allow-lists the verified
+  id before any session exists; refused mail goes to `refused/` and is never
+  answered. Each accepted mail is ONE turn in a fresh session with the role's
+  policy minus every pi built-in and every Discord tool, and its reply is sent
+  only after the turn, as the agent, to the verified sender. *(`test/capabilities/tps-mail/`,
+  `test/shell/mail-consumer.test.ts`, `test/shell/mail-turn.test.ts`)*
 - **`bob init` stamps a policy that loads.** A fresh agent of every role is
   stamped with the role's ceiling intersected with the tools that can exist for
   it: pi's built-ins plus the tools of the capabilities bob stamps (currently
@@ -395,6 +403,87 @@ stay textual, like a Discord snowflake.
 
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
+
+### `tps-mail` — answering TPS mail
+
+An agent answers TPS mail through the `tps-mail` capability. It is off until you
+configure it: `bob onboard` writes it only as a commented template, because the
+`senders:` allow-list is a decision only the operator can make.
+
+```yaml
+capabilities:
+  - flair
+  - tps-mail
+
+tps-mail:
+  inbox: ~/.tps/mail/rocky     # the agent's TPS inbox (holds new/ and cur/)
+  senders:                     # REQUIRED, non-empty: exact TPS agent ids, no globs
+    - flint
+  turnTimeoutMs: 600000        # optional: wall-clock bound on one mail turn (default 10 min)
+  maxReplyChars: 4000          # optional: reply cap (default 4000, at most 16000)
+
+flair:                         # required: senders are verified against Flair,
+  url: http://127.0.0.1:19926  # and replies are signed as this identity
+  agentId: rocky
+  keyFile: ~/.flair/keys/rocky.key
+```
+
+The persistent runtime (`bob run <name>`, what the service unit runs) runs the
+consumer. For each file in `new/`, oldest first by filename:
+
+- **Accepting, before any session exists.** The inner signed envelope is
+  verified against the sender's key as registered in the agent's Flair (the same
+  source `tps` verifies against); its signed `from` must equal the record's
+  `from` and any `X-TPS-Sender` header; it must be addressed to this agent; and
+  the verified id must be on `senders:`. Anything else — unsigned, a bad
+  signature, an unregistered key, a mismatch, a sender not on the list — is moved
+  to `<inbox>/refused/` with a `.reason` file, counted, and never answered.
+  `X-TPS-Trust` is not consulted.
+- **One fresh session per mail.** Each accepted mail runs ONE turn through the
+  agent's launcher (`bin/<name>`, i.e. `bob launch`), never in the warm session,
+  so a reply can only draw on what that turn read. The verified fields reach the
+  launcher on stdin, never as an argument. A turn past `turnTimeoutMs` is killed.
+- **What a mail turn can do.** The role's tool policy **minus every pi
+  built-in and every Discord tool**: no `read`, `grep`, `find` or `ls`, no
+  shell, no `edit` or `write`, and no `discord_reply`, `discord_react` or
+  `discord_fetch` — a mail turn cannot read Discord content into a reply or
+  speak anywhere but in its reply to the sender. It keeps its other capability
+  tools — Flair above all. The mail body is framed as
+  untrusted data from the verified sender, inside a delimited block, with
+  control and bidi characters stripped and a length bound; it never enters the
+  system prompt.
+- **The reply.** The turn's final message — the same finality rule as `bob run`:
+  the last assistant message that ended after the last compaction — is capped at
+  `maxReplyChars` and handed to `tps mail send` with the body on stdin, as the
+  agent (`TPS_AGENT_ID` is the agent's own id), threaded to the inbound's signed
+  `messageId`, to the verified sender only. A tool-only or empty turn sends no
+  reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`, then
+  moves the mail to `cur/`; a re-delivery with that marker is acked without a
+  second reply.
+- **Failures.** A failed or timed-out turn, an unreachable Flair, or a failed
+  send leaves the mail in `new/`, counted and logged, and it is retried with
+  backoff. Delivery is at-least-once: only a crash between the CLI's success and
+  the marker can send a second reply, threaded to the same message.
+
+**Allow-listing a sender grants it the agent's read scope.** Whatever a mail
+turn can read — its Flair memory — can end up in the reply to that sender. The prompt's "do not disclose" rule is defence in depth, not the
+boundary. List only principals already entitled to that scope.
+
+`bob doctor <name>` FAILS when `bob.yaml` still carries `channels.tps_mail` (the
+old onboard scaffold, which nothing reads) without the capability; when the
+`tps-mail:` block is invalid — an empty `senders:` above all, which also makes
+the capability refuse to load; when the agent has no Flair identity; when the
+inbox is missing; when this host is not a TPS delivery target (no joined branch
+and no office identity, #134); or when `tps` or the agent's signing key is
+missing. It reports refused mail per reason, turn failures and reply failures.
+
+**Stated limits.** The reply needs a `tps` that accepts `tps mail send <to>
+--stdin --reply-to <messageId>`; `tps` 0.7.0 takes the body only as an argument
+and has no reply-to option, so with it every reply fails closed — counted and
+retried, never sent unthreaded or with the body on a command line. `tps` signs
+with `~/.flair/keys/<agent>.key` and, as of 0.7.0, does not read the PEM key
+`bob onboard` writes there. `bob doctor` checks `tps` on its own `PATH`; a
+service unit's `PATH` can differ.
 
 ### `reachy` (jarvis) — S3 skeleton
 

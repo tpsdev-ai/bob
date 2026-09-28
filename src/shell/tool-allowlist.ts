@@ -45,6 +45,38 @@ export const PI_BUILTIN_TOOLS = [
 // unit, with no human at the keyboard to approve a command.
 export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell"] as const;
 
+// What a MAIL TURN never holds (bob#200 §4, F4). A mail turn answers ONE
+// allow-listed peer, and whatever it can read can end up in the reply, so the
+// disclosure boundary is on the READ side:
+//   * every pi built-in — no filesystem reads (`read`, and `grep`/`find`/`ls`,
+//     which read file contents and names too), no shell (`bash`/`powershell`
+//     read the filesystem with no tool boundary at all), and no file edits
+//     (`edit` returns file content; a `write` could rewrite the agent's own
+//     config and so its allow-list, on the strength of a mail);
+//   * the Discord tools — `discord_fetch` would read channel content into a
+//     mail reply, and `discord_reply`/`discord_react` would let a mail make the
+//     agent speak somewhere other than to its sender. A mail turn answers its
+//     sender, deterministically, through the reply the consumer sends — and
+//     nowhere else.
+// The turn keeps its other capability tools — the Flair tools above all,
+// because memory with receipts is the point. Applied after the role ceiling
+// and bob.yaml, so it only ever NARROWS the policy.
+export const MAIL_TURN_EXCLUDED_TOOLS: readonly string[] = [
+  ...PI_BUILTIN_TOOLS,
+  "discord_reply",
+  "discord_react",
+  "discord_fetch",
+];
+
+// The policy a mail turn runs with: the role's resolved policy minus every
+// MAIL_TURN_EXCLUDED_TOOLS name (pi applies excludeTools after tools).
+export function applyMailTurnPolicy(policy: ToolPolicy): ToolPolicy {
+  return {
+    ...policy,
+    excludeTools: [...new Set([...policy.excludeTools, ...MAIL_TURN_EXCLUDED_TOOLS])],
+  };
+}
+
 // Names that existed in the OpenClaw / Claude-Code tool set and DO map onto a
 // real name here — used only to say which one in the error and in doctor's fix
 // line. Keyed lowercase.

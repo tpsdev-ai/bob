@@ -14,17 +14,33 @@
 //     provider was exe-dev-gateway)
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
+//   - tps-mail (bob#200): FAILS when channels.tps_mail is declared with no
+//     capability to honour it, when the capability's config is invalid (an
+//     empty senders allow-list above all), when the agent has no Flair identity,
+//     when the inbox is missing, when this host is not a TPS delivery target
+//     (#134), or when the reply transport (the tps CLI, the signing key) is
+//     missing; and surfaces refused counts per reason, dispatch failures and
+//     reply failures.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  expandHome,
+  TPS_MAIL_CAPABILITY,
+  type TpsMailCapabilityConfig,
+  validateTpsMailConfig,
+} from "../capabilities/tps-mail/config.js";
+import { REFUSAL_REASONS } from "../capabilities/tps-mail/envelope.js";
+import {
   readAgentRole,
+  readBlock,
   readCapabilities,
   readResident,
   readTools,
   type ToolsBlock,
 } from "./bob-yaml.js";
+import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { resolveAgentToolPolicy } from "./run.js";
 import {
   auditToolNames,
@@ -63,6 +79,8 @@ export interface DoctorOptions {
   flairKeysDir?: string;
   // Override for tests. Defaults to process.env.HOME.
   homeDir?: string;
+  // PATH searched for the tps CLI (tests). Defaults to process.env.PATH.
+  pathEnv?: string;
 }
 
 export function runDoctor(opts: DoctorOptions): DoctorReport {
@@ -197,6 +215,27 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       ? "present"
       : "not present — fine if using a provider without custom routing",
   });
+
+  // bob#200: the tps-mail capability. When it is declared its own checks cover
+  // the inbox, so the generic inbox check below runs only for an agent without it.
+  let yamlText: string | undefined;
+  try {
+    yamlText = readFileSync(join(agentDir, "bob.yaml"), "utf8");
+  } catch {
+    yamlText = undefined;
+  }
+  const mail = tpsMailChecks({
+    name: opts.name,
+    yamlText,
+    home,
+    flairKeysDir,
+    pathEnv: opts.pathEnv ?? process.env.PATH ?? "",
+  });
+  if (mail.declared) {
+    checks.push(...mail.checks);
+    return finalize(opts.name, agentDir, checks);
+  }
+  checks.push(...mail.checks);
 
   // TPS mail inbox
   const mailDir = join(home, ".tps", "mail", opts.name);
@@ -367,6 +406,272 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
     status: "ok",
     detail: `${block.allow.length} name${block.allow.length === 1 ? "" : "s"}: ${block.allow.join(", ")}`,
   };
+}
+
+// ─── tps-mail (bob#200) ─────────────────────────────────────────────────────
+
+// Does bob.yaml carry the legacy `channels: tps_mail:` block onboard used to
+// scaffold? Nothing reads it, so an agent carrying it LOOKS mail-capable.
+function declaresLegacyTpsMailChannel(yamlText: string): boolean {
+  let inChannels = false;
+  for (const line of yamlText.split(/\r?\n/)) {
+    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) {
+      inChannels = /^channels\s*:/.test(line);
+      continue;
+    }
+    if (inChannels && /^\s+tps_mail\s*:/.test(line)) return true;
+  }
+  return false;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// Is this host somewhere TPS delivers mail to (#134)? A joined branch holds the
+// office's host record (identity/host.json, written by `tps branch init`) and
+// runs the branch daemon; an office host holds its own host identity
+// (identity/host.seed). Neither: mail sent from another host never arrives.
+function deliveryTargetCheck(tpsRoot: string): DoctorCheck {
+  const name = "tps-mail delivery";
+  const identityDir = join(tpsRoot, "identity");
+  if (existsSync(join(identityDir, "host.json"))) {
+    let running = false;
+    try {
+      const raw = readFileSync(join(tpsRoot, "branch.pid"), "utf8").trim();
+      running = /^[0-9]+$/.test(raw) && pidAlive(Number(raw));
+    } catch {
+      running = false;
+    }
+    return running
+      ? { name, status: "ok", detail: "joined TPS branch; the branch daemon is running" }
+      : {
+          name,
+          status: "warn",
+          detail:
+            "joined TPS branch, but the branch daemon is not running (branch.pid) — mail from the office is not delivered until it is",
+          fix: "tps branch start",
+        };
+  }
+  if (["host.seed", "host.pub", "host.key"].some((f) => existsSync(join(identityDir, f)))) {
+    return { name, status: "ok", detail: "TPS office host (mail is delivered locally)" };
+  }
+  return {
+    name,
+    status: "fail",
+    detail: `this host is not a TPS delivery target — no joined branch (${join(identityDir, "host.json")}) and no office identity (${join(identityDir, "host.seed")}), so mail sent from another host never arrives (#134)`,
+    fix: "join this host to the office as a branch: 'tps branch init' here, then 'tps office join <name> <token>' on the office host",
+  };
+}
+
+function findOnPath(bin: string, pathEnv: string): string | undefined {
+  for (const dir of pathEnv.split(":")) {
+    if (dir === "") continue;
+    const candidate = join(dir, bin);
+    try {
+      const st = statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      // not here
+    }
+  }
+  return undefined;
+}
+
+function countRefusedByReason(refusedDir: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  if (!existsSync(refusedDir)) return counts;
+  let names: string[];
+  try {
+    names = readdirSync(refusedDir);
+  } catch {
+    return counts;
+  }
+  for (const f of names) {
+    if (!f.endsWith(".json")) continue;
+    let reason = "unknown";
+    try {
+      const m = /^reason:\s*(\S+)/m.exec(readFileSync(join(refusedDir, `${f}.reason`), "utf8"));
+      if (m) reason = m[1];
+    } catch {
+      // a refused record with no sidecar still counts
+    }
+    counts[reason] = (counts[reason] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function countJson(dir: string): number {
+  try {
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).length;
+  } catch {
+    return 0;
+  }
+}
+
+function summarize(counts: Record<string, number>): string {
+  const parts = Object.entries(counts)
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${k}=${n}`);
+  return parts.length > 0 ? ` (${parts.join(", ")})` : "";
+}
+
+function sum(counts: Record<string, number> | undefined): number {
+  return Object.values(counts ?? {}).reduce((a, b) => a + (typeof b === "number" ? b : 0), 0);
+}
+
+function tpsMailChecks(o: {
+  name: string;
+  yamlText: string | undefined;
+  home: string;
+  flairKeysDir: string;
+  pathEnv: string;
+}): { declared: boolean; checks: DoctorCheck[] } {
+  if (o.yamlText === undefined) return { declared: false, checks: [] };
+  let capabilities: string[];
+  try {
+    capabilities = readCapabilities(o.yamlText);
+  } catch {
+    capabilities = [];
+  }
+  const declared = capabilities.includes(TPS_MAIL_CAPABILITY);
+  if (!declared) {
+    if (!declaresLegacyTpsMailChannel(o.yamlText)) return { declared: false, checks: [] };
+    return {
+      declared: false,
+      checks: [
+        {
+          name: "tps-mail",
+          status: "fail",
+          detail:
+            "bob.yaml declares channels.tps_mail, but nothing consumes it — the agent looks mail-capable and is not",
+          fix: "declare the tps-mail capability (add tps-mail to capabilities: and a tps-mail: block with inbox: and senders:), or delete channels.tps_mail",
+        },
+      ],
+    };
+  }
+
+  const checks: DoctorCheck[] = [];
+  let config: TpsMailCapabilityConfig;
+  try {
+    config = validateTpsMailConfig(readBlock(o.yamlText, TPS_MAIL_CAPABILITY) ?? {});
+  } catch (err) {
+    checks.push({
+      name: "tps-mail config",
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "give the tps-mail: block inbox: and a non-empty senders: list of exact TPS agent ids — with no allow-list the capability refuses to load",
+    });
+    return { declared, checks };
+  }
+  checks.push({
+    name: "tps-mail config",
+    status: "ok",
+    detail: `${config.senders.length} allow-listed sender${config.senders.length === 1 ? "" : "s"}: ${config.senders.join(", ")} (each is granted this agent's read scope)`,
+  });
+
+  let identity: TpsMailIdentity | undefined;
+  try {
+    identity = readTpsMailIdentity(o.yamlText);
+    checks.push({
+      name: "tps-mail identity",
+      status: "ok",
+      detail: `signs as ${identity.agentId}`,
+    });
+  } catch (err) {
+    checks.push({
+      name: "tps-mail identity",
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "add the flair: block (url, agentId, keyFile) — re-run 'bob onboard <name> --force' without --no-flair",
+    });
+  }
+
+  const inbox = expandHome(config.inbox, o.home);
+  if (!existsSync(join(inbox, "new"))) {
+    checks.push({
+      name: "tps-mail inbox",
+      status: "fail",
+      detail: `${join(inbox, "new")} not present`,
+      fix: `point tps-mail.inbox at the agent's TPS inbox, or create it: mkdir -p ${join(inbox, "new")} ${join(inbox, "cur")}`,
+    });
+  } else {
+    checks.push({ name: "tps-mail inbox", status: "ok", detail: inbox });
+  }
+
+  checks.push(deliveryTargetCheck(join(o.home, ".tps")));
+
+  const tps = findOnPath("tps", o.pathEnv);
+  if (!tps) {
+    checks.push({
+      name: "tps-mail reply transport",
+      status: "fail",
+      detail: "the tps CLI is not on PATH — replies are sent with 'tps mail send'",
+      fix: "install @tpsdev-ai/cli, and make sure the service unit's PATH reaches it",
+    });
+  } else if (identity && !existsSync(join(o.flairKeysDir, `${identity.agentId}.key`))) {
+    checks.push({
+      name: "tps-mail reply transport",
+      status: "fail",
+      detail: `no signing key at ${join(o.flairKeysDir, `${identity.agentId}.key`)} — the tps CLI would send replies unsigned, and recipients dead-letter those`,
+      fix: `provision the agent's Flair key at ${join(o.flairKeysDir, `${identity.agentId}.key`)}`,
+    });
+  } else {
+    checks.push({ name: "tps-mail reply transport", status: "ok", detail: tps });
+  }
+
+  // Activity: refused per reason (durable, from refused/), what is waiting,
+  // and the running consumer's failure counters.
+  const refused = countRefusedByReason(join(inbox, "refused"));
+  let stats:
+    | {
+        replied?: number;
+        noReply?: number;
+        dispatchFailed?: number;
+        timeouts?: number;
+        replyFailed?: Record<string, number>;
+        verifyUnavailable?: number;
+      }
+    | undefined;
+  try {
+    stats = JSON.parse(readFileSync(tpsMailStatsPath(o.home, o.name), "utf8"));
+  } catch {
+    stats = undefined;
+  }
+  const refusedTotal = sum(refused);
+  const pending = countJson(join(inbox, "new"));
+  const reasons = Object.fromEntries(REFUSAL_REASONS.map((r) => [r, refused[r] ?? 0]));
+  for (const [k, n] of Object.entries(refused)) if (!(k in reasons)) reasons[k] = n;
+  const parts = [
+    `new=${pending} cur=${countJson(join(inbox, "cur"))} refused=${refusedTotal}${summarize(reasons)}`,
+  ];
+  let failing = false;
+  if (stats) {
+    const replyFailed = sum(stats.replyFailed);
+    parts.push(
+      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0}`,
+    );
+    failing =
+      (stats.dispatchFailed ?? 0) > 0 || replyFailed > 0 || (stats.verifyUnavailable ?? 0) > 0;
+  } else {
+    parts.push("no consumer stats yet (the persistent runtime writes them)");
+  }
+  checks.push({
+    name: "tps-mail activity",
+    status: failing ? "warn" : "ok",
+    detail: parts.join("; "),
+    ...(failing
+      ? {
+          fix: "read the runtime log's tps-mail: lines — a failed mail stays in new/ and is retried with backoff",
+        }
+      : {}),
+  });
+  return { declared, checks };
 }
 
 function fileCheck(name: string, path: string, opts: { onMissing: string }): DoctorCheck {

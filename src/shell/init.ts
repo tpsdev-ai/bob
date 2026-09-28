@@ -5,7 +5,8 @@
 //
 // Layout written:
 //   ~/agents/<name>/
-//     ├── bob.yaml         # canonical config
+//     ├── bob.yaml         # canonical config (tps-mail left commented: it
+//     │                    #   needs a senders: allow-list onboard cannot know)
 //     ├── soul.md             # role's seed soul (caller-editable)
 //     ├── bin/<name>          # generated launcher
 //     ├── work/               # working dir (empty)
@@ -207,9 +208,16 @@ identity:
   key_file: ${flairKeyFile(opts.name)}
   pub_file: ~/.flair/keys/${opts.name}.pub
 
-channels:
-  tps_mail:
-    inbox: ~/.tps/mail/${opts.name}
+# TPS mail is OFF until you configure it (bob#200). To let this agent answer
+# TPS mail, add tps-mail to capabilities: below and uncomment this block.
+# senders: is REQUIRED and is the trust boundary: exact TPS agent ids, no globs.
+# Allow-listing a sender grants it this agent's read scope (what a mail turn can
+# read — its Flair memory — can end up in the reply), so list only principals
+# already entitled to it.
+# tps-mail:
+#   inbox: ~/.tps/mail/${opts.name}
+#   senders:
+#     - <sender-id>
 
 # Add cron entries here:
 # cron:

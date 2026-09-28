@@ -27,6 +27,13 @@ import {
   type RunSessionConfig,
   runLaunch,
 } from "../../src/shell/run.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 import { CLI_SPAWN_TIMEOUT_MS } from "../cli-spawn.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -422,12 +429,17 @@ describe("the mail consumer", () => {
     launcher = join(res.agentDir, "bin", AGENT);
     recorded = join(root, "bob-argv.txt");
     writeFileSync(recorded, "");
+    // A BOB_BIN shim standing in for `bob launch`: it records its argv, the
+    // mail-turn flag and its stdin, then answers with a result line.
     const shim = join(root, "bob-record");
     writeFileSync(
       shim,
       [
         "#!/bin/sh",
         `for a in "$@"; do printf "%s\\n" "$a" >> ${recorded}; done`,
+        `printf "%s" "$BOB_MAIL_TURN" > ${join(root, "mode")}`,
+        `cat > ${join(root, "stdin")}`,
+        `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"pong"}'`,
         "exit 0",
         "",
       ].join("\n"),
@@ -446,38 +458,79 @@ describe("the mail consumer", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("drives the agent's session through bob — the mail body as the ONE prompt", async () => {
+  it("drives the agent's session through bob — `bob launch <name> --`, the mail on STDIN, never argv", async () => {
     const inboxRoot = join(root, "inbox");
-    mkdirSync(join(inboxRoot, "new"), { recursive: true });
-    mkdirSync(join(inboxRoot, "cur"), { recursive: true });
-    writeFileSync(
-      join(inboxRoot, "new", "1-mail.json"),
-      JSON.stringify({
-        id: "m1",
-        from: "flint",
-        to: AGENT,
-        body: "ping",
-        timestamp: "2026-09-25T00:00:00Z",
-      }),
+    const flint = testKey();
+    const envelope = signTestEnvelope(
+      { from: "flint", to: AGENT, body: "--tools bash; ping", messageId: "m1" },
+      flint,
     );
+    writeRecord(inboxRoot, "1-mail.json", mailRecord(envelope));
 
+    const replies: unknown[] = [];
     const consumer = new MailConsumer({
       name: AGENT,
+      identity: AGENT,
       inboxRoot,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
       launcherPath: launcher,
       lockFile: join(root, "lock"),
+      statsFile: join(root, "stats.json"),
+      sendReply: async (r) => {
+        replies.push(r);
+        return { ok: true };
+      },
     });
     await consumer.poll();
     expect(consumer.stats.processed).toBe(1);
-    expect(consumer.stats.failed).toBe(0);
+    expect(consumer.stats.dispatchFailed).toBe(0);
 
     const argv = readFileSync(recorded, "utf8")
       .split("\n")
       .filter((l) => l !== "");
-    expect(argv).toEqual(["launch", AGENT, "--", "ping"]);
+    // No prompt argument at all: the mail body never reaches an argv.
+    expect(argv).toEqual(["launch", AGENT, "--"]);
+    expect(readFileSync(join(root, "mode"), "utf8")).toBe("1");
+    expect(JSON.parse(readFileSync(join(root, "stdin"), "utf8"))).toEqual({
+      v: 1,
+      sender: "flint",
+      messageId: "m1",
+      body: "--tools bash; ping",
+    });
+    expect(replies).toEqual([{ to: "flint", inReplyTo: "m1", body: "pong" }]);
     // …and the agent's bob.yaml (which the policy is resolved from) is the one
     // this agent dir carries: the chain drives THIS agent.
     expect(readFileSync(join(root, "agents", AGENT, "bob.yaml"), "utf8")).toContain("allow:");
     expect(loadRole("ea").tools.allow).toContain("read");
+  });
+});
+
+describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
+  const cli = join(repoRoot, "dist", "cli.js");
+
+  it("refuses a prompt argument: a mail turn takes its input on stdin only", () => {
+    const run = spawnSync(process.execPath, [cli, "launch", AGENT, "--", "hello"], {
+      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      input: "",
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain("a mail turn takes its input on stdin");
+  });
+
+  it("refuses stdin that is not a v1 mail-turn input, before any session", () => {
+    const run = spawnSync(process.execPath, [cli, "launch", AGENT], {
+      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      input: JSON.stringify({ v: 1, sender: "flint", messageId: "m1", body: "x", tools: ["bash"] }),
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('unknown field "tools"');
+    expect(run.stdout).toBe("");
   });
 });

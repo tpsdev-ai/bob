@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPersistent, startPersistent } from "../../src/shell/persistent.js";
@@ -273,5 +273,125 @@ describe("runPersistent / startPersistent", () => {
     await done;
     expect(exited).toBe(0);
     expect(fake.disposed()).toBe(true);
+  });
+});
+
+// ─── bob#200: the persistent runtime runs the tps-mail consumer ─────────────
+describe("startPersistent — the tps-mail consumer", () => {
+  let root: string;
+  let home: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bob-persistent-mail-"));
+    home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    scaffoldAgent(root, "rocky");
+    const yamlPath = join(root, "rocky", "bob.yaml");
+    writeFileSync(
+      yamlPath,
+      [
+        readFileSync(yamlPath, "utf8"),
+        "capabilities:",
+        "  - tps-mail",
+        "",
+        "tps-mail:",
+        `  inbox: ${join(root, "inbox")}`,
+        "  senders:",
+        "    - flint",
+        "",
+        "flair:",
+        "  url: http://127.0.0.1:19926",
+        "  agentId: rocky",
+        "  keyFile: ~/.flair/keys/rocky.key",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const mailSeams = {
+    resolveKey: async () => null,
+    runTurn: async () => ({ kind: "silent" as const }),
+    sendReply: async () => ({ ok: true as const }),
+    pollIntervalMs: 60_000,
+    log: () => {},
+  };
+
+  it("starts the consumer (lock taken) and stops it on shutdown (lock released)", async () => {
+    const fake = fakeWarmSession();
+    const handle = await startPersistent({
+      name: "rocky",
+      agentsRoot: root,
+      sessionFactory: async () => fake.session,
+      installSignalHandlers: false,
+      log: () => {},
+      mailHome: home,
+      mailConsumer: mailSeams,
+    });
+    const lock = join(home, ".bob", "rocky.lock");
+    expect(handle.mailConsumer).toBeDefined();
+    expect(readFileSync(lock, "utf8")).toBe(String(process.pid));
+    expect(existsSync(join(root, "inbox", "refused"))).toBe(true);
+    await handle.shutdown();
+    expect(existsSync(lock)).toBe(false);
+    expect(fake.disposed()).toBe(true);
+  });
+
+  it("a consumer lock held by a LIVE pid fails the runtime BEFORE the warm session starts", async () => {
+    mkdirSync(join(home, ".bob"), { recursive: true });
+    // A live pid (this test process) holds it: a second runtime for the agent.
+    writeFileSync(join(home, ".bob", "rocky.lock"), String(process.pid));
+    let factoryCalls = 0;
+    await expect(
+      startPersistent({
+        name: "rocky",
+        agentsRoot: root,
+        sessionFactory: async () => {
+          factoryCalls += 1;
+          return fakeWarmSession().session;
+        },
+        installSignalHandlers: false,
+        log: () => {},
+        mailHome: home,
+        mailConsumer: mailSeams,
+      }),
+    ).rejects.toThrow(/already running/);
+    expect(factoryCalls).toBe(0);
+  });
+
+  it("a session that fails to start releases the consumer lock", async () => {
+    await expect(
+      startPersistent({
+        name: "rocky",
+        agentsRoot: root,
+        sessionFactory: async () => {
+          throw new Error("model not found");
+        },
+        installSignalHandlers: false,
+        log: () => {},
+        mailHome: home,
+        mailConsumer: mailSeams,
+      }),
+    ).rejects.toThrow(/model not found/);
+    expect(existsSync(join(home, ".bob", "rocky.lock"))).toBe(false);
+  });
+
+  it("refuses to start without the agent's Flair identity (it verifies and signs with it)", async () => {
+    const yamlPath = join(root, "rocky", "bob.yaml");
+    writeFileSync(yamlPath, readFileSync(yamlPath, "utf8").split("flair:")[0]);
+    await expect(
+      startPersistent({
+        name: "rocky",
+        agentsRoot: root,
+        sessionFactory: async () => fakeWarmSession().session,
+        installSignalHandlers: false,
+        log: () => {},
+        mailHome: home,
+        mailConsumer: mailSeams,
+      }),
+    ).rejects.toThrow(/needs the agent's Flair identity/);
   });
 });
