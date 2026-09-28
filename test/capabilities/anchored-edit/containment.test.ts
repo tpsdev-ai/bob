@@ -1,7 +1,8 @@
-// Containment tests (bob#185 slice 1, round 2, blocker 2): the trusted root is
-// pinned once per session, and I/O is bound to the verified target, so a
-// directory (or the root) replaced AFTER a call resolves its path but BEFORE it
-// takes the per-file lock is caught rather than followed.
+// Containment tests (bob#185 slice 1): the trusted root is pinned once per
+// session, and each path is resolved and checked inside it before the operation,
+// so a directory (or the root) replaced AFTER a call resolves its path but
+// BEFORE it takes the per-file lock is caught rather than followed. A swap
+// between that check and the I/O is a documented, unguarded race.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
