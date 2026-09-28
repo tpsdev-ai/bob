@@ -3,8 +3,9 @@
 //
 // `overrides/` holds exactly two things:
 //   * named, schema-checked disable lists for tools and capabilities;
-//   * allow-listed skill, prompt, threshold (and soul) files, each replacing a
-//     packaged position file at the same relative path.
+//   * allow-listed skill, prompt and threshold files, each replacing a packaged
+//     position file at the same relative path. The SOUL is not overridable — a
+//     local file may never replace the persona the position ships.
 //
 // Every other policy key is refused BY NAME. There is no key that can enable a
 // tool, widen a ceiling, switch on a capability, pick a provider, name a secret
@@ -164,7 +165,7 @@ export function resolvePositionFiles(
   agentDir: string,
 ): { files: Record<string, string>; sources: Record<string, "position" | "override"> } {
   const overrides = loadOverrides(agentDir);
-  const allowed = new Set(position.manifest.files.map((f) => f.path));
+  const allowed = new Map(position.manifest.files.map((f) => [f.path, f.kind]));
   const files: Record<string, string> = {};
   const sources: Record<string, "position" | "override"> = {};
 
@@ -177,6 +178,14 @@ export function resolvePositionFiles(
       if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
     }
     if (overrideContent !== undefined) {
+      // The soul is the persona: a local override may replace a skill, prompt
+      // or threshold file, but never the soul. Slice 1 ships soul-only
+      // positions, so in practice every present override file is refused here.
+      if (f.kind === "soul") {
+        refuse(
+          `override file "${f.path}" replaces the position's soul, which is not an overridable kind. A local override may replace a skill, prompt or threshold file at the same relative path — never the persona.`,
+        );
+      }
       files[f.path] = overrideContent;
       sources[f.path] = "override";
     } else {

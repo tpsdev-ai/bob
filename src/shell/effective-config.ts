@@ -2,18 +2,22 @@
 //
 // It combines the trust layers, in order, for an ADOPTED agent:
 //
-//   1. verify the position name/version/hash and the role name against the host
-//      grant;
+//   1. verify the position name/hash AND the position's role + version against
+//      the host grant, and load the CURRENT packaged role the grant ratified;
 //   2. refuse, BY NAME, every requested tool or capability outside the ratified
 //      maxima — before any intersection;
 //   3. apply the narrow-only local disables (tools + capabilities);
 //   4. run the EXISTING validators (resolveToolPolicy, resolveCapabilities) on
-//      the result, and check host secret presence for the enabled set.
+//      the result, with BOTH the packaged role's ceiling and the grant maximum
+//      enforced.
 //
 // An agent with NO grant is not adopted: the caller keeps today's resolution
 // untouched, so an existing `bob init` agent keeps booting unchanged.
 //
 // The resolver runs before hire commits files, and again before every session.
+//
+// Slice 1 ships NO secret bindings: a position that declares a secret is refused
+// (position-runtime.ts), so there is nothing to bind here.
 
 import { createHash } from "node:crypto";
 import {
@@ -28,7 +32,7 @@ import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js
 import type { HostGrant, RatifiedSnapshot } from "./host-grant.js";
 import { loadOverrides, type Overrides, resolvePositionFiles } from "./overrides.js";
 import type { LoadedPosition } from "./positions.js";
-import { missingSecrets, type SecretBindings } from "./secrets.js";
+import { loadRole } from "./role-loader.js";
 import { type RoleToolCeiling, resolveToolNames, resolveToolPolicy } from "./tool-allowlist.js";
 
 export interface ResolvedPositionFile {
@@ -57,11 +61,7 @@ export interface EffectiveConfigInputs {
   position: LoadedPosition;
   grant: HostGrant;
   overrides?: Overrides;
-  bindings: SecretBindings;
   persistent?: boolean;
-  // When true (hire + every session start) the enabled-only secret presence
-  // check runs and refuses on a missing binding.
-  checkSecrets?: boolean;
 }
 
 function refuse(detail: string): never {
@@ -92,6 +92,24 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
       `the "${position.manifest.name}" position on disk does not match the host-ratified hash (ratified ${grant.position.hash}, found ${position.hash}). Refusing to boot on an unratified position; re-run 'bob position adopt' with the operator.`,
     );
   }
+  // The manifest's role AND version are pinned by the grant too. The hash covers
+  // the manifest, but a grant is the thing that must be compared EXPLICITLY:
+  // name/hash alone would let a future re-hash of a drifted manifest pass.
+  if (position.manifest.role !== grant.role) {
+    refuse(
+      `the "${position.manifest.name}" position names role "${position.manifest.role}", but the host grant ratified role "${grant.role}". A position's role is pinned by the binding and cannot be changed.`,
+    );
+  }
+  if (position.manifest.version !== grant.position.version) {
+    refuse(
+      `the "${position.manifest.name}" position is version "${position.manifest.version}", but the host grant ratified version "${grant.position.version}". Refusing to boot on an unratified position version; re-run 'bob position adopt' with the operator.`,
+    );
+  }
+
+  // Load and validate the CURRENT packaged role the grant ratified. The role is
+  // the tool ceiling; it has to be readable and its names usable, exactly as
+  // resolveAgentToolPolicy requires on the non-adopted path.
+  const role = loadRole(grant.role as never);
 
   // The instance's declared role must be the ratified one.
   const roleBlock = readAgentRole(yamlText);
@@ -145,7 +163,9 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
   const enabledCaps = requested.filter((c) => !disabledCaps.has(c));
 
   // (4) The existing validators, on the narrowed result. The ceiling is the
-  // host-ratified maximum (a host trust root), never a position field.
+  // PACKAGED ROLE's allow list (the same ceiling every non-adopted session
+  // gets); the host-ratified maximum was already enforced above, so a session
+  // holds neither more than the role allows nor more than the grant ratified.
   const narrowed: ToolsBlock = {
     allow: enabledTools,
     ...(block.exclude !== undefined ? { exclude: block.exclude } : {}),
@@ -156,24 +176,14 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
   const policy = resolveToolPolicy({
     yamlText,
     tools: narrowed,
-    role: roleCeiling(grant.role, grant.maxTools, grant.allowResidentShell),
+    role: roleCeiling(role.role, role.tools.allow, grant.allowResidentShell),
     resident: readResident(yamlText),
     persistent: input.persistent,
   });
 
   const resolution = resolveCapabilities({ yamlText, only: enabledCaps });
 
-  // (5) Enabled-only host secret presence.
-  if (input.checkSecrets !== false) {
-    const missing = missingSecrets(position.manifest.secrets ?? [], enabledCaps, input.bindings);
-    if (missing.length > 0) {
-      refuse(
-        `enabled capabilit${missing.length === 1 ? "y" : "ies"} require host secret${missing.length === 1 ? "" : "s"} that are not bound: ${missing.map((m) => `${m.capability} needs "${m.name}"`).join("; ")}. A position names a secret; the host supplies it. Bind it (BOB_SECRET_* or the host secrets file), or disable the capability.`,
-      );
-    }
-  }
-
-  // (6) Resolve packaged files against the allow-listed override layer.
+  // (5) Resolve packaged files against the allow-listed override layer.
   const resolvedFiles = resolvePositionFiles(position, agentDir);
   const files: ResolvedPositionFile[] = position.manifest.files.map((f) => ({
     path: f.path,
@@ -198,25 +208,40 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
   };
 }
 
-// The ratified snapshot for `bob position diff`: the effective sets plus the
-// resolved-file hashes and soul hash at ratification.
+// The ratified snapshot for `bob position diff`: the complete set of effective
+// SETTINGS `bob position diff` is responsible for comparing, plus the resolved
+// file hashes and soul hash at ratification. It stores the settings the spec
+// covers — role, tool allow list, tool exclusions, the residency decision, the
+// resident-shell grant, the capability set — so a change to ANY of them shows
+// as drift, not just a change to tools/capabilities/files/soul.
 export function snapshotForDiff(config: EffectiveConfig, soulHash: string): RatifiedSnapshot {
   const files: Record<string, string> = {};
   for (const f of config.files) files[f.path] = hashString(f.content);
   return {
+    role: config.role,
     tools: [...config.tools].sort(),
+    excludeTools: [...config.excludeTools].sort(),
+    resident: config.resident,
+    allowResidentShell: config.allowResidentShell,
     capabilities: [...config.capabilities].sort(),
     files,
     soulHash,
+    // The position identity is bookkeeping: it lives in the grant, and callers
+    // overwrite this placeholder from the grant. An empty default here is
+    // intentional (see position-runtime.ts).
     position: { name: "", version: "", hash: "" },
   };
 }
 
 export interface PositionDiff {
+  roleChanged: boolean;
   tools: { added: string[]; removed: string[] };
+  excludeTools: { added: string[]; removed: string[] };
   capabilities: { added: string[]; removed: string[] };
   files: { added: string[]; removed: string[]; changed: string[] };
   soulChanged: boolean;
+  residentChanged: boolean;
+  allowResidentShellChanged: boolean;
   empty: boolean;
 }
 
@@ -230,15 +255,22 @@ export function computePositionDiff(
 ): PositionDiff {
   const bTools = new Set(baseline.tools);
   const cTools = new Set(current.tools);
+  const bExclude = new Set(baseline.excludeTools);
+  const cExclude = new Set(current.excludeTools);
   const bCaps = new Set(baseline.capabilities);
   const cCaps = new Set(current.capabilities);
   const files: Record<string, string> = {};
   for (const f of current.files) files[f.path] = hashString(f.content);
 
   const diff: PositionDiff = {
+    roleChanged: baseline.role !== current.role,
     tools: {
       added: [...cTools].filter((t) => !bTools.has(t)).sort(),
       removed: [...bTools].filter((t) => !cTools.has(t)).sort(),
+    },
+    excludeTools: {
+      added: [...cExclude].filter((t) => !bExclude.has(t)).sort(),
+      removed: [...bExclude].filter((t) => !cExclude.has(t)).sort(),
     },
     capabilities: {
       added: [...cCaps].filter((c) => !bCaps.has(c)).sort(),
@@ -256,17 +288,24 @@ export function computePositionDiff(
         .sort(),
     },
     soulChanged: baseline.soulHash !== soulHash,
+    residentChanged: baseline.resident !== current.resident,
+    allowResidentShellChanged: baseline.allowResidentShell !== current.allowResidentShell,
     empty: false,
   };
   diff.empty =
+    !diff.roleChanged &&
     diff.tools.added.length === 0 &&
     diff.tools.removed.length === 0 &&
+    diff.excludeTools.added.length === 0 &&
+    diff.excludeTools.removed.length === 0 &&
     diff.capabilities.added.length === 0 &&
     diff.capabilities.removed.length === 0 &&
     diff.files.added.length === 0 &&
     diff.files.removed.length === 0 &&
     diff.files.changed.length === 0 &&
-    !diff.soulChanged;
+    !diff.soulChanged &&
+    !diff.residentChanged &&
+    !diff.allowResidentShellChanged;
   return diff;
 }
 

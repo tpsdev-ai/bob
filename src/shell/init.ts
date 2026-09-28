@@ -89,6 +89,11 @@ export interface InitOptions {
   // with the tools the stamped capabilities can provide). A position supplies
   // its own requested tool set.
   toolAllow?: readonly string[];
+  // The persona BODY to write under the identity header (defaults to the role's
+  // template soul). A position supplies its packaged soul here, so the seed soul
+  // is the agent's OWN identity plus the position's persona — never the generic
+  // role template alone.
+  soulBody?: string;
 }
 
 export interface InitResult {
@@ -139,7 +144,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // own identity (#89). The hiring interview overwrites the file with a
   // refined persona; this header is the floor, not the ceiling.
   const soulPath = join(agentDir, "soul.md");
-  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + template.soul);
+  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + (opts.soulBody ?? template.soul));
   written.push(soulPath);
 
   // bob.yaml — canonical config. The tools: allowlist is the role's ceiling

@@ -385,9 +385,12 @@ function usageError(err: unknown): number | undefined {
 function formatPositionDiff(name: string, diff: import("./shell/index.js").PositionDiff): string {
   if (diff.empty) return `[bob position diff] ${name}: no drift from the ratified baseline.`;
   const lines: string[] = [`[bob position diff] ${name}: drift from the ratified baseline:`];
+  if (diff.roleChanged) lines.push(`  role: changed`);
   for (const d of [
     ["tools added", diff.tools.added],
     ["tools removed", diff.tools.removed],
+    ["tools excluded (added)", diff.excludeTools.added],
+    ["tools excluded (removed)", diff.excludeTools.removed],
     ["capabilities added", diff.capabilities.added],
     ["capabilities removed", diff.capabilities.removed],
     ["files added", diff.files.added],
@@ -396,6 +399,8 @@ function formatPositionDiff(name: string, diff: import("./shell/index.js").Posit
   ] as const) {
     if (d[1].length > 0) lines.push(`  ${d[0]}: ${d[1].join(", ")}`);
   }
+  if (diff.residentChanged) lines.push(`  resident: changed`);
+  if (diff.allowResidentShellChanged) lines.push(`  allowResidentShell: changed`);
   if (diff.soulChanged) lines.push(`  soul.md: changed`);
   return lines.join("\n");
 }
@@ -506,7 +511,7 @@ async function main(): Promise<number> {
         }
         const provider = stringFlag(args.flags, "provider");
         const model = stringFlag(args.flags, "model");
-        const result = hireAgent({
+        const result = await hireAgent({
           name,
           positionName: as,
           agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
@@ -523,6 +528,9 @@ async function main(): Promise<number> {
         console.log(`  ratified tools:  ${result.grant.maxTools.join(", ") || "(none)"}`);
         console.log(`  ratified caps:   ${result.grant.maxCapabilities.join(", ") || "(none)"}`);
         console.log(`  override repo:   ${result.overrideDir}`);
+        console.log(
+          `  interview:       ${result.interview.soulUpdated ? "soul.md updated" : "soul.md unchanged"}`,
+        );
         return 0;
       }
       case "position": {

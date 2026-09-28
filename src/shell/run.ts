@@ -555,8 +555,6 @@ export interface RunOptions {
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
   positionsRoot?: string;
-  // Host secret bindings (tests). Defaults to the environment + host file.
-  bindings?: import("./secrets.js").SecretBindings;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
   // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
@@ -632,7 +630,6 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model: opts.model,
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
-    ...(opts.bindings !== undefined ? { bindings: opts.bindings } : {}),
   });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
@@ -959,8 +956,6 @@ export interface ResolveRunConfigOptions {
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
   positionsRoot?: string;
-  // Host secret bindings (tests). Defaults to the environment + host file.
-  bindings?: import("./secrets.js").SecretBindings;
 }
 
 export interface ResolvedRunConfig {
@@ -1037,6 +1032,10 @@ export interface LaunchOptions {
   agentsRoot?: string;
   // Per-invocation model override (same semantics as `bob run --model`).
   model?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
   // Test seam for the one-shot path (defaults to the real SDK factory).
   sessionFactory?: RunSessionFactory;
   // Test seam for the interactive path (defaults to pi's InteractiveMode in a
@@ -1112,6 +1111,8 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
       prompt: opts.prompt,
       model: opts.model,
       agentsRoot: opts.agentsRoot,
+      ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+      ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
       captureStdout: true,
       sessionFactory: opts.sessionFactory,
     });
@@ -1125,6 +1126,8 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     name: opts.name,
     agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
     model: opts.model,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
   return interactive({ config, policy, deps: opts.deps });
@@ -1175,7 +1178,6 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     yamlText,
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
-    ...(opts.bindings !== undefined ? { bindings: opts.bindings } : {}),
     ...(opts.persistent !== undefined ? { persistent: opts.persistent } : {}),
   });
 

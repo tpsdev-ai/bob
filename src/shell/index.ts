@@ -133,12 +133,17 @@ export {
   soulPathFor,
 } from "./flair-soul.js";
 export {
+  BINDING_MARKER,
+  bindingMarkerPath,
   defaultHostRoot,
   type HostGrant,
+  type PositionBindingMarker,
   type RatifiedSnapshot,
   readBaseline,
+  readBindingMarker,
   readGrant,
   writeBaseline,
+  writeBindingMarker,
   writeGrant,
 } from "./host-grant.js";
 export {
@@ -180,10 +185,12 @@ export {
   type AdoptOptions,
   type AdoptResult,
   adoptAgent,
+  type EffectiveSettings,
   type HireOptions,
   type HireResult,
   hireAgent,
   positionDiff,
+  readPositionMarker,
   resolveAdoptedConfig,
 } from "./position-runtime.js";
 export {
@@ -221,14 +228,6 @@ export {
   type SessionManagerLike,
 } from "./run.js";
 export {
-  isBound,
-  loadSecretBindings,
-  missingSecrets,
-  type SecretBinding,
-  type SecretBindings,
-  secretEnvVar,
-} from "./secrets.js";
-export {
   type CommandRunner,
   detectPlatform,
   down,
@@ -264,6 +263,7 @@ export {
   runInteractiveSession,
   SETUP_TOOL_POLICY,
   type SessionDeps,
+  setupToolPolicy,
 } from "./session.js";
 export {
   auditToolNames,

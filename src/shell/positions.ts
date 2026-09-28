@@ -25,7 +25,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Same path-safety class as loadRole: a position name becomes a path segment.
@@ -43,11 +43,18 @@ export const DEFAULT_POSITIONS_ROOT = join(__dirname, "..", "..", "positions");
 // soul is a persona, not a threshold. `threshold` files must name an implemented
 // consumer (see IMPLEMENTED_THRESHOLD_CONSUMERS).
 export type PositionFileKind = "soul" | "skill" | "prompt" | "threshold";
+// The kinds the SCHEMA knows (a later slice loads the rest).
 const FILE_KINDS: readonly PositionFileKind[] = ["soul", "skill", "prompt", "threshold"];
+// The kinds slice 1 can actually LOAD and use. Slice 1 ships soul-only positions
+// (a persona); skill, prompt and threshold files have no consumer yet, so a
+// manifest that declares one is REFUSED rather than accepted and silently
+// ignored — an unsupported kind in a manifest would look like a loaded file.
+const SLICE1_FILE_KINDS: readonly PositionFileKind[] = ["soul"];
 
 // A threshold file names a schema and a runtime consumer. A threshold with no
 // implemented consumer is refused (a number nothing reads is a claim, not a
-// control).
+// control). Slice 1 consumes no threshold at all (see SLICE1_FILE_KINDS), so a
+// manifest carrying a `thresholds` entry is refused too.
 export const IMPLEMENTED_THRESHOLD_CONSUMERS: readonly string[] = ["context_compaction"];
 
 export interface PositionFileSpec {
@@ -181,7 +188,13 @@ export function validateManifest(raw: unknown, source: string): PositionManifest
     if (typeof fo.kind !== "string" || !FILE_KINDS.includes(fo.kind as PositionFileKind)) {
       fail(`${source}: files[${i}].kind must be one of ${FILE_KINDS.join(", ")}.`);
     }
-    return { path: fo.path, kind: fo.kind as PositionFileKind };
+    const kind = fo.kind as PositionFileKind;
+    if (!SLICE1_FILE_KINDS.includes(kind)) {
+      fail(
+        `${source}: files[${i}] has kind "${kind}", which slice 1 cannot load (only ${SLICE1_FILE_KINDS.join(", ")} files are supported). A manifest that names a kind nothing reads is refused rather than accepted and ignored; ${kind} files ship in a later slice.`,
+      );
+    }
+    return { path: fo.path, kind };
   });
 
   const secretsRaw = obj.secrets ?? [];
@@ -205,6 +218,11 @@ export function validateManifest(raw: unknown, source: string): PositionManifest
 
   const thrRaw = obj.thresholds ?? [];
   if (!Array.isArray(thrRaw)) fail(`${source}: "thresholds" must be a list.`);
+  if (thrRaw.length > 0) {
+    fail(
+      `${source}: declares thresholds, but slice 1 consumes no threshold (only ${SLICE1_FILE_KINDS.join(", ")} files are supported). Threshold files and their consumers ship in a later slice; a threshold nothing reads is a claim, not a control.`,
+    );
+  }
   const thresholds: PositionThresholdSpec[] = thrRaw.map((t, i) => {
     if (!t || typeof t !== "object" || Array.isArray(t))
       fail(`${source}: thresholds[${i}] must be an object.`);
@@ -279,14 +297,56 @@ export function readPositionFile(dir: string, rel: string): string {
   return readFileSync(realTarget, "utf8");
 }
 
+// Resolve a position REFERENCE to a directory inside the packaged positions
+// root. Two spellings are accepted:
+//
+//   * a bare name (`builder`) — a single path segment under the root;
+//   * the spec's confined `path:<relative>` form (`path:builder`) — a relative
+//     path resolved under the root and realpath-confined to stay inside it, so
+//     `path:../escape` and a symlink out of the tree are refused.
+//
+// The directory's basename is the position's declared name (manifest.name must
+// match it), so a grant always pins a bare name that reloads the same position
+// at boot.
+function resolvePositionDir(root: string, ref: string): { dir: string; name: string } {
+  if (!ref.startsWith("path:")) {
+    if (!POSITION_NAME.test(ref))
+      fail(`invalid position name ${JSON.stringify(ref)} (must match ${POSITION_NAME}).`);
+    return { dir: join(root, ref), name: ref };
+  }
+  const rel = ref.slice("path:".length);
+  assertRelativeSafe(rel, `position reference ${JSON.stringify(ref)}`);
+  const realRoot = realpathSync(root);
+  let realDir: string;
+  try {
+    realDir = realpathSync(join(root, rel));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT")
+      fail(`unknown position reference ${JSON.stringify(ref)}. Looked in ${root}.`);
+    throw err;
+  }
+  const relToRoot = relative(realRoot, realDir);
+  if (
+    relToRoot === "" ||
+    relToRoot === ".." ||
+    relToRoot.startsWith(`..${sep}`) ||
+    isAbsolute(relToRoot)
+  ) {
+    fail(
+      `position reference ${JSON.stringify(ref)} resolves outside the packaged positions directory. A path-form position must stay inside ${root}.`,
+    );
+  }
+  return { dir: realDir, name: basename(realDir) };
+}
+
 // Load and validate a packaged position. `root` is injectable so tests can point
 // at a scratch positions directory with a test-only candidate; production uses
 // DEFAULT_POSITIONS_ROOT.
 export function loadPosition(name: string, opts: { root?: string } = {}): LoadedPosition {
   const root = opts.root ?? DEFAULT_POSITIONS_ROOT;
-  if (!POSITION_NAME.test(name))
-    fail(`invalid position name ${JSON.stringify(name)} (must match ${POSITION_NAME}).`);
-  const dir = join(root, name);
+  const resolved = resolvePositionDir(root, name);
+  const { dir } = resolved;
+  name = resolved.name;
   const manifestPath = join(dir, "position.json");
   let raw: string;
   try {

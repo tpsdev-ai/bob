@@ -13,9 +13,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { defaultHostRoot, readGrant } from "./host-grant.js";
 import type { SessionRunner } from "./onboard.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
-import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
+import { runInteractiveSession, setupToolPolicy } from "./session.js";
 
 // Same path-traversal + prompt-injection defense as runOnboard.
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -32,6 +33,10 @@ export interface AlignOptions {
   // Test seam: the interactive session. Defaults to pi's InteractiveMode over
   // bob's session runtime.
   sessionRunner?: SessionRunner;
+  // The host state root + positions root, for an ADOPTED agent (so the setup
+  // session's policy is resolved from its grant, not the fixed setup policy).
+  hostRoot?: string;
+  positionsRoot?: string;
 }
 
 export interface AlignResult {
@@ -84,7 +89,22 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   const { config } = resolveRunConfig({
     name: opts.name,
     agentsRoot: dirname(opts.agentDir),
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+  // The setup session's POLICY: the fixed read+write exception for an ordinary
+  // agent, or — for an ADOPTED agent — the grant's resolved tools plus exactly
+  // the one write tool soul.md needs, so it never exceeds the grant.
+  const adopted = readGrant(opts.hostRoot ?? defaultHostRoot(), opts.name) !== undefined;
+  const policy = setupToolPolicy(
+    {
+      tools: config.tools,
+      excludeTools: config.excludeTools ?? [],
+      resident: false,
+      allowResidentShell: false,
+    },
+    adopted,
+  );
   const sessionConfig: RunSessionConfig = {
     ...config,
     // bob.yaml supplies both fields, the same pair `bob run` runs the agent on
@@ -96,13 +116,15 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     // boundary where a bob name enters.
     provider: opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : config.provider,
     model: opts.model ?? config.model,
+    tools: policy.tools,
+    excludeTools: policy.excludeTools,
     appendSystemPrompt: META_PROMPT(opts.name, soulPath),
   };
 
   const runner = opts.sessionRunner ?? runInteractiveSession;
   const exitCode = await runner({
     config: sessionConfig,
-    policy: SETUP_TOOL_POLICY,
+    policy,
     initialMessage: FIRST_MESSAGE(opts.name, soulPath),
   });
 

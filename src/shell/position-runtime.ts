@@ -2,24 +2,27 @@
 // boot resolver the session entry paths use.
 //
 //   * `hireAgent`     — scaffold a NEW agent from a packaged position, ratify the
-//                       host grant, store the diff baseline and initialize the
-//                       override repository. Validates the candidate BEFORE it
-//                       writes anything, so a refused hire leaves no scaffold,
-//                       grant or override repository behind.
+//                       host grant, store the diff baseline, initialize the
+//                       override repository, and run the hiring interview. It
+//                       validates the candidate BEFORE it writes anything, so a
+//                       refused hire leaves no scaffold, grant or override
+//                       repository behind.
 //   * `adoptAgent`    — bind an EXISTING agent to a position: independently
-//                       resolve it before and after, verify its requests, record
-//                       the binding/ratification/baseline, initialize the
-//                       override repository, and leave the config and soul
-//                       byte-for-byte unchanged.
+//                       resolve it before and after, verify its requests, REQUIRE
+//                       the two resolutions to be equal, then record the
+//                       binding/ratification/baseline and initialize the override
+//                       repository, leaving the config and soul byte-for-byte
+//                       unchanged.
 //   * `resolveAdoptedConfig` — the boot resolver. Returns undefined for an agent
 //                       with no grant (an ordinary `bob init` agent keeps
 //                       booting unchanged); otherwise the effective config with
-//                       the grant/position/override/secret layers applied.
+//                       the grant/position/override layers applied. A previously
+//                       bound agent whose grant is missing REFUSES.
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { resolveCapabilities } from "./capability-loader.js";
@@ -33,18 +36,22 @@ import {
 import {
   defaultHostRoot,
   type HostGrant,
+  type PositionBindingMarker,
   type RatifiedSnapshot,
   readBaseline,
+  readBindingMarker,
   readGrant,
   writeBaseline,
+  writeBindingMarker,
   writeGrant,
 } from "./host-grant.js";
 import { type InitResult, initAgent } from "./init.js";
+import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
 import { initOverrideRepo } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
 import { loadRole } from "./role-loader.js";
 import { resolveAgentToolPolicy } from "./run.js";
-import { loadSecretBindings, type SecretBindings } from "./secrets.js";
+import type { SessionDeps } from "./session.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
@@ -54,7 +61,6 @@ export interface PositionCommonOptions {
   agentsRoot: string;
   hostRoot?: string;
   positionsRoot?: string;
-  bindings?: SecretBindings;
   now?: () => Date;
 }
 
@@ -64,10 +70,6 @@ function refuse(detail: string): never {
 
 function resolveHostRoot(opts: { hostRoot?: string }): string {
   return opts.hostRoot ?? defaultHostRoot();
-}
-
-function resolveBindings(opts: PositionCommonOptions, hostRoot: string): SecretBindings {
-  return opts.bindings ?? loadSecretBindings({ hostRoot });
 }
 
 // A grant built from a ratifiable position + role. maxTools/maxCapabilities are
@@ -94,9 +96,9 @@ function grantFor(
   };
 }
 
-// Assert the position's requests are compatible with its named role, and that
-// its permitted capabilities are blessed + implemented. Runs BEFORE any file is
-// written.
+// Assert the position's requests are compatible with its named role, that its
+// permitted capabilities are blessed + implemented, and that it declares no
+// feature slice 1 cannot honor. Runs BEFORE any file is written.
 function assertPositionAgainstRole(position: LoadedPosition, roleAllow: readonly string[]): void {
   const ceiling = new Set(roleAllow);
   const widened = position.manifest.tools.filter((t) => !ceiling.has(t));
@@ -112,6 +114,15 @@ function assertPositionAgainstRole(position: LoadedPosition, roleAllow: readonly
         `the "${position.manifest.name}" position permits capability "${cap}", which is not blessed and implemented.`,
       );
     }
+  }
+  // Slice 1 ships NO host secret bindings. A position that declares a secret is
+  // REFUSED rather than accepted with the requirement quietly unmet: hire and
+  // adoption both go through this check, so no position that names a secret can
+  // be bound. (None of the shipped positions declares one.)
+  if ((position.manifest.secrets?.length ?? 0) > 0) {
+    refuse(
+      `the "${position.manifest.name}" position declares host secret${(position.manifest.secrets?.length ?? 0) === 1 ? "" : "s"}, which slice 1 does not bind. Host secret bindings ship in a later slice; a position that names a secret is refused rather than accepted with the requirement unmet.`,
+    );
   }
 }
 
@@ -139,6 +150,11 @@ export interface HireOptions extends PositionCommonOptions {
   skipFlair?: boolean;
   flairKeysDir?: string;
   flairUrl?: string;
+  // Test seam for the hiring interview (defaults to pi's InteractiveMode). The
+  // interview runs AFTER candidate validation and scaffolding, and may rewrite
+  // soul.md; the baseline is snapshotted from the result.
+  interview?: SessionRunner;
+  deps?: SessionDeps;
 }
 
 export interface HireResult {
@@ -148,10 +164,16 @@ export interface HireResult {
   baseline: RatifiedSnapshot;
   overrideDir: string;
   effective: EffectiveConfig;
+  // The hiring interview's result (soul before/after, exit code).
+  interview: OnboardResult;
 }
 
-// Hire a NEW agent from a packaged position.
-export function hireAgent(opts: HireOptions): HireResult {
+const DEFAULT_PROVIDER = "exe-dev-gateway";
+const DEFAULT_MODEL = "claude-sonnet-4-6";
+
+// Hire a NEW agent from a packaged position. ASYNC because it runs the existing
+// onboarding interview after the candidate is validated and scaffolded.
+export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
   const hostRoot = resolveHostRoot(opts);
   const positionsRoot = opts.positionsRoot ?? DEFAULT_POSITIONS_ROOT;
@@ -162,7 +184,6 @@ export function hireAgent(opts: HireOptions): HireResult {
   assertPositionAgainstRole(position, role.tools.allow);
 
   const agentDir = join(opts.agentsRoot, opts.name);
-  const bindings = resolveBindings(opts, hostRoot);
   const grant = grantFor(opts.name, position, role.tools.allowResidentShell === true, now);
 
   // VALIDATE against the materialized defaults BEFORE writing anything, so a
@@ -177,53 +198,107 @@ export function hireAgent(opts: HireOptions): HireResult {
     agentDir,
     position,
     grant,
-    bindings,
-    checkSecrets: true,
   });
 
+  const provider = opts.provider ?? DEFAULT_PROVIDER;
+  const model = opts.model ?? DEFAULT_MODEL;
+
+  // The position supplies the seed persona, but the agent's OWN identity (the
+  // header initAgent stamps) stays on top: the seed soul is the identity plus
+  // the position's persona, never the generic packaged soul alone.
+  const soulFile = effective.files.find((f) => f.kind === "soul");
   const init = initAgent({
     name: opts.name,
     role: position.manifest.role as never,
-    provider: opts.provider ?? "exe-dev-gateway",
-    model: opts.model ?? "claude-sonnet-4-6",
+    provider,
+    model,
     agentsRoot: opts.agentsRoot,
     capabilities: position.manifest.capabilities.default,
     toolAllow: position.manifest.tools,
     skipFlair: opts.skipFlair ?? true,
+    ...(soulFile !== undefined ? { soulBody: soulFile.content } : {}),
     ...(opts.flairKeysDir !== undefined ? { flairKeysDir: opts.flairKeysDir } : {}),
     ...(opts.flairUrl !== undefined ? { flairUrl: opts.flairUrl } : {}),
   });
 
-  // Materialize the position's packaged files into the instance. Slice 1 ships
-  // only a soul (kind "soul"): it replaces the role's seed template in the
-  // agent, so the position actually supplies the persona it declares.
-  const soulFile = effective.files.find((f) => f.kind === "soul");
-  if (soulFile) writeFileSync(join(init.agentDir, "soul.md"), soulFile.content);
+  // The hiring interview runs after candidate validation and scaffolding. It
+  // refines the seed soul (which already carries the agent's identity).
+  const interview = await runOnboard({
+    name: opts.name,
+    role: position.manifest.role,
+    agentDir: init.agentDir,
+    provider,
+    model,
+    ...(opts.interview !== undefined ? { sessionRunner: opts.interview } : {}),
+    ...(opts.deps !== undefined ? { deps: opts.deps } : {}),
+  });
 
   writeGrant(hostRoot, grant);
+  writeBindingMarker(init.agentDir, grant);
+  // The baseline is snapshotted AFTER the interview: what the operator ratified
+  // is the agent as it now stands, so `position diff` is empty immediately.
   const baseline = snapshotForDiff(effective, soulHashOf(init.agentDir));
   baseline.position = grant.position;
   writeBaseline(hostRoot, opts.name, baseline);
   const overrideDir = initOverrideRepo(init.agentDir);
 
-  return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective };
+  return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
 }
 
 export interface AdoptOptions extends PositionCommonOptions {}
+
+// The effective settings adoption compares before and after binding.
+export interface EffectiveSettings {
+  role: string;
+  tools: string[];
+  excludeTools: string[];
+  resident: boolean;
+  allowResidentShell: boolean;
+  capabilities: string[];
+}
 
 export interface AdoptResult {
   agentDir: string;
   grant: HostGrant;
   baseline: RatifiedSnapshot;
   overrideDir: string;
-  // The agent's own tool/capability requests resolved BEFORE binding (today's
-  // path) and AFTER binding (the grant/position resolver), for the adoption
-  // comparison.
-  before: { tools: string[]; capabilities: string[] };
-  after: { tools: string[]; capabilities: string[] };
+  // The agent's effective settings BEFORE binding (today's path) and AFTER
+  // binding (the grant/position resolver). Adoption REQUIRES these to be equal.
+  before: EffectiveSettings;
+  after: EffectiveSettings;
   soulHashBefore: string;
   soulHashAfter: string;
   diff: PositionDiff;
+}
+
+function settingsEqual(a: EffectiveSettings, b: EffectiveSettings): boolean {
+  const norm = (s: EffectiveSettings) => ({
+    role: s.role,
+    tools: [...s.tools].sort(),
+    excludeTools: [...s.excludeTools].sort(),
+    resident: s.resident,
+    allowResidentShell: s.allowResidentShell,
+    capabilities: [...s.capabilities].sort(),
+  });
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+}
+
+// Name the settings that differ, for the refusal message.
+function settingsDiffs(a: EffectiveSettings, b: EffectiveSettings): string[] {
+  const out: string[] = [];
+  if (a.role !== b.role) out.push(`role (${a.role} -> ${b.role})`);
+  const diffSet = (label: string, x: string[], y: string[]) => {
+    const xs = [...x].sort().join(", ") || "(none)";
+    const ys = [...y].sort().join(", ") || "(none)";
+    if (xs !== ys) out.push(`${label} (${xs} -> ${ys})`);
+  };
+  diffSet("tools", a.tools, b.tools);
+  diffSet("excludeTools", a.excludeTools, b.excludeTools);
+  diffSet("capabilities", a.capabilities, b.capabilities);
+  if (a.resident !== b.resident) out.push(`resident (${a.resident} -> ${b.resident})`);
+  if (a.allowResidentShell !== b.allowResidentShell)
+    out.push(`allowResidentShell (${a.allowResidentShell} -> ${b.allowResidentShell})`);
+  return out;
 }
 
 // Bind an EXISTING agent to a position.
@@ -263,6 +338,14 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
   // The agent's OWN requests resolved the way they are today (the "before").
   const beforePolicy = resolveAgentToolPolicy(yamlText);
   const beforeCaps = resolveCapabilities({ yamlText }).capabilities.map((c) => c.name);
+  const before: EffectiveSettings = {
+    role: existingRole,
+    tools: beforePolicy.tools,
+    excludeTools: beforePolicy.excludeTools,
+    resident: beforePolicy.resident,
+    allowResidentShell: beforePolicy.allowResidentShell,
+    capabilities: beforeCaps,
+  };
 
   // Verify the existing requests against the position's permitted sets — adoption
   // refuses rather than silently narrowing.
@@ -281,7 +364,6 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     );
   }
 
-  const bindings = resolveBindings(opts, hostRoot);
   const grant = grantFor(opts.name, position, role.tools.allowResidentShell === true, now);
 
   // The "after": the same requests under the grant/position resolver.
@@ -290,18 +372,29 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     agentDir,
     position,
     grant,
-    bindings,
-    checkSecrets: true,
   });
 
-  const before = { tools: [...beforePolicy.tools].sort(), capabilities: [...beforeCaps].sort() };
-  const after = {
-    tools: [...effective.tools].sort(),
-    capabilities: [...effective.capabilities].sort(),
+  const after: EffectiveSettings = {
+    role: effective.role,
+    tools: effective.tools,
+    excludeTools: effective.excludeTools,
+    resident: effective.resident,
+    allowResidentShell: effective.allowResidentShell,
+    capabilities: effective.capabilities,
   };
+
+  // Adoption only binds when the two independently resolved configurations are
+  // EQUAL. Otherwise the binding would silently change the agent's effective
+  // settings — the opposite of "adopt without rewriting it".
+  if (!settingsEqual(before, after)) {
+    refuse(
+      `cannot adopt ${opts.name}: the effective configuration before binding does not equal the one after binding — ${settingsDiffs(before, after).join("; ")}. Adoption binds only when the two resolutions agree; fix the position, the overrides or bob.yaml so they match.`,
+    );
+  }
 
   const soulHashBefore = soulHashOf(agentDir);
   writeGrant(hostRoot, grant);
+  writeBindingMarker(agentDir, grant);
   const baseline = snapshotForDiff(effective, soulHashBefore);
   baseline.position = grant.position;
   writeBaseline(hostRoot, opts.name, baseline);
@@ -324,30 +417,36 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
 }
 
 // The boot resolver. Returns undefined when the agent has no grant (not adopted
-// — today's resolution is used untouched), else the effective configuration.
+// — today's resolution is used untouched), else the effective configuration. A
+// BOUND agent (its binding marker is present) whose grant is missing REFUSES:
+// there is no fallback to legacy resolution once an agent has been adopted.
 export function resolveAdoptedConfig(input: {
   name: string;
   agentDir: string;
   yamlText: string;
   hostRoot?: string;
   positionsRoot?: string;
-  bindings?: SecretBindings;
   persistent?: boolean;
 }): EffectiveConfig | undefined {
   const hostRoot = input.hostRoot ?? defaultHostRoot();
   const grant = readGrant(hostRoot, input.name);
-  if (!grant) return undefined;
+  if (!grant) {
+    const marker = readBindingMarker(input.agentDir);
+    if (marker) {
+      refuse(
+        `${input.name} was bound to a position (binding marker present) but its host grant is missing from the host state root. Refusing to boot an adopted agent whose trust root cannot be read — there is no fallback to legacy, unratified resolution. Re-run 'bob position adopt' with the operator, or restore the grant.`,
+      );
+    }
+    return undefined;
+  }
   const position = loadPosition(grant.position.name, {
     root: input.positionsRoot ?? DEFAULT_POSITIONS_ROOT,
   });
-  const bindings = input.bindings ?? loadSecretBindings({ hostRoot });
   return resolveEffectiveConfig({
     yamlText: input.yamlText,
     agentDir: input.agentDir,
     position,
     grant,
-    bindings,
-    checkSecrets: true,
     persistent: input.persistent,
   });
 }
@@ -358,7 +457,6 @@ export function positionDiff(input: {
   agentsRoot: string;
   hostRoot?: string;
   positionsRoot?: string;
-  bindings?: SecretBindings;
 }): PositionDiff {
   const hostRoot = input.hostRoot ?? defaultHostRoot();
   const grant = readGrant(hostRoot, input.name);
@@ -370,14 +468,11 @@ export function positionDiff(input: {
   const position = loadPosition(grant.position.name, {
     root: input.positionsRoot ?? DEFAULT_POSITIONS_ROOT,
   });
-  const bindings = input.bindings ?? loadSecretBindings({ hostRoot });
   const effective = resolveEffectiveConfig({
     yamlText,
     agentDir,
     position,
     grant,
-    bindings,
-    checkSecrets: false,
   });
   return computePositionDiff(baseline, effective, soulHashOf(agentDir));
 }
@@ -388,6 +483,11 @@ export function readPositionBinding(
   name: string,
 ): HostGrant | undefined {
   return readGrant(hostRoot ?? defaultHostRoot(), name);
+}
+
+// Read the binding marker for an agent, for diagnostics.
+export function readPositionMarker(agentDir: string): PositionBindingMarker | undefined {
+  return readBindingMarker(agentDir);
 }
 
 // The agent's currently requested capabilities (its bob.yaml), for tests/tools.
@@ -408,4 +508,4 @@ export function agentDirFor(agentsRoot: string, name: string): string {
 }
 
 // Re-exported for the CLI so it does not reach into effective-config directly.
-export { computePositionDiff, dirname };
+export { computePositionDiff };

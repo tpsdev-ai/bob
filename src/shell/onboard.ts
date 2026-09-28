@@ -18,8 +18,9 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { defaultHostRoot, readGrant } from "./host-grant.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
-import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
+import { runInteractiveSession, type SessionDeps, setupToolPolicy } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
 
 export interface OnboardOptions {
@@ -36,6 +37,11 @@ export interface OnboardOptions {
   // over bob's session runtime.
   sessionRunner?: SessionRunner;
   deps?: SessionDeps;
+  // The host state root + positions root, for an ADOPTED agent (so the setup
+  // session's policy is resolved from its grant, not the fixed setup policy).
+  // Defaults match resolveRunConfig.
+  hostRoot?: string;
+  positionsRoot?: string;
 }
 
 // The interactive-session seam. Defaults to pi's InteractiveMode; tests inject
@@ -104,24 +110,41 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   const soulHashBefore = hashFile(soulPath);
 
   // The interview session runs the agent's OWN config (bob.yaml capabilities,
-  // cwd, credentials) with the interview meta-prompt appended, and the fixed
-  // setup policy — never the role's ceiling, which is what makes the interview
-  // able to write soul.md at all.
+  // cwd, credentials) with the interview meta-prompt appended. Its POLICY is the
+  // setup policy: the fixed read+write exception for an ordinary agent, or — for
+  // an ADOPTED agent — the grant's resolved tools plus exactly the one write tool
+  // soul.md needs, so the session never exceeds the grant.
   const { config } = resolveRunConfig({
     name: opts.name,
     agentsRoot: dirname(opts.agentDir),
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+  const adopted = readGrant(opts.hostRoot ?? defaultHostRoot(), opts.name) !== undefined;
+  const policy = setupToolPolicy(
+    {
+      tools: config.tools,
+      excludeTools: config.excludeTools ?? [],
+      resident: false,
+      allowResidentShell: false,
+    },
+    adopted,
+  );
   const sessionConfig: RunSessionConfig = {
     ...config,
     provider: mapBobProviderToPi(opts.provider),
     model: opts.model,
+    // The session's tools are the setup policy, not the grant's raw set (they
+    // differ by exactly the one write tool when the grant lacks it).
+    tools: policy.tools,
+    excludeTools: policy.excludeTools,
     appendSystemPrompt: META_PROMPT(opts.name, opts.role, soulPath),
   };
 
   const runner = opts.sessionRunner ?? runInteractiveSession;
   const exitCode = await runner({
     config: sessionConfig,
-    policy: SETUP_TOOL_POLICY,
+    policy,
     initialMessage: FIRST_MESSAGE(opts.name, opts.role, soulPath),
     deps: opts.deps,
   });

@@ -83,6 +83,27 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
   allowResidentShell: false,
 };
 
+// The session policy for the privileged setup commands (onboard, align).
+//
+// A NON-adopted agent keeps the fixed setup exception above. An ADOPTED agent's
+// setup session must NOT create a session with privileges outside its host
+// grant: it gets the grant's resolved tools, plus EXACTLY the one `write` tool
+// the interview needs to write soul.md — and nothing else. (bob#195 slice 1;
+// stated in the README.)
+//
+// `base` is the policy resolveRunConfig already resolved from the grant.
+export function setupToolPolicy(base: ToolPolicy, adopted: boolean): ToolPolicy {
+  if (!adopted) return SETUP_TOOL_POLICY;
+  const tools = [...new Set([...base.tools, "write"])];
+  const excludeTools = base.excludeTools.filter((t) => t !== "write");
+  return {
+    tools,
+    excludeTools,
+    resident: base.resident,
+    allowResidentShell: base.allowResidentShell,
+  };
+}
+
 // ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
 //
 // Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and
