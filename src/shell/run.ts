@@ -62,6 +62,7 @@ import {
 } from "./session.js";
 import { resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
 import type { TurnAdmission } from "./turn-admission.js";
+import { originValidationError } from "./turn-origin.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -1130,7 +1131,11 @@ function parseCron(yamlText: string): CronEntry[] {
         typeof e.prompt === "string" &&
         e.prompt.length > 0,
     )
-    .map((e) => ({ name: e.name, schedule: e.schedule, prompt: e.prompt }));
+    .map((e) => {
+      const reason = originValidationError({ kind: "cron", job: e.name });
+      if (reason) throw new Error(`bob: invalid cron entry name: ${reason}`);
+      return { name: e.name, schedule: e.schedule, prompt: e.prompt };
+    });
 }
 
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {

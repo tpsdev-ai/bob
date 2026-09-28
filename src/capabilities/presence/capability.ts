@@ -359,6 +359,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // write wins) and sent when the in-flight beat finishes. This is why the
   // in-flight cap is only for the beacon, not for state transitions.
   let beatInFlight = false;
+  let stopped = false;
   // Pending desired state (last write wins): set by beatState while a beat is
   // in flight; drained by sendNow's finally.
   let pendingState: PresenceBeatOpts | null = null;
@@ -407,7 +408,7 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
   // Liveness-only (beacon) beat: droppable. If a beat is already in flight,
   // drop it - a beacon is a liveness ping, not a transition that must land.
   const beatBeacon = (): void => {
-    if (beatInFlight) return;
+    if (stopped || beatInFlight) return;
     sendNow({});
   };
 
@@ -512,6 +513,8 @@ export function wirePresence(opts: WirePresenceOptions): PresenceHandle {
 
   return {
     stop(): void {
+      if (stopped) return;
+      stopped = true;
       beacon.stop();
     },
   };

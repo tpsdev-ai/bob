@@ -1,6 +1,8 @@
 // Turn origins are runtime metadata, projected at admission before any await.
 // Prompt, model and tool text cannot supply an origin.
 
+import { ORIGIN_FIELD_LIMITS } from "./origin-limits.js";
+
 export type TurnOrigin =
   | { kind: "run" }
   | { kind: "mail"; from: string }
@@ -39,24 +41,43 @@ export function originLabel(
   return `${label.slice(0, budget)}\u2026`;
 }
 
-const AGENT_JOB_RE = /^[a-z0-9-]{1,64}$/;
-// discord `channel` id: digits only, 1..20 chars (a Discord snowflake).
-const CHANNEL_ID_RE = /^[0-9]{1,20}$/;
-
-// Validate an origin's field(s) by character class AND length (round-3 item 2).
-// {kind:"run"} has no field to validate and is always valid. Anything else that
-// is not a clean token is rejected — the turn stays run.
-export function isValidOrigin(o: TurnOrigin): boolean {
+// Validate before admission, so a malformed source cannot quietly become a
+// run turn. The error names the field and bound, never the caller's value.
+export function originValidationError(o: TurnOrigin): string | undefined {
+  const check = (
+    value: string,
+    field: string,
+    max: number,
+    pattern: RegExp,
+  ): string | undefined => {
+    if (typeof value !== "string") return `${field} must be a string`;
+    if (value.length === 0) return `${field} must not be empty`;
+    if (value.length > max) return `${field} exceeds ${max} characters`;
+    if (!pattern.test(value)) return `${field} contains invalid characters`;
+    return undefined;
+  };
   switch (o.kind) {
     case "run":
-      return true;
+      return undefined;
     case "mail":
-      return AGENT_JOB_RE.test(o.from);
+      return check(o.from, "mail.from", ORIGIN_FIELD_LIMITS.mailFrom, /^[a-z0-9-]+$/);
     case "cron":
-      return AGENT_JOB_RE.test(o.job);
+      // bob init documents names with underscores (morning_briefing).
+      return check(o.job, "cron.job", ORIGIN_FIELD_LIMITS.cronJob, /^[a-z0-9_-]+$/);
     case "discord":
-      return CHANNEL_ID_RE.test(o.channelId);
+      return check(
+        o.channelId,
+        "discord.channelId",
+        ORIGIN_FIELD_LIMITS.discordChannelId,
+        /^[0-9]+$/,
+      );
+    default:
+      return "kind is unknown";
   }
+}
+
+export function isValidOrigin(o: TurnOrigin): boolean {
+  return originValidationError(o) === undefined;
 }
 
 // Project a caller-supplied origin down to ONLY the approved fields for its kind
@@ -66,15 +87,24 @@ export function isValidOrigin(o: TurnOrigin): boolean {
 // reference), so an extra field can never reach the presence label or the turn
 // summary.
 export function approvedOrigin(o: TurnOrigin): TurnOrigin {
-  if (!isValidOrigin(o)) return { kind: "run" };
+  let approved: TurnOrigin;
   switch (o.kind) {
     case "mail":
-      return { kind: "mail", from: o.from };
+      approved = { kind: "mail", from: o.from };
+      break;
     case "cron":
-      return { kind: "cron", job: o.job };
+      approved = { kind: "cron", job: o.job };
+      break;
     case "discord":
-      return { kind: "discord", channelId: o.channelId };
+      approved = { kind: "discord", channelId: o.channelId };
+      break;
+    case "run":
+      approved = { kind: "run" };
+      break;
     default:
-      return { kind: "run" };
+      throw new Error("bob: invalid turn origin: kind is unknown");
   }
+  const reason = originValidationError(approved);
+  if (reason) throw new Error(`bob: invalid turn origin: ${reason}`);
+  return approved;
 }

@@ -39,12 +39,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   // The real ExtensionAPI satisfies the structural PresencePiLike the core
-  // needs. wirePresence wires the four subscriptions + the beacon.
-  wirePresence({
+  // needs. wirePresence wires the turn subscriptions + the beacon.
+  const presence = wirePresence({
     pi: pi as unknown as Parameters<typeof wirePresence>[0]["pi"],
     flair,
     config,
     admission: getTurnAdmission(pi),
+  });
+  pi.on("session_shutdown", () => {
+    presence.stop();
   });
 }
 

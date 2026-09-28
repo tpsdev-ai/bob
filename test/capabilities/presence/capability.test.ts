@@ -280,6 +280,28 @@ describe("wirePresence — beats", () => {
     await settle();
     expect(flair.beats).toHaveLength(1);
   });
+
+  it("stop() is idempotent and ignores an already queued beacon callback", async () => {
+    const pi = new FakePresencePi();
+    const flair = new FakePresenceClient();
+    let queuedTick!: () => void;
+    let stopCount = 0;
+    const handle = wirePresence({
+      pi,
+      flair,
+      config: baseConfig(),
+      scheduleBeacon: (_ms, fire) => {
+        queuedTick = fire;
+        return { tick: fire, stop: () => stopCount++ };
+      },
+    });
+    handle.stop();
+    handle.stop();
+    queuedTick();
+    await settle();
+    expect(stopCount).toBe(1);
+    expect(flair.beats).toHaveLength(0);
+  });
 });
 
 // ── 2. Resilience: no throw into pi, in-flight cap, collapsed failures ──────

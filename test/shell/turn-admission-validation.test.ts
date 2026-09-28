@@ -6,6 +6,7 @@ const valid: TurnOrigin[] = [
   { kind: "run" },
   { kind: "mail", from: "flint" },
   { kind: "cron", job: "daily-brief" },
+  { kind: "cron", job: "morning_briefing" },
   { kind: "discord", channelId: "123456789" },
   { kind: "mail", from: "a".repeat(64) },
   { kind: "cron", job: "a".repeat(64) },
@@ -36,7 +37,25 @@ describe("admission origin projection", () => {
   });
   it.each(invalid)("rejects invalid metadata: %j", (origin) => {
     expect(isValidOrigin(origin)).toBe(false);
-    expect(approvedOrigin(origin)).toEqual({ kind: "run" });
+    expect(() => approvedOrigin(origin)).toThrow(/invalid turn origin/);
+  });
+
+  it.each([
+    [{ kind: "mail", from: "a".repeat(65) }, "mail.from exceeds 64 characters"],
+    [{ kind: "cron", job: "a".repeat(65) }, "cron.job exceeds 64 characters"],
+    [{ kind: "discord", channelId: "1".repeat(21) }, "discord.channelId exceeds 20 characters"],
+  ] as const)("refuses an over-limit origin before prompting: %j", async (origin, reason) => {
+    const admission = createTurnAdmission();
+    let prompts = 0;
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt() {
+        prompts++;
+      },
+    });
+    await expect(admission.admitTurn(origin, "prompt")).rejects.toThrow(reason);
+    expect(prompts).toBe(0);
   });
 
   it("copies approved fields before queuing and discards extra fields", async () => {
@@ -56,6 +75,19 @@ describe("admission origin projection", () => {
     expect(seen).toEqual([{ kind: "mail", from: "flint" }]);
     expect(JSON.stringify(seen)).not.toContain("PROMPT_SECRET");
     expect(admission.readOrigin()).toEqual({ kind: "run" });
+  });
+
+  it("validates the copied value when a caller's field changes between reads", () => {
+    let reads = 0;
+    const input = {
+      kind: "cron" as const,
+      get job() {
+        reads++;
+        return reads === 1 ? "brief" : "a".repeat(65);
+      },
+    };
+    expect(approvedOrigin(input)).toEqual({ kind: "cron", job: "brief" });
+    expect(reads).toBe(1);
   });
 
   it("a rejected prompt releases the FIFO and cannot taint the next admission", async () => {

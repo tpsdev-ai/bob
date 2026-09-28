@@ -39,7 +39,12 @@ export function createTurnAdmission() {
     admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]> {
       // Copy before queuing: neither extra fields nor later caller mutations
       // may alter metadata. Closing is synchronous, including during preflight.
-      const approved = approvedOrigin(origin);
+      let approved: TurnOrigin;
+      try {
+        approved = approvedOrigin(origin);
+      } catch (err) {
+        return Promise.reject(err);
+      }
       const run = async (): Promise<unknown[]> => {
         await bound;
         if (closed) throw new Error("bob: turn admission is closed");

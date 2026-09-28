@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
-import { assertCapabilitiesLoaded, runAgent } from "../../src/shell/run.js";
+import { assertCapabilitiesLoaded, resolveRunConfig, runAgent } from "../../src/shell/run.js";
 
 // A fake AgentSession matching the RunSession seam. Emits canned assistant
 // text via text_delta events and then the `message_end` a real pi turn ends
@@ -134,6 +134,17 @@ describe("runAgent", () => {
     await expect(
       runAgent({ name: "../../etc", prompt: "hi", agentsRoot, sessionFactory: factory }),
     ).rejects.toThrow(/invalid agent name/);
+  });
+
+  it("refuses an over-limit cron job name while resolving bob.yaml", () => {
+    const yamlPath = join(agentsRoot, "testbot", "bob.yaml");
+    writeFileSync(
+      yamlPath,
+      `${readFileSync(yamlPath, "utf8")}\ncron:\n  - name: ${"a".repeat(65)}\n    schedule: "* * * * *"\n    prompt: go\n`,
+    );
+    expect(() => resolveRunConfig({ name: "testbot", agentsRoot })).toThrow(
+      /cron\.job exceeds 64 characters/,
+    );
   });
 
   it("errors when the agent dir does not exist", async () => {
