@@ -138,6 +138,8 @@ describe("positions (bob#195) — 2. hire a valid position; refuse an above-ceil
     });
     expect(existsSync(join(result.agentDir, "bob.yaml"))).toBe(true);
     expect(existsSync(join(result.agentDir, "overrides", ".git"))).toBe(true);
+    // The position's packaged soul is materialized into the agent.
+    expect(readFileSync(join(result.agentDir, "soul.md"), "utf8")).toContain("You are a builder.");
     expect(readGrant(s.hostRoot, "new1")?.position.name).toBe("builder");
   });
 

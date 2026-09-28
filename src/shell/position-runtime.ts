@@ -18,7 +18,7 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
@@ -193,6 +193,12 @@ export function hireAgent(opts: HireOptions): HireResult {
     ...(opts.flairKeysDir !== undefined ? { flairKeysDir: opts.flairKeysDir } : {}),
     ...(opts.flairUrl !== undefined ? { flairUrl: opts.flairUrl } : {}),
   });
+
+  // Materialize the position's packaged files into the instance. Slice 1 ships
+  // only a soul (kind "soul"): it replaces the role's seed template in the
+  // agent, so the position actually supplies the persona it declares.
+  const soulFile = effective.files.find((f) => f.kind === "soul");
+  if (soulFile) writeFileSync(join(init.agentDir, "soul.md"), soulFile.content);
 
   writeGrant(hostRoot, grant);
   const baseline = snapshotForDiff(effective, soulHashOf(init.agentDir));
