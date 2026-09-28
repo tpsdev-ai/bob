@@ -59,15 +59,17 @@ hold is a load error, not a silent drop.
 ## Paths and the workspace root
 
 - The **root is pi's tool execution context `cwd`**. Neither a tool argument nor
-  `bob.yaml` can name it. The canonical root is pinned ONCE per session, so a
-  root replaced mid-session does not redefine what the tools address.
+  `bob.yaml` can name it. The canonical root pathname is pinned ONCE per session; a
+  root replaced by a path that resolves elsewhere is refused, but a root replaced
+  by another directory at the same pathname is not detected (see the documented
+  gaps).
 - Absolute paths and any `..` segment are refused before the filesystem is
   touched.
 - A target is resolved to its canonical (realpath) form inside the pinned root,
   and the path is **resolved and checked inside the pinned root before each
   operation**: an internal symlink is allowed (its directory entry is preserved)
   and a symlink leading outside the root is refused, and the parent directory is
-  re-checked immediately before each I/O. Those are resolution-time checks that
+  re-checked before path-based opens and the rename. Those are resolution-time checks that
   run *before* the operation, not atomically with it — a directory (or the root)
   swapped by another process between the check and the I/O is **not** guarded
   (see the documented gaps).
@@ -110,6 +112,10 @@ guard.
   (or the root) swapped by another process between that check and the I/O is not
   guarded — the same class as the cross-process race above (and `bash` stays
   outside every guard in slice 1).
+- **The checks compare canonical pathnames.** A directory (or the root) replaced
+  by another directory at the SAME pathname passes the check, even before it runs;
+  only a replacement that resolves elsewhere (for example a symlink leading outside
+  the root) is refused.
 - **`bash` is outside every guard.** The tripwire and the anchored rules govern
   `read_lines`/`edit_lines`/`insert_after`/`write_file` only. A shell command can
   still rewrite a tracked file (including a write followed by a commit in one

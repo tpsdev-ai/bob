@@ -28,7 +28,7 @@ afterEach(() => {
 });
 
 describe("anchored-edit — containment", () => {
-  it("refuses a call whose parent DIRECTORY was replaced after resolution", async () => {
+  it("refuses a call whose parent directory was replaced by a symlink leading outside the root", async () => {
     // root/sub/f.txt, resolved and dispatched...
     mkdirSync(join(h.root, "sub"));
     writeFileSync(join(h.root, "sub", "f.txt"), "one\ntwo\n");

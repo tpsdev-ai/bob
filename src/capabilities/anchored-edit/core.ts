@@ -537,7 +537,8 @@ interface Budget {
 
 // A caller path resolved within the PINNED root. `canonical` is the realpath
 // resolved (and checked inside the root) at call time and used for I/O;
-// `parentReal` is the realpath of its directory, re-checked before each I/O.
+// `parentReal` is the realpath of its directory, re-checked before path-based
+// opens and the rename.
 interface ResolvedTarget {
   root: string;
   canonical: string;
@@ -651,9 +652,10 @@ export class AnchoredEditSession {
     return { root: realRoot, canonical, parentReal, base: basename(canonical), exists };
   }
 
-  // Re-check, immediately before I/O, that the parent directory is still the
-  // one resolved inside the pinned root. A directory (or the root) replaced
-  // BEFORE this check is caught here. The check and the I/O are separate
+  // Re-check, before path-based opens and the rename, that the parent directory
+  // still resolves to the same canonical pathname inside the pinned root. A
+  // replacement that resolves elsewhere is caught here; one replaced by another
+  // directory at the SAME pathname is not (documented gap). The check and the I/O are separate
   // syscalls: a directory swapped by another process BETWEEN them is not
   // guarded — the same class as the cross-process race in the README's
   // documented gaps.
