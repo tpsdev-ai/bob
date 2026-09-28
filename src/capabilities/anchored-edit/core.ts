@@ -31,8 +31,10 @@
 //   * insert_after     inserts after a real anchor, or L0 for before line 1.
 //   * write_file       exclusive creation; takes no fingerprint.
 //
-// Documented GAPS live in README.md (cross-process race, bash outside the
-// guards, slice-2 items) — read it before trusting this as a sandbox.
+// Documented GAPS live in README.md (the containment check is at RESOLUTION
+// time — a directory swapped between that check and the I/O is an unguarded
+// race, as is any cross-process change; bash is outside the guards; slice-2
+// items) — read it before trusting this as a sandbox.
 
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -41,7 +43,6 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  readFileSync,
   readSync,
   realpathSync,
   renameSync,
@@ -49,6 +50,13 @@ import {
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+// A writer seam: node's writeSync may accept FEWER bytes than requested, so the
+// session loops until the whole buffer is accepted. The seam exists so a test
+// can force a short write without a real short-writing device.
+export type WriteChunk = (fd: number, data: Buffer) => number;
+
+const defaultWriteChunk: WriteChunk = (fd, data) => writeSync(fd, data);
 
 // --- limits (fixed in slice 1; no bob.yaml path can raise them) --------------
 
@@ -182,9 +190,12 @@ export function eolLabel(lines: readonly RawLine[]): Eol {
 // Split caller-supplied text into logical lines. Separators are LF or CRLF; one
 // terminal empty segment produced by a trailing separator is discarded, so "\n"
 // is one blank line. A lone CR is refused.
-export function parseNewText(text: string): string[] {
+export function parseNewText(text: string, path?: string): string[] {
   if (/\r(?!\n)/.test(text)) {
-    throw new Refusal("input text contains a lone CR — use LF or CRLF line endings.");
+    const where = path === undefined ? "the input text" : `"${path}"`;
+    throw new Refusal(
+      `refusing the text for ${where}: rule: lone CR — it contains a lone CR; use LF or CRLF line endings.`,
+    );
   }
   const parts = text.split(/\r\n|\n/);
   if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
@@ -212,14 +223,24 @@ function displayLine(content: Buffer): { text: string; truncated: boolean } {
 // Render `raw` as a read_lines result. start/end are 1-based inclusive line
 // numbers. At most MAX_LINES_PER_PAGE lines and MAX_OUTPUT_BYTES bytes; the
 // header states when a page was cut.
-export function renderReadLines(raw: Buffer, start?: number, end?: number): ReadResult {
+export function renderReadLines(
+  raw: Buffer,
+  start?: number,
+  end?: number,
+  path?: string,
+): ReadResult {
+  const label = path === undefined ? "the file" : `"${path}"`;
   if (raw.includes(0)) {
-    throw new Refusal("file contains a NUL byte — refusing to read a binary file.");
+    throw new Refusal(
+      `refusing to read ${label}: rule: binary file — it contains a NUL byte. read_lines refuses binary files.`,
+    );
   }
   try {
     new TextDecoder("utf-8", { fatal: true }).decode(raw);
   } catch {
-    throw new Refusal("file is not valid UTF-8 — refusing to read a binary file.");
+    throw new Refusal(
+      `refusing to read ${label}: rule: binary file — it is not valid UTF-8. read_lines refuses binary files.`,
+    );
   }
   const { bom, lines } = parseFile(raw);
   const fp = fingerprintOf(raw);
@@ -228,7 +249,9 @@ export function renderReadLines(raw: Buffer, start?: number, end?: number): Read
   const from = start === undefined ? 1 : start;
   const to = end === undefined ? total : end;
   if (from < 1 || (total > 0 && from > total)) {
-    throw new Refusal(`read_lines start=${from} is out of range: the file has ${total} lines.`);
+    throw new Refusal(
+      `refusing to read ${label}: rule: out-of-range read — start=${from} is out of range; the file has ${total} lines.`,
+    );
   }
   const boundedEnd = Math.max(from - 1, Math.min(to, total));
   const pageEnd = Math.min(boundedEnd, from - 1 + MAX_LINES_PER_PAGE);
@@ -310,6 +333,23 @@ function renderLines(newLines: readonly string[], sep: string, lastTerminated: b
   return Buffer.from(parts.join(""), "utf8");
 }
 
+// A blank line can only exist at end-of-file when it is TERMINATED: a file that
+// ends in a separator has no phantom final line, and an empty UNTERMINATED final
+// line renders to nothing. Rendering one would silently drop the very line the
+// caller asked for (a splice that reports a written line and lineDelta 0 while
+// the bytes lost a line). Refuse the unrepresentable case instead.
+function assertRepresentableFinalNewLine(
+  newLines: readonly string[],
+  lastTerminated: boolean,
+  label: string,
+): void {
+  if (!lastTerminated && newLines.length > 0 && newLines[newLines.length - 1] === "") {
+    throw new Refusal(
+      `refusing to edit ${label}: rule: unrepresentable blank final line — the result would end with an empty final line in a file that keeps no final newline, so the line cannot be represented. Add a non-empty last line or a trailing newline.`,
+    );
+  }
+}
+
 // The dominant separator for a file, computed on the ORIGINAL lines.
 function sepFor(lines: readonly RawLine[]): string {
   return eolString(dominantEol(lines));
@@ -326,22 +366,26 @@ export function applyEditLines(
   from: number,
   to: number,
   newLines: readonly string[],
+  path?: string,
 ): SpliceResult {
+  const label = path === undefined ? "the file" : `"${path}"`;
   const { bom, lines } = parseFile(raw);
   const before = bom ? BOM : Buffer.alloc(0);
   const body = bom ? raw.subarray(3) : raw;
   if (lines.length === 0) {
-    throw new Refusal("edit_lines needs an existing non-empty file; the file has no lines.");
+    throw new Refusal(
+      `refusing to edit ${label}: rule: empty file — edit_lines needs an existing non-empty file; the file has no lines.`,
+    );
   }
   if (from < 1 || to < from || to > lines.length) {
     throw new Refusal(
-      `edit_lines range ${from}..${to} is out of range: the file has ${lines.length} lines.`,
+      `refusing to edit ${label}: rule: out-of-range — the range ${from}..${to} is out of range; the file has ${lines.length} lines.`,
     );
   }
   for (let n = from; n <= to; n++) {
     if ([...lines[n - 1].content.toString("utf8")].length > MAX_LINE_CHARS) {
       throw new Refusal(
-        `edit_lines refuses to touch line ${n}: it is longer than the ${MAX_LINE_CHARS}-character display cap, so the model never saw it in full. Re-read is not possible; split the line with another tool.`,
+        `refusing to edit ${label}: rule: overlong line — line ${n} is longer than the ${MAX_LINE_CHARS}-character display cap, so the model never saw it in full. Re-read is not possible; split the line with another tool.`,
       );
     }
   }
@@ -361,6 +405,7 @@ export function applyEditLines(
   } else {
     lastTerminated = true;
   }
+  assertRepresentableFinalNewLine(newLines, lastTerminated, label);
   const mid = newLines.length === 0 ? Buffer.alloc(0) : renderLines(newLines, sep, lastTerminated);
 
   // When the range is the tail and the result is now shorter than the prefix's
@@ -394,21 +439,28 @@ export function applyInsertAfter(
   raw: Buffer,
   after: number,
   newLines: readonly string[],
+  path?: string,
 ): SpliceResult {
+  const label = path === undefined ? "the file" : `"${path}"`;
   const { bom, lines } = parseFile(raw);
   const before = bom ? BOM : Buffer.alloc(0);
   const body = bom ? raw.subarray(3) : raw;
   if (after < 0 || after > lines.length) {
     throw new Refusal(
-      `insert_after anchor line ${after} is out of range: the file has ${lines.length} lines.`,
+      `refusing to insert into ${label}: rule: out-of-range — anchor line ${after} is out of range; the file has ${lines.length} lines.`,
     );
   }
   const sep = sepFor(lines);
 
   if (lines.length === 0) {
     // Only L0 makes sense on an empty file: the whole file becomes the text.
-    if (after !== 0) throw new Refusal("insert_after on an empty file requires anchor L0.");
+    if (after !== 0) {
+      throw new Refusal(
+        `refusing to insert into ${label}: rule: empty file — an empty file requires anchor L0.`,
+      );
+    }
     // An empty file has NO final newline; inserting keeps that state.
+    assertRepresentableFinalNewLine(newLines, false, label);
     const next = Buffer.concat([before, renderLines(newLines, sep, false)]);
     return {
       raw: next,
@@ -442,6 +494,7 @@ export function applyInsertAfter(
   } else if (atEof) {
     lastTerm = finalNl ? sep : "";
   }
+  assertRepresentableFinalNewLine(newLines, lastTerm !== "", label);
   const mid = Buffer.from(
     lead + newLines.map((t, i) => t + (i === newLines.length - 1 ? lastTerm : sep)).join(""),
     "utf8",
@@ -482,8 +535,9 @@ interface Budget {
   tripped: boolean;
 }
 
-// A caller path resolved within the PINNED root. `canonical` is the verified
-// realpath used for I/O; `parentReal` is the realpath of its directory.
+// A caller path resolved within the PINNED root. `canonical` is the realpath
+// resolved (and checked inside the root) at call time and used for I/O;
+// `parentReal` is the realpath of its directory, re-checked before each I/O.
 interface ResolvedTarget {
   root: string;
   canonical: string;
@@ -507,6 +561,13 @@ export class AnchoredEditSession {
   // execution context. A later replacement of the root path (a swapped symlink,
   // a recreated directory) does NOT redefine it.
   private pinnedRoot: string | null = null;
+  // A byte-accepting writer seam (a test forces short writes); the default is
+  // node's writeSync, looped by writeAllBytes until every byte is accepted.
+  private readonly writeChunk: WriteChunk;
+
+  constructor(writeChunk: WriteChunk = defaultWriteChunk) {
+    this.writeChunk = writeChunk;
+  }
 
   // Run `fn` under the per-path critical section. The canonical path is the key.
   private runLocked<T>(key: string, fn: () => T): Promise<T> {
@@ -590,9 +651,12 @@ export class AnchoredEditSession {
     return { root: realRoot, canonical, parentReal, base: basename(canonical), exists };
   }
 
-  // Re-verify, immediately before I/O, that the parent directory is still the
+  // Re-check, immediately before I/O, that the parent directory is still the
   // one resolved inside the pinned root. A directory (or the root) replaced
-  // after resolution is caught here, binding the I/O to the verified target.
+  // BEFORE this check is caught here. The check and the I/O are separate
+  // syscalls: a directory swapped by another process BETWEEN them is not
+  // guarded — the same class as the cross-process race in the README's
+  // documented gaps.
   private verifyParent(t: ResolvedTarget, p: string): void {
     let now: string;
     try {
@@ -639,9 +703,22 @@ export class AnchoredEditSession {
     }
   }
 
-  // Write the verified target atomically: a temp created EXCLUSIVELY (no
-  // symlink follow) in the same verified directory, then renamed over the
-  // target. Every step re-checks the parent, binding the write to the target.
+  // Write every byte to fd, looping because writeSync may accept a SHORT count.
+  // A writer that accepts nothing (or fails) is an incomplete write, which the
+  // caller cleans up.
+  private writeAllBytes(fd: number, data: Buffer): void {
+    let off = 0;
+    while (off < data.length) {
+      const n = this.writeChunk(fd, data.subarray(off));
+      if (n <= 0) throw new Error("incomplete write: the writer accepted no bytes");
+      off += n;
+    }
+  }
+
+  // Write the verified target: a temp created EXCLUSIVELY (no symlink follow)
+  // in the same directory, written until every byte is accepted, then renamed
+  // over the target. Every step re-checks the parent; a swap between a check
+  // and its I/O is the documented, unguarded race.
   private writeVerified(t: ResolvedTarget, p: string, data: Buffer): void {
     this.verifyParent(t, p);
     const tmp = join(
@@ -657,7 +734,7 @@ export class AnchoredEditSession {
       );
     }
     try {
-      writeSync(fd, data);
+      this.writeAllBytes(fd, data);
     } catch {
       closeSync(fd);
       try {
@@ -705,7 +782,7 @@ export class AnchoredEditSession {
   readLines(rootArg: string, path: string, start?: number, end?: number): ToolOutput {
     const t = this.resolveWithin(rootArg, path);
     const raw = this.readVerified(t, path);
-    const res = renderReadLines(raw, start, end);
+    const res = renderReadLines(raw, start, end, path);
     this.readFingerprints.set(t.canonical, res.fingerprint);
     return {
       content: [{ type: "text", text: res.text }],
@@ -725,11 +802,12 @@ export class AnchoredEditSession {
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
+      // A tripped budget answers FIRST for every later mutation of this file —
+      // inside the lock, before the file is read or the inputs validated.
+      this.assertNotTripped(t.canonical, path);
       const raw = this.readVerified(t, path);
       const signals: string[] = [];
       if (!this.readFingerprints.has(t.canonical)) signals.push("edit_without_read");
-      // A tripped budget answers FIRST for every later mutation of this file.
-      this.assertNotTripped(t.canonical, path);
       // Validate BOTH range anchors, then the fingerprint — all inside the lock.
       const from = this.resolveAnchor(raw, fromAnchor, path, "from");
       const to = this.resolveAnchor(raw, toAnchor, path, "to");
@@ -739,8 +817,8 @@ export class AnchoredEditSession {
         );
       }
       this.requireFingerprint(t.canonical, path, fingerprint, fromAnchor, raw, from, signals);
-      const newLines = newText === "" ? [] : parseNewText(newText);
-      const spliced = applyEditLines(raw, from, to, newLines);
+      const newLines = newText === "" ? [] : parseNewText(newText, path);
+      const spliced = applyEditLines(raw, from, to, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
       this.writeVerified(t, path, spliced.raw);
       const fp = fingerprintOf(spliced.raw);
@@ -760,10 +838,12 @@ export class AnchoredEditSession {
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
+      // A tripped budget answers FIRST for every later mutation of this file —
+      // inside the lock, before the file is read or the inputs validated.
+      this.assertNotTripped(t.canonical, path);
       const raw = this.readVerified(t, path);
       const signals: string[] = [];
       if (!this.readFingerprints.has(t.canonical)) signals.push("edit_without_read");
-      this.assertNotTripped(t.canonical, path);
       const after = this.resolveAnchor(raw, anchor, path, "insert", true);
       if (text === "") {
         throw new Refusal(
@@ -779,8 +859,8 @@ export class AnchoredEditSession {
         Math.max(1, after),
         signals,
       );
-      const newLines = parseNewText(text);
-      const spliced = applyInsertAfter(raw, after, newLines);
+      const newLines = parseNewText(text, path);
+      const spliced = applyInsertAfter(raw, after, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
       this.writeVerified(t, path, spliced.raw);
       const fp = fingerprintOf(spliced.raw);
@@ -825,8 +905,10 @@ export class AnchoredEditSession {
     }
     let ok = false;
     try {
-      writeSync(fd, buf);
+      this.writeAllBytes(fd, buf);
       ok = true;
+    } catch {
+      // An incomplete write: fall through, the finally block cleans it up.
     } finally {
       closeSync(fd);
       if (!ok) {
@@ -837,6 +919,11 @@ export class AnchoredEditSession {
           /* best effort */
         }
       }
+    }
+    if (!ok) {
+      throw new Refusal(
+        `refusing to create "${path}": the write was incomplete and was cleaned up.`,
+      );
     }
     const fp = fingerprintOf(buf);
     this.readFingerprints.set(t.canonical, fp);

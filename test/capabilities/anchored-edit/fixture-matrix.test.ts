@@ -171,3 +171,47 @@ describe("anchored-edit — byte-exactness fixture matrix", () => {
     expect((res.details.anchors as string[]).length).toBe(2); // an anchor for EVERY written line
   });
 });
+
+describe("anchored-edit — blank final line and EOF blank insert (unrepresentable cases)", () => {
+  it("REFUSES a blank final line in a file that keeps no final newline", async () => {
+    const p = write("n1.txt", "aaaa\nb"); // 2 lines, no final newline
+    const before = read(p);
+    const out = await edit(p, 2, 2, "\n"); // one blank line as the new final line
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toMatch(/blank final line/);
+    expect(out.text).toContain("n1.txt");
+    expect(read(p).equals(before)).toBe(true); // bytes unchanged
+  });
+
+  it("REFUSES a blank insert into an EMPTY file (unrepresentable)", async () => {
+    const p = write("n2.txt", "");
+    const out = await h.call("insert_after", {
+      path: p,
+      anchor: "L0",
+      text: "\n",
+      fingerprint: fpOf(p),
+    });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toMatch(/blank final line/);
+    expect(out.text).toContain("n2.txt");
+    expect(read(p).length).toBe(0); // still empty (zero bytes)
+  });
+
+  it("REPRESENTS a blank final line when the file keeps a final newline (bytes, count, delta, anchors)", async () => {
+    const p = write("n3.txt", "a\nb\n"); // has a final newline
+    const res = await h.call("edit_lines", {
+      path: p,
+      from: h.anchor(p, 2),
+      to: h.anchor(p, 2),
+      new_text: "\n",
+      fingerprint: fpOf(p),
+    });
+    expect(res.text).toMatch(/ok/);
+    expect(read(p).toString()).toBe("a\n\n"); // blank line 2 represented, final newline kept
+    expect(res.details.lineCount as number).toBe(2);
+    expect(res.details.lineDelta as number).toBe(0);
+    expect((res.details.anchors as string[]).length).toBe(1);
+    const re = await h.call("read_lines", { path: p });
+    expect(re.details.lineCount as number).toBe(2);
+  });
+});

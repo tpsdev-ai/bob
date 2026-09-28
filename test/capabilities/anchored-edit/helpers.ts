@@ -13,6 +13,7 @@ import {
   type AnchoredEditSession,
   anchorToken,
   parseFile,
+  type WriteChunk,
 } from "../../../src/capabilities/anchored-edit/core.js";
 
 export interface RegisteredTool {
@@ -46,7 +47,7 @@ export interface Harness {
   anchor(name: string, line: number): string;
 }
 
-export function makeHarness(): Harness {
+export function makeHarness(opts: { writeChunk?: WriteChunk } = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), "bob-anchored-edit-"));
   const tools = new Map<string, RegisteredTool>();
   const pi: PiLike = {
@@ -54,7 +55,7 @@ export function makeHarness(): Harness {
       tools.set(tool.name, tool as unknown as RegisteredTool);
     },
   };
-  const session = wireAnchoredEdit({ pi, log: () => {} });
+  const session = wireAnchoredEdit({ pi, log: () => {}, writeChunk: opts.writeChunk });
   return {
     root,
     tools,

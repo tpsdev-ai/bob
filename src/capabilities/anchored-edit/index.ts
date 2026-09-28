@@ -45,5 +45,6 @@ export {
   Refusal,
   renderReadLines,
   splitRawLines,
+  type WriteChunk,
 } from "./core.js";
 export { anchoredEditManifest } from "./manifest.js";

@@ -53,7 +53,8 @@ hold is a load error, not a silent drop.
   belongs to the affected span. New separators use the dominant style (LF on a
   tie). Input text is split into logical lines on LF or CRLF, one terminal empty
   segment from a trailing separator is discarded (`"\n"` is one blank line), and
-  a lone CR is refused.
+  a lone CR is refused. A blank line that would become the file's unterminated
+  final line cannot be represented and is refused rather than silently dropped.
 
 ## Paths and the workspace root
 
@@ -63,16 +64,22 @@ hold is a load error, not a silent drop.
 - Absolute paths and any `..` segment are refused before the filesystem is
   touched.
 - A target is resolved to its canonical (realpath) form inside the pinned root,
-  and every read and write is bound to that verified target: an internal symlink
-  is allowed (its directory entry is preserved) and a symlink leading outside
-  the root is refused; a target left in a directory (or root) that is replaced
-  after resolution is refused rather than followed.
+  and the path is **resolved and checked inside the pinned root before each
+  operation**: an internal symlink is allowed (its directory entry is preserved)
+  and a symlink leading outside the root is refused, and the parent directory is
+  re-checked immediately before each I/O. Those are resolution-time checks that
+  run *before* the operation, not atomically with it — a directory (or the root)
+  swapped by another process between the check and the I/O is **not** guarded
+  (see the documented gaps).
 - Writes go through a temporary file created *exclusively* (no symlink follow) in
-  the verified directory and then committed over the target.
+  the target's directory and then renamed over the target, and a write is
+  completed until the writer accepts every byte — an incomplete write is cleaned
+  up and refused, never reported as a success.
 - Creation is exclusive and does not follow symlinks: any existing directory
   entry, including a dangling symlink, counts as occupied, and a refused
-  creation leaves nothing behind.
-- Every refusal names the path and the rule.
+  creation leaves nothing behind, even when the write was incomplete.
+- Every refusal names the caller's path and the rule (binary file, out-of-range
+  read, lone CR, overlong line included).
 
 ## The rewrite tripwire
 
@@ -98,6 +105,11 @@ guard.
 - **The critical section is per-path and in-process only.** Each call checks the
   fingerprint and its anchors, then writes, under a per-path lock. A
   **cross-process** change after that check is an explicitly unguarded race.
+- **Containment is checked at resolution time, not bound to the I/O.** Paths are
+  resolved and checked inside the pinned root before each operation; a directory
+  (or the root) swapped by another process between that check and the I/O is not
+  guarded — the same class as the cross-process race above (and `bash` stays
+  outside every guard in slice 1).
 - **`bash` is outside every guard.** The tripwire and the anchored rules govern
   `read_lines`/`edit_lines`/`insert_after`/`write_file` only. A shell command can
   still rewrite a tracked file (including a write followed by a commit in one

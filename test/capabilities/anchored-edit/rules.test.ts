@@ -228,3 +228,76 @@ describe("anchored-edit — the rewrite tripwire", () => {
     expect(read("ins.txt")).toBe("x\ny\nz\nq\nr\ns\na\nb\n");
   });
 });
+
+describe("anchored-edit — a tripped budget answers first", () => {
+  it("answers budget_stop even when the later read would fail", async () => {
+    write("tb.txt", "x\ny\nz\n"); // 6 bytes -> limit 3
+    await edit("tb.txt", 1, 3, "a\nb\nc"); // trips the budget
+    rmSync(join(h.root, "tb.txt")); // a read would now fail
+    const out = await h.call("edit_lines", {
+      path: "tb.txt",
+      from: "L1#00000000",
+      to: "L1#00000000",
+      new_text: "Q",
+      fingerprint: "F#0000000000000000",
+    });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.details.signals).toContain("budget_stop");
+    expect(out.text).toMatch(/BLOCKED/);
+  });
+});
+
+describe("anchored-edit — every refusal names the caller's path and the rule", () => {
+  it("a binary (NUL) read refusal names the path and the rule", async () => {
+    writeFileSync(join(h.root, "bin2"), Buffer.from([0x00, 0x01, 0x02]));
+    const out = await h.call("read_lines", { path: "bin2" });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toContain("bin2");
+    expect(out.text).toMatch(/binary/);
+  });
+
+  it("an invalid-UTF-8 read refusal names the path and the rule", async () => {
+    writeFileSync(join(h.root, "bad8"), Buffer.from([0xff, 0xfe, 0x41]));
+    const out = await h.call("read_lines", { path: "bad8" });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toContain("bad8");
+    expect(out.text).toMatch(/UTF-8|binary/);
+  });
+
+  it("an out-of-range read refusal names the path and the rule", async () => {
+    write("r.txt", "one\n");
+    const out = await h.call("read_lines", { path: "r.txt", start: 99 });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toContain("r.txt");
+    expect(out.text).toMatch(/out-of-range/);
+  });
+
+  it("a lone-CR refusal names the path and the rule", async () => {
+    write("cr.txt", "a\nb\n");
+    const out = await h.call("edit_lines", {
+      path: "cr.txt",
+      from: h.anchor("cr.txt", 1),
+      to: h.anchor("cr.txt", 1),
+      new_text: "x\ry",
+      fingerprint: fp("cr.txt"),
+    });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toContain("cr.txt");
+    expect(out.text).toMatch(/lone CR/);
+  });
+
+  it("an overlong-line refusal names the path and the rule", async () => {
+    const long = "x".repeat(2500);
+    write("long.txt", `${long}\nshort\n`);
+    const out = await h.call("edit_lines", {
+      path: "long.txt",
+      from: h.anchor("long.txt", 1),
+      to: h.anchor("long.txt", 1),
+      new_text: "y",
+      fingerprint: fp("long.txt"),
+    });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toContain("long.txt");
+    expect(out.text).toMatch(/overlong/);
+  });
+});

@@ -19,6 +19,7 @@ import {
   MAX_OUTPUT_BYTES,
   Refusal,
   type ToolOutput,
+  type WriteChunk,
 } from "./core.js";
 
 // The minimal slice of pi's ExtensionAPI this core needs. Declared structurally
@@ -43,6 +44,8 @@ export interface WireOptions {
   pi: PiLike;
   // Logger seam — defaults to console.error.
   log?: (msg: string) => void;
+  // Writer seam — lets a test force a short write; defaults to node writeSync.
+  writeChunk?: WriteChunk;
 }
 
 const ANCHOR_DOC =
@@ -62,7 +65,7 @@ function capped(text: string): string {
 export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
   const { pi } = opts;
   const log = opts.log ?? ((m: string) => console.error(m));
-  const session = new AnchoredEditSession();
+  const session = new AnchoredEditSession(opts.writeChunk);
 
   // Run one tool body with the shared result shape: every result (success or
   // refusal) is capped, and a refusal records its signals in the structured
