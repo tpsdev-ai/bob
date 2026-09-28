@@ -9,11 +9,11 @@
 // The session comes from bob's ONE factory through pi's InteractiveMode
 // (session.ts) — bob never spawns the pi CLI, and no argument reaches the
 // session. The interview runs under the FIXED setup policy
-// (read + write, session.ts SETUP_TOOL_POLICY), which may exceed the role's
+// (read + write_soul, session.ts SETUP_TOOL_POLICY), which may exceed the role's
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated
-// exceptions"). A model can only reach them through a shell tool, and a shell
-// can already write files, so read + write grants it nothing new.
+// exceptions"). `write_soul` is bob's own tool (write-soul.ts): it takes content
+// only and can write the agent's own soul.md and nothing else (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -76,7 +76,8 @@ Your job in this session:
    - What's the founder's pet peeve about people in this role?
 3. As you learn, refine the persona DRAFT in your head. Don't write to disk yet.
 4. When the human signals they're done ("ship it", "that's enough", "we're good", or similar),
-   write the FULL refined persona to ${soulPath} using the Write tool, OVERWRITING whatever is there.
+   write the FULL refined persona to ${soulPath} using the write_soul tool (it writes your
+   own soul.md and nothing else), OVERWRITING whatever is there.
    The persona should be markdown, first-person, written in YOUR voice as ${name}.
 5. After writing, summarize in one sentence what you wrote, then wait for the human to exit.
 
@@ -115,6 +116,9 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
     ...config,
     provider: mapBobProviderToPi(opts.provider),
     model: opts.model,
+    // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
+    // to THIS agent's soul.md. pi's generic `write` is not granted.
+    setupSoulPath: soulPath,
     appendSystemPrompt: META_PROMPT(opts.name, opts.role, soulPath),
   };
 

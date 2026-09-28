@@ -6,9 +6,10 @@
 // drift, new constraints, or fresh signal; the agent rewrites soul.md.
 //
 // Same session shape as onboard — bob's factory through pi's InteractiveMode,
-// under the fixed setup policy (read + write) — and the same soul.md
+// under the fixed setup policy (read + write_soul) — and the same soul.md
 // hash-before/after test of whether the alignment actually produced a persona
-// update.
+// update. `write_soul` is bob's own tool (write-soul.ts): it takes content only
+// and can write the agent's own soul.md and nothing else (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -56,8 +57,8 @@ Your job in this session:
    - Pet peeves the founder has voiced lately
 3. Ask short, specific questions. Don't fish — anchor on concrete signals.
 4. When the human signals they're done ("ship it", "looks good", or similar),
-   write the UPDATED full persona to ${soulPath} via the Write tool,
-   OVERWRITING the previous version.
+   write the UPDATED full persona to ${soulPath} via the write_soul tool (it writes
+   your own soul.md and nothing else), OVERWRITING the previous version.
 5. Summarize the deltas in one sentence after writing, then wait for exit.
 
 Do NOT:
@@ -87,6 +88,9 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   });
   const sessionConfig: RunSessionConfig = {
     ...config,
+    // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
+    // to THIS agent's soul.md. pi's generic `write` is not granted.
+    setupSoulPath: soulPath,
     // bob.yaml supplies both fields, the same pair `bob run` runs the agent on
     // (#155) — an alignment check-in that ran on some other model was aligning
     // an agent it was not looking at. An override replaces ONLY the field it

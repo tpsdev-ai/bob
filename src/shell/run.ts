@@ -527,6 +527,12 @@ export interface RunSessionConfig {
   // DEFAULT_CONTRACT_CAP_CHARS). The block is cut with a visible truncation
   // marker; the heading is never the part that is cut.
   contractCapChars?: number;
+  // bob#204: the agent's OWN `soul.md`, set ONLY by the setup sessions
+  // (`bob onboard`'s hiring interview and `bob align`). When present, bob's
+  // session factory registers the bob-owned `write_soul` tool bound to this
+  // path — the setup policy's one write, target resolved by bob, never by a
+  // tool argument. No other path sets it, so no other session gets the tool.
+  setupSoulPath?: string;
 }
 
 // The injectable seam. Production builds a real pi AgentSession through bob's

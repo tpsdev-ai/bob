@@ -174,10 +174,15 @@ change one, the named test is what tells you.
 
 1. **Onboarding and alignment are privileged local setup commands**, available
    to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
-   `read` and `write`, which may exceed the role's ceiling — the interview's job
-   is to write `soul.md`. A model can only reach them through a shell tool, and
-   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
-   `align.test.ts`)*
+   `read` and `write_soul`, which may exceed the role's ceiling — the interview's
+   job is to write `soul.md`. `write_soul` is bob's OWN tool (`src/shell/write-soul.ts`):
+   it takes content only and its one target is the agent's own `soul.md`,
+   resolved by bob and never by a tool argument, so a setup session can write
+   `soul.md` and nothing else — not `bob.yaml`, not an override, not a grant, not
+   a file outside the agent directory. A model can only reach these commands
+   through a shell tool, and a shell can already write files; the exception is
+   now a single soul.md write rather than pi's unrestricted `write`. *(`test/shell/onboard.test.ts`,
+   `align.test.ts`, `write-soul.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
 3. **The contract costs tokens, per request.** The task is sent in the first

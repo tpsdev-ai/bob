@@ -19,7 +19,13 @@ import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[]; excludeTools: string[] };
-  config: { provider: string; model: string; cwd: string; appendSystemPrompt: string };
+  config: {
+    provider: string;
+    model: string;
+    cwd: string;
+    appendSystemPrompt: string;
+    setupSoulPath?: string;
+  };
   initialMessage: string;
 }
 
@@ -38,6 +44,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
         model: input.config.model,
         cwd: input.config.cwd,
         appendSystemPrompt: input.config.appendSystemPrompt,
+        setupSoulPath: input.config.setupSoulPath,
       },
       initialMessage: input.initialMessage,
     };
@@ -111,12 +118,11 @@ describe("runOnboard", () => {
     expect(res.soulHashBefore).toBe(res.soulHashAfter);
   });
 
-  it("runs the interview under the FIXED setup policy — read + write, even past the role ceiling", async () => {
+  it("runs the interview under the FIXED setup policy — read + write_soul, even past the role ceiling", async () => {
     // `reviewer`'s ceiling has no `write`: the interview cannot use the role's
     // policy, because writing the refined persona is the job. That is the
-    // stated exception, and it is a PRIVILEGED path: a model can only reach
-    // `bob onboard` through a shell tool, and a shell can already write files
-    // (the reviewer role has bash and no write tool, as asserted below).
+    // stated exception, and it is a PRIVILEGED path. bob#204: the exception is
+    // now the bob-owned `write_soul` (soul.md only), NOT pi's generic `write`.
     expect(loadRole("reviewer").tools.allow).not.toContain("write");
     expect(loadRole("reviewer").tools.allow).toContain("bash");
     scaffoldAgent("reviewer");
@@ -125,7 +131,9 @@ describe("runOnboard", () => {
 
     expect(runs).toHaveLength(1);
     expect(runs[0].policy.tools).toEqual([...SETUP_TOOL_POLICY.tools]);
-    expect(runs[0].policy.tools).toEqual(["read", "write"]);
+    expect(runs[0].policy.tools).toEqual(["read", "write_soul"]);
+    // bob#204: the generic `write` pi tool is NOT granted to a setup session.
+    expect(runs[0].policy.tools).not.toContain("write");
   });
 
   it("hands the interview the agent's own config and the interview meta-prompt", async () => {
@@ -138,6 +146,9 @@ describe("runOnboard", () => {
     expect(run.config.cwd).toBe(join(agentDir, "work"));
     expect(run.config.appendSystemPrompt).toContain("hiring interview");
     expect(run.config.appendSystemPrompt).toContain(join(agentDir, "soul.md"));
+    // bob#204: the session is told its ONE soul-only write target; the factory
+    // registers write_soul bound to it and to nothing else.
+    expect(run.config.setupSoulPath).toBe(join(agentDir, "soul.md"));
     expect(run.initialMessage).toContain("testbot");
   });
 

@@ -16,7 +16,13 @@ import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[] };
-  config: { appendSystemPrompt: string; provider: string; model: string; piAgentDir: string };
+  config: {
+    appendSystemPrompt: string;
+    provider: string;
+    model: string;
+    piAgentDir: string;
+    setupSoulPath?: string;
+  };
   // The whole session config, for tests that compare every field.
   fullConfig: Record<string, unknown>;
   initialMessage: string;
@@ -35,6 +41,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
         provider: input.config.provider,
         model: input.config.model,
         piAgentDir: input.config.piAgentDir,
+        setupSoulPath: input.config.setupSoulPath,
       },
       fullConfig: { ...(input.config as unknown as Record<string, unknown>) },
       initialMessage: input.initialMessage,
@@ -110,7 +117,7 @@ describe("runAlign", () => {
     expect(res.soulUpdated).toBe(false);
   });
 
-  it("runs the check-in under the fixed setup policy (read + write)", async () => {
+  it("runs the check-in under the fixed setup policy (read + write_soul)", async () => {
     scaffoldAgent();
     const { runner, runs } = fakeRunner({});
     await runAlign({
@@ -121,6 +128,10 @@ describe("runAlign", () => {
       sessionRunner: runner,
     });
     expect(runs[0].policy.tools).toEqual([...SETUP_TOOL_POLICY.tools]);
+    // bob#204: soul-only write; pi's generic `write` is NOT granted.
+    expect(runs[0].policy.tools).toEqual(["read", "write_soul"]);
+    expect(runs[0].policy.tools).not.toContain("write");
+    expect(runs[0].config.setupSoulPath).toBe(join(agentDir, "soul.md"));
   });
 
   it("frames the check-in around the agent's current soul.md", async () => {
