@@ -18,6 +18,23 @@ bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
 3. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done. Bob mirrors the result back into Flair.
 4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob run pulse` keeps Pulse on duty — one warm, persistent session that loads the bob.yaml capabilities: the Discord listener that responds to mentions, plus the in-process `cron:` scheduler that fires the agent's briefings and sweeps into the live session (configure the Discord channel and the `cron:` entries in bob.yaml, not on the command line).
 
+The `jarvis` role is the office's resident agent: memory with receipts, awareness
+from available presence and event information, small help routed to the right
+owner, and Discord conversation. Hire one with
+`bob onboard <name> --role jarvis --provider <provider> --model <model>`; the
+interview gives the class seed an individual persona. The role allows only
+`read`, `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch`
+and `discord_react`, with `allowResidentShell: false`. Onboarding stamps only
+the Flair capability: configure `discord` with its token file and channel
+allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
+conversation there. The body and automatic decision loop come later.
+
+Jarvis's template defaults are `ollama` / `qwen3:8b`, accepted as strings by the
+role loader. Pass your provider and model explicitly: onboarding currently uses
+its own defaults rather than the template's, and its `ollama` configuration
+points to Ollama Cloud. A local Ollama endpoint requires operator configuration
+in the agent's `.pi-agent/models.json`.
+
 ### Flair identity, and where the soul lives
 
 Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Bob reads it from `FLAIR_ADMIN_PASS` in the environment, or from the `0600` `~/.flair/admin-pass` file `flair init` writes — **never from a command-line flag**, because argv is world-readable and lands in shell history. If neither is available, `bob onboard` fails with the exact fix rather than leaving a keypair on disk with no identity behind it. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points it at a hub instead of the local spoke.
@@ -417,7 +434,7 @@ src/
     flair/              memory search/write/get over the agent's Flair store
     observatory/        team-view producer
     fixture/            a no-op capability that proves the loader end to end
-roles/                  ea, writer, reviewer, coder, qa, builder-local, custom
+roles/                  ea, jarvis, writer, reviewer, coder, qa, builder-local, custom
 positions/              packaged position presets — builder, reviewer
 test/                   mirrors src/
 ```
@@ -579,7 +596,7 @@ path's persisted files (`(c)`).
 
 ## Status
 
-`0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/writer/reviewer/coder/qa/custom), and `bob doctor` all landed this week (PR-15 through PR-22). Branch-office docs and richer routing tables are next.
+`0.x`. The interactive onboard flow, real `bob run`, Discord listener with auto-reply, per-agent pi config seeding, role templates (ea/jarvis/writer/reviewer/coder/qa/builder-local/custom), and `bob doctor` are available. Branch-office docs and richer routing tables are next.
 
 ## License
 

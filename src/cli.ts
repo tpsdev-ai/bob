@@ -84,7 +84,7 @@ Commands:
                       To send a prompt that starts with "-", use: launch <name> -- --tools
   help                Show this help
 
-Roles: ea | writer | reviewer | coder | qa | custom
+Roles: ea | jarvis | writer | reviewer | coder | qa | builder-local | custom
 
 Flair: onboarding registers the agent as a Flair principal, which needs an admin
 credential for the target instance — FLAIR_ADMIN_PASS in the environment, or the
