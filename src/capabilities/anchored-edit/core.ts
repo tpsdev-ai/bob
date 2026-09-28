@@ -39,6 +39,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
+  fchmodSync,
   constants as fsc,
   fstatSync,
   lstatSync,
@@ -745,6 +746,19 @@ export class AnchoredEditSession {
         /* best effort */
       }
       throw new Refusal(`refusing to edit "${p}": the write failed and was cleaned up.`);
+    }
+    // Keep the target's permission bits: the temp was created 0600, and the rename would
+    // otherwise replace the file's mode (an executable would lose its exec bit).
+    try {
+      fchmodSync(fd, lstatSync(t.canonical).mode & 0o7777);
+    } catch {
+      closeSync(fd);
+      try {
+        unlinkSync(tmp);
+      } catch {
+        /* best effort */
+      }
+      throw new Refusal(`refusing to edit "${p}": could not keep the file's permissions.`);
     }
     closeSync(fd);
     this.verifyParent(t, p);
