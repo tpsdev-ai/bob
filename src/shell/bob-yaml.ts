@@ -187,7 +187,7 @@ export function readAgentRole(yamlText: string): string {
       lineOfKey(yamlText, "agent", "role"),
       raw === undefined
         ? `bob.yaml must declare the agent's role (agent.role) — the role's role.json is the ceiling on the tool allowlist.`
-        : `"role" must be a role name (ea, writer, reviewer, coder, qa, builder-local, custom).`,
+        : `"role" must be a role name (ea, jarvis, writer, reviewer, coder, qa, builder-local, custom).`,
     );
   }
   return raw.trim();

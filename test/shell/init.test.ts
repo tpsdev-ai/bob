@@ -122,7 +122,7 @@ describe("initAgent", () => {
     // mcp__plugin_discord_discord__reply) that pi's registry does not know, so
     // every role's allowlist was inert. Assert against the whole set, per role,
     // so a bad rename names the role it came from.
-    for (const role of ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const) {
+    for (const role of ["ea", "jarvis", "writer", "reviewer", "coder", "qa", "custom"] as const) {
       const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
       const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
       expect(names.length).toBeGreaterThan(0);
@@ -163,7 +163,7 @@ describe("initAgent", () => {
     // resolve a policy that holds. Anything the role's ceiling allows but no
     // stamped capability provides is dropped, so the stamped list is always a
     // subset of pi's built-ins + the stamped capabilities' tools.
-    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    const roles = ["ea", "jarvis", "writer", "reviewer", "coder", "qa", "custom"] as const;
     for (const role of roles) {
       const res = initAgent({ ...baseOpts(), name: `bot-${role}`, role });
       const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
@@ -184,7 +184,7 @@ describe("initAgent", () => {
     // that every name in its stamped policy is actually ACTIVE — the audit that
     // runs at creation is the same check, so a stamped agent that could not
     // hold its policy would fail here.
-    const roles = ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const;
+    const roles = ["ea", "jarvis", "writer", "reviewer", "coder", "qa", "custom"] as const;
     for (const role of roles) {
       const res = initAgent({
         ...baseOpts(),

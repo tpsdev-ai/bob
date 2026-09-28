@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { loadRole } from "../../src/shell/role-loader.js";
+import { resolveToolNames } from "../../src/shell/tool-allowlist.js";
 
 describe("role-loader", () => {
   it("loads the ea role template", () => {
@@ -41,6 +42,35 @@ describe("role-loader", () => {
       expect(t.tools.allow, tool).not.toContain(tool);
     }
     expect(t.tools.allowResidentShell).toBe(true);
+  });
+
+  it("loads jarvis with only registered office tools and no shell or file-writing tools", () => {
+    const t = loadRole("jarvis");
+    expect(t.role).toBe("jarvis");
+    expect(t.soul.trim().length).toBeGreaterThan(0);
+    expect(t.tools.allow).toEqual([
+      "read",
+      "flair_search",
+      "flair_write",
+      "flair_get",
+      "discord_reply",
+      "discord_fetch",
+      "discord_react",
+    ]);
+    expect(resolveToolNames(t.tools.allow, "")).toEqual(t.tools.allow);
+    // flair_write stores memories; none of the shell or file mutators belong here.
+    for (const tool of [
+      "bash",
+      "powershell",
+      "write",
+      "edit",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]) {
+      expect(t.tools.allow, tool).not.toContain(tool);
+    }
+    expect(t.tools.allowResidentShell).toBe(false);
   });
 
   it("throws on unknown role", () => {

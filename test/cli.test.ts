@@ -11,14 +11,18 @@ describe("bob CLI", () => {
     const out = spawnNode([CLI, "help"]);
     expect(out).toContain("Bob — moldable office-agent shell");
     expect(out).toContain("Commands:");
+    expect(out).toMatch(/^Roles:.*\bjarvis\b/m);
   });
 
-  it("onboard --dry-run shows the plan without writing", () => {
-    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
-    expect(out).toContain("[bob onboard] PLAN (--dry-run)");
-    expect(out).toContain("agent.id        = testbot");
-    expect(out).toContain("agent.role      = ea");
-  });
+  it.each(["ea", "jarvis"])(
+    "onboard --role %s --dry-run shows the plan without writing",
+    (role) => {
+      const out = spawnNode([CLI, "onboard", "testbot", "--role", role, "--dry-run"]);
+      expect(out).toContain("[bob onboard] PLAN (--dry-run)");
+      expect(out).toContain("agent.id        = testbot");
+      expect(out).toContain(`agent.role      = ${role}`);
+    },
+  );
 
   it("onboard fails for unknown role", () => {
     try {

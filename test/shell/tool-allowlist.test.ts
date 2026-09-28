@@ -299,7 +299,7 @@ describe("resolveToolPolicy", () => {
 
 describe("shipped roles", () => {
   it("every shipped role's allowlist resolves against the real tool names", () => {
-    for (const role of ["ea", "writer", "reviewer", "coder", "qa", "custom"] as const) {
+    for (const role of ["ea", "jarvis", "writer", "reviewer", "coder", "qa", "custom"] as const) {
       const template = loadRole(role);
       // Throws (naming the offender) if any shipped name is not a tool pi can
       // enable — the guard that keeps roles/*/role.json honest.
