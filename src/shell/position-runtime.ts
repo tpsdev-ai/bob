@@ -279,6 +279,11 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 // interview — leaves no scaffold and no half-written binding.
 export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
+  if (opts.skipFlair === false) {
+    refuse(
+      "Flair provisioning is not supported for hire in slice 1. Use bob onboard for a Flair identity.",
+    );
+  }
   const hostRoot = resolveHostRoot(opts);
   const positionsRoot = opts.positionsRoot ?? DEFAULT_POSITIONS_ROOT;
   const now = opts.now ?? (() => new Date());
@@ -347,6 +352,8 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       agentDir: init.agentDir,
       provider,
       model,
+      hostRoot,
+      positionsRoot,
       ...(opts.interview !== undefined ? { sessionRunner: opts.interview } : {}),
       ...(opts.deps !== undefined ? { deps: opts.deps } : {}),
     });

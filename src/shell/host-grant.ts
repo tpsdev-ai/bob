@@ -77,6 +77,31 @@ export interface HostGrant {
   ratifiedAt: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+// One shape check at the storage boundary; all boot, setup and diagnostic
+// readers go through readGrant, so none can interpret malformed JSON differently.
+function isHostGrant(value: unknown): value is HostGrant {
+  if (!isRecord(value) || !isRecord(value.position)) return false;
+  return (
+    typeof value.agent === "string" &&
+    typeof value.role === "string" &&
+    typeof value.position.name === "string" &&
+    typeof value.position.version === "string" &&
+    typeof value.position.hash === "string" &&
+    isStringArray(value.maxTools) &&
+    isStringArray(value.maxCapabilities) &&
+    typeof value.allowResidentShell === "boolean" &&
+    typeof value.ratifiedAt === "string"
+  );
+}
+
 export interface RatifiedSnapshot {
   // The effective configuration at ratification: what `position diff` compares
   // to. Every setting the spec covers is stored, so drift in ANY of them shows.
@@ -212,13 +237,20 @@ export function readGrant(hostRoot: string, agent: string): HostGrant | undefine
       `bob: the host grant for "${agent}" at ${p} is unreadable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read.`,
     );
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as HostGrant;
+    parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(
-      `bob: the host grant for "${agent}" at ${p} is unparsable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read.`,
+      `bob: the host grant for "${agent}" at ${p} is unparsable (${err instanceof Error ? err.message : String(err)}). Refusing to boot an adopted agent whose trust root cannot be read. Restore a valid host grant with the operator.`,
     );
   }
+  if (!isHostGrant(parsed)) {
+    throw new Error(
+      `bob: the host grant for "${agent}" at ${p} is malformed. Refusing to boot an adopted agent whose trust root cannot be read. Restore a valid host grant with the operator.`,
+    );
+  }
+  return parsed;
 }
 
 export function writeGrant(hostRoot: string, grant: HostGrant): string {

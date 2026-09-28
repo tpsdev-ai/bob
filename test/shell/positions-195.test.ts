@@ -72,6 +72,82 @@ beforeEach(() => {
   mkdirSync(s.agentsRoot, { recursive: true });
   mkdirSync(s.positionsRoot, { recursive: true });
 });
+
+describe("CodeRabbit grant shape", () => {
+  const grant = {
+    agent: "shape",
+    role: "coder",
+    position: { name: "builder", version: "1", hash: "h" },
+    maxTools: ["read"],
+    maxCapabilities: [],
+    allowResidentShell: false,
+    ratifiedAt: "now",
+  };
+  it.each([
+    "null",
+    "{}",
+    "[]",
+    JSON.stringify({ ...grant, position: [] }),
+    JSON.stringify({ ...grant, maxTools: "read" }),
+    JSON.stringify({ ...grant, maxCapabilities: "flair" }),
+    JSON.stringify({ ...grant, ratifiedAt: undefined }),
+  ])("refuses malformed grant %s consistently for boot and setup sessions", async (raw) => {
+    const name = "shape";
+    const init = initAgent({
+      name,
+      role: "coder",
+      provider: "exe-dev-gateway",
+      model: "claude-sonnet-4-6",
+      agentsRoot: s.agentsRoot,
+      skipFlair: true,
+    });
+    mkdirSync(dirname(grantPath(s.hostRoot, name)), { recursive: true });
+    writeFileSync(grantPath(s.hostRoot, name), raw);
+    const expected = /host grant.*shape.*malformed.*Refusing.*Restore/i;
+    expect(() => readGrant(s.hostRoot, name)).toThrow(expected);
+    expect(() => resolve(name)).toThrow(expected);
+    expect(() => positionDiff({ name, agentsRoot: s.agentsRoot, hostRoot: s.hostRoot })).toThrow(
+      expected,
+    );
+    await expect(
+      runOnboard({
+        name,
+        role: "coder",
+        agentDir: init.agentDir,
+        provider: "exe-dev-gateway",
+        model: "claude-sonnet-4-6",
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        sessionRunner: noopInterview,
+      }),
+    ).rejects.toThrow(expected);
+    await expect(
+      runAlign({
+        name,
+        agentDir: init.agentDir,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        sessionRunner: noopInterview,
+      }),
+    ).rejects.toThrow(expected);
+  });
+});
+
+it("hire rejects direct Flair opt-in before scaffolding", async () => {
+  const name = "flair-opt-in";
+  await expect(
+    hireAgent({
+      name,
+      positionName: "builder",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+      skipFlair: false,
+      interview: noopInterview,
+    }),
+  ).rejects.toThrow(/Flair.*not supported.*slice 1/i);
+  expect(existsSync(join(s.agentsRoot, name))).toBe(false);
+});
 afterEach(() => {
   rmSync(s.base, { recursive: true, force: true });
 });

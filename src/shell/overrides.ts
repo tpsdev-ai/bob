@@ -347,6 +347,10 @@ export function initOverrideRepo(agentDir: string): string {
         "user.email=bob@tps.dev",
         "-c",
         "user.name=bob",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
         "commit",
         "--quiet",
         "-m",
@@ -360,7 +364,14 @@ export function initOverrideRepo(agentDir: string): string {
 
 function git(args: string[], cwd: string): void {
   try {
-    execFileSync("git", args, { cwd, stdio: "ignore" });
+    // Internal bookkeeping must not read the operator's global/system config
+    // or copy an operator template with executable hooks into this new repo.
+    const { GIT_TEMPLATE_DIR: _templateDir, ...env } = process.env;
+    execFileSync("git", args, {
+      cwd,
+      stdio: "ignore",
+      env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    });
   } catch (err) {
     throw new Error(
       `bob: could not initialize the override repository at ${cwd} (git ${args[0]} failed: ${err instanceof Error ? err.message : String(err)}). Git is required for the local override layer.`,

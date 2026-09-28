@@ -499,6 +499,10 @@ async function main(): Promise<number> {
         }
         return doctor(args.positional[0]);
       case "hire": {
+        if (args.flags.flair !== undefined) {
+          console.error("bob hire: --flair is not supported in slice 1");
+          return 2;
+        }
         const name = args.positional[0];
         const as = stringFlag(args.flags, "as");
         if (!name) {
@@ -517,7 +521,7 @@ async function main(): Promise<number> {
           agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
-          skipFlair: boolFlag(args.flags, "no-flair") || !boolFlag(args.flags, "flair"),
+          skipFlair: true,
         });
         console.log(`[bob hire] ${name} hired as position "${as}"`);
         console.log(`  agent dir:       ${result.agentDir}`);
