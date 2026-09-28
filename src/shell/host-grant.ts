@@ -13,20 +13,26 @@
 // any intersection, applies the narrow-only local disables, and only then runs
 // the existing validators.
 //
-// The grant is TAMPER-EVIDENT, NOT tamper-proof. It is stored under the host
-// state root (~/.bob/host) — outside the agent's directory (~/agents/<name>/)
-// and outside its session cwd — but that placement is NOT a containment
-// boundary. Any same-user writer can modify the grant file, and that includes
-// the agent's OWN built-in file tools: pi resolves `write`/`edit` paths outside
-// the session cwd, so a positioned agent (and its setup session) can write the
-// grant path directly. What makes the grant evidence, rather than a wall, is
-// that boot re-reads and checks it: a grant that is missing or unreadable is a
-// LOUD refusal (never a silent fallback), and every boot compares the grant's
-// pinned position name, version and hash and role against the packaged position
-// (and enforces both the packaged role ceiling and the ratified maxima), so a
-// grant edited to disagree with the packaged position fails closed. A same-user
-// writer can still produce a grant that keeps those checks passing: real
-// isolation is the sandbox work (bob#189), which slice 1 does not ship.
+// Boot checks the grant against the packaged position selected by that grant
+// and its role. The grant file is stored under the host state root (~/.bob/host)
+// — outside the agent's directory (~/agents/<name>/) and outside its session cwd
+// — but that placement is NOT a containment boundary. Any same-user writer can
+// edit the grant file, and that includes the agent's OWN built-in file tools: pi
+// resolves `write`/`edit` paths outside the session cwd, so a positioned agent
+// (and its setup session) can write the grant path directly. What gives it force
+// is that boot RE-READS and CHECKS it, not that it is authenticated:
+//
+//   Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189.
+//
+// Each boot compares the grant's pinned position name, version, hash and role
+// against the packaged position, AND compares the grant's frozen agent, tool
+// set, capability set and resident-shell flag against the booted agent, the
+// selected manifest's sets and the packaged role's flag; each mismatch is
+// refused by field. A same-user writer can still produce a grant that keeps
+// those checks passing: the grant also selects the package it is checked
+// against, so there is no independent record authenticating the original
+// ratification. Real isolation is the sandbox work (bob#189), which slice 1
+// does not ship.
 //
 // The "previously bound" guard: hire and adoption also write a small binding
 // marker INTO the agent's directory (`.position-binding.json`). The marker is
@@ -40,7 +46,7 @@
 // stored alongside, so `bob position diff` compares the current effective
 // configuration against what the operator ratified.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -124,19 +130,32 @@ const PRESENT_UNREADABLE_MARKER: PositionBindingMarker = {
 };
 
 // Read the binding marker. PRESENCE decides, contents never do: this returns
-// undefined ONLY when the marker file is ABSENT. A marker that exists but is
+// undefined ONLY when the marker's directory entry is ABSENT. Presence is
+// established with lstatSync on the entry itself, so a PRESENT marker whose read
+// then fails (a dangling symlink, unreadable permissions, a directory, invalid
+// UTF-8) is still PRESENT — that is what makes the caller refuse a missing grant
+// rather than fall back to legacy resolution. A marker that exists but is
 // unreadable, not valid JSON, or valid-but-falsey JSON (`null`, `0`, `false`,
-// `""`, `[]`) is still PRESENT — that is what makes the caller refuse a missing
-// grant rather than fall back to legacy resolution. The parsed marker is
-// returned when the content is a JSON object, so diagnostics can read its
-// fields; otherwise the sentinel stands in for "present but unusable".
+// `""`, `[]`) is still PRESENT; only an absent directory entry is absent. The
+// parsed marker is returned when the content is a JSON object, so diagnostics
+// can read its fields; otherwise the sentinel stands in for "present but
+// unusable".
 export function readBindingMarker(agentDir: string): PositionBindingMarker | undefined {
   const p = bindingMarkerPath(agentDir);
+  // Establish directory-entry presence WITHOUT reading: lstat does not follow a
+  // symlink, so a marker that is a symlink to a nonexistent target is present.
+  try {
+    lstatSync(p);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    return PRESENT_UNREADABLE_MARKER;
+  }
+  // The entry is present. Any read failure still counts as present-but-unusable
+  // (the caller refuses a previously bound agent whose grant is missing).
   let raw: string;
   try {
     raw = readFileSync(p, "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+  } catch {
     return PRESENT_UNREADABLE_MARKER;
   }
   let parsed: unknown;

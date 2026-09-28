@@ -875,7 +875,7 @@ function scratchAgentDir(name: string): string {
 }
 
 // ---------------------------------------------------------------------------
-describe("bob#195 round 3, blocker 1 — the grant is tamper-EVIDENT: a same-user write is detected at boot", () => {
+describe("bob#195 round 3, blocker 1 — a same-user grant write is DETECTED at boot", () => {
   it("a plain fs write to the resolved grant path is DETECTED: boot refuses the edited grant", async () => {
     await hireBuilder("tf1");
     expect(() => resolve("tf1")).not.toThrow();
@@ -1080,5 +1080,175 @@ describe("bob#195 round 3, blocker 4 — both reference forms are a single top-l
     }
     expect(String((err as Error)?.message)).toMatch(/single top-level name/);
     expect(existsSync(join(s.agentsRoot, "ref3"))).toBe(false);
+  });
+});
+
+// ===========================================================================
+// ROUND 4
+// ===========================================================================
+
+// Build the JSON text of a grant with one field overridden, written back to the
+// agent's grant file. `writeGrant` derives its path from `grant.agent`, so an
+// agent-field mutation must be written directly.
+const writeGrantText = (name: string, mutate: (g: Record<string, unknown>) => void) => {
+  const g = JSON.parse(readFileSync(grantFile(name), "utf8")) as Record<string, unknown>;
+  mutate(g);
+  writeFileSync(grantFile(name), `${JSON.stringify(g, null, 2)}\n`);
+};
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 4, blocker 1 — boot compares the grant's OWN frozen fields with the packaged artifacts", () => {
+  it("refuses a grant whose `agent` does not match the booted agent", async () => {
+    await hireBuilder("ga1");
+    writeGrantText("ga1", (g) => {
+      g.agent = "someone-else";
+    });
+    let err: unknown;
+    try {
+      resolve("ga1");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/agent/);
+    expect(msg).toContain("someone-else");
+    expect(msg).toContain("ga1");
+    expect(msg).toMatch(/re-hire or re-adopt/);
+  });
+
+  it("refuses a grant whose `maxTools` does not equal the selected manifest's tool set", async () => {
+    await hireBuilder("gt1");
+    const g = readGrant(s.hostRoot, "gt1");
+    if (!g) throw new Error("no grant");
+    // WIDER than the manifest; bob.yaml still requests only the position's set,
+    // so nothing but the grant-vs-manifest comparison can refuse this.
+    writeGrant(s.hostRoot, { ...g, maxTools: [...g.maxTools, "ls"] });
+    let err: unknown;
+    try {
+      resolve("gt1");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/maxTools/);
+    expect(msg).toContain("ls");
+    expect(msg).toMatch(/re-hire or re-adopt/);
+  });
+
+  it("refuses a grant whose `maxCapabilities` does not equal the selected manifest's capability set", async () => {
+    await hireBuilder("gc1");
+    const g = readGrant(s.hostRoot, "gc1");
+    if (!g) throw new Error("no grant");
+    // bob.yaml requests none (the position's default is empty), so only the
+    // grant-vs-manifest comparison can refuse this.
+    writeGrant(s.hostRoot, { ...g, maxCapabilities: [...g.maxCapabilities, "observatory"] });
+    let err: unknown;
+    try {
+      resolve("gc1");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/maxCapabilities/);
+    expect(msg).toContain("observatory");
+    expect(msg).toMatch(/re-hire or re-adopt/);
+  });
+
+  it("refuses a grant whose `allowResidentShell` does not equal the packaged role's flag", async () => {
+    await hireBuilder("gr1");
+    const g = readGrant(s.hostRoot, "gr1");
+    if (!g) throw new Error("no grant");
+    expect(g.allowResidentShell).toBe(true); // the coder role grants a resident shell
+    writeGrant(s.hostRoot, { ...g, allowResidentShell: false });
+    let err: unknown;
+    try {
+      resolve("gr1");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/allowResidentShell/);
+    expect(msg).toContain("coder");
+    expect(msg).toContain("false");
+    expect(msg).toMatch(/re-hire or re-adopt/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 4, blocker 2 — marker presence is the directory ENTRY, not the read", () => {
+  it("a PRESENT marker whose read returns ENOENT (a dangling symlink) still refuses boot", async () => {
+    await hireBuilder("mk5");
+    const marker = bindingMarkerPath(join(s.agentsRoot, "mk5"));
+    rmSync(grantFile("mk5"));
+    // Replace the marker with a symlink whose target does not exist: the entry
+    // is present (lstat sees it), the read returns ENOENT.
+    rmSync(marker);
+    symlinkSync(join(s.base, "does-not-exist.json"), marker);
+    let err: unknown;
+    try {
+      resolve("mk5");
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toMatch(/grant is missing/i);
+    expect(msg).toContain(marker);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 4, blocker 3 — the override scan covers symlinks and ENFORCES agreement", () => {
+  it("refuses an UNLISTED present SYMLINK entry under overrides/files/", () => {
+    const agentDir = scratchAgentDir("ovs1");
+    // A symlink entry the manifest does not allow-list. A symlink is not a
+    // regular file, so the scan must SEE it and put it in the present list.
+    symlinkSync("keep.md", join(overridesDir(agentDir), "files", "evil.md"));
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    let err: unknown;
+    try {
+      resolvePositionFiles(pos, agentDir);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toContain("evil.md");
+    expect(msg).toMatch(/not allow-listed/);
+  });
+
+  it("refuses a file PRESENT under overrides/files/ but NOT DECLARED (agreement is enforced)", () => {
+    const agentDir = scratchAgentDir("ovs2");
+    writeFileSync(
+      join(overridesDir(agentDir), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
+    );
+    writeFileSync(join(overridesDir(agentDir), "files", "keep.md"), "override\n");
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    let err: unknown;
+    try {
+      resolvePositionFiles(pos, agentDir);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toContain("keep.md");
+    expect(msg).toMatch(/not declared/);
+  });
+
+  it("refuses a file DECLARED and allow-listed but ABSENT from overrides/files/ (agreement is enforced)", () => {
+    const agentDir = scratchAgentDir("ovs3");
+    writeFileSync(
+      join(overridesDir(agentDir), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [{ path: "keep.md" }] }, null, 2)}\n`,
+    );
+    const pos = loadedPosition([{ path: "keep.md", kind: "skill" }], { "keep.md": "packaged\n" });
+    let err: unknown;
+    try {
+      resolvePositionFiles(pos, agentDir);
+    } catch (e) {
+      err = e;
+    }
+    const msg = String((err as Error)?.message);
+    expect(msg).toContain("keep.md");
+    expect(msg).toMatch(/not present/);
   });
 });

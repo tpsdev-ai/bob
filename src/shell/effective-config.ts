@@ -3,7 +3,10 @@
 // It combines the trust layers, in order, for an ADOPTED agent:
 //
 //   1. verify the position name/hash AND the position's role + version against
-//      the host grant, and load the CURRENT packaged role the grant ratified;
+//      the host grant, compare the grant's frozen `agent`/`maxTools`/
+//      `maxCapabilities`/`allowResidentShell` against the booted agent, the
+//      selected manifest's tool and capability sets, and the packaged role's
+//      flag, and load the CURRENT packaged role the grant ratified;
 //   2. refuse, BY NAME, every requested tool or capability outside the ratified
 //      maxima — before any intersection;
 //   3. apply the narrow-only local disables (tools + capabilities);
@@ -57,6 +60,9 @@ export interface EffectiveConfig {
 
 export interface EffectiveConfigInputs {
   yamlText: string;
+  // The agent this resolution is for. The grant's frozen `agent` field is
+  // compared with it, so a grant file copied to another agent's path is caught.
+  agent: string;
   agentDir: string;
   position: LoadedPosition;
   grant: HostGrant;
@@ -66,6 +72,19 @@ export interface EffectiveConfigInputs {
 
 function refuse(detail: string): never {
   throw new Error(`bob: ${detail}`);
+}
+
+// Set equality (order- and duplicate-insensitive) for the grant-vs-packaged
+// comparisons below.
+function stringSetsEqual(a: readonly string[], b: readonly string[]): boolean {
+  const norm = (xs: readonly string[]) => [...new Set(xs)].sort();
+  const x = norm(a);
+  const y = norm(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+function listOrNone(xs: readonly string[]): string {
+  return xs.length > 0 ? [...xs].join(", ") : "(none)";
 }
 
 // The role ceiling must cover the position's requested tools, and the grant's
@@ -79,7 +98,7 @@ export function roleCeiling(
 }
 
 export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveConfig {
-  const { yamlText, agentDir, position, grant } = input;
+  const { yamlText, agent, agentDir, position, grant } = input;
 
   // (1) The position identity and the role are pinned by the grant.
   if (position.manifest.name !== grant.position.name) {
@@ -110,6 +129,36 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
   // the tool ceiling; it has to be readable and its names usable, exactly as
   // resolveAgentToolPolicy requires on the non-adopted path.
   const role = loadRole(grant.role as never);
+
+  // (1b) The grant's OWN frozen fields are compared with the booted agent and
+  // the PACKAGED artifacts the grant selects. Without these, a grant edit could
+  // widen the tool set or the resident-shell authority while the name/version/
+  // hash/role checks above still pass — the grant would be compared only with
+  // itself. Each mismatch is refused by FIELD, naming the field, the grant
+  // value, the packaged value and the remedy (re-hire or re-adopt).
+  if (grant.agent !== agent) {
+    refuse(
+      `the host grant was ratified for agent "${grant.agent}", but the agent being booted is "${agent}" (field "agent"). Refusing a grant applied to a different agent; re-hire or re-adopt "${agent}" with the operator.`,
+    );
+  }
+  if (!stringSetsEqual(grant.maxTools, position.manifest.tools)) {
+    refuse(
+      `the host grant's "maxTools" (${listOrNone(grant.maxTools)}) does not equal the packaged "${position.manifest.name}" position's tool set (${listOrNone(position.manifest.tools)}), which the position's role ceiling already covers. A grant may only ratify exactly the tools the selected position requests; re-hire or re-adopt with the operator.`,
+    );
+  }
+  if (!stringSetsEqual(grant.maxCapabilities, position.manifest.capabilities.permitted)) {
+    refuse(
+      `the host grant's "maxCapabilities" (${listOrNone(grant.maxCapabilities)}) does not equal the packaged "${position.manifest.name}" position's capability set (${listOrNone(position.manifest.capabilities.permitted)}). A grant may only ratify exactly the capabilities the selected position permits; re-hire or re-adopt with the operator.`,
+    );
+  }
+  // The resident-shell grant is the PACKAGED role's flag, never the editable
+  // grant file's. Compare them, then use the packaged flag below.
+  const packagedResidentShell = role.tools.allowResidentShell === true;
+  if (grant.allowResidentShell !== packagedResidentShell) {
+    refuse(
+      `the host grant's "allowResidentShell" (${grant.allowResidentShell}) does not equal the packaged "${grant.role}" role's flag (${packagedResidentShell}). The resident-shell grant comes from the packaged role, not the editable grant file; re-hire or re-adopt with the operator.`,
+    );
+  }
 
   // The instance's declared role must be the ratified one.
   const roleBlock = readAgentRole(yamlText);
@@ -176,7 +225,9 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
   const policy = resolveToolPolicy({
     yamlText,
     tools: narrowed,
-    role: roleCeiling(role.role, role.tools.allow, grant.allowResidentShell),
+    // The ceiling's resident-shell flag is the PACKAGED role's (the grant was
+    // proven equal to it above), so authority never flows from the grant file.
+    role: roleCeiling(role.role, role.tools.allow, packagedResidentShell),
     resident: readResident(yamlText),
     persistent: input.persistent,
   });

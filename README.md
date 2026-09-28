@@ -83,18 +83,16 @@ The trust layers, from the top down:
    the existing validators. Changing `bob.yaml` cannot select another role or add
    a grant.
 
-   **The grant is TAMPER-EVIDENT, not tamper-proof.** It is stored under the host
-   state root (`~/.bob/host`), outside the agent's directory and its session cwd
-   — but that placement is NOT a containment boundary. Any same-user writer can
-   modify the grant file, and that includes the agent's own built-in file tools
-   (`write`, `edit`), which resolve paths outside the session cwd; the sandbox
-   work (bob#189) is the real boundary, and slice 1 does not ship it. What the
-   grant gives is **evidence**: every boot re-reads and checks it, so a grant that
-   is missing or unreadable is a loud refusal, and a grant edited to disagree with
-   the packaged position (its pinned name, version, hash or role) fails closed. A
+   The grant is stored under the host state root (`~/.bob/host`), outside the
+   agent's directory and its session cwd — but that placement is NOT a
+   containment boundary. Any same-user writer can edit the grant file, and that
+   includes the agent's own built-in file tools (`write`, `edit`), which resolve
+   paths outside the session cwd; the sandbox work (bob#189) is the real
+   boundary, and slice 1 does not ship it. What the grant gives is boot checks,
+   not authentication. Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189. Every boot compares the grant's pinned name, version, hash and role against the packaged position, AND compares the grant's frozen agent, tool set, capability set and resident-shell flag against the booted agent, the selected manifest's sets and the packaged role's flag, refusing each mismatch by field (the field, the grant value, the packaged value and the remedy). The PACKAGED role's resident-shell flag — never the grant's — is what tool-policy resolution receives. A
    previously bound agent is pinned by a binding marker in its directory: if the
-   marker file exists and the grant is missing, boot REFUSES — never a silent
-   fallback to unratified legacy resolution.
+   marker's directory entry is present and the grant is missing, boot REFUSES —
+   never a silent fallback to unratified legacy resolution.
 3. **Position** — the declared requests, which the grant must cover.
 4. **Instance** — the agent's `bob.yaml`, which may only narrow within the grant.
 5. **Overrides** — `~/agents/<name>/overrides/`, a per-agent Git repository that
@@ -127,12 +125,13 @@ the seed soul is the identity header plus the position's persona, never the
 generic packaged soul alone. Hire without Flair stays the default for the shipped
 positions, presented as a local identity. An ADOPTED agent's setup session
 (`bob onboard`, `bob align`) gets the grant's resolved tools plus EXACTLY the one
-`write` tool the interview needs to write `soul.md`, and nothing else.
+`write` tool the interview needs to write `soul.md` — that single `write` is an
+explicit allowance that may exceed the grant's tool set, and nothing else does.
 
 An agent with no grant is not adopted: it resolves exactly as before, so every
 existing `bob init` agent keeps booting unchanged. The one exception is the
-binding marker: an agent whose marker file exists but whose grant is missing is
-treated as BOUND, and boot refuses rather than falling back.
+binding marker: an agent whose marker's directory entry is present but whose
+grant is missing is treated as BOUND, and boot refuses rather than falling back.
 
 **Later slices:** position upgrade (staged, verified, atomic), arbitrary
 `path:`/`npm:`/`git:` sources (with their own security review), host secret

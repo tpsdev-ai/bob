@@ -196,6 +196,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   );
   const effective = resolveEffectiveConfig({
     yamlText,
+    agent: opts.name,
     agentDir,
     position,
     grant,
@@ -370,6 +371,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
   // The "after": the same requests under the grant/position resolver.
   const effective = resolveEffectiveConfig({
     yamlText,
+    agent: opts.name,
     agentDir,
     position,
     grant,
@@ -445,6 +447,7 @@ export function resolveAdoptedConfig(input: {
   });
   return resolveEffectiveConfig({
     yamlText: input.yamlText,
+    agent: input.name,
     agentDir: input.agentDir,
     position,
     grant,
@@ -471,6 +474,7 @@ export function positionDiff(input: {
   });
   const effective = resolveEffectiveConfig({
     yamlText,
+    agent: input.name,
     agentDir,
     position,
     grant,

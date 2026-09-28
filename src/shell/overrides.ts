@@ -37,10 +37,11 @@ export interface Overrides {
   // The override paths DECLARED in overrides.json (`files:`). Validated against
   // the manifest allow-list at resolution — even when no file is present.
   files: string[];
-  // The override files PRESENT under `overrides/files/` (a directory scan).
-  // Validated against the manifest allow-list TOO. The declaration and the tree
-  // are checked INDEPENDENTLY, so neither a declared path the tree lacks nor an
-  // undeclared file the tree carries can slip through.
+  // The override files PRESENT under `overrides/files/` (a directory scan,
+  // symlink entries included). Validated against the manifest allow-list TOO.
+  // The declaration and the tree are checked INDEPENDENTLY and must also AGREE:
+  // neither a declared path the tree lacks nor an undeclared file (or symlink)
+  // the tree carries can slip through.
   present: string[];
 }
 
@@ -172,18 +173,39 @@ function collectFiles(baseDir: string, prefix: string, out: string[]): void {
   const entries = readdirEntries(baseDir);
   for (const entry of entries) {
     const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-    if (entry.isDirectory()) collectFiles(join(baseDir, entry.name), rel, out);
-    else if (entry.isFile()) out.push(rel);
+    if (entry.isDirectory()) {
+      collectFiles(join(baseDir, entry.name), rel, out);
+      continue;
+    }
+    // A regular file OR a SYMLINK entry is recorded so it is checked against the
+    // manifest allow-list. A symlink's TARGET is confined at read time
+    // (readConfinedOverride), but the ENTRY itself must be declared and
+    // allow-listed, so an unlisted symlink outside a manifest path cannot slip
+    // silently through the present list.
+    if (entry.isFile() || entry.isSymbolicLink()) {
+      out.push(rel);
+      continue;
+    }
+    // Anything else (a socket, a FIFO, a block/char device, …) reports as
+    // neither a file, a directory nor a symlink, so it cannot be compared with
+    // the manifest allow-list. Refuse it rather than silently omitting it.
+    refuse(
+      `override entry "${rel}" is not a regular file, directory or symlink, so it cannot be checked against the manifest's allow-list. Remove it from the override tree (overrides/files/).`,
+    );
   }
 }
 
-function readdirEntries(
-  dir: string,
-): Array<{ name: string; isDirectory(): boolean; isFile(): boolean }> {
+function readdirEntries(dir: string): Array<{
+  name: string;
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}> {
   return readdirSync(dir, { withFileTypes: true }) as unknown as Array<{
     name: string;
     isDirectory(): boolean;
     isFile(): boolean;
+    isSymbolicLink(): boolean;
   }>;
 }
 
@@ -253,6 +275,26 @@ export function resolvePositionFiles(
       if (!allowed.has(rel)) {
         refuse(
           `override file "${rel}" is present in the override tree but is not allow-listed by the "${position.manifest.name}" position. A local file may only replace a packaged file at the same path.`,
+        );
+      }
+    }
+    // ENFORCE AGREEMENT: each list is manifest-allowed above; here the
+    // declaration and the tree must also AGREE. A file present but undeclared,
+    // or declared but absent, is refused by name — a one-sided edit is not an
+    // override.
+    const declaredSet = new Set(overrides.files);
+    const presentSet = new Set(overrides.present);
+    for (const rel of presentSet) {
+      if (!declaredSet.has(rel)) {
+        refuse(
+          `override file "${rel}" is present under overrides/files/ but is not declared in overrides.json. Declare it under "files:" or remove it from the tree — the declaration and the tree must agree.`,
+        );
+      }
+    }
+    for (const rel of declaredSet) {
+      if (!presentSet.has(rel)) {
+        refuse(
+          `override file "${rel}" is declared in overrides.json but is not present under overrides/files/. Add the file to the tree or remove its declaration — the declaration and the tree must agree.`,
         );
       }
     }
