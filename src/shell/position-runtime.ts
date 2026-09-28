@@ -21,7 +21,7 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
@@ -100,15 +100,26 @@ function readablePosition(hostRoot: string, agentDir: string, name: string): str
   return undefined;
 }
 
+// Occupancy and rollback ownership concern directory entries, not their targets.
+// Only ENOENT proves absence; an unreadable entry must never be claimed as ours.
+function entryPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code !== "ENOENT";
+  }
+}
+
 // Refuse when ANY ratification path is already occupied. Runs BEFORE any write.
 function assertUnoccupied(hostRoot: string, agentDir: string, name: string): void {
   const occupied: string[] = [];
   const gp = grantPath(hostRoot, name);
   const mp = bindingMarkerPath(agentDir);
   const bp = baselinePath(hostRoot, name);
-  if (existsSync(gp)) occupied.push(`grant ${gp}`);
-  if (existsSync(mp)) occupied.push(`binding marker ${mp}`);
-  if (existsSync(bp)) occupied.push(`baseline ${bp}`);
+  if (entryPresent(gp)) occupied.push(`grant ${gp}`);
+  if (entryPresent(mp)) occupied.push(`binding marker ${mp}`);
+  if (entryPresent(bp)) occupied.push(`baseline ${bp}`);
   if (occupied.length === 0) return;
   const current = readablePosition(hostRoot, agentDir, name);
   refuse(
@@ -308,7 +319,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   // --- The bind: scaffold, interview and the file commit, under a rollback. ---
   const tx: BindTxn = {
     agentDir,
-    agentDirCreated: !existsSync(agentDir),
+    agentDirCreated: !entryPresent(agentDir),
     overrideDirCreated: false,
   };
   try {
@@ -362,7 +373,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !existsSync(overridesDir(init.agentDir));
+    tx.overrideDirCreated = !entryPresent(overridesDir(init.agentDir));
     const overrideDir = initOverrideRepo(init.agentDir);
     opts.commitHook?.("override-repo");
 
@@ -549,7 +560,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !existsSync(overridesDir(agentDir));
+    tx.overrideDirCreated = !entryPresent(overridesDir(agentDir));
     const overrideDir = initOverrideRepo(agentDir);
     opts.commitHook?.("override-repo");
 

@@ -12,9 +12,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -1700,5 +1702,78 @@ describe("bob#195 round 6, blocker 4 — a failure at any commit stage rolls bac
     expect(msg).toMatch(/already exists/);
     expect(readFileSync(join(agentDir, "keep.txt"), "utf8")).toBe("operator data\n");
     expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+  });
+});
+
+// Directory entries, including unresolved links, belong to the operator until
+// this operation actually creates them. Test both refusal and rollback ownership.
+describe("bob#195 pass 6 — preserve occupied directory entries", () => {
+  for (const operation of ["hire", "adopt"] as const) {
+    for (const record of ["grant", "marker", "baseline"] as const) {
+      it(`${operation} preserves an occupied ${record} entry`, async () => {
+        const name = `entry-${operation}-${record}`;
+        const agentDir = agentDirFor(name);
+        if (operation === "adopt") adoptReadyAgent(name);
+        const paths = {
+          grant: grantPath(s.hostRoot, name),
+          marker: bindingMarkerPath(agentDir),
+          baseline: baselinePath(s.hostRoot, name),
+        };
+        const occupied = paths[record];
+        mkdirSync(dirname(occupied), { recursive: true });
+        const target = join(s.base, "absent-record");
+        symlinkSync(target, occupied);
+        const before = readlinkSync(occupied);
+        const msg = await refusalOf(() =>
+          operation === "hire"
+            ? hireBuilder(name)
+            : adoptAgent({
+                name,
+                positionName: "builder",
+                agentsRoot: s.agentsRoot,
+                hostRoot: s.hostRoot,
+              }),
+        );
+        expect(msg).toContain(occupied);
+        expect(msg).toMatch(/not supported in this slice/);
+        expect(lstatSync(occupied).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(occupied)).toBe(before);
+        expect(existsSync(target)).toBe(false);
+        for (const [kind, path] of Object.entries(paths)) {
+          if (kind !== record) expect(existsSync(path)).toBe(false);
+        }
+      });
+    }
+  }
+
+  it("hire rollback preserves the pre-existing agent entry", async () => {
+    const name = "entry-agent";
+    const agentDir = agentDirFor(name);
+    const target = join(s.base, "absent-agent");
+    symlinkSync(target, agentDir);
+    const before = readlinkSync(agentDir);
+    await refusalOf(() => hireBuilder(name));
+    expect(lstatSync(agentDir).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentDir)).toBe(before);
+    expect(existsSync(target)).toBe(false);
+    expect(readGrant(s.hostRoot, name)).toBeUndefined();
+  });
+
+  it("adopt rollback preserves the pre-existing override entry", async () => {
+    const name = "entry-overrides";
+    adoptReadyAgent(name);
+    const dir = overridesDir(agentDirFor(name));
+    const target = join(s.base, "absent-overrides");
+    symlinkSync(target, dir);
+    const before = readlinkSync(dir);
+    await refusalOf(() =>
+      adoptAgent({ name, positionName: "builder", agentsRoot: s.agentsRoot, hostRoot: s.hostRoot }),
+    );
+    expect(lstatSync(dir).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(dir)).toBe(before);
+    expect(existsSync(target)).toBe(false);
+    expect(readGrant(s.hostRoot, name)).toBeUndefined();
+    expect(readBaseline(s.hostRoot, name)).toBeUndefined();
+    expect(existsSync(bindingMarkerPath(agentDirFor(name)))).toBe(false);
   });
 });
