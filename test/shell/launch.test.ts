@@ -12,8 +12,17 @@
 //   * the REAL generated launcher + the mail consumer — the chain reaches
 //     `bob launch` with the prompt as the one argument, and never the pi binary.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -508,6 +517,75 @@ describe("the mail consumer", () => {
 
 describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
   const cli = join(repoRoot, "dist", "cli.js");
+  // An input the CLI refuses for its extra field — which it can only say after
+  // reading ALL of it. (Refused before any agent lookup, so no agent dir.)
+  const refusable = (bodyBytes = 1) =>
+    JSON.stringify({
+      v: 1,
+      sender: "flint",
+      messageId: "m1",
+      body: "x".repeat(bodyBytes),
+      tools: ["bash"],
+    });
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "bob-mailturn-cli-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+  const mailEnv = () => ({ ...process.env, HOME: home, BOB_MAIL_TURN: "1" });
+
+  // bob#203: bun's spawnSync hands a child its `input` as a memfd on Linux — a
+  // REGULAR FILE, not a pipe. Under bun, reading a regular-file stdin through
+  // `process.stdin` (which bob's imports create early) came back EMPTY for any
+  // file up to 64 KiB — every real mail — and whole above it. A regular file
+  // reproduces that on any OS, so all three sizes are pinned: the CI's own
+  // shape, a mid-size mail, and one that needs several read(2) chunks.
+  for (const bodyBytes of [1, 32_000, 150_000]) {
+    it(`reads stdin that is a REGULAR FILE to EOF (the Linux spawnSync-input case, ${bodyBytes}-byte body)`, () => {
+      const file = join(home, "input.json");
+      writeFileSync(file, refusable(bodyBytes));
+      const fd = openSync(file, "r");
+      try {
+        const run = spawnSync(process.execPath, [cli, "launch", AGENT], {
+          env: mailEnv(),
+          stdio: [fd, "pipe", "pipe"],
+          encoding: "utf8",
+          timeout: CLI_SPAWN_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        });
+        expect(run.stderr).toContain('unknown field "tools"');
+        expect(run.status).toBe(2);
+      } finally {
+        closeSync(fd);
+      }
+    });
+  }
+
+  it("reads stdin written through a pipe in several delayed pieces to EOF", async () => {
+    const bytes = Buffer.from(refusable(100_000));
+    const child = spawn(process.execPath, [cli, "launch", AGENT], {
+      env: mailEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+    child.stdin?.on("error", () => {});
+    const cuts = [5, 37, 4096, 70_000, bytes.length];
+    let at = 0;
+    for (const cut of cuts) {
+      child.stdin?.write(bytes.subarray(at, cut));
+      at = cut;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    child.stdin?.end();
+    expect(await closed).toBe(2);
+    expect(stderr).toContain('unknown field "tools"');
+  }, 20_000);
 
   it("refuses a prompt argument: a mail turn takes its input on stdin only", () => {
     const run = spawnSync(process.execPath, [cli, "launch", AGENT, "--", "hello"], {

@@ -34,6 +34,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -1228,18 +1229,66 @@ export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<nu
   return 0;
 }
 
-// Read the mail-turn input from a stream, refusing more than `maxBytes`.
-export async function readMailTurnInput(
-  stream: NodeJS.ReadableStream,
-  maxBytes: number = MAIL_TURN_INPUT_MAX_BYTES,
-): Promise<string> {
+// Read the mail-turn input: fd 0 (stdin), synchronously, until EOF.
+//
+// NOT through `process.stdin` (bob#203). Under bun, a `process.stdin` that was
+// created in an earlier tick yields NOTHING when fd 0 is a regular file — and
+// bob's module graph creates it at import (pi-coding-agent touches the getter),
+// so every read came back empty. On Linux, bun's spawnSync hands a child its
+// `input` as a memfd, which is a regular file: the mail-turn test failed there
+// with "not JSON" while passing on macOS, where it is a pipe. Node was never
+// affected. Reading the descriptor directly has no stream state to lose and
+// behaves the same in both runtimes, for a pipe, a file or a memfd, in one
+// chunk or many.
+//
+// It reads until read(2) returns 0 (EOF) — every chunk, however the writer
+// split it. A pipe may be non-blocking (node makes fd 0 non-blocking once
+// `process.stdin` exists), so EAGAIN waits briefly and reads again. More than
+// `maxBytes` is refused rather than truncated. A writer that never closes the
+// pipe blocks the read; the consumer's turn timeout kills the process.
+export interface MailTurnInputReadOptions {
+  fd?: number;
+  maxBytes?: number;
+  // Seams (tests): the read(2) and the EAGAIN wait.
+  readSync?: (fd: number, buf: Buffer, offset: number, length: number, position: null) => number;
+  sleep?: (ms: number) => void;
+}
+
+const EAGAIN_WAIT_MS = 5;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export function readMailTurnInput(opts: MailTurnInputReadOptions = {}): string {
+  const fd = opts.fd ?? 0;
+  const maxBytes = opts.maxBytes ?? MAIL_TURN_INPUT_MAX_BYTES;
+  const read = opts.readSync ?? ((f, b, o, l, p) => readSync(f, b, o, l, p));
+  const sleep = opts.sleep ?? sleepSync;
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of stream) {
-    const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
-    size += buf.length;
-    if (size > maxBytes) throw new Error(`mail turn input exceeds ${maxBytes} bytes`);
-    chunks.push(buf);
+  const buf = Buffer.alloc(64 * 1024);
+  for (;;) {
+    let n: number;
+    try {
+      n = read(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+        sleep(EAGAIN_WAIT_MS);
+        continue;
+      }
+      if (code === "EOF") break;
+      throw err;
+    }
+    if (n === 0) break; // EOF: the writer closed its end
+    size += n;
+    if (size > maxBytes) {
+      throw new Error(
+        `mail turn input exceeds ${maxBytes} bytes; refusing it rather than reading a truncated mail`,
+      );
+    }
+    chunks.push(Buffer.from(buf.subarray(0, n)));
   }
   return Buffer.concat(chunks).toString("utf8");
 }

@@ -182,6 +182,7 @@ export {
   type ExtensionErrorSource,
   LaunchArgError,
   type LaunchOptions,
+  type MailTurnInputReadOptions,
   type MailTurnLaunchOptions,
   mapBobProviderToPi,
   parseLaunchArgs,

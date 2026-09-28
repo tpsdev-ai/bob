@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  parseMailTurnInput,
   parseMailTurnResult,
   serializeMailTurnInput,
 } from "../../src/capabilities/tps-mail/prompt.js";
@@ -18,6 +19,7 @@ import {
   createPiRunSession,
   type RunSession,
   type RunSessionConfig,
+  readMailTurnInput,
   runAgent,
   runMailTurnLaunch,
 } from "../../src/shell/run.js";
@@ -297,5 +299,77 @@ describe("the mail turn's outcome", () => {
     });
     expect(code).toBe(2);
     expect(built).toBe(false);
+  });
+});
+
+// bob#203: the mail-turn stdin reader reads fd 0 until EOF, whatever the
+// writer's chunking — deterministic on any OS through the injected read(2).
+describe("readMailTurnInput — fd 0 until EOF", () => {
+  // A scripted read(2): each step is a chunk of bytes, or an errno to throw.
+  function scriptedRead(steps: Array<Buffer | string>) {
+    let i = 0;
+    const calls = { reads: 0, sleeps: 0 };
+    const readSync = (_fd: number, buf: Buffer, offset: number, length: number) => {
+      calls.reads += 1;
+      const step = steps[i++];
+      if (step === undefined) return 0; // EOF
+      if (typeof step === "string") {
+        throw Object.assign(new Error(step), { code: step });
+      }
+      expect(step.length).toBeLessThanOrEqual(length);
+      step.copy(buf, offset);
+      return step.length;
+    };
+    const sleep = () => {
+      calls.sleeps += 1;
+    };
+    return { readSync, sleep, calls };
+  }
+
+  it("assembles a valid input delivered in several chunks, with short reads and EAGAIN between them", () => {
+    const input = serializeMailTurnInput({
+      sender: "flint",
+      messageId: "m-1",
+      body: "SMOKE: reply SMOKE-OK — ünïcödé split across chunks",
+    });
+    const bytes = Buffer.from(input);
+    // Cut INSIDE a multi-byte character too: the reader joins bytes, not strings.
+    const cuts = [1, 8, 40, bytes.indexOf(Buffer.from("ü")) + 1, bytes.length - 3];
+    const pieces: Array<Buffer | string> = [];
+    let at = 0;
+    for (const cut of [...cuts, bytes.length]) {
+      pieces.push(bytes.subarray(at, cut));
+      pieces.push("EAGAIN");
+      at = cut;
+    }
+    const io = scriptedRead(pieces);
+    const text = readMailTurnInput({ readSync: io.readSync, sleep: io.sleep });
+    expect(text).toBe(input);
+    expect(parseMailTurnInput(text)).toEqual({
+      sender: "flint",
+      messageId: "m-1",
+      body: "SMOKE: reply SMOKE-OK — ünïcödé split across chunks",
+    });
+    expect(io.calls.sleeps).toBe(cuts.length + 1); // every EAGAIN waited, then read again
+  });
+
+  it("refuses more than maxBytes rather than returning a truncated mail", () => {
+    const io = scriptedRead([Buffer.alloc(60, 97), Buffer.alloc(60, 97)]);
+    expect(() =>
+      readMailTurnInput({ maxBytes: 100, readSync: io.readSync, sleep: io.sleep }),
+    ).toThrow(/exceeds 100 bytes; refusing it rather than reading a truncated mail/);
+  });
+
+  it("an empty stdin is its own error, not 'not JSON'", () => {
+    const io = scriptedRead([]);
+    const text = readMailTurnInput({ readSync: io.readSync, sleep: io.sleep });
+    expect(text).toBe("");
+    expect(() => parseMailTurnInput(text)).toThrow(/empty \(stdin reached EOF with no data\)/);
+    expect(() => parseMailTurnInput("{trunc")).toThrow(/not JSON \(6 bytes read\)/);
+  });
+
+  it("a read error other than EAGAIN is not swallowed", () => {
+    const io = scriptedRead(["EIO"]);
+    expect(() => readMailTurnInput({ readSync: io.readSync, sleep: io.sleep })).toThrow(/EIO/);
   });
 });

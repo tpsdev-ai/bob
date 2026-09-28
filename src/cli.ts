@@ -441,7 +441,16 @@ async function main(): Promise<number> {
               );
               return 2;
             }
-            const input = await readMailTurnInput(process.stdin);
+            let input: string;
+            try {
+              // fd 0 until EOF — never process.stdin (see readMailTurnInput).
+              input = readMailTurnInput();
+            } catch (err) {
+              console.error(
+                `bob launch ${launch.name}: mail turn refused — ${err instanceof Error ? err.message : String(err)}`,
+              );
+              return 2;
+            }
             return await runMailTurnLaunch({ name: launch.name, input });
           }
           return await runLaunch(launch);

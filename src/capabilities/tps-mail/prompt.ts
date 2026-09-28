@@ -46,11 +46,15 @@ export function serializeMailTurnInput(input: MailTurnInput): string {
 // because they are placed into the task contract: only a strict id may go
 // there. Errors name the problem, never the content.
 export function parseMailTurnInput(text: string): MailTurnInput {
+  // Empty is its own error: it means stdin reached EOF with no data at all (a
+  // reader or a transport problem), not that the consumer wrote a bad payload.
+  if (text.length === 0)
+    throw new Error("mail turn input is empty (stdin reached EOF with no data)");
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error("mail turn input is not JSON");
+    throw new Error(`mail turn input is not JSON (${Buffer.byteLength(text)} bytes read)`);
   }
   const p = parsed as Record<string, unknown> | null;
   if (!p || typeof p !== "object" || Array.isArray(p) || p.v !== 1) {
