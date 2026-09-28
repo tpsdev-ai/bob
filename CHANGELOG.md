@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Presence stops its beacon on session shutdown.** Repeated shutdown and an already queued beacon callback emit nothing further.
+- **Over-limit turn origins fail explicitly.** Mail agent names, cron job names and Discord channel IDs share producer and admission limits; cron names with underscores retain cron attribution.
+
 - **flair-pair derives the registered public key from the private key and refuses a .pub that disagrees.** A Flair-minted `.pub` is RAW 32 bytes (`writeFileSync(pubPath, Buffer.from(kp.publicKey))`), but the reuse path read it as base64 TEXT, so a key directory minted by `flair agent add`/`rotate-key` registered a WRONG public key that could never verify the private key's signatures. `flairPair()` now loads the private key through the normalizer and DERIVES the public key (`createPublicKey`), reads a present `.pub` as BYTES — exactly 32 raw bytes, or strict base64 text decoding to 32 bytes, the same rule as the private key — and REFUSES a `.pub` that does not match the derived key, naming both files and never any key material. With no `.pub`, it creates one holding the derived key (published complete, never replacing an existing file), so deleting a mismatched `.pub` and re-running repairs the pair. (`test/shell/flair-pair-pub-191.test.ts` (p1)-(p8))
 
 - **bob loads the raw 32-byte seed key Flair writes (and base64 of it), as well as base64 PKCS8 and PEM, and a malformed key fails with the file, its size and the accepted formats.** Flair's own tooling (`flair agent add`, `flair agent rotate-key`) writes a bare 32-byte binary seed, but every key reader only accepted PEM PKCS8 or base64 PKCS8 DER, so a Flair-made key failed at signing time with `error:0680008E:asn1 encoding routines::not enough data`. One normalizer (`src/lib/ed25519-key.ts`) now turns all four shapes into PKCS8 DER, and every reader takes the file's BYTES through it; anything unparsable or not Ed25519 is refused naming the path and the byte count, never the key. (`test/lib/ed25519-key.test.ts`)
@@ -15,6 +18,8 @@ All notable changes to this project will be documented in this file.
 - **Dependency updates are configured through Renovate on the shared tpsdev-ai preset; Dependabot is retired.** bob keeps its stricter install gate: advisory fixes wait the same 7 days as every update (bunfig refuses versions younger than 7 days, except @types/node and typescript), the whole pi runtime family is excluded, lockfile maintenance is off, and CodeQL's sub-actions update as one PR for every update type.
 
 ### Added
+
+- **Presence reports runtime-authored turn activity, liveness beats and metadata-only turn summaries.** Persistent cron and Discord turns pass through one bob-owned FIFO admission: origin and prompt start together, the origin clears at `agent_end`, and shutdown closes admission before stopping scheduling. A turn outside admission is `run`. Discord replies remain attached to their own inbound admission. Presence replaces the heartbeat placeholder; beats and summaries carry no prompt, model or tool text.
 
 - **The `jarvis` role — the office's resident agent.** `bob onboard <name> --role jarvis` loads a class soul seed for memory with receipts, office awareness from available sources, small help and Discord conversation, with persona prompts for the hiring interview. Its exact tool ceiling is `read`, `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and `discord_react`, with `allowResidentShell: false` and no shell or file-writing tools. Discord still requires operator configuration; the body and automatic decision loop come later. Refs #180.
 

@@ -785,3 +785,64 @@ describe("#145 — the contract survives the paths a resident agent takes", () =
     }
   });
 });
+
+// Exercise the loader boundary as well as pi's asynchronous preflight/events.
+// The path-loaded probe gets the service exactly as presence and Discord do.
+it("presence admission survives the real pi loader and clears on agent_end", async () => {
+  const capture = join(extDir, "origins.jsonl");
+  const admissionModule = join(process.cwd(), "dist/shell/turn-admission.js");
+  const capabilityText = `
+    import { appendFileSync } from "node:fs";
+    import { getTurnAdmission } from ${JSON.stringify(admissionModule)};
+    export default function(pi) {
+      const admission = getTurnAdmission(pi);
+      if (!admission) throw new Error("missing bob admission service");
+      pi.on("before_agent_start", async () => {
+        await Promise.resolve();
+        appendFileSync(${JSON.stringify(capture)}, JSON.stringify(admission.readOrigin()) + "\\n");
+      });
+    }
+  `;
+  let admission: RunSessionConfig["turnAdmission"];
+  const handle = await startPersistent({
+    name: "testbot",
+    agentsRoot,
+    log: () => {},
+    sessionFactory: async (config) => {
+      admission = config.turnAdmission;
+      const built = await bobFactoryFor({ fromConfig: config, capabilityText });
+      const result = await built.factory({
+        cwd: config.cwd,
+        agentDir: config.piAgentDir,
+        sessionManager: SessionManager.inMemory(config.cwd) as never,
+      });
+      return result.session as unknown as RunSession;
+    },
+  });
+  const afterEnd: unknown[] = [];
+  handle.session.subscribe((event) => {
+    if (event.type === "agent_end") afterEnd.push(admission?.readOrigin());
+  });
+  try {
+    const first = handle.admitTurn({ kind: "discord", channelId: "123" }, "first");
+    const second = handle.admitTurn({ kind: "cron", job: "brief" }, "second");
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.some((message) => (message as { role?: string }).role === "assistant")).toBe(true);
+    expect(b.some((message) => (message as { role?: string }).role === "assistant")).toBe(true);
+    await handle.session.prompt("bare", { expandPromptTemplates: false });
+    const { readFileSync } = await import("node:fs");
+    expect(
+      readFileSync(capture, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+    ).toEqual([
+      { kind: "discord", channelId: "123" },
+      { kind: "cron", job: "brief" },
+      { kind: "run" },
+    ]);
+    expect(afterEnd).toEqual([{ kind: "run" }, { kind: "run" }, { kind: "run" }]);
+  } finally {
+    await handle.shutdown();
+  }
+});

@@ -32,6 +32,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { ORIGIN_FIELD_LIMITS } from "./origin-limits.js";
 
 export interface MailMessage {
   id: string;
@@ -78,6 +79,9 @@ export class MailConsumer {
   constructor(opts: MailConsumerOptions) {
     if (!AGENT_NAME.test(opts.name)) {
       throw new Error(`invalid agent name: ${opts.name} (must match ${AGENT_NAME})`);
+    }
+    if (opts.name.length > ORIGIN_FIELD_LIMITS.mailFrom) {
+      throw new Error(`invalid agent name: exceeds ${ORIGIN_FIELD_LIMITS.mailFrom} characters`);
     }
     const inboxRoot = opts.inboxRoot ?? join(homedir(), ".tps", "mail", opts.name);
     const launcherPath =
