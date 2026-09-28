@@ -17,6 +17,7 @@ export interface RecordedCall {
   url: string;
   path: string;
   headers: Record<string, string>;
+  redirect?: "error";
   body?: Record<string, unknown>;
   // For ops-API calls: the `operation` field, so ordering assertions read.
   op?: string;
@@ -53,7 +54,7 @@ export interface FakeFlair {
   souls: Record<string, string>;
   fetchImpl: (
     url: string,
-    init: { method: string; headers: Record<string, string>; body?: string },
+    init: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
   ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
   // Call sequence as "<surface>:<what>" strings — the ordering assertion.
   sequence(): string[];
@@ -76,7 +77,14 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const parsed = new URL(url);
     const path = parsed.pathname;
     const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
-    const call: RecordedCall = { method: init.method, url, path, headers: init.headers, body };
+    const call: RecordedCall = {
+      method: init.method,
+      url,
+      path,
+      headers: init.headers,
+      redirect: init.redirect,
+      body,
+    };
 
     // ── Harper ops API: everything POSTs to "/" with an `operation` ──────────
     if (path === "/" && init.method === "POST" && body?.operation) {

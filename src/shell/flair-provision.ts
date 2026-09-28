@@ -80,9 +80,31 @@ export async function provisionFlairIdentity(
   return { registration, soul };
 }
 
+// Align's bob.yaml is agent-writable. The operator must name its Flair URL
+// on this invocation; a stale or agent-edited config cannot select a Basic-auth target.
+export function operatorSelectedFlairUrl(
+  agentId: string,
+  configUrl: string,
+  selectedUrl?: string,
+): string {
+  if (!selectedUrl) {
+    throw new Error(
+      `bob align '${agentId}': no operator-selected Flair URL. bob.yaml is agent-writable; pass --flair-url <url> matching its flair.url before operator Basic auth is sent.`,
+    );
+  }
+  if (selectedUrl.replace(/\/+$/, "") !== configUrl.replace(/\/+$/, "")) {
+    throw new Error(
+      `bob align '${agentId}': bob.yaml flair.url differs from --flair-url. Review the agent's config and supply the intended URL explicitly; no operator Basic auth was sent.`,
+    );
+  }
+  return selectedUrl;
+}
+
 export interface SyncFlairSoulOptions
   extends Omit<ProvisionFlairIdentityOptions, "publicKeyBase64" | "opsUrl"> {
   publicKeyBase64?: string;
+  // Selected by the operator at this invocation, never read from bob.yaml.
+  operatorFlairUrl: string;
 }
 
 // Align path: the persona changed but the identity already exists. VERIFY
@@ -95,9 +117,10 @@ export interface SyncFlairSoulOptions
 export async function syncFlairSoul(
   opts: SyncFlairSoulOptions,
 ): Promise<ProvisionFlairIdentityResult> {
+  const flairUrl = operatorSelectedFlairUrl(opts.name, opts.flairUrl, opts.operatorFlairUrl);
   const registration = await verifyRegisteredWithFlair({
     name: opts.name,
-    flairUrl: opts.flairUrl,
+    flairUrl,
     keyFile: opts.keyFile,
     fetchImpl: opts.fetchImpl,
     now: opts.now,
@@ -108,7 +131,9 @@ export async function syncFlairSoul(
   return { registration, soul };
 }
 
-function soulOptions(opts: SyncFlairSoulOptions): PushSoulOptions {
+function soulOptions(
+  opts: Omit<ProvisionFlairIdentityOptions, "publicKeyBase64">,
+): PushSoulOptions {
   return {
     soulPath: opts.soulPath,
     displayName: opts.displayName ?? capitalize(opts.name),

@@ -21,6 +21,7 @@ import {
   installService,
   LaunchArgError,
   loadRole,
+  operatorSelectedFlairUrl,
   parseArgs,
   parseLaunchArgs,
   provisionFlairIdentity,
@@ -57,6 +58,7 @@ Commands:
                       pair 'bob run' uses); --provider / --model override just the
                       field each names. Mirrors the revised persona into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
+                             --flair-url <u> (required for Flair sync)
                              --admin-pass-file <path> --admin-user <user>
                              --no-flair
   run <name>          Run the agent PERSISTENTLY (on-duty) — one warm pi session
@@ -143,7 +145,9 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
 
   if (noInteractive) {
     console.log(`\nSkipped interview (--no-interactive). Edit ~/agents/${name}/soul.md by hand,`);
-    console.log(`then run 'bob align ${name}' to push the revised persona into Flair.`);
+    console.log(
+      `then run 'bob align ${name} --flair-url ${flairUrl}' to push the revised persona into Flair.`,
+    );
     return;
   }
 
@@ -173,6 +177,7 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
         name,
         role,
         flairUrl: result.flairConfig.url,
+        operatorFlairUrl: result.flairConfig.url,
         keyFile: result.flairConfig.keyPath,
         soulPath: outcome.soulPath,
         adminPassFile,
@@ -183,7 +188,7 @@ async function onboard(name: string, flags: Record<string, string | boolean>): P
     }
   } else {
     console.log(`[bob onboard] persona unchanged — ${outcome.soulPath} still the seed template.`);
-    console.log(`Run 'bob align ${name}' to try the interview again.`);
+    console.log(`Run 'bob align ${name} --flair-url ${flairUrl}' to try the interview again.`);
   }
 }
 
@@ -244,6 +249,8 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   const noFlair = boolFlag(flags, "no-flair");
   const adminPassFile = stringFlag(flags, "admin-pass-file");
   const adminUser = stringFlag(flags, "admin-user");
+  const operatorFlairUrl = stringFlag(flags, "flair-url");
+  if (!noFlair) operatorSelectedFlairUrl(name, readFlairBlock(agentDir).url, operatorFlairUrl);
 
   console.log(`[bob align ${name}] starting alignment check — pi session in ${agentDir}/work`);
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
@@ -272,6 +279,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
     name,
     role: readAgentRole(agentDir),
     flairUrl: flair.url,
+    operatorFlairUrl: operatorFlairUrl ?? "",
     keyFile: flair.keyFile,
     soulPath: outcome.soulPath,
     adminPassFile,
@@ -280,9 +288,8 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   console.log(describeProvisioning(synced));
 }
 
-// Read the agent's own `flair:` block out of its bob.yaml. Align must target
-// the instance and key the agent was ONBOARDED against, not today's default —
-// re-deriving them here is how an agent silently gets a soul on the wrong hub.
+// Read the agent's `flair:` block from bob.yaml. Its URL is untrusted until
+// syncFlairSoul compares it with the operator's --flair-url selection.
 function readFlairBlock(agentDir: string): { url: string; agentId: string; keyFile: string } {
   const yamlPath = join(agentDir, "bob.yaml");
   const block = readBlock(readFileSync(yamlPath, "utf8"), "flair");

@@ -118,6 +118,7 @@ export {
 } from "./flair-pair.js";
 export {
   describeProvisioning,
+  operatorSelectedFlairUrl,
   type ProvisionFlairIdentityOptions,
   type ProvisionFlairIdentityResult,
   provisionFlairIdentity,

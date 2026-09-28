@@ -95,6 +95,44 @@ describe("pushSoulToFlair (#94)", () => {
     expect(fake.calls.some((c) => c.path === "/Soul" || c.path === "/Soul/")).toBe(false);
   });
 
+  it("allows an HTTPS Flair target chosen at onboarding", async () => {
+    const fake = registeredFake();
+    await pushSoulToFlair(
+      { ...registration(), flairUrl: "https://flair.example.test" },
+      {
+        soulPath,
+        keyFile,
+        adminPassFile: join(tmp, "admin-pass"),
+        fetchImpl: fake.fetchImpl,
+      },
+    );
+    expect(fake.souls["testbot:persona"]).toBe(PERSONA);
+  });
+
+  it("refuses a cleartext remote soul target before any read or Basic write", async () => {
+    const fake = registeredFake();
+    await expect(
+      pushSoulToFlair(
+        { ...registration(), flairUrl: "http://192.0.2.9:19926" },
+        {
+          soulPath,
+          keyFile,
+          adminPassFile: join(tmp, "admin-pass"),
+          fetchImpl: fake.fetchImpl,
+        },
+      ),
+    ).rejects.toThrow(/cannot send operator Basic auth.*HTTPS or numeric loopback/s);
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("refuses redirects for every operator-authorized soul PUT", async () => {
+    const fake = registeredFake();
+    await push(fake);
+    expect(
+      fake.calls.filter((call) => call.method === "PUT").every((call) => call.redirect === "error"),
+    ).toBe(true);
+  });
+
   it("uses operator Basic auth for every write, and agent signing only for the divergence read", async () => {
     const fake = registeredFake();
     await push(fake);

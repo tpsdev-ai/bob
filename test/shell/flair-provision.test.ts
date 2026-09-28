@@ -6,6 +6,7 @@ import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
 import { ADMIN_PASS_ENV, FlairAdminCredentialError } from "../../src/shell/flair-pair.js";
 import {
   describeProvisioning,
+  operatorSelectedFlairUrl,
   provisionFlairIdentity,
   syncFlairSoul,
 } from "../../src/shell/flair-provision.js";
@@ -251,6 +252,31 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
   });
 });
 
+describe("align operator URL pin", () => {
+  it("requires an operator URL before an agent-writable config can select the target", () => {
+    expect(() => operatorSelectedFlairUrl("testbot", "https://flair.example.test")).toThrow(
+      /bob.yaml is agent-writable.*--flair-url/,
+    );
+  });
+
+  it("rejects a changed bob.yaml URL, but accepts the matching operator URL", () => {
+    expect(() =>
+      operatorSelectedFlairUrl(
+        "testbot",
+        "https://attacker.example.test",
+        "https://flair.example.test",
+      ),
+    ).toThrow(/bob.yaml flair.url differs from --flair-url/);
+    expect(
+      operatorSelectedFlairUrl(
+        "testbot",
+        "https://flair.example.test/",
+        "https://flair.example.test",
+      ),
+    ).toBe("https://flair.example.test");
+  });
+});
+
 describe("syncFlairSoul — bob align (#94)", () => {
   let agentsRoot: string;
   let keysRoot: string;
@@ -276,22 +302,32 @@ describe("syncFlairSoul — bob align (#94)", () => {
     rmSync(keysRoot, { recursive: true, force: true });
   });
 
-  const sync = (fake: ReturnType<typeof makeFakeFlair>) =>
+  const sync = (fake: ReturnType<typeof makeFakeFlair>, over: Record<string, unknown> = {}) =>
     syncFlairSoul({
       name: "testbot",
       role: "reviewer",
       flairUrl: scaffold.flairConfig?.url ?? "",
+      operatorFlairUrl: scaffold.flairConfig?.url ?? "",
       keyFile: scaffold.flairConfig?.keyPath ?? "",
       soulPath: join(scaffold.agentDir, "soul.md"),
       adminPassFile: join(keysRoot, "admin-pass"),
       fetchImpl: fake.fetchImpl,
       warn: (m) => warnings.push(m),
+      ...over,
     });
 
   const registeredFake = () =>
     makeFakeFlair({
       agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
     });
+
+  it("refuses an agent-edited URL before registration check or Basic auth", async () => {
+    const fake = registeredFake();
+    await expect(sync(fake, { flairUrl: "https://attacker.example.test" })).rejects.toThrow(
+      /bob.yaml flair.url differs from --flair-url/,
+    );
+    expect(fake.calls).toEqual([]);
+  });
 
   it("pushes the revised persona with the operator password file", async () => {
     const fake = registeredFake();

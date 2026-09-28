@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initAgent } from "../src/shell/init.js";
 import { type SpawnError, spawnNode } from "./cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
@@ -95,6 +96,45 @@ describe("bob CLI", () => {
     const out = spawnNode([CLI, "help"]);
     expect(out).toContain("align <name>");
     expect(out).toContain("--agent-dir");
+  });
+
+  it("align refuses a URL that differs from bob.yaml before opening the setup session", () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-align-pin-cli-"));
+    try {
+      const agent = initAgent({
+        name: "testbot",
+        role: "reviewer",
+        provider: "ollama-cloud",
+        model: "kimi-k2.6",
+        agentsRoot: join(home, "agents"),
+        flairKeysDir: join(home, ".flair", "keys"),
+      });
+      let output = "";
+      try {
+        spawnNode(
+          [
+            CLI,
+            "align",
+            "testbot",
+            "--agent-dir",
+            agent.agentDir,
+            "--flair-url",
+            "https://attacker.example.test",
+          ],
+          {
+            env: { ...process.env, HOME: home },
+          },
+        );
+        throw new Error("expected align to refuse a mismatched Flair URL");
+      } catch (err: unknown) {
+        const e = err as SpawnError;
+        output = e.stdout ?? e.message ?? "";
+      }
+      expect(output).toContain("bob.yaml flair.url differs from --flair-url");
+      expect(output).not.toContain("starting alignment check");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("help advertises persistent run + lifecycle commands", () => {

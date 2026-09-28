@@ -40,7 +40,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { FlairHttpClient } from "../capabilities/flair/client.js";
-import { adminPassPath, type FlairRegistration, flairOperatorBasicAuth } from "./flair-pair.js";
+import {
+  adminPassPath,
+  assertOperatorAuthTarget,
+  type FlairRegistration,
+  flairOperatorBasicAuth,
+} from "./flair-pair.js";
 
 // Soul keys bob owns. Anything else in an agent's soul (set by hand, by
 // `flair soul set`, or promoted from a memory candidate) is left alone —
@@ -98,6 +103,7 @@ export async function pushSoulToFlair(
   registration: FlairRegistration,
   opts: PushSoulOptions,
 ): Promise<SoulPushResult> {
+  assertOperatorAuthTarget(registration.flairUrl, registration.agentId);
   const readFile = opts.readFile ?? ((p: string) => readFileSync(p));
   const writeFile =
     opts.writeFile ?? ((p: string, contents: string) => writeFileSync(p, contents, "utf8"));
@@ -162,13 +168,16 @@ export async function pushSoulToFlair(
   const authorization = flairOperatorBasicAuth(adminPass, opts.adminUser);
   const doFetch =
     opts.fetchImpl ??
-    ((u: string, i: { method: string; headers: Record<string, string>; body?: string }) =>
-      fetch(u, i));
+    ((
+      u: string,
+      i: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
+    ) => fetch(u, i));
   const base = registration.flairUrl.replace(/\/+$/, "");
   const soulSet = async (key: string, value: string): Promise<string> => {
     const id = `${registration.agentId}:${key}`;
     const res = await doFetch(`${base}/Soul/${encodeURIComponent(id)}`, {
       method: "PUT",
+      redirect: "error",
       headers: { Authorization: authorization, "Content-Type": "application/json" },
       body: JSON.stringify({
         id,

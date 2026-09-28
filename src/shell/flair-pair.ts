@@ -288,6 +288,31 @@ export function adminPassPath(override?: string): string {
   return override ?? join(homedir(), ".flair", "admin-pass");
 }
 
+// Basic auth is a bearer credential. Never send it to a cleartext network
+// endpoint; numeric loopback is the only HTTP exception (no DNS lookup).
+export function assertOperatorAuthTarget(target: string, agentId: string): void {
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    throw new Error(
+      `cannot send operator Basic auth for '${agentId}': invalid Flair URL. Supply an HTTPS URL or a numeric loopback HTTP URL.`,
+    );
+  }
+  const loopback = /^127(?:\.\d{1,3}){3}$/.test(url.hostname) || url.hostname === "[::1]";
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error(
+      `cannot send operator Basic auth for '${agentId}' to ${url.origin}: the destination is not HTTPS or numeric loopback HTTP, or carries URL credentials/query/fragment. Use an operator-selected HTTPS URL or numeric loopback URL, then retry.`,
+    );
+  }
+}
+
 // Harper's default super_user is "admin". Keep the Basic identity shared by
 // Agent registration and the shell-only Soul writer.
 export function flairOperatorBasicAuth(password: string, user = "admin"): string {
@@ -321,7 +346,7 @@ export interface FlairRegistration {
 // Minimal fetch shape (so tests inject a fake without DOM lib types).
 export type FlairFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 export interface RegisterWithFlairArgs {
@@ -359,6 +384,7 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
   }
   const env = args.env ?? process.env;
   const opsUrl = resolveFlairOpsUrl(args.flairUrl, args.opsUrl ?? env[OPS_TARGET_ENV]);
+  assertOperatorAuthTarget(opsUrl, args.name);
   const adminPass = resolveFlairAdminPass({ adminPassFile: args.adminPassFile, env });
   if (adminPass === undefined) {
     throw new FlairAdminCredentialError(
@@ -429,6 +455,7 @@ function opsPoster(
   return async (body) => {
     const res = await doFetch(`${opsUrl}/`, {
       method: "POST",
+      redirect: "error",
       headers: { "Content-Type": "application/json", Authorization: authorization },
       body: JSON.stringify(body),
     });

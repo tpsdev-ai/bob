@@ -300,10 +300,28 @@ describe("registerWithFlair", () => {
     expect(fake.calls.length).toBe(0);
   });
 
+  it("refuses cleartext non-loopback ops targets before reading or sending Basic auth", async () => {
+    for (const target of ["http://192.0.2.9:9925", "http://127.evil.test:9925"]) {
+      const fake = makeFakeFlair();
+      await expect(registerWithFlair(args(fake, { [OPS_TARGET_ENV]: target }))).rejects.toThrow(
+        /cannot send operator Basic auth.*HTTPS or numeric loopback/s,
+      );
+      expect(fake.calls).toEqual([]);
+    }
+  });
+
+  it("refuses redirects for the operator-authorized registration request", async () => {
+    const fake = makeFakeFlair();
+    await registerWithFlair(args(fake));
+    expect(fake.calls.filter((call) => call.op).every((call) => call.redirect === "error")).toBe(
+      true,
+    );
+  });
+
   it("honours FLAIR_OPS_TARGET over the derived port", async () => {
     const fake = makeFakeFlair();
-    await registerWithFlair(args(fake, { [OPS_TARGET_ENV]: "http://ops.example:4242" }));
-    expect(fake.calls[0].url).toBe("http://ops.example:4242/");
+    await registerWithFlair(args(fake, { [OPS_TARGET_ENV]: "https://ops.example:4242" }));
+    expect(fake.calls[0].url).toBe("https://ops.example:4242/");
   });
 });
 
