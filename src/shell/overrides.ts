@@ -353,6 +353,7 @@ export function initOverrideRepo(agentDir: string): string {
         "core.hooksPath=/dev/null",
         "commit",
         "--quiet",
+        "--no-verify",
         "-m",
         "override baseline",
       ],
