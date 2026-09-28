@@ -74,6 +74,8 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
+Turn origin fields have these limits: mail agent names and cron job names are at most 64 characters; Discord channel IDs are at most 20 digits. Cron names use lowercase letters, digits, hyphens or underscores. Over-limit origins are refused before a turn starts rather than silently relabelled as `run`.
+
 ## Operator guarantees, and the tests that pin them
 
 Each guarantee below is enforced in one place and pinned by a test. If you

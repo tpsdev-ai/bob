@@ -5,7 +5,7 @@
 // prompt. It stands up ONE warm `createAgentSession` (the same builder as
 // `bob run`, only with a DURABLE SessionManager) with the agent's capabilities
 // loaded — including the discord capability, whose gateway listener feeds
-// inbound messages into the session via `pi.sendUserMessage()` over the
+// inbound messages into bob's FIFO admission over the
 // session's whole lifetime, and routes each reply back to the originating
 // channel (see src/capabilities/discord).
 //
@@ -41,7 +41,7 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
-import { promptSession } from "./session.js";
+import { createTurnAdmission, type TurnAdmission } from "./turn-admission.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -54,6 +54,8 @@ export interface RunPersistentOptions {
   // Inject the session factory (tests). Defaults to the real SDK factory with a
   // DURABLE SessionManager (persisted on disk under the agent's cwd).
   sessionFactory?: RunSessionFactory;
+  // Scheduler seam: tests release a real fire callback during shutdown.
+  cronSchedulerFactory?: typeof startCronScheduler;
   // Install OS signal handlers for graceful shutdown. Defaults to true in
   // production; tests pass false and drive `handle.shutdown()` directly.
   installSignalHandlers?: boolean;
@@ -74,6 +76,7 @@ export interface RunPersistentOptions {
 export interface PersistentHandle {
   // The warm session (so tests can assert it stays usable across prompts).
   session: RunSession;
+  admitTurn: TurnAdmission["admitTurn"];
   // Resolved provider/model for diagnostics.
   provider: string;
   model: string;
@@ -137,7 +140,16 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     duties: cron,
   });
   const factory = opts.sessionFactory ?? defaultPersistentFactory;
-  const session = await factory(config);
+  const admission = createTurnAdmission();
+  config.turnAdmission = admission;
+  let session: RunSession;
+  try {
+    session = await factory(config);
+    admission.bind(session);
+  } catch (error) {
+    admission.close();
+    throw error;
+  }
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
@@ -145,8 +157,8 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // note (the last thing the agent said, git status --short, the last few tool
   // calls) is sent as a steer. It is useful and it is NEVER load-bearing: the standing contract is
   // in the system prompt, so a note that fails to send is logged and the
-  // runtime keeps serving. There is no admission gate and no fail-closed exit
-  // here — the shape change removed the need for both.
+  // runtime keeps serving. The note uses pi's steer path; it does not
+  // submit a new bob admission or supply an origin.
   const observer = createCompactionObserver({
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
@@ -154,24 +166,14 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   });
   const unsubscribeContract = session.subscribe((event) => observer.observe(event));
 
-  // Scheduled work: fire each bob.yaml `cron:` prompt INTO this live session on
-  // its cadence (one gateway, no second `bob run` process). Await the idle
-  // barrier first so a tick doesn't cut into an in-flight inbound turn; fires
-  // are serialized by the scheduler. No-op when the agent declares no cron.
+  // Every scheduled turn goes through the same admission as inbound Discord.
   let cronScheduler: CronSchedulerHandle | undefined;
   if (cron.length > 0) {
     log(`[bob] scheduling ${cron.length} cron job(s) for ${opts.name}`);
-    cronScheduler = startCronScheduler({
+    cronScheduler = (opts.cronSchedulerFactory ?? startCronScheduler)({
       entries: cron,
       fire: async (entry) => {
-        try {
-          await session.waitForIdle?.();
-        } catch {
-          // proceed — pi serializes turns regardless
-        }
-        // bob's prompt entry point: the text is the prompt, no command /
-        // template / skill expansion (session.ts promptSession).
-        await promptSession(session, entry.prompt);
+        await admission.admitTurn({ kind: "cron", job: entry.name }, entry.prompt);
       },
       log,
     });
@@ -183,10 +185,12 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     if (disposed) return;
     if (disposing) return disposing;
     disposing = (async () => {
-      // Stop scheduling first so a pending cron tick can't fire into a session
-      // we're about to dispose.
+      // Close synchronously FIRST: even a fire already inside its callback
+      // cannot start a prompt after this point. Drain admitted work before dispose.
+      admission.close();
       cronScheduler?.stop();
       unsubscribeContract();
+      await admission.drain();
       // Await any in-flight turn so we don't cut off a reply mid-stream. The
       // RunSession seam exposes `prompt` but not an idle barrier; production's
       // pi AgentSession has `agent.waitForIdle()`. We call it best-effort
@@ -204,7 +208,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     return disposing;
   };
 
-  return { session, provider, model, shutdown };
+  return { session, admitTurn: admission.admitTurn, provider, model, shutdown };
 }
 
 // Run persistently and BLOCK until a shutdown signal (or the injected

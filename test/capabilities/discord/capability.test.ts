@@ -32,9 +32,11 @@ class FakePi implements PiLike {
       this.agentEndHandler = handler as AgentEndHandler;
     }
   }
-  sendUserMessage(content: string): void {
+  private completions: Array<(messages: unknown[]) => void> = [];
+  admitTurn = (_origin: unknown, content: string): Promise<unknown[]> => {
     this.userMessages.push(content);
-  }
+    return new Promise((resolve) => this.completions.push(resolve));
+  };
   // Simulate the agent finishing a turn with the given assistant text. Drives
   // the agent_end reply-routing path. `await` so the async reply post settles.
   async finishTurn(assistantText: string | undefined): Promise<void> {
@@ -42,7 +44,9 @@ class FakePi implements PiLike {
       assistantText === undefined
         ? [{ role: "assistant", content: [{ type: "text", text: "" }] }]
         : [{ role: "assistant", content: [{ type: "text", text: assistantText }] }];
-    await this.agentEndHandler?.({ messages });
+    this.completions.shift()?.(messages);
+    await Promise.resolve();
+    await Promise.resolve();
   }
   // helper
   async call(name: string, params: Record<string, unknown>) {
@@ -120,6 +124,7 @@ function setup(
   };
   const wired = wireDiscordCapability({
     pi,
+    admitTurn: pi.admitTurn,
     client,
     config,
     log: (m) => logs.push(m),
@@ -278,7 +283,7 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
     client.replyThrows = true;
     client.fire({ id: "m1", channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
     await pi.finishTurn("hello");
-    expect(logs.some((l) => /failed to post reply to channel-A/.test(l))).toBe(true);
+    expect(logs.some((l) => /inbound turn\/reply failed for channel-A/.test(l))).toBe(true);
   });
 
   it("the reply path never includes the bot token (no token in this core)", async () => {
@@ -363,22 +368,22 @@ describe("wireDiscordCapability — typing indicator spans the turn", () => {
     expect(client.typings).toHaveLength(0);
   });
 
-  it("a second inbound message re-points the heartbeat instead of stacking a second timer", async () => {
+  it("each inbound admission owns its reply and heartbeat", async () => {
     const { pi, client } = setup({}, { typingIntervalMs: 10 });
-    client.fire({ id: "m1", channelId: "channel-A", content: "<@1> first", mentionsBot: true });
-    client.fire({ id: "m2", channelId: "channel-B", content: "<@1> second", mentionsBot: true });
-    await sleep(45);
-    const total = client.typings.length;
-    // Two stacked intervals would roughly double the pulse rate; one slot keeps
-    // it near ~1 per interval (plus the two immediate pulses).
-    expect(total).toBeLessThanOrEqual(9);
-    // The single remaining timer follows the LATEST message's channel.
-    expect(client.typings[client.typings.length - 1]).toBe("channel-B");
-    // ...and one stop still silences everything.
-    await pi.finishTurn("answered");
-    const atCompletion = client.typings.length;
-    await sleep(60);
-    expect(client.typings.length).toBe(atCompletion);
+    client.fire({ id: "m1", channelId: "channel-A", content: "first", mentionsBot: true });
+    client.fire({ id: "m2", channelId: "channel-B", content: "second", mentionsBot: true });
+    await pi.finishTurn("first reply");
+    const afterFirst = client.typings.length;
+    await sleep(35);
+    expect(client.typings.slice(afterFirst).every((c) => c === "channel-B")).toBe(true);
+    await pi.finishTurn("second reply");
+    expect(client.replies).toEqual([
+      { channelId: "channel-A", text: "first reply", replyTo: "m1" },
+      { channelId: "channel-B", text: "second reply", replyTo: "m2" },
+    ]);
+    const afterBoth = client.typings.length;
+    await sleep(30);
+    expect(client.typings.length).toBe(afterBoth);
   });
 
   it("stop() (shutdown/disconnect) clears a heartbeat that is still running", async () => {
@@ -432,6 +437,7 @@ describe("wireDiscordCapability — 429 surfacing + lifecycle", () => {
     };
     const wired = wireDiscordCapability({
       pi,
+      admitTurn: pi.admitTurn,
       client,
       config,
       log: () => {},
@@ -450,6 +456,7 @@ describe("wireDiscordCapability — 429 surfacing + lifecycle", () => {
     };
     const wired = wireDiscordCapability({
       pi,
+      admitTurn: pi.admitTurn,
       client,
       config,
       log: () => {},
