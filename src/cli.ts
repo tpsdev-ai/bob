@@ -10,12 +10,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type Args,
+  adoptAgent,
   type BobRole,
   boolFlag,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
   down,
   formatReport,
+  hireAgent,
   type InitResult,
   initAgent,
   installService,
@@ -23,6 +25,7 @@ import {
   loadRole,
   parseArgs,
   parseLaunchArgs,
+  positionDiff,
   provisionFlairIdentity,
   readBlock,
   restart,
@@ -69,6 +72,10 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check of the agent's setup — prints each check
+  hire <name>         Hire a NEW agent from a packaged position.
+                      Flags: --as <position> --provider <p> --model <m> --no-flair
+  position adopt <n>  Bind an EXISTING agent to a position (--as <position>).
+  position diff <n>   Show the ratified baseline vs the current effective config.
   launch <name>       The agent's session, with its resolved role tool
                       allowlist. This is what bin/<name> runs.
                       Takes at most ONE prompt (a multi-word one needs quotes).
@@ -374,6 +381,25 @@ function usageError(err: unknown): number | undefined {
   return undefined;
 }
 
+// Render a position diff for `bob position diff`.
+function formatPositionDiff(name: string, diff: import("./shell/index.js").PositionDiff): string {
+  if (diff.empty) return `[bob position diff] ${name}: no drift from the ratified baseline.`;
+  const lines: string[] = [`[bob position diff] ${name}: drift from the ratified baseline:`];
+  for (const d of [
+    ["tools added", diff.tools.added],
+    ["tools removed", diff.tools.removed],
+    ["capabilities added", diff.capabilities.added],
+    ["capabilities removed", diff.capabilities.removed],
+    ["files added", diff.files.added],
+    ["files removed", diff.files.removed],
+    ["files changed", diff.files.changed],
+  ] as const) {
+    if (d[1].length > 0) lines.push(`  ${d[0]}: ${d[1].join(", ")}`);
+  }
+  if (diff.soulChanged) lines.push(`  soul.md: changed`);
+  return lines.join("\n");
+}
+
 async function main(): Promise<number> {
   // parseArgs validates every declared boolean flag, so a bad spelling is a
   // usage error HERE — before any command runs — and never a stack trace.
@@ -467,6 +493,83 @@ async function main(): Promise<number> {
           return 2;
         }
         return doctor(args.positional[0]);
+      case "hire": {
+        const name = args.positional[0];
+        const as = stringFlag(args.flags, "as");
+        if (!name) {
+          console.error("bob hire: missing <name>");
+          return 2;
+        }
+        if (!as) {
+          console.error("bob hire: missing --as <position>");
+          return 2;
+        }
+        const provider = stringFlag(args.flags, "provider");
+        const model = stringFlag(args.flags, "model");
+        const result = hireAgent({
+          name,
+          positionName: as,
+          agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+          skipFlair: boolFlag(args.flags, "no-flair") || !boolFlag(args.flags, "flair"),
+        });
+        console.log(`[bob hire] ${name} hired as position "${as}"`);
+        console.log(`  agent dir:       ${result.agentDir}`);
+        console.log(`  ratified role:   ${result.grant.role}`);
+        console.log(
+          `  position:        ${result.grant.position.name} ${result.grant.position.version} (${result.grant.position.hash.slice(0, 12)}…)`,
+        );
+        console.log(`  ratified tools:  ${result.grant.maxTools.join(", ") || "(none)"}`);
+        console.log(`  ratified caps:   ${result.grant.maxCapabilities.join(", ") || "(none)"}`);
+        console.log(`  override repo:   ${result.overrideDir}`);
+        return 0;
+      }
+      case "position": {
+        const sub = args.positional[0];
+        const name = args.positional[1];
+        if (sub === "diff") {
+          if (!name) {
+            console.error("bob position diff: missing <name>");
+            return 2;
+          }
+          const diff = positionDiff({
+            name,
+            agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
+          });
+          console.log(formatPositionDiff(name, diff));
+          return diff.empty ? 0 : 3;
+        }
+        if (sub === "adopt") {
+          const as = stringFlag(args.flags, "as");
+          if (!name) {
+            console.error("bob position adopt: missing <name>");
+            return 2;
+          }
+          if (!as) {
+            console.error("bob position adopt: missing --as <position>");
+            return 2;
+          }
+          const result = adoptAgent({
+            name,
+            positionName: as,
+            agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
+          });
+          console.log(`[bob position adopt] ${name} bound to position "${as}"`);
+          console.log(`  ratified role:   ${result.grant.role}`);
+          console.log(
+            `  position:        ${result.grant.position.name} ${result.grant.position.version}`,
+          );
+          console.log(
+            `  config unchanged: ${result.diff.empty ? "yes (diff empty)" : "NO — diff is not empty"}`,
+          );
+          return 0;
+        }
+        console.error(
+          `bob position: unknown subcommand '${sub ?? ""}'. Use 'position adopt <name> --as <position>' or 'position diff <name>'.`,
+        );
+        return 2;
+      }
       case "help":
       case "--help":
       case "-h":

@@ -51,6 +51,7 @@ import {
   type SilenceReason,
 } from "./compaction-contract.js";
 import type { BobRole, CronEntry } from "./index.js";
+import { resolveAdoptedConfig } from "./position-runtime.js";
 import { loadRole } from "./role-loader.js";
 import {
   createBobRuntimeFactory,
@@ -550,6 +551,12 @@ export interface RunOptions {
   captureStdout?: boolean;
   // Override the agents root dir (tests). Defaults to ~/agents.
   agentsRoot?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
+  // Host secret bindings (tests). Defaults to the environment + host file.
+  bindings?: import("./secrets.js").SecretBindings;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
   // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
@@ -623,6 +630,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    ...(opts.bindings !== undefined ? { bindings: opts.bindings } : {}),
   });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
@@ -944,6 +954,13 @@ export interface ResolveRunConfigOptions {
   // in) applies even when bob.yaml does not say `resident: true`. The one-shot
   // `bob run` path leaves this falsy.
   persistent?: boolean;
+  // Host state root for the position grant store. Defaults to ~/.bob/host. When
+  // an agent has no grant it is NOT adopted, and resolution is unchanged.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
+  // Host secret bindings (tests). Defaults to the environment + host file.
+  bindings?: import("./secrets.js").SecretBindings;
 }
 
 export interface ResolvedRunConfig {
@@ -1147,19 +1164,54 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   const model = opts.model ?? yamlModel;
   const appendSystemPrompt = readSoul(agentDir);
 
-  // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
-  // the blessed catalog, validating each config block. Throws fast on an
-  // unknown / unbuilt / misconfigured capability — better than running an
-  // under-equipped agent. Produces the pi extension sources the session loads
-  // plus the per-capability config env each extension reads (no secrets).
-  const resolution = resolveCapabilities({ yamlText });
+  // The ONE effective-config resolver. For an ADOPTED agent (a host grant
+  // exists) it applies the grant/position/override/secret layers through every
+  // session entry path. For an agent with NO grant it returns undefined and the
+  // ordinary resolution below is used untouched — that is what keeps an existing
+  // `bob init` agent booting unchanged.
+  const adopted = resolveAdoptedConfig({
+    name: opts.name,
+    agentDir,
+    yamlText,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    ...(opts.bindings !== undefined ? { bindings: opts.bindings } : {}),
+    ...(opts.persistent !== undefined ? { persistent: opts.persistent } : {}),
+  });
 
-  // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
-  // may only narrow it; a missing allowlist is a load error; every name must be
-  // one pi or a loaded capability can enable (pi drops an unknown name
-  // SILENTLY, so a stale name would otherwise look like a working allowlist
-  // while the tool is simply absent). Throws naming the offender and the fix.
-  const toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
+  let toolPolicy: ToolPolicy;
+  let extensionSources: string[];
+  let capabilityBySource: Record<string, string>;
+  let capabilityEnv: Record<string, string>;
+  if (adopted) {
+    toolPolicy = {
+      tools: adopted.tools,
+      excludeTools: adopted.excludeTools,
+      resident: adopted.resident,
+      allowResidentShell: adopted.allowResidentShell,
+    };
+    extensionSources = adopted.extensionSources;
+    capabilityBySource = adopted.capabilityBySource;
+    capabilityEnv = adopted.capabilityEnv;
+  } else {
+    // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
+    // the blessed catalog, validating each config block. Throws fast on an
+    // unknown / unbuilt / misconfigured capability — better than running an
+    // under-equipped agent. Produces the pi extension sources the session loads
+    // plus the per-capability config env each extension reads (no secrets).
+    const resolution = resolveCapabilities({ yamlText });
+    // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
+    // may only narrow it; a missing allowlist is a load error; every name must be
+    // one pi or a loaded capability can enable (pi drops an unknown name
+    // SILENTLY, so a stale name would otherwise look like a working allowlist
+    // while the tool is simply absent). Throws naming the offender and the fix.
+    toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
+    extensionSources = resolution.extensionSources;
+    capabilityBySource = Object.fromEntries(
+      resolution.capabilities.map((c) => [c.piPackage, c.name]),
+    );
+    capabilityEnv = capabilityConfigEnv(resolution);
+  }
 
   // The agent block (id/name/role). Read through readBlock, but a malformed
   // `agent:` block must not stop the agent from running: it is only used to
@@ -1183,11 +1235,9 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     appendSystemPrompt,
     cwd: join(agentDir, "work"),
     piAgentDir: join(agentDir, ".pi-agent"),
-    extensionSources: resolution.extensionSources,
-    capabilityBySource: Object.fromEntries(
-      resolution.capabilities.map((c) => [c.piPackage, c.name]),
-    ),
-    capabilityEnv: capabilityConfigEnv(resolution),
+    extensionSources,
+    capabilityBySource,
+    capabilityEnv,
     // Always both: resolveAgentToolPolicy refuses an agent without an
     // allowlist, so there is no longer a "declared none" case here.
     tools: toolPolicy.tools,

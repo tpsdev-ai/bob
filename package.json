@@ -13,7 +13,8 @@
   "files": [
     "dist",
     "bin",
-    "roles"
+    "roles",
+    "positions"
   ],
   "engines": {
     "node": ">=22.19.0"

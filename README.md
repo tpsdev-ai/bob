@@ -51,9 +51,63 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
+| `bob hire <name> --as <position>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository |
+| `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
+| `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
 | `bob help`                 | Show this usage                                                                               |
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
+
+## Positions
+
+A **position** is a packaged, role-compatible preset — a starting shape for an
+agent. `positions/builder` and `positions/reviewer` ship with bob. A position
+names an existing **role** (it never carries or edits one), and declares the
+tools it requests, the capabilities it permits (and which are on by default),
+and the packaged files it uses (a seed soul now; skill, prompt and threshold
+files later). `builder-local` (bob#185) becomes a position over its role once
+that lands.
+
+The trust layers, from the top down:
+
+1. **Role** — `roles/<role>/role.json` ships with bob and is the tool ceiling.
+   Unchanged by positions.
+2. **Host grant** — the per-agent trust root. At `bob hire` (or `bob position
+   adopt`) the operator ratifies the role name, the position version and hash,
+   the maximum tool set and the maximum capability set into host state that the
+   agent's own tools cannot edit. Every boot verifies the position hash and role
+   against it, refuses BY NAME each tool or capability outside the ratified set
+   before any intersection, and only then runs the existing validators. Changing
+   `bob.yaml` cannot select another role or add a grant.
+3. **Position** — the declared requests, which the grant must cover.
+4. **Instance** — the agent's `bob.yaml`, which may only narrow within the grant.
+5. **Overrides** — `~/agents/<name>/overrides/`, a per-agent Git repository that
+   may only SUBTRACT: named, schema-checked disable lists for tools and
+   capabilities, and allow-listed files that replace a packaged position file at
+   the same relative path. Every other key is refused by name. A local file may
+   only replace a packaged file; an additional path must be allow-listed by the
+   manifest.
+
+**Secrets** are named, never carried: a position declares the secret NAMES a
+capability needs, and host-owned bindings (the `BOB_SECRET_*` environment, or the
+host `secrets.json`) supply the value or path at session start. Presence is
+checked only for the effective ENABLED capability set, at hire and again at every
+session. A secret missing for a capability that is off blocks only enabling it.
+
+**Adoption** binds an existing agent without rewriting it: `bob position adopt`
+independently resolves the agent before and after binding, verifies its requests
+against the position, role and new grant, records the binding, ratification and
+normalized baseline, and initializes the override repository — leaving the
+pre-existing `bob.yaml` and `soul.md` byte-for-byte unchanged. Immediately after,
+`bob position diff` is empty.
+
+An agent with no grant is not adopted: it resolves exactly as before, so every
+existing `bob init` agent keeps booting unchanged.
+
+**Later slices:** position upgrade (staged, verified, atomic), arbitrary
+`path:`/`npm:`/`git:` sources (with their own security review), the model
+selector, the performance review, full jarvis and new comms. Slice 1 loads only
+positions shipped under bob's own `positions/` directory.
 
 ## Operator guarantees, and the tests that pin them
 
@@ -326,6 +380,7 @@ src/
     observatory/        team-view producer
     fixture/            a no-op capability that proves the loader end to end
 roles/                  ea, writer, reviewer, coder, qa, custom
+positions/              packaged position presets — builder, reviewer
 test/                   mirrors src/
 ```
 
