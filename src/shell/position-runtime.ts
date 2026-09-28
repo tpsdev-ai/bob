@@ -21,7 +21,7 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";

@@ -71,7 +71,13 @@ function recordingInterview(
 ): SessionRunner {
   return async (input) => {
     seen.policy = input.policy;
-    seen.seedSoul = existsSync(path) ? readFileSync(path, "utf8") : "";
+    // No existsSync-then-read window (CodeQL js/file-system-race): a missing
+    // file is just an empty seed.
+    try {
+      seen.seedSoul = readFileSync(path, "utf8");
+    } catch {
+      seen.seedSoul = "";
+    }
     writeFileSync(path, persona);
     return 0;
   };
