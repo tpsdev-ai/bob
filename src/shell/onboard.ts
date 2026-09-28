@@ -112,8 +112,9 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   // The interview session runs the agent's OWN config (bob.yaml capabilities,
   // cwd, credentials) with the interview meta-prompt appended. Its POLICY is the
   // setup policy: the fixed read+write exception for an ordinary agent, or — for
-  // an ADOPTED agent — the grant's resolved tools plus exactly the one write tool
-  // soul.md needs, so the session never exceeds the grant.
+  // an ADOPTED agent — the grant's resolved tools plus the explicit extra `write`
+  // allowance for soul.md. It may exceed the grant's tool set and removes any
+  // `write` exclusion; no other tool is added or unexcluded.
   const { config } = resolveRunConfig({
     name: opts.name,
     agentsRoot: dirname(opts.agentDir),

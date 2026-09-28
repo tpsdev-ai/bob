@@ -93,8 +93,9 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   // The setup session's POLICY: the fixed read+write exception for an ordinary
-  // agent, or — for an ADOPTED agent — the grant's resolved tools plus exactly
-  // the one write tool soul.md needs, so it never exceeds the grant.
+  // agent, or — for an ADOPTED agent — the grant's resolved tools plus the
+  // explicit extra `write` allowance for soul.md. It may exceed the grant's tool
+  // set and removes any `write` exclusion; no other tool is added or unexcluded.
   const adopted = readGrant(opts.hostRoot ?? defaultHostRoot(), opts.name) !== undefined;
   const policy = setupToolPolicy(
     {

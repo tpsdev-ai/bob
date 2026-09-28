@@ -30,6 +30,7 @@ import {
   initAgent,
   type LoadedPosition,
   loadPosition,
+  loadRole,
   overridesDir,
   type PositionManifest,
   positionDiff,
@@ -192,22 +193,96 @@ describe("bob#195 blocker 2 — the packaged role and the manifest version are e
     expect(String((err as Error)?.message)).toMatch(/version/);
   });
 
-  it("enforces the PACKAGED role ceiling, not just the grant's tool list", async () => {
-    await hireBuilder("r2b");
-    const grant = readGrant(s.hostRoot, "r2b");
-    if (!grant) throw new Error("no grant");
-    // A host grant that ratifies a tool the packaged `coder` role does NOT allow.
-    writeGrant(s.hostRoot, { ...grant, maxTools: [...grant.maxTools, "ls"] });
-    // bob.yaml requests it: within the grant, outside the packaged role.
-    const yaml = readFileSync(bobYamlPath("r2b"), "utf8");
-    writeFileSync(bobYamlPath("r2b"), yaml.replace(/(\n {4}- find)/, "$1\n    - ls"));
-    let err: unknown;
-    try {
-      resolve("r2b");
-    } catch (e) {
-      err = e;
-    }
-    expect(String((err as Error)?.message)).toMatch(/role/i);
+  // Assemble boot state directly: hire would reject this position first.
+  // All writable state stays in s.base; the actual packaged role is read only.
+  // No interview, session, credential lookup, Git command, or module mock.
+  function bootFixture(name: string, tools: string[]) {
+    const role = loadRole("coder");
+    expect(role.tools.allow).toContain("read");
+    expect(role.tools.allow).not.toContain("ls");
+    candidate(name, {
+      version: "1.0.0",
+      role: "coder",
+      tools,
+      capabilities: { permitted: [], default: [] },
+      files: [{ path: "soul.md", kind: "soul" }],
+    });
+    const position = loadPosition(name, { root: s.positionsRoot });
+    const agentDir = join(s.agentsRoot, name);
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(soulPath(name), "boot fixture\n");
+    const grant = {
+      agent: name,
+      role: position.manifest.role,
+      position: {
+        name: position.manifest.name,
+        version: position.manifest.version,
+        hash: position.hash,
+      },
+      maxTools: [...position.manifest.tools],
+      maxCapabilities: [...position.manifest.capabilities.permitted],
+      allowResidentShell: role.tools.allowResidentShell === true,
+      ratifiedAt: new Date(0).toISOString(),
+    };
+    writeGrant(s.hostRoot, grant);
+    const requestTools = (requested: string[]) => {
+      writeFileSync(
+        bobYamlPath(name),
+        [
+          "agent:",
+          "  role: coder",
+          "provider:",
+          "  name: exe-dev-gateway",
+          "  model: fixture-model",
+          "tools:",
+          "  allow:",
+          ...requested.map((tool) => `    - ${tool}`),
+          "capabilities:",
+          "",
+        ].join("\n"),
+      );
+    };
+    requestTools(["read"]);
+    const boot = () =>
+      resolveRunConfig({
+        name,
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: s.positionsRoot,
+      });
+    return { agentDir, boot, grant, position, requestTools };
+  }
+
+  it("r2b: refuses maxTools that differs from the selected manifest's tool set", () => {
+    const f = bootFixture("r2b", ["read"]);
+    expect(f.boot().config.tools).toEqual(["read"]);
+    // The grant and request include ls, but the manifest still permits only read.
+    writeGrant(s.hostRoot, { ...f.grant, maxTools: [...f.grant.maxTools, "ls"] });
+    f.requestTools(["read", "ls"]);
+    expect(() => f.boot()).toThrow(/the host grant's "maxTools".*does not equal/);
+  });
+
+  it("r5a: boot enforces the PACKAGED role ceiling after matching grant maxima", () => {
+    const f = bootFixture("r5a", ["read", "ls"]);
+    // The on-disk grant matches the manifest, including its real loaded hash.
+    expect(readGrant(s.hostRoot, "r5a")).toEqual(f.grant);
+    expect(f.grant.maxTools).toEqual(f.position.manifest.tools);
+    expect(f.grant.maxCapabilities).toEqual(f.position.manifest.capabilities.permitted);
+    expect(f.boot().config.tools).toEqual(["read"]);
+
+    f.requestTools(["read", "ls"]);
+    // Only resolveToolPolicy emits this refusal; a maxTools mismatch cannot pass.
+    expect(() => f.boot()).toThrow(
+      'bob.yaml widens the tool allowlist beyond the "coder" role: ls is not in the role.',
+    );
+
+    // Local disables run before the role ceiling, so removing ls permits boot.
+    mkdirSync(overridesDir(f.agentDir), { recursive: true });
+    writeFileSync(
+      join(overridesDir(f.agentDir), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: ["ls"], capabilities: [] }, files: [] })}\n`,
+    );
+    expect(f.boot().config.tools).toEqual(["read"]);
   });
 });
 

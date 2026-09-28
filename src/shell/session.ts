@@ -86,10 +86,10 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
 // The session policy for the privileged setup commands (onboard, align).
 //
 // A NON-adopted agent keeps the fixed setup exception above. An ADOPTED agent's
-// setup session must NOT create a session with privileges outside its host
-// grant: it gets the grant's resolved tools, plus EXACTLY the one `write` tool
-// the interview needs to write soul.md — and nothing else. (bob#195 slice 1;
-// stated in the README.)
+// setup session gets the grant's resolved tools plus the explicit extra `write`
+// allowance needed to write soul.md. That allowance may exceed the grant's tool
+// set and removes any `write` exclusion; no other tool is added or unexcluded.
+// (bob#195 slice 1; stated in the README.)
 //
 // `base` is the policy resolveRunConfig already resolved from the grant.
 export function setupToolPolicy(base: ToolPolicy, adopted: boolean): ToolPolicy {

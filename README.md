@@ -78,10 +78,11 @@ The trust layers, from the top down:
    hash, the maximum tool set and the maximum capability set into host state.
    Every boot loads the current packaged role and compares the manifest name,
    version, hash and role against the grant, refuses BY NAME each tool or
-   capability outside the ratified set before any intersection, enforces BOTH the
-   packaged role's ceiling AND the grant's ratified maximum, and only then runs
-   the existing validators. Changing `bob.yaml` cannot select another role or add
-   a grant.
+   capability outside the grant maxima before any intersection, then applies
+   the narrow-only local disables. It passes the narrowed tools to
+   `resolveToolPolicy`, which enforces the packaged role's ceiling, and the
+   narrowed capabilities to `resolveCapabilities`. Changing `bob.yaml` cannot
+   select another role or add a grant.
 
    The grant is stored under the host state root (`~/.bob/host`), outside the
    agent's directory and its session cwd — but that placement is NOT a
