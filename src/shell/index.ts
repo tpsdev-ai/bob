@@ -134,8 +134,10 @@ export {
 } from "./flair-soul.js";
 export {
   BINDING_MARKER,
+  baselinePath,
   bindingMarkerPath,
   defaultHostRoot,
+  grantPath,
   type HostGrant,
   type PositionBindingMarker,
   type RatifiedSnapshot,
@@ -185,6 +187,8 @@ export {
   type AdoptOptions,
   type AdoptResult,
   adoptAgent,
+  type BindHooks,
+  type BindStep,
   type EffectiveSettings,
   type HireOptions,
   type HireResult,

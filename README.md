@@ -245,9 +245,11 @@ change one, the named test is what tells you.
    FIXED setup policy of `read` and `write`, which may exceed the role's ceiling —
    the interview's job is to write `soul.md`. A model can only reach them through
    a shell tool, and a shell can already write files, so read + write grants it
-   nothing new. For an ADOPTED agent the setup session must not exceed the grant:
-   it gets the grant's resolved tools plus EXACTLY the one `write` tool `soul.md`
-   needs. *(`test/shell/onboard.test.ts`, `align.test.ts`,
+   nothing new. For an ADOPTED agent the setup session gets the grant's resolved
+   tools PLUS one explicit `write` exception: exactly the single `write` tool the
+   interview needs to write `soul.md`. That one `write` may exceed the grant's
+   tool set — no other tool is added or unexcluded — so the interview can rewrite
+   the persona it was hired to shape. *(`test/shell/onboard.test.ts`, `align.test.ts`,
    `test/shell/positions-195.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.

@@ -108,10 +108,13 @@ export interface PositionBindingMarker {
   ratifiedAt: string;
 }
 
-function grantPath(hostRoot: string, agent: string): string {
+// The three paths that carry an agent's ratification state. Exported so callers
+// (hire/adoption) can name them in a refusal and roll back exactly the files they
+// created.
+export function grantPath(hostRoot: string, agent: string): string {
   return join(hostRoot, "grants", `${agent}.json`);
 }
-function baselinePath(hostRoot: string, agent: string): string {
+export function baselinePath(hostRoot: string, agent: string): string {
   return join(hostRoot, "baselines", `${agent}.json`);
 }
 

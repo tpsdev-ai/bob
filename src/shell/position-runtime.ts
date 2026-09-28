@@ -21,7 +21,7 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
@@ -34,8 +34,10 @@ import {
   snapshotForDiff,
 } from "./effective-config.js";
 import {
+  baselinePath,
   bindingMarkerPath,
   defaultHostRoot,
+  grantPath,
   type HostGrant,
   type PositionBindingMarker,
   type RatifiedSnapshot,
@@ -48,10 +50,10 @@ import {
 } from "./host-grant.js";
 import { type InitResult, initAgent } from "./init.js";
 import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
-import { initOverrideRepo } from "./overrides.js";
+import { initOverrideRepo, overridesDir } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
 import { loadRole } from "./role-loader.js";
-import { resolveAgentToolPolicy } from "./run.js";
+import { assertProviderRunnable, mapBobProviderToPi, resolveAgentToolPolicy } from "./run.js";
 import type { SessionDeps } from "./session.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -71,6 +73,87 @@ function refuse(detail: string): never {
 
 function resolveHostRoot(opts: { hostRoot?: string }): string {
   return opts.hostRoot ?? defaultHostRoot();
+}
+
+// --- Re-binding is refused: ordinary hire and adoption only ever CREATE a
+// binding. An agent that already carries a grant, a binding marker or a baseline
+// is refused by name (each occupied path) and the refusal says re-binding is not
+// supported in this slice. An explicit re-bind operation, which would preserve
+// the prior record, is deferred to a later slice.
+
+// The agent's current position, read from the grant when it parses, else from the
+// binding marker. Undefined when neither is readable (the occupied file holds
+// arbitrary bytes) — the refusal then simply omits the position.
+function readablePosition(hostRoot: string, agentDir: string, name: string): string | undefined {
+  try {
+    const g = readGrant(hostRoot, name);
+    if (g && typeof g.position?.name === "string" && g.position.name !== "") {
+      return typeof g.position.version === "string" && g.position.version !== ""
+        ? `${g.position.name} ${g.position.version}`
+        : g.position.name;
+    }
+  } catch {
+    // An unreadable or unparsable grant is still OCCUPIED state; just unnamed here.
+  }
+  const m = readBindingMarker(agentDir);
+  if (m && typeof m.position === "string" && m.position !== "") return m.position;
+  return undefined;
+}
+
+// Refuse when ANY ratification path is already occupied. Runs BEFORE any write.
+function assertUnoccupied(hostRoot: string, agentDir: string, name: string): void {
+  const occupied: string[] = [];
+  const gp = grantPath(hostRoot, name);
+  const mp = bindingMarkerPath(agentDir);
+  const bp = baselinePath(hostRoot, name);
+  if (existsSync(gp)) occupied.push(`grant ${gp}`);
+  if (existsSync(mp)) occupied.push(`binding marker ${mp}`);
+  if (existsSync(bp)) occupied.push(`baseline ${bp}`);
+  if (occupied.length === 0) return;
+  const current = readablePosition(hostRoot, agentDir, name);
+  refuse(
+    `refusing to bind "${name}": ratification state for this agent already exists (${occupied.join(", ")}).` +
+      (current !== undefined ? ` Its current position is "${current}".` : "") +
+      ` Re-binding an already-bound agent is not supported in this slice; remove the existing record deliberately to bind "${name}" afresh.`,
+  );
+}
+
+// The stages of a bind, after each of which a test may inject a failure. `scaffold`
+// and `interview` are the pre-commit steps that WRITE (the scaffold and the
+// interview's refined soul); the rest are the file commit.
+export type BindStep = "scaffold" | "interview" | "grant" | "marker" | "baseline" | "override-repo";
+
+export interface BindHooks {
+  // Test-only failure-injection seam: invoked AFTER each bind step, so a test can
+  // throw at a chosen step and prove the rollback removes exactly what this
+  // operation created. Never set in production.
+  afterStep?: (step: BindStep) => void;
+}
+
+// The ledger of paths THIS operation creates, so a later failure removes exactly
+// them and nothing else. When the agent directory was created here, every
+// scaffold file (including the marker and the override repository) lives inside
+// it, so removing it is complete; for adoption the agent directory pre-exists, so
+// only the marker, the override repository (when this operation created it) and
+// the host grant/baseline are removed.
+interface BindTxn {
+  agentDir: string;
+  agentDirCreated: boolean;
+  markerPath?: string;
+  overrideDirCreated: boolean;
+  grantPath?: string;
+  baselinePath?: string;
+}
+
+function rollbackBind(tx: BindTxn): void {
+  if (tx.agentDirCreated) {
+    rmSync(tx.agentDir, { recursive: true, force: true });
+  } else {
+    if (tx.markerPath !== undefined) rmSync(tx.markerPath, { force: true });
+    if (tx.overrideDirCreated) rmSync(overridesDir(tx.agentDir), { recursive: true, force: true });
+  }
+  if (tx.grantPath !== undefined) rmSync(tx.grantPath, { force: true });
+  if (tx.baselinePath !== undefined) rmSync(tx.baselinePath, { force: true });
 }
 
 // A grant built from a ratifiable position + role. maxTools/maxCapabilities are
@@ -156,6 +239,9 @@ export interface HireOptions extends PositionCommonOptions {
   // soul.md; the baseline is snapshotted from the result.
   interview?: SessionRunner;
   deps?: SessionDeps;
+  // Test seam: a function called after each bind step, so a test can inject a
+  // failure and prove the rollback. See BindHooks.
+  commitHook?: (step: BindStep) => void;
 }
 
 export interface HireResult {
@@ -174,19 +260,32 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 // Hire a NEW agent from a packaged position. ASYNC because it runs the existing
 // onboarding interview after the candidate is validated and scaffolded.
+//
+// Order: EVERY deterministic refusal runs before anything is written; the
+// scaffold and interview then run under a transaction, and the file commit
+// (grant, marker, baseline, override repository) removes everything THIS
+// operation created on any later failure. So a refused hire — including a failed
+// interview — leaves no scaffold and no half-written binding.
 export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
   const hostRoot = resolveHostRoot(opts);
   const positionsRoot = opts.positionsRoot ?? DEFAULT_POSITIONS_ROOT;
   const now = opts.now ?? (() => new Date());
+  const agentDir = join(opts.agentsRoot, opts.name);
 
+  // --- Deterministic refusals. NONE of these writes anything. ---
   const position = loadPosition(opts.positionName, { root: positionsRoot });
   const role = loadRole(position.manifest.role as never);
   assertPositionAgainstRole(position, role.tools.allow);
+  assertUnoccupied(hostRoot, agentDir, opts.name);
 
-  const agentDir = join(opts.agentsRoot, opts.name);
+  const provider = opts.provider ?? DEFAULT_PROVIDER;
+  const model = opts.model ?? DEFAULT_MODEL;
+  // The provider/runtime-key refusal the interview session would otherwise raise
+  // AFTER the scaffold exists. Run it up front so a missing key leaves nothing.
+  assertProviderRunnable(mapBobProviderToPi(provider), `bob hire ${opts.name}`);
+
   const grant = grantFor(opts.name, position, role.tools.allowResidentShell === true, now);
-
   // VALIDATE against the materialized defaults BEFORE writing anything, so a
   // refused hire commits no scaffold, grant or override repository.
   const yamlText = materializedYaml(
@@ -201,53 +300,84 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     position,
     grant,
   });
-
-  const provider = opts.provider ?? DEFAULT_PROVIDER;
-  const model = opts.model ?? DEFAULT_MODEL;
-
   // The position supplies the seed persona, but the agent's OWN identity (the
   // header initAgent stamps) stays on top: the seed soul is the identity plus
   // the position's persona, never the generic packaged soul alone.
   const soulFile = effective.files.find((f) => f.kind === "soul");
-  const init = initAgent({
-    name: opts.name,
-    role: position.manifest.role as never,
-    provider,
-    model,
-    agentsRoot: opts.agentsRoot,
-    capabilities: position.manifest.capabilities.default,
-    toolAllow: position.manifest.tools,
-    skipFlair: opts.skipFlair ?? true,
-    ...(soulFile !== undefined ? { soulBody: soulFile.content } : {}),
-    ...(opts.flairKeysDir !== undefined ? { flairKeysDir: opts.flairKeysDir } : {}),
-    ...(opts.flairUrl !== undefined ? { flairUrl: opts.flairUrl } : {}),
-  });
 
-  // The hiring interview runs after candidate validation and scaffolding. It
-  // refines the seed soul (which already carries the agent's identity).
-  const interview = await runOnboard({
-    name: opts.name,
-    role: position.manifest.role,
-    agentDir: init.agentDir,
-    provider,
-    model,
-    ...(opts.interview !== undefined ? { sessionRunner: opts.interview } : {}),
-    ...(opts.deps !== undefined ? { deps: opts.deps } : {}),
-  });
+  // --- The bind: scaffold, interview and the file commit, under a rollback. ---
+  const tx: BindTxn = {
+    agentDir,
+    agentDirCreated: !existsSync(agentDir),
+    overrideDirCreated: false,
+  };
+  try {
+    const init = initAgent({
+      name: opts.name,
+      role: position.manifest.role as never,
+      provider,
+      model,
+      agentsRoot: opts.agentsRoot,
+      capabilities: position.manifest.capabilities.default,
+      toolAllow: position.manifest.tools,
+      skipFlair: opts.skipFlair ?? true,
+      ...(soulFile !== undefined ? { soulBody: soulFile.content } : {}),
+      ...(opts.flairKeysDir !== undefined ? { flairKeysDir: opts.flairKeysDir } : {}),
+      ...(opts.flairUrl !== undefined ? { flairUrl: opts.flairUrl } : {}),
+    });
+    opts.commitHook?.("scaffold");
 
-  writeGrant(hostRoot, grant);
-  writeBindingMarker(init.agentDir, grant);
-  // The baseline is snapshotted AFTER the interview: what the operator ratified
-  // is the agent as it now stands, so `position diff` is empty immediately.
-  const baseline = snapshotForDiff(effective, soulHashOf(init.agentDir));
-  baseline.position = grant.position;
-  writeBaseline(hostRoot, opts.name, baseline);
-  const overrideDir = initOverrideRepo(init.agentDir);
+    // The hiring interview runs after candidate validation and scaffolding. It
+    // refines the seed soul (which already carries the agent's identity). A
+    // nonzero exit is a FAILED hire: nothing is committed.
+    const interview = await runOnboard({
+      name: opts.name,
+      role: position.manifest.role,
+      agentDir: init.agentDir,
+      provider,
+      model,
+      ...(opts.interview !== undefined ? { sessionRunner: opts.interview } : {}),
+      ...(opts.deps !== undefined ? { deps: opts.deps } : {}),
+    });
+    if (interview.exitCode !== 0) {
+      refuse(
+        `the onboarding interview for "${opts.name}" exited with code ${interview.exitCode}; a failed interview is a failed hire, so nothing was committed.`,
+      );
+    }
+    opts.commitHook?.("interview");
 
-  return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
+    writeGrant(hostRoot, grant);
+    tx.grantPath = grantPath(hostRoot, opts.name);
+    opts.commitHook?.("grant");
+
+    writeBindingMarker(init.agentDir, grant);
+    tx.markerPath = bindingMarkerPath(init.agentDir);
+    opts.commitHook?.("marker");
+
+    // The baseline is snapshotted AFTER the interview: what the operator ratified
+    // is the agent as it now stands, so `position diff` is empty immediately.
+    const baseline = snapshotForDiff(effective, soulHashOf(init.agentDir));
+    baseline.position = grant.position;
+    writeBaseline(hostRoot, opts.name, baseline);
+    tx.baselinePath = baselinePath(hostRoot, opts.name);
+    opts.commitHook?.("baseline");
+
+    tx.overrideDirCreated = !existsSync(overridesDir(init.agentDir));
+    const overrideDir = initOverrideRepo(init.agentDir);
+    opts.commitHook?.("override-repo");
+
+    return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
+  } catch (err) {
+    rollbackBind(tx);
+    throw err;
+  }
 }
 
-export interface AdoptOptions extends PositionCommonOptions {}
+export interface AdoptOptions extends PositionCommonOptions {
+  // Test seam: a function called after each bind step, so a test can inject a
+  // failure and prove the rollback. See BindHooks.
+  commitHook?: (step: BindStep) => void;
+}
 
 // The effective settings adoption compares before and after binding.
 export interface EffectiveSettings {
@@ -311,6 +441,9 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
   const now = opts.now ?? (() => new Date());
 
   const agentDir = join(opts.agentsRoot, opts.name);
+  // Re-binding is refused: an agent that already carries a grant, a binding
+  // marker or a baseline is refused by name BEFORE anything is written.
+  assertUnoccupied(hostRoot, agentDir, opts.name);
   const yamlPath = join(agentDir, "bob.yaml");
   let yamlText: string;
   try {
@@ -395,28 +528,49 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     );
   }
 
-  const soulHashBefore = soulHashOf(agentDir);
-  writeGrant(hostRoot, grant);
-  writeBindingMarker(agentDir, grant);
-  const baseline = snapshotForDiff(effective, soulHashBefore);
-  baseline.position = grant.position;
-  writeBaseline(hostRoot, opts.name, baseline);
-  const overrideDir = initOverrideRepo(agentDir);
-  const soulHashAfter = soulHashOf(agentDir);
+  // --- The file commit, under a rollback. The agent directory PRE-EXISTS (it was
+  // scaffolded by bob init), so on a later failure only the marker, the override
+  // repository (when this operation created it) and the host grant/baseline are
+  // removed — the existing bob.yaml, soul.md and any other file are untouched. ---
+  const tx: BindTxn = { agentDir, agentDirCreated: false, overrideDirCreated: false };
+  try {
+    const soulHashBefore = soulHashOf(agentDir);
+    writeGrant(hostRoot, grant);
+    tx.grantPath = grantPath(hostRoot, opts.name);
+    opts.commitHook?.("grant");
 
-  const diff = computePositionDiff(baseline, effective, soulHashAfter);
+    writeBindingMarker(agentDir, grant);
+    tx.markerPath = bindingMarkerPath(agentDir);
+    opts.commitHook?.("marker");
 
-  return {
-    agentDir,
-    grant,
-    baseline,
-    overrideDir,
-    before,
-    after,
-    soulHashBefore,
-    soulHashAfter,
-    diff,
-  };
+    const baseline = snapshotForDiff(effective, soulHashBefore);
+    baseline.position = grant.position;
+    writeBaseline(hostRoot, opts.name, baseline);
+    tx.baselinePath = baselinePath(hostRoot, opts.name);
+    opts.commitHook?.("baseline");
+
+    tx.overrideDirCreated = !existsSync(overridesDir(agentDir));
+    const overrideDir = initOverrideRepo(agentDir);
+    opts.commitHook?.("override-repo");
+
+    const soulHashAfter = soulHashOf(agentDir);
+    const diff = computePositionDiff(baseline, effective, soulHashAfter);
+
+    return {
+      agentDir,
+      grant,
+      baseline,
+      overrideDir,
+      before,
+      after,
+      soulHashBefore,
+      soulHashAfter,
+      diff,
+    };
+  } catch (err) {
+    rollbackBind(tx);
+    throw err;
+  }
 }
 
 // The boot resolver. Returns undefined when the agent has no grant (not adopted

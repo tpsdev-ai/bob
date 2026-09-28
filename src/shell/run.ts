@@ -1367,6 +1367,20 @@ function readBobYaml(agentDir: string, name: string): string {
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
 // block (name + model) — the exact shape init.ts emits. The bob provider is
 // mapped to pi's provider id the same way init.ts's resolvePiProvider does.
+// The provider/runtime-key refusal the session resolver applies, factored out so
+// callers that write BEFORE a session exists (hire scaffolds and runs the
+// interview) can run it up front and leave nothing behind on a missing key.
+// `provider` is pi's provider id (already mapped by mapBobProviderToPi); `label`
+// names the caller for the message (e.g. "bob run <name>").
+export function assertProviderRunnable(provider: string, label: string): void {
+  if (provider !== "openrouter") return;
+  if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
+  if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
+  throw new Error(
+    `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+  );
+}
+
 function resolveProviderAndModel(
   yamlText: string,
   name: string,
@@ -1379,14 +1393,9 @@ function resolveProviderAndModel(
   const provider = mapBobProviderToPi(bobProvider);
   // The openrouter key is read from the environment AT RUN TIME and never written
   // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
-  // request is made (bob#183).
-  if (provider === "openrouter" && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
-    if (openrouterKeyWasConsumed())
-      throw new Error(`bob run ${name}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
-    throw new Error(
-      `bob run ${name}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
-    );
-  }
+  // request is made (bob#183). The check is shared with `bob hire`'s pre-write
+  // validation so both refuse identically.
+  assertProviderRunnable(provider, `bob run ${name}`);
   return { provider, model };
 }
 

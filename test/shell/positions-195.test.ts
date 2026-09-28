@@ -24,8 +24,10 @@ import { dirname, join } from "node:path";
 import {
   adoptAgent,
   BINDING_MARKER,
+  baselinePath,
   bindingMarkerPath,
   DEFAULT_POSITIONS_ROOT,
+  grantPath,
   hireAgent,
   initAgent,
   type LoadedPosition,
@@ -1325,5 +1327,378 @@ describe("bob#195 round 4, blocker 3 — the override scan covers symlinks and E
     const msg = String((err as Error)?.message);
     expect(msg).toContain("keep.md");
     expect(msg).toMatch(/not present/);
+  });
+});
+
+// ===========================================================================
+// ROUND 6
+// ===========================================================================
+
+// Distinct, non-empty bytes for the "the prior record survives byte-for-byte" checks.
+const priorBytes = (tag: string) => Buffer.from(`prior ${tag} record — must survive\n`);
+
+// An injected failure at ONE chosen bind step.
+const failAt =
+  (stage: string) =>
+  (step: string): void => {
+    if (step === stage) throw new Error(`injected failure at ${step}`);
+  };
+
+const agentDirFor = (name: string) => join(s.agentsRoot, name);
+
+// A complete, adoptable EXISTING agent: the coder role with exactly the builder
+// position's tool set, so adoption's before/after are equal and it WOULD bind.
+function adoptReadyAgent(name: string): void {
+  initAgent({
+    name,
+    role: "coder",
+    provider: "exe-dev-gateway",
+    model: "claude-sonnet-4-6",
+    agentsRoot: s.agentsRoot,
+    capabilities: [],
+    toolAllow: ["read", "bash", "write", "edit", "grep", "find"],
+    skipFlair: true,
+  });
+}
+
+// Run a call that must refuse; return the refusal message (fail loudly if it did not).
+async function refusalOf(fn: () => Promise<unknown> | unknown): Promise<string> {
+  try {
+    await fn();
+  } catch (e) {
+    return String((e as Error)?.message);
+  }
+  throw new Error("expected a refusal, but the call succeeded");
+}
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 6, blocker 1 — ordinary hire and adopt REFUSE occupied ratification state", () => {
+  it("hire refuses an existing GRANT, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-g1";
+    mkdirSync(join(s.hostRoot, "grants"), { recursive: true });
+    const gp = grantPath(s.hostRoot, name);
+    const before = priorBytes("grant");
+    writeFileSync(gp, before);
+
+    const msg = await refusalOf(() => hireBuilder(name));
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(gp);
+    expect(msg).toMatch(/not supported in this slice/);
+    expect(readFileSync(gp).equals(before)).toBe(true);
+    expect(existsSync(agentDirFor(name))).toBe(false);
+  });
+
+  it("hire refuses an existing BINDING MARKER, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-m1";
+    const agentDir = agentDirFor(name);
+    mkdirSync(agentDir, { recursive: true });
+    const mp = bindingMarkerPath(agentDir);
+    const before = priorBytes("marker");
+    writeFileSync(mp, before);
+
+    const msg = await refusalOf(() => hireBuilder(name));
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(mp);
+    expect(readFileSync(mp).equals(before)).toBe(true);
+    // No scaffold was written beside the marker.
+    expect(existsSync(join(agentDir, "bob.yaml"))).toBe(false);
+    expect(existsSync(join(agentDir, "overrides"))).toBe(false);
+    expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+  });
+
+  it("hire refuses an existing BASELINE, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-b1";
+    mkdirSync(join(s.hostRoot, "baselines"), { recursive: true });
+    const bp = baselinePath(s.hostRoot, name);
+    const before = priorBytes("baseline");
+    writeFileSync(bp, before);
+
+    const msg = await refusalOf(() => hireBuilder(name));
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(bp);
+    expect(readFileSync(bp).equals(before)).toBe(true);
+    expect(existsSync(agentDirFor(name))).toBe(false);
+  });
+
+  it("adopt refuses an existing GRANT, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-ag1";
+    adoptReadyAgent(name);
+    mkdirSync(join(s.hostRoot, "grants"), { recursive: true });
+    const gp = grantPath(s.hostRoot, name);
+    const before = priorBytes("grant");
+    writeFileSync(gp, before);
+
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+      }),
+    );
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(gp);
+    expect(readFileSync(gp).equals(before)).toBe(true);
+    expect(existsSync(bindingMarkerPath(agentDirFor(name)))).toBe(false);
+  });
+
+  it("adopt refuses an existing BINDING MARKER, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-am1";
+    adoptReadyAgent(name);
+    const mp = bindingMarkerPath(agentDirFor(name));
+    const before = priorBytes("marker");
+    writeFileSync(mp, before);
+
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+      }),
+    );
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(mp);
+    expect(readFileSync(mp).equals(before)).toBe(true);
+    expect(readGrant(s.hostRoot, name)).toBeUndefined();
+  });
+
+  it("adopt refuses an existing BASELINE, names its path, and leaves the prior bytes byte-for-byte", async () => {
+    const name = "oc-ab1";
+    adoptReadyAgent(name);
+    mkdirSync(join(s.hostRoot, "baselines"), { recursive: true });
+    const bp = baselinePath(s.hostRoot, name);
+    const before = priorBytes("baseline");
+    writeFileSync(bp, before);
+
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+      }),
+    );
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(bp);
+    expect(readFileSync(bp).equals(before)).toBe(true);
+    expect(readGrant(s.hostRoot, name)).toBeUndefined();
+    expect(existsSync(bindingMarkerPath(agentDirFor(name)))).toBe(false);
+  });
+
+  it("names EVERY occupied path and the agent's current position when it is readable", async () => {
+    const name = "oc-all";
+    await hireBuilder(name);
+    const agentDir = agentDirFor(name);
+    const gp = grantPath(s.hostRoot, name);
+    const mp = bindingMarkerPath(agentDir);
+    const bp = baselinePath(s.hostRoot, name);
+    const grantBefore = readFileSync(gp);
+    const markerBefore = readFileSync(mp);
+    const baselineBefore = readFileSync(bp);
+
+    const msg = await refusalOf(() => hireBuilder(name));
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain(gp);
+    expect(msg).toContain(mp);
+    expect(msg).toContain(bp);
+    expect(msg).toContain("builder");
+    expect(msg).toMatch(/not supported in this slice/);
+    // Every prior record survives byte-for-byte.
+    expect(readFileSync(gp).equals(grantBefore)).toBe(true);
+    expect(readFileSync(mp).equals(markerBefore)).toBe(true);
+    expect(readFileSync(bp).equals(baselineBefore)).toBe(true);
+  });
+
+  it("adopting a previously-hired agent is refused, naming the position", async () => {
+    const name = "oc-ah";
+    await hireBuilder(name);
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+      }),
+    );
+    expect(msg).toMatch(/already exists/);
+    expect(msg).toContain("builder");
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 6, blocker 2 — every deterministic refusal runs BEFORE anything is written", () => {
+  it("hire refuses a missing openrouter runtime key with no scaffold, grant or baseline left behind", async () => {
+    const name = "prov1";
+    const had = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      // The scaffold step must NEVER run: the refusal is deterministic and runs
+      // before anything is written (not merely rolled back afterwards).
+      let scaffoldSteps = 0;
+      const msg = await refusalOf(() =>
+        hireAgent({
+          name,
+          positionName: "builder",
+          agentsRoot: s.agentsRoot,
+          hostRoot: s.hostRoot,
+          positionsRoot: DEFAULT_POSITIONS_ROOT,
+          skipFlair: true,
+          provider: "openrouter",
+          model: "deepseek/deepseek-v4.1-flash",
+          interview: noopInterview,
+          commitHook: (step) => {
+            if (step === "scaffold") scaffoldSteps += 1;
+          },
+        }),
+      );
+      expect(msg).toMatch(/OPENROUTER_API_KEY/);
+      expect(scaffoldSteps).toBe(0);
+      expect(existsSync(agentDirFor(name))).toBe(false);
+      expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+      expect(existsSync(baselinePath(s.hostRoot, name))).toBe(false);
+    } finally {
+      if (had !== undefined) process.env.OPENROUTER_API_KEY = had;
+    }
+  });
+
+  it("hire refuses an occupied path before it scaffolds, even for a position that would otherwise bind", async () => {
+    const name = "oc-pre";
+    mkdirSync(join(s.hostRoot, "grants"), { recursive: true });
+    const gp = grantPath(s.hostRoot, name);
+    const before = priorBytes("grant");
+    writeFileSync(gp, before);
+    let scaffoldSteps = 0;
+    const msg = await refusalOf(() =>
+      hireAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        skipFlair: true,
+        interview: noopInterview,
+        commitHook: (step) => {
+          if (step === "scaffold") scaffoldSteps += 1;
+        },
+      }),
+    );
+    expect(msg).toMatch(/already exists/);
+    // The refusal is the OCCUPIED-state one, before the scaffold; the prior
+    // grant is untouched.
+    expect(scaffoldSteps).toBe(0);
+    expect(existsSync(agentDirFor(name))).toBe(false);
+    expect(readFileSync(gp).equals(before)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 6, blocker 3 — a failed interview is a FAILED hire: nothing is committed", () => {
+  it("a nonzero interview exit leaves no scaffold and no binding", async () => {
+    const name = "iv1";
+    const msg = await refusalOf(() => hireBuilder(name, async () => 7));
+    expect(msg).toMatch(/exited with code 7/);
+    expect(existsSync(agentDirFor(name))).toBe(false);
+    expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+    expect(existsSync(baselinePath(s.hostRoot, name))).toBe(false);
+    expect(readGrant(s.hostRoot, name)).toBeUndefined();
+  });
+
+  it("an interview that throws leaves no scaffold and no binding", async () => {
+    const name = "iv2";
+    const msg = await refusalOf(() =>
+      hireBuilder(name, async () => {
+        throw new Error("interview blew up");
+      }),
+    );
+    expect(msg).toMatch(/interview blew up/);
+    expect(existsSync(agentDirFor(name))).toBe(false);
+    expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("bob#195 round 6, blocker 4 — a failure at any commit stage rolls back what THIS operation created", () => {
+  const stages = ["grant", "marker", "baseline", "override-repo"] as const;
+
+  for (const stage of stages) {
+    it(`hire: a failure after the ${stage} stage leaves no scaffold and no binding, and a pre-existing file survives`, async () => {
+      const sentinel = join(s.agentsRoot, "sentinel-keep");
+      writeFileSync(sentinel, "operator data\n");
+      const name = `rb-${stage}`;
+      const msg = await refusalOf(() =>
+        hireAgent({
+          name,
+          positionName: "builder",
+          agentsRoot: s.agentsRoot,
+          hostRoot: s.hostRoot,
+          positionsRoot: DEFAULT_POSITIONS_ROOT,
+          skipFlair: true,
+          interview: noopInterview,
+          commitHook: failAt(stage),
+        }),
+      );
+      expect(msg).toMatch(new RegExp(`injected failure at ${stage}`));
+      expect(existsSync(agentDirFor(name))).toBe(false);
+      expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
+      expect(existsSync(baselinePath(s.hostRoot, name))).toBe(false);
+      expect(readGrant(s.hostRoot, name)).toBeUndefined();
+      expect(readBaseline(s.hostRoot, name)).toBeUndefined();
+      expect(readFileSync(sentinel, "utf8")).toBe("operator data\n");
+    });
+
+    it(`adopt: a failure after the ${stage} stage removes the binding but leaves the pre-existing agent files untouched`, async () => {
+      const name = `ar-${stage}`;
+      adoptReadyAgent(name);
+      const agentDir = agentDirFor(name);
+      const note = join(agentDir, "NOTES.txt");
+      writeFileSync(note, "operator note\n");
+      const yamlBefore = readFileSync(bobYamlPath(name));
+      const soulBefore = readFileSync(soulPath(name));
+
+      const msg = await refusalOf(() =>
+        adoptAgent({
+          name,
+          positionName: "builder",
+          agentsRoot: s.agentsRoot,
+          hostRoot: s.hostRoot,
+          positionsRoot: DEFAULT_POSITIONS_ROOT,
+          commitHook: failAt(stage),
+        }),
+      );
+      expect(msg).toMatch(new RegExp(`injected failure at ${stage}`));
+      expect(existsSync(bindingMarkerPath(agentDir))).toBe(false);
+      expect(readGrant(s.hostRoot, name)).toBeUndefined();
+      expect(readBaseline(s.hostRoot, name)).toBeUndefined();
+      expect(existsSync(overridesDir(agentDir))).toBe(false);
+      // Pre-existing files survive untouched.
+      expect(readFileSync(bobYamlPath(name)).equals(yamlBefore)).toBe(true);
+      expect(readFileSync(soulPath(name)).equals(soulBefore)).toBe(true);
+      expect(readFileSync(note, "utf8")).toBe("operator note\n");
+      // The rollback left no occupied state, so the agent can still be adopted.
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+      });
+      expect(readGrant(s.hostRoot, name)?.position.name).toBe("builder");
+    });
+  }
+
+  it("hire refuses a pre-existing UNBOUND agent dir and leaves its files untouched", async () => {
+    const name = "pre1";
+    const agentDir = agentDirFor(name);
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "keep.txt"), "operator data\n");
+    const msg = await refusalOf(() => hireBuilder(name));
+    expect(msg).toMatch(/already exists/);
+    expect(readFileSync(join(agentDir, "keep.txt"), "utf8")).toBe("operator data\n");
+    expect(existsSync(grantPath(s.hostRoot, name))).toBe(false);
   });
 });
