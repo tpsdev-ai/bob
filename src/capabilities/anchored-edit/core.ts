@@ -34,14 +34,18 @@
 // Documented GAPS live in README.md (cross-process race, bash outside the
 // guards, slice-2 items) — read it before trusting this as a sandbox.
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
+  constants as fsc,
+  fstatSync,
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -236,6 +240,8 @@ export function renderReadLines(raw: Buffer, start?: number, end?: number): Read
 
   const bodyLines: string[] = [];
   let bytes = Buffer.byteLength(header, "utf8") + 1;
+  // Reserve room for the cut note so it can never push the result over the cap.
+  const budget = MAX_OUTPUT_BYTES - CUT_NOTE_RESERVE - 1;
   let cutByBytes = false;
   for (let n = from; n <= pageEnd; n++) {
     const { text: t, truncated } = displayLine(lines[n - 1].content);
@@ -244,7 +250,7 @@ export function renderReadLines(raw: Buffer, start?: number, end?: number): Read
       : "";
     const rendered = `${anchorToken(n, lines[n - 1])} ${t}${marker}`;
     const cost = Buffer.byteLength(rendered, "utf8") + 1;
-    if (bytes + cost > MAX_OUTPUT_BYTES) {
+    if (bytes + cost > budget) {
       cutByBytes = true;
       break;
     }
@@ -259,8 +265,30 @@ export function renderReadLines(raw: Buffer, start?: number, end?: number): Read
       `page cut at line ${lastShown} of ${total}; more lines need another read_lines(start=${lastShown + 1}).`,
     );
   }
-  const out = [header, ...bodyLines, ...notes].join("\n");
+  const out = clampUtf8([header, ...bodyLines, ...notes].join("\n"), MAX_OUTPUT_BYTES);
   return { text: out, fingerprint: fp, lineCount: total };
+}
+
+// Space reserved for a cut note, so a body that fills the cap still leaves room
+// for the note that says it was cut.
+const CUT_NOTE_RESERVE = 300;
+
+// Truncate `text` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a
+// character, appending a cut marker that is itself inside the cap. The single
+// place any result is bounded by bytes.
+export function clampUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const marker = "\n…[result cut]";
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+  let out = "";
+  let used = 0;
+  for (const ch of text) {
+    const b = Buffer.byteLength(ch, "utf8");
+    if (used + b > budget) break;
+    out += ch;
+    used += b;
+  }
+  return out + marker;
 }
 
 // --- edit splices (pure) -----------------------------------------------------
@@ -340,10 +368,13 @@ export function applyEditLines(
   // final-newline state is kept: if the file had no final newline, the prefix's
   // last line must lose its terminator too.
   let prefix = body.subarray(0, prefixEnd);
+  let removedAdjacent = 0;
   if (newLines.length === 0 && tail && !finalNl && lines.length > 0) {
     const pl = lines[from - 1 - 1]; // the line before the deleted range
     if (from - 1 >= 1 && pl.terminator !== "") {
       prefix = body.subarray(0, byteStart(body, lines, from) - pl.terminator.length);
+      // The adjacent separator was removed with the final line; charge it too.
+      removedAdjacent = pl.terminator.length;
     }
   }
   const suffix = body.subarray(suffixStart);
@@ -351,7 +382,7 @@ export function applyEditLines(
   const next = Buffer.concat([before, prefix, mid, suffix]);
   return {
     raw: next,
-    removedBytes: span,
+    removedBytes: span + removedAdjacent,
     writtenLineNumbers: Array.from({ length: newLines.length }, (_, i) => from + i),
     lineDelta: newLines.length - (to - from + 1),
   };
@@ -377,8 +408,14 @@ export function applyInsertAfter(
   if (lines.length === 0) {
     // Only L0 makes sense on an empty file: the whole file becomes the text.
     if (after !== 0) throw new Refusal("insert_after on an empty file requires anchor L0.");
-    const next = Buffer.concat([before, renderLines(newLines, sep, true)]);
-    return { raw: next, removedBytes: 0, writtenLineNumbers: [1], lineDelta: newLines.length };
+    // An empty file has NO final newline; inserting keeps that state.
+    const next = Buffer.concat([before, renderLines(newLines, sep, false)]);
+    return {
+      raw: next,
+      removedBytes: 0,
+      writtenLineNumbers: Array.from({ length: newLines.length }, (_, i) => 1 + i),
+      lineDelta: newLines.length,
+    };
   }
 
   const atEof = after === lines.length;
@@ -445,6 +482,20 @@ interface Budget {
   tripped: boolean;
 }
 
+// A caller path resolved within the PINNED root. `canonical` is the verified
+// realpath used for I/O; `parentReal` is the realpath of its directory.
+interface ResolvedTarget {
+  root: string;
+  canonical: string;
+  parentReal: string;
+  base: string;
+  exists: boolean;
+}
+
+// Bound on the anchors echoed in a mutation result, so a huge insertion cannot
+// return an unbounded structured list.
+const ANCHOR_ECHO_LIMIT = 64;
+
 // Per-session state. One instance per pi session (the extension factory makes
 // it), so "per run" in the spec means "per session".
 export class AnchoredEditSession {
@@ -452,6 +503,10 @@ export class AnchoredEditSession {
   private readonly readFingerprints = new Map<string, string>();
   private readonly budgets = new Map<string, Budget>();
   private readonly locks = new Map<string, Promise<void>>();
+  // The trusted canonical root, pinned ONCE per session from pi's first tool
+  // execution context. A later replacement of the root path (a swapped symlink,
+  // a recreated directory) does NOT redefine it.
+  private pinnedRoot: string | null = null;
 
   // Run `fn` under the per-path critical section. The canonical path is the key.
   private runLocked<T>(key: string, fn: () => T): Promise<T> {
@@ -475,58 +530,146 @@ export class AnchoredEditSession {
 
   // --- path handling ---------------------------------------------------------
 
-  // Resolve a caller path within `root`. Refuses absolute paths and any ".."
-  // segment. Returns the canonical (realpath) target; `exists` says whether it
-  // already exists. Containment is checked on the canonical target.
-  resolveWithin(root: string, p: string): { abs: string; canonical: string; exists: boolean } {
+  // Resolve a caller path within the PINNED trusted root. Refuses absolute
+  // paths and any ".." segment. Returns the verified canonical target (for I/O)
+  // and its canonical parent directory.
+  resolveWithin(rootArg: string, p: string): ResolvedTarget {
     if (typeof p !== "string" || p.trim() === "") {
-      throw new Refusal("a path is required.");
+      throw new Refusal("refusing a request with no path: a path is required.");
     }
     if (isAbsolute(p)) {
-      throw new Refusal(`refusing absolute path "${p}": paths are relative to the workspace root.`);
+      throw new Refusal(
+        `refusing absolute path "${p}": paths must be relative to the workspace root.`,
+      );
     }
     const segs = p.split(/[\\/]/);
     if (segs.some((s) => s === "..")) {
       throw new Refusal(`refusing path "${p}": a ".." segment can escape the workspace root.`);
     }
-    const realRoot = realpathSync(root);
-    const abs = resolve(realRoot, p);
-    const rel = relative(realRoot, abs);
-    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      throw new Refusal(`refusing path "${p}": it resolves outside the workspace root.`);
+    let realRoot: string;
+    try {
+      if (this.pinnedRoot === null) this.pinnedRoot = realpathSync(rootArg);
+      // Re-resolve the PINNED root each call, so a root that disappeared is
+      // refused rather than silently redefined to whatever now sits at its path.
+      realRoot = realpathSync(this.pinnedRoot);
+      if (realRoot !== this.pinnedRoot) {
+        throw new Refusal(`refusing path "${p}": the workspace root was replaced.`);
+      }
+    } catch (e) {
+      if (e instanceof Refusal) throw e;
+      throw new Refusal(`refusing path "${p}": the workspace root is not readable.`);
     }
+    const abs = resolve(realRoot, p);
+    assertInside(realRoot, abs, p);
     let exists = false;
-    let canonical: string;
     try {
       lstatSync(abs);
       exists = true;
     } catch {
       exists = false;
     }
+    let canonical: string;
+    let parentReal: string;
     if (exists) {
       try {
         canonical = realpathSync(abs);
+        parentReal = realpathSync(dirname(abs));
       } catch {
         // A dangling symlink: lstat sees an entry, realpath cannot resolve it.
         // It is OCCUPIED for creation, and its parent must be inside the root.
-        const parentReal = realpathSync(dirname(abs));
+        parentReal = realpathSync(dirname(abs));
         assertInside(realRoot, parentReal, p);
         canonical = join(parentReal, basename(abs));
       }
     } else {
-      const parentReal = realpathSync(dirname(abs));
+      parentReal = realpathSync(dirname(abs));
       assertInside(realRoot, parentReal, p);
       canonical = join(parentReal, basename(abs));
     }
-    // Containment on the path used for I/O (the canonical target): a symlink
-    // leading outside the root is refused.
-    const crel = relative(realRoot, canonical);
-    if (crel === ".." || crel.startsWith(`..${sep}`) || isAbsolute(crel)) {
+    assertInside(realRoot, canonical, p);
+    return { root: realRoot, canonical, parentReal, base: basename(canonical), exists };
+  }
+
+  // Re-verify, immediately before I/O, that the parent directory is still the
+  // one resolved inside the pinned root. A directory (or the root) replaced
+  // after resolution is caught here, binding the I/O to the verified target.
+  private verifyParent(t: ResolvedTarget, p: string): void {
+    let now: string;
+    try {
+      now = realpathSync(t.parentReal);
+    } catch {
+      throw new Refusal(`refusing path "${p}": the parent directory disappeared.`);
+    }
+    if (now !== t.parentReal) {
       throw new Refusal(
-        `refusing path "${p}": it resolves through a symlink to outside the workspace root.`,
+        `refusing path "${p}": the parent directory was replaced since it was resolved.`,
       );
     }
-    return { abs, canonical, exists };
+    assertInside(t.root, now, p);
+  }
+
+  // Read the verified target through a file descriptor opened without following
+  // a symlink and confirmed to be a regular file.
+  private readVerified(t: ResolvedTarget, p: string): Buffer {
+    this.verifyParent(t, p);
+    let fd: number;
+    try {
+      fd = openSync(t.canonical, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+    } catch {
+      throw new Refusal(
+        `refusing to read "${p}": it is not a regular file inside the workspace root.`,
+      );
+    }
+    try {
+      if (!fstatSync(fd).isFile()) {
+        throw new Refusal(`refusing to read "${p}": it is not a regular file.`);
+      }
+      const chunks: Buffer[] = [];
+      const buf = Buffer.alloc(65536);
+      let read = 0;
+      for (;;) {
+        const n = readSync(fd, buf, 0, buf.length, read);
+        if (n <= 0) break;
+        chunks.push(Buffer.from(buf.subarray(0, n)));
+        read += n;
+      }
+      return Buffer.concat(chunks);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  // Write the verified target atomically: a temp created EXCLUSIVELY (no
+  // symlink follow) in the same verified directory, then renamed over the
+  // target. Every step re-checks the parent, binding the write to the target.
+  private writeVerified(t: ResolvedTarget, p: string, data: Buffer): void {
+    this.verifyParent(t, p);
+    const tmp = join(
+      t.parentReal,
+      `.${t.base}.anchored-edit.${randomBytes(6).toString("hex")}.tmp`,
+    );
+    let fd: number;
+    try {
+      fd = openSync(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, 0o600);
+    } catch {
+      throw new Refusal(
+        `refusing to edit "${p}": could not create a working file in its directory.`,
+      );
+    }
+    try {
+      writeSync(fd, data);
+    } catch {
+      closeSync(fd);
+      try {
+        unlinkSync(tmp);
+      } catch {
+        /* best effort */
+      }
+      throw new Refusal(`refusing to edit "${p}": the write failed and was cleaned up.`);
+    }
+    closeSync(fd);
+    this.verifyParent(t, p);
+    renameSync(tmp, t.canonical);
   }
 
   private budgetFor(canonical: string, size: number): Budget {
@@ -559,11 +702,11 @@ export class AnchoredEditSession {
 
   // --- read_lines ------------------------------------------------------------
 
-  readLines(root: string, path: string, start?: number, end?: number): ToolOutput {
-    const { canonical } = this.resolveWithin(root, path);
-    const raw = readFileSync(canonical);
+  readLines(rootArg: string, path: string, start?: number, end?: number): ToolOutput {
+    const t = this.resolveWithin(rootArg, path);
+    const raw = this.readVerified(t, path);
     const res = renderReadLines(raw, start, end);
-    this.readFingerprints.set(canonical, res.fingerprint);
+    this.readFingerprints.set(t.canonical, res.fingerprint);
     return {
       content: [{ type: "text", text: res.text }],
       details: { fingerprint: `F#${res.fingerprint}`, lineCount: res.lineCount, signals: [] },
@@ -573,25 +716,35 @@ export class AnchoredEditSession {
   // --- edit_lines ------------------------------------------------------------
 
   editLines(
-    root: string,
+    rootArg: string,
     path: string,
-    from: number,
-    to: number,
+    fromAnchor: string,
+    toAnchor: string,
     newText: string,
     fingerprint: string,
   ): Promise<ToolOutput> {
-    const { canonical } = this.resolveWithin(root, path);
-    return this.runLocked(canonical, () => {
-      const raw = readFileSync(canonical);
-      const signals = this.checkFingerprint(canonical, path, fingerprint, raw);
-      // Empty new_text deletes the range; only nonempty text is parsed into
-      // logical lines (parseNewText("") is one blank line).
+    const t = this.resolveWithin(rootArg, path);
+    return this.runLocked(t.canonical, () => {
+      const raw = this.readVerified(t, path);
+      const signals: string[] = [];
+      if (!this.readFingerprints.has(t.canonical)) signals.push("edit_without_read");
+      // A tripped budget answers FIRST for every later mutation of this file.
+      this.assertNotTripped(t.canonical, path);
+      // Validate BOTH range anchors, then the fingerprint — all inside the lock.
+      const from = this.resolveAnchor(raw, fromAnchor, path, "from");
+      const to = this.resolveAnchor(raw, toAnchor, path, "to");
+      if (from > to) {
+        throw new Refusal(
+          `refusing to edit "${path}": the from anchor is line ${from} and the to anchor is line ${to}; from must not be after to.`,
+        );
+      }
+      this.requireFingerprint(t.canonical, path, fingerprint, fromAnchor, raw, from, signals);
       const newLines = newText === "" ? [] : parseNewText(newText);
       const spliced = applyEditLines(raw, from, to, newLines);
-      this.charge(spliced.removedBytes, canonical, path, raw.length);
-      writeAtomic(canonical, spliced.raw);
+      this.charge(spliced.removedBytes, t.canonical, path, raw.length);
+      this.writeVerified(t, path, spliced.raw);
       const fp = fingerprintOf(spliced.raw);
-      this.readFingerprints.set(canonical, fp);
+      this.readFingerprints.set(t.canonical, fp);
       return this.success(path, spliced.raw, fp, spliced, "edit_lines", signals);
     });
   }
@@ -599,42 +752,66 @@ export class AnchoredEditSession {
   // --- insert_after ----------------------------------------------------------
 
   insertAfter(
-    root: string,
+    rootArg: string,
     path: string,
     anchor: string,
     text: string,
     fingerprint: string,
   ): Promise<ToolOutput> {
-    const { canonical } = this.resolveWithin(root, path);
-    return this.runLocked(canonical, () => {
-      const raw = readFileSync(canonical);
-      const signals = this.checkFingerprint(canonical, path, fingerprint, raw);
-      const after = this.matchAnchor(raw, anchor, path);
-      if (text === "") throw new Refusal("insert_after refuses empty text.");
+    const t = this.resolveWithin(rootArg, path);
+    return this.runLocked(t.canonical, () => {
+      const raw = this.readVerified(t, path);
+      const signals: string[] = [];
+      if (!this.readFingerprints.has(t.canonical)) signals.push("edit_without_read");
+      this.assertNotTripped(t.canonical, path);
+      const after = this.resolveAnchor(raw, anchor, path, "insert", true);
+      if (text === "") {
+        throw new Refusal(
+          `refusing insert_after on "${path}": the text is empty and insert_after refuses empty text.`,
+        );
+      }
+      this.requireFingerprint(
+        t.canonical,
+        path,
+        fingerprint,
+        anchor,
+        raw,
+        Math.max(1, after),
+        signals,
+      );
       const newLines = parseNewText(text);
       const spliced = applyInsertAfter(raw, after, newLines);
-      this.charge(spliced.removedBytes, canonical, path, raw.length);
-      writeAtomic(canonical, spliced.raw);
+      this.charge(spliced.removedBytes, t.canonical, path, raw.length);
+      this.writeVerified(t, path, spliced.raw);
       const fp = fingerprintOf(spliced.raw);
-      this.readFingerprints.set(canonical, fp);
+      this.readFingerprints.set(t.canonical, fp);
       return this.success(path, spliced.raw, fp, spliced, "insert_after", signals);
     });
   }
 
   // --- write_file ------------------------------------------------------------
 
-  writeFile(root: string, path: string, content: string): ToolOutput {
-    const { canonical, exists } = this.resolveWithin(root, path);
-    if (exists) {
+  writeFile(rootArg: string, path: string, content: string): ToolOutput {
+    const t = this.resolveWithin(rootArg, path);
+    // Validate the creation content BEFORE opening, so a refused creation never
+    // leaves an occupied empty file behind.
+    if (content.includes("\u0000")) {
+      throw new Refusal(
+        `refusing to create "${path}": the content contains a NUL byte, and write_file refuses binary content.`,
+      );
+    }
+    if (t.exists) {
       throw new Refusal(
         `refusing to create "${path}": a directory entry already exists there. write_file only creates new files.`,
       );
     }
+    const buf = Buffer.from(content, "utf8");
+    this.verifyParent(t, path);
     let fd: number;
     try {
-      // O_CREAT|O_EXCL: a dangling symlink at the path counts as occupied, and
-      // creation never follows a symlink.
-      fd = openSync(canonical, "wx", 0o644);
+      // O_CREAT|O_EXCL|O_NOFOLLOW: exclusive, and a dangling symlink counts as
+      // occupied (creation never follows a symlink).
+      fd = openSync(t.canonical, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, 0o644);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "EEXIST") {
@@ -642,19 +819,27 @@ export class AnchoredEditSession {
           `refusing to create "${path}": a directory entry already exists there (including a dangling symlink). write_file only creates new files.`,
         );
       }
-      throw err;
+      throw new Refusal(
+        `refusing to create "${path}": the file could not be created in its directory.`,
+      );
     }
-    let buf: Buffer;
+    let ok = false;
     try {
-      if (content.includes("\u0000"))
-        throw new Refusal("write_file refuses a NUL byte in content.");
-      buf = Buffer.from(content, "utf8");
       writeSync(fd, buf);
+      ok = true;
     } finally {
       closeSync(fd);
+      if (!ok) {
+        // Clean up a failed write: never leave a half-made file as occupied.
+        try {
+          unlinkSync(t.canonical);
+        } catch {
+          /* best effort */
+        }
+      }
     }
     const fp = fingerprintOf(buf);
-    this.readFingerprints.set(canonical, fp);
+    this.readFingerprints.set(t.canonical, fp);
     return {
       content: [{ type: "text", text: `created ${path} (F#${fp}, ${buf.length} bytes)` }],
       details: { fingerprint: `F#${fp}`, bytes: buf.length, signals: [] },
@@ -663,39 +848,76 @@ export class AnchoredEditSession {
 
   // --- helpers ---------------------------------------------------------------
 
-  private checkFingerprint(
-    canonical: string,
-    path: string,
-    claimed: string,
-    raw: Buffer,
-  ): string[] {
-    const expected = normalizeFingerprint(claimed);
-    const actual = fingerprintOf(raw);
-    const signals: string[] = [];
-    if (!this.readFingerprints.has(canonical)) signals.push("edit_without_read");
-    if (expected !== actual) {
-      signals.push("stale_anchor");
+  // A tripped budget answers FIRST for every later mutation of the file.
+  private assertNotTripped(canonical: string, displayPath: string): void {
+    const b = this.budgets.get(canonical);
+    if (b?.tripped) {
       throw new Refusal(
-        `refusing to edit "${path}": stale fingerprint. Expected F#${expected}, file is F#${actual}. Re-read the file with read_lines and retry.`,
-        signals,
+        `refusing further edits to "${displayPath}": this run already reached the rewrite limit (removed or replaced ${b.removed} of ${b.limit} bytes, half of ${b.size}). Report BLOCKED; the file cannot be rewritten safely in this run.`,
+        ["budget_stop"],
       );
     }
-    return signals;
   }
 
-  // Return the line number an anchor addresses, or "L0" => 0. A missing or
-  // mismatched anchor is refused with a bounded re-read window.
-  private matchAnchor(raw: Buffer, anchor: string, _path: string): number {
-    const trimmed = anchor.trim();
-    if (trimmed === "L0") return 0;
+  // Require the current fingerprint. A mismatch is a stale refusal carrying the
+  // caller's expected token, the observed token, a bounded window and a unique
+  // candidate.
+  private requireFingerprint(
+    _canonical: string,
+    path: string,
+    claimed: string,
+    expectedToken: string,
+    raw: Buffer,
+    atLine: number,
+    signals: string[],
+  ): void {
+    const expected = normalizeFingerprint(claimed);
+    const actual = fingerprintOf(raw);
+    if (expected === actual) return;
+    const { lines } = parseFile(raw);
+    const n = Math.min(Math.max(1, atLine), Math.max(1, lines.length));
+    const observed =
+      lines.length > 0 && n >= 1 && n <= lines.length
+        ? anchorToken(n, lines[n - 1])
+        : "line absent";
+    throw new Refusal(
+      `refusing to edit "${path}": stale fingerprint (expected F#${expected}, file is F#${actual}). Expected anchor ${expectedToken.trim()}, observed ${observed}.\n${windowAround(raw, n)}`,
+      ["stale_anchor", ...signals],
+    );
+  }
+
+  // Resolve an anchor token to its line number (0 for `L0` when the caller
+  // allows it). A missing or mismatched anchor is refused with the expected
+  // token, the observed token (or "line absent"), a bounded window and a unique
+  // candidate.
+  private resolveAnchor(
+    raw: Buffer,
+    anchor: string,
+    path: string,
+    which: string,
+    allowL0 = false,
+  ): number {
+    const trimmed = String(anchor).trim();
+    if (trimmed === "L0") {
+      if (allowL0) return 0;
+      throw new Refusal(
+        `refusing the ${which} anchor "${anchor}" in "${path}": L0 addresses the position before line 1 and is only valid for insert_after.`,
+        ["stale_anchor"],
+      );
+    }
     const m = /^L(\d+)#([0-9a-f]{8})$/.exec(trimmed);
-    if (!m) throw new Refusal(`unrecognised anchor "${anchor}": expected L<n>#<8 hex> or L0.`);
+    if (!m) {
+      throw new Refusal(
+        `refusing the ${which} anchor "${anchor}" in "${path}": expected L<n>#<8 hex> (a token from read_lines).`,
+        ["stale_anchor"],
+      );
+    }
     const n = Number(m[1]);
     const want = m[2];
     const { lines } = parseFile(raw);
     if (n < 1 || n > lines.length) {
       throw new Refusal(
-        `anchor "${anchor}" points at line ${n}, but the file has ${lines.length} lines.\n${windowAround(raw, n)}`,
+        `refusing the ${which} anchor "${anchor}" in "${path}": line ${n} is absent (the file has ${lines.length} lines).\n${windowAround(raw, n)}`,
         ["stale_anchor"],
       );
     }
@@ -703,7 +925,7 @@ export class AnchoredEditSession {
     if (anchorHashOf(lines[n - 1]) !== want) {
       const candidate = uniqueCandidate(lines, want, n);
       throw new Refusal(
-        `stale anchor "${anchor}": line ${n} is now ${got}.${candidate}\n${windowAround(raw, n)}`,
+        `refusing the ${which} anchor "${anchor}" in "${path}": stale. Expected ${trimmed}, observed ${got}.${candidate}\n${windowAround(raw, n)}`,
         ["stale_anchor"],
       );
     }
@@ -719,14 +941,22 @@ export class AnchoredEditSession {
     signals: string[],
   ): ToolOutput {
     const { lines } = parseFile(raw);
-    const anchors = spliced.writtenLineNumbers
+    const all = spliced.writtenLineNumbers
       .filter((n) => n >= 1 && n <= lines.length)
       .map((n) => anchorToken(n, lines[n - 1]));
+    const anchors = all.slice(0, ANCHOR_ECHO_LIMIT);
+    const omitted = all.length - anchors.length;
     const delta = spliced.lineDelta >= 0 ? `+${spliced.lineDelta}` : `${spliced.lineDelta}`;
+    const written =
+      anchors.length === 0
+        ? ""
+        : omitted > 0
+          ? `written: ${anchors.join(" ")} …(+${omitted} more; read_lines to re-anchor them)`
+          : `written: ${anchors.join(" ")}`;
     const text = [
       `${tool} ok on ${path}`,
       `F#${fp} lines=${lines.length} (${delta})`,
-      anchors.length > 0 ? `written: ${anchors.join(" ")}` : "",
+      written,
       signals.length > 0 ? `signals: ${signals.join(", ")}` : "",
     ]
       .filter(Boolean)
@@ -738,6 +968,7 @@ export class AnchoredEditSession {
         lineCount: lines.length,
         lineDelta: spliced.lineDelta,
         anchors,
+        anchorsOmitted: omitted,
         signals,
       },
     };
@@ -778,16 +1009,4 @@ function uniqueCandidate(lines: readonly RawLine[], want: string, _at: number): 
   }
   if (hits.length === 1) return ` Candidate: line ${hits[0]} has that hash.`;
   return "";
-}
-
-// Write via a temp file + rename, so a reader never sees a half-written file.
-function writeAtomic(target: string, data: Buffer): void {
-  const tmp = `${target}.anchored-edit.tmp`;
-  const fd = openSync(tmp, "w", 0o644);
-  try {
-    writeSync(fd, data);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, target);
 }

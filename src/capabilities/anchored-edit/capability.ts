@@ -13,7 +13,13 @@
 // it. See core.ts for the byte rules and README.md for the documented gaps.
 
 import { type TSchema, Type } from "typebox";
-import { AnchoredEditSession, MAX_OUTPUT_BYTES, Refusal, type ToolOutput } from "./core.js";
+import {
+  AnchoredEditSession,
+  clampUtf8,
+  MAX_OUTPUT_BYTES,
+  Refusal,
+  type ToolOutput,
+} from "./core.js";
 
 // The minimal slice of pi's ExtensionAPI this core needs. Declared structurally
 // so a tiny test fake and the real ExtensionAPI both satisfy it.
@@ -46,11 +52,11 @@ function ok(text: string, details: Record<string, unknown>): ToolOutput {
   return { content: [{ type: "text", text }], details };
 }
 
-// Enforce the output cap on every result, including errors, and say when it cut.
+// Enforce the output cap on every result, including errors. The truncation is
+// UTF-8-byte-safe and reserves room for its own marker, so the result never
+// exceeds the cap.
 function capped(text: string): string {
-  const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes <= MAX_OUTPUT_BYTES) return text;
-  return `${text.slice(0, MAX_OUTPUT_BYTES)}…[result cut at ${MAX_OUTPUT_BYTES} bytes; read_lines again for more anchors]`;
+  return clampUtf8(text, MAX_OUTPUT_BYTES);
 }
 
 export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
@@ -122,14 +128,20 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
     name: "edit_lines",
     label: "Edit Lines",
     description:
-      `Replace lines from..to (1-based inclusive) with new_text, or delete them when new_text is empty. ` +
-      `${ANCHOR_DOC} Every call needs the current F# (a fingerprint); a mismatch is refused as stale. ` +
+      `Replace the range from the 'from' anchor to the 'to' anchor INCLUSIVE with new_text, or delete it when new_text is empty. ` +
+      `${ANCHOR_DOC} BOTH ends are anchors from read_lines; every call also needs the current F# (a fingerprint). A stale anchor or fingerprint is refused as stale, naming the expected and observed tokens and a re-read window. ` +
       `new_text is split into logical lines on LF or CRLF; a trailing separator's final empty segment is discarded, so "\\n" is one blank line. ` +
       `A line longer than 2000 characters cannot be edited. A call that would remove or replace more than half the file is refused by the rewrite tripwire.`,
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
-      from: Type.Integer({ minimum: 1 }),
-      to: Type.Integer({ minimum: 1 }),
+      from: Type.String({
+        minLength: 1,
+        description: "The L<n>#<h> anchor of the FIRST line to replace.",
+      }),
+      to: Type.String({
+        minLength: 1,
+        description: "The L<n>#<h> anchor of the LAST line to replace (inclusive).",
+      }),
       new_text: Type.String(),
       fingerprint: Type.String({
         minLength: 1,
@@ -141,8 +153,8 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
         session.editLines(
           ctxCwd(ctx),
           params.path as string,
-          params.from as number,
-          params.to as number,
+          params.from as string,
+          params.to as string,
           params.new_text as string,
           params.fingerprint as string,
         ),

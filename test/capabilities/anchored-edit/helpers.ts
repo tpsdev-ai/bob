@@ -2,14 +2,18 @@
 // definitions `wireAnchoredEdit` registers, so tests drive the REAL registered
 // tools (the same objects pi would call), not the core functions directly.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type PiLike,
   wireAnchoredEdit,
 } from "../../../src/capabilities/anchored-edit/capability.js";
-import type { AnchoredEditSession } from "../../../src/capabilities/anchored-edit/core.js";
+import {
+  type AnchoredEditSession,
+  anchorToken,
+  parseFile,
+} from "../../../src/capabilities/anchored-edit/core.js";
 
 export interface RegisteredTool {
   name: string;
@@ -38,6 +42,8 @@ export interface Harness {
     details: Record<string, unknown>;
   }>;
   cleanup(): void;
+  // The anchor token for a 1-based line of a file in the scratch root.
+  anchor(name: string, line: number): string;
 }
 
 export function makeHarness(): Harness {
@@ -58,6 +64,11 @@ export function makeHarness(): Harness {
       if (!tool) throw new Error(`tool ${name} was not registered`);
       const res = await tool.execute("test-call", params, undefined, undefined, { cwd });
       return { text: res.content[0].text, details: (res.details ?? {}) as Record<string, unknown> };
+    },
+    anchor(name, line) {
+      const { lines } = parseFile(readFileSync(join(root, name)));
+      if (line < 1 || line > lines.length) throw new Error(`no line ${line} in ${name}`);
+      return anchorToken(line, lines[line - 1]);
     },
     cleanup() {
       rmSync(root, { recursive: true, force: true });

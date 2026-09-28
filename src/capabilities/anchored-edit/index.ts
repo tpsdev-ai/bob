@@ -32,6 +32,7 @@ export {
   anchorToken,
   applyEditLines,
   applyInsertAfter,
+  clampUtf8,
   dominantEol,
   eolLabel,
   fingerprintOf,

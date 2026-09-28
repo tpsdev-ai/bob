@@ -12,9 +12,24 @@ edits. It registers four tools through `pi.registerTool`, **beside** pi's own
 | tool | takes | does |
 | --- | --- | --- |
 | `read_lines` | `path`, `start?`, `end?` | returns a fingerprint header + one `L<n>#<h> <content>` per line |
-| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint` | replaces lines `from..to` inclusive (empty `new_text` deletes) |
+| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint` | replaces the range from the `from` anchor to the `to` anchor, inclusive (empty `new_text` deletes) |
 | `insert_after` | `path`, `anchor`, `text`, `fingerprint` | inserts after a line anchor, or `L0` for before line 1 |
 | `write_file` | `path`, `content` | creates a NEW file exclusively; no fingerprint |
+
+## Enabling it
+
+Opting an agent in is **three things together**, and a freshly initialized agent
+stamps only Flair — so all three must be set for the tools to load:
+
+1. `agent.role: builder-local` in `bob.yaml` (the role that holds these four
+   tools and no `read`/`edit`/`write`);
+2. `anchored-edit` under `capabilities:` in `bob.yaml`; and
+3. the four tool names (`read_lines`, `edit_lines`, `insert_after`, `write_file`)
+   in the `tools.allow:` list.
+
+The role is the ceiling: `bob.yaml` may narrow the allowlist but cannot widen it
+past what `roles/builder-local/role.json` allows, and a name the role does not
+hold is a load error, not a silent drop.
 
 ## The model
 
@@ -43,15 +58,20 @@ edits. It registers four tools through `pi.registerTool`, **beside** pi's own
 ## Paths and the workspace root
 
 - The **root is pi's tool execution context `cwd`**. Neither a tool argument nor
-  `bob.yaml` can name it.
+  `bob.yaml` can name it. The canonical root is pinned ONCE per session, so a
+  root replaced mid-session does not redefine what the tools address.
 - Absolute paths and any `..` segment are refused before the filesystem is
   touched.
-- For an existing file the target is resolved within the root and the **canonical
-  (realpath) target** is used for the critical-section key and for I/O, so an
-  internal symlink is allowed (its directory entry is preserved) and a symlink
-  leading outside is refused. Containment is checked on the path used for I/O.
+- A target is resolved to its canonical (realpath) form inside the pinned root,
+  and every read and write is bound to that verified target: an internal symlink
+  is allowed (its directory entry is preserved) and a symlink leading outside
+  the root is refused; a target left in a directory (or root) that is replaced
+  after resolution is refused rather than followed.
+- Writes go through a temporary file created *exclusively* (no symlink follow) in
+  the verified directory and then committed over the target.
 - Creation is exclusive and does not follow symlinks: any existing directory
-  entry, including a dangling symlink, counts as occupied.
+  entry, including a dangling symlink, counts as occupied, and a refused
+  creation leaves nothing behind.
 - Every refusal names the path and the rule.
 
 ## The rewrite tripwire

@@ -1,8 +1,8 @@
-// Integration (bob#185 slice 1): the two things the spec asked the builder to
-// VERIFY — (a) the run log's tool-result projection carries the structured
-// signals, and (b) pi's tool execution context cwd equals Bob's pinned
-// config.cwd on the run, launch and persistent entry paths — plus a REAL-session
-// proof that a tool observes that cwd.
+// Integration (bob#185 slice 1, round 2): the two things the spec asked the
+// builder to VERIFY — (a) the run log's tool-result projection carries the
+// structured signals, and (b) pi's tool execution context cwd equals Bob's
+// pinned config.cwd — the latter through a REAL context probe run through the
+// `run`, `launch` and `persistent` entry paths (blocker 6), not fake sessions.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -18,13 +18,8 @@ import {
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../../src/shell/init.js";
 import { startPersistent } from "../../../src/shell/persistent.js";
-import type { RunSession, RunSessionConfig } from "../../../src/shell/run.js";
-import {
-  projectRunLogRecord,
-  resolveRunConfig,
-  runAgent,
-  runLaunch,
-} from "../../../src/shell/run.js";
+import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../../src/shell/run.js";
+import { projectRunLogRecord, runAgent, runLaunch } from "../../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../../src/shell/session.js";
 
 // --- (a) the run-log projection carries the signals --------------------------
@@ -42,101 +37,15 @@ describe("anchored-edit — structured signals survive the run-log projection", 
       },
     });
     const details = (record.result as { details: { signals: string[] } }).details;
-    // VERIFIED: the projection logs `result` whole, so `details` (and its
-    // `signals`) reach the run log. No bridge in run.ts is needed.
     expect(details.signals).toEqual(["stale_anchor", "budget_stop"]);
     expect(JSON.stringify(record)).toContain("stale_anchor");
   });
 });
 
-// --- (b) run / launch / persistent pass config.cwd ---------------------------
-
-function fakeSession(): RunSession {
-  return {
-    subscribe() {
-      return () => {};
-    },
-    async prompt() {},
-    get messages() {
-      return [];
-    },
-    dispose() {},
-  } as RunSession;
-}
-
-describe("anchored-edit — Bob pins config.cwd on every entry path", () => {
-  let root: string;
-  let agentsRoot: string;
-  let agentDir: string;
-  beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "bob-cwd-"));
-    agentsRoot = join(root, "agents");
-    const res = initAgent({
-      name: "testbot",
-      role: "builder-local",
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      agentsRoot,
-      flairKeysDir: join(root, ".flair", "keys"),
-      skipFlair: true,
-    });
-    agentDir = res.agentDir;
-  });
-  afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
-  });
-  const expectedCwd = () => join(agentDir, "work");
-
-  it("run passes config.cwd === <agentDir>/work to the session factory", async () => {
-    const seen: string[] = [];
-    await runAgent({
-      name: "testbot",
-      prompt: "go",
-      agentsRoot,
-      sessionFactory: async (config: RunSessionConfig) => {
-        seen.push(config.cwd);
-        return fakeSession();
-      },
-    });
-    expect(seen).toEqual([expectedCwd()]);
-  });
-
-  it("launch passes config.cwd === <agentDir>/work to the session factory", async () => {
-    const seen: string[] = [];
-    await runLaunch({
-      name: "testbot",
-      prompt: "go",
-      agentsRoot,
-      sessionFactory: async (config: RunSessionConfig) => {
-        seen.push(config.cwd);
-        return fakeSession();
-      },
-    });
-    expect(seen).toEqual([expectedCwd()]);
-  });
-
-  it("persistent passes config.cwd === <agentDir>/work to the session factory", async () => {
-    const seen: string[] = [];
-    const handle = await startPersistent({
-      name: "testbot",
-      agentsRoot,
-      installSignalHandlers: false,
-      keepAlive: async () => {},
-      sessionFactory: async (config: RunSessionConfig) => {
-        seen.push(config.cwd);
-        return fakeSession();
-      },
-    });
-    expect(seen).toEqual([expectedCwd()]);
-    await handle.shutdown();
-  });
-});
-
-// --- (b') a REAL pi session executes a tool with ctx.cwd === that cwd --------
+// --- (b) a REAL context probe through run / launch / persistent --------------
 
 const STUB_PROVIDER = "bob-stub";
 const STUB_MODEL = "stub-1";
-const probeCwds: string[] = [];
 
 function stubProviderWithToolCall(toolName: string) {
   const state = { callCount: 0 };
@@ -181,51 +90,57 @@ function stubProviderWithToolCall(toolName: string) {
   return streamSimple;
 }
 
-describe("anchored-edit — a real pi session's tool context cwd is config.cwd", () => {
-  let root: string;
-  let agentsRoot: string;
-  let agentDir: string;
-  let extDir: string;
-  let cwd: string;
-  beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "bob-cwd-live-"));
-    extDir = mkdtempSync(join(tmpdir(), "bob-cwd-ext-"));
-    agentsRoot = join(root, "agents");
-    probeCwds.length = 0;
-    const res = initAgent({
-      name: "testbot",
-      role: "builder-local",
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      agentsRoot,
-      flairKeysDir: join(root, ".flair", "keys"),
-      skipFlair: true,
-    });
-    agentDir = res.agentDir;
-    cwd = join(agentDir, "work");
-  });
-  afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(extDir, { recursive: true, force: true });
-  });
+let root: string;
+let agentsRoot: string;
+let agentDir: string;
+let extDir: string;
+let cwd: string;
+let probePath: string;
+const probed: string[] = [];
 
-  it("a tool's ExtensionContext.cwd equals <agentDir>/work", async () => {
-    const probePath = join(extDir, "probe.js");
-    writeFileSync(
-      probePath,
-      [
-        "export default function (pi) {",
-        "  pi.registerTool({",
-        "    name: 'probe_cwd', label: 'Probe cwd', description: 'records the tool execution context cwd',",
-        "    parameters: { type: 'object', properties: {} },",
-        "    async execute(id, params, signal, onUpdate, ctx) {",
-        "      globalThis.__probeCwds.push(ctx.cwd);",
-        "      return { content: [{ type: 'text', text: 'ok' }], details: {} };",
-        "    },",
-        "  });",
-        "}",
-      ].join("\n"),
-    );
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), "bob-cwd-live-"));
+  extDir = mkdtempSync(join(tmpdir(), "bob-cwd-ext-"));
+  agentsRoot = join(root, "agents");
+  probed.length = 0;
+  const res = initAgent({
+    name: "testbot",
+    role: "builder-local",
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    agentsRoot,
+    flairKeysDir: join(root, ".flair", "keys"),
+    skipFlair: true,
+  });
+  agentDir = res.agentDir;
+  cwd = join(agentDir, "work");
+  probePath = join(extDir, "probe.js");
+  writeFileSync(
+    probePath,
+    [
+      "export default function (pi) {",
+      "  pi.registerTool({",
+      "    name: 'probe_cwd', label: 'Probe cwd', description: 'records the tool execution context cwd',",
+      "    parameters: { type: 'object', properties: {} },",
+      "    async execute(id, params, signal, onUpdate, ctx) {",
+      "      globalThis.__probeCwds.push(ctx.cwd);",
+      "      return { content: [{ type: 'text', text: 'ok' }], details: {} };",
+      "    },",
+      "  });",
+      "}",
+    ].join("\n"),
+  );
+  (globalThis as unknown as { __probeCwds: string[] }).__probeCwds = probed;
+});
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+  rmSync(extDir, { recursive: true, force: true });
+});
+
+/** A RunSessionFactory that builds a REAL pi session with the probe tool, using
+ *  the stub model — so the entry path drives it exactly as production does. */
+function realProbeFactory(): RunSessionFactory {
+  return async (config: RunSessionConfig): Promise<RunSession> => {
     const runtime = await ModelRuntime.create({ modelsPath: null });
     runtime.registerProvider(STUB_PROVIDER, {
       name: "Bob Stub",
@@ -246,8 +161,6 @@ describe("anchored-edit — a real pi session's tool context cwd is config.cwd",
         },
       ],
     });
-    (globalThis as unknown as { __probeCwds: string[] }).__probeCwds = probeCwds;
-    const config = resolveRunConfig({ name: "testbot", agentsRoot }).config;
     const factory = createBobRuntimeFactory({
       config: {
         ...config,
@@ -266,15 +179,48 @@ describe("anchored-edit — a real pi session's tool context cwd is config.cwd",
       modelRuntime: runtime,
     });
     const { session } = await factory({
-      cwd,
-      agentDir: join(agentDir, ".pi-agent"),
-      sessionManager: SessionManager.inMemory(cwd) as never,
+      cwd: config.cwd,
+      agentDir: config.piAgentDir,
+      sessionManager: SessionManager.inMemory(config.cwd) as never,
+    });
+    return session as unknown as RunSession;
+  };
+}
+
+describe("anchored-edit — a REAL probe's ctx.cwd equals config.cwd on every entry path", () => {
+  it("run: ctx.cwd === <agentDir>/work", async () => {
+    await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: realProbeFactory(),
+    });
+    expect(probed).toEqual([cwd]);
+  }, 60_000);
+
+  it("launch: ctx.cwd === <agentDir>/work", async () => {
+    await runLaunch({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: realProbeFactory(),
+    });
+    expect(probed).toEqual([cwd]);
+  }, 60_000);
+
+  it("persistent: ctx.cwd === <agentDir>/work", async () => {
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot,
+      installSignalHandlers: false,
+      keepAlive: async () => {},
+      sessionFactory: realProbeFactory(),
     });
     try {
-      await session.prompt("go", { expandPromptTemplates: false });
+      await handle.session.prompt("go", { expandPromptTemplates: false });
     } finally {
-      session.dispose();
+      await handle.shutdown();
     }
-    expect(probeCwds).toEqual([cwd]);
-  });
+    expect(probed).toEqual([cwd]);
+  }, 60_000);
 });

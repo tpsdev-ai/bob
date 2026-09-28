@@ -38,8 +38,8 @@ describe("anchored-edit — smoke session through the tool registry", () => {
     // rewrite tripwire (half the file) is not in play.
     const edited = await h.call("edit_lines", {
       path: "app.js",
-      from: 1,
-      to: 2,
+      from: h.anchor("app.js", 1),
+      to: h.anchor("app.js", 2),
       new_text: "const v1 = 10;\nconst v2 = 20;",
       fingerprint: fp,
     });

@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -30,6 +31,14 @@ const write = (name: string, content: string): string => {
 };
 const read = (name: string): string => readFileSync(join(h.root, name), "utf8");
 const fp = (name: string): string => `F#${fingerprintOf(readFileSync(join(h.root, name)))}`;
+const edit = (name: string, from: number, to: number, newText: string) =>
+  h.call("edit_lines", {
+    path: name,
+    from: h.anchor(name, from),
+    to: h.anchor(name, to),
+    new_text: newText,
+    fingerprint: fp(name),
+  });
 
 describe("anchored-edit — paths", () => {
   it("refuses an absolute path", async () => {
@@ -53,7 +62,7 @@ describe("anchored-edit — paths", () => {
     try {
       const out = await h.call("read_lines", { path: "out-link" });
       expect(out.text).toMatch(/REFUSED/);
-      expect(out.text).toMatch(/symlink|outside/);
+      expect(out.text).toMatch(/outside|symlink/);
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
@@ -64,11 +73,10 @@ describe("anchored-edit — paths", () => {
     symlinkSync("real.txt", join(h.root, "in-link"));
     const out = await h.call("read_lines", { path: "in-link" });
     expect(out.text).toContain("hello");
-    // Editing through the link writes to the target, and the link stays a link.
     await h.call("edit_lines", {
       path: "in-link",
-      from: 2,
-      to: 2,
+      from: h.anchor("real.txt", 2),
+      to: h.anchor("real.txt", 2),
       new_text: "WORLD",
       fingerprint: fp("real.txt"),
     });
@@ -103,34 +111,36 @@ describe("anchored-edit — write_file (create only)", () => {
     expect(out.text).toMatch(/REFUSED/);
     expect(out.text).toMatch(/exists/);
   });
+
+  it("refuses NUL content BEFORE opening, leaving NO file behind", async () => {
+    const out = await h.call("write_file", { path: "nul.txt", content: "a\u0000b" });
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.text).toMatch(/NUL/);
+    expect(existsSync(join(h.root, "nul.txt"))).toBe(false); // never opened
+  });
 });
 
 describe("anchored-edit — fingerprints and signals", () => {
-  it("refuses a stale fingerprint and names both", async () => {
+  it("refuses a stale fingerprint and names expected/observed anchors", async () => {
     write("a.txt", "one\ntwo\n");
     const out = await h.call("edit_lines", {
       path: "a.txt",
-      from: 1,
-      to: 1,
+      from: h.anchor("a.txt", 1),
+      to: h.anchor("a.txt", 1),
       new_text: "ONE",
       fingerprint: "F#0000000000000000",
     });
     expect(out.text).toMatch(/REFUSED/);
     expect(out.text).toContain("0000000000000000");
     expect(out.text).toContain(fingerprintOf(readFileSync(join(h.root, "a.txt"))));
+    expect(out.text).toMatch(/window around line 1/); // the bounded re-read window
     expect(out.details.signals).toContain("stale_anchor");
     expect(read("a.txt")).toBe("one\ntwo\n");
   });
 
   it("records edit_without_read when a mutating call had no prior read", async () => {
     write("b.txt", "one\ntwo\n");
-    const out = await h.call("edit_lines", {
-      path: "b.txt",
-      from: 1,
-      to: 1,
-      new_text: "ONE",
-      fingerprint: fp("b.txt"),
-    });
+    const out = await edit("b.txt", 1, 1, "ONE");
     expect(out.details.signals).toContain("edit_without_read");
     expect(read("b.txt")).toBe("ONE\ntwo\n");
   });
@@ -146,7 +156,7 @@ describe("anchored-edit — fingerprints and signals", () => {
     });
     expect(out.text).toMatch(/REFUSED/);
     expect(out.details.signals).toContain("stale_anchor");
-    expect(out.text).toContain("L2#"); // the observed token
+    expect(out.text).toContain("L2#");
     expect(out.text).toMatch(/window around line 2/);
   });
 
@@ -161,35 +171,35 @@ describe("anchored-edit — fingerprints and signals", () => {
 describe("anchored-edit — the rewrite tripwire", () => {
   it("refuses a full replacement of a small existing file (budget_stop)", async () => {
     write("small.txt", "x\ny\nz\n"); // 6 bytes -> limit 3
-    const out = await h.call("edit_lines", {
-      path: "small.txt",
-      from: 1,
-      to: 3,
-      new_text: "a\nb\nc",
-      fingerprint: fp("small.txt"),
-    });
+    const out = await edit("small.txt", 1, 3, "a\nb\nc");
     expect(out.text).toMatch(/REFUSED/);
     expect(out.details.signals).toContain("budget_stop");
     expect(out.text).toMatch(/BLOCKED/);
-    expect(read("small.txt")).toBe("x\ny\nz\n"); // unchanged
+    expect(read("small.txt")).toBe("x\ny\nz\n");
   });
 
-  it("refuses every further mutation once a file has tripped", async () => {
+  it("charges the ADJACENT separator when the final line is deleted", async () => {
+    // "a\nb" is 3 bytes -> limit 1. Deleting line 2 removes "b" AND the "\n"
+    // separator: 2 bytes, over the limit -> refused. (Charging 1 used to let it
+    // through.)
+    write("eof.txt", "a\nb");
+    const out = await edit("eof.txt", 2, 2, "");
+    expect(out.text).toMatch(/REFUSED/);
+    expect(out.details.signals).toContain("budget_stop");
+    expect(read("eof.txt")).toBe("a\nb"); // unchanged
+  });
+
+  it("refuses every further mutation once a file has tripped, BEFORE any other check", async () => {
     write("t.txt", "x\ny\nz\n"); // 6 bytes -> limit 3
-    await h.call("edit_lines", {
-      path: "t.txt",
-      from: 1,
-      to: 3,
-      new_text: "a\nb\nc",
-      fingerprint: fp("t.txt"),
-    });
-    // A now-legal single-line edit is still refused (the trip is sticky).
+    await edit("t.txt", 1, 3, "a\nb\nc"); // trips it
+    // A later call with a WRONG fingerprint must answer budget_stop first, not
+    // a stale-anchor refusal.
     const out = await h.call("edit_lines", {
       path: "t.txt",
-      from: 1,
-      to: 1,
+      from: h.anchor("t.txt", 1),
+      to: h.anchor("t.txt", 1),
       new_text: "Q",
-      fingerprint: fp("t.txt"),
+      fingerprint: "F#0000000000000000",
     });
     expect(out.text).toMatch(/REFUSED/);
     expect(out.details.signals).toContain("budget_stop");
@@ -197,28 +207,9 @@ describe("anchored-edit — the rewrite tripwire", () => {
 
   it("is cumulative: many small edits cannot get under the limit", async () => {
     write("cum.txt", "a\nb\nc\nd\n"); // 8 bytes -> limit 4
-    await h.call("edit_lines", {
-      path: "cum.txt",
-      from: 1,
-      to: 1,
-      new_text: "A",
-      fingerprint: fp("cum.txt"),
-    });
-    await h.call("edit_lines", {
-      path: "cum.txt",
-      from: 2,
-      to: 2,
-      new_text: "B",
-      fingerprint: fp("cum.txt"),
-    });
-    // 4 bytes removed so far; a third would exceed.
-    const out = await h.call("edit_lines", {
-      path: "cum.txt",
-      from: 3,
-      to: 3,
-      new_text: "C",
-      fingerprint: fp("cum.txt"),
-    });
+    await edit("cum.txt", 1, 1, "A");
+    await edit("cum.txt", 2, 2, "B");
+    const out = await edit("cum.txt", 3, 3, "C");
     expect(out.text).toMatch(/REFUSED/);
     expect(out.details.signals).toContain("budget_stop");
   });
@@ -232,8 +223,6 @@ describe("anchored-edit — the rewrite tripwire", () => {
       text: "x\ny\nz\nq\nr\ns\n",
       fingerprint: fp("ins.txt"),
     });
-    // The inserted text is far larger than the limit, but an insertion removes
-    // nothing, so it is allowed.
     expect(out.text).toMatch(/ok/);
     expect(out.details.signals).toEqual([]);
     expect(read("ins.txt")).toBe("x\ny\nz\nq\nr\ns\na\nb\n");
