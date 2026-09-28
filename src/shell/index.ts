@@ -8,7 +8,7 @@
 // PR-1 ships the type surface + role loader + a stub mail consumer.
 // PR-2 will wire the Discord bridge + cron scheduler.
 
-export type BobRole = "ea" | "writer" | "reviewer" | "coder" | "qa" | "custom";
+export type BobRole = "ea" | "writer" | "reviewer" | "coder" | "qa" | "builder-local" | "custom";
 
 export interface ProviderConfig {
   name:

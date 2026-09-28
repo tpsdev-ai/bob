@@ -379,7 +379,7 @@ src/
     flair/              memory search/write/get over the agent's Flair store
     observatory/        team-view producer
     fixture/            a no-op capability that proves the loader end to end
-roles/                  ea, writer, reviewer, coder, qa, custom
+roles/                  ea, writer, reviewer, coder, qa, builder-local, custom
 positions/              packaged position presets — builder, reviewer
 test/                   mirrors src/
 ```
