@@ -64,21 +64,35 @@ A **position** is a packaged, role-compatible preset — a starting shape for an
 agent. `positions/builder` and `positions/reviewer` ship with bob. A position
 names an existing **role** (it never carries or edits one), and declares the
 tools it requests, the capabilities it permits (and which are on by default),
-and the packaged files it uses (a seed soul now; skill, prompt and threshold
-files later). `builder-local` (bob#185) becomes a position over its role once
-that lands.
+and the packaged files it uses (a seed soul; skill, prompt and threshold files
+are later slices, and a manifest that declares one is REFUSED until it loads).
+`builder-local` (bob#185) becomes a position over its role once that lands.
 
 The trust layers, from the top down:
 
 1. **Role** — `roles/<role>/role.json` ships with bob and is the tool ceiling.
    Unchanged by positions.
 2. **Host grant** — the per-agent trust root. At `bob hire` (or `bob position
-   adopt`) the operator ratifies the role name, the position version and hash,
-   the maximum tool set and the maximum capability set into host state that the
-   agent's own tools cannot edit. Every boot verifies the position hash and role
-   against it, refuses BY NAME each tool or capability outside the ratified set
-   before any intersection, and only then runs the existing validators. Changing
-   `bob.yaml` cannot select another role or add a grant.
+   adopt`) the operator ratifies the role name, the position name, version and
+   hash, the maximum tool set and the maximum capability set into host state.
+   Every boot loads the current packaged role and compares the manifest name,
+   version, hash and role against the grant, refuses BY NAME each tool or
+   capability outside the ratified set before any intersection, enforces BOTH the
+   packaged role's ceiling AND the grant's ratified maximum, and only then runs
+   the existing validators. Changing `bob.yaml` cannot select another role or add
+   a grant.
+
+   **The grant is TAMPER-EVIDENT, not tamper-proof.** It is stored outside every
+   agent-addressable path — never under the agent's directory or its session cwd
+   — so the tools a position can hand the agent (`write`, `edit`, the
+   anchored-edit tools) cannot address it by path containment. And a previously
+   bound agent whose grant is missing or unreadable REFUSES to boot: hire and
+   adoption write a binding marker into the agent directory, and a marker with no
+   readable grant is a loud refusal, never a silent fallback to unratified legacy
+   resolution. It is NOT a security boundary against the OS user: an agent
+   running as the SAME user with a shell can still edit host files. Real
+   isolation is the sandbox work (bob#189), which slice 1 does not ship — that is
+   the honest guarantee.
 3. **Position** — the declared requests, which the grant must cover.
 4. **Instance** — the agent's `bob.yaml`, which may only narrow within the grant.
 5. **Overrides** — `~/agents/<name>/overrides/`, a per-agent Git repository that
@@ -86,28 +100,42 @@ The trust layers, from the top down:
    capabilities, and allow-listed files that replace a packaged position file at
    the same relative path. Every other key is refused by name. A local file may
    only replace a packaged file; an additional path must be allow-listed by the
-   manifest.
+   manifest. The **soul** is not overridable: a local file may never replace the
+   persona. (Slice 1 positions ship only a soul file, so in practice every
+   present override file is refused.)
 
-**Secrets** are named, never carried: a position declares the secret NAMES a
-capability needs, and host-owned bindings (the `BOB_SECRET_*` environment, or the
-host `secrets.json`) supply the value or path at session start. Presence is
-checked only for the effective ENABLED capability set, at hire and again at every
-session. A secret missing for a capability that is off blocks only enabling it.
+**Secrets** are deferred to a later slice: slice 1 ships NO host secret
+bindings. A position that declares a secret is REFUSED at hire and adoption, so
+no position that names a secret can be bound. (None of the shipped positions
+declares one.)
 
 **Adoption** binds an existing agent without rewriting it: `bob position adopt`
-independently resolves the agent before and after binding, verifies its requests
-against the position, role and new grant, records the binding, ratification and
-normalized baseline, and initializes the override repository — leaving the
-pre-existing `bob.yaml` and `soul.md` byte-for-byte unchanged. Immediately after,
-`bob position diff` is empty.
+independently resolves the agent before and after binding and REQUIRES the two
+effective configurations to be equal — otherwise it refuses — then verifies its
+requests against the position, role and new grant, records the binding,
+ratification and normalized baseline, and initializes the override repository —
+leaving the pre-existing `bob.yaml` and `soul.md` byte-for-byte unchanged.
+Immediately after, `bob position diff` is empty. The diff compares every
+effective setting the spec covers — role, tools, tool exclusions, the residency
+decision, the resident-shell grant, capabilities, resolved files and the soul.
+
+**Hire** (`bob hire`) validates the candidate, scaffolds the agent, runs the
+existing hiring interview, and keeps the agent's OWN identity in its seed soul —
+the seed soul is the identity header plus the position's persona, never the
+generic packaged soul alone. Hire without Flair stays the default for the shipped
+positions, presented as a local identity. An ADOPTED agent's setup session
+(`bob onboard`, `bob align`) gets the grant's resolved tools plus EXACTLY the one
+`write` tool the interview needs to write `soul.md`, and nothing else.
 
 An agent with no grant is not adopted: it resolves exactly as before, so every
 existing `bob init` agent keeps booting unchanged.
 
 **Later slices:** position upgrade (staged, verified, atomic), arbitrary
-`path:`/`npm:`/`git:` sources (with their own security review), the model
-selector, the performance review, full jarvis and new comms. Slice 1 loads only
-positions shipped under bob's own `positions/` directory.
+`path:`/`npm:`/`git:` sources (with their own security review), host secret
+bindings, skill/prompt/threshold files and their consumers, the model selector,
+the performance review, full jarvis and new comms. Slice 1 loads only positions
+shipped under bob's own `positions/` directory, referenced by bare name or by the
+confined `path:<relative>` spelling (a path that resolves inside that directory).
 
 ## Operator guarantees, and the tests that pin them
 
@@ -208,11 +236,14 @@ change one, the named test is what tells you.
 ### Stated exceptions
 
 1. **Onboarding and alignment are privileged local setup commands**, available
-   to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
-   `read` and `write`, which may exceed the role's ceiling — the interview's job
-   is to write `soul.md`. A model can only reach them through a shell tool, and
-   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
-   `align.test.ts`)*
+   to whoever runs `bob` as that OS user. For an ordinary agent they run under a
+   FIXED setup policy of `read` and `write`, which may exceed the role's ceiling —
+   the interview's job is to write `soul.md`. A model can only reach them through
+   a shell tool, and a shell can already write files, so read + write grants it
+   nothing new. For an ADOPTED agent the setup session must not exceed the grant:
+   it gets the grant's resolved tools plus EXACTLY the one `write` tool `soul.md`
+   needs. *(`test/shell/onboard.test.ts`, `align.test.ts`,
+   `test/shell/positions-195.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
 3. **The contract costs tokens, per request.** The task is sent in the first
