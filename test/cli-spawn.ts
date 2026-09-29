@@ -15,7 +15,7 @@
 // Mirrors test/shell/flair-fake.ts: a shared, non-`.test.ts` module the
 // CLI-spawning tests import so the timeout lives in one place and the spawn is
 // always shell-free.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 // The default per-spawn budget. One place sets the timeout so every CLI spawn
 // in the suite is bounded: a blocking command hangs at most this long.
 export const CLI_SPAWN_TIMEOUT_MS = 10_000;
@@ -92,4 +92,39 @@ export function spawnNode(args: string[], opts: SpawnOptions = {}): string {
     });
   }
   return merged;
+}
+
+// The same run WITHOUT blocking the event loop, for a test whose child talks
+// to a server in this test process (spawnSync would hold the loop that server
+// answers on). Same interpreter and per-spawn timeout; a non-zero exit is a
+// result here, not a throw, so the caller asserts on code, stdout and stderr
+// separately.
+export function spawnNodeAsync(
+  args: string[],
+  opts: SpawnOptions = {},
+): Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }> {
+  const timeoutMs = opts.timeoutMs ?? CLI_SPAWN_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const child = spawn(INTERPRETER, args, {
+      env: opts.env ?? process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
 }

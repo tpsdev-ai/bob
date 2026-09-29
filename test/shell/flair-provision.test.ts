@@ -2,14 +2,17 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
+import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
 import { ADMIN_PASS_ENV, FlairAdminCredentialError } from "../../src/shell/flair-pair.js";
 import {
   describeProvisioning,
+  operatorSelectedFlairUrl,
   provisionFlairIdentity,
   syncFlairSoul,
 } from "../../src/shell/flair-provision.js";
 import { initAgent } from "../../src/shell/init.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { captureOutput, makeFakeFlair, operatorCredentialForms } from "./flair-fake.js";
 
 const TEST_ADMIN_CREDENTIAL = "placeholder-not-a-real-admin-credential";
 
@@ -32,6 +35,7 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
       agentsRoot,
       flairKeysDir: keysRoot,
     });
+    writeFileSync(join(keysRoot, "admin-pass"), `${TEST_ADMIN_CREDENTIAL}\n`, { mode: 0o600 });
   });
   afterEach(() => {
     rmSync(agentsRoot, { recursive: true, force: true });
@@ -51,8 +55,8 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
       publicKeyBase64: scaffold.flair?.publicKeyBase64 ?? "",
       keyFile: cfg.keyPath,
       soulPath: join(scaffold.agentDir, "soul.md"),
-      adminPassFile: join(keysRoot, "no-such-admin-pass"),
-      env: { [ADMIN_PASS_ENV]: TEST_ADMIN_CREDENTIAL },
+      adminPassFile: join(keysRoot, "admin-pass"),
+      adminPassFromEnv: TEST_ADMIN_CREDENTIAL,
       fetchImpl: fake.fetchImpl,
       warn: () => {},
       ...over,
@@ -80,6 +84,25 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
     expect(fake.souls["testbot:persona"]).toContain("You are Testbot (`testbot`)");
   });
 
+  it("onboard succeeds where Flair refuses the agent-signed Soul PUT", async () => {
+    const fake = makeFakeFlair();
+    const client = new FlairHttpClient({
+      url: scaffold.flairConfig?.url ?? "",
+      agentId: "testbot",
+      keyFile: scaffold.flairConfig?.keyPath ?? "",
+      fetchImpl: fake.fetchImpl,
+    });
+    await expect(client.soulSet("persona", "agent attempted write")).rejects.toThrow(/403/);
+    expect(fake.souls["testbot:persona"]).toBeUndefined();
+    await provision(fake);
+    expect(fake.souls["testbot:persona"]).toBe(
+      readFileSync(join(scaffold.agentDir, "soul.md"), "utf8"),
+    );
+    expect(
+      fake.calls.filter((c) => c.method === "PUT" && c.path.startsWith("/Soul/")),
+    ).toHaveLength(4);
+  });
+
   it("registers against the URL the scaffold actually wrote into bob.yaml", async () => {
     const fake = makeFakeFlair();
     await provision(fake);
@@ -91,9 +114,8 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
 
   // ─── THE ORDERING DEPENDENCY (#94 depends on #93) ────────────────────────
   //
-  // Flair attributes a Soul row to the SIGNING identity and refuses a
-  // signature it cannot resolve to an Agent record. A soul write in front of
-  // registration is a 401, so the order is not a preference.
+  // Registration precedes the operator Soul writes; the agent-signed
+  // divergence read requires the new Agent record.
   it("registers BEFORE it writes the soul", async () => {
     const fake = makeFakeFlair();
     await provision(fake);
@@ -132,12 +154,73 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
     expect(fake.souls["testbot:persona"]).toBeUndefined();
   });
 
+  // ─── NO OPERATOR CREDENTIAL FROM A REFLECTING SERVER ─────────────────────
+  // Both operator transports onboard uses — the ops-API registration and the
+  // Soul PUT — fail against a server that reflects request headers into its
+  // error body; neither the error nor anything written to stdout/stderr may
+  // carry the credential in any form.
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    for (const failAt of ["registration", "soul"] as const) {
+      it(`onboard never echoes the credential when ${failAt} fails on a reflecting server (${reflect})`, async () => {
+        const fake = makeFakeFlair(
+          failAt === "registration" ? { opsStatus: 500, reflect } : { soulPutStatus: 500, reflect },
+        );
+        const { error, output } = await captureOutput(() => provision(fake, { warn: undefined }));
+        const message = (error as Error).message;
+        expect(message).toContain(
+          failAt === "registration"
+            ? "flair ops-API search_by_id Agent -> 500: operator request failed"
+            : "flair Soul PUT testbot:name -> 500: operator write failed",
+        );
+        const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+        expect(fake.errorBodies.join("\n")).toContain(
+          reflect === "authorization" ? header : decoded,
+        );
+        for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+          expect(message).not.toContain(form);
+          expect(output).not.toContain(form);
+        }
+      });
+    }
+  }
+
+  // ─── NO OPERATOR CREDENTIAL FROM A TRANSPORT EXCEPTION ────────────────────
+  // fetch() rejecting, or a response body failing to read, with the credential
+  // in the exception's message and cause — on registration and on the Soul PUT.
+  const transportCases = [
+    { name: "registration fetch", stage: "fetch", method: "POST" },
+    { name: "registration body read", stage: "text", method: "POST" },
+    { name: "Soul PUT fetch", stage: "fetch", method: "PUT" },
+  ] as const;
+  for (const c of transportCases) {
+    it(`onboard never surfaces the credential when the ${c.name} fails in transport`, async () => {
+      const fake = makeFakeFlair({
+        transportFailure: { stage: c.stage, match: (r) => r.method === c.method },
+      });
+      const { error, output } = await captureOutput(() => provision(fake, { warn: undefined }));
+      const err = error as Error;
+      expect(err.message).toContain(
+        c.stage === "fetch"
+          ? "the request failed before a response arrived"
+          : "the response could not be read",
+      );
+      expect(err.cause).toBeUndefined();
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(inspect(err)).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
+
   // ─── FAIL LOUDLY ON A MISSING CREDENTIAL ─────────────────────────────────
   it("throws — and writes no soul — when no admin credential is available", async () => {
     const fake = makeFakeFlair();
     let thrown: unknown;
     try {
-      await provision(fake, { env: {} });
+      await provision(fake, {
+        adminPassFromEnv: undefined,
+        adminPassFile: join(keysRoot, "missing-admin-pass"),
+      });
     } catch (err) {
       thrown = err;
     }
@@ -150,11 +233,26 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
 
   it("the credential error names the agent, the env var, the file and the manual fix", async () => {
     const fake = makeFakeFlair();
-    const err = (await provision(fake, { env: {} }).catch((e) => e)) as Error;
+    const err = (await provision(fake, {
+      adminPassFromEnv: undefined,
+      adminPassFile: join(keysRoot, "missing-admin-pass"),
+    }).catch((e) => e)) as Error;
     expect(err.message).toContain("testbot");
     expect(err.message).toContain(ADMIN_PASS_ENV);
     expect(err.message).toContain("admin-pass");
     expect(err.message).toContain("flair agent add testbot");
+  });
+
+  it("onboard fails at the Soul step when registration used an env password but the file is missing", async () => {
+    const fake = makeFakeFlair();
+    const missing = join(keysRoot, "missing-admin-pass");
+    const err = (await provision(fake, { adminPassFile: missing }).catch((e) => e)) as Error;
+    expect(fake.agents.testbot).toBeDefined();
+    expect(err.message).toContain("cannot write Flair soul for 'testbot'");
+    expect(err.message).toContain(missing);
+    expect(err.message).toContain("--admin-pass-file");
+    expect(err.message).not.toContain(TEST_ADMIN_CREDENTIAL);
+    expect(fake.calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
   // ─── IDEMPOTENT RE-RUN ────────────────────────────────────────────────────
@@ -216,6 +314,31 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
   });
 });
 
+describe("align operator URL pin", () => {
+  it("requires an operator URL before an agent-writable config can select the target", () => {
+    expect(() => operatorSelectedFlairUrl("testbot", "https://flair.example.test")).toThrow(
+      /bob.yaml is agent-writable.*--flair-url/,
+    );
+  });
+
+  it("rejects a changed bob.yaml URL, but accepts the matching operator URL", () => {
+    expect(() =>
+      operatorSelectedFlairUrl(
+        "testbot",
+        "https://attacker.example.test",
+        "https://flair.example.test",
+      ),
+    ).toThrow(/bob.yaml flair.url differs from --flair-url/);
+    expect(
+      operatorSelectedFlairUrl(
+        "testbot",
+        "https://flair.example.test/",
+        "https://flair.example.test",
+      ),
+    ).toBe("https://flair.example.test");
+  });
+});
+
 describe("syncFlairSoul — bob align (#94)", () => {
   let agentsRoot: string;
   let keysRoot: string;
@@ -234,21 +357,25 @@ describe("syncFlairSoul — bob align (#94)", () => {
       agentsRoot,
       flairKeysDir: keysRoot,
     });
+    writeFileSync(join(keysRoot, "admin-pass"), `${TEST_ADMIN_CREDENTIAL}\n`, { mode: 0o600 });
   });
   afterEach(() => {
     rmSync(agentsRoot, { recursive: true, force: true });
     rmSync(keysRoot, { recursive: true, force: true });
   });
 
-  const sync = (fake: ReturnType<typeof makeFakeFlair>) =>
+  const sync = (fake: ReturnType<typeof makeFakeFlair>, over: Record<string, unknown> = {}) =>
     syncFlairSoul({
       name: "testbot",
       role: "reviewer",
       flairUrl: scaffold.flairConfig?.url ?? "",
+      operatorFlairUrl: scaffold.flairConfig?.url ?? "",
       keyFile: scaffold.flairConfig?.keyPath ?? "",
       soulPath: join(scaffold.agentDir, "soul.md"),
+      adminPassFile: join(keysRoot, "admin-pass"),
       fetchImpl: fake.fetchImpl,
       warn: (m) => warnings.push(m),
+      ...over,
     });
 
   const registeredFake = () =>
@@ -256,12 +383,65 @@ describe("syncFlairSoul — bob align (#94)", () => {
       agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
     });
 
-  it("pushes the revised persona without needing any admin credential", async () => {
+  it("refuses an agent-edited URL before registration check or Basic auth", async () => {
+    const fake = registeredFake();
+    await expect(sync(fake, { flairUrl: "https://attacker.example.test" })).rejects.toThrow(
+      /bob.yaml flair.url differs from --flair-url/,
+    );
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("pushes the revised persona with the operator password file", async () => {
     const fake = registeredFake();
     writeFileSync(join(scaffold.agentDir, "soul.md"), "# interviewed persona\n");
     await sync(fake);
     expect(fake.souls["testbot:persona"]).toBe("# interviewed persona\n");
-    expect(fake.calls.every((c) => !/^Basic /.test(c.headers.Authorization ?? ""))).toBe(true);
+    expect(
+      fake.calls.find((c) => c.method === "GET" && c.path.startsWith("/Agent/"))?.headers
+        .Authorization,
+    ).toMatch(/^TPS-Ed25519 /);
+    expect(
+      fake.calls
+        .filter((c) => c.method === "PUT" && c.path.startsWith("/Soul/"))
+        .every((c) => /^Basic /.test(c.headers.Authorization ?? "")),
+    ).toBe(true);
+  });
+
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    it(`align never echoes the credential when the Soul PUT fails on a reflecting server (${reflect})`, async () => {
+      const fake = makeFakeFlair({
+        agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
+        // A divergent persona, so the default warn path writes to stderr too.
+        souls: { "testbot:persona": "an older persona\n" },
+        soulPutStatus: 500,
+        reflect,
+      });
+      const { error, output } = await captureOutput(() => sync(fake, { warn: undefined }));
+      const message = (error as Error).message;
+      expect(message).toContain("flair Soul PUT testbot:name -> 500: operator write failed");
+      expect(output).toContain("soul divergence for 'testbot'");
+      const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+      expect(fake.errorBodies.join("\n")).toContain(reflect === "authorization" ? header : decoded);
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(message).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
+
+  it("align never surfaces the credential when the Soul PUT fails in transport", async () => {
+    const fake = makeFakeFlair({
+      agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
+      transportFailure: { stage: "fetch", match: (r) => r.method === "PUT" },
+    });
+    const { error, output } = await captureOutput(() => sync(fake, { warn: undefined }));
+    const err = error as Error;
+    expect(err.message).toContain("flair Soul PUT testbot:name to ");
+    expect(err.cause).toBeUndefined();
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect(inspect(err)).not.toContain(form);
+      expect(output).not.toContain(form);
+    }
   });
 
   it("verifies registration FIRST, and the verification precedes every soul call", async () => {

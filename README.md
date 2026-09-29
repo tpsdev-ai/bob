@@ -37,11 +37,13 @@ in the agent's `.pi-agent/models.json`.
 
 ### Flair identity, and where the soul lives
 
-Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Bob reads it from `FLAIR_ADMIN_PASS` in the environment, or from the `0600` `~/.flair/admin-pass` file `flair init` writes — **never from a command-line flag**, because argv is world-readable and lands in shell history. If neither is available, `bob onboard` fails with the exact fix rather than leaving a keypair on disk with no identity behind it. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points it at a hub instead of the local spoke.
+Registering an Agent record writes to Flair's admin-only `Agent` table, so onboarding needs an **admin credential** for the target instance. Registration reads `FLAIR_ADMIN_PASS` or the `0600` `~/.flair/admin-pass` file `flair init` writes. bob takes `FLAIR_ADMIN_PASS` out of its environment at startup and hands the value only to registration. Soul writes by `bob onboard` and `bob align` use operator Basic auth and read **only that file**, at each push; an environment password alone cannot authorize the Soul step. `--admin-pass-file <path>` overrides the file path and `--admin-user <user>` overrides the default `admin` username for these setup commands. Never pass the password value as a command-line flag, since argv is world-readable and lands in shell history. A missing file stops the Soul push with a path and remedy. `--no-flair` scaffolds an agent with no Flair identity at all; `--flair-url` points onboard at a hub instead of the local spoke. For `bob align`, pass `--flair-url <url>` again: align compares this operator-selected URL with the agent-writable `bob.yaml` URL and refuses a mismatch before sending Basic auth. Operator Basic auth is sent only over HTTPS or numeric loopback HTTP.
 
 The persona is mirrored **one way: `soul.md` → Flair**, at the points where bob is already authoring one (`bob onboard`, `bob align`). Flair is the source of truth for *consumers* — it's what `bootstrap` returns, what travels to another machine running that identity, and what federates. `soul.md` is the source of truth for *authoring* — the hiring interview and your editor both write it, and the launcher reads it locally so a Flair outage can never boot a persona-less agent. Launch itself never syncs, in either direction.
 
 If the two diverge (you edited `soul.md` after onboarding, or something else wrote the soul), the local file wins — loudly and losslessly: bob saves Flair's copy to `soul.flair.bak.md` next to `soul.md` and warns, naming both. Nothing is resolved silently.
+
+The divergence read remains signed with the agent's key. Only local onboarding and alignment use the operator password file for the Soul PUT. The `flair_*` runtime tools and self-improvement proposals receive no operator credential and cannot write a Soul entry. The operator password is read at call time, removed from the process environment and never passed to an agent session. It is not isolated from same-user file access, which is tracked separately: agent tools run as the same OS user as bob.
 
 ## What's wired
 
@@ -61,7 +63,7 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
 | `bob onboard <name>`       | Scaffold + register the Flair identity + write its soul + open the hiring interview              |
-| `bob align <name>`         | Recurring drift check — refines the persona and mirrors it back into Flair. Runs on the agent's own bob.yaml provider and model; `--provider`/`--model` override one field each |
+| `bob align <name> --flair-url <url>` | Recurring drift check — refines the persona and mirrors it back into Flair. Runs on the agent's own bob.yaml provider and model; `--provider`/`--model` override one field each |
 | `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). `--model X` overrides bob.yaml's model for the whole session. This is what the service unit runs |
 | `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |

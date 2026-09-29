@@ -123,10 +123,12 @@ export {
   registerWithFlair,
   resolveFlairAdminPass,
   resolveFlairOpsUrl,
+  takeFlairAdminPassFromEnv,
   verifyRegisteredWithFlair,
 } from "./flair-pair.js";
 export {
   describeProvisioning,
+  operatorSelectedFlairUrl,
   type ProvisionFlairIdentityOptions,
   type ProvisionFlairIdentityResult,
   provisionFlairIdentity,
