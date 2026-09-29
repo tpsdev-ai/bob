@@ -57,6 +57,7 @@ function scaffold(): { agentDir: string; cwd: string; piAgentDir: string } {
     role: "ea",
     provider: "anthropic",
     model: "claude-sonnet-4-6",
+    contextWindow: 200_000,
     agentsRoot,
     flairKeysDir: join(root, ".flair", "keys"),
     skipFlair: true,

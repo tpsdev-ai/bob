@@ -8,20 +8,22 @@ Bob is a thin TypeScript shell on top of [pi-coding-agent](https://github.com/ea
 
 ```sh
 # Hire Pulse as an EA, route through exe.dev's LLM gateway:
-bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7
+bob onboard pulse --role ea --provider exe-dev-gateway --model claude-opus-4-7 --context-window 200000
 ```
+
+`--context-window` is the model's context window as the server enforces it, and it is required: bob writes it to bob.yaml, and every session (the hiring interview included) refuses to start without it. Without the flag, `bob onboard` and `bob hire` refuse before writing anything (see [Model budget](#model-budget)).
 
 `bob onboard` does four things:
 
 1. **Scaffolds** `~/agents/pulse/` — soul.md (from the role template), bob.yaml config, ed25519 keypair, per-agent pi config (auth + gateway routing), and an executable launcher at `bin/pulse`.
 2. **Provisions the Flair identity** — registers the Ed25519 public key as a Flair **Agent** record and writes the persona into Pulse's Flair **soul**, in that order. Without the Agent record the agent's signed memory/soul calls don't verify; without the soul entry its own `bootstrap` returns no persona. Both are part of "onboarded", not follow-up chores.
 3. **Opens an interview** — pi-coding-agent runs in interactive mode with a meta-system-prompt that frames the session as a hiring conversation. You shape the persona by talking; the agent writes the refined `soul.md` itself when you signal you're done. Bob mirrors the result back into Flair.
-4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call. `bob run pulse` keeps Pulse on duty — one warm, persistent session that loads the bob.yaml capabilities: the Discord listener that responds to mentions, plus the in-process `cron:` scheduler that fires the agent's briefings and sweeps into the live session (configure the Discord channel and the `cron:` entries in bob.yaml, not on the command line).
+4. **Leaves you with a working agent.** `pulse "what should I know this morning?"` starts a session. `bob run pulse --model claude-sonnet-4-6 "draft today's brief"` overrides the model for one call (the override model needs its own window under `provider.models:` in bob.yaml). `bob run pulse` keeps Pulse on duty — one warm, persistent session that loads the bob.yaml capabilities: the Discord listener that responds to mentions, plus the in-process `cron:` scheduler that fires the agent's briefings and sweeps into the live session (configure the Discord channel and the `cron:` entries in bob.yaml, not on the command line).
 
 The `jarvis` role is the office's resident agent: memory with receipts, awareness
 from available presence and event information, small help routed to the right
 owner, and Discord conversation. Hire one with
-`bob onboard <name> --role jarvis --provider <provider> --model <model>`; the
+`bob onboard <name> --role jarvis --provider <provider> --model <model> --context-window <tokens>`; the
 interview gives the class seed an individual persona. The role allows only
 `read`, `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch`
 and `discord_react`, with `allowResidentShell: false`. Onboarding stamps only
@@ -62,15 +64,15 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 
 | Command                  | What it does                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------- |
-| `bob onboard <name>`       | Scaffold + register the Flair identity + write its soul + open the hiring interview              |
-| `bob align <name> --flair-url <url>` | Recurring drift check — refines the persona and mirrors it back into Flair. Runs on the agent's own bob.yaml provider and model; `--provider`/`--model` override one field each |
+| `bob onboard <name> --context-window <tokens>` | Scaffold + register the Flair identity + write its soul + open the hiring interview. Without `--context-window` it refuses before writing anything |
+| `bob align <name> --flair-url <url>` | Recurring drift check — refines the persona and mirrors it back into Flair. Runs on the agent's own bob.yaml provider and model; `--provider`/`--model` override one field each. A `--model` needs its own `provider.models:` window, as for `bob run`; bob.yaml declares windows for its own provider only, so a `--provider` naming another one is refused |
 | `bob run <name>`           | Run the agent on duty: one warm, persistent session that loads the bob.yaml capabilities (the Discord listener and the in-process `cron:` scheduler). `--model X` overrides bob.yaml's model for the whole session. This is what the service unit runs |
 | `bob run <name> <prompt>`  | Run ONE short-lived task and print the answer. `--model X` overrides per call                    |
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
-| `bob hire <name> --as <position>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository |
+| `bob hire <name> --as <position> --context-window <tokens>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository. Without `--context-window` it refuses before writing anything |
 | `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
 | `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
 | `bob help`                 | Show this usage                                                                               |
@@ -793,7 +795,7 @@ by bob's gate (bob#180 §4).
 Bob agents run on a provider declared in `bob.yaml` (`provider.name` + `provider.model`). `openrouter`
 is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`, and the model id is
 passed through verbatim — for example `bob onboard orr --provider openrouter --model
-deepseek/deepseek-v4.1-flash`.
+deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,
@@ -809,6 +811,33 @@ entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a com
 `openrouter` model resolves from bob's in-memory provider. **bob holds the OpenRouter key; pi does not.** It lives in bob's runtime-factory closure (so `/new` and `/resume` reuse it) and in the transport function built from it, which sends only to `https://openrouter.ai/api/v1`; pi's auth and registered provider config hold a NON-SECRET placeholder, and pi's model data carries no key. The first session the runtime factory builds reads `OPENROUTER_API_KEY` once and DELETES it from `process.env`, after pi's model runtime is created and before capabilities, extensions and tools load (`(r2)`); the transport refuses a model whose `baseUrl`/`api` is not bob's (`(t1, unit)`), refuses the listed credential header names (`authorization`, `proxy-authorization`, `cf-aig-authorization`, `x-api-key`, `api-key`, `x-auth-token`, `cookie`) (`(t4, unit)`, `(r3)`), and its fetch wrapper refuses a non-canonical URL or a `Request` (`(t5, unit)`, `(r4)`); a real session turn carries `Bearer <the real key>` to `<base>/chat/completions` (`(t2, session path)`); the key is in none of pi's auth, registered provider config or model data (`(t3)`); a `ModelRuntime.refresh()` with a tampered `models.json` can install pi's BUILT-IN provider as the effective one — bob's transport is then not on the request path — so what holds instead is key containment: the key is no longer in `process.env` or in pi's data, so the fallback provider that pi's request path prepares has no key to send and `getAuth("openrouter")` resolves none (`(r1)`, whose control phase shows the same path DOES send the key to another host while the environment still holds it). STATED LIMIT: this removes the IN-PROCESS path only — a same-user process can still read a process's initial environment block (`/proc/<pid>/environ` on Linux, `ps eww` on macOS); isolating the agent's own tools from that is bob#189, not this change. The key also lives in the bob process's memory — the runtime-factory and transport closures — so a same-user process that can read another process's memory (a debugger, `/proc/<pid>/mem`, or a core dump) can recover it; isolating that is likewise bob#189. Operator symptom of the refresh fallback: after a `refresh()` that breaks composition, pi's built-in `openrouter` provider is the effective one and has none of bob's key, so a turn fails with an auth error even though the operator's key is valid — check first whether a `.pi-agent/models.json` entry defines `openrouter` (an extension cannot: bob's registration guard refuses it). An
 unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
 path's persisted files (`(c)`).
+
+## Model budget
+
+bob.yaml's `provider:` block names the model and its limits; an optional `session:` block sets when to compact and how much to think:
+
+```yaml
+provider:
+  name: ollama
+  model: some-model
+  context_window: 262144      # REQUIRED: the context length the server enforces for this model
+  max_output_tokens: 32000    # optional: the per-request output cap
+  models:                     # optional: other models a --model override may name
+    - id: other-model
+      context_window: 131072
+
+session:                      # optional; each key overrides the role's default
+  compaction_threshold: 0.5   # compact once the context passes this fraction of the window
+  thinking: low               # off | low | high
+```
+
+- **The context window is required.** Every session refuses to start without a window declared for the provider/model it runs, naming bob.yaml and the key that would declare it: `provider.context_window` for bob.yaml's own `provider.model`, a `provider.models:` entry with that model's `id` for a `--model` override. bob does not fall back to pi's model default, because that default can disagree with the server. The declared window (and output cap) is what pi's runtime uses for that model: bob applies it to pi's model lookups, so it holds when pi refreshes the session's model. `bob run --model` and `bob align --model` resolve the override's window the same way. bob.yaml declares windows for its own provider only, so `bob align --provider` naming another provider is refused. `bob onboard` and `bob hire` require `--context-window <tokens>` and refuse without it before writing anything. An unknown key in `provider:` or `session:` is refused.
+- **Compaction is checked between model calls.** pi compacts when the context exceeds `window - reserve`; bob sets pi's reserve from `compaction_threshold`, so pi's own trigger fires at the threshold. pi checks it only when a run ends, so bob also checks after every model call that ended in tool calls. Over the threshold, bob queues a short checkpoint message and ends pi's low-level loop at that turn boundary. pi's own compaction then runs and the run continues with the checkpoint message. If pi does not compact after a checkpoint, bob stops checkpointing until a compaction succeeds. A threshold at or below the 20000 tokens pi keeps verbatim is refused.
+- **Thinking** is handed to pi as the session's thinking level. pi clamps it to what the model declares (a model not marked `reasoning` in pi's model config runs with thinking off) and sends it in the provider's own shape (for example `reasoning_effort` on the OpenAI-compatible path, when the model's compat allows it). Whether a server acts on it is the server's behaviour.
+- **The output cap is sent, with a backstop.** `max_output_tokens` is the token count pi sends (`max_completion_tokens` or `max_tokens` on the OpenAI-compatible path); a server that honours it stops there. For a server that ignores it, bob has a backstop that counts streamed pieces (text, thinking and tool-call deltas), not tokens: it ends the stream after more pieces than the token cap, aborting the request and ending the message as a `length` stop. A server sends a piece only after generating at least one token, so the backstop is never early (bob does not tokenize: a server or proxy that split one token across pieces would break that premise); it can be late, because a piece that carries several tokens counts once (a stream of a few large pieces may not be ended at all). The ended message holds only the pieces bob accepted, never output that arrived after the cut. Its usage is assigned, not measured: the server's final count never arrives, so `usage.output` is the cap (a lower bound) and the prompt counts are 0.
+- **Role defaults.** `roles/<role>/role.json` may carry `"session": {"compaction_threshold": …, "thinking": …}`; `builder-local` ships `0.5` and `low`. A role without one uses pi's defaults.
+
+Every `bob run` log also carries one `requestUsage` record per model request: `promptTokens`, `cachedPromptTokens`, `completionTokens`, `thinkingTokens` (the provider's count when it reports one, otherwise the number of streamed thinking pieces, a count of pieces rather than tokens, labelled by `thinkingTokensSource`), `ttftMs` (request start to the first streamed piece), `durationMs`, `stopReason`, `provider` and `model`, plus `outputCapped` when bob's backstop ended the stream (then the token counts are the assigned ones above, not the provider's). The record carries counts and timings only, no prompt or response text; the run log as a whole is the session transcript and does carry both.
 
 ## Status
 

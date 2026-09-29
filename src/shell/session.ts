@@ -34,7 +34,7 @@
 //       otherwise stay open on a tool state nobody audited.
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   type AgentSessionRuntime,
@@ -50,6 +50,16 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { ADMIN_PASS_ENV } from "./flair-pair.js";
+import {
+  applyModelLimits,
+  capOutputStream,
+  compactionSettingsFor,
+  installMidRunCompaction,
+  type MidRunCompactionSession,
+  type ModelLimits,
+  requireModelLimits,
+  type StreamFunction,
+} from "./model-budget.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -615,8 +625,61 @@ export interface AuditExtensions {
 // loader, which is also what makes "nothing is installed" true (there is no
 // package to resolve). projectTrusted:false keeps project discovery off
 // regardless of any trust.json on disk.
-export function isolatedSettings(): SettingsManager {
-  return SettingsManager.inMemory({}, { projectTrusted: false });
+//
+// bob#214: the one setting bob DOES put here is pi's compaction reserve, derived
+// from the session's compaction threshold (model-budget.ts
+// compactionSettingsFor) — configuring pi's own trigger rather than adding one.
+export function isolatedSettings(compaction?: { reserveTokens: number }): SettingsManager {
+  return SettingsManager.inMemory(compaction !== undefined ? { compaction } : {}, {
+    projectTrusted: false,
+  });
+}
+
+/**
+ * bob#214: the declared limits of the pair a session config runs, or the named
+ * refusal (requireModelLimits). The factory's first check, before any key is
+ * read or any runtime built; exported so a caller's resolved config can be
+ * checked the same way without building a session.
+ */
+export function sessionModelLimits(
+  config: Pick<RunSessionConfig, "provider" | "model" | "modelLimits" | "yamlModel" | "piAgentDir">,
+): ModelLimits {
+  return requireModelLimits({
+    provider: config.provider,
+    model: config.model,
+    limits: config.modelLimits,
+    bobYamlPath: join(dirname(config.piAgentDir), "bob.yaml"),
+    ...(config.yamlModel !== undefined ? { yamlModel: config.yamlModel } : {}),
+  });
+}
+
+/**
+ * bob#214: install the model budget on a session pi just built — the
+ * output-cap backstop on its stream function and the compaction check between
+ * model calls.
+ * Both hook pi's PUBLIC agent surfaces (`agent.streamFunction`,
+ * `agent.shouldStopAfterTurn`); a session without them cannot carry the budget
+ * and is refused rather than run unbudgeted.
+ */
+export function installSessionBudget(
+  session: unknown,
+  deps?: { log?: (message: string) => void },
+): void {
+  const s = session as Partial<MidRunCompactionSession> & {
+    agent?: { streamFunction?: StreamFunction };
+  };
+  if (
+    typeof s?.agent?.streamFunction !== "function" ||
+    typeof s.settingsManager?.getCompactionSettings !== "function" ||
+    typeof s.steer !== "function" ||
+    typeof s.subscribe !== "function"
+  ) {
+    throw new Error(
+      "bob: refusing a session that does not expose pi's agent stream function, compaction settings, steer() and subscribe() — bob installs the output-cap backstop and the between-calls compaction check on those (bob#214)",
+    );
+  }
+  s.agent.streamFunction = capOutputStream(s.agent.streamFunction, deps);
+  installMidRunCompaction(s as MidRunCompactionSession, deps);
 }
 
 // The isolated resource-loader options: nothing ambient, only the agent's
@@ -989,6 +1052,18 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const cwd = config.cwd;
     const agentDir = config.piAgentDir;
 
+    // bob#214: the model's declared window, for THIS session's provider/model,
+    // or a refusal naming the remedy — before any key is read or any runtime
+    // built. The compaction threshold becomes pi's own compaction reserve.
+    const limits = sessionModelLimits(config);
+    const compaction =
+      config.compactionThreshold !== undefined
+        ? {
+            reserveTokens: compactionSettingsFor(limits.contextWindow, config.compactionThreshold)
+              .reserveTokens,
+          }
+        : undefined;
+
     // Capability config env, then the runtime-mode signal — read by the
     // extensions at load time below. Config only; never a secret.
     for (const [key, value] of Object.entries(config.capabilityEnv)) {
@@ -1038,10 +1113,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // see guardOpenrouterRegistration.)
       guardOpenrouterRegistration(modelRuntime);
     }
+    // bob#214: the configured pair resolves with the configured window (and
+    // output cap) wherever pi looks it up — here, on a restored session, and when
+    // pi refreshes the session's model.
+    applyModelLimits(modelRuntime, limits);
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
-      settingsManager: isolatedSettings(),
+      settingsManager: isolatedSettings(compaction),
       modelRuntime,
       resourceLoaderOptions: isolatedLoaderOptions(
         { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
@@ -1082,6 +1161,9 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       model,
       tools: policy.tools,
       ...(policy.excludeTools.length > 0 ? { excludeTools: policy.excludeTools } : {}),
+      // bob#214: the role's (or bob.yaml's) thinking level. pi clamps it to what
+      // the model declares and hands it to the provider in its own request shape.
+      ...(config.thinking !== undefined ? { thinkingLevel: config.thinking } : {}),
     });
 
     // The guard's dispose target: the session is now the thing a failed
@@ -1150,6 +1232,21 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
                 "the session could not be reloaded or bound",
               ),
       );
+    } catch (err) {
+      try {
+        disposeSession();
+      } catch {
+        // the refusal is the error that matters
+      }
+      throw err;
+    }
+
+    // bob#214: the output-cap backstop and the between-calls compaction check. A session
+    // that cannot carry them is disposed and refused, like a failed audit.
+    try {
+      installSessionBudget(result.session, {
+        log: deps?.log ?? ((m: string) => console.error(m)),
+      });
     } catch (err) {
       try {
         disposeSession();
