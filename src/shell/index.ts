@@ -277,7 +277,6 @@ export {
   runInteractiveSession,
   SETUP_TOOL_POLICY,
   type SessionDeps,
-  setupToolPolicy,
 } from "./session.js";
 export {
   auditToolNames,

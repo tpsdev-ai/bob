@@ -98,7 +98,9 @@ describe("CodeRabbit positions regressions", () => {
       expect(result.status).toBe(0);
       expect(result.stderr).toBe("");
       const policy = JSON.parse(result.stdout) as { tools: string[] };
-      expect(policy.tools).toEqual(["read", "write"]);
+      // bob#204: every setup session, the hire interview's included, runs the
+      // fixed setup policy — read + write_soul, never pi's `write`.
+      expect(policy.tools).toEqual(["read", "write_soul"]);
       expect(existsSync(join(hostRoot, "grants", "roots.json"))).toBe(true);
     } finally {
       rmSync(base, { recursive: true, force: true });

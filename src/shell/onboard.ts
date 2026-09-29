@@ -9,19 +9,19 @@
 // The session comes from bob's ONE factory through pi's InteractiveMode
 // (session.ts) — bob never spawns the pi CLI, and no argument reaches the
 // session. The interview runs under the FIXED setup policy
-// (read + write, session.ts SETUP_TOOL_POLICY), which may exceed the role's
+// (read + write_soul, session.ts SETUP_TOOL_POLICY), which may exceed the role's
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated
-// exceptions"). A model can only reach them through a shell tool, and a shell
-// can already write files, so read + write grants it nothing new.
+// exceptions"). `write_soul` is bob's own tool (write-soul.ts): it takes content
+// only, and its one target is the soul.md of the agent the session runs as
+// (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { defaultHostRoot, readGrant } from "./host-grant.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
-import { runInteractiveSession, type SessionDeps, setupToolPolicy } from "./session.js";
+import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
+import { bindSetupSoulTarget } from "./write-soul.js";
 
 export interface OnboardOptions {
   // Agent identity (must already exist on disk via initAgent).
@@ -37,8 +37,9 @@ export interface OnboardOptions {
   // over bob's session runtime.
   sessionRunner?: SessionRunner;
   deps?: SessionDeps;
-  // The host state root + positions root, for an ADOPTED agent (so the setup
-  // session's policy is resolved from its grant, not the fixed setup policy).
+  // The host state root + positions root, for an ADOPTED agent: the setup
+  // session runs the agent's grant-resolved config (capabilities, cwd). Its
+  // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
   // Defaults match resolveRunConfig.
   hostRoot?: string;
   positionsRoot?: string;
@@ -82,7 +83,8 @@ Your job in this session:
    - What's the founder's pet peeve about people in this role?
 3. As you learn, refine the persona DRAFT in your head. Don't write to disk yet.
 4. When the human signals they're done ("ship it", "that's enough", "we're good", or similar),
-   write the FULL refined persona to ${soulPath} using the Write tool, OVERWRITING whatever is there.
+   write the FULL refined persona to ${soulPath} using the write_soul tool (its only argument
+   is the content; its target is your own soul.md, bound by bob), OVERWRITING whatever is there.
    The persona should be markdown, first-person, written in YOUR voice as ${name}.
 5. After writing, summarize in one sentence what you wrote, then wait for the human to exit.
 
@@ -106,46 +108,46 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   if (!ROLE_NAME.test(opts.role)) {
     throw new Error(`invalid role: ${JSON.stringify(opts.role)} (must match ${ROLE_NAME})`);
   }
-  const soulPath = join(opts.agentDir, "soul.md");
-  const soulHashBefore = hashFile(soulPath);
-
   // The interview session runs the agent's OWN config (bob.yaml capabilities,
-  // cwd, credentials) with the interview meta-prompt appended. Its POLICY is the
-  // setup policy: the fixed read+write exception for an ordinary agent, or — for
-  // an ADOPTED agent — the grant's resolved tools plus the explicit extra `write`
-  // allowance for soul.md. It may exceed the grant's tool set and removes any
-  // `write` exclusion; no other tool is added or unexcluded.
+  // cwd, credentials) with the interview meta-prompt appended, and the fixed
+  // setup policy (read + write_soul) — never the role's or the grant's own tools,
+  // for an ordinary agent and an ADOPTED one alike (bob#204). An adopted agent's
+  // config is still resolved from its grant (capabilities, cwd).
+  //
+  // bob#204: the agents root is canonicalized ONCE, before anything is read,
+  // and that one tree supplies the config, the session's paths and the
+  // write_soul binding. An agent directory that is not `<root>/<name>` is
+  // refused before the session starts.
+  const { agentsRoot, soulPath } = bindSetupSoulTarget({
+    command: "bob onboard",
+    name: opts.name,
+    requestedAgentDir: opts.agentDir,
+  });
   const { config } = resolveRunConfig({
     name: opts.name,
-    agentsRoot: dirname(opts.agentDir),
+    agentsRoot,
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
-  const adopted = readGrant(opts.hostRoot ?? defaultHostRoot(), opts.name) !== undefined;
-  const policy = setupToolPolicy(
-    {
-      tools: config.tools,
-      excludeTools: config.excludeTools ?? [],
-      resident: false,
-      allowResidentShell: false,
-    },
-    adopted,
-  );
+  const soulHashBefore = hashFile(soulPath);
   const sessionConfig: RunSessionConfig = {
     ...config,
     provider: mapBobProviderToPi(opts.provider),
     model: opts.model,
-    // The session's tools are the setup policy, not the grant's raw set (they
-    // differ by exactly the one write tool when the grant lacks it).
-    tools: policy.tools,
-    excludeTools: policy.excludeTools,
+    // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
+    // to THIS agent's soul.md. pi's generic `write` is not granted.
+    setupSoulPath: soulPath,
+    // The session's tools are the setup policy — read + write_soul for every
+    // agent, adopted or not — never the role's or the grant's own set.
+    tools: [...SETUP_TOOL_POLICY.tools],
+    excludeTools: [...SETUP_TOOL_POLICY.excludeTools],
     appendSystemPrompt: META_PROMPT(opts.name, opts.role, soulPath),
   };
 
   const runner = opts.sessionRunner ?? runInteractiveSession;
   const exitCode = await runner({
     config: sessionConfig,
-    policy,
+    policy: SETUP_TOOL_POLICY,
     initialMessage: FIRST_MESSAGE(opts.name, opts.role, soulPath),
     deps: opts.deps,
   });

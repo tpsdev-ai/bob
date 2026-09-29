@@ -135,7 +135,9 @@ describe("FLAIR_ADMIN_PASS never reaches an agent session", () => {
       sessionRunner: probingRunner(seen),
     });
     expect(seen).toHaveLength(1);
-    expectNoOperatorPassword(seen[0], true);
+    // Setup sessions hold only read + write_soul (bob#204), so there is no bash
+    // to probe with; the child-process probe still reads the session's environment.
+    expectNoOperatorPassword(seen[0], false);
   });
 
   it("align's check-in", async () => {
@@ -152,6 +154,8 @@ describe("FLAIR_ADMIN_PASS never reaches an agent session", () => {
       sessionRunner: probingRunner(seen),
     });
     expect(seen).toHaveLength(1);
-    expectNoOperatorPassword(seen[0], true);
+    // Setup sessions hold only read + write_soul (bob#204), so there is no bash
+    // to probe with; the child-process probe still reads the session's environment.
+    expectNoOperatorPassword(seen[0], false);
   });
 });

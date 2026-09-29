@@ -147,9 +147,9 @@ existing hiring interview, and keeps the agent's OWN identity in its seed soul �
 the seed soul is the identity header plus the position's persona, never the
 generic packaged soul alone. Hire without Flair stays the default for the shipped
 positions, presented as a local identity. An ADOPTED agent's setup session
-(`bob onboard`, `bob align`) gets the grant's resolved tools plus EXACTLY the one
-`write` tool the interview needs to write `soul.md` — that single `write` is an
-explicit allowance that may exceed the grant's tool set, and nothing else does.
+(`bob onboard`, `bob align`) runs the agent's grant-resolved configuration under
+the same fixed setup policy as every other agent's — exactly `read` and
+`write_soul` (see "Stated exceptions") — never the grant's own tools.
 
 An agent with no grant is not adopted: it resolves exactly as before, so every
 existing `bob init` agent keeps booting unchanged. The one exception is the
@@ -270,16 +270,33 @@ change one, the named test is what tells you.
 ### Stated exceptions
 
 1. **Onboarding and alignment are privileged local setup commands**, available
-   to whoever runs `bob` as that OS user. For an ordinary agent they run under a
-   FIXED setup policy of `read` and `write`, which may exceed the role's ceiling —
-   the interview's job is to write `soul.md`. A model can only reach them through
-   a shell tool, and a shell can already write files, so read + write grants it
-   nothing new. For an ADOPTED agent the setup session gets the grant's resolved
-   tools PLUS one explicit `write` exception: exactly the single `write` tool the
-   interview needs to write `soul.md`. That one `write` may exceed the grant's
-   tool set — no other tool is added or unexcluded — so the interview can rewrite
-   the persona it was hired to shape. *(`test/shell/onboard.test.ts`, `align.test.ts`,
-   `test/shell/positions-195.test.ts`)*
+   to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
+   `read` and `write_soul`, for an ordinary agent and an ADOPTED one alike (never
+   the grant's own tools), which may exceed the role's ceiling — the interview's
+   job is to write `soul.md`. `write_soul` is bob's OWN tool (`src/shell/write-soul.ts`):
+   it takes `content` and no other argument, and its one target is `soul.md` in
+   the directory the session runs as. Before the session starts, bob
+   canonicalizes the agents root once, uses that one tree for the session's
+   config, paths and binding, and refuses an `--agent-dir` that names a different
+   agent's directory. It refuses a symlink in any component of that path.
+
+   **Threat model.** What this defends against is the setup session's OWN tool
+   calls. The model holds only `read` and `write_soul`, with no shell and no way
+   to start a second process, so whatever arguments it sends, the one file it can
+   write is the bound `soul.md` — not `bob.yaml`, an override, a grant, or a file
+   outside the agent directory. A concurrent local process that renames
+   directories inside the agents tree is OUT OF SCOPE: it already has the user's
+   write access. On Linux the tool's temp creation, rename and cleanup resolve
+   through an open handle on the agent directory. On macOS, where Node has no
+   directory-relative calls, they use the path, re-checked immediately before each
+   step: that protects the session's own calls and is only a best-effort check
+   against such a process. A crash mid-write can leave a temp named
+   `.soul.md.write_soul-<pid>-<24 hex>.tmp` in the agent directory; bob never
+   deletes files on name-and-age evidence, never reads that temp, and it is safe
+   to delete by hand. A model can only reach these commands through a shell tool,
+   and a shell can already write files; the exception is now a single soul.md
+   write rather than pi's unrestricted `write`. *(`test/shell/onboard.test.ts`,
+   `align.test.ts`, `write-soul.test.ts`, `positions-195.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
 3. **The contract costs tokens, per request.** The task is sent in the first

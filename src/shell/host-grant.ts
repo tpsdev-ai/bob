@@ -19,7 +19,8 @@
 // — but that placement is NOT a containment boundary. Any same-user writer can
 // edit the grant file, and that includes the agent's OWN built-in file tools: pi
 // resolves `write`/`edit` paths outside the session cwd, so a positioned agent
-// (and its setup session) can write the grant path directly. What gives it force
+// that holds them can write the grant path directly (its setup session cannot:
+// it holds only read + write_soul, bob#204). What gives it force
 // is that boot RE-READS and CHECKS it, not that it is authenticated:
 //
 //   Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189.
