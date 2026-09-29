@@ -51,6 +51,8 @@ interface HarnessSummary {
   ok: boolean;
   authorization?: string;
   messages?: unknown;
+  protocol?: string;
+  probeProtocol?: string;
   error?: string;
 }
 
@@ -142,4 +144,11 @@ test("the discord REST client sends an authed request and reads the response", a
   expect(summary.authorization).toBe(`Bot ${TOKEN}`);
   // And the client resolved with the server's JSON.
   expect(summary.messages).toEqual(EXPECTED_MESSAGES);
+
+  // The fixture is an HTTP/2 endpoint: through the pinned undici's own
+  // transport it negotiates h2 — the transport bob#217's failure used — so the
+  // mutation (undoing the fix) reproduces the reported h2 failure against this
+  // same server. The fixed client makes its own call with the runtime's fetch
+  // (see summary.protocol).
+  expect(summary.probeProtocol).toBe("2.0");
 });

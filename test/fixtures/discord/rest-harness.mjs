@@ -17,6 +17,7 @@
 
 import fs from "node:fs";
 import http2 from "node:http2";
+import { Agent, request as undiciRequest } from "undici";
 import { DiscordJsClient } from "../../../dist/capabilities/discord/discord-js-client.js";
 
 const [tlsDir, token] = process.argv.slice(2);
@@ -50,35 +51,58 @@ const server = http2.createSecureServer({
   allowHTTP1: true,
 });
 
-// Record the Authorization header the request arrives with. Node's HTTP/2
-// server emits the HTTP/1-compatible "request" event for h2 streams too, so
-// one handler covers both the h2 path (undici's default) and the HTTP/1.1
-// path a plain fetch takes.
+// Record the Authorization header the request arrives with, and the HTTP
+// version the server negotiated for it. Node's HTTP/2 server emits the
+// HTTP/1-compatible "request" event for h2 streams too, so one handler covers
+// both the h2 path (the pinned undici's default, and the transport bob#217's
+// failure used) and the HTTP/1.1 path a plain fetch takes.
+const versions = [];
 let authorization;
 server.on("request", (req, res) => {
+  versions.push(req.httpVersion);
   authorization = req.headers.authorization;
   res.setHeader("content-type", "application/json");
+  // Mirror the reported Discord response, which carried a Set-Cookie header.
+  res.setHeader("set-cookie", "bob_fixture=1; Path=/");
   res.end(JSON.stringify(MESSAGES));
 });
 
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const { port } = server.address();
+const apiBase = `https://127.0.0.1:${port}`;
 
 // The capability's own client, constructed the way the capability constructs it.
 // Only the REST API base is pointed at the local server.
 const client = new DiscordJsClient({ token, botUserId: "999" });
-client.client.rest.options.api = `https://127.0.0.1:${port}`;
+client.client.rest.options.api = apiBase;
 
 let result;
 try {
   const messages = await client.fetchRecent("123456", 5);
-  result = { ok: true, authorization, messages };
+  result = { ok: true, authorization, messages, protocol: versions[0] };
 } catch (err) {
   result = {
     ok: false,
     authorization,
+    protocol: versions[0],
     error: err instanceof Error ? err.message : String(err),
   };
 }
+
+// Probe the fixture through the pinned undici's OWN transport, to show it
+// negotiates HTTP/2 — the transport bob#217's failure used. The fixed client
+// makes its call with the runtime's fetch instead. A short keep-alive keeps the
+// harness from lingering on the probe's socket.
+const probeAgent = new Agent({ keepAliveTimeout: 1, keepAliveMaxTimeout: 1 });
+try {
+  const probe = await undiciRequest(`${apiBase}/probe`, { dispatcher: probeAgent });
+  await probe.body.dump();
+  result.probeProtocol = versions[1];
+} catch (err) {
+  result.probeProtocol = `error: ${err instanceof Error ? err.message : String(err)}`;
+} finally {
+  await probeAgent.close();
+}
+
 server.close();
 console.log(JSON.stringify(result));

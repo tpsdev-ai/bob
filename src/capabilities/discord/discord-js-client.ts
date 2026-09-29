@@ -48,6 +48,33 @@ import type { DiscordClient, DiscordMessage } from "../../shell/discord-types.js
 // string values) and an `AbortSignal`. We forward exactly those, copying the
 // headers by their OWN enumerable string keys only, so no symbol-keyed entry
 // (the `sensitiveHeaders` one included) can reach a Headers constructor.
+//
+// Two things the manager offers are deliberately NOT forwarded:
+//
+//   * `dispatcher` / agent. @discordjs/rest only sets one when a caller gives
+//     the manager an agent, and this binding never does (DiscordJsClient never
+//     calls setAgent); in this capability the value is always absent. When a
+//     caller did set one it is an npm-undici dispatcher, and Node's global
+//     fetch rejects a foreign dispatcher ("invalid onRequestStart method"), so
+//     forwarding it would fail every request — the same class of failure this
+//     function exists to remove. We drop it instead of passing it through.
+//
+//   * redirects. A followed cross-origin redirect drops the Authorization
+//     header, so an authenticated call could leave the process unauthenticated;
+//     and the Discord API does not redirect. We ask fetch not to follow and turn
+//     any 3xx into an error that names the status and the target host.
+//
+// Derive the host a redirect points at, for the error text. A missing or
+// unparseable Location is named as such, never assumed benign.
+function redirectTargetHost(location: string | null, base: string): string {
+  if (!location) return "an unspecified location";
+  try {
+    return new URL(location, base).host;
+  } catch {
+    return "an unparseable location";
+  }
+}
+
 export async function makeDiscordRestRequest(
   url: string,
   init: Parameters<RESTOptions["makeRequest"]>[1],
@@ -57,12 +84,22 @@ export async function makeDiscordRestRequest(
   for (const [name, value] of Object.entries(initHeaders)) {
     if (typeof value === "string") headers.set(name, value);
   }
-  return fetch(url, {
+  const res = await fetch(url, {
     method: init.method ?? "GET",
     headers,
     body: (init.body ?? undefined) as NonNullable<Parameters<typeof fetch>[1]>["body"],
     signal: init.signal ?? undefined,
+    redirect: "manual",
   });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(
+      `discord REST: refusing to follow a redirect (HTTP ${res.status} to ${redirectTargetHost(
+        res.headers.get("location"),
+        url,
+      )})`,
+    );
+  }
+  return res;
 }
 
 export interface DiscordJsClientOptions {
