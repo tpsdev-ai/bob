@@ -375,21 +375,24 @@ async function run(
   return result.exitCode;
 }
 
-// `bob install-service <name>` — write the agent's launchd plist so it self-runs
-// (KeepAlive + RunAtLoad). Does NOT start it — that's `bob up`. The plist runs
-// `bob run <name>`; it embeds NO secrets (the discord token is read from the
-// file path in bob.yaml at runtime).
+// `bob install-service <name>` — write the agent's service unit so it self-runs
+// (KeepAlive + RunAtLoad). Does NOT start it — that's `bob up`. The unit runs
+// bob under Node: `<interpreter> <bob> run <name>`, with the interpreter
+// resolved at install time; it embeds NO secrets (the discord token is read
+// from the file path in bob.yaml at runtime).
 async function installServiceCmd(
   name: string,
   flags: Record<string, string | boolean>,
 ): Promise<number> {
-  // launchd + systemd both use a minimal PATH, so the unit needs an absolute
-  // path to `bob`. Default to the current executable's path when not overridden.
+  // launchd + systemd both use a minimal PATH, so the unit needs ABSOLUTE paths
+  // to `bob` and to a Node interpreter. Default the bob path to this process's
+  // own script; installService resolves the interpreter (or refuses the install
+  // with a remedy when no Node is available).
   const bobBin = stringFlag(flags, "bob-bin") ?? (process.argv[1] || "bob");
   const model = stringFlag(flags, "model");
-  const { path: written } = await installService({ name, bobBin, model });
+  const { path: written, interpreter } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
-  console.log(`  runs:    ${bobBin} run ${name}`);
+  console.log(`  runs:    ${interpreter} ${bobBin} run ${name}`);
   console.log(`  next:    bob up ${name}   (load + start)`);
   if (bobBin === "bob") {
     console.error(
