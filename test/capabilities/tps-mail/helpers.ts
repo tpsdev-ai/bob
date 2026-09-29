@@ -39,6 +39,9 @@ export interface EnvelopeFields {
   messageId?: string;
   timestamp?: string;
   subject?: string;
+  // The signed thread id (`tps mail send --reply-to`). Set only when the key is
+  // present, so any value — null or a non-string included — can be signed.
+  replyToId?: unknown;
   // Extra agent hops BEFORE `from` (each signed with its own key).
   priorAgents?: Array<{ agent: string; key: TestKey }>;
 }
@@ -87,6 +90,7 @@ export function signTestEnvelope(
     timestamp: ts,
     delegationChain: chain,
   };
+  if ("replyToId" in fields) envelope.replyToId = fields.replyToId;
   envelope.signature = `ed25519:${sign(null, Buffer.from(canonicalize(envelope)), fromKey.privateKey).toString("base64")}`;
   return envelope;
 }

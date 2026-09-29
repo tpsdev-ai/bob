@@ -667,6 +667,8 @@ describe("bob#200 x bob#195 — an adopted agent's runtime capabilities are the 
         .includes("tps-mail");
     const home = join(s.agentsRoot, "..", "doctor-home");
     mkdirSync(home, { recursive: true });
+    // An empty PATH: doctor probes the tps CLI it finds there, and this test is
+    // about the effective capability set, never a real CLI on the developer's PATH.
     const doctor = () =>
       runDoctor({
         name: "mq",
@@ -674,6 +676,7 @@ describe("bob#200 x bob#195 — an adopted agent's runtime capabilities are the 
         homeDir: home,
         hostRoot: s.hostRoot,
         positionsRoot: s.positionsRoot,
+        pathEnv: join(home, "no-bin"),
       }).checks;
 
     expect(runtime()).toBe(true);
