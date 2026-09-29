@@ -1,6 +1,6 @@
-// Regression test for #221: the WHOLE suite must not leave temporary
-// directories under TMPDIR — and this check must not pass vacuously when the
-// suite it runs fails or is truncated.
+// Regression test for #221: the WHOLE suite must not leave temporary entries
+// under TMPDIR (apart from one top-level name exempted below) — and this check
+// must not pass vacuously when the suite it runs fails or is truncated.
 //
 // It runs `bun test ./test` in a CHILD process with TMPDIR pointed at a fresh
 // empty directory, waits for the child, and asserts THREE things:
@@ -9,16 +9,16 @@
 //      fail THIS check, not sail through on the "Ran N tests" text alone;
 //   2. the child ran the WHOLE suite — Bun's end summary reports how many files
 //      it ran, and that count must equal the test files discovered under test/;
-//   3. no top-level entry other than the runtime's `jiti` cache is left behind.
+//   3. no top-level entry is left behind except the name exempted below.
 //
 // It is OPT-IN: the normal suite skips it (it spawns a whole second suite), and
 // CI runs it in its own job with BOB_LEAK_CHECK=1. A guard env var stops the
 // child from re-running THIS file, which would recurse.
 //
-// The runtime itself creates a couple of paths under TMPDIR during a run. They
-// are named EXPLICITLY below (today only `jiti`), never by a broad pattern. The
-// exemption covers that whole top-level entry, so a leak INSIDE `jiti` would not
-// be detected; any other top-level leftover fails the check.
+// One top-level name is exempted: `jiti`, the name the runtime's transpile cache
+// uses under TMPDIR. The exemption matches the NAME only: the check cannot tell
+// who created an entry with that name, and a leak placed inside it would not be
+// detected. Any other top-level leftover fails the check.
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -26,8 +26,9 @@ import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
-// Paths the RUNTIME (not a test) creates directly under TMPDIR during a run.
-const RUNTIME_CREATED = new Set(["jiti"]);
+// Top-level names exempted by NAME only (the runtime's transpile cache uses `jiti`).
+// Matching a name cannot establish who created the entry or what is inside it.
+const EXEMPT_BY_NAME = new Set(["jiti"]);
 
 const IS_CHILD = process.env.BOB_LEAK_CHECK_CHILD === "1";
 const ENABLED = process.env.BOB_LEAK_CHECK === "1";
@@ -49,7 +50,7 @@ describe("leak check (#221)", () => {
   // and unless explicitly enabled — the normal suite stays fast, and CI runs
   // this file in its own job with BOB_LEAK_CHECK=1.
   (IS_CHILD || !ENABLED ? test.skip : test)(
-    "the whole suite leaves no temporary directory under TMPDIR",
+    "the whole suite leaves no top-level entry under TMPDIR except the name-exempted jiti",
     () => {
       const tmpRoot = mkdtempSync(join(tmpdir(), "bob-leak-check-"));
       // A real TMPDIR is world-traversable (/tmp is 1777); mkdtempSync makes a
@@ -87,9 +88,9 @@ describe("leak check (#221)", () => {
           ranFiles,
           `child ran ${ranFiles} files but ${onDisk} test files exist under ${relative(REPO_ROOT, TEST_ROOT)}/`,
         ).toBe(onDisk);
-        // (3) Nothing but the runtime-created paths may remain (a leak is named
-        // by the leftover entries, so a failure reports the offending prefix).
-        const leftover = readdirSync(tmpRoot).filter((e) => !RUNTIME_CREATED.has(e));
+        // (3) No top-level entry may remain except the names in EXEMPT_BY_NAME
+        // (matched by name only). A failure lists the leftover entries.
+        const leftover = readdirSync(tmpRoot).filter((e) => !EXEMPT_BY_NAME.has(e));
         expect(leftover).toEqual([]);
       } finally {
         rmSync(tmpRoot, { recursive: true, force: true });
