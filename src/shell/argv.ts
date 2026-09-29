@@ -49,6 +49,7 @@ export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "force",
   "no-interactive",
   "no-flair",
+  "flair",
   "interactive",
 ]);
 

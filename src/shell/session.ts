@@ -89,6 +89,14 @@ export const SETUP_TOOL_POLICY: ToolPolicy = {
   allowResidentShell: false,
 };
 
+// SETUP_TOOL_POLICY is the policy of EVERY setup session, an ADOPTED agent's
+// included. bob#195 slice 1 gave an adopted agent's setup session the grant's
+// resolved tools plus pi's `write`; bob#204 replaces that too: pi's `write`
+// accepts any path, and a grant's tools can include a shell, so either would let
+// the interview write files other than soul.md. The grant still governs every
+// other session of an adopted agent (resolveRunConfig), and its setup session
+// still runs the agent's grant-resolved config (capabilities, cwd).
+
 // ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
 //
 // Round 2 pinned the endpoint with a CHECK against `.pi-agent/models.json` — and

@@ -35,6 +35,11 @@ export interface AlignOptions {
   // Test seam: the interactive session. Defaults to pi's InteractiveMode over
   // bob's session runtime.
   sessionRunner?: SessionRunner;
+  // The host state root + positions root, for an ADOPTED agent: the setup
+  // session runs the agent's grant-resolved config (capabilities, cwd). Its
+  // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
+  hostRoot?: string;
+  positionsRoot?: string;
 }
 
 export interface AlignResult {
@@ -86,6 +91,8 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   const { config, agentDir: runAgentDir } = resolveRunConfig({
     name: opts.name,
     agentsRoot: dirname(requestedAgentDir),
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const { soulPath } = bindSetupSoulTarget({
     command: "bob align",
@@ -112,6 +119,10 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     // boundary where a bob name enters.
     provider: opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : config.provider,
     model: opts.model ?? config.model,
+    // The session's tools are the setup policy — read + write_soul for every
+    // agent, adopted or not — never the role's or the grant's own set.
+    tools: [...SETUP_TOOL_POLICY.tools],
+    excludeTools: [...SETUP_TOOL_POLICY.excludeTools],
     appendSystemPrompt: META_PROMPT(opts.name, soulPath),
   };
 

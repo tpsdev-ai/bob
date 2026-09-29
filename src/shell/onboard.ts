@@ -38,6 +38,12 @@ export interface OnboardOptions {
   // over bob's session runtime.
   sessionRunner?: SessionRunner;
   deps?: SessionDeps;
+  // The host state root + positions root, for an ADOPTED agent: the setup
+  // session runs the agent's grant-resolved config (capabilities, cwd). Its
+  // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
+  // Defaults match resolveRunConfig.
+  hostRoot?: string;
+  positionsRoot?: string;
 }
 
 // The interactive-session seam. Defaults to pi's InteractiveMode; tests inject
@@ -105,12 +111,15 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   }
   // The interview session runs the agent's OWN config (bob.yaml capabilities,
   // cwd, credentials) with the interview meta-prompt appended, and the fixed
-  // setup policy — never the role's ceiling, which is what makes the interview
-  // able to write soul.md at all.
+  // setup policy (read + write_soul) — never the role's or the grant's own tools,
+  // for an ordinary agent and an ADOPTED one alike (bob#204). An adopted agent's
+  // config is still resolved from its grant (capabilities, cwd).
   const requestedAgentDir = resolve(opts.agentDir);
   const { config, agentDir: runAgentDir } = resolveRunConfig({
     name: opts.name,
     agentsRoot: dirname(requestedAgentDir),
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   // bob#204: write_soul is bound to the directory the session RUNS AS; an
   // agent directory that is not that one is refused before the session starts.
@@ -128,6 +137,10 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
     // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
     // to THIS agent's soul.md. pi's generic `write` is not granted.
     setupSoulPath: soulPath,
+    // The session's tools are the setup policy — read + write_soul for every
+    // agent, adopted or not — never the role's or the grant's own set.
+    tools: [...SETUP_TOOL_POLICY.tools],
+    excludeTools: [...SETUP_TOOL_POLICY.excludeTools],
     appendSystemPrompt: META_PROMPT(opts.name, opts.role, soulPath),
   };
 

@@ -1,0 +1,8 @@
+{
+  "name": "reviewer",
+  "version": "0.1.0",
+  "role": "reviewer",
+  "tools": ["read", "bash", "grep"],
+  "capabilities": { "permitted": ["flair"], "default": [] },
+  "files": [{ "path": "soul.md", "kind": "soul" }]
+}
