@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCapabilities } from "../../src/shell/bob-yaml.js";
-import { initAgent } from "../../src/shell/init.js";
+import { initAgent, stampedToolAllowlist } from "../../src/shell/init.js";
+import { loadRole } from "../../src/shell/role-loader.js";
 import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
 import { knownToolNames } from "../../src/shell/tool-allowlist.js";
 
@@ -180,14 +181,15 @@ describe("initAgent", () => {
     // builder-local's role allows run/run_status/run_cancel, but only the
     // flair capability is stamped by bob init. work is NOT stamped, so those
     // tools cannot exist. bash is a pi built-in but also NOT in the builder-local
-    // role's ceiling. A stamped builder-local agent carries only grip tools
-    // (grep, find, ls) and the flair trio.
+    // role's ceiling. A stamped builder-local agent carries only the read-only
+    // built-ins (grep, find, ls) and the flair trio.
     const res = initAgent({ ...baseOpts(), name: "bot-bl-check", role: "builder-local" });
     const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
-    expect(names).not.toContain("bash");
-    expect(names).not.toContain("run");
-    expect(names).not.toContain("run_status");
-    expect(names).not.toContain("run_cancel");
+    expect(names).toEqual(["grep", "find", "ls", "flair_search", "flair_write", "flair_get"]);
+    // With work among the capabilities, the run tools are stamped; bash never is.
+    const withWork = stampedToolAllowlist(loadRole("builder-local").tools.allow, ["flair", "work"]);
+    for (const tool of ["run", "run_status", "run_cancel"]) expect(withWork).toContain(tool);
+    expect(withWork).not.toContain("bash");
   });
 
   it("loads a freshly initialised agent of EVERY role (allowlist ⊆ what can exist)", () => {

@@ -40,26 +40,102 @@ export const PI_BUILTIN_TOOLS = [
   "powershell",
 ] as const;
 
-// What a resident agent must not hold unless its role opts in: a shell and the
-// tools that write files. A resident agent runs unattended behind its service
-// unit, with no human at the keyboard to approve a command.
+// What each tool an agent's allowlist can name does, reviewed by hand, one row
+// per name (bob#213). The rows cover pi's built-ins and every tool a blessed
+// capability's manifest declares in `provides.tools`, planned capabilities
+// included, so no capability goes live with a tool nobody classified.
+// test/shell/tool-allowlist.test.ts fails on such a name without a row, and on a
+// row whose name nothing provides.
 //
-// `run` (the work capability, bob#211) executes arbitrary commands, so it is
-// shell-equivalent and dropped with `bash` and `powershell`: without it here, a
-// resident role listing `run` would hold arbitrary execution without the
-// `allowResidentShell` opt-in. `run_status` and `run_cancel` execute nothing and
-// are not gated.
-export const RESIDENT_EXCLUDED_TOOLS = [
-  "bash",
-  "write",
-  "edit",
-  "powershell",
-  "run",
+// The manifests are the authority, not the extensions' `registerTool` calls: a
+// session's `tools` allowlist is required (resolveToolPolicy), it resolves only
+// pi built-ins and names in a built capability's `provides.tools`
+// (auditToolNames), and pi enables only the names that allowlist lists. A tool
+// an extension registers without declaring it can never be active. The setup
+// sessions' bob-owned `write_soul` has no row: no allowlist can name it, and
+// the setup policy (SETUP_TOOL_POLICY in session.ts, read + write_soul) is fixed.
+//
+//   read-only  reads and reports; changes nothing.
+//   writer     writes a file the model names, or runs a command the model
+//              writes. A resident agent drops these unless its role opts in.
+//   effect     changes something without writing a file the model names or
+//              running a command: a memory write, a Discord post or reaction,
+//              a status report, a robot action, or cancelling a job this run
+//              started. A resident agent keeps these (the jarvis role holds
+//              flair_write and discord_reply without the shell opt-in).
+export type ToolEffect = "read-only" | "writer" | "effect";
 
-   "write_file",
-  "edit_lines",
-  "insert_after",
-] as const;
+// The writer rows come first, in the order RESIDENT_EXCLUDED_TOOLS lists them.
+export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze({
+  bash: "writer", // pi: runs a command
+  write: "writer", // pi: writes a file
+  edit: "writer", // pi: edits a file
+  powershell: "writer", // pi (Windows): runs a command
+  run: "writer", // work: runs a command
+  write_file: "writer", // anchored-edit: writes a file
+  edit_lines: "writer", // anchored-edit: edits a file
+  insert_after: "writer", // anchored-edit: edits a file
+  flair_write: "effect", // flair: writes a memory
+  discord_reply: "effect", // discord: posts a message
+  discord_react: "effect", // discord: adds a reaction
+  observatory_report: "effect", // observatory: posts the office's status
+  reachy_look: "effect", // reachy: turns the robot's head
+  reachy_say: "effect", // reachy: speaks a line
+  reachy_frame: "effect", // reachy: asks the robot for a camera frame
+  run_cancel: "effect", // work: stops a job this run started
+  mail_send: "effect", // mail (planned): sends a mail
+  read: "read-only", // pi
+  grep: "read-only", // pi
+  find: "read-only", // pi
+  ls: "read-only", // pi
+  read_lines: "read-only", // anchored-edit
+  run_status: "read-only", // work
+  flair_search: "read-only", // flair
+  flair_get: "read-only", // flair
+  discord_fetch: "read-only", // discord
+  reachy_state: "read-only", // reachy (placeholder)
+  bob_fixture_noop: "read-only", // fixture: echoes its argument
+});
+
+// Every tool name an agent's allowlist could name: pi's built-ins, then every
+// name a blessed capability's manifest provides (built or planned), in catalog
+// order.
+export function providedToolNames(): string[] {
+  const names = new Set<string>(PI_BUILTIN_TOOLS);
+  for (const entry of Object.values(BLESSED_CATALOG)) {
+    for (const tool of entry.manifest.provides?.tools ?? []) names.add(tool);
+  }
+  return [...names];
+}
+
+// The provided names that have no row in `effects`.
+export function unclassifiedToolNames(
+  provided: readonly string[] = providedToolNames(),
+  effects: Readonly<Record<string, ToolEffect>> = TOOL_EFFECTS,
+): string[] {
+  return provided.filter((name) => !Object.hasOwn(effects, name));
+}
+
+// The names a resident agent drops: every writer row, in row order, then every
+// provided name with no row at all. Allowlist-shaped: a resident agent keeps a
+// tool only when its row says read-only or effect, so a missing classification
+// drops the tool; it never keeps it.
+export function residentExclusions(
+  provided: readonly string[] = providedToolNames(),
+  effects: Readonly<Record<string, ToolEffect>> = TOOL_EFFECTS,
+): string[] {
+  const writers = Object.keys(effects).filter((name) => effects[name] === "writer");
+  return [...new Set([...writers, ...unclassifiedToolNames(provided, effects)])];
+}
+
+// What a resident agent must not hold unless its role opts in
+// (`allowResidentShell`). A resident agent runs unattended behind its service
+// unit, with no human at the keyboard to approve a command or a file write.
+//
+// Every writer is dropped (`run`, bob#211, with `bash` and `powershell`; the
+// anchored-edit writers with pi's `write` and `edit`), and so is any provided
+// name without a row. `run_status` and `run_cancel` run nothing and are kept.
+export const RESIDENT_EXCLUDED_TOOLS: readonly string[] = Object.freeze(residentExclusions());
 
 // What a MAIL TURN may hold (bob#200 §4, F4): an explicit, reviewed ALLOWLIST,
 // never a denylist. A mail turn answers ONE allow-listed peer and whatever it

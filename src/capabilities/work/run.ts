@@ -48,7 +48,7 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { formatSize, getShellConfig, truncateTail } from "@earendil-works/pi-coding-agent";
 import {
   type GroupOps,
@@ -365,9 +365,11 @@ function canonicalPath(p: string): string {
   }
 }
 
+// `child` is `parent` or below it. A path escapes only through a whole ".."
+// segment: a name that merely starts with two dots (`..cache`) is inside.
 function isInside(parent: string, child: string): boolean {
   const rel = relative(canonicalPath(parent), canonicalPath(child));
-  return rel === "" || (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 // An owner-only directory: a real directory (not a symlink), owned by this user,
@@ -630,9 +632,9 @@ export class JobManager {
         `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not an existing directory. Pass an existing directory, relative to the workspace, or omit cwd.`,
       );
     }
-    // Containment: the resolved path must stay inside the workspace.
-    // Resolve symlinks first (realpath) for both workspace and cwd to catch
-    // a symlink inside the workspace pointing outside.
+    // Containment: the directory must stay inside the workspace. Both paths are
+    // resolved through symlinks (realpath) first, so a symlink inside the
+    // workspace that points outside it is refused.
     const workspace = canonicalPath(ctxCwd);
     const resolved = canonicalPath(dir);
     if (!isInside(workspace, resolved)) {

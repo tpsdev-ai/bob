@@ -199,7 +199,7 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
       cwd: Type.Optional(
         Type.String({
           description:
-             "Working directory, relative to the workspace or an absolute path inside it. Omit to run in the workspace.",
+            "Working directory, relative to the workspace or an absolute path inside it. Omit to run in the workspace.",
         }),
       ),
       timeout_s: Type.Optional(

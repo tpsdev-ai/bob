@@ -9,11 +9,15 @@ import { loadRole } from "../../src/shell/role-loader.js";
 import {
   auditToolNames,
   knownToolNames,
+  PI_BUILTIN_TOOLS,
   RESIDENT_EXCLUDED_TOOLS,
   type RoleToolCeiling,
   residentDroppedTools,
+  residentExclusions,
   resolveToolNames,
   resolveToolPolicy,
+  TOOL_EFFECTS,
+  unclassifiedToolNames,
 } from "../../src/shell/tool-allowlist.js";
 
 // The block exactly as `bob init` emits it.
@@ -382,38 +386,95 @@ describe("shipped roles", () => {
       expect(names).toContain(name);
     }
     // Not a pi tool, never indexed as one.
+    expect(names).not.toContain("webfetch");
   });
-  it("all registered file-writing tools are in RESIDENT_EXCLUDED_TOOLS", () => {
-    const fileWriters: string[] = [];
-    for (const entry of Object.values(BLESSED_CATALOG)) {
-      const tools = entry.manifest.provides?.tools ?? [];
-      for (const t of tools) {
-        if (
-          t.startsWith("edit_") ||
-          t.startsWith("write_") ||
-          t.startsWith("insert_") ||
-          t === "run"
-        ) {
-          if (!fileWriters.includes(t)) fileWriters.push(t);
-        }
-      }
+});
+
+// bob#213: the resident policy is allowlist-shaped over TOOL_EFFECTS, a reviewed
+// classification of every tool an agent's allowlist can name.
+describe("the reviewed tool classification (TOOL_EFFECTS)", () => {
+  // Enumerated HERE, not through the source's own helpers, from the authority
+  // the name resolution uses: pi's built-ins plus every blessed capability's
+  // manifest `provides.tools`, planned capabilities included.
+  function providedHere(): string[] {
+    const names = new Set<string>(PI_BUILTIN_TOOLS);
+    for (const [capability, entry] of Object.entries(BLESSED_CATALOG)) {
+      const tools = entry.manifest.provides?.tools;
+      // A manifest with no tools array would add nothing, silently.
+      expect({ capability, isArray: Array.isArray(tools) }).toEqual({ capability, isArray: true });
+      for (const tool of tools ?? []) names.add(tool);
     }
-    for (const tool of fileWriters) {
-      expect(RESIDENT_EXCLUDED_TOOLS).toContain(tool);
+    return [...names];
+  }
+
+  it("the enumeration reaches the capabilities' tools (it is not empty)", () => {
+    const names = providedHere();
+    for (const name of [
+      "write_file",
+      "edit_lines",
+      "insert_after",
+      "run",
+      "run_cancel",
+      "flair_write",
+      "discord_reply",
+      "reachy_frame",
+      "observatory_report",
+      "bob_fixture_noop",
+      "mail_send",
+    ]) {
+      expect(names).toContain(name);
     }
   });
-  it("goes RED when a writer tool is not in RESIDENT_EXCLUDED_TOOLS", () => {
-    const hypotheticalTool = "write_xxx";
-    const isWriter =
-      hypotheticalTool.startsWith("edit_") ||
-      hypotheticalTool.startsWith("write_") ||
-      hypotheticalTool.startsWith("insert_") ||
-      hypotheticalTool === "run";
-    expect(isWriter).toBe(true);
-    const fileWriters: string[] = [];
-    if (isWriter) fileWriters.push(hypotheticalTool);
-    for (const tool of fileWriters) {
-      expect(RESIDENT_EXCLUDED_TOOLS).toContain(tool);
-    }
+
+  it("classifies every tool pi or a blessed capability provides", () => {
+    // Adding a tool to a manifest without a TOOL_EFFECTS row turns this red,
+    // naming the tool.
+    expect(providedHere().filter((name) => !Object.hasOwn(TOOL_EFFECTS, name))).toEqual([]);
+    // The source's own view agrees; it is what the resident exclusion reads.
+    expect(unclassifiedToolNames()).toEqual([]);
+  });
+
+  it("has no row for a name nothing provides", () => {
+    const provided = new Set(providedHere());
+    expect(Object.keys(TOOL_EFFECTS).filter((name) => !provided.has(name))).toEqual([]);
+  });
+
+  it("a resident agent drops exactly the writer rows", () => {
+    expect(RESIDENT_EXCLUDED_TOOLS).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
+    expect(RESIDENT_EXCLUDED_TOOLS).toEqual(
+      Object.keys(TOOL_EFFECTS).filter((name) => TOOL_EFFECTS[name] === "writer"),
+    );
+  });
+
+  it("a resident agent keeps every read-only and effect tool, and nothing else", () => {
+    const all = knownToolNames();
+    const yaml = `tools:\n  allow:\n${all.map((name) => `    - ${name}`).join("\n")}\n`;
+    const p = resolveToolPolicy({ yamlText: yaml, tools: readTools(yaml), resident: true });
+    const kept = p.tools.filter((name) => !p.excludeTools.includes(name));
+    expect(kept).toEqual(
+      all.filter((name) => TOOL_EFFECTS[name] === "read-only" || TOOL_EFFECTS[name] === "effect"),
+    );
+    expect(kept).toContain("flair_write");
+    expect(kept).toContain("discord_reply");
+    expect(kept).toContain("run_cancel");
+    expect(kept).not.toContain("write_file");
+  });
+
+  it("fails closed: a provided name with no row is dropped, not kept", () => {
+    const effects = { read: "read-only", bash: "writer" } as const;
+    expect(unclassifiedToolNames(["read", "bash", "save_file"], effects)).toEqual(["save_file"]);
+    expect(residentExclusions(["read", "bash", "save_file"], effects)).toEqual([
+      "bash",
+      "save_file",
+    ]);
   });
 });
