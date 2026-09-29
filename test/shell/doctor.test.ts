@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatReport, runDoctor } from "../../src/shell/doctor.js";
@@ -574,6 +582,23 @@ describe("formatReport", () => {
 //
 // ACCEPTANCE (doctor half): "an empty allow-list makes the capability refuse
 // to load, and doctor fails" — (d2).
+
+// `tps mail --help` as a CLI that takes the reply contract prints it (the
+// relevant lines of tpsdev-ai/cli main after #431), and as 0.7.0 prints it.
+const TPS_MAIL_USAGE_WITH_CONTRACT = [
+  "Usage:",
+  "  tps mail send <agent> <message>   Send signed mail to a local or remote agent",
+  "  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId",
+  "  tps mail check [agent]             Read available messages (leases processing)",
+  "",
+].join("\n");
+const TPS_MAIL_USAGE_070 = [
+  "Usage:",
+  "  tps mail send <agent> <message>   Send mail to a local or remote agent",
+  "  tps mail check [agent]             Read available messages (leases processing)",
+  "",
+].join("\n");
+
 describe("runDoctor — tps-mail", () => {
   let home: string;
   let pathDir: string;
@@ -585,8 +610,7 @@ describe("runDoctor — tps-mail", () => {
     // this host is a delivery target, and the tps-mail capability declared.
     pathDir = join(home, "bin");
     mkdirSync(pathDir, { recursive: true });
-    writeFileSync(join(pathDir, "tps"), "#!/bin/sh\nexit 0\n");
-    chmodSync(join(pathDir, "tps"), 0o755);
+    fakeTps(TPS_MAIL_USAGE_WITH_CONTRACT);
     mkdirSync(join(home, ".tps", "identity"), { recursive: true });
     writeFileSync(join(home, ".tps", "identity", "host.seed"), "stub");
     writeYaml({});
@@ -595,6 +619,17 @@ describe("runDoctor — tps-mail", () => {
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
   });
+
+  // A fake tps on the private PATH: `tps mail --help` prints `usage` (from a
+  // file, so no quoting is involved) and exits `code`; any other argv exits 0.
+  function fakeTps(usage: string, code = 0, extra = "") {
+    writeFileSync(join(pathDir, "tps-usage.txt"), usage);
+    writeFileSync(
+      join(pathDir, "tps"),
+      `#!/bin/sh\n${extra}if [ "$1" = mail ] && [ "$2" = --help ]; then /bin/cat "${join(pathDir, "tps-usage.txt")}"; exit ${code}; fi\nexit 0\n`,
+    );
+    chmodSync(join(pathDir, "tps"), 0o755);
+  }
 
   function writeYaml(o: {
     senders?: string[];
@@ -700,9 +735,10 @@ describe("runDoctor — tps-mail", () => {
   });
 
   it("(d6) FAILS when the tps CLI is not on PATH, or the signing key is missing", () => {
-    expect(check(doctor(join(home, "empty-path")), "tps-mail reply transport")?.status).toBe(
-      "fail",
-    );
+    const noTps = doctor(join(home, "empty-path"));
+    expect(check(noTps, "tps-mail reply transport")?.status).toBe("fail");
+    // No CLI, nothing to probe: the transport failure is the report.
+    expect(check(noTps, "tps-mail reply contract")).toBeUndefined();
     rmSync(join(home, ".flair", "keys", "testbot.key"));
     const c = check(doctor(), "tps-mail reply transport");
     expect(c?.status).toBe("fail");
@@ -840,5 +876,83 @@ describe("runDoctor — tps-mail", () => {
     expect(c?.detail).toContain("held for inspection=1 (marker-malformed=1)");
     expect(c?.detail).toContain("marker read failures=2");
     expect(c?.detail).toContain("reap exhausted=1");
+  });
+
+  // The reply contract (tpsdev-ai/cli#431): bob replies with `tps mail send
+  // <to> --stdin --reply-to <messageId>`, so doctor asks the tps on PATH
+  // whether it takes that. Every unknown answer FAILS; none passes.
+  it("(rc1) a tps whose mail usage names --stdin and --reply-to passes", () => {
+    const report = doctor();
+    const c = check(report, "tps-mail reply contract");
+    expect(c?.status).toBe("ok");
+    expect(c?.detail).toBe(`${join(pathDir, "tps")} takes 'mail send --stdin --reply-to'`);
+    expect(report.summary.fail).toBe(0);
+  });
+
+  it("(rc2) a 0.7.0-shaped tps (no --stdin, no --reply-to) FAILS naming both flags and the remedy", () => {
+    fakeTps(TPS_MAIL_USAGE_070);
+    const report = doctor();
+    const c = check(report, "tps-mail reply contract");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("names no --stdin or --reply-to");
+    expect(c?.detail).toContain("every reply would fail closed");
+    expect(c?.fix).toContain("tpsdev-ai/cli#431");
+    expect(report.summary.fail).toBeGreaterThan(0);
+    // The CLI and the key are there: only the contract fails.
+    expect(check(report, "tps-mail reply transport")?.status).toBe("ok");
+  });
+
+  it("(rc3) a usage naming only --stdin FAILS naming --reply-to", () => {
+    fakeTps("  tps mail send <agent> --stdin   Read the body from stdin\n");
+    const c = check(doctor(), "tps-mail reply contract");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("names no --reply-to");
+  });
+
+  it("(rc4) a probe that exits non-zero FAILS, even when its output names both flags", () => {
+    fakeTps(TPS_MAIL_USAGE_WITH_CONTRACT, 3);
+    const c = check(doctor(), "tps-mail reply contract");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("exited 3");
+  });
+
+  it("(rc5) a probe past its timeout is killed and FAILS", () => {
+    fakeTps(TPS_MAIL_USAGE_WITH_CONTRACT, 0, "exec /bin/sleep 30\n");
+    const started = Date.now();
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+      pathEnv: pathDir,
+      tpsProbeTimeoutMs: 300,
+    });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const c = check(report, "tps-mail reply contract");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("did not finish within 300ms");
+  }, 15_000);
+
+  it("(rc6) a probe that cannot start FAILS instead of throwing", () => {
+    writeFileSync(join(pathDir, "tps"), "#!/nonexistent/interpreter\n");
+    chmodSync(join(pathDir, "tps"), 0o755);
+    const c = check(doctor(), "tps-mail reply contract");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("could not be run");
+  });
+
+  it("(rc7) the probe gets PATH and HOME only — no ambient variable reaches it", () => {
+    const envOut = join(home, "probe-env.txt");
+    fakeTps(TPS_MAIL_USAGE_WITH_CONTRACT, 0, `/usr/bin/env > "${envOut}"\n`);
+    process.env.BOB_DOCTOR_PROBE_SENTINEL = "ambient";
+    try {
+      expect(check(doctor(), "tps-mail reply contract")?.status).toBe("ok");
+    } finally {
+      delete process.env.BOB_DOCTOR_PROBE_SENTINEL;
+    }
+    const seen = readFileSync(envOut, "utf8");
+    expect(seen).toContain(`HOME=${home}\n`);
+    expect(seen).toContain(`PATH=${pathDir}\n`);
+    expect(seen).not.toContain("BOB_DOCTOR_PROBE_SENTINEL");
   });
 });
