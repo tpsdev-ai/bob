@@ -7,6 +7,7 @@
 // The wrapper uses the runtime's global fetch, which these exercise directly.
 import { describe, expect, it } from "bun:test";
 import {
+  copyStringHeaders,
   DiscordJsClient,
   makeDiscordRestRequest,
 } from "../../../src/capabilities/discord/discord-js-client.js";
@@ -147,5 +148,28 @@ describe("makeDiscordRestRequest — a refused redirect releases its body", () =
     } finally {
       (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
     }
+  });
+});
+
+describe("copyStringHeaders — every HeadersInit form", () => {
+  it("keeps string headers from a plain object, a Headers instance and pairs", () => {
+    const fromObject = copyStringHeaders({ authorization: "Bot tok", "x-a": "1" });
+    const fromHeaders = copyStringHeaders(new Headers({ authorization: "Bot tok", "x-a": "1" }));
+    const fromPairs = copyStringHeaders([
+      ["authorization", "Bot tok"],
+      ["x-a", "1"],
+    ]);
+    for (const h of [fromObject, fromHeaders, fromPairs]) {
+      expect(h.get("authorization")).toBe("Bot tok");
+      expect(h.get("x-a")).toBe("1");
+    }
+  });
+
+  it("drops symbol keys and non-string values", () => {
+    const raw: Record<string | symbol, unknown> = { "x-ok": "yes", "x-num": 7 };
+    raw[Symbol("sensitiveHeaders")] = ["authorization"];
+    const h = copyStringHeaders(raw);
+    expect(h.get("x-ok")).toBe("yes");
+    expect(h.has("x-num")).toBe(false);
   });
 });

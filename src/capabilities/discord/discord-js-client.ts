@@ -75,15 +75,41 @@ function redirectTargetHost(location: string | null, base: string): string {
   }
 }
 
+/**
+ * Copy the string-valued headers of any HeadersInit form: a Headers-like object
+ * (anything with forEach, including another fetch implementation's Headers), an
+ * array of [name, value] pairs, or a plain object. Only string names and values
+ * are kept; a symbol-keyed entry (what undici attaches to raw response headers)
+ * never reaches the runtime's Headers constructor.
+ */
+export function copyStringHeaders(source: unknown): Headers {
+  const headers = new Headers();
+  if (source == null) return headers;
+  if (Array.isArray(source)) {
+    for (const pair of source) {
+      if (Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") {
+        headers.append(pair[0], pair[1]);
+      }
+    }
+  } else if (typeof (source as { forEach?: unknown }).forEach === "function") {
+    (source as { forEach: (cb: (value: unknown, name: unknown) => void) => void }).forEach(
+      (value, name) => {
+        if (typeof name === "string" && typeof value === "string") headers.append(name, value);
+      },
+    );
+  } else if (typeof source === "object") {
+    for (const [name, value] of Object.entries(source as Record<string, unknown>)) {
+      if (typeof value === "string") headers.set(name, value);
+    }
+  }
+  return headers;
+}
+
 export async function makeDiscordRestRequest(
   url: string,
   init: Parameters<RESTOptions["makeRequest"]>[1],
 ): Promise<Response> {
-  const headers = new Headers();
-  const initHeaders = (init.headers ?? {}) as Record<string, unknown>;
-  for (const [name, value] of Object.entries(initHeaders)) {
-    if (typeof value === "string") headers.set(name, value);
-  }
+  const headers = copyStringHeaders(init.headers);
   const res = await fetch(url, {
     method: init.method ?? "GET",
     headers,
