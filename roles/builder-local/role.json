@@ -18,5 +18,9 @@
     "allowResidentShell": true
   },
   "default_provider": "exe-dev-gateway",
-  "default_model": "claude-sonnet-4-6"
+  "default_model": "claude-sonnet-4-6",
+  "session": {
+    "compaction_threshold": 0.5,
+    "thinking": "low"
+  }
 }

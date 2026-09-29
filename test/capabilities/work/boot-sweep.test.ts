@@ -20,7 +20,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -31,6 +34,7 @@ import {
   identityFromProc,
   type ProcIdentity,
   processInstanceId,
+  RunRefusal,
   readProcIdentity,
 } from "../../../src/capabilities/work/run.js";
 import { type GroupOps, NODE_GROUP_OPS } from "../../../src/shell/process-group.js";
@@ -515,4 +519,68 @@ describe("the process identity reader", () => {
       expect(readProcIdentity(process.pid)).toBe("unsupported");
     },
   );
+});
+
+describe("run's cwd stays inside the workspace (bob#213)", () => {
+  // The containment check's own refusal. A cwd that does not exist is refused
+  // before it, with "is not an existing directory".
+  const OUTSIDE = "run refused: cwd resolves outside the workspace";
+
+  it("accepts a relative path that resolves inside the workspace", async () => {
+    live = await workSession({ script: program() });
+    mkdirSync(join(live.cwd, "sub"));
+    const j = await live.work.manager.start({ command: "echo ok", cwd: "sub" }, live.cwd);
+    await j.done;
+    expect(j.outcome).toBe("exited");
+    expect(j.exitCode).toBe(0);
+    await live.work.manager.endRun();
+  });
+
+  it("accepts a directory inside the workspace whose name starts with two dots (..cache)", async () => {
+    live = await workSession({ script: program() });
+    mkdirSync(join(live.cwd, "..cache"));
+    const j = await live.work.manager.start({ command: "echo ok", cwd: "..cache" }, live.cwd);
+    await j.done;
+    expect(j.outcome).toBe("exited");
+    expect(j.exitCode).toBe(0);
+    await live.work.manager.endRun();
+  });
+
+  it("refuses a cwd that escapes the workspace (..)", async () => {
+    live = await workSession({ script: program() });
+    let err: unknown;
+    try {
+      await live.work.manager.start({ command: "echo out", cwd: ".." }, live.cwd);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(RunRefusal);
+    expect((err as Error).message).toContain(`${OUTSIDE} ${live.cwd} `);
+    await live.work.manager.endRun();
+  });
+
+  it("refuses a symlink inside the workspace that resolves outside it", async () => {
+    live = await workSession({ script: program() });
+    // The target EXISTS and is outside the workspace: a sibling of it in the
+    // session's scratch directory, removed with the session. So the existence
+    // check passes and only the containment check can refuse. A setup step
+    // that fails throws and fails the test.
+    const outside = join(live.scratch, "outside");
+    mkdirSync(outside);
+    const link = join(live.cwd, "outside-link");
+    symlinkSync(outside, link, "dir");
+    expect(statSync(link).isDirectory()).toBe(true);
+    expect(realpathSync(link)).toBe(realpathSync(outside));
+    expect(realpathSync(outside).startsWith(`${realpathSync(live.cwd)}/`)).toBe(false);
+    let err: unknown;
+    try {
+      await live.work.manager.start({ command: "echo out", cwd: "outside-link" }, live.cwd);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(RunRefusal);
+    expect((err as Error).message).toContain(`${OUTSIDE} ${live.cwd} `);
+    expect((err as Error).message).toContain(`(resolved to ${realpathSync(outside)})`);
+    await live.work.manager.endRun();
+  });
 });

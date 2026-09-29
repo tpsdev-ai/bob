@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BobRole } from "./index.js";
+import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
 
 export interface RoleTemplate {
   role: BobRole;
@@ -16,6 +17,12 @@ export interface RoleTemplate {
   };
   default_provider?: string;
   default_model?: string;
+  // bob#214: the role's session budget — when to compact (a fraction of the
+  // model's context window, checked between model calls) and how much to think
+  // (off | low | high). bob.yaml's `session:` block overrides either key for
+  // one agent. Absent: pi's own defaults. Validated at load: an unknown key or
+  // a malformed value is a load error, like any other role.json defect.
+  session?: SessionBudget;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -48,8 +55,22 @@ export function loadRole(role: BobRole): RoleTemplate {
     const config = JSON.parse(readFileSync(configPath, "utf8")) as Omit<
       RoleTemplate,
       "soul" | "role"
-    >;
-    return { role, soul, ...config };
+    > & { session?: unknown };
+    let session: SessionBudget | undefined;
+    if (config.session !== undefined) {
+      if (
+        config.session === null ||
+        typeof config.session !== "object" ||
+        Array.isArray(config.session)
+      ) {
+        throw new ModelBudgetError(`${configPath}: "session" must be an object.`);
+      }
+      session = parseSessionBudget(
+        config.session as Record<string, unknown>,
+        `${configPath} "session"`,
+      );
+    }
+    return { role, soul, ...config, ...(session !== undefined ? { session } : {}) } as RoleTemplate;
   }
   throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);
 }

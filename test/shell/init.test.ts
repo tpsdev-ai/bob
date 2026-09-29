@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCapabilities } from "../../src/shell/bob-yaml.js";
-import { initAgent } from "../../src/shell/init.js";
+import { initAgent, stampedToolAllowlist } from "../../src/shell/init.js";
+import { loadRole } from "../../src/shell/role-loader.js";
 import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
 import { knownToolNames } from "../../src/shell/tool-allowlist.js";
 
@@ -68,6 +69,7 @@ describe("initAgent", () => {
     role: "ea" as const,
     provider: "ollama-cloud",
     model: "kimi-k2.6",
+    contextWindow: 262_144,
     agentsRoot: tmpRoot,
     flairKeysDir: keysRoot,
   });
@@ -174,6 +176,21 @@ describe("initAgent", () => {
     expect(names).not.toContain("discord_fetch");
     expect(names).not.toContain("discord_react");
     expect(names.join(",")).not.toContain("mcp__");
+  });
+
+  it("builder-local stamps neither bash nor run (work capability is not declared)", () => {
+    // builder-local's role allows run/run_status/run_cancel, but only the
+    // flair capability is stamped by bob init. work is NOT stamped, so those
+    // tools cannot exist. bash is a pi built-in but also NOT in the builder-local
+    // role's ceiling. A stamped builder-local agent carries only the read-only
+    // built-ins (grep, find, ls) and the flair trio.
+    const res = initAgent({ ...baseOpts(), name: "bot-bl-check", role: "builder-local" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    expect(names).toEqual(["grep", "find", "ls", "flair_search", "flair_write", "flair_get"]);
+    // With work among the capabilities, the run tools are stamped; bash never is.
+    const withWork = stampedToolAllowlist(loadRole("builder-local").tools.allow, ["flair", "work"]);
+    for (const tool of ["run", "run_status", "run_cancel"]) expect(withWork).toContain(tool);
+    expect(withWork).not.toContain("bash");
   });
 
   it("loads a freshly initialised agent of EVERY role (allowlist ⊆ what can exist)", () => {
@@ -509,5 +526,67 @@ describe("initAgent", () => {
       );
       expect(messages.some((m) => m.includes("nudge-gw"))).toBe(false);
     });
+  });
+});
+
+// bob#214: the context window is written into bob.yaml, never guessed.
+describe("initAgent — the context window (bob#214)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bob-init-214-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  const opts = (name: string) => ({
+    name,
+    role: "builder-local" as const,
+    provider: "ollama-cloud",
+    model: "kimi-k2.6",
+    agentsRoot: root,
+    skipFlair: true,
+  });
+
+  it("writes provider.context_window when given, and resolveRunConfig binds it to the model", () => {
+    initAgent({ ...opts("cw-set"), contextWindow: 262_144 });
+    const yaml = readFileSync(join(root, "cw-set", "bob.yaml"), "utf8");
+    expect(yaml).toMatch(/^ {2}context_window: 262144$/m);
+    const { config } = resolveRunConfig({ name: "cw-set", agentsRoot: root });
+    expect(config.modelLimits).toEqual({
+      provider: "ollama-cloud",
+      model: "kimi-k2.6",
+      contextWindow: 262_144,
+    });
+    // The builder-local role's session budget reaches the config.
+    expect(config.compactionThreshold).toBe(0.5);
+    expect(config.thinking).toBe("low");
+  });
+
+  it("without one, writes a commented placeholder, warns, and leaves the window UNDECLARED", () => {
+    const originalError = console.error;
+    const calls: string[] = [];
+    console.error = (...args: unknown[]) => {
+      calls.push(args.join(" "));
+    };
+    try {
+      initAgent(opts("cw-unset"));
+    } finally {
+      console.error = originalError;
+    }
+    const yaml = readFileSync(join(root, "cw-unset", "bob.yaml"), "utf8");
+    expect(yaml).toContain("# context_window: <tokens>");
+    expect(yaml).not.toMatch(/^ {2}context_window:/m);
+    expect(calls.some((m) => m.includes("provider.context_window"))).toBe(true);
+    const { config } = resolveRunConfig({ name: "cw-unset", agentsRoot: root });
+    expect(config.modelLimits).toBeUndefined();
+  });
+
+  it("refuses a context window that is not a positive whole number", () => {
+    expect(() => initAgent({ ...opts("cw-bad"), contextWindow: 0 })).toThrow(
+      /positive whole number/,
+    );
+    expect(() => initAgent({ ...opts("cw-bad2"), contextWindow: 1.5 })).toThrow(
+      /positive whole number/,
+    );
   });
 });

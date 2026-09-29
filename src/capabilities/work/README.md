@@ -17,18 +17,27 @@ It registers three tools through `pi.registerTool`:
 | `run_status` | `run_id?` | one job's state, outcome, cleanup and output excerpt; with no `run_id`, every job this run owns |
 | `run_cancel` | `run_id` | cancels one of this run's jobs by its recorded process group |
 
+`cwd` is relative to the workspace, or an absolute path inside it; omitted, the
+command starts in the workspace. It must be an existing directory, and after
+symlinks are resolved it must still be inside the workspace; otherwise `run`
+refuses the call, naming the path it resolved, and starts nothing. This fixes
+where a command starts, not what it can reach: the command itself can still
+change directory.
+
 ## Enabling it
 
-`roles/builder-local/role.json` allows `run`, `run_status` and `run_cancel`, and
-does not allow `bash`: in that role, `run` replaces pi's shell, and that is a
-fact of the config (tool availability is a per-role allow-list), not of load
-order. An agent opts in the same way as for `anchored-edit`: `work` under
-`capabilities:` in `bob.yaml` and the three names in `tools.allow:`.
+The `work` capability is what enables `run`. `roles/builder-local/role.json`
+allows `run`, `run_status` and `run_cancel`, and does not allow `bash`: in that
+role, `run` replaces pi's shell, and that is a fact of the config (tool
+availability is a per-role allow-list), not of load order. An agent opts in the
+same way as for `anchored-edit`: `work` under `capabilities:` in `bob.yaml` and
+the three names in `tools.allow:`.
 
 `run` executes arbitrary commands, so the resident policy treats it as a shell:
-it is in `RESIDENT_EXCLUDED_TOOLS` with `bash` and `powershell`, and a resident
-agent keeps it only when its role sets `tools.allowResidentShell` (builder-local
-does). `run_status` and `run_cancel` execute nothing and are not gated.
+its `TOOL_EFFECTS` row is `writer`, so it is in `RESIDENT_EXCLUDED_TOOLS` with
+`bash` and `powershell`, and a resident agent keeps it only when its role sets
+`tools.allowResidentShell` (builder-local does). `run_status` and `run_cancel`
+execute nothing and are not gated.
 
 ## The deadline
 

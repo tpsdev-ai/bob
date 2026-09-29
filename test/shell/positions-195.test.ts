@@ -149,6 +149,7 @@ it("hire rejects direct Flair opt-in before scaffolding", async () => {
       hostRoot: s.hostRoot,
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       skipFlair: false,
+      contextWindow: 200_000,
       interview: noopInterview,
     }),
   ).rejects.toThrow(/Flair.*not supported.*slice 1/i);
@@ -226,6 +227,7 @@ const hireBuilder = (name: string, interview: SessionRunner = noopInterview) =>
     hostRoot: s.hostRoot,
     positionsRoot: DEFAULT_POSITIONS_ROOT,
     skipFlair: true,
+    contextWindow: 200_000,
     interview,
   });
 
@@ -386,6 +388,7 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       hostRoot: s.hostRoot,
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
 
@@ -533,6 +536,7 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       hostRoot: s.hostRoot,
       positionsRoot: s.positionsRoot,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     // Control: m1 IS adopted, and its ordinary session holds the grant's file and
@@ -600,6 +604,7 @@ describe("bob#200 x bob#195 — an adopted agent's runtime capabilities are the 
       hostRoot: s.hostRoot,
       positionsRoot: s.positionsRoot,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     const yaml = readFileSync(bobYamlPath("mp"), "utf8");
@@ -646,6 +651,7 @@ describe("bob#200 x bob#195 — an adopted agent's runtime capabilities are the 
       hostRoot: s.hostRoot,
       positionsRoot: s.positionsRoot,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     const yaml = readFileSync(bobYamlPath("mq"), "utf8");
@@ -714,6 +720,7 @@ describe("bob#195 blocker 4 — slice 1 refuses a position that declares a secre
         hostRoot: s.hostRoot,
         positionsRoot: s.positionsRoot,
         skipFlair: true,
+        contextWindow: 200_000,
         interview: noopInterview,
       });
     } catch (e) {
@@ -801,6 +808,7 @@ describe("bob#195 blocker 6 — unsupported file kinds, soul overrides, and the 
         hostRoot: s.hostRoot,
         positionsRoot: s.positionsRoot,
         skipFlair: true,
+        contextWindow: 200_000,
         interview: noopInterview,
       });
     } catch (e) {
@@ -992,6 +1000,7 @@ describe("positions (bob#195) — 2. hire a valid position; refuse an above-ceil
         hostRoot: s.hostRoot,
         positionsRoot: s.positionsRoot,
         skipFlair: true,
+        contextWindow: 200_000,
         interview: noopInterview,
       });
     } catch (e) {
@@ -1119,6 +1128,7 @@ describe("positions (bob#195) — 3. boot refusals for an ungranted role / capab
       hostRoot: s.hostRoot,
       positionsRoot: s.positionsRoot,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     const allowedYaml = readFileSync(bobYamlPath("presence-allowed"), "utf8");
@@ -1506,6 +1516,7 @@ describe("bob#195 round 3, blocker 4 — both reference forms are a single top-l
       hostRoot: s.hostRoot,
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     expect(readGrant(s.hostRoot, "ref1")?.position.name).toBe("builder");
@@ -1527,6 +1538,7 @@ describe("bob#195 round 3, blocker 4 — both reference forms are a single top-l
       hostRoot: s.hostRoot,
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       skipFlair: true,
+      contextWindow: 200_000,
       interview: noopInterview,
     });
     // The grant pins the TOP-LEVEL name, so boot reloads the same directory.
@@ -1571,6 +1583,7 @@ describe("bob#195 round 3, blocker 4 — both reference forms are a single top-l
         hostRoot: s.hostRoot,
         positionsRoot: s.positionsRoot,
         skipFlair: true,
+        contextWindow: 200_000,
         interview: noopInterview,
       });
     } catch (e) {
@@ -1969,6 +1982,7 @@ describe("bob#195 round 6, blocker 2 — every deterministic refusal runs BEFORE
           hostRoot: s.hostRoot,
           positionsRoot: DEFAULT_POSITIONS_ROOT,
           skipFlair: true,
+          contextWindow: 200_000,
           provider: "openrouter",
           model: "deepseek/deepseek-v4.1-flash",
           interview: noopInterview,
@@ -2002,6 +2016,7 @@ describe("bob#195 round 6, blocker 2 — every deterministic refusal runs BEFORE
         hostRoot: s.hostRoot,
         positionsRoot: DEFAULT_POSITIONS_ROOT,
         skipFlair: true,
+        contextWindow: 200_000,
         interview: noopInterview,
         commitHook: (step) => {
           if (step === "scaffold") scaffoldSteps += 1;
@@ -2059,6 +2074,7 @@ describe("bob#195 round 6, blocker 4 — a failure at any commit stage rolls bac
           hostRoot: s.hostRoot,
           positionsRoot: DEFAULT_POSITIONS_ROOT,
           skipFlair: true,
+          contextWindow: 200_000,
           interview: noopInterview,
           commitHook: failAt(stage),
         }),

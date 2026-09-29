@@ -1,4 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   detectPlatform,
   down,
@@ -7,15 +12,25 @@ import {
   plistPath,
   renderPlist,
   renderSystemdUnit,
+  resolveNodeExecutable,
   restart,
+  serviceCommandArgs,
   serviceLabel,
   servicePath,
   systemdUnitName,
   systemdUnitPath,
   up,
 } from "../../src/shell/service.js";
+import { spawnNode } from "../cli-spawn.js";
 
 const HOME = "/Users/test";
+// A fixed interpreter for render assertions (the real default is the resolved
+// Node executable — see resolveNodeExecutable).
+const INTERPRETER = "/opt/node/bin/node";
+// The repo's bin/bob — the acceptance test runs the unit's OWN command line.
+const BOB_BIN = fileURLToPath(new URL("../../bin/bob", import.meta.url));
+// The built CLI, for the test that reads its printed install-service command.
+const CLI = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
 
 // Capture launchctl/systemctl invocations without running the real binary.
 function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
@@ -29,10 +44,19 @@ function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
 
 describe("renderPlist", () => {
   it("references the PERSISTENT entrypoint (bob run <name>)", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const xml = renderPlist({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
     expect(xml).toContain("<string>/usr/local/bin/bob</string>");
     expect(xml).toContain("<string>run</string>");
     expect(xml).toContain("<string>pulse</string>");
+    // The interpreter is absolute and comes BEFORE the bob script (bob#218).
+    expect(xml).toContain(
+      `    <string>${INTERPRETER}</string>\n    <string>/usr/local/bin/bob</string>`,
+    );
   });
 
   it("sets KeepAlive + RunAtLoad (the agent self-runs)", () => {
@@ -158,8 +182,13 @@ describe("lifecycle (launchd) — up / down / restart invoke the right launchctl
 
 describe("systemd backend", () => {
   it("renderSystemdUnit runs the persistent entrypoint + Restart=always, no secret", () => {
-    const unit = renderSystemdUnit({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
-    expect(unit).toContain("ExecStart=/usr/local/bin/bob run pulse");
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
+    expect(unit).toContain(`ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse`);
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain(`WorkingDirectory=${HOME}/agents/pulse/work`);
@@ -173,9 +202,12 @@ describe("systemd backend", () => {
       name: "pulse",
       bobBin: "/usr/local/bin/bob",
       model: "claude-fast",
+      interpreter: INTERPRETER,
       home: HOME,
     });
-    expect(unit).toContain("ExecStart=/usr/local/bin/bob run pulse --model claude-fast");
+    expect(unit).toContain(
+      `ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse --model claude-fast`,
+    );
     expect(() => renderSystemdUnit({ name: "../evil", bobBin: "/bin/bob" })).toThrow(
       /invalid agent name/,
     );
@@ -195,6 +227,7 @@ describe("systemd backend", () => {
     const res = await installService({
       name: "pulse",
       bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
       home: HOME,
       platform: "systemd",
       writeFile: (path, contents) => written.push({ path, contents }),
@@ -202,7 +235,7 @@ describe("systemd backend", () => {
     });
     expect(res.path).toBe(`${HOME}/.config/systemd/user/bob-pulse.service`);
     expect(written[0].path).toBe(res.path);
-    expect(written[0].contents).toContain("ExecStart=/usr/local/bin/bob run pulse");
+    expect(written[0].contents).toContain(`ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse`);
     expect(calls).toEqual([["--user", "daemon-reload"]]);
   });
 
@@ -235,4 +268,300 @@ describe("systemd backend", () => {
     // No override → host platform (just assert it returns a valid backend).
     expect(["launchd", "systemd"]).toContain(detectPlatform());
   });
+});
+
+describe("the unit does not depend on the service manager's PATH (bob#218)", () => {
+  it("launchd: the default interpreter is an absolute Node path", () => {
+    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const interpreter = resolveNodeExecutable();
+    expect(basename(interpreter)).toBe("node");
+    expect(xml).toContain(
+      `    <string>${interpreter}</string>\n    <string>/usr/local/bin/bob</string>`,
+    );
+  });
+
+  it("systemd: the default interpreter is an absolute Node path", () => {
+    const unit = renderSystemdUnit({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const interpreter = resolveNodeExecutable();
+    expect(basename(interpreter)).toBe("node");
+    expect(unit).toContain(`ExecStart=${interpreter} /usr/local/bin/bob run pulse`);
+  });
+});
+
+describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () => {
+  it("returns the installer's own interpreter when it IS node", () => {
+    expect(resolveNodeExecutable({ execPath: "/usr/local/bin/node", pathEnv: "" })).toBe(
+      "/usr/local/bin/node",
+    );
+  });
+
+  it("finds node on the installer's PATH when the installer is not node", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bob-node-path-"));
+    writeFileSync(join(dir, "node"), "#!/bin/sh\n");
+    chmodSync(join(dir, "node"), 0o755);
+    try {
+      expect(resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
+        join(dir, "node"),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("makes a RELATIVE PATH entry absolute", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bob-node-rel-"));
+    writeFileSync(join(dir, "node"), "#!/bin/sh\n");
+    chmodSync(join(dir, "node"), 0o755);
+    try {
+      const rel = relative(process.cwd(), dir); // a RELATIVE PATH entry
+      expect(rel.startsWith("/")).toBe(false); // premise: it IS relative
+      const resolved = resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: rel });
+      expect(resolved).toBe(join(dir, "node"));
+      expect(resolved.startsWith("/")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a DIRECTORY named node in favour of a real node file later on PATH", () => {
+    const dirOnly = mkdtempSync(join(tmpdir(), "bob-node-isdir-"));
+    const fileDir = mkdtempSync(join(tmpdir(), "bob-node-isfile-"));
+    mkdirSync(join(dirOnly, "node")); // a DIRECTORY named node
+    writeFileSync(join(fileDir, "node"), "#!/bin/sh\n");
+    chmodSync(join(fileDir, "node"), 0o755);
+    try {
+      const delimiter = process.platform === "win32" ? ";" : ":";
+      const resolved = resolveNodeExecutable({
+        execPath: "/opt/bun/bin/bun",
+        pathEnv: `${dirOnly}${delimiter}${fileDir}`,
+      });
+      // The directory is skipped; the real file later on PATH is chosen.
+      expect(resolved).toBe(join(fileDir, "node"));
+    } finally {
+      rmSync(dirOnly, { recursive: true, force: true });
+      rmSync(fileDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses with the engines floor and the PATH remedy when no node is found", () => {
+    const empty = mkdtempSync(join(tmpdir(), "bob-no-node-"));
+    try {
+      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: empty })).toThrow(
+        /22\.19\.0/,
+      );
+      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: empty })).toThrow(
+        /on PATH/,
+      );
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("installService resolves the interpreter at install time (bob#218)", () => {
+  it("a bun-launched install writes the Node path, not bun", async () => {
+    const written: Array<{ path: string; contents: string }> = [];
+    const res = await installService({
+      name: "pulse",
+      bobBin: BOB_BIN,
+      home: HOME,
+      platform: "systemd",
+      writeFile: (path, contents) => written.push({ path, contents }),
+      runSystemctl: async () => ({ code: 0, stderr: "" }),
+    });
+    // process.execPath is the test runner (bun); the unit must still be node.
+    expect(basename(res.interpreter)).toBe("node");
+    expect(basename(res.interpreter)).not.toBe(basename(process.execPath));
+    expect(written[0].contents).toContain(`ExecStart=${res.interpreter} ${BOB_BIN} run pulse`);
+  });
+
+  it("a non-node installer resolves node from its PATH", async () => {
+    const binDir = mkdtempSync(join(tmpdir(), "bob-install-bin-"));
+    const nodePath = join(binDir, "node");
+    writeFileSync(nodePath, "#!/bin/sh\n");
+    chmodSync(nodePath, 0o755);
+    const written: Array<{ path: string; contents: string }> = [];
+    try {
+      const res = await installService({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        platform: "systemd",
+        execPath: "/opt/bun/bin/bun",
+        pathEnv: binDir,
+        writeFile: (path, contents) => written.push({ path, contents }),
+        runSystemctl: async () => ({ code: 0, stderr: "" }),
+      });
+      expect(res.interpreter).toBe(nodePath);
+      expect(written).toHaveLength(1);
+      expect(written[0].contents).toContain(`ExecStart=${nodePath} ${BOB_BIN} run pulse`);
+      expect(written[0].contents).not.toContain("/opt/bun/bin/bun");
+    } finally {
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when no node is available, and writes NOTHING", async () => {
+    const empty = mkdtempSync(join(tmpdir(), "bob-install-nonode-"));
+    const written: Array<{ path: string; contents: string }> = [];
+    try {
+      const attempt = installService({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        platform: "systemd",
+        execPath: "/opt/bun/bin/bun",
+        pathEnv: empty,
+        writeFile: (path, contents) => written.push({ path, contents }),
+        runSystemctl: async () => ({ code: 0, stderr: "" }),
+      });
+      await expect(attempt).rejects.toThrow(/22\.19\.0/);
+      expect(written).toHaveLength(0);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+// The acceptance from bob#218: run the unit's OWN command line with a PATH that
+// does not contain the interpreter, and get a working `bob --help` out of it.
+describe("the rendered unit runs under a minimal PATH with no interpreter on it (bob#218)", () => {
+  const minimalPath = mkdtempSync(join(tmpdir(), "bob-218-nopath-"));
+  afterAll(() => rmSync(minimalPath, { recursive: true, force: true }));
+
+  // The unit's tokens up to and including the bob script: an absolute
+  // interpreter (when present) followed by bobBin. The unit appends the
+  // subcommand; the test runs `--help` so no agent is needed.
+  function interpreterAndBob(tokens: string[]): string[] {
+    const i = tokens.indexOf(BOB_BIN);
+    if (i < 0) throw new Error(`the bob script is not in the unit: ${tokens.join(" ")}`);
+    return tokens.slice(0, i + 1);
+  }
+
+  function programArguments(plist: string): string[] {
+    const array = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
+    if (!array) throw new Error("no ProgramArguments array in the plist");
+    return [...array[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]);
+  }
+
+  function execStart(unit: string): string[] {
+    const line = unit.split("\n").find((l) => l.startsWith("ExecStart="));
+    if (!line) throw new Error("no ExecStart in the systemd unit");
+    return line
+      .slice("ExecStart=".length)
+      .split(" ")
+      .filter((t) => t.length > 0);
+  }
+
+  function helpUnderMinimalPath(command: string[]): { code: number | null; out: string } {
+    const r = spawnSync(command[0], [...command.slice(1), "--help"], {
+      env: { HOME, PATH: minimalPath },
+      encoding: "utf8",
+    });
+    return { code: r.status, out: r.stdout ?? "" };
+  }
+
+  it("the minimal PATH really has no node on it (so the test can see the defect)", () => {
+    const r = spawnSync("node", ["--version"], {
+      env: { HOME, PATH: minimalPath },
+      encoding: "utf8",
+    });
+    expect(r.error).toBeDefined(); // ENOENT — node is not resolvable on this PATH
+  });
+
+  it("launchd: the rendered command runs under the resolved Node and gets bob --help to exit 0", () => {
+    const plist = renderPlist({ name: "pulse", bobBin: BOB_BIN, home: HOME });
+    const head = interpreterAndBob(programArguments(plist));
+    expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
+    const res = helpUnderMinimalPath(head);
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Usage: bob");
+  });
+
+  it("systemd: the rendered command runs under the resolved Node and gets bob --help to exit 0", () => {
+    const unit = renderSystemdUnit({ name: "pulse", bobBin: BOB_BIN, home: HOME });
+    const head = interpreterAndBob(execStart(unit));
+    expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
+    const res = helpUnderMinimalPath(head);
+    expect(res.code).toBe(0);
+    expect(res.out).toContain("Usage: bob");
+  });
+});
+
+// The unit writes its command as `ExecStart=` (systemd) or an array of
+// <string> entries (launchd); read whichever the host platform produced.
+function unitCommand(unitText: string): string {
+  if (process.platform === "darwin") {
+    const array = unitText.match(/<array>([\s\S]*?)<\/array>/)?.[1] ?? "";
+    return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]).join(" ");
+  }
+  const line = unitText.split("\n").find((l) => l.startsWith("ExecStart="));
+  return (line ?? "").slice("ExecStart=".length);
+}
+
+describe("the printed install-service command is the unit's command (bob#218)", () => {
+  it("renderers and installService build it from ONE argument list", async () => {
+    const argv = serviceCommandArgs({
+      interpreter: INTERPRETER,
+      bobBin: "/usr/local/bin/bob",
+      name: "pulse",
+      model: "claude-fast",
+    });
+    expect(argv).toEqual([
+      INTERPRETER,
+      "/usr/local/bin/bob",
+      "run",
+      "pulse",
+      "--model",
+      "claude-fast",
+    ]);
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      model: "claude-fast",
+      home: HOME,
+    });
+    expect(unit).toContain(`ExecStart=${argv.join(" ")}`);
+
+    const written: Array<{ path: string; contents: string }> = [];
+    const res = await installService({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      model: "claude-fast",
+      home: HOME,
+      platform: "systemd",
+      writeFile: (path, contents) => written.push({ path, contents }),
+      runSystemctl: async () => ({ code: 0, stderr: "" }),
+    });
+    expect(res.argv).toEqual(argv);
+    expect(written[0].contents).toContain(`ExecStart=${argv.join(" ")}`);
+  });
+
+  it("the CLI prints exactly the command the unit runs, including --model", () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-print-home-"));
+    const binDir = mkdtempSync(join(tmpdir(), "bob-print-bin-"));
+    // A stub systemctl so the install's daemon-reload succeeds without a bus.
+    writeFileSync(join(binDir, "systemctl"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(binDir, "systemctl"), 0o755);
+    try {
+      const out = spawnNode(
+        [CLI, "install-service", "pulse", "--bob-bin", BOB_BIN, "--model", "claude-fast"],
+        { env: { ...process.env, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` } },
+      );
+      const printed = out
+        .split("\n")
+        .find((l) => l.includes("runs:"))
+        ?.split("runs:")[1]
+        ?.trim();
+      expect(printed).toContain("--model claude-fast");
+      // The unit the CLI just wrote carries the same command verbatim.
+      const unitText = readFileSync(servicePath("pulse", { home }), "utf8");
+      expect(printed).toBe(unitCommand(unitText));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

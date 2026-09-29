@@ -95,6 +95,11 @@ export interface InitOptions {
   // is the agent's OWN identity plus the position's persona — never the generic
   // role template alone.
   soulBody?: string;
+  // bob#214: the context window (tokens) the server enforces for `model`,
+  // written to bob.yaml as provider.context_window. Every session refuses to
+  // start without one, so an agent scaffolded without it gets a commented
+  // placeholder and a warning, and must have it set before it runs.
+  contextWindow?: number;
 }
 
 export interface InitResult {
@@ -120,6 +125,14 @@ export interface InitResult {
 export function initAgent(opts: InitOptions): InitResult {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${opts.name} (must match ${AGENT_NAME})`);
+  }
+  if (
+    opts.contextWindow !== undefined &&
+    (!Number.isSafeInteger(opts.contextWindow) || opts.contextWindow <= 0)
+  ) {
+    throw new Error(
+      `bob: the context window must be a positive whole number of tokens (got ${String(opts.contextWindow)})`,
+    );
   }
   // Validates the role + loads the template. Throws on unknown / unsafe role.
   const template = loadRole(opts.role);
@@ -171,6 +184,11 @@ export function initAgent(opts: InitOptions): InitResult {
   // writePiAgentConfig's doc comment for why bare baseUrl configs aren't
   // enough for `bob run`.
   written.push(...writePiAgentConfig(opts, agentDir));
+  if (opts.contextWindow === undefined) {
+    console.error(
+      `⚠ Set provider.context_window in ${yamlPath} before running — bob refuses to start a session without the model's context window.`,
+    );
+  }
 
   // bin/<name> launcher
   const binPath = join(agentDir, "bin", opts.name);
@@ -226,6 +244,14 @@ agent:
 provider:
   name: ${opts.provider}
   model: ${opts.model}
+${
+  opts.contextWindow !== undefined
+    ? `  # The context window the server enforces for this model (tokens).
+  context_window: ${opts.contextWindow}`
+    : `  # REQUIRED before this agent runs: the context window (tokens) the server
+  # enforces for this model. bob refuses to start a session without it.
+  # context_window: <tokens>`
+}
 
 identity:
   # Ed25519 keypair on disk + the Flair Agent record registered at onboard.
