@@ -426,8 +426,8 @@ describe("write_soul tool core", () => {
     const res = await wire(soulPath).execute("c1", { content: "# first persona\n" });
     expect(res.details.refused).toBeUndefined();
     expect(NEW_SOUL_MODE).toBe(0o600);
-    expect(statSync(soulPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(soulPath, "utf-8")).toBe("# first persona\n");
+    expect(statSync(soulPath).mode & 0o777).toBe(0o600);
   });
 
   // A directory swapped between the check and the rename. The swap moves the
