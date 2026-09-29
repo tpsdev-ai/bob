@@ -556,13 +556,17 @@ consumer. For each file in `new/`, oldest first by filename:
   its own process group, and the group is reaped as soon as the launcher
   process EXITS (or the turn is aborted: past `turnTimeoutMs`, or a shutdown) —
   not when its output closes, so a descendant holding that output cannot hold
-  up the turn or its result. Reaping sends SIGTERM, then SIGKILL after a grace,
-  and probes the group every 50 ms for at most the grace plus a reap limit
-  (5 s); members still there after that (a process that cannot be killed) are
-  given up on, logged with the group id and counted (`reapExhausted`). Signals
-  go to the numeric group id, and only after a probe found the group; once every
-  member has exited, a reused id could only be signalled in the window from the
-  group's death to the next probe (at most 50 ms) plus that probe to its signal.
+  up the turn or its result — except a member cleanup cannot kill: one that
+  survives the reap and keeps the output open still delays the result until the
+  turn timeout. Reaping sends SIGTERM, then SIGKILL after a grace, and probes the
+  group on a nominal 50 ms poll interval (with no hard bound under event-loop
+  delay) for up to the grace plus a reap limit (5 s); members still there after
+  that are given up on, logged with the group id and counted (`reapExhausted`).
+  Signals go to the numeric group id, and only after a probe found the group;
+  once every member has exited, a reused id could only be signalled in the
+  window from the group's death to the next probe (a nominal 50 ms poll
+  interval, with no hard bound under event-loop delay) plus that probe to its
+  signal.
   The consumer passes its own pid to the turn. At start — before it reads its
   input — the turn requires that pid to BE its parent (the generated launcher
   `exec`s bob; a custom launcher must too) and ends itself otherwise; after
@@ -595,16 +599,25 @@ consumer. For each file in `new/`, oldest first by filename:
   ack a re-delivery, not to refuse a collision — until bob has fsynced the
   `replied/` directory itself; a failed sync leaves the mail in `new/` for a
   retry, after a restart as well. A `replied/` directory whose filesystem cannot
-  fsync a directory gets its own error, and fails `bob doctor`, which probes
-  `replied/` itself: mail there is never acked. The marker records the verified
+  fsync a directory gets its own error, and fails `bob doctor`, which inspects
+  the `replied/` entry itself without following it (a broken symlink or a
+  non-directory fails; the inbox root is probed only when `replied/` does not
+  exist yet): mail there is never acked. The marker records the verified
   sender and a digest of the signed envelope (its outer signature normalized to
   the verified bytes): a re-delivery of that same envelope is acked without a
-  second reply. Only a marker that was READ and names a DIFFERENT envelope makes
-  a mail an `id-collision` refusal — never acked, never given the first one's
-  reply. A marker that cannot be read (an I/O error) is retried; one that reads
-  but is not a marker bob wrote is not guessed at: the mail is HELD in
-  `<inbox>/held/` with a `.reason` file for a human, counted, and shown by
-  `bob doctor`.
+  second reply. A marker is used only after schema validation: every field bob
+  writes (`sender`, `digest`, `inboundId` equal to this inbound, `outcome`, `at`)
+  must be present and well-formed. These fields cannot prove who wrote the file,
+  only that it has the shape bob writes. An `id-collision` refusal — never
+  acked, never given the first one's reply — comes from an existing marker only
+  after a successful read and schema validation show it names a DIFFERENT
+  envelope; it also comes from state this run holds for the id and a different
+  envelope: pending settlement (a settled turn whose marker is not yet written)
+  or a pending reply (a composed reply awaiting a send retry). A marker that
+  cannot be read (an I/O error) is retried; one that reads but fails schema
+  validation is not guessed at: the mail is HELD in `<inbox>/held/` with a
+  `.reason` file (written before the move, so a held mail always has its
+  reason) for a human, counted, and shown by `bob doctor`.
 - **Presence.** A mail turn is not reflected in the presence roster: it runs
   in its own process, outside the warm session and its turn admission, so it
   neither beats busy nor writes a turn summary. The liveness beacon is

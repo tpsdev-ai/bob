@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatReport, runDoctor } from "../../src/shell/doctor.js";
+import { MailConsumer, tpsMailStatsPath } from "../../src/shell/mail-consumer.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 
 // Build a complete-and-healthy agent layout for doctor to scan. Tests
 // then delete/chmod individual pieces to drive specific failure paths.
@@ -752,6 +760,70 @@ describe("runDoctor — tps-mail", () => {
     }
     expect(check(doctor(), "tps-mail inbox")?.detail).toContain("replied/ can fsync a directory");
   });
+
+  // Round 7: doctor inspects the ACTUAL replied/ entry without following it.
+  it("(d11) FAILS a replied/ that is a BROKEN symlink — never falls back to the healthy root", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    symlinkSync(join(home, "no-such-dir"), replied);
+    const c = check(doctor(), "tps-mail inbox");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain(`${replied}: cannot fsync the directory (a broken symlink)`);
+  });
+
+  it("(d12) FAILS a replied/ that is not a directory", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    writeFileSync(replied, "a regular file");
+    const c = check(doctor(), "tps-mail inbox");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain(`${replied}: cannot fsync the directory (not a directory)`);
+  });
+
+  // Round 7: an exhausted reap that fires AFTER stop() reaches doctor, which
+  // reads the stats FILE.
+  it("(d13) an exhausted reap after stop() is visible to doctor", async () => {
+    const inbox = join(home, ".tps", "mail", "testbot");
+    const flint = testKey();
+    writeRecord(
+      inbox,
+      "1.json",
+      mailRecord(
+        signTestEnvelope({ from: "flint", to: "testbot", body: "x", messageId: "m-1" }, flint),
+      ),
+    );
+    const launcher = join(home, "launcher");
+    writeFileSync(
+      launcher,
+      `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"ok"}'\nexit 0\n`,
+    );
+    chmodSync(launcher, 0o755);
+    const consumer = new MailConsumer({
+      name: "testbot",
+      identity: "testbot",
+      inboxRoot: inbox,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
+      launcherPath: launcher,
+      lockFile: join(home, ".bob", "testbot.lock"),
+      statsFile: tpsMailStatsPath(home, "testbot"),
+      pollIntervalMs: 60_000,
+      log: () => {},
+      sendReply: async () => ({ ok: true }),
+      turnRunner: {
+        killGraceMs: 50,
+        reapLimitMs: 150,
+        groupOps: { exists: () => true, signal: () => {} }, // a group that never goes away
+      },
+    });
+    consumer.start();
+    await consumer.poll();
+    await consumer.stop(); // its last stats write happens BEFORE the reap gives up
+    const deadline = Date.now() + 3000;
+    while (consumer.stats.reapExhausted === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(consumer.stats.reapExhausted).toBe(1);
+    expect(check(doctor(), "tps-mail activity")?.detail).toContain("reap exhausted=1");
+  }, 10_000);
 
   it("(d10) surfaces mail HELD for inspection, marker read failures and an exhausted reap", () => {
     const heldDir = join(home, ".tps", "mail", "testbot", "held");

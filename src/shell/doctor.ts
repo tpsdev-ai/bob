@@ -26,6 +26,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -484,6 +485,24 @@ function deliveryTargetCheck(tpsRoot: string): DoctorCheck {
   };
 }
 
+// What is wrong with the replied/ entry itself: "absent" when there is none,
+// undefined when it is (or links to) a directory, else the problem.
+function repliedEntryProblem(path: string): string | undefined {
+  let link: ReturnType<typeof lstatSync>;
+  try {
+    link = lstatSync(path);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : String(err);
+  }
+  let target: ReturnType<typeof statSync>;
+  try {
+    target = statSync(path);
+  } catch {
+    return link.isSymbolicLink() ? "a broken symlink" : "unreadable";
+  }
+  return target.isDirectory() ? undefined : "not a directory";
+}
+
 // Can this directory be fsynced? undefined when it can; the error code when not.
 function directoryFsyncProblem(dir: string): string | undefined {
   let fd: number | undefined;
@@ -683,9 +702,13 @@ function tpsMailChecks(o: {
     // THE replied/ DIRECTORY itself (Gauge round 6, blocker 1): it can be a
     // mount or a symlink onto another filesystem. Before the consumer has
     // created it, the inbox root is where it will be created.
+    // The ACTUAL entry, not followed: a broken symlink or a non-directory is a
+    // failure; only a genuinely absent entry falls back to the inbox root.
     const repliedDir = join(inbox, "replied");
-    const probed = existsSync(repliedDir) ? repliedDir : inbox;
-    const durability = directoryFsyncProblem(probed);
+    const entry = repliedEntryProblem(repliedDir);
+    const probed = entry === "absent" ? inbox : repliedDir;
+    const durability =
+      entry === "absent" || entry === undefined ? directoryFsyncProblem(probed) : entry;
     checks.push(
       durability === undefined
         ? {

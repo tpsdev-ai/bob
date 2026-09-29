@@ -131,16 +131,20 @@ const TURN_KILL_GRACE_MS = 5000;
 // EXITED (`exit`, not `close`: `close` waits for every inherited pipe, so a
 // descendant holding stdout would otherwise hold cleanup, and the turn's
 // result, until the timeout). The whole group gets SIGTERM, then SIGKILL after
-// the grace; its existence is probed every 50 ms, for at most the grace plus
+// the grace; its existence is probed on a nominal 50 ms interval (no hard
+// bound under event-loop delay), for up to the grace plus
 // the reap limit. If members remain after that (unkillable: a process in
 // uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
 // with the group id and counted (`reapExhausted`). `close` is kept only to
-// collect the result, which arrives once the reaping has freed the pipes.
+// collect the result, which arrives once the reaping has freed the pipes —
+// except when a member cleanup cannot kill keeps a pipe open: then the result
+// waits for the turn timeout (a stated limit, tracked as a follow-up).
 // Stated limit: signals go to the numeric group id. POSIX keeps a group id in
 // use while any member lives, so it cannot name another group while a
 // descendant survives. Once every member has exited, the id is free: the window
 // in which a reused id could be signalled runs from the group's death to the
-// next existence probe (at most 50 ms) plus from that probe to the signal, and
+// next existence probe (a nominal 50 ms, unbounded under event-loop delay) plus
+// from that probe to the signal, and
 // needs the pid counter to wrap onto that exact id inside it.
 // Being its own group, the turn is not taken down with the runtime's group on a
 // crash; the mail-turn child watches the consumer pid and ends itself (run.ts).
@@ -652,6 +656,9 @@ export class MailConsumer {
         ...opts.turnRunner,
         onReapExhausted: (pgid) => {
           this.stats.reapExhausted += 1;
+          // It can fire after stop()'s last stats write: persist it here so
+          // doctor sees it.
+          this.persistStats();
           this.log(
             `tps-mail: a mail turn's process group ${pgid} still has members after SIGKILL and the reap limit; cleanup gave up (a member may be unkillable or owned by another user)`,
           );
@@ -928,21 +935,27 @@ export class MailConsumer {
 
   // Set a mail aside for a human: held/<file> + held/<file>.reason. It is
   // never answered and never refused on an unproven state.
+  // The .reason sidecar is written BEFORE the move, so a mail is never in
+  // held/ without its reason: if the sidecar cannot be written the mail stays
+  // in new/ for a retry.
   private hold(file: string, reason: HoldReason, detail: string): void {
-    this.stats.held[reason] += 1;
     const heldDir = join(this.inboxRoot, "held");
     try {
       mkdirSync(heldDir, { recursive: true });
-      renameSync(join(this.inboxRoot, "new", file), join(heldDir, file));
       writeFileSync(
         join(heldDir, `${file}.reason`),
         `reason: ${reason}\n${detail}\nheld at ${new Date(this.now()).toISOString()}\nInspect the marker; if the mail was NOT answered, remove the marker and move the mail back to new/.\n`,
         { mode: 0o600 },
       );
+      renameSync(join(this.inboxRoot, "new", file), join(heldDir, file));
     } catch (err) {
-      this.log(`tps-mail: could not move ${file} to held/: ${(err as Error).message}`);
+      this.log(
+        `tps-mail: could not hold ${file} in held/: ${(err as Error).message}; left in new/`,
+      );
       this.scheduleRetry(file);
+      return;
     }
+    this.stats.held[reason] += 1;
     this.log(`tps-mail: HELD ${file} for manual inspection (${reason}: ${detail})`);
   }
 
@@ -964,9 +977,22 @@ export class MailConsumer {
       if (code === "ENOENT") return { kind: "none" };
       return { kind: "io-error", code: code ?? (err as Error).message };
     }
+    // Schema validation of the COMPLETE record settle writes: every field, with
+    // inboundId equal to this inbound. Anything less is held as malformed. The
+    // fields cannot prove who wrote the file — only that it has the shape bob
+    // writes.
     try {
-      const m = JSON.parse(raw) as { sender?: unknown; digest?: unknown };
-      if (typeof m.sender === "string" && typeof m.digest === "string") {
+      const m = JSON.parse(raw) as Record<string, unknown>;
+      if (
+        typeof m.sender === "string" &&
+        TPS_AGENT_ID.test(m.sender) &&
+        typeof m.digest === "string" &&
+        /^[0-9a-f]{64}$/.test(m.digest) &&
+        m.inboundId === messageId &&
+        (m.outcome === "replied" || m.outcome === "no-reply") &&
+        typeof m.at === "string" &&
+        !Number.isNaN(Date.parse(m.at))
+      ) {
         return { kind: "binding", sender: m.sender, digest: m.digest };
       }
     } catch {

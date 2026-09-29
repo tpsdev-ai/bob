@@ -1194,6 +1194,44 @@ describe("round 6, blocker 1 — an existing marker is trusted only once its dir
   });
 });
 
+describe("round 7 — schema validation of a marker, and a held mail never loses its reason", () => {
+  it("(m7) a READABLE but incomplete or mismatched marker is held, not trusted as a binding", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const h = harness();
+    await h.consumer.poll(); // answered: the full marker is written
+    const full = JSON.parse(readFileSync(join(inbox, "replied", "m-1"), "utf8"));
+    const variants = [
+      { sender: full.sender, digest: full.digest }, // two fields only
+      { ...full, inboundId: "someone-else" }, // not this inbound's record
+    ];
+    let n = 2;
+    for (const marker of variants) {
+      writeFileSync(join(inbox, "replied", "m-1"), JSON.stringify(marker));
+      const file = `${n++}.json`;
+      deliver(file, { messageId: "m-1" }); // the SAME signed envelope again
+      await h.consumer.poll();
+      expect(existsSync(join(inbox, "held", file))).toBe(true);
+      expect(inDir("cur")).toEqual(["1.json"]);
+    }
+    expect(h.consumer.stats.held["marker-malformed"]).toBe(2);
+    expect(h.consumer.stats.duplicates).toBe(0);
+    expect(h.consumer.stats.refused["id-collision"]).toBe(0);
+  });
+
+  it("(h1) a .reason sidecar that cannot be written leaves the mail in new/, never in held/ without its reason", async () => {
+    mkdirSync(join(inbox, "replied"), { recursive: true });
+    writeFileSync(join(inbox, "replied", "m-1"), "not json");
+    deliver("1.json", { messageId: "m-1" });
+    mkdirSync(join(inbox, "held", "1.json.reason"), { recursive: true }); // unwritable as a file
+    const h = harness();
+    await h.consumer.poll();
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "held", "1.json"))).toBe(false);
+    expect(h.consumer.stats.held["marker-malformed"]).toBe(0);
+    expect(h.logs.join("\n")).toMatch(/could not hold 1\.json in held\/.*left in new\//);
+  });
+});
+
 describe("round 6, blocker 2 — only a PROVEN collision refuses", () => {
   it("(r1) a marker READ error is retried, then the same envelope's redelivery is acked", async () => {
     deliver("1.json", { messageId: "m-1" });
