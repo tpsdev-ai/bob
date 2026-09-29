@@ -5,12 +5,20 @@
 // seam is a session runner, not a fake child process.
 //
 // The exception this file pins: onboarding and alignment run under the FIXED
-// setup policy (read + write) — which may EXCEED the role's ceiling. They are
+// setup policy (read + write_soul) — which may EXCEED the role's ceiling. They are
 // privileged local setup commands available to whoever runs bob as that OS
 // user, and the interview's whole job is to WRITE the persona (see README
 // "Stated exceptions").
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runOnboard, type SessionRunner } from "../../src/shell/onboard.js";
@@ -19,7 +27,13 @@ import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
   policy: { tools: string[]; excludeTools: string[] };
-  config: { provider: string; model: string; cwd: string; appendSystemPrompt: string };
+  config: {
+    provider: string;
+    model: string;
+    cwd: string;
+    appendSystemPrompt: string;
+    setupSoulPath?: string;
+  };
   initialMessage: string;
 }
 
@@ -38,6 +52,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
         model: input.config.model,
         cwd: input.config.cwd,
         appendSystemPrompt: input.config.appendSystemPrompt,
+        setupSoulPath: input.config.setupSoulPath,
       },
       initialMessage: input.initialMessage,
     };
@@ -54,7 +69,8 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
 let agentDir: string;
 
 function scaffoldAgent(role = "ea"): void {
-  const root = mkdtempSync(join(tmpdir(), "bob-onboard-"));
+  // Canonical: write_soul is bound to the realpath of the agents root.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-onboard-")));
   agentDir = join(root, "testbot");
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
   mkdirSync(join(agentDir, "work"), { recursive: true });
@@ -111,12 +127,11 @@ describe("runOnboard", () => {
     expect(res.soulHashBefore).toBe(res.soulHashAfter);
   });
 
-  it("runs the interview under the FIXED setup policy — read + write, even past the role ceiling", async () => {
+  it("runs the interview under the FIXED setup policy — read + write_soul, even past the role ceiling", async () => {
     // `reviewer`'s ceiling has no `write`: the interview cannot use the role's
     // policy, because writing the refined persona is the job. That is the
-    // stated exception, and it is a PRIVILEGED path: a model can only reach
-    // `bob onboard` through a shell tool, and a shell can already write files
-    // (the reviewer role has bash and no write tool, as asserted below).
+    // stated exception, and it is a PRIVILEGED path. bob#204: the exception is
+    // now the bob-owned `write_soul` (soul.md only), NOT pi's generic `write`.
     expect(loadRole("reviewer").tools.allow).not.toContain("write");
     expect(loadRole("reviewer").tools.allow).toContain("bash");
     scaffoldAgent("reviewer");
@@ -125,7 +140,9 @@ describe("runOnboard", () => {
 
     expect(runs).toHaveLength(1);
     expect(runs[0].policy.tools).toEqual([...SETUP_TOOL_POLICY.tools]);
-    expect(runs[0].policy.tools).toEqual(["read", "write"]);
+    expect(runs[0].policy.tools).toEqual(["read", "write_soul"]);
+    // bob#204: the generic `write` pi tool is NOT granted to a setup session.
+    expect(runs[0].policy.tools).not.toContain("write");
   });
 
   it("hands the interview the agent's own config and the interview meta-prompt", async () => {
@@ -138,7 +155,33 @@ describe("runOnboard", () => {
     expect(run.config.cwd).toBe(join(agentDir, "work"));
     expect(run.config.appendSystemPrompt).toContain("hiring interview");
     expect(run.config.appendSystemPrompt).toContain(join(agentDir, "soul.md"));
+    // bob#204: the session is told its ONE soul-only write target; the factory
+    // registers write_soul bound to it and to nothing else.
+    expect(run.config.setupSoulPath).toBe(join(agentDir, "soul.md"));
     expect(run.initialMessage).toContain("testbot");
+  });
+
+  it("refuses an agent directory that is not the one the interview runs as (bob#204)", async () => {
+    scaffoldAgent();
+    const other = join(dirname(agentDir), "other");
+    mkdirSync(other);
+    writeFileSync(join(other, "soul.md"), "other persona\n");
+    const { runner, runs } = fakeRunner({});
+    await expect(runOnboard(options({ agentDir: other, sessionRunner: runner }))).rejects.toThrow(
+      /refusing to start - the agent directory \S*other is not testbot's/,
+    );
+    expect(runs).toEqual([]);
+    expect(readFileSync(join(other, "soul.md"), "utf8")).toBe("other persona\n");
+  });
+
+  it("resolves a linked agents root once: the config and the soul come from the canonical tree (bob#204)", async () => {
+    scaffoldAgent();
+    const link = join(dirname(agentDir), "agents-link");
+    symlinkSync(dirname(agentDir), link);
+    const { runner, runs } = fakeRunner({});
+    await runOnboard(options({ agentDir: join(link, "testbot"), sessionRunner: runner }));
+    expect(runs[0]?.config.cwd).toBe(join(agentDir, "work"));
+    expect(runs[0]?.config.setupSoulPath).toBe(join(agentDir, "soul.md"));
   });
 
   it("maps a bob provider name to pi's provider id", async () => {

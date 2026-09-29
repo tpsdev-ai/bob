@@ -6,17 +6,17 @@
 // drift, new constraints, or fresh signal; the agent rewrites soul.md.
 //
 // Same session shape as onboard — bob's factory through pi's InteractiveMode,
-// under the fixed setup policy (read + write) — and the same soul.md
+// under the fixed setup policy (read + write_soul) — and the same soul.md
 // hash-before/after test of whether the alignment actually produced a persona
-// update.
+// update. `write_soul` is bob's own tool (write-soul.ts): it takes content only,
+// and its one target is the soul.md of the agent the session runs as (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { defaultHostRoot, readGrant } from "./host-grant.js";
 import type { SessionRunner } from "./onboard.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
-import { runInteractiveSession, setupToolPolicy } from "./session.js";
+import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
+import { bindSetupSoulTarget } from "./write-soul.js";
 
 // Same path-traversal + prompt-injection defense as runOnboard.
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -33,8 +33,9 @@ export interface AlignOptions {
   // Test seam: the interactive session. Defaults to pi's InteractiveMode over
   // bob's session runtime.
   sessionRunner?: SessionRunner;
-  // The host state root + positions root, for an ADOPTED agent (so the setup
-  // session's policy is resolved from its grant, not the fixed setup policy).
+  // The host state root + positions root, for an ADOPTED agent: the setup
+  // session runs the agent's grant-resolved config (capabilities, cwd). Its
+  // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
   hostRoot?: string;
   positionsRoot?: string;
 }
@@ -42,6 +43,9 @@ export interface AlignOptions {
 export interface AlignResult {
   exitCode: number;
   soulUpdated: boolean;
+  // The canonical agent directory the session ran from (bob#204): the caller
+  // reads anything else it needs (the flair block) from this same tree.
+  agentDir: string;
   soulPath: string;
   soulHashBefore: string;
   soulHashAfter: string;
@@ -61,7 +65,8 @@ Your job in this session:
    - Pet peeves the founder has voiced lately
 3. Ask short, specific questions. Don't fish — anchor on concrete signals.
 4. When the human signals they're done ("ship it", "looks good", or similar),
-   write the UPDATED full persona to ${soulPath} via the Write tool,
+   write the UPDATED full persona to ${soulPath} via the write_soul tool (its only
+   argument is the content; its target is your own soul.md, bound by bob),
    OVERWRITING the previous version.
 5. Summarize the deltas in one sentence after writing, then wait for exit.
 
@@ -80,34 +85,32 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
   }
-  const soulPath = join(opts.agentDir, "soul.md");
+  // bob#204: the agents root is canonicalized ONCE, before anything is read,
+  // and that one tree supplies the session's config, its paths and the
+  // write_soul binding. An --agent-dir naming a different agent's directory is
+  // refused here, before the session starts - otherwise the check-in would run
+  // as one agent and write another agent's soul.md.
+  const { agentsRoot, agentDir, soulPath } = bindSetupSoulTarget({
+    command: "bob align",
+    name: opts.name,
+    requestedAgentDir: opts.agentDir,
+  });
+  const { config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+  });
   if (!existsSync(soulPath)) {
     throw new Error(`cannot align ${opts.name}: ${soulPath} not found — run 'bob onboard' first`);
   }
   const soulHashBefore = hashFile(soulPath);
 
-  const { config } = resolveRunConfig({
-    name: opts.name,
-    agentsRoot: dirname(opts.agentDir),
-    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
-    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
-  });
-  // The setup session's POLICY: the fixed read+write exception for an ordinary
-  // agent, or — for an ADOPTED agent — the grant's resolved tools plus the
-  // explicit extra `write` allowance for soul.md. It may exceed the grant's tool
-  // set and removes any `write` exclusion; no other tool is added or unexcluded.
-  const adopted = readGrant(opts.hostRoot ?? defaultHostRoot(), opts.name) !== undefined;
-  const policy = setupToolPolicy(
-    {
-      tools: config.tools,
-      excludeTools: config.excludeTools ?? [],
-      resident: false,
-      allowResidentShell: false,
-    },
-    adopted,
-  );
   const sessionConfig: RunSessionConfig = {
     ...config,
+    // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
+    // to THIS agent's soul.md. pi's generic `write` is not granted.
+    setupSoulPath: soulPath,
     // bob.yaml supplies both fields, the same pair `bob run` runs the agent on
     // (#155) — an alignment check-in that ran on some other model was aligning
     // an agent it was not looking at. An override replaces ONLY the field it
@@ -117,15 +120,17 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     // boundary where a bob name enters.
     provider: opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : config.provider,
     model: opts.model ?? config.model,
-    tools: policy.tools,
-    excludeTools: policy.excludeTools,
+    // The session's tools are the setup policy — read + write_soul for every
+    // agent, adopted or not — never the role's or the grant's own set.
+    tools: [...SETUP_TOOL_POLICY.tools],
+    excludeTools: [...SETUP_TOOL_POLICY.excludeTools],
     appendSystemPrompt: META_PROMPT(opts.name, soulPath),
   };
 
   const runner = opts.sessionRunner ?? runInteractiveSession;
   const exitCode = await runner({
     config: sessionConfig,
-    policy,
+    policy: SETUP_TOOL_POLICY,
     initialMessage: FIRST_MESSAGE(opts.name, soulPath),
   });
 
@@ -133,6 +138,7 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   return {
     exitCode,
     soulUpdated: soulHashBefore !== soulHashAfter,
+    agentDir,
     soulPath,
     soulHashBefore,
     soulHashAfter,

@@ -17,6 +17,7 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -429,9 +430,12 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
     expect(sink[0].tools.slice().sort()).toEqual(["bash", "grep", "read"]);
   });
 
-  it("`bob onboard` on an adopted agent runs the grant's tools plus EXACTLY the one write tool", async () => {
+  // bob#204: an adopted agent's setup session runs the SAME fixed setup policy
+  // as every agent's — exactly read + write_soul, never the grant's own tools
+  // (the reviewer grant allows bash) and never pi's unrestricted `write`.
+  it("`bob onboard` on an adopted agent runs exactly read + write_soul, bound to its own soul.md", async () => {
     const hired = await hireReviewer("p4");
-    const seen: { policy?: { tools: string[] } } = {};
+    const seen: { policy?: { tools: string[] }; config?: RunSessionConfig } = {};
     await runOnboard({
       name: "p4",
       role: "reviewer",
@@ -442,21 +446,19 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       sessionRunner: async (input) => {
         seen.policy = input.policy as { tools: string[] };
+        seen.config = input.config;
         return 0;
       },
     });
-    const tools = seen.policy?.tools ?? [];
-    // The grant's tools are present (old code used a fixed [read, write]).
-    expect(tools.slice().sort()).toEqual(["bash", "grep", "read", "write"]);
-    // Nothing but `write` may exceed the grant.
-    const grant = readGrant(s.hostRoot, "p4");
-    const outside = tools.filter((t) => !(grant?.maxTools ?? []).includes(t));
-    expect(outside).toEqual(["write"]);
+    expect(readGrant(s.hostRoot, "p4")?.maxTools ?? []).toContain("bash");
+    expect(seen.policy?.tools).toEqual(["read", "write_soul"]);
+    expect(seen.config?.tools).toEqual(["read", "write_soul"]);
+    expect(seen.config?.setupSoulPath).toBe(join(realpathSync(hired.agentDir), "soul.md"));
   });
 
-  it("`bob align` on an adopted agent runs the grant's tools plus EXACTLY the one write tool", async () => {
+  it("`bob align` on an adopted agent runs exactly read + write_soul, bound to its own soul.md", async () => {
     const hired = await hireReviewer("p5");
-    const seen: { policy?: { tools: string[] } } = {};
+    const seen: { policy?: { tools: string[] }; config?: RunSessionConfig } = {};
     await runAlign({
       name: "p5",
       agentDir: hired.agentDir,
@@ -464,14 +466,14 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       sessionRunner: async (input) => {
         seen.policy = input.policy as { tools: string[] };
+        seen.config = input.config;
         return 0;
       },
     });
-    const tools = seen.policy?.tools ?? [];
-    expect(tools.slice().sort()).toEqual(["bash", "grep", "read", "write"]);
-    const grant = readGrant(s.hostRoot, "p5");
-    const outside = tools.filter((t) => !(grant?.maxTools ?? []).includes(t));
-    expect(outside).toEqual(["write"]);
+    expect(readGrant(s.hostRoot, "p5")?.maxTools ?? []).toContain("bash");
+    expect(seen.policy?.tools).toEqual(["read", "write_soul"]);
+    expect(seen.config?.tools).toEqual(["read", "write_soul"]);
+    expect(seen.config?.setupSoulPath).toBe(join(realpathSync(hired.agentDir), "soul.md"));
   });
 
   // bob#200 x bob#195: a TPS mail turn (`bob launch` with BOB_MAIL_TURN=1) is one

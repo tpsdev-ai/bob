@@ -58,6 +58,7 @@ import {
 } from "./system-prompt-contract.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
 import { admissionEventBus } from "./turn-admission.js";
+import { createWriteSoulExtension } from "./write-soul.js";
 
 // pi does not export DefaultResourceLoaderOptions at the package root, so
 // derive the loader-option shape from the class: cwd/agentDir/settingsManager
@@ -70,40 +71,31 @@ type LoaderOptions = Omit<
 // The FIXED policy onboarding and alignment run under. They are privileged
 // local setup commands (see README "Stated exceptions"): the interview has to
 // READ the seed persona and WRITE the refined one, so the setup policy is
-// exactly read + write — the two tools that job needs, and nothing else.
+// exactly read + write_soul — the two tools that job needs, and nothing else.
 //
-// It may exceed the role's ceiling on purpose: a `reviewer` agent is hired by
-// a human at the keyboard who is already allowed to edit that human's files,
-// and the tool that would let the MODEL reach the interview is the shell tool,
-// which can already write files (the reviewer role has bash and no write tool),
-// so read + write grants a model that reaches it nothing new.
+// `write_soul` is BOB-OWNED (write-soul.ts): it takes content only and its one
+// target is the agent's own soul.md, resolved by bob. It replaced pi's generic
+// `write` in bob#204, where a setup session could otherwise rewrite bob.yaml,
+// overrides, grants, launchers, or any file outside the agent directory.
+//
+// It may still exceed the role's ceiling on purpose: a `reviewer` agent is hired
+// by a human at the keyboard who is already allowed to edit that human's files,
+// and the interview is a privileged local setup step. But the excess is now a
+// single soul.md write, not an unrestricted one.
 export const SETUP_TOOL_POLICY: ToolPolicy = {
-  tools: ["read", "write"],
+  tools: ["read", "write_soul"],
   excludeTools: [],
   resident: false,
   allowResidentShell: false,
 };
 
-// The session policy for the privileged setup commands (onboard, align).
-//
-// A NON-adopted agent keeps the fixed setup exception above. An ADOPTED agent's
-// setup session gets the grant's resolved tools plus the explicit extra `write`
-// allowance needed to write soul.md. That allowance may exceed the grant's tool
-// set and removes any `write` exclusion; no other tool is added or unexcluded.
-// (bob#195 slice 1; stated in the README.)
-//
-// `base` is the policy resolveRunConfig already resolved from the grant.
-export function setupToolPolicy(base: ToolPolicy, adopted: boolean): ToolPolicy {
-  if (!adopted) return SETUP_TOOL_POLICY;
-  const tools = [...new Set([...base.tools, "write"])];
-  const excludeTools = base.excludeTools.filter((t) => t !== "write");
-  return {
-    tools,
-    excludeTools,
-    resident: base.resident,
-    allowResidentShell: base.allowResidentShell,
-  };
-}
+// SETUP_TOOL_POLICY is the policy of EVERY setup session, an ADOPTED agent's
+// included. bob#195 slice 1 gave an adopted agent's setup session the grant's
+// resolved tools plus pi's `write`; bob#204 replaces that too: pi's `write`
+// accepts any path, and a grant's tools can include a shell, so either would let
+// the interview write files other than soul.md. The grant still governs every
+// other session of an adopted agent (resolveRunConfig), and its setup session
+// still runs the agent's grant-resolved config (capabilities, cwd).
 
 // ── openrouter: bob OWNS the provider (bob#183 round 3; round 6: transport) ────
 //
@@ -648,9 +640,15 @@ export function isolatedLoaderOptions(
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
   },
-  extra?: { guard?: InlineExtension },
+  extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[] },
 ): LoaderOptions {
   const contractBlock = config.contractBlock;
+  // Inline extensions pi appends AFTER every path-loaded one: the setup tool
+  // first, then bob's contract guard (which must run its request handler LAST).
+  const inlineFactories = [
+    ...(extra?.toolExtensions ?? []),
+    ...(extra?.guard ? [extra.guard] : []),
+  ];
   return {
     // The only extensions are the declared capabilities' paths. With
     // noExtensions the loader uses exactly these (temporary CLI scope) and
@@ -670,7 +668,7 @@ export function isolatedLoaderOptions(
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
       : {}),
-    ...(extra?.guard !== undefined ? { extensionFactories: [extra.guard] } : {}),
+    ...(inlineFactories.length > 0 ? { extensionFactories: inlineFactories } : {}),
   };
 }
 
@@ -969,6 +967,12 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
           contract: contractBlock,
           deps: () => guardDeps,
         });
+  // bob#204: a SETUP session (onboard/align) is the only one that sets
+  // `setupSoulPath`; it gets the bob-owned soul-only write tool, bound to the
+  // path bob resolved. No other session registers it, so `write_soul` exists
+  // exactly where the setup policy grants it.
+  const writeSoulExt =
+    config.setupSoulPath !== undefined ? createWriteSoulExtension(config.setupSoulPath) : undefined;
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
   // (round 8, item 4) pi calls this factory AGAIN for `/new`, `/resume`, `/fork`,
@@ -1034,7 +1038,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       modelRuntime,
       resourceLoaderOptions: isolatedLoaderOptions(
         { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
-        { ...(guard !== undefined ? { guard } : {}) },
+        {
+          ...(guard !== undefined ? { guard } : {}),
+          ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
+        },
       ),
     });
     // bob asked for these extensions explicitly: a declared capability whose
