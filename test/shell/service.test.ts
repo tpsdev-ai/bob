@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   detectPlatform,
@@ -14,12 +14,14 @@ import {
   renderSystemdUnit,
   resolveNodeExecutable,
   restart,
+  serviceCommandArgs,
   serviceLabel,
   servicePath,
   systemdUnitName,
   systemdUnitPath,
   up,
 } from "../../src/shell/service.js";
+import { spawnNode } from "../cli-spawn.js";
 
 const HOME = "/Users/test";
 // A fixed interpreter for render assertions (the real default is the resolved
@@ -27,6 +29,8 @@ const HOME = "/Users/test";
 const INTERPRETER = "/opt/node/bin/node";
 // The repo's bin/bob — the acceptance test runs the unit's OWN command line.
 const BOB_BIN = fileURLToPath(new URL("../../bin/bob", import.meta.url));
+// The built CLI, for the test that reads its printed install-service command.
+const CLI = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
 
 // Capture launchctl/systemctl invocations without running the real binary.
 function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
@@ -304,6 +308,41 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
     }
   });
 
+  it("makes a RELATIVE PATH entry absolute", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bob-node-rel-"));
+    writeFileSync(join(dir, "node"), "#!/bin/sh\n");
+    chmodSync(join(dir, "node"), 0o755);
+    try {
+      const rel = relative(process.cwd(), dir); // a RELATIVE PATH entry
+      expect(rel.startsWith("/")).toBe(false); // premise: it IS relative
+      const resolved = resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: rel });
+      expect(resolved).toBe(join(dir, "node"));
+      expect(resolved.startsWith("/")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a DIRECTORY named node in favour of a real node file later on PATH", () => {
+    const dirOnly = mkdtempSync(join(tmpdir(), "bob-node-isdir-"));
+    const fileDir = mkdtempSync(join(tmpdir(), "bob-node-isfile-"));
+    mkdirSync(join(dirOnly, "node")); // a DIRECTORY named node
+    writeFileSync(join(fileDir, "node"), "#!/bin/sh\n");
+    chmodSync(join(fileDir, "node"), 0o755);
+    try {
+      const delimiter = process.platform === "win32" ? ";" : ":";
+      const resolved = resolveNodeExecutable({
+        execPath: "/opt/bun/bin/bun",
+        pathEnv: `${dirOnly}${delimiter}${fileDir}`,
+      });
+      // The directory is skipped; the real file later on PATH is chosen.
+      expect(resolved).toBe(join(fileDir, "node"));
+    } finally {
+      rmSync(dirOnly, { recursive: true, force: true });
+      rmSync(fileDir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses with the engines floor and the PATH remedy when no node is found", () => {
     const empty = mkdtempSync(join(tmpdir(), "bob-no-node-"));
     try {
@@ -447,4 +486,82 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
     expect(res.code).toBe(0);
     expect(res.out).toContain("Usage: bob");
   });
+});
+
+// The unit writes its command as `ExecStart=` (systemd) or an array of
+// <string> entries (launchd); read whichever the host platform produced.
+function unitCommand(unitText: string): string {
+  if (process.platform === "darwin") {
+    const array = unitText.match(/<array>([\s\S]*?)<\/array>/)?.[1] ?? "";
+    return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]).join(" ");
+  }
+  const line = unitText.split("\n").find((l) => l.startsWith("ExecStart="));
+  return (line ?? "").slice("ExecStart=".length);
+}
+
+describe("the printed install-service command is the unit's command (bob#218)", () => {
+  it("renderers and installService build it from ONE argument list", async () => {
+    const argv = serviceCommandArgs({
+      interpreter: INTERPRETER,
+      bobBin: "/usr/local/bin/bob",
+      name: "pulse",
+      model: "claude-fast",
+    });
+    expect(argv).toEqual([
+      INTERPRETER,
+      "/usr/local/bin/bob",
+      "run",
+      "pulse",
+      "--model",
+      "claude-fast",
+    ]);
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      model: "claude-fast",
+      home: HOME,
+    });
+    expect(unit).toContain(`ExecStart=${argv.join(" ")}`);
+
+    const written: Array<{ path: string; contents: string }> = [];
+    const res = await installService({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      model: "claude-fast",
+      home: HOME,
+      platform: "systemd",
+      writeFile: (path, contents) => written.push({ path, contents }),
+      runSystemctl: async () => ({ code: 0, stderr: "" }),
+    });
+    expect(res.argv).toEqual(argv);
+    expect(written[0].contents).toContain(`ExecStart=${argv.join(" ")}`);
+  });
+
+  it("the CLI prints exactly the command the unit runs, including --model", () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-print-home-"));
+    const binDir = mkdtempSync(join(tmpdir(), "bob-print-bin-"));
+    // A stub systemctl so the install's daemon-reload succeeds without a bus.
+    writeFileSync(join(binDir, "systemctl"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(binDir, "systemctl"), 0o755);
+    try {
+      const out = spawnNode(
+        [CLI, "install-service", "pulse", "--bob-bin", BOB_BIN, "--model", "claude-fast"],
+        { env: { ...process.env, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` } },
+      );
+      const printed = out
+        .split("\n")
+        .find((l) => l.includes("runs:"))
+        ?.split("runs:")[1]
+        ?.trim();
+      expect(printed).toContain("--model claude-fast");
+      // The unit the CLI just wrote carries the same command verbatim.
+      const unitText = readFileSync(servicePath("pulse", { home }), "utf8");
+      expect(printed).toBe(unitCommand(unitText));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

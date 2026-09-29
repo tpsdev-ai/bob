@@ -390,9 +390,9 @@ async function installServiceCmd(
   // with a remedy when no Node is available).
   const bobBin = stringFlag(flags, "bob-bin") ?? (process.argv[1] || "bob");
   const model = stringFlag(flags, "model");
-  const { path: written, interpreter } = await installService({ name, bobBin, model });
+  const { path: written, argv } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
-  console.log(`  runs:    ${interpreter} ${bobBin} run ${name}`);
+  console.log(`  runs:    ${argv.join(" ")}`);
   console.log(`  next:    bob up ${name}   (load + start)`);
   if (bobBin === "bob") {
     console.error(
