@@ -11,20 +11,27 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
+import {
+  type DirPinOps,
+  NODE_DIR_PIN_OPS,
+  RunRefusal,
+} from "../../../src/capabilities/work/run.js";
 import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
 
@@ -753,41 +760,418 @@ describe("run — refusals name actor, state and remedy", () => {
   }, 20_000);
 });
 
-describe("run — the directory a command starts in is the one that was checked (bob#224)", () => {
-  it("refuses when the checked cwd is replaced by a symlink to an outside dir between resolution and spawn", async () => {
-    const outside = mkdtempSync(join(tmpdir(), "bob-run-outside-"));
+describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", () => {
+  // Every refusal here runs a command that writes a MARKER outside the workspace
+  // by absolute path: had the command started anywhere — registered as a job or
+  // not — the marker would exist. An empty job list alone would not prove that.
+  function marker(): { file: string; command: string } {
+    const dir = join((live as LiveWork).scratch, "marker");
+    mkdirSync(dir);
+    const file = join(dir, "ran");
+    return { file, command: `touch '${file}'` };
+  }
+  async function expectNothingStarted(file: string): Promise<void> {
+    const w = live as LiveWork;
+    expect(await waitFor(() => existsSync(file), 500)).toBe(false);
+    expect(w.work.manager.list()).toEqual([]);
+    // The capture file made for the refused job is gone too.
+    const runDir = w.work.manager.runDir;
+    if (runDir !== null) expect(readdirSync(join(runDir, "out"))).toEqual([]);
+  }
+  async function refusalOf(p: Promise<unknown>): Promise<Error> {
     try {
-      live = await workSession({
-        wire: {
-          // Swap the CHECKED directory for a symlink to an outside directory, in
-          // the window the pin re-check closes (between resolution and spawn).
-          beforeSpawn: (cwd) => {
-            rmSync(cwd, { recursive: true, force: true });
-            symlinkSync(outside, cwd);
-          },
+      await p;
+    } catch (err) {
+      expect(err).toBeInstanceOf(RunRefusal);
+      return err as Error;
+    }
+    throw new Error("expected run to refuse, but it started a job");
+  }
+  const failure = (code: string) => Object.assign(new Error(`injected ${code}`), { code });
+  // A directory OUTSIDE the workspace: a sibling of it in the session's scratch
+  // directory, removed with the session.
+  function outsideDir(name = "outside"): string {
+    const dir = join((live as LiveWork).scratch, name);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  it("refuses when the checked cwd is replaced by a symlink to an outside dir after the pin (through the tool)", async () => {
+    let outside = "";
+    let m = { file: "", command: "" };
+    live = await workSession({
+      wire: {
+        beforeSpawn: (cwd) => {
+          rmSync(cwd, { recursive: true, force: true });
+          symlinkSync(outside, cwd);
         },
-        script: program(call("run", { command: "true", cwd: "sub" })),
-      });
-      mkdirSync(join(live.cwd, "sub"), { recursive: true });
-      await live.prompt();
-      const r = lastOf(live.results, "run");
-      expect(r.isError).toBe(true);
-      expect(r.text).toMatch(/was replaced after it was checked/);
-      expect(r.text).toMatch(/[Nn]othing was started/);
-      // Nothing started: the manager holds no job.
-      expect(live.work.manager.list()).toEqual([]);
+      },
+      script: program(callWith("run", () => ({ command: m.command, cwd: "sub" }))),
+    });
+    outside = outsideDir();
+    m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("now resolves outside the workspace");
+    expect(r.text).toContain("immediately before the spawn");
+    expect(r.text).toContain("Nothing was started");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("(a) refuses when an INTERMEDIATE path component is replaced by a symlink after the pin", async () => {
+    let outside = "";
+    live = await workSession({
+      script: program(),
+      wire: {
+        // Move the directory holding the pinned one outside, and link to it:
+        // the pinned directory (same device + inode) is now reached through a
+        // symlinked parent, outside the workspace.
+        beforeSpawn: () => {
+          const ws = (live as LiveWork).cwd;
+          renameSync(join(ws, "a"), join(outside, "a"));
+          symlinkSync(join(outside, "a"), join(ws, "a"), "dir");
+        },
+      },
+    });
+    outside = outsideDir();
+    const m = marker();
+    mkdirSync(join(live.cwd, "a", "b"), { recursive: true });
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "a/b" }, live.cwd),
+    );
+    expect(err.message).toContain("now resolves outside the workspace");
+    expect(err.message).toContain(`(to ${realpathSync(join(outside, "a", "b"))})`);
+    expect(err.message).toContain("immediately before the spawn");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("(b) refuses when the pinned directory is moved outside and linked to", async () => {
+    let outside = "";
+    live = await workSession({
+      script: program(),
+      wire: {
+        beforeSpawn: () => {
+          const ws = (live as LiveWork).cwd;
+          renameSync(join(ws, "sub"), join(outside, "sub"));
+          symlinkSync(join(outside, "sub"), join(ws, "sub"), "dir");
+        },
+      },
+    });
+    outside = outsideDir();
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("now resolves outside the workspace");
+    expect(err.message).toContain("immediately before the spawn");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("refuses when the cwd is replaced by ANOTHER directory inside the workspace after the pin", async () => {
+    live = await workSession({
+      script: program(),
+      wire: {
+        beforeSpawn: () => {
+          const ws = (live as LiveWork).cwd;
+          renameSync(join(ws, "sub"), join(ws, "sub-old"));
+          mkdirSync(join(ws, "sub"));
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("was replaced after it was checked");
+    expect(err.message).toContain("device or inode changed, immediately before the spawn");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("refuses when an intermediate component is swapped BEFORE the pin opens (the pin is verified as it is taken)", async () => {
+    let outside = "";
+    live = await workSession({
+      script: program(),
+      wire: {
+        // The pin's open follows the swapped parent into an outside decoy.
+        beforePin: () => {
+          const w = live as LiveWork;
+          renameSync(join(w.cwd, "a"), join(w.scratch, "stash-a"));
+          symlinkSync(join(outside, "decoy"), join(w.cwd, "a"), "dir");
+        },
+      },
+    });
+    outside = outsideDir();
+    mkdirSync(join(outside, "decoy", "b"), { recursive: true });
+    const m = marker();
+    mkdirSync(join(live.cwd, "a", "b"), { recursive: true });
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "a/b" }, live.cwd),
+    );
+    expect(err.message).toContain("now resolves outside the workspace");
+    expect(err.message).toContain("when it was pinned");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a realpath that FAILS immediately before the spawn refuses (unknown is not inside)", async () => {
+    let armed = false;
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      realpath: (p) => {
+        if (armed) throw failure("EIO");
+        return NODE_DIR_PIN_OPS.realpath(p);
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        beforeSpawn: () => {
+          armed = true;
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("could not be re-resolved immediately before the spawn (EIO)");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a no-follow stat that FAILS immediately before the spawn refuses", async () => {
+    let armed = false;
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      lstat: (p) => {
+        if (armed) throw failure("EIO");
+        return NODE_DIR_PIN_OPS.lstat(p);
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        beforeSpawn: () => {
+          armed = true;
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("could not be re-checked immediately before the spawn (EIO)");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a cwd whose realpath FAILS when it is first resolved is refused, not guessed", async () => {
+    // Fails for the cwd only while resolving; the (never reached) pin would see it work.
+    let failing = true;
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      realpath: (p) => {
+        if (failing && p.endsWith(`${sep}sub`)) throw failure("EACCES");
+        return NODE_DIR_PIN_OPS.realpath(p);
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        beforePin: () => {
+          failing = false;
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain('run refused: cwd "sub"');
+    expect(err.message).toContain("could not be resolved through its symlinks (EACCES)");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a workspace whose realpath FAILS is refused, not guessed", async () => {
+    let failing = true;
+    let ws = "";
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      realpath: (p) => {
+        if (failing && p === ws) throw failure("EACCES");
+        return NODE_DIR_PIN_OPS.realpath(p);
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        beforePin: () => {
+          failing = false;
+        },
+      },
+    });
+    ws = live.cwd;
+    const m = marker();
+    const err = await refusalOf(live.work.manager.start({ command: m.command }, live.cwd));
+    expect(err.message).toContain(`the workspace ${live.cwd} could not be resolved`);
+    expect(err.message).toContain("(EACCES)");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("an fstat that throws after the pin opened closes the descriptor and refuses", async () => {
+    const opened: number[] = [];
+    const closed: number[] = [];
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      open: (p, flags) => {
+        const fd = NODE_DIR_PIN_OPS.open(p, flags);
+        opened.push(fd);
+        return fd;
+      },
+      fstat: () => {
+        throw failure("EIO");
+      },
+      close: (fd) => {
+        closed.push(fd);
+        NODE_DIR_PIN_OPS.close(fd);
+      },
+    };
+    live = await workSession({ script: program(), wire: { dirPinOps } });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    try {
+      const err = await refusalOf(
+        live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+      );
+      expect(err.message).toContain("its identity could not be read (EIO)");
+      expect(err.message).toContain("The descriptor was closed");
+      expect(opened.length).toBe(1);
+      expect(closed).toEqual(opened);
+      await expectNothingStarted(m.file);
     } finally {
-      rmSync(outside, { recursive: true, force: true });
+      // Should a regression leak the descriptor, do not leak it past this test.
+      for (const fd of opened.filter((f) => !closed.includes(f))) {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed
+        }
+      }
     }
   }, 20_000);
 
-  it("a normal in-workspace cwd still runs", async () => {
-    live = await workSession({ script: program(call("run", { command: "true", cwd: "sub" })) });
-    mkdirSync(join(live.cwd, "sub"), { recursive: true });
+  it("a pin close that throws refuses BEFORE anything is spawned", async () => {
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      close: (fd) => {
+        NODE_DIR_PIN_OPS.close(fd);
+        throw failure("EIO");
+      },
+    };
+    live = await workSession({ script: program(), wire: { dirPinOps } });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("could not be closed (EIO)");
+    expect(err.message).toContain("Nothing was started");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+    "a searchable but unreadable directory is refused: the pin opens it for reading",
+    async () => {
+      // Node's realpath succeeds on a directory the process may search but not
+      // read (bun's native one fails, EACCES, before the pin is reached): the
+      // stub gives Node's answer for this one directory, so the pin's own open
+      // is what refuses, as it does in production under Node.
+      let rawSub = "";
+      let canonSub = "";
+      const dirPinOps: DirPinOps = {
+        ...NODE_DIR_PIN_OPS,
+        realpath: (p) => {
+          if (canonSub !== "" && (p === rawSub || p === canonSub)) return canonSub;
+          return NODE_DIR_PIN_OPS.realpath(p);
+        },
+      };
+      live = await workSession({ script: program(), wire: { dirPinOps } });
+      const m = marker();
+      rawSub = join(live.cwd, "sub");
+      mkdirSync(rawSub);
+      canonSub = realpathSync(rawSub);
+      chmodSync(rawSub, 0o300);
+      try {
+        const err = await refusalOf(
+          live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+        );
+        expect(err.message).toContain("could not be opened to pin its identity (EACCES)");
+        expect(err.message).toContain("without read permission is refused");
+        await expectNothingStarted(m.file);
+      } finally {
+        chmodSync(rawSub, 0o700);
+      }
+    },
+    20_000,
+  );
+
+  it("the live-job limit holds for starts issued together: nothing yields between the check and the registration", async () => {
+    live = await workSession({ script: program(), wire: { maxLiveJobs: 1 } });
+    const manager = live.work.manager;
+    const first = manager.start({ command: "sleep 30", background: true }, live.cwd);
+    // Registered before start() returned its promise: no await ran between the
+    // limit check and the registration (with no test seam set, as in production).
+    expect(manager.list().map((j) => j.runId)).toEqual(["run-1"]);
+    const second = manager.start({ command: "sleep 30", background: true }, live.cwd);
+    const [a, b] = await Promise.allSettled([first, second]);
+    expect(a.status).toBe("fulfilled");
+    expect(b.status).toBe("rejected");
+    expect((b as PromiseRejectedResult).reason.message).toContain(
+      "run refused: this run already has 1 running job (run-1)",
+    );
+    expect(manager.list().length).toBe(1);
+    await manager.endRun();
+  }, 20_000);
+
+  it("a normal in-workspace cwd still runs, and the pin is opened and closed exactly once", async () => {
+    const opened: number[] = [];
+    const closed: number[] = [];
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      open: (p, flags) => {
+        const fd = NODE_DIR_PIN_OPS.open(p, flags);
+        opened.push(fd);
+        return fd;
+      },
+      close: (fd) => {
+        closed.push(fd);
+        NODE_DIR_PIN_OPS.close(fd);
+      },
+    };
+    let m = { file: "", command: "" };
+    live = await workSession({
+      wire: { dirPinOps },
+      script: program(callWith("run", () => ({ command: m.command, cwd: "sub" }))),
+    });
+    m = marker();
+    mkdirSync(join(live.cwd, "sub"));
     await live.prompt();
     const r = lastOf(live.results, "run");
     expect(r.isError).toBe(false);
     expect(r.details.outcome).toBe("exited");
     expect(r.details.exit_code).toBe(0);
+    // The positive control for every marker assertion above: a command that
+    // starts writes the marker.
+    expect(existsSync(m.file)).toBe(true);
+    expect(opened.length).toBe(1);
+    expect(closed).toEqual(opened);
   }, 20_000);
 });

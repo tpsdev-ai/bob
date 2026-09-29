@@ -249,7 +249,10 @@ change one, the named test is what tells you.
   can fail, and the log line is written either way); none of it enters the
   restarted session's model context. The sweep signals a leftover job only while its
   leader's identity can be pinned (Linux). `run`'s `cwd` must resolve, through
-  symlinks, to a directory inside the workspace. The command's `outcome` and the
+  symlinks, to a directory inside the workspace; it is re-checked against a
+  pinned identity immediately before the spawn, which narrows, but does not
+  close, the window before the command starts in which a replaced path
+  component could change where it starts. The command's `outcome` and the
   verified `cleanup_state` are reported separately, and only a clean exit 0 is
   success. `run` counts as a shell for the resident
   policy. It is a process-group backend running as the same user, not a sandbox.
