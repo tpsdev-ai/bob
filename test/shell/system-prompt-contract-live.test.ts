@@ -794,7 +794,7 @@ describe("#145 — the contract survives the paths a resident agent takes", () =
 
 // Exercise the loader boundary as well as pi's asynchronous preflight/events.
 // The path-loaded probe gets the service exactly as presence and Discord do.
-it("presence admission survives the real pi loader and clears on agent_end", async () => {
+it("presence admission survives the real pi loader and names the turn's origin at agent_end", async () => {
   const capture = join(extDir, "origins.jsonl");
   const admissionModule = join(process.cwd(), "dist/shell/turn-admission.js");
   const capabilityText = `
@@ -847,7 +847,14 @@ it("presence admission survives the real pi loader and clears on agent_end", asy
       { kind: "cron", job: "brief" },
       { kind: "run" },
     ]);
-    expect(afterEnd).toEqual([{ kind: "run" }, { kind: "run" }, { kind: "run" }]);
+    // The admitted origin is still current at agent_end (agent_end fires inside
+    // the prompt; the origin is cleared only when the prompt settles), so a
+    // mid-turn readOrigin() never reverts to run.
+    expect(afterEnd).toEqual([
+      { kind: "discord", channelId: "123" },
+      { kind: "cron", job: "brief" },
+      { kind: "run" },
+    ]);
   } finally {
     await handle.shutdown();
   }
