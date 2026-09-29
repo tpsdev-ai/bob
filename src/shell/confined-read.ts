@@ -626,9 +626,10 @@ export interface ReadConfinementConfig {
 // when its policy says so OR its config carries the resolved residency decision
 // (a one-shot `bob run` of a `resident: true` agent) OR it is the persistent
 // runtime. The fixed setup session (onboard/align: read + write_soul) is
-// exempt: it must read the seed soul at `<agentDir>/soul.md`, outside its
-// workspace root, and runs locally at the operator's keyboard before any chat
-// surface exists.
+// exempt: it must read `<agentDir>/soul.md` (the seed during onboarding, the
+// current persona during alignment), which is outside its workspace root. It
+// runs locally at the operator's keyboard, and the setup session itself opens no
+// inbound Discord gateway (another service of the same agent may still have one).
 export function readConfinementApplies(
   policy: ReadConfinementPolicy,
   config: Omit<ReadConfinementConfig, "cwd">,
