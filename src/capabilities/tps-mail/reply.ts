@@ -15,12 +15,14 @@
 // may have handed the reply on before failing — so that retry can deliver a
 // second reply, threaded to the same messageId (the stated at-least-once case).
 //
-// CLI CONTRACT (finding, stated in the PR): the argv below asks the CLI for the
-// body on stdin (`--stdin`) and for threading (`--reply-to <messageId>`).
-// `tps mail send` as of @tpsdev-ai/cli 0.7.0 (main ac10d66) accepts neither —
-// its body is argv-only and it has no reply-to flag — so until the CLI grows
-// them, every reply FAILS CLOSED here (its usage error exits non-zero): it is
+// CLI CONTRACT: the argv below asks the CLI for the body on stdin (`--stdin`)
+// and for threading (`--reply-to <messageId>`, signed inside the envelope as
+// `replyToId`). tpsdev-ai/cli#431 added both, reads the PEM PKCS8 key `bob
+// onboard` writes, and refuses a send it cannot sign. @tpsdev-ai/cli 0.7.0 and
+// older take neither flag — the body is argv-only and there is no reply-to —
+// so with them every reply FAILS CLOSED here (the usage error exits non-zero):
 // counted, logged and retried, never sent unthreaded or with the body in argv.
+// `bob doctor` FAILS a tps on PATH whose mail usage does not name both flags.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -80,10 +82,11 @@ export function tpsCliReplySender(opts: TpsCliReplyOptions): ReplySender {
 
   return (reply) =>
     new Promise<ReplyResult>((resolve) => {
-      // The CLI signs with <keysDir>/<from>.key, and with NO key it sends the
-      // body UNSIGNED and still exits 0 — a reply every promote()-reading
-      // recipient dead-letters. Refuse to hand it over rather than record a
-      // dead letter as "sent".
+      // The CLI signs with <keysDir>/<from>.key. A tps before tpsdev-ai/cli#431
+      // with NO key sends the body UNSIGNED and still exits 0 — a reply every
+      // promote()-reading recipient dead-letters; a tps with that change
+      // refuses the send itself. bob refuses first either way, rather than
+      // record a dead letter as "sent".
       const keyPath = join(keysDir, `${opts.identity}.key`);
       if (!existsSync(keyPath)) {
         resolve({
