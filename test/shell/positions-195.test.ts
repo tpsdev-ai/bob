@@ -783,6 +783,55 @@ describe("positions (bob#195) — 2. hire a valid position; refuse an above-ceil
 
 // ---------------------------------------------------------------------------
 describe("positions (bob#195) — 3. boot refusals for an ungranted role / capability", () => {
+  it("an adopted agent boots inside grant maxima and refuses tool/capability requests outside them", () => {
+    const name = "adopted-maxima";
+    adoptReadyAgent(name);
+    adoptAgent({
+      name,
+      positionName: "builder",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: DEFAULT_POSITIONS_ROOT,
+    });
+
+    const grant = readGrant(s.hostRoot, name);
+    expect(grant?.position.name).toBe("builder");
+    expect(readBindingMarker(agentDirFor(name))?.position).toBe("builder");
+    expect(readBaseline(s.hostRoot, name)?.position.name).toBe("builder");
+    expect(loadRole("coder").tools.allow).toContain("flair_write");
+    expect(grant?.maxTools).not.toContain("flair_write");
+    expect(grant?.maxCapabilities).not.toContain("presence");
+
+    const good = readFileSync(bobYamlPath(name), "utf8");
+    expect(good).toContain("    - find\n");
+    expect(good).toContain("capabilities:\n");
+    const withinGrant = good.replace("capabilities:\n", "capabilities:\n  - flair\n");
+    writeFileSync(bobYamlPath(name), withinGrant);
+    expect(resolve(name).config.tools).toContain("find");
+    expect(Object.values(resolve(name).config.capabilityBySource)).toEqual(["flair"]);
+    writeFileSync(bobYamlPath(name), withinGrant.replace("    - find\n", ""));
+    expect(resolve(name).config.tools).not.toContain("find");
+
+    writeFileSync(
+      bobYamlPath(name),
+      withinGrant.replace("    - find\n", "    - find\n    - flair_write\n"),
+    );
+    expect(() => resolve(name)).toThrow(
+      /bob\.yaml requests tool outside the host-ratified set: flair_write\./,
+    );
+
+    writeFileSync(
+      bobYamlPath(name),
+      withinGrant.replace("  - flair\n", "  - flair\n  - presence\n"),
+    );
+    expect(() => resolve(name)).toThrow(
+      /bob\.yaml requests capability "presence".*position does not permit.*host grant ratifies it/,
+    );
+
+    writeFileSync(bobYamlPath(name), good);
+    expect(resolve(name).config.tools).toContain("find");
+  });
+
   it("refuses a role change, refuses an ungranted capability, and boots when restored", async () => {
     await hireBuilder("boot1");
     const good = readFileSync(bobYamlPath("boot1"), "utf8");
