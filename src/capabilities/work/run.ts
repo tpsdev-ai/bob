@@ -141,14 +141,23 @@ export interface ProcIdentity {
   sid: number;
 }
 
-// null: the process is gone (or only a zombie is left). "unsupported": this
-// platform gives no sub-second start time, so no identity can be pinned — and
-// the boot sweep then signals nothing.
-export type IdentityReader = (pid: number) => ProcIdentity | null | "unsupported";
+// What a read of a process's identity can say:
+//   a ProcIdentity  — the process, pinned;
+//   null            — the process is GONE: /proc has no such pid (ENOENT/ESRCH),
+//                     or only a zombie is left;
+//   "unreadable"    — the process may exist but its record could not be read or
+//                     parsed (EACCES, EPERM, an unexpected format …): the tool
+//                     CANNOT TELL, which is never the same as "gone" or
+//                     "replaced";
+//   "unsupported"   — this platform gives no sub-second start time, so no
+//                     identity can be pinned — and the boot sweep then signals
+//                     nothing.
+export type IdentityRead = ProcIdentity | null | "unreadable" | "unsupported";
+export type IdentityReader = (pid: number) => IdentityRead;
 
 let linuxBootId: string | null | undefined;
 
-export function readProcIdentity(pid: number): ProcIdentity | null | "unsupported" {
+export function readProcIdentity(pid: number): IdentityRead {
   if (process.platform !== "linux") return "unsupported";
   if (linuxBootId === undefined) {
     try {
@@ -158,17 +167,28 @@ export function readProcIdentity(pid: number): ProcIdentity | null | "unsupporte
     }
   }
   if (linuxBootId === null) return "unsupported";
+  return identityFromProc(pid, linuxBootId, (path) => readFileSync(path, "utf8"));
+}
+
+// The /proc/<pid>/stat half of readProcIdentity, with the read injectable so the
+// error classification is testable on any platform.
+export function identityFromProc(
+  pid: number,
+  boot: string,
+  readStat: (path: string) => string,
+): ProcIdentity | null | "unreadable" {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   let stat: string;
   try {
-    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-  } catch {
-    return null;
+    stat = readStat(`/proc/${pid}/stat`);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ESRCH" ? null : "unreadable";
   }
   // "pid (comm) state ppid pgrp session ..." — comm may hold spaces or parens,
   // so the fields are counted from the LAST ")".
   const close = stat.lastIndexOf(")");
-  if (close < 0) return null;
+  if (close < 0) return "unreadable";
   const f = stat.slice(close + 2).split(" ");
   const state = f[0];
   if (state === "Z" || state === "X" || state === "x") return null;
@@ -176,9 +196,9 @@ export function readProcIdentity(pid: number): ProcIdentity | null | "unsupporte
   const sid = Number(f[3]);
   const start = f[19];
   if (!Number.isSafeInteger(pgid) || !Number.isSafeInteger(sid) || !/^\d+$/.test(start ?? "")) {
-    return null;
+    return "unreadable";
   }
-  return { boot: linuxBootId, start, pgid, sid };
+  return { boot, start, pgid, sid };
 }
 
 export function sameIdentity(a: ProcIdentity, b: ProcIdentity): boolean {
@@ -836,10 +856,12 @@ export class JobManager {
     });
     child.once("exit", (code, signal) => this.onLeaderExit(job, code, signal));
 
-    // The first durable record. A job the registry does not know about could
-    // outlive a crashed supervisor with nothing left to find it, so if this
-    // write fails the job is stopped (the deadline's escalation) and verified
-    // before the refusal is returned.
+    // The first durable record, written right after spawn and before the
+    // deadline is armed. The command is already running by now: the shell
+    // starts at spawn. A job the registry does not know about could outlive a
+    // crashed supervisor with nothing left to find it, so if this write fails
+    // the job is terminated (the deadline's escalation) and the refusal says
+    // whether its group was verified empty.
     try {
       this.writeEntry(job);
     } catch (err) {
@@ -851,7 +873,7 @@ export class JobManager {
       this.jobs.delete(runId);
       const clean = job.cleanup === "group_empty" || job.cleanup === "group_killed";
       throw new RunRefusal(
-        `run refused: the job record for ${runId} could not be written (${code}), so the job was stopped before it could run unrecorded. Its process group ${job.pgid} ${
+        `run refused: the job record for ${runId} could not be written (${code}) right after the job started, so the job was terminated (SIGTERM, then SIGKILL after a grace). Its process group ${job.pgid} ${
           clean
             ? `was verified empty (cleanup_state ${job.cleanup}): nothing from it is left running`
             : `could NOT be verified empty (cleanup_state ${job.cleanup}): something from it may survive`
@@ -1395,16 +1417,18 @@ export class JobManager {
   //   * this process's own pid counts only with this process's instance id;
   //   * a gone pid is a dead supervisor;
   //   * a live pid with a pinned identity on record counts only if it still
-  //     has that identity;
-  //   * a live pid with no pinned identity (a platform without one) counts
-  //     only while the run's heartbeat (its record's mtime) is fresh.
+  //     has that identity — a read that finds the pid gone is a mismatch;
+  //   * a live pid whose identity cannot be compared — none on record (a
+  //     platform without one), or a read that could not tell ("unreadable") —
+  //     counts only while the run's heartbeat (its record's mtime) is fresh.
+  //     "Cannot tell" never classifies a live supervisor as replaced.
   private supervisorAlive(meta: Record<string, unknown>, record: string, now: number): boolean {
     const pid = meta.supervisor_pid as number;
     if (pid === process.pid) return meta.supervisor_instance === processInstanceId();
     if (!isPidAlive(pid)) return false;
     const recorded = meta.supervisor_identity;
     const current = this.readIdentity(pid);
-    if (isIdentity(recorded) && current !== "unsupported") {
+    if (isIdentity(recorded) && current !== "unsupported" && current !== "unreadable") {
       return current !== null && sameIdentity(recorded, current);
     }
     let mtime: number;
@@ -1459,7 +1483,9 @@ export class JobManager {
         } else if (!pinned()) {
           cleanup = "escaped_or_unverified";
           note =
-            "its process group exists but its leader no longer has the identity pinned at spawn (gone, or its pid was reused), so it was NOT signalled";
+            this.readIdentity(pgid) === "unreadable"
+              ? "its leader's identity could not be read, so the tool cannot tell whether the group is still this job's; it was NOT signalled"
+              : "its process group exists but its leader no longer has the identity pinned at spawn (gone, or its pid was reused), so it was NOT signalled";
         } else {
           const t = await this.terminatePinnedGroup(pgid, pinned);
           cleanup = t.cleanup;

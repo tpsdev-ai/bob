@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type IdentityReader,
+  identityFromProc,
   type ProcIdentity,
   processInstanceId,
   readProcIdentity,
@@ -60,6 +61,26 @@ function startGroup(command = "sleep 30"): ChildProcess {
   const c = spawn("/bin/sh", ["-c", command], { detached: true, stdio: "ignore" });
   started.push(c);
   return c;
+}
+
+// A real detached group that IGNORES SIGTERM, returned only once its shell has
+// installed the trap (it says "ready" first) — a SIGTERM that arrived before
+// the trap would end it, which is not the case under test.
+async function startTermIgnoringGroup(): Promise<number> {
+  const c = spawn("/bin/sh", ["-c", "trap '' TERM; echo ready; exec sleep 30"], {
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  started.push(c);
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("the test group never said ready")), 5000);
+    c.stdout?.once("data", () => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
+  c.stdout?.destroy();
+  return c.pid as number;
 }
 
 // A pid that is certainly gone: a process that already ran to completion.
@@ -156,8 +177,8 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
     const orphan = startGroup().pid as number;
     const reused = startGroup().pid as number;
     const unpinned = startGroup().pid as number;
-    const gone = spawn("true", [], { detached: true, stdio: "ignore" });
-    await new Promise((r) => gone.once("exit", r));
+    // A group that is already gone: the pid of a process that ran to completion.
+    const gone = deadPid();
     const liveRunGroup = startGroup().pid as number;
 
     // The identities "the platform" reports now. The orphan's matches its record;
@@ -178,10 +199,7 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
       join(deadRun, "jobs", `pg-${reused}.run-2.json`),
       entry("run-2", reused, dead, ident(reused, "7000")),
     );
-    writeJson(
-      join(deadRun, "jobs", `pg-${gone.pid}.run-3.json`),
-      entry("run-3", gone.pid as number, dead, null),
-    );
+    writeJson(join(deadRun, "jobs", `pg-${gone}.run-3.json`), entry("run-3", gone, dead, null));
     writeJson(
       join(deadRun, "jobs", `pg-${unpinned}.run-4.json`),
       entry("run-4", unpinned, dead, null),
@@ -230,7 +248,7 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
     expect((e2.reaped_by as { signalled: boolean; note: string }).signalled).toBe(false);
 
     // (3) A group already gone: no exit status was ever observed.
-    expect(readEntry(deadRun, `pg-${gone.pid}.run-3.json`)).toMatchObject({
+    expect(readEntry(deadRun, `pg-${gone}.run-3.json`)).toMatchObject({
       outcome: "no_exit_status",
       cleanup_state: "group_empty",
     });
@@ -290,7 +308,7 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
     const stateRoot = scratchState();
     const dead = deadPid();
     // A group that ignores SIGTERM, so only SIGKILL could end it.
-    const group = startGroup("trap '' TERM; sleep 30").pid as number;
+    const group = await startTermIgnoringGroup();
     const pinnedId = ident(group, "424242");
     let reads = 0;
     // Matches for the first check and the check before SIGTERM; lost after.
@@ -379,6 +397,80 @@ describe("boot sweep — a supervisor pid that now belongs to another process", 
     // The foreign process was never signalled by any of this.
     expect(groupAlive(foreign)).toBe(true);
   }, 20_000);
+});
+
+// A /proc/<pid>/stat line for `pid` with the given start tick, as Linux writes
+// it: "pid (comm) state ppid pgrp session tty tpgid flags … starttime …".
+function statLine(pid: number, start: string, state = "S"): string {
+  const after = [state, "1", String(pid), String(pid), "0", "-1", "4194304"];
+  while (after.length < 19) after.push("0");
+  after.push(start, "0", "0");
+  return `${pid} (sleep (x)) ${after.join(" ")}\n`;
+}
+
+function errno(code: string): NodeJS.ErrnoException {
+  const err = new Error(code) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+describe("boot sweep — an identity that cannot be read", () => {
+  it("an unreadable identity (EACCES) for a live supervisor with a fresh heartbeat is 'cannot tell': no signal, no capture deleted", async () => {
+    const stateRoot = scratchState();
+    const supervisor = startGroup().pid as number; // a live pid standing in for a bob
+    const job = startGroup().pid as number; // the live run's pinned job
+    const jobStart = "31337";
+    // The REAL classification (identityFromProc) over an injected stat read:
+    // the supervisor's /proc record fails with EACCES; the job's reads fine.
+    const reader: IdentityReader = (pid) =>
+      identityFromProc(pid, "test-boot", (path) => {
+        if (path === `/proc/${supervisor}/stat`) throw errno("EACCES");
+        if (path === `/proc/${job}/stat`) return statLine(job, jobStart);
+        throw errno("ENOENT");
+      });
+    expect(reader(supervisor)).toBe("unreadable");
+    const signals: Array<[number, string]> = [];
+    // A live run: its supervisor's identity is on record, its heartbeat is fresh.
+    const run = seedRun(stateRoot, "run-unread", supervisor, {
+      supervisor_identity: ident(supervisor, "4242"),
+    });
+    writeJson(
+      join(run, "jobs", `pg-${job}.run-1.json`),
+      entry("run-1", job, supervisor, { boot: "test-boot", start: jobStart, pgid: job, sid: job }),
+    );
+    live = await workSession({
+      stateRoot,
+      wire: { readIdentity: reader, groupOps: recordingOps(signals) },
+      script: program(),
+    });
+    expect(await live.work.bootSweep).toEqual([]);
+    expect(signals).toEqual([]);
+    expect(groupAlive(job)).toBe(true);
+    expect(existsSync(join(run, "out", "run-1.log"))).toBe(true);
+    expect(existsSync(join(run, "ended.json"))).toBe(false);
+    expect(readEntry(run, `pg-${job}.run-1.json`).state).toBe("running");
+  }, 20_000);
+
+  it("the stat read's errors: only 'no such process' is gone; anything else is unreadable", () => {
+    const read = (e: string) => () => {
+      throw errno(e);
+    };
+    expect(identityFromProc(4321, "b", read("ENOENT"))).toBeNull();
+    expect(identityFromProc(4321, "b", read("ESRCH"))).toBeNull();
+    for (const code of ["EACCES", "EPERM", "EIO", "EMFILE"]) {
+      expect(identityFromProc(4321, "b", read(code)), code).toBe("unreadable");
+    }
+    // A record that cannot be parsed cannot tell either; a zombie is gone.
+    expect(identityFromProc(4321, "b", () => "garbage")).toBe("unreadable");
+    expect(identityFromProc(4321, "b", () => statLine(4321, "77", "Z"))).toBeNull();
+    // A good record pins start, group and session (comm may hold parens).
+    expect(identityFromProc(4321, "b", () => statLine(4321, "77"))).toEqual({
+      boot: "b",
+      start: "77",
+      pgid: 4321,
+      sid: 4321,
+    });
+  });
 });
 
 describe("the process identity reader", () => {

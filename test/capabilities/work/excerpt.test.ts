@@ -135,6 +135,32 @@ describe("the shared redaction set (observatory sanitize.ts)", () => {
     expect(redactSecrets("the authorization step passed").redactions).toBe(0);
   });
 
+  it("redacts the WHOLE header value through the end of its line: quoted Digest parameters, any length", () => {
+    // A quoted Digest header: every parameter goes, not just the text up to the
+    // first quote.
+    const digest = redactSecrets(
+      `Authorization: Digest username="alice", realm="example.org", nonce="secret123", uri="/api", response="6629fae49393a05397450978507c4ef1"`,
+    );
+    expect(digest).toEqual({ text: "Authorization: [redacted]", redactions: 1 });
+    // A value longer than any fixed cap, made of pieces no other rule matches
+    // (dots and dashes break the long-opaque-run rules).
+    const longBasic = `Proxy-Authorization: Basic ${"a1.b2-".repeat(1200)}tail-secret-9`;
+    expect(longBasic.length).toBeGreaterThan(7000);
+    expect(redactSecrets(longBasic)).toEqual({
+      text: "Proxy-Authorization: [redacted]",
+      redactions: 1,
+    });
+    // The value ends at its own line: the next line is left alone, and a header
+    // with an empty value does not swallow the next line.
+    expect(redactSecrets(`Authorization: Basic abc\nnext line`).text).toBe(
+      "Authorization: [redacted]\nnext line",
+    );
+    expect(redactSecrets("Authorization:\r\nnext line")).toEqual({
+      text: "Authorization:\r\nnext line",
+      redactions: 0,
+    });
+  });
+
   it("covers credentials in a URL's userinfo, keeping the host", () => {
     const r = redactSecrets("cloning https://bob:pa55word@github.com/org/repo.git");
     expect(r.text).not.toContain("pa55word");

@@ -107,7 +107,9 @@ named error.
 - The model sees a bounded tail excerpt (16 KiB, 400 lines). Before the cut, the
   window is passed through bob's existing secret redaction (the observatory's
   `redactSecrets`: provider token shapes, `Authorization` / `Proxy-Authorization`
-  header values of any scheme, `key=`/`token=` and `*_TOKEN=`/`*_PASSWORD=`-style
+  header values of any scheme and length — the whole value through the end of
+  its line, quoted Digest parameters included, the header name kept —
+  `key=`/`token=` and `*_TOKEN=`/`*_PASSWORD=`-style
   assignments, URL userinfo, PEM blocks, long opaque runs), with a margin before
   the excerpt so a secret that straddles the cut is redacted whole. `redactions`
   counts what was replaced. The full capture stays local: it is never in the
@@ -139,10 +141,11 @@ named error.
 - Every job is recorded on disk, keyed by its process group, in the run's own
   state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`
   (supervisor pid, deadline, the group leader's pinned identity, command digest,
-  outcome, cleanup). The record is written before the job's deadline is armed;
-  if that first write fails, the job is stopped with the deadline's escalation
-  and verified, and `run` returns a refusal naming the job's process group and
-  whether it was verified empty — a job never runs without its record.
+  outcome, cleanup). The first record is written right after spawn — the
+  command is already running by then — and before the job's deadline is armed.
+  If that first write fails, the job is terminated with the deadline's
+  escalation, and `run` returns a refusal naming the job's process group and
+  saying whether that group was verified empty.
 - **Identity.** A pid can be reused, even within one second, so a pid (or a
   1-second `ps` start time) is not an identity. On Linux the tool pins a process
   as the boot id plus the start time in clock ticks, the process group and the
@@ -161,9 +164,11 @@ named error.
     supervisor's pid now: its captures go at once, its records after 24 hours.
   - A run whose supervisor is **gone** — its pid is dead; or the pid is this
     process but the instance id is another's; or the pid is live but no longer
-    has the pinned identity; or, with no identity on record, the heartbeat is
-    more than 10 minutes stale — has its captures deleted, is marked ended, and
-    each job still recorded as running is reported.
+    has the pinned identity; or its identity cannot be compared (none on
+    record, or the read could not tell) and the heartbeat is more than 10
+    minutes stale — has its captures deleted, is marked ended, and each job
+    still recorded as running is reported. An identity read that fails for any
+    reason other than "no such process" means "cannot tell", never "replaced".
   - Such a job's group is signalled **only while its leader has the identity
     pinned at spawn**, checked again immediately before every signal: SIGTERM,
     then SIGKILL after the grace. If the identity was never pinned (no

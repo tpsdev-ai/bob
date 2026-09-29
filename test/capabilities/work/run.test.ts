@@ -286,6 +286,33 @@ describe("run — output", () => {
     expect(r.details.redactions).toBe(2);
   }, 20_000);
 
+  it("a quoted Digest header and a long Basic value are redacted whole in the run result", async () => {
+    const digest = `Authorization: Digest username="alice", realm="example.org", nonce="secret123", uri="/api", response="6629fae49393a05397450978507c4ef1"`;
+    const longBasic = `Authorization: Basic ${"a1.b2-".repeat(1200)}tail-secret-9`;
+    live = await workSession({
+      script: program(
+        call("run", { command: `printf '%s\\n' '${digest}' '${longBasic}' 'after'` }),
+      ),
+    });
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    for (const leaked of [
+      "alice",
+      "example.org",
+      "secret123",
+      "6629fae4",
+      "a1.b2-",
+      "tail-secret",
+    ]) {
+      expect(r.text, leaked).not.toContain(leaked);
+      expect(JSON.stringify(r.details), leaked).not.toContain(leaked);
+    }
+    expect(r.details.output_excerpt).toBe(
+      "Authorization: [redacted]\nAuthorization: [redacted]\nafter\n",
+    );
+    expect(r.details.redactions).toBe(2);
+  }, 20_000);
+
   it("a running job's unterminated final line is withheld until its capture completes", async () => {
     live = await workSession({
       script: program(
@@ -339,8 +366,8 @@ describe("run — output", () => {
   }, 20_000);
 });
 
-describe("run — a job is never left running without its durable record", () => {
-  it("a failed first registry write stops the job and verifies no process from it remains", async () => {
+describe("run — a failed first record write terminates the job", () => {
+  it("a failed first registry write terminates the job and verifies no process from it remains", async () => {
     let failed = false;
     live = await workSession({
       wire: {
@@ -356,7 +383,9 @@ describe("run — a job is never left running without its durable record", () =>
         },
       },
       script: program(
-        // A command that ignores SIGTERM: stopping it needs the full escalation.
+        // A command that ignores SIGTERM once its trap is set: stopping it may
+        // need the full escalation (the write fails microseconds after spawn,
+        // so the trap may or may not be in place yet).
         call("run", { command: "trap '' TERM; sleep 30 & wait", background: true }),
         call("run_status", {}),
         call("run", { command: "echo recovered" }),
@@ -369,7 +398,9 @@ describe("run — a job is never left running without its durable record", () =>
     expect(m).not.toBeNull();
     const pgid = Number(m?.[1]);
     try {
-      expect(refused.text).toContain("could not be written (ENOSPC)");
+      expect(refused.text).toContain(
+        "could not be written (ENOSPC) right after the job started, so the job was terminated",
+      );
       expect(refused.text).toContain("nothing from it is left running");
       // No process from that job remains.
       expect(groupAlive(pgid)).toBe(false);

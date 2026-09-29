@@ -28,11 +28,14 @@ export const REDACTED = "[redacted]";
 // trying to recognize "a secret" semantically.
 const SECRET_PATTERNS: RegExp[] = [
   // Authorization / Proxy-Authorization header VALUES, whatever the scheme
-  // (Basic, Bearer, Token, Digest, a bare credential …): everything after the
-  // colon to the end of the line or the closing quote. The header name stays.
-  // First in the list, so a scheme-specific rule below never double-counts it;
-  // a value that is already "[redacted]" is left alone. Quantifiers are bounded.
-  /(?<=\b(?:proxy-)?authorization["']?\s{0,8}[:=]\s{0,8}["']?)(?!\[redacted\])[^\s"'][^"'\r\n]{0,4095}/gi,
+  // (Basic, Bearer, Token, Digest with quoted parameters, a bare credential …)
+  // and whatever the length: EVERYTHING after the separator through the end of
+  // the line is replaced, quotes and all. The header name stays. First in the
+  // list, so a scheme-specific rule below never double-counts it; a value that
+  // is already "[redacted]" is left alone. The separator and the value must be
+  // on the header's own line. The lookbehind is bounded and the value runs to
+  // the line end, so the rule stays linear.
+  /(?<=\b(?:proxy-)?authorization["']?[ \t]{0,8}[:=][ \t]{0,8})(?!\[redacted\])[^\s][^\r\n]*/gi,
   // GitHub tokens: ghp_, gho_, ghu_, ghs_, ghr_, github_pat_…
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
