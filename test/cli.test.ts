@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "../src/shell/argv.js";
 import { initAgent } from "../src/shell/init.js";
 import { type SpawnError, spawnNode, spawnNodeAsync } from "./cli-spawn.js";
 import { operatorCredentialForms } from "./shell/flair-fake.js";
@@ -11,6 +12,33 @@ import { operatorCredentialForms } from "./shell/flair-fake.js";
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
 describe("bob CLI", () => {
+  it("hire keeps the agent name positional after a bare --flair", () => {
+    expect(parseArgs(["hire", "--flair", "flagged", "--as", "builder"]).positional).toEqual([
+      "flagged",
+    ]);
+  });
+  it.each([
+    ["--flair=true", "flagged"],
+    ["--flair=false", "flagged"],
+    ["--flair", "flagged"],
+  ])("hire refuses unsupported %s before creating an agent", (flag, name) => {
+    const home = mkdtempSync(join(tmpdir(), "bob-hire-flair-"));
+    const args =
+      flag === "--flair"
+        ? [CLI, "hire", flag, name, "--as", "builder"]
+        : [CLI, "hire", name, "--as", "builder", flag];
+    try {
+      spawnNode(args, { env: { ...process.env, HOME: home } });
+      throw new Error("hire unexpectedly succeeded");
+    } catch (err) {
+      const e = err as SpawnError;
+      expect(e.code).toBe(2);
+      expect(e.stdout).toContain("--flair is not supported");
+      expect(existsSync(join(home, "agents", name))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
   it("prints help on `bob help`", () => {
     const out = spawnNode([CLI, "help"]);
     expect(out).toContain("Bob — moldable office-agent shell");

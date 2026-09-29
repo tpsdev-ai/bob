@@ -76,7 +76,7 @@ describe("parseArgs", () => {
   // --- Declared boolean flags: validated at parse time, by whitelist (#173 round 3) ---
   it("declares every boolean flag the CLI reads", () => {
     expect([...BOOLEAN_FLAGS].sort()).toEqual(
-      ["dry-run", "force", "interactive", "no-flair", "no-interactive"].sort(),
+      ["dry-run", "flair", "force", "interactive", "no-flair", "no-interactive"].sort(),
     );
   });
 
