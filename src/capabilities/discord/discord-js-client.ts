@@ -19,8 +19,51 @@
 //     connect() (login). Only the PERSISTENT runtime calls connect(); a one-shot
 //     run gets the outbound REST tools with no gateway, no duplicate login.
 
-import { Client, Events, GatewayIntentBits, type Message, Routes } from "discord.js";
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  type Message,
+  type RESTOptions,
+  Routes,
+} from "discord.js";
 import type { DiscordClient, DiscordMessage } from "../../shell/discord-types.js";
+
+// The REST request function this binding hands to discord.js, replacing
+// @discordjs/rest's own strategy.
+//
+// @discordjs/rest returns a response built with `new Headers(res.headers)`.
+// Under Node, its default strategy uses the `undici` package the lockfile
+// pins, and undici negotiates HTTP/2 by default; Discord's edge serves h2, and
+// Node's http2 client tags the response headers object with a
+// `Symbol(sensitiveHeaders)` key. undici's Headers constructor rejects that
+// symbol ("Key Symbol(sensitiveHeaders) in init is a symbol, which cannot be
+// converted to a ByteString"), so EVERY REST call fails — the gateway never
+// connects and no Discord message is sent or received.
+//
+// The runtime's global `fetch` does not go through the pinned `undici` package
+// and has no such problem, so the capability performs the request itself. The
+// REST manager builds the init: an uppercase `method`, a `body` (a JSON string
+// for this binding's calls, or null for GET/HEAD), `headers` (a plain object of
+// string values) and an `AbortSignal`. We forward exactly those, copying the
+// headers by their OWN enumerable string keys only, so no symbol-keyed entry
+// (the `sensitiveHeaders` one included) can reach a Headers constructor.
+export async function makeDiscordRestRequest(
+  url: string,
+  init: Parameters<RESTOptions["makeRequest"]>[1],
+): Promise<Response> {
+  const headers = new Headers();
+  const initHeaders = (init.headers ?? {}) as Record<string, unknown>;
+  for (const [name, value] of Object.entries(initHeaders)) {
+    if (typeof value === "string") headers.set(name, value);
+  }
+  return fetch(url, {
+    method: init.method ?? "GET",
+    headers,
+    body: (init.body ?? undefined) as NonNullable<Parameters<typeof fetch>[1]>["body"],
+    signal: init.signal ?? undefined,
+  });
+}
 
 export interface DiscordJsClientOptions {
   // Bot token. Read from a secret file in production; passed inline in
@@ -71,6 +114,10 @@ export class DiscordJsClient implements DiscordClient {
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.MessageContent,
       ],
+      // Give the REST manager a request path that never builds a Headers from an
+      // h2-tagged response (see makeDiscordRestRequest). Without this, the
+      // capability cannot make ANY REST call under Node.
+      rest: { makeRequest: makeDiscordRestRequest as RESTOptions["makeRequest"] },
     });
     // Enable the REST manager WITHOUT logging in — outbound works in a one-shot
     // run with no gateway connection. (login() also sets the token; doing it
