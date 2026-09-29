@@ -121,4 +121,31 @@ describe("makeDiscordRestRequest — a refused redirect releases its body", () =
       (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
     }
   });
+
+  it("still rejects with the redirect error when cancelling the body fails", async () => {
+    const originalFetch = globalThis.fetch;
+    const stub = (async () => {
+      const body = new ReadableStream({
+        pull() {},
+        cancel() {
+          throw new Error("cancel failed");
+        },
+      });
+      return new Response(body, {
+        status: 307,
+        headers: { location: "http://elsewhere.invalid/" },
+      });
+    }) as typeof fetch;
+    (globalThis as { fetch: typeof fetch }).fetch = stub;
+    try {
+      await expect(
+        makeDiscordRestRequest("http://discord.invalid/v10/x", {
+          method: "GET",
+          headers: { authorization: "Bot tok" },
+        } as unknown as MakeRequestInit),
+      ).rejects.toThrow(/HTTP 307 to elsewhere\.invalid/);
+    } finally {
+      (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
+    }
+  });
 });
