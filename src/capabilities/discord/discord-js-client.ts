@@ -277,4 +277,31 @@ export class DiscordJsClient implements DiscordClient {
       ...(m.guild_id !== undefined ? { guildId: m.guild_id } : {}),
     }));
   }
+
+  async fetchMessage(channelId: string, messageId: string): Promise<DiscordMessage | null> {
+    try {
+      const m = (await this.client.rest.get(
+        Routes.channelMessage(channelId, messageId),
+      )) as RawApiMessage;
+      return {
+        id: m.id,
+        channelId: m.channel_id,
+        authorId: m.author.id,
+        authorName: m.author.username,
+        content: m.content,
+        mentionsBot: this.resolvedBotUserId
+          ? (m.mentions ?? []).some((u) => u.id === this.resolvedBotUserId)
+          : false,
+        ...(m.guild_id !== undefined ? { guildId: m.guild_id } : {}),
+      };
+    } catch (err) {
+      // 404 = the message is not in THIS channel. Any other failure (a 401/403,
+      // a 5xx, a transport error) is a REAL failure and is rethrown, never
+      // reported as "not found" — the caller refuses on null, so a lookup that
+      // failed must not read as "absent" either (it refuses either way, but the
+      // real error is what reaches the operator).
+      if ((err as { status?: number }).status === 404) return null;
+      throw err;
+    }
+  }
 }

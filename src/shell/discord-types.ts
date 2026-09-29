@@ -38,6 +38,12 @@ export interface DiscordClient {
   // agent can read recent context without an inbound event. Does not include
   // the bot filtering the gateway listener applies — it's a raw read.
   fetchRecent(channelId: string, limit: number): Promise<DiscordMessage[]>;
+  // Fetch ONE message from a specific channel, or null when it is not there
+  // (404). A message id alone does not carry its channel, so this is how the
+  // capability checks that a quote-reply / reaction names a message in the
+  // turn's own channel. A transport failure other than 404 is thrown, never
+  // reported as "not found".
+  fetchMessage(channelId: string, messageId: string): Promise<DiscordMessage | null>;
   // Fire the "<bot> is typing…" affordance on a channel — the signal that the
   // agent picked the message up and is working on it.
   //

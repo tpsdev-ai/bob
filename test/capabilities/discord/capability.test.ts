@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   type AssistantMessageLike,
+  createDiscordTurn,
   type PiLike,
   wireDiscordCapability,
 } from "../../../src/capabilities/discord/capability.js";
@@ -35,12 +36,12 @@ class FakePi implements PiLike {
     }
   }
   private completions: Array<(messages: unknown[]) => void> = [];
-  // The running turn's origin, as bob's real turn admission exposes it through
-  // `readOrigin`. Turns are serialized (one prompt at a time), so the origin is
-  // single-valued: it names the turn currently running, and {kind:"run"} when
-  // none is. This mirrors the real admission's readOrigin(), which is what the
-  // capability's outbound tools consult to stay inside the running turn's
-  // channel.
+  // A simple single-valued stand-in for the running turn's origin, NOT a model
+  // of the real admission: the real admission is a FIFO whose origin spans the
+  // whole admitted prompt, while this fake admits every message immediately and
+  // replaces the origin (its `admitTurn` never QUEUES). The binding property is
+  // pinned against the REAL admission in the tests below, which is why that
+  // distinction matters; here it only backs the per-call checks.
   currentOrigin: TurnOrigin = { kind: "run" };
   readOrigin = (): TurnOrigin => this.currentOrigin;
   admitTurn = (origin: TurnOrigin, content: string): Promise<unknown[]> => {
@@ -77,6 +78,10 @@ class FakeDiscordClient implements DiscordClient {
   // Every typing pulse, in order — the heartbeat assertions count these.
   readonly typings: string[] = [];
   fetchReturns: DiscordMessage[] = [];
+  // message id -> the channel it lives in, recorded as messages are `fire`d, so
+  // `fetchMessage` can mimic Discord: a lookup in the WRONG channel is null
+  // (404), exactly as the real client reports it.
+  readonly messageChannels = new Map<string, string>();
   connectCalled = false;
   disconnectCalled = false;
   replyThrows = false;
@@ -103,13 +108,27 @@ class FakeDiscordClient implements DiscordClient {
   async fetchRecent(_channelId: string, _limit: number): Promise<DiscordMessage[]> {
     return this.fetchReturns;
   }
+  async fetchMessage(channelId: string, messageId: string): Promise<DiscordMessage | null> {
+    const ch = this.messageChannels.get(messageId);
+    if (ch === undefined || ch !== channelId) return null;
+    return {
+      id: messageId,
+      channelId: ch,
+      authorId: "u1",
+      authorName: "user",
+      content: "",
+      mentionsBot: false,
+    };
+  }
   async sendTyping(channelId: string): Promise<void> {
     if (this.typingThrows) throw new Error("simulated discord typing failure");
     this.typings.push(channelId);
   }
   fire(msg: Partial<DiscordMessage> & Pick<DiscordMessage, "channelId" | "content">): void {
+    const id = msg.id ?? "m1";
+    this.messageChannels.set(id, msg.channelId);
     this.handler?.({
-      id: msg.id ?? "m1",
+      id,
       channelId: msg.channelId,
       authorId: msg.authorId ?? "u1",
       authorName: msg.authorName ?? "user",
@@ -374,6 +393,14 @@ function setupRealAdmission() {
     release(text: string) {
       releases.get(text)?.();
     },
+    // Emit an agent_end through the session's subscription, exactly as pi would
+    // at an agent-loop boundary (a retry / continuation fires one mid-prompt).
+    emitAgentEnd(messages?: unknown[]) {
+      listener?.({
+        type: "agent_end",
+        messages: messages ?? [{ role: "assistant", content: [{ type: "text", text: "mid" }] }],
+      });
+    },
     // Let the FIFO's microtask chain settle.
     flush: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
   };
@@ -480,6 +507,38 @@ describe("wireDiscordCapability — a real queued turn keeps its own origin (iss
       { channelId: "222", text: "B?::answer", replyTo: "mB" },
     ]);
   });
+
+  it("keeps the binding across a mid-loop agent_end (the origin spans the whole admitted prompt)", async () => {
+    const h = setupRealAdmission();
+    const report = deferred<Array<{ tool: string; outcome: string }>>();
+    h.setOnTurn(async (text) => {
+      if (text !== "A?") return;
+      // A retry/continuation fires an agent_end INSIDE the prompt. The turn must
+      // stay bound to channel 111 after it — a per-call readOrigin() that the
+      // agent_end cleared would revert the tools to allowlist reach mid-turn.
+      h.emitAgentEnd();
+      const after: Array<{ tool: string; outcome: string }> = [];
+      for (const [tool, params] of [
+        ["discord_reply", { channelId: "222", text: "sneak" }],
+        ["discord_react", { channelId: "222", messageId: "mB", emoji: "✅" }],
+        ["discord_fetch", { channelId: "222" }],
+      ] as const) {
+        after.push({ tool, outcome: await attempt(h.pi, tool, params) });
+      }
+      report.resolve(after);
+    });
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    await h.flush();
+    const after = await report.promise;
+    const refusal = expect.stringMatching(/bound to channel 111.*refusing to use channel 222/);
+    expect(after).toEqual([
+      { tool: "discord_reply", outcome: refusal },
+      { tool: "discord_react", outcome: refusal },
+      { tool: "discord_fetch", outcome: refusal },
+    ]);
+    h.release("A?");
+    await h.flush();
+  });
 });
 
 describe("wireDiscordCapability — a turn's tools are bound to its channel (issue #227)", () => {
@@ -573,6 +632,64 @@ describe("wireDiscordCapability — a turn's tools are bound to its channel (iss
       /not in the configured allow-list/,
     );
     expect(client.replies).toHaveLength(0);
+  });
+
+  it("discord_reply's replyTo must belong to the turn's channel (refused otherwise)", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    // A message that lives in ANOTHER channel cannot be quote-replied from this turn.
+    client.messageChannels.set("mB", "channel-B");
+    await expect(
+      pi.call("discord_reply", { channelId: "channel-A", text: "x", replyTo: "mB" }),
+    ).rejects.toThrow(
+      /refusing message mB: it cannot be shown to belong to this turn's channel channel-A/,
+    );
+    expect(client.replies).toHaveLength(0);
+    // A message in the turn's OWN channel is allowed.
+    await pi.call("discord_reply", { channelId: "channel-A", text: "ok", replyTo: "mA" });
+    expect(client.replies).toEqual([{ channelId: "channel-A", text: "ok", replyTo: "mA" }]);
+  });
+
+  it("discord_react's messageId must belong to the turn's channel (refused otherwise)", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    client.messageChannels.set("mB", "channel-B");
+    await expect(
+      pi.call("discord_react", { channelId: "channel-A", messageId: "mB", emoji: "✅" }),
+    ).rejects.toThrow(
+      /refusing message mB: it cannot be shown to belong to this turn's channel channel-A/,
+    );
+    expect(client.reactions).toHaveLength(0);
+  });
+
+  it("a MAIL turn cannot use the discord tools (a non-chat origin is refused, not allowed)", async () => {
+    const { pi, client } = setup();
+    // A mail turn's origin is not a chat surface, so the turn guard refuses it
+    // rather than defaulting to allow. (The mail-turn tool allowlist also
+    // excludes these tools; this pins the guard independent of that.)
+    pi.currentOrigin = { kind: "mail", from: "flint" };
+    await expect(pi.call("discord_reply", { channelId: "channel-A", text: "x" })).rejects.toThrow(
+      /from a mail turn: only a discord turn may act on a channel/,
+    );
+    await expect(pi.call("discord_fetch", { channelId: "channel-A" })).rejects.toThrow(
+      /from a mail turn/,
+    );
+    expect(client.replies).toHaveLength(0);
+  });
+});
+
+describe("wireDiscordCapability — the turn identity's DM projection (issue #227)", () => {
+  it("a message with no guildId is a DM; with a guildId it is not", () => {
+    const base = {
+      id: "m1",
+      channelId: "1",
+      authorId: "u",
+      authorName: "n",
+      content: "x",
+      mentionsBot: false,
+    };
+    expect(createDiscordTurn(base).isDM).toBe(true);
+    expect(createDiscordTurn({ ...base, guildId: "9" }).isDM).toBe(false);
   });
 });
 

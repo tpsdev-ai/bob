@@ -29,7 +29,7 @@ interview gives the class seed an individual persona. The role allows only
 and `discord_react`, with `allowResidentShell: false`. Onboarding stamps only
 the Flair capability: configure `discord` with its token file and channel
 allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
-conversation there. The body and automatic decision loop come later.
+conversation there. The body and automatic decision loop come later. A turn admitted through the runtime's admission binds the outbound Discord tools to that turn's channel; outside an admitted turn (a one-shot `bob run`) the channel allow-list is the only boundary.
 
 Jarvis's template defaults are `ollama` / `qwen3:8b`, accepted as strings by the
 role loader. Pass your provider and model explicitly: onboarding currently uses
