@@ -498,6 +498,34 @@ describe("registerWithFlair", () => {
     expect((err as Error).message).toContain("flair ops-API insert Agent -> 409");
   });
 
+  // The update REQUEST itself fails after the race was confirmed: rejected in
+  // transport with the credential inside, or refused with a 500 whose body
+  // reader would throw it. Either way the update did not take effect, so the
+  // original insert error is reported — never `repaired`, never the credential.
+  for (const stage of ["fetch", "text"] as const) {
+    it(`surfaces the ORIGINAL insert error when a raced row's update request fails (${stage})`, async () => {
+      const fake = makeFakeFlair({
+        insertReply: { status: 409, body: '{"error":"conflict"}' },
+        transportFailure: { stage, status: 500, match: (r) => r.op === "update" },
+      });
+      let outcome: string | undefined;
+      const { error, output } = await captureOutput(async () => {
+        outcome = (await registerWithFlair({ ...args(fake), fetchImpl: racingFetch(fake) }))
+          .outcome;
+      });
+      expect(outcome).toBeUndefined();
+      // The update was attempted, and failed.
+      expect(fake.calls.some((c) => c.op === "update")).toBe(true);
+      const err = error as Error;
+      expect(err.message).toContain("flair ops-API insert Agent -> 409: operator request failed");
+      expect(err.cause).toBeUndefined();
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(inspect(err)).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
+
   // ─── Transport exceptions never carry the credential out ─────────────────
   // fetch() rejecting, or the response body failing to read, can put the
   // request — and so the Basic header — in the exception's message or cause.

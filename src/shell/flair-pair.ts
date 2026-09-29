@@ -476,18 +476,24 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
       publicKeyBase64: args.publicKeyBase64,
     };
   }
-  await post({
-    operation: "update",
-    database: "flair",
-    table: "Agent",
-    records: [
-      {
-        id: args.name,
-        publicKey: args.publicKeyBase64,
-        updatedAt: new Date(now()).toISOString(),
-      },
-    ],
-  });
+  // A failed update request means the update did not take effect: when an
+  // insert was refused, its error is the one reported (both are body-free).
+  try {
+    await post({
+      operation: "update",
+      database: "flair",
+      table: "Agent",
+      records: [
+        {
+          id: args.name,
+          publicKey: args.publicKeyBase64,
+          updatedAt: new Date(now()).toISOString(),
+        },
+      ],
+    });
+  } catch (err: unknown) {
+    throw insertFailure ?? err;
+  }
   // A repair is reported only when the stored key now IS the requested one:
   // an accepted update is not proof that the row changed.
   let after: AgentRecord | null;
