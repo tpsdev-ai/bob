@@ -27,18 +27,19 @@ describe("role-loader", () => {
     },
   );
 
-  it("builder-local holds the anchored tools + shell and NO read/edit/write", () => {
+  it("builder-local holds the anchored tools + the managed run tool and NO read/edit/write/bash", () => {
     const t = loadRole("builder-local");
     // The four anchored tools that replace whole-file editing.
     for (const tool of ["read_lines", "edit_lines", "insert_after", "write_file"]) {
       expect(t.tools.allow, tool).toContain(tool);
     }
-    // The shell + browsing tools it keeps, and Flair memory.
-    for (const tool of ["bash", "grep", "find", "ls", "flair_search"]) {
+    // The managed run tool (bob#211) + browsing tools it keeps, and Flair memory.
+    for (const tool of ["run", "run_status", "run_cancel", "grep", "find", "ls", "flair_search"]) {
       expect(t.tools.allow, tool).toContain(tool);
     }
-    // NO whole-file edit/write tools — the point of the role.
-    for (const tool of ["read", "edit", "write"]) {
+    // NO whole-file edit/write tools — the point of the role — and NO raw shell:
+    // `run` REPLACES pi's bash (bob#211), a checkable fact of this config.
+    for (const tool of ["read", "edit", "write", "bash", "powershell"]) {
       expect(t.tools.allow, tool).not.toContain(tool);
     }
     expect(t.tools.allowResidentShell).toBe(true);

@@ -229,7 +229,7 @@ describe("resolveToolPolicy", () => {
       allowResidentShell: true,
     });
     expect(p.allowResidentShell).toBe(false);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
   });
 
   it("REFUSES allowResidentShell: true when the role does not grant it", () => {
@@ -270,7 +270,7 @@ describe("resolveToolPolicy", () => {
     const yaml = "resident: true\ntools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, true);
     expect(p.tools).toEqual(["read", "bash"]);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
     expect(residentDroppedTools(p)).toEqual(["bash"]);
   });
 
@@ -278,7 +278,7 @@ describe("resolveToolPolicy", () => {
     const yaml = "tools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, false, true);
     expect(p.resident).toBe(true);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
   });
 
   it("keeps the shell when the role opts in with allowResidentShell", () => {
@@ -293,7 +293,7 @@ describe("resolveToolPolicy", () => {
   it("unions a declared exclude with the resident exclusions, without duplicates", () => {
     const yaml =
       "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  exclude:\n    - bash\n";
-    expect(policy(yaml, true).excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+    expect(policy(yaml, true).excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
   });
 });
 

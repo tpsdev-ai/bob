@@ -695,7 +695,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
     writeBobYaml({ role: "qa", allow: ["read", "bash", "edit", "write"], resident: true });
     const config = await configFor();
     expect(config.tools).toEqual(["read", "bash", "edit", "write"]);
-    expect(config.excludeTools).toEqual(["bash", "write", "edit", "powershell"]);
+    expect(config.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
   });
 
   it("keeps a resident CODER's shell — the opt-in lives in the role now", async () => {

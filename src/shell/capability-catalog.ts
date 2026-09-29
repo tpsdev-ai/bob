@@ -25,6 +25,7 @@ import { observatoryManifest } from "../capabilities/observatory/manifest.js";
 import { presenceManifest } from "../capabilities/presence/manifest.js";
 import { reachyManifest } from "../capabilities/reachy/manifest.js";
 import { tpsMailManifest } from "../capabilities/tps-mail/manifest.js";
+import { workManifest } from "../capabilities/work/manifest.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 
 // Planned capabilities whose extensions don't exist yet (later PRs). Listed so
@@ -63,6 +64,11 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   // mail, run by the persistent runtime. The planned free-form `mail` capability
   // (a mail_send tool with a recipient allow-list) below is a later slice.
   "tps-mail": { manifest: tpsMailManifest },
+  // bob#211: managed command execution for builder-local — `run` (a deadline
+  // always, owned cancellation, honest outcomes), `run_status`, `run_cancel`.
+  // It replaces raw `bash` in that role; `run` is shell-equivalent, so it is in
+  // RESIDENT_EXCLUDED_TOOLS (tool-allowlist.ts).
+  work: { manifest: workManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
 });
