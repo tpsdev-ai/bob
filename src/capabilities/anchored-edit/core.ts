@@ -149,6 +149,33 @@ export function anchorToken(lineNo: number, line: RawLine): string {
   return `L${lineNo}#${anchorHashOf(line)}`;
 }
 
+// The prefix renderReadLines puts in front of each line's text, INCLUDING the
+// separating space: `L<n>#<8 hex> `. This is the single definition of the
+// rendered prefix; ANCHOR_PREFIX_RE (right below) matches the same shape, and
+// the guard uses that regex, so the guard and the renderer cannot drift.
+export function anchorPrefix(lineNo: number, line: RawLine): string {
+  return `${anchorToken(lineNo, line)} `;
+}
+
+// The rendered read_lines anchor prefix at the START of a line: `L<n>#<8 hex>`
+// plus a space. ONE regex, shared by every tool's prefix guard below.
+export const ANCHOR_PREFIX_RE = /^L\d+#[0-9a-f]{8} /;
+
+// Refuse `text` when any line still carries a read_lines anchor prefix. A model
+// copied read_lines output straight into new text with the prefixes included,
+// and the tool is the one place that can catch it. Names the tool, the FIRST
+// offending line number and the remedy.
+export function assertNoAnchorPrefix(text: string, tool: string, path: string): void {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (ANCHOR_PREFIX_RE.test(lines[i])) {
+      throw new Refusal(
+        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If the file's real content genuinely begins lines with that shape, pass allow_anchor_prefixes: true for this call.`,
+      );
+    }
+  }
+}
+
 export function fingerprintOf(raw: Buffer): string {
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
@@ -272,7 +299,7 @@ export function renderReadLines(
     const marker = truncated
       ? ` …[truncated, ${[...lines[n - 1].content.toString("utf8")].length} chars total]`
       : "";
-    const rendered = `${anchorToken(n, lines[n - 1])} ${t}${marker}`;
+    const rendered = `${anchorPrefix(n, lines[n - 1])}${t}${marker}`;
     const cost = Buffer.byteLength(rendered, "utf8") + 1;
     if (bytes + cost > budget) {
       cutByBytes = true;
@@ -841,6 +868,7 @@ export class AnchoredEditSession {
     toAnchor: string,
     newText: string,
     fingerprint: string,
+    allowAnchorPrefixes = false,
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
@@ -859,6 +887,9 @@ export class AnchoredEditSession {
         );
       }
       this.requireFingerprint(t.canonical, path, fingerprint, fromAnchor, raw, from, signals);
+      if (!allowAnchorPrefixes && newText !== "") {
+        assertNoAnchorPrefix(newText, "edit_lines", path);
+      }
       const newLines = newText === "" ? [] : parseNewText(newText, path);
       const spliced = applyEditLines(raw, from, to, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
@@ -877,6 +908,7 @@ export class AnchoredEditSession {
     anchor: string,
     text: string,
     fingerprint: string,
+    allowAnchorPrefixes = false,
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
@@ -901,6 +933,7 @@ export class AnchoredEditSession {
         Math.max(1, after),
         signals,
       );
+      if (!allowAnchorPrefixes) assertNoAnchorPrefix(text, "insert_after", path);
       const newLines = parseNewText(text, path);
       const spliced = applyInsertAfter(raw, after, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
@@ -913,8 +946,16 @@ export class AnchoredEditSession {
 
   // --- write_file ------------------------------------------------------------
 
-  writeFile(rootArg: string, path: string, content: string): ToolOutput {
+  writeFile(
+    rootArg: string,
+    path: string,
+    content: string,
+    allowAnchorPrefixes = false,
+  ): ToolOutput {
     const t = this.resolveWithin(rootArg, path);
+    // A new_text copied from read_lines keeps its `L<n>#<h> ` prefixes; refuse it
+    // here, before anything is opened, so a refused creation leaves nothing.
+    if (!allowAnchorPrefixes) assertNoAnchorPrefix(content, "write_file", path);
     // Validate the creation content BEFORE opening, so a refused creation never
     // leaves an occupied empty file behind.
     if (content.includes("\u0000")) {

@@ -134,6 +134,7 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
       `Replace the range from the 'from' anchor to the 'to' anchor INCLUSIVE with new_text, or delete it when new_text is empty. ` +
       `${ANCHOR_DOC} BOTH ends are anchors from read_lines; every call also needs the current F# (a fingerprint). A stale anchor or fingerprint is refused as stale, naming the expected and observed tokens and a re-read window. ` +
       `new_text is split into logical lines on LF or CRLF; a trailing separator's final empty segment is discarded, so "\\n" is one blank line. ` +
+      `If any line of new_text still begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused, naming the first offending line: strip the copied prefixes. Pass allow_anchor_prefixes: true ONLY for a file whose real content genuinely begins lines with that shape. ` +
       `A line longer than 2000 characters cannot be edited. A call that would remove or replace more than half the file is refused by the rewrite tripwire.`,
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
@@ -150,6 +151,12 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
         minLength: 1,
         description: "The current F#<16 hex> for the file.",
       }),
+      allow_anchor_prefixes: Type.Optional(
+        Type.Boolean({
+          description:
+            "Default false. Set true ONLY for a file whose real content genuinely begins lines with the read_lines anchor shape (L<n>#<8 hex> ); it turns off the anchor-prefix guard for this call.",
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return run(() =>
@@ -160,6 +167,7 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
           params.to as string,
           params.new_text as string,
           params.fingerprint as string,
+          params.allow_anchor_prefixes === true,
         ),
       );
     },
@@ -171,12 +179,19 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
     description:
       `Insert text after an existing line anchor, or use L0 to insert before line 1 (valid for any existing file, including an empty one). ` +
       `${ANCHOR_DOC} Every call needs the current F#. text is split like edit_lines; empty text is refused. ` +
+      `If any line of text still begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused, naming the first offending line: strip the copied prefixes. Pass allow_anchor_prefixes: true ONLY for a file whose real content genuinely begins lines with that shape. ` +
       `Pure insertions are NOT counted by the rewrite tripwire (they destroy no existing content).`,
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
       anchor: Type.String({ minLength: 1, description: "A line anchor L<n>#<h>, or L0." }),
       text: Type.String({ minLength: 1 }),
       fingerprint: Type.String({ minLength: 1 }),
+      allow_anchor_prefixes: Type.Optional(
+        Type.Boolean({
+          description:
+            "Default false. Set true ONLY for a file whose real content genuinely begins lines with the read_lines anchor shape (L<n>#<8 hex> ); it turns off the anchor-prefix guard for this call.",
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return run(() =>
@@ -186,6 +201,7 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
           params.anchor as string,
           params.text as string,
           params.fingerprint as string,
+          params.allow_anchor_prefixes === true,
         ),
       );
     },
@@ -195,14 +211,26 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
     name: "write_file",
     label: "Write File",
     description:
-      "Create a NEW file, exclusively. Takes no fingerprint. Refuses if any directory entry already exists at the path (including a dangling symlink); this tool never replaces an existing file.",
+      "Create a NEW file, exclusively. Takes no fingerprint. Refuses if any directory entry already exists at the path (including a dangling symlink); this tool never replaces an existing file. " +
+      "If any line of content still begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused, naming the first offending line: strip the copied prefixes. Pass allow_anchor_prefixes: true ONLY for a file whose real content genuinely begins lines with that shape.",
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
       content: Type.String(),
+      allow_anchor_prefixes: Type.Optional(
+        Type.Boolean({
+          description:
+            "Default false. Set true ONLY for a file whose real content genuinely begins lines with the read_lines anchor shape (L<n>#<8 hex> ); it turns off the anchor-prefix guard for this call.",
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return run(() =>
-        session.writeFile(ctxCwd(ctx), params.path as string, params.content as string),
+        session.writeFile(
+          ctxCwd(ctx),
+          params.path as string,
+          params.content as string,
+          params.allow_anchor_prefixes === true,
+        ),
       );
     },
   });

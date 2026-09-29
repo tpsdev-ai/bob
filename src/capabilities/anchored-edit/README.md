@@ -12,9 +12,9 @@ edits. It registers four tools through `pi.registerTool`, **beside** pi's own
 | tool | takes | does |
 | --- | --- | --- |
 | `read_lines` | `path`, `start?`, `end?` | returns a fingerprint header + one `L<n>#<h> <content>` per line |
-| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint` | replaces the range from the `from` anchor to the `to` anchor, inclusive (empty `new_text` deletes) |
-| `insert_after` | `path`, `anchor`, `text`, `fingerprint` | inserts after a line anchor, or `L0` for before line 1 |
-| `write_file` | `path`, `content` | creates a NEW file exclusively; no fingerprint |
+| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint`, `allow_anchor_prefixes?` | replaces the range from the `from` anchor to the `to` anchor, inclusive (empty `new_text` deletes) |
+| `insert_after` | `path`, `anchor`, `text`, `fingerprint`, `allow_anchor_prefixes?` | inserts after a line anchor, or `L0` for before line 1 |
+| `write_file` | `path`, `content`, `allow_anchor_prefixes?` | creates a NEW file exclusively; no fingerprint |
 
 ## Enabling it
 
@@ -95,6 +95,18 @@ splitting a rewrite into many small edits does not get under it. **Pure
 insertions are not counted** — an insertion destroys no existing content, and
 counting it would refuse the common case of appending tests to a file. The cost
 is that some legitimate edits to small files are refused.
+
+## Read_lines prefixes in new text
+
+A local model that copies `read_lines` output into `new_text` keeps the
+`L<n>#<h> ` prefixes. `edit_lines`, `insert_after` and `write_file` refuse text
+in which any line starts with that rendered shape — `L`, digits, `#`, 8 hex
+characters, then a space — and write nothing. The refusal names the tool, the
+first offending line number and the remedy (strip the prefixes). The shape comes
+from the one place `read_lines` renders it (`anchorPrefix` / `ANCHOR_PREFIX_RE`
+in `core.ts`), so the guard and the renderer cannot drift. For a file whose real
+content genuinely begins lines with that shape, pass `allow_anchor_prefixes:
+true` for that ONE call; it is off by default and is not remembered.
 
 ## Signals
 
