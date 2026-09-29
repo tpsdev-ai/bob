@@ -29,15 +29,23 @@
 //     tolerated failure is a credential path that does not exist (ENOENT /
 //     ENOTDIR): no file lives there, so it cannot be the file being read.
 //
-// Closing the check-to-open race: after the check, bob OPENS the checked
-// canonical path (O_NOFOLLOW, O_NONBLOCK) and fstat()s the descriptor; the
-// bytes are read from that descriptor only when its device + inode equal the
-// file that was checked. A path swapped between the check and the open is
-// therefore refused, never read.
+// Between the check and the open: bob OPENS the checked canonical path itself
+// (O_NOFOLLOW, O_NONBLOCK) and fstat()s the descriptor; the bytes are read from
+// that descriptor only when its device + inode equal the file that was checked.
+// So a FINAL path component replaced by a symlink is refused (O_NOFOLLOW), and
+// a CHANGED file — a different device or inode at the checked path — is
+// refused. That is all this step claims.
 //
-// What this does NOT cover: other tools that read files (pi's grep/find/ls,
-// anchored-edit's read_lines) are not confined by this module, and a bob.yaml
-// credential path is only refused as bob's parser reads it.
+// What this does NOT cover:
+//   * an ANCESTOR directory of the checked path replaced between the check and
+//     the open: O_NOFOLLOW guards only the final component, and the fstat
+//     comparison only catches a different file, so a replaced ancestor that
+//     still leads to the same device + inode is not detected. Opening along an
+//     ancestor-stable path (component by component from a held directory) is a
+//     separate control, not built here;
+//   * other tools that read files (pi's grep/find/ls, anchored-edit's
+//     read_lines) — they are not confined by this module;
+//   * a credential path is only refused as bob's parser reads it.
 
 import { type BigIntStats, constants, realpathSync, statSync } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";
@@ -46,22 +54,163 @@ import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:pa
 import type { ReadOperations, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createReadToolDefinition } from "@earendil-works/pi-coding-agent";
 import { readBlock } from "./bob-yaml.js";
+import type { CatalogEntry } from "./capability.js";
+import type { IdentityConfig } from "./index.js";
 
 // ─── The credential list, from bob's own parsed config ───────────────────────
 
-// Every config field that names a key or token FILE, keyed by the bob.yaml
-// block that carries it. The capability entries are the blessed capabilities'
-// config schemas (a drift test walks every schema in the catalog and fails on a
-// key/token/credential file field missing here); `identity` is bob.yaml's own
-// block (`bob init` writes `identity.key_file`). The top-level `flair:` block is
-// both the flair capability's config and the identity tps-mail signs with.
-export const CREDENTIAL_FILE_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  identity: Object.freeze(["key_file"]),
-  flair: Object.freeze(["keyFile"]),
-  discord: Object.freeze(["tokenFile"]),
-  presence: Object.freeze(["keyFile"]),
-  observatory: Object.freeze(["officeKeyFile"]),
+// THE INVENTORY. Every string-valued field of every blessed capability's config
+// schema, and of bob.yaml's own `identity:` block, carries an explicit class:
+// `credential` (it names a key, token or other secret FILE) or
+// `not-a-credential`. The credential list below is DERIVED from this map, and a
+// test (configFieldInventoryGaps) fails on any schema field that has no class —
+// whatever the field is called — and on a class for a field no schema has. So
+// a capability that adds a field cannot ship until someone decides what it is.
+//
+// A field is named by a path inside its block: `a/b` for a nested property,
+// `[]` for every item of a list, `*` for every value of a map. The top-level
+// `flair:` block is both the flair capability's config and the identity
+// tps-mail signs with.
+export type ConfigFieldClass = "credential" | "not-a-credential";
+
+// bob.yaml's `identity:` block (bob init writes it). Keyed by IdentityConfig's
+// fields, so adding a field to that type without classifying it here is a
+// compile error.
+const IDENTITY_FIELD_CLASSES = {
+  flair_url: "not-a-credential",
+  key_file: "credential",
+  pub_file: "not-a-credential",
+} as const satisfies Record<keyof IdentityConfig, ConfigFieldClass>;
+
+export const CONFIG_FIELD_CLASSES: Readonly<
+  Record<string, Readonly<Record<string, ConfigFieldClass>>>
+> = Object.freeze({
+  identity: IDENTITY_FIELD_CLASSES,
+  flair: { url: "not-a-credential", agentId: "not-a-credential", keyFile: "credential" },
+  discord: {
+    tokenFile: "credential",
+    "channelIds/[]": "not-a-credential",
+    botUserId: "not-a-credential",
+    model: "not-a-credential",
+  },
+  presence: {
+    url: "not-a-credential",
+    agentId: "not-a-credential",
+    keyFile: "credential",
+    busyActivity: "not-a-credential",
+    "summary/durability": "not-a-credential",
+  },
+  observatory: {
+    observatoryUrl: "not-a-credential",
+    officeId: "not-a-credential",
+    officeKeyFile: "credential",
+    "agents/[]/agentId": "not-a-credential",
+    "agents/[]/name": "not-a-credential",
+    "agents/[]/role": "not-a-credential",
+    "agents/[]/model": "not-a-credential",
+    "agents/[]/type": "not-a-credential",
+    // Signal files the producer reads for a task summary and liveness.
+    "agents/[]/beadsFile": "not-a-credential",
+    "agents/[]/heartbeatFile": "not-a-credential",
+  },
+  reachy: {
+    // The sidecar's UNIX socket: a connection point, not a secret file.
+    socket: "not-a-credential",
+    sidecarVersion: "not-a-credential",
+    wakeName: "not-a-credential",
+    "enrolledSpeakers/*": "not-a-credential",
+  },
+  "tps-mail": { inbox: "not-a-credential", "senders/[]": "not-a-credential" },
+  fixture: { greeting: "not-a-credential" },
+  "anchored-edit": {},
+  work: {},
 });
+
+// The credential fields of one block, derived from the inventory.
+export function credentialFieldsOf(classes: Readonly<Record<string, ConfigFieldClass>>): string[] {
+  return Object.entries(classes)
+    .filter(([, c]) => c === "credential")
+    .map(([field]) => field);
+}
+
+// Every field path in a (typebox / JSON) schema that can hold a string: a
+// `string`, a union with a string member, or a node with no type at all (it
+// could hold anything). Numbers, integers, booleans and null are skipped;
+// objects, lists and maps are walked.
+export function stringFieldsOf(schema: unknown, at = ""): string[] {
+  const node = (schema ?? {}) as Record<string, unknown>;
+  const join2 = (a: string, b: string) => (a === "" ? b : `${a}/${b}`);
+  const union = (node.anyOf ?? node.oneOf) as unknown[] | undefined;
+  if (Array.isArray(union)) {
+    const members = union as Array<Record<string, unknown>>;
+    const scalar = (m: Record<string, unknown>) =>
+      m.const !== undefined ||
+      ["string", "number", "integer", "boolean", "null"].includes(m.type as string);
+    if (members.every(scalar)) {
+      const stringy = members.some((m) => m.type === "string" || typeof m.const === "string");
+      return stringy ? [at] : [];
+    }
+    return [...new Set(members.flatMap((m) => stringFieldsOf(m, at)))];
+  }
+  if (Array.isArray(node.allOf)) {
+    return [...new Set((node.allOf as unknown[]).flatMap((m) => stringFieldsOf(m, at)))];
+  }
+  const type = node.type;
+  if (type === "object") {
+    const out: string[] = [];
+    for (const [k, v] of Object.entries((node.properties ?? {}) as Record<string, unknown>)) {
+      out.push(...stringFieldsOf(v, join2(at, k)));
+    }
+    for (const v of Object.values((node.patternProperties ?? {}) as Record<string, unknown>)) {
+      out.push(...stringFieldsOf(v, join2(at, "*")));
+    }
+    if (node.additionalProperties !== undefined && typeof node.additionalProperties === "object") {
+      out.push(...stringFieldsOf(node.additionalProperties, join2(at, "*")));
+    }
+    return [...new Set(out)];
+  }
+  if (type === "array") return stringFieldsOf(node.items, join2(at, "[]"));
+  if (type === "number" || type === "integer" || type === "boolean" || type === "null") return [];
+  if (typeof node.const === "string" || type === "string" || type === undefined) return [at];
+  // A type list (["string", "null"]) or anything else: it may hold a string.
+  return [at];
+}
+
+// The inventory gate. For every IMPLEMENTED capability in `catalog`, every
+// string field of its config schema must have a class in `classes`, and every
+// class must name a field that schema has. `identity` is bob.yaml's own block
+// (checked by the compiler against IdentityConfig). Returns one line per gap;
+// empty means the inventory is exhaustive. A not-yet-implemented capability is
+// skipped: resolveCapabilities refuses it, so its config never reaches a
+// session.
+export function configFieldInventoryGaps(
+  catalog: Readonly<Record<string, CatalogEntry>>,
+  classes: Readonly<Record<string, Readonly<Record<string, ConfigFieldClass>>>>,
+): string[] {
+  const gaps: string[] = [];
+  for (const [name, entry] of Object.entries(catalog)) {
+    if (entry.notYetImplemented) continue;
+    const declared = classes[name];
+    if (declared === undefined) {
+      gaps.push(`${name}: the capability has no entry in the inventory`);
+      continue;
+    }
+    const fields = stringFieldsOf(entry.manifest.configSchema);
+    for (const f of fields) {
+      if (declared[f] === undefined) gaps.push(`${name}/${f}: not classified`);
+    }
+    for (const f of Object.keys(declared)) {
+      if (!fields.includes(f))
+        gaps.push(`${name}/${f}: classified, but the schema has no such string field`);
+    }
+  }
+  for (const name of Object.keys(classes)) {
+    if (name === "identity") continue;
+    if (catalog[name] === undefined)
+      gaps.push(`${name}: classified, but no capability has that name`);
+  }
+  return gaps;
+}
 
 // pi's provider stores under the agent's `.pi-agent` dir: the login store holds
 // the provider API keys, and models.json may carry a provider `apiKey`. Both are
@@ -88,6 +237,9 @@ export interface CredentialSources {
   // that opens it (a capability opens its key file with the process cwd).
   // Defaults to process.cwd().
   processCwd?: string;
+  // The inventory to derive the credential fields from. Defaults to
+  // CONFIG_FIELD_CLASSES; a test passes its own.
+  fieldClasses?: Readonly<Record<string, Readonly<Record<string, ConfigFieldClass>>>>;
 }
 
 // Expand `~` / `~/` the way the capabilities and pi do. An absolute path is
@@ -107,6 +259,33 @@ function credentialCandidates(value: string, workspaceRoot: string, processCwd: 
   return [resolvePath(processCwd, expanded), resolvePath(workspaceRoot, expanded)];
 }
 
+// Every value at a field path (`a/b`, `[]` = each list item, `*` = each map
+// value). A missing value contributes nothing; a container of the wrong shape
+// is "malformed" — never skipped.
+function valuesAt(value: unknown, segments: readonly string[]): unknown[] | "malformed" {
+  if (segments.length === 0) return value === undefined ? [] : [value];
+  if (value === undefined) return [];
+  const [head, ...rest] = segments;
+  let children: unknown[];
+  if (head === "[]") {
+    if (!Array.isArray(value)) return "malformed";
+    children = value;
+  } else if (head === "*") {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return "malformed";
+    children = Object.values(value);
+  } else {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return "malformed";
+    children = [(value as Record<string, unknown>)[head]];
+  }
+  const out: unknown[] = [];
+  for (const child of children) {
+    const found = valuesAt(child, rest);
+    if (found === "malformed") return found;
+    out.push(...found);
+  }
+  return out;
+}
+
 // Every key or token file the agent's parsed config names, plus pi's provider
 // stores — or a REASON the list cannot be built. The caller must not substitute
 // an empty list for a failure: a resident `read` is composed only with a list.
@@ -117,7 +296,10 @@ export function collectCredentialPaths(src: CredentialSources): CredentialPathLi
     join(src.piAgentDir, PROVIDER_MODELS_STORE),
   ]);
   const resolved = new Map(src.capabilities.map((c) => [c.name, c.config]));
-  for (const [block, fields] of Object.entries(CREDENTIAL_FILE_FIELDS)) {
+  const classes = src.fieldClasses ?? CONFIG_FIELD_CLASSES;
+  for (const [block, blockClasses] of Object.entries(classes)) {
+    const fields = credentialFieldsOf(blockClasses);
+    if (fields.length === 0) continue;
     let config: Record<string, unknown> | undefined = resolved.get(block);
     if (config === undefined) {
       try {
@@ -131,15 +313,22 @@ export function collectCredentialPaths(src: CredentialSources): CredentialPathLi
     }
     if (config === undefined) continue;
     for (const field of fields) {
-      const value = config[field];
-      if (value === undefined) continue;
-      if (typeof value !== "string" || value.trim() === "") {
+      const values = valuesAt(config, field.split("/"));
+      if (values === "malformed") {
         return {
           ok: false,
-          reason: `bob.yaml ${block}.${field} is not a file path (write it as a quoted string)`,
+          reason: `bob.yaml ${block}.${field.replaceAll("/", ".")} is not where a file path can be read`,
         };
       }
-      for (const p of credentialCandidates(value, src.workspaceRoot, processCwd)) paths.add(p);
+      for (const value of values) {
+        if (typeof value !== "string" || value.trim() === "") {
+          return {
+            ok: false,
+            reason: `bob.yaml ${block}.${field.replaceAll("/", ".")} is not a file path (write it as a quoted string)`,
+          };
+        }
+        for (const p of credentialCandidates(value, src.workspaceRoot, processCwd)) paths.add(p);
+      }
     }
   }
   return { ok: true, paths: [...paths] };
@@ -246,8 +435,10 @@ export function checkReadTarget(absolutePath: string, opts: ConfineReadOptions):
 
 // Open the CHECKED canonical path and verify the descriptor is the checked file
 // (device + inode, and still a regular file) before anything is read from it.
-// O_NOFOLLOW refuses a final component swapped for a symlink; the fstat
-// comparison refuses any other replacement. `absolutePath` is for the message.
+// O_NOFOLLOW refuses a FINAL component swapped for a symlink; the fstat
+// comparison refuses a DIFFERENT file (device or inode). A replaced ancestor
+// directory that leads to the same file is not detected (see the header).
+// `absolutePath` is for the message.
 export async function openVerifiedReadTarget(
   checked: CheckedReadTarget,
   absolutePath: string,

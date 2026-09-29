@@ -11,6 +11,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -21,16 +22,23 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createReadToolDefinition, SessionManager } from "@earendil-works/pi-coding-agent";
-import { BLESSED_CATALOG, lookupCapability } from "../../src/shell/capability-catalog.js";
+import { Type } from "typebox";
+import { readBlock } from "../../src/shell/bob-yaml.js";
+import type { CatalogEntry } from "../../src/shell/capability.js";
+import { BLESSED_CATALOG } from "../../src/shell/capability-catalog.js";
+import { resolveCapabilities } from "../../src/shell/capability-loader.js";
 import {
-  CREDENTIAL_FILE_FIELDS,
+  CONFIG_FIELD_CLASSES,
+  type ConfigFieldClass,
   checkReadTarget,
   collectCredentialPaths,
+  configFieldInventoryGaps,
   confinedReadCustomTools,
   createConfinedReadToolDefinition,
   openVerifiedReadTarget,
   readConfinementApplies,
 } from "../../src/shell/confined-read.js";
+import { initAgent } from "../../src/shell/init.js";
 import { runOnboard } from "../../src/shell/onboard.js";
 import type { RunSessionConfig } from "../../src/shell/run.js";
 import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
@@ -385,72 +393,169 @@ describe("collectCredentialPaths — from bob's own parsed config", () => {
   });
 });
 
-describe("drift: every blessed capability's credential file fields are collected", () => {
-  type Schema = Record<string, unknown>;
-  const CRED_WORD = /(key|token|secret|credential|password|passphrase|cert)/i;
-  const FILE_WORD = /(file|path)$/i;
-
-  // Every property in a schema, with its JSON-pointer-ish location.
-  function* walk(
-    schema: Schema,
-    at: string,
-  ): Generator<{ at: string; name: string; prop: Schema }> {
-    const props = schema.properties as Record<string, Schema> | undefined;
-    for (const [name, prop] of Object.entries(props ?? {})) {
-      yield { at: `${at}/${name}`, name, prop };
-      yield* walk(prop, `${at}/${name}`);
-    }
-    if (schema.items && typeof schema.items === "object")
-      yield* walk(schema.items as Schema, `${at}/[]`);
-    for (const k of ["anyOf", "oneOf", "allOf"]) {
-      for (const sub of (schema[k] as Schema[] | undefined) ?? []) yield* walk(sub, at);
-    }
-    const pattern = schema.patternProperties as Record<string, Schema> | undefined;
-    for (const sub of Object.values(pattern ?? {})) yield* walk(sub, `${at}/*`);
-  }
-  // A field that names a key, token or credential FILE: a credential word in
-  // its name, and a file/path suffix or a description that says it is a path.
-  function credentialFileFields(schema: Schema): string[] {
-    const found: string[] = [];
-    for (const { at, name, prop } of walk(schema, "")) {
-      const desc = typeof prop.description === "string" ? prop.description : "";
-      if (CRED_WORD.test(name) && (FILE_WORD.test(name) || /\b(path|file)\b/i.test(desc))) {
-        found.push(at);
-      }
-    }
-    return found;
-  }
-
-  it("the detector fires on the known credential fields and not on plain signal-file paths", () => {
-    const schema = (n: string) => lookupCapability(n)?.manifest.configSchema as unknown as Schema;
-    expect(credentialFileFields(schema("discord"))).toEqual(["/tokenFile"]);
-    expect(credentialFileFields(schema("observatory"))).toEqual(["/officeKeyFile"]);
-    // observatory's agents[].beadsFile / heartbeatFile are paths, not credentials.
-    const all = [...walk(schema("observatory"), "")].map((p) => p.at);
-    expect(all).toContain("/agents/[]/beadsFile");
-    expect(all).toContain("/agents/[]/heartbeatFile");
+describe("the config-field inventory: every string field is classified", () => {
+  // The gate is configFieldInventoryGaps (src/shell/confined-read.ts): every
+  // string field of every implemented blessed capability schema must carry an
+  // explicit class in CONFIG_FIELD_CLASSES — credential or not — whatever the
+  // field is called. The credential list is derived from those classes.
+  type Classes = Record<string, Record<string, ConfigFieldClass>>;
+  const probeCatalog = (configSchema: unknown): Record<string, CatalogEntry> => ({
+    probe: {
+      manifest: {
+        name: "probe",
+        piPackage: "@tpsdev-ai/bob/capabilities/probe",
+        configSchema: configSchema as CatalogEntry["manifest"]["configSchema"],
+        provides: {},
+      } as CatalogEntry["manifest"],
+    },
   });
 
-  it("every credential file field in every blessed schema is in CREDENTIAL_FILE_FIELDS", () => {
-    const missing: string[] = [];
-    for (const [name, entry] of Object.entries(BLESSED_CATALOG)) {
-      for (const at of credentialFileFields(entry.manifest.configSchema as unknown as Schema)) {
-        const top = at.split("/").filter(Boolean);
-        const covered = top.length === 1 && (CREDENTIAL_FILE_FIELDS[name] ?? []).includes(top[0]);
-        if (!covered) missing.push(`${name}${at}`);
-      }
-    }
-    expect(missing).toEqual([]);
+  it("the shipped inventory is exhaustive and names only real fields", () => {
+    expect(configFieldInventoryGaps(BLESSED_CATALOG, CONFIG_FIELD_CLASSES)).toEqual([]);
   });
 
-  it("every capability entry in CREDENTIAL_FILE_FIELDS names a real string field of that schema", () => {
-    for (const [name, fields] of Object.entries(CREDENTIAL_FILE_FIELDS)) {
-      if (name === "identity") continue; // bob.yaml's own block, not a capability
-      const schema = lookupCapability(name)?.manifest.configSchema as unknown as Schema | undefined;
-      expect(schema, name).toBeDefined();
-      const props = (schema?.properties ?? {}) as Record<string, Schema>;
-      for (const field of fields) expect(props[field]?.type, `${name}.${field}`).toBe("string");
+  it("an UNCLASSIFIED `authFile` (or `privateIdentityPath`) fails the gate, whatever its name says", () => {
+    const schema = Type.Object({
+      authFile: Type.String({ description: "Path to the credential file the service reads." }),
+      privateIdentityPath: Type.String({ description: "Path to the private identity key." }),
+      note: Type.String(),
+      retries: Type.Integer(),
+    });
+    const partial: Classes = { probe: { note: "not-a-credential" } };
+    expect(configFieldInventoryGaps(probeCatalog(schema), partial)).toEqual([
+      "probe/authFile: not classified",
+      "probe/privateIdentityPath: not classified",
+    ]);
+    // Classified, the gate passes — and a credential class is what collection uses.
+    const full: Classes = {
+      probe: {
+        note: "not-a-credential",
+        authFile: "credential",
+        privateIdentityPath: "credential",
+      },
+    };
+    expect(configFieldInventoryGaps(probeCatalog(schema), full)).toEqual([]);
+  });
+
+  it("the gate reaches nested lists, maps, string unions and untyped fields", () => {
+    const schema = Type.Object({
+      agents: Type.Array(Type.Object({ secretRef: Type.String(), weight: Type.Number() })),
+      extra: Type.Record(Type.String(), Type.String()),
+      kind: Type.Union([Type.Literal("a"), Type.Literal("b")]),
+      blob: Type.Unknown(),
+      nested: Type.Object({ enabled: Type.Boolean(), path: Type.String() }),
+    });
+    expect(configFieldInventoryGaps(probeCatalog(schema), { probe: {} })).toEqual([
+      "probe/agents/[]/secretRef: not classified",
+      "probe/extra/*: not classified",
+      "probe/kind: not classified",
+      "probe/blob: not classified",
+      "probe/nested/path: not classified",
+    ]);
+  });
+
+  it("a class for a missing field, a capability with no entry, and an entry with no capability are gaps", () => {
+    const schema = Type.Object({ url: Type.String() });
+    expect(
+      configFieldInventoryGaps(probeCatalog(schema), {
+        probe: { url: "not-a-credential", gone: "credential" },
+        ghost: {},
+      }),
+    ).toEqual([
+      "probe/gone: classified, but the schema has no such string field",
+      "ghost: classified, but no capability has that name",
+    ]);
+    expect(configFieldInventoryGaps(probeCatalog(schema), {})).toEqual([
+      "probe: the capability has no entry in the inventory",
+    ]);
+  });
+
+  it("a not-yet-implemented capability is skipped only because resolution refuses it", () => {
+    const unbuilt = Object.entries(BLESSED_CATALOG).filter(([, e]) => e.notYetImplemented);
+    for (const [name] of unbuilt) {
+      expect(() => resolveCapabilities({ yamlText: `capabilities:\n  - ${name}\n` })).toThrow(
+        /not yet implemented/,
+      );
     }
+  });
+
+  it("bob init's identity block has exactly the classified fields", () => {
+    const agentsRoot = mkdtempSync(join(tmpdir(), "bob-inventory-init-"));
+    const keysDir = mkdtempSync(join(tmpdir(), "bob-inventory-keys-"));
+    try {
+      const { agentDir } = initAgent({
+        name: "testbot",
+        role: "reviewer",
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        contextWindow: 200_000,
+        agentsRoot,
+        flairKeysDir: keysDir,
+      });
+      const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8");
+      const identity = readBlock(yaml, "identity") ?? {};
+      expect(Object.keys(identity).sort()).toEqual(
+        Object.keys(CONFIG_FIELD_CLASSES.identity).sort(),
+      );
+    } finally {
+      rmSync(agentsRoot, { recursive: true, force: true });
+      rmSync(keysDir, { recursive: true, force: true });
+    }
+  });
+
+  it("every credential-classified field is collected, including in nested lists and maps", () => {
+    // Every shipped block: set each credential field to a distinct path.
+    const capabilities: Array<{ name: string; config: Record<string, unknown> }> = [];
+    const identityLines: string[] = [];
+    const want: string[] = [];
+    for (const [block, classes] of Object.entries(CONFIG_FIELD_CLASSES)) {
+      for (const [field, cls] of Object.entries(classes)) {
+        if (cls !== "credential") continue;
+        expect(field.includes("/"), `${block}/${field} is top-level`).toBe(false);
+        const path = `/creds/${block}-${field}`;
+        want.push(path);
+        if (block === "identity") identityLines.push(`  ${field}: ${path}`);
+        else capabilities.push({ name: block, config: { [field]: path } });
+      }
+    }
+    const list = collectCredentialPaths({
+      yamlText: ["identity:", ...identityLines, ""].join("\n"),
+      capabilities,
+      piAgentDir: "/agent/.pi-agent",
+      workspaceRoot: "/agent/work",
+    });
+    expect(list.ok).toBe(true);
+    if (!list.ok) return;
+    for (const p of want) expect(list.paths).toContain(p);
+
+    // A nested credential class is collected from every list item and map value.
+    const fieldClasses: Classes = {
+      probe: { "agents/[]/secretFile": "credential", "keys/*": "credential" },
+    };
+    const nested = collectCredentialPaths({
+      yamlText: "",
+      capabilities: [
+        {
+          name: "probe",
+          config: { agents: [{ secretFile: "/a" }, { secretFile: "/b" }], keys: { x: "/c" } },
+        },
+      ],
+      piAgentDir: "/agent/.pi-agent",
+      workspaceRoot: "/agent/work",
+      fieldClasses,
+    });
+    expect(nested.ok).toBe(true);
+    if (!nested.ok) return;
+    expect(nested.paths).toEqual(expect.arrayContaining(["/a", "/b", "/c"]));
+    // A container of the wrong shape is unavailable, never skipped.
+    const malformed = collectCredentialPaths({
+      yamlText: "",
+      capabilities: [{ name: "probe", config: { agents: "not-a-list" } }],
+      piAgentDir: "/agent/.pi-agent",
+      workspaceRoot: "/agent/work",
+      fieldClasses,
+    });
+    expect(malformed.ok).toBe(false);
   });
 });
 
