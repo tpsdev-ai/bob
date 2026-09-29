@@ -67,6 +67,9 @@ async function harness() {
   const starts: string[] = [];
   const ends: string[] = [];
   const origins: Array<{ text: string; origin: TurnOrigin }> = [];
+  // The origin read at each agent_end, INSIDE the prompt: the admitted origin
+  // must still be current there (agent_end fires mid-prompt).
+  const postEndOrigins: Array<{ text: string; origin: TurnOrigin }> = [];
   const summaries: Array<{ origin: TurnOrigin }> = [];
   const beats: unknown[] = [];
   const replies: Array<{ channel: string; text: string; replyTo?: string }> = [];
@@ -109,7 +112,7 @@ async function harness() {
           { role: "toolResult", content: "tool-output-secret" },
         ],
       });
-      expect(admission.readOrigin()).toEqual({ kind: "run" });
+      postEndOrigins.push({ text, origin: admission.readOrigin() });
       ends.push(text);
       p.ended.resolve();
     },
@@ -171,6 +174,9 @@ async function harness() {
           async fetchRecent() {
             return [];
           },
+          async fetchMessage() {
+            return null;
+          },
           async sendTyping() {},
         },
         log: () => {},
@@ -195,6 +201,7 @@ async function harness() {
     starts,
     ends,
     origins,
+    postEndOrigins,
     summaries,
     beats,
     replies,
@@ -232,6 +239,14 @@ describe("round 5 interleavings", () => {
       { text: "cron-secret", origin: { kind: "cron", job: "brief" } },
     ]);
     expect(h.summaries.map((s) => s.origin)).toEqual(h.origins.map((o) => o.origin));
+    // agent_end fires INSIDE the prompt: the admitted origin must still be
+    // current there (it is cleared only when the prompt settles, not on
+    // agent_end), or a per-call readOrigin() would revert the discord tools to
+    // allowlist reach mid-turn (bob#227).
+    expect(h.postEndOrigins).toEqual([
+      { text: "discord-secret", origin: { kind: "discord", channelId: "123" } },
+      { text: "cron-secret", origin: { kind: "cron", job: "brief" } },
+    ]);
     expect(h.replies).toEqual([
       { channel: "123", text: "discord-secret-model-secret", replyTo: "msg" },
     ]);
