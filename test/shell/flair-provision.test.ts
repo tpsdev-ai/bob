@@ -11,7 +11,7 @@ import {
   syncFlairSoul,
 } from "../../src/shell/flair-provision.js";
 import { initAgent } from "../../src/shell/init.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { captureOutput, makeFakeFlair, operatorCredentialForms } from "./flair-fake.js";
 
 const TEST_ADMIN_CREDENTIAL = "placeholder-not-a-real-admin-credential";
 
@@ -152,6 +152,36 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
     ).rejects.toThrow();
     expect(fake.souls["testbot:persona"]).toBeUndefined();
   });
+
+  // ─── NO OPERATOR CREDENTIAL FROM A REFLECTING SERVER ─────────────────────
+  // Both operator transports onboard uses — the ops-API registration and the
+  // Soul PUT — fail against a server that reflects request headers into its
+  // error body; neither the error nor anything written to stdout/stderr may
+  // carry the credential in any form.
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    for (const failAt of ["registration", "soul"] as const) {
+      it(`onboard never echoes the credential when ${failAt} fails on a reflecting server (${reflect})`, async () => {
+        const fake = makeFakeFlair(
+          failAt === "registration" ? { opsStatus: 500, reflect } : { soulPutStatus: 500, reflect },
+        );
+        const { error, output } = await captureOutput(() => provision(fake, { warn: undefined }));
+        const message = (error as Error).message;
+        expect(message).toContain(
+          failAt === "registration"
+            ? "flair ops-API search_by_id Agent -> 500: operator request failed"
+            : "flair Soul PUT testbot:name -> 500: operator write failed",
+        );
+        const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+        expect(fake.errorBodies.join("\n")).toContain(
+          reflect === "authorization" ? header : decoded,
+        );
+        for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+          expect(message).not.toContain(form);
+          expect(output).not.toContain(form);
+        }
+      });
+    }
+  }
 
   // ─── FAIL LOUDLY ON A MISSING CREDENTIAL ─────────────────────────────────
   it("throws — and writes no soul — when no admin credential is available", async () => {
@@ -344,6 +374,28 @@ describe("syncFlairSoul — bob align (#94)", () => {
         .every((c) => /^Basic /.test(c.headers.Authorization ?? "")),
     ).toBe(true);
   });
+
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    it(`align never echoes the credential when the Soul PUT fails on a reflecting server (${reflect})`, async () => {
+      const fake = makeFakeFlair({
+        agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
+        // A divergent persona, so the default warn path writes to stderr too.
+        souls: { "testbot:persona": "an older persona\n" },
+        soulPutStatus: 500,
+        reflect,
+      });
+      const { error, output } = await captureOutput(() => sync(fake, { warn: undefined }));
+      const message = (error as Error).message;
+      expect(message).toContain("flair Soul PUT testbot:name -> 500: operator write failed");
+      expect(output).toContain("soul divergence for 'testbot'");
+      const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+      expect(fake.errorBodies.join("\n")).toContain(reflect === "authorization" ? header : decoded);
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(message).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
 
   it("verifies registration FIRST, and the verification precedes every soul call", async () => {
     const fake = registeredFake();

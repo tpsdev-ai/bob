@@ -46,10 +46,20 @@ export interface FakeFlairOptions {
   // operator Basic credential is accepted. GET still accepts agent signatures.
   adminPassword?: string;
   adminUser?: string;
+  // Force every Soul PUT to this status (for failure-path tests).
+  soulPutStatus?: number;
+  // A server or intermediary that reflects request headers into its error
+  // bodies. When set, every non-2xx reply appends the request's credential:
+  // "authorization" echoes the Authorization header verbatim; "decoded-basic"
+  // echoes the decoded user:password of a Basic header.
+  reflect?: "authorization" | "decoded-basic";
 }
 
 export interface FakeFlair {
   calls: RecordedCall[];
+  // Every non-2xx body the fake served, in order — so a test can prove a
+  // reflected credential really was on the wire back to bob.
+  errorBodies: string[];
   agents: Record<string, FakeAgentRow>;
   souls: Record<string, string>;
   fetchImpl: (
@@ -73,7 +83,18 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const agents: Record<string, FakeAgentRow> = { ...(opts.agents ?? {}) };
   const souls: Record<string, string> = { ...(opts.souls ?? {}) };
 
+  const errorBodies: string[] = [];
+
   const fetchImpl: FakeFlair["fetchImpl"] = async (url, init) => {
+    const res = await route(url, init);
+    if (res.ok) return res;
+    let body = await res.text();
+    if (opts.reflect) body = `${body} ${reflectedCredential(init.headers, opts.reflect)}`;
+    errorBodies.push(body);
+    return reply(res.status, body);
+  };
+
+  const route: FakeFlair["fetchImpl"] = async (url, init) => {
     const parsed = new URL(url);
     const path = parsed.pathname;
     const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
@@ -147,6 +168,9 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       const id = decodeURIComponent(soulMatch[1]);
       const signerId = signingAgentId(init.headers);
       if (init.method === "PUT") {
+        if (opts.soulPutStatus && opts.soulPutStatus >= 400) {
+          return reply(opts.soulPutStatus, { error: "soul write refused" });
+        }
         const expected = `Basic ${Buffer.from(`${opts.adminUser ?? "admin"}:${opts.adminPassword ?? "placeholder-not-a-real-admin-credential"}`).toString("base64")}`;
         if (init.headers.Authorization !== expected)
           return reply(403, { error: "soul_write_requires_operator" });
@@ -169,6 +193,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
 
   return {
     calls,
+    errorBodies,
     agents,
     souls,
     fetchImpl,
@@ -189,4 +214,60 @@ function signingAgentId(headers: Record<string, string>): string | undefined {
   // that answers 401 in production, so the fake rejects it too.
   if (Number(ts) < 1e12) return undefined;
   return agentId;
+}
+
+// What a header-reflecting server appends to an error body.
+function reflectedCredential(
+  headers: Record<string, string>,
+  mode: "authorization" | "decoded-basic",
+): string {
+  const raw = headers.authorization ?? headers.Authorization ?? "";
+  if (mode === "authorization") return `(request Authorization: ${raw})`;
+  const decoded = raw.startsWith("Basic ")
+    ? Buffer.from(raw.slice("Basic ".length), "base64").toString("utf8")
+    : raw;
+  return `(authenticated as ${decoded})`;
+}
+
+// Every form an operator Basic credential can take in output: the header, its
+// base64, the decoded user:password, and the bare password.
+export function operatorCredentialForms(password: string, user = "admin"): string[] {
+  const base64 = Buffer.from(`${user}:${password}`).toString("base64");
+  return [`Basic ${base64}`, base64, `${user}:${password}`, password];
+}
+
+// Run `fn` and capture everything it writes to stdout/stderr — console.* and
+// the raw process streams — whether it resolves or throws.
+export async function captureOutput(
+  fn: () => Promise<unknown>,
+): Promise<{ error: unknown; output: string }> {
+  const chunks: string[] = [];
+  const methods = ["log", "info", "warn", "error", "debug"] as const;
+  const savedConsole = methods.map((m) => console[m]);
+  const savedOut = process.stdout.write;
+  const savedErr = process.stderr.write;
+  for (const m of methods) {
+    console[m] = (...args: unknown[]) => {
+      chunks.push(args.map(String).join(" "));
+    };
+  }
+  const sink = ((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  process.stdout.write = sink;
+  process.stderr.write = sink;
+  let error: unknown;
+  try {
+    await fn();
+  } catch (err) {
+    error = err;
+  } finally {
+    methods.forEach((m, i) => {
+      console[m] = savedConsole[i];
+    });
+    process.stdout.write = savedOut;
+    process.stderr.write = savedErr;
+  }
+  return { error, output: chunks.join("\n") };
 }

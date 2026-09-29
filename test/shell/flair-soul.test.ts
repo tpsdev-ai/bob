@@ -12,7 +12,7 @@ import {
   SOUL_KEY_PERSONA,
   SOUL_KEY_ROLE,
 } from "../../src/shell/flair-soul.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { captureOutput, makeFakeFlair, operatorCredentialForms } from "./flair-fake.js";
 
 const FLAIR_URL = "http://127.0.0.1:19926";
 const PERSONA = "# You are Testbot (`testbot`)\n\nYou are Testbot, a reviewer.\n";
@@ -146,6 +146,32 @@ describe("pushSoulToFlair (#94)", () => {
       expect(write.body?.agentId).toBe("testbot");
     }
   });
+
+  // A server or intermediary that reflects request headers into an error body
+  // must not carry the operator credential into bob's error or output.
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    it(`never echoes the credential from a server that reflects it (${reflect})`, async () => {
+      const fake = makeFakeFlair({
+        agents: { testbot: { id: "testbot", publicKey: pub } },
+        // A divergent persona, so the default warn path writes to stderr too.
+        souls: { "testbot:persona": "an older persona\n" },
+        soulPutStatus: 500,
+        reflect,
+      });
+      const { error, output } = await captureOutput(() => push(fake, { warn: undefined }));
+      const message = (error as Error).message;
+      expect(message).toContain("flair Soul PUT testbot:name -> 500: operator write failed");
+      expect(message).toContain(join(tmp, "admin-pass"));
+      expect(output).toContain("soul divergence for 'testbot'");
+      // The reflected credential really was in the body bob received.
+      const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+      expect(fake.errorBodies.join("\n")).toContain(reflect === "authorization" ? header : decoded);
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(message).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
 
   it("marks soul entries permanent — identity must not age out of bootstrap", async () => {
     const fake = registeredFake();

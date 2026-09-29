@@ -13,7 +13,7 @@ import {
   resolveFlairOpsUrl,
   verifyRegisteredWithFlair,
 } from "../../src/shell/flair-pair.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { captureOutput, makeFakeFlair, operatorCredentialForms } from "./flair-fake.js";
 
 // Obvious placeholder, never a real credential. Every assertion about it is
 // about SHAPE (present / absent / not-echoed), never about the value meaning
@@ -285,11 +285,71 @@ describe("registerWithFlair", () => {
     }
   });
 
-  it("never echoes the credential in an error message", async () => {
-    const fake = makeFakeFlair({ opsStatus: 500 });
-    const err = await registerWithFlair(args(fake)).catch((e) => e as Error);
-    expect((err as Error).message).toContain("500");
-    expect((err as Error).message).not.toContain(TEST_ADMIN_CREDENTIAL);
+  // A server or intermediary that reflects request headers into an error body
+  // must not carry the operator credential into bob's error or output: the
+  // error names status, operation, table and credential source, never the body.
+  for (const reflect of ["authorization", "decoded-basic"] as const) {
+    it(`never echoes the credential from a server that reflects it (${reflect})`, async () => {
+      const fake = makeFakeFlair({ opsStatus: 500, reflect });
+      const { error, output } = await captureOutput(() => registerWithFlair(args(fake)));
+      const message = (error as Error).message;
+      expect(message).toContain("flair ops-API search_by_id Agent -> 500");
+      expect(message).toContain(ADMIN_PASS_ENV);
+      // The reflected credential really was in the body bob received.
+      const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+      expect(fake.errorBodies.join("\n")).toContain(reflect === "authorization" ? header : decoded);
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(message).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
+
+  it("names the admin-pass FILE when the credential came from it", async () => {
+    const file = join(tmpKeys, "admin-pass");
+    writeFileSync(file, `${TEST_ADMIN_CREDENTIAL}\n`, { mode: 0o600 });
+    const fake = makeFakeFlair({ opsStatus: 403, reflect: "authorization" });
+    const err = await registerWithFlair({ ...args(fake), adminPassFile: file, env: {} }).catch(
+      (e) => e as Error,
+    );
+    expect((err as Error).message).toContain(`-> 403: operator request failed; check ${file}`);
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect((err as Error).message).not.toContain(form);
+    }
+  });
+
+  // The duplicate refusal is read from the error body as a boolean only, so
+  // it still reconciles without the body joining any message.
+  it("reconciles an insert refused with an error status naming a duplicate", async () => {
+    const fake = makeFakeFlair({ reflect: "authorization" });
+    const orig = fake.fetchImpl;
+    let seenRead = false;
+    const racing: typeof fake.fetchImpl = async (url, init) => {
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      if (body?.operation === "search_by_id" && !seenRead) {
+        seenRead = true;
+        fake.agents.testbot = { id: "testbot", publicKey: "AAAAotherkeyAAAA" };
+        return { ok: true, status: 200, text: async () => "[]" };
+      }
+      if (body?.operation === "insert") {
+        const echoed = init.headers.Authorization;
+        return {
+          ok: false,
+          status: 400,
+          text: async () => `{"error":"duplicate primary key testbot"} (echo: ${echoed})`,
+        };
+      }
+      return orig(url, init);
+    };
+    const { error, output } = await captureOutput(async () => {
+      const reg = await registerWithFlair({ ...args(fake), fetchImpl: racing });
+      expect(reg.outcome).toBe("repaired");
+    });
+    expect(error).toBeUndefined();
+    expect(fake.agents.testbot.publicKey).toBe(pub);
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect(output).not.toContain(form);
+    }
   });
 
   it("rejects invalid agent names before touching the network", async () => {

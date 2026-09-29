@@ -14,7 +14,9 @@
 // SECURITY: registration's admin password is read from a file path or an env
 // var, held only long enough to build one Basic header, and never logged, echoed, or
 // placed in an error message or in argv. Every error here names the env var or
-// the FILE PATH, never a value.
+// the FILE PATH, never a value. No error on an operator-authorized request
+// includes the server's response body either: a server or intermediary that
+// reflects request headers would otherwise carry the Basic header into it.
 
 import { generateKeyPairSync, randomUUID, webcrypto } from "node:crypto";
 import {
@@ -275,13 +277,21 @@ export interface AdminPassSources {
 // all on a default install and silently fail on a hardened one — a control
 // that works only where it isn't needed.
 export function resolveFlairAdminPass(opts: AdminPassSources = {}): string | undefined {
+  return resolveAdminPassWithSource(opts)?.password;
+}
+
+// The same resolution, plus WHERE the password came from: the env var NAME or
+// the file PATH, never the value, so an operator-request error can name it.
+function resolveAdminPassWithSource(
+  opts: AdminPassSources,
+): { password: string; source: string } | undefined {
   const env = opts.env ?? process.env;
   const fromEnv = env[ADMIN_PASS_ENV];
-  if (fromEnv && fromEnv.trim() !== "") return fromEnv.trim();
+  if (fromEnv && fromEnv.trim() !== "") return { password: fromEnv.trim(), source: ADMIN_PASS_ENV };
   const file = adminPassPath(opts.adminPassFile);
   if (!existsSync(file)) return undefined;
   const contents = readFileSync(file, "utf8").trim();
-  return contents === "" ? undefined : contents;
+  return contents === "" ? undefined : { password: contents, source: file };
 }
 
 export function adminPassPath(override?: string): string {
@@ -385,7 +395,7 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
   const env = args.env ?? process.env;
   const opsUrl = resolveFlairOpsUrl(args.flairUrl, args.opsUrl ?? env[OPS_TARGET_ENV]);
   assertOperatorAuthTarget(opsUrl, args.name);
-  const adminPass = resolveFlairAdminPass({ adminPassFile: args.adminPassFile, env });
+  const adminPass = resolveAdminPassWithSource({ adminPassFile: args.adminPassFile, env });
   if (adminPass === undefined) {
     throw new FlairAdminCredentialError(
       args.name,
@@ -393,7 +403,13 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
       args.keyPath ?? join(homedir(), ".flair", "keys", `${args.name}.key`),
     );
   }
-  const post = opsPoster(opsUrl, args.adminUser ?? "admin", adminPass, args.fetchImpl);
+  const post = opsPoster(
+    opsUrl,
+    args.adminUser ?? "admin",
+    adminPass.password,
+    adminPass.source,
+    args.fetchImpl,
+  );
   const now = args.now ?? (() => Date.now());
 
   const existing = await readAgentRecord(post, args.name);
@@ -442,10 +458,37 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
 
 type OpsPoster = (body: Record<string, unknown>) => Promise<unknown>;
 
+// A non-2xx answer to an operator-authorized ops-API request. The message
+// names the status, operation, table and where the credential came from, and
+// never the response body: the request carries the operator's Basic header,
+// which a reflecting server or intermediary could echo into that body (the
+// Soul writer in flair-soul.ts refuses to print its response for the same
+// reason). The one fact read from the body — whether an insert was refused
+// because the row already exists — is kept as a boolean, never as text.
+class FlairOpsRequestError extends Error {
+  readonly status: number;
+  readonly duplicate: boolean;
+  constructor(
+    operation: string,
+    table: string,
+    status: number,
+    credentialSource: string,
+    duplicate: boolean,
+  ) {
+    super(
+      `flair ops-API ${operation} ${table} -> ${status}: operator request failed; check ${credentialSource} and the target Flair instance.`,
+    );
+    this.name = "FlairOpsRequestError";
+    this.status = status;
+    this.duplicate = duplicate;
+  }
+}
+
 function opsPoster(
   opsUrl: string,
   adminUser: string,
   adminPass: string,
+  credentialSource: string,
   fetchImpl?: FlairFetch,
 ): OpsPoster {
   const doFetch: FlairFetch =
@@ -461,11 +504,14 @@ function opsPoster(
     });
     const text = await res.text();
     if (!res.ok) {
-      // Status + a short server-provided reason only. Never the request body
-      // (it carries no secret today, but the auth header must never join it)
-      // and never the operation's records.
-      throw new Error(
-        `flair ops-API ${String(body.operation)} ${String(body.table)} -> ${res.status}: ${text.slice(0, 200)}`,
+      // The server's response could echo a header. Never print it or the
+      // secret; never the request body or the operation's records either.
+      throw new FlairOpsRequestError(
+        String(body.operation),
+        String(body.table),
+        res.status,
+        credentialSource,
+        res.status === 409 || /duplicate|already exists|\b409\b/i.test(text),
       );
     }
     if (text.trim() === "") return undefined;
@@ -537,8 +583,7 @@ async function insertAgentRecord(
       ],
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (/duplicate|already exists|\b409\b/i.test(message)) return false;
+    if (err instanceof FlairOpsRequestError && err.duplicate) return false;
     throw err;
   }
   const skipped = (result as { skipped_hashes?: unknown[] } | undefined)?.skipped_hashes;
