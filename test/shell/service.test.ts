@@ -5,7 +5,9 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -316,16 +318,20 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
     }
   });
 
-  it("makes a RELATIVE PATH entry absolute", () => {
+  it("skips a RELATIVE PATH entry: the unit never depends on the installer's working directory", () => {
     const dir = mkdtempSync(join(tmpdir(), "bob-node-rel-"));
     writeFileSync(join(dir, "node"), "#!/bin/sh\n");
     chmodSync(join(dir, "node"), 0o755);
     try {
       const rel = relative(process.cwd(), dir); // a RELATIVE PATH entry
       expect(rel.startsWith("/")).toBe(false); // premise: it IS relative
-      const resolved = resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: rel });
-      expect(resolved).toBe(join(dir, "node"));
-      expect(resolved.startsWith("/")).toBe(true);
+      // premise: the same directory, named absolutely, IS chosen
+      expect(resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
+        join(dir, "node"),
+      );
+      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: rel })).toThrow(
+        /no Node executable found/,
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -423,6 +429,274 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
       rmSync(otherDir, { recursive: true, force: true });
       rmSync(stableDir, { recursive: true, force: true });
     }
+  });
+});
+
+// The trust screen: a PATH `node` is a candidate only when it is reached through
+// an ABSOLUTE PATH entry and every directory on the way to its file, symlink
+// targets included, is owned by the installer or root and not writable by
+// others (see resolveNodeExecutable). Temp directories are created with explicit
+// modes; the running uid is the installer.
+describe("resolveNodeExecutable — only trusted, absolute PATH entries supply node (bob#233)", () => {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  const BUN = "/opt/bun/bin/bun"; // a non-Node installer
+  const NO_NODE = /no Node executable found/;
+  const scratch: string[] = [];
+  afterAll(() => {
+    for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+  });
+
+  // A fresh temp directory (0700, owned by the running uid), chmod'ed to `mode`.
+  function tempDir(prefix: string, mode?: number): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    scratch.push(dir);
+    if (mode !== undefined) chmodSync(dir, mode);
+    return dir;
+  }
+  // Nested directories under `parent`, each 0755 whatever the umask.
+  function subdirs(parent: string, ...names: string[]): string {
+    let dir = parent;
+    for (const name of names) {
+      dir = join(dir, name);
+      mkdirSync(dir);
+      chmodSync(dir, 0o755);
+    }
+    return dir;
+  }
+  // Make `dir` 1777 (world-writable + sticky, like /tmp). bun's fs.chmodSync
+  // drops the sticky bit, so this runs chmod(1) and asserts the bit is set.
+  function makeSticky(dir: string): void {
+    const r = spawnSync("chmod", ["1777", dir], { encoding: "utf8", timeout: 10_000 });
+    expect(r.status).toBe(0);
+    expect(statSync(dir).mode & 0o7777).toBe(0o1777);
+  }
+  // An executable regular file named node in `dir`.
+  function nodeFile(dir: string): string {
+    const file = join(dir, "node");
+    writeFileSync(file, "#!/bin/sh\n");
+    chmodSync(file, 0o755);
+    return file;
+  }
+  // A symlink named node in `dir`, pointing at `target`.
+  function nodeLink(dir: string, target: string): string {
+    const link = join(dir, "node");
+    symlinkSync(target, link);
+    return link;
+  }
+
+  describe("directory trust (finding 1)", () => {
+    it("a 0777 directory whose node symlinks to the running interpreter, first on PATH, is not chosen: the fallback applies", () => {
+      const versioned = nodeFile(tempDir("bob-trust-versioned-"));
+      const open = tempDir("bob-trust-0777-", 0o777);
+      nodeLink(open, versioned);
+      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: open })).toBe(versioned);
+      // A trusted matching symlink LATER on PATH is still chosen: the untrusted
+      // entry is skipped, not fatal.
+      const closed = tempDir("bob-trust-0700-");
+      const stable = nodeLink(closed, versioned);
+      expect(
+        resolveNodeExecutable({ execPath: versioned, pathEnv: `${open}${delimiter}${closed}` }),
+      ).toBe(stable);
+    });
+
+    it("a group-writable directory is not chosen when its group is not the administrators group", () => {
+      const dir = tempDir("bob-trust-0775-", 0o775);
+      nodeFile(dir);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: null })).toThrow(
+        NO_NODE,
+      );
+    });
+
+    it("group write by the administrators group is accepted (stock Homebrew); other-write never is", () => {
+      const dir = tempDir("bob-trust-admin-", 0o775);
+      const node = nodeFile(dir);
+      const gid = statSync(dir).gid;
+      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: gid })).toBe(node);
+      const open = tempDir("bob-trust-admin-0777-", 0o777);
+      nodeFile(open);
+      expect(() =>
+        resolveNodeExecutable({ execPath: BUN, pathEnv: open, adminGid: statSync(open).gid }),
+      ).toThrow(NO_NODE);
+    });
+
+    it("a sticky, world-writable directory holding node is not chosen (the sticky bit excuses only an ancestor)", () => {
+      const dir = tempDir("bob-trust-sticky-holder-");
+      makeSticky(dir);
+      nodeFile(dir);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: null })).toThrow(
+        NO_NODE,
+      );
+    });
+
+    it.skipIf(process.getuid?.() === 0)(
+      "a directory owned by neither the installer nor root is not chosen",
+      () => {
+        const dir = tempDir("bob-trust-owner-");
+        const node = nodeFile(dir);
+        const me = process.getuid?.() ?? 0;
+        // premise: the installer that owns it does choose it
+        expect(resolveNodeExecutable({ execPath: BUN, pathEnv: dir, getUid: () => me })).toBe(node);
+        expect(() =>
+          resolveNodeExecutable({ execPath: BUN, pathEnv: dir, getUid: () => me + 1 }),
+        ).toThrow(NO_NODE);
+      },
+    );
+
+    it("an ancestor writable by others rejects the candidate unless it has the sticky bit", () => {
+      const outer = tempDir("bob-trust-ancestor-", 0o777);
+      const bin = subdirs(outer, "bin");
+      chmodSync(bin, 0o700);
+      const node = nodeFile(bin);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: bin, adminGid: null })).toThrow(
+        NO_NODE,
+      );
+      makeSticky(outer); // now like /tmp
+      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: bin, adminGid: null })).toBe(node);
+    });
+
+    it("a symlink is judged by where it leads: a node link or a PATH directory link into a 0777 directory is not chosen", () => {
+      const open = tempDir("bob-trust-target-", 0o777);
+      const target = nodeFile(open);
+      // A trusted directory whose node symlinks INTO the untrusted one.
+      const holder = tempDir("bob-trust-linkholder-");
+      nodeLink(holder, target);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: holder })).toThrow(NO_NODE);
+      // A PATH entry that is itself a symlink to the untrusted directory.
+      const parent = tempDir("bob-trust-dirlink-");
+      const linked = join(parent, "bin");
+      symlinkSync(open, linked);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: linked })).toThrow(NO_NODE);
+      // premise: a PATH directory link into a TRUSTED directory is chosen.
+      const good = tempDir("bob-trust-gooddir-");
+      nodeFile(good);
+      const goodLink = join(parent, "good");
+      symlinkSync(good, goodLink);
+      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: goodLink })).toBe(
+        join(goodLink, "node"),
+      );
+    });
+
+    it("a Homebrew-shaped relative link (bin/node -> ../Cellar/node/<v>/bin/node) in trusted directories is chosen", () => {
+      const prefix = tempDir("bob-trust-prefix-");
+      const versioned = nodeFile(subdirs(prefix, "Cellar", "node", "1.0.0", "bin"));
+      const stable = join(subdirs(prefix, "bin"), "node");
+      symlinkSync("../Cellar/node/1.0.0/bin/node", stable);
+      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: join(prefix, "bin") })).toBe(
+        stable,
+      );
+    });
+
+    it("a failed stat makes the candidate untrusted: it is skipped and the fallback applies", () => {
+      const versioned = nodeFile(tempDir("bob-trust-statv-"));
+      const dir = tempDir("bob-trust-statfail-");
+      const stable = nodeLink(dir, versioned);
+      const failing = realpathSync(dir);
+      let fired = 0;
+      const statPath = (path: string) => {
+        if (path === failing) {
+          fired += 1;
+          throw new Error("EACCES (injected)");
+        }
+        return statSync(path);
+      };
+      // premise: without the failure the link is chosen
+      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: dir })).toBe(stable);
+      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: dir, statPath })).toBe(
+        versioned,
+      );
+      expect(fired).toBeGreaterThan(0); // the injected failure really fired
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, statPath })).toThrow(
+        NO_NODE,
+      );
+    });
+
+    it("a symlink cycle is untrusted (the walk is bounded)", () => {
+      const dir = tempDir("bob-trust-loop-");
+      symlinkSync(join(dir, "loop"), join(dir, "node"));
+      symlinkSync(join(dir, "node"), join(dir, "loop"));
+      expect(() =>
+        resolveNodeExecutable({ execPath: BUN, pathEnv: dir, isExecutable: () => true }),
+      ).toThrow(NO_NODE);
+    });
+  });
+
+  describe("relative PATH entries (finding 2)", () => {
+    it("`bin` and `.` are never chosen, even when they hold a matching node; empty segments are skipped", () => {
+      const versioned = nodeFile(tempDir("bob-rel-versioned-"));
+      const cwd = tempDir("bob-rel-cwd-");
+      nodeLink(cwd, versioned); // ./node -> the running interpreter
+      const bin = subdirs(cwd, "bin");
+      nodeLink(bin, versioned); // bin/node -> the running interpreter
+      const abs = tempDir("bob-rel-abs-");
+      const absNode = nodeFile(abs);
+      // premise: the same directory named ABSOLUTELY is chosen
+      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: bin })).toBe(join(bin, "node"));
+      const previous = process.cwd();
+      process.chdir(cwd);
+      try {
+        const relativeOnly = `bin${delimiter}.`;
+        expect(resolveNodeExecutable({ execPath: versioned, pathEnv: relativeOnly })).toBe(
+          versioned,
+        );
+        expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: relativeOnly })).toThrow(
+          NO_NODE,
+        );
+        expect(
+          resolveNodeExecutable({ execPath: BUN, pathEnv: `${relativeOnly}${delimiter}${abs}` }),
+        ).toBe(absNode);
+        expect(
+          resolveNodeExecutable({ execPath: BUN, pathEnv: `${delimiter}${delimiter}${abs}` }),
+        ).toBe(absNode);
+      } finally {
+        process.chdir(previous);
+      }
+    });
+  });
+
+  describe("the non-Node installer branch (finding 3)", () => {
+    it("skips an untrusted first match for a trusted later one, and refuses when only untrusted or relative entries hold node", () => {
+      const open = tempDir("bob-nn-0777-", 0o777);
+      nodeFile(open);
+      const trusted = tempDir("bob-nn-trusted-");
+      const good = nodeFile(trusted);
+      expect(
+        resolveNodeExecutable({ execPath: BUN, pathEnv: `${open}${delimiter}${trusted}` }),
+      ).toBe(good);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: open })).toThrow(NO_NODE);
+      // The refusal names what it skipped and why, so the remedy is actionable.
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: open })).toThrow(
+        `Skipped as untrusted: ${join(open, "node")}`,
+      );
+      // With nothing skipped, the refusal does not claim anything was.
+      let bare = "";
+      try {
+        resolveNodeExecutable({ execPath: BUN, pathEnv: "" });
+      } catch (e) {
+        bare = (e as Error).message;
+      }
+      expect(bare).toMatch(NO_NODE);
+      expect(bare).not.toContain("Skipped as untrusted");
+      const rel = relative(process.cwd(), trusted);
+      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: rel })).toThrow(NO_NODE);
+    });
+
+    it("installService refuses and writes NOTHING when PATH holds only an untrusted node", async () => {
+      const open = tempDir("bob-nn-install-", 0o777);
+      nodeFile(open);
+      const written: Array<{ path: string; contents: string }> = [];
+      const attempt = installService({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        platform: "systemd",
+        execPath: BUN,
+        pathEnv: open,
+        writeFile: (path, contents) => written.push({ path, contents }),
+        runSystemctl: async () => ({ code: 0, stderr: "" }),
+      });
+      await expect(attempt).rejects.toThrow(/22\.19\.0/);
+      expect(written).toHaveLength(0);
+    });
   });
 });
 

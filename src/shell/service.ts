@@ -31,12 +31,13 @@ import {
   constants,
   lstatSync,
   mkdirSync,
+  readlinkSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
 
 // Strict class init.ts/run.ts use — agent names are filesystem paths AND get
 // embedded in the unit Label / file name / ExecStart, so this doubles as path,
@@ -62,6 +63,14 @@ function assertName(name: string): void {
 // `engines.node`; the install-time refusal below names it as the remedy.
 const NODE_ENGINES_FLOOR = ">=22.19.0";
 
+// Ownership and mode of a directory, symlinks followed: what the trust screen
+// reads. The default source is fs.statSync.
+export interface PathOwnership {
+  uid: number;
+  gid: number;
+  mode: number;
+}
+
 export interface NodeResolutionDeps {
   // The installing process's own interpreter. Defaults to process.execPath.
   execPath?: string;
@@ -70,6 +79,111 @@ export interface NodeResolutionDeps {
   // Whether a candidate path is a REGULAR EXECUTABLE file. Defaults to an fs
   // check (regular file + X_OK); injected in tests.
   isExecutable?: (file: string) => boolean;
+  // The installer's uid. The trust screen accepts directories owned by this uid
+  // or by root. Defaults to process.getuid().
+  getUid?: () => number;
+  // Ownership and mode of a directory (symlinks followed). Defaults to
+  // fs.statSync. A throw makes the candidate UNTRUSTED. Injected in tests.
+  statPath?: (path: string) => PathOwnership;
+  // The host's administrators group. A directory writable by its owner and this
+  // group, and by no one else, is accepted: the group's members can already act
+  // as root. Defaults to 80 (`admin`) on macOS, the group stock Homebrew makes
+  // its prefix writable by, and to null (no group-writable directory is
+  // accepted) elsewhere. Injected in tests.
+  adminGid?: number | null;
+}
+
+// The group-write and other-write permission bits, the other-write bit alone,
+// and the sticky bit.
+const GROUP_OR_OTHER_WRITE = 0o022;
+const OTHER_WRITE = 0o002;
+const STICKY = 0o1000;
+// Symlink hops followed while screening one candidate (Linux's MAXSYMLINKS).
+const MAX_SYMLINK_HOPS = 40;
+// macOS's `admin` group.
+const DARWIN_ADMIN_GID = 80;
+
+interface TrustContext {
+  uid: number;
+  adminGid: number | null;
+  statPath: (path: string) => PathOwnership;
+}
+
+// Whether one directory on the way to a candidate interpreter is trusted. Every
+// directory must be owned by the installer or by root; a failed stat is
+// untrusted. A HOLDER, a directory whose entry names the interpreter (the PATH
+// entry holding `node`, and the directory holding the last name of any symlink
+// target), must be writable by no one but its owner, except that write by the
+// host's administrators group is accepted. An ANCESTOR, any other directory
+// traversed, may also be group- or other-writable when it has the sticky bit
+// (as /tmp does), which stops others renaming entries they do not own.
+function directoryTrusted(dir: string, role: "holder" | "ancestor", ctx: TrustContext): boolean {
+  let st: PathOwnership;
+  try {
+    st = ctx.statPath(dir);
+  } catch {
+    return false;
+  }
+  if (st.uid !== ctx.uid && st.uid !== 0) return false;
+  if ((st.mode & GROUP_OR_OTHER_WRITE) === 0) return true;
+  if ((st.mode & OTHER_WRITE) === 0 && ctx.adminGid !== null && st.gid === ctx.adminGid) {
+    return true;
+  }
+  return role === "ancestor" && (st.mode & STICKY) !== 0;
+}
+
+// Whether a candidate interpreter path is trusted: every directory traversed to
+// reach the file passes directoryTrusted. The walk resolves the path one name at
+// a time and follows each symlink hop, the `node` entry's own target included,
+// so a symlinked directory is judged both by the directory holding the link and
+// by every directory the link leads through. A candidate the walk cannot follow
+// (a failed lstat or readlink, more than MAX_SYMLINK_HOPS hops, a non-directory
+// on the way, or a final entry that is not a regular file) is untrusted, and so
+// is a relative path.
+function interpreterPathTrusted(file: string, ctx: TrustContext): boolean {
+  if (!isAbsolute(file)) return false;
+  const names = (path: string): string[] =>
+    path
+      .slice(parse(path).root.length)
+      .split(sep)
+      .filter((n) => n.length > 0);
+  let dir = parse(file).root;
+  if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+  let pending = names(file);
+  let hops = 0;
+  while (pending.length > 0) {
+    const name = pending.shift() as string;
+    if (name === ".") continue;
+    if (name === "..") {
+      dir = dirname(dir);
+      continue;
+    }
+    const last = pending.length === 0;
+    if (last && !directoryTrusted(dir, "holder", ctx)) return false;
+    const entry = join(dir, name);
+    let target: string | undefined;
+    try {
+      const st = lstatSync(entry);
+      if (st.isSymbolicLink()) target = readlinkSync(entry);
+      else if (last) return st.isFile();
+      else if (!st.isDirectory()) return false;
+    } catch {
+      return false;
+    }
+    if (target === undefined) {
+      dir = entry;
+      if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+      continue;
+    }
+    hops += 1;
+    if (hops > MAX_SYMLINK_HOPS) return false;
+    if (isAbsolute(target)) {
+      dir = parse(target).root;
+      if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+    }
+    pending = [...names(target), ...pending];
+  }
+  return false;
 }
 
 function defaultIsExecutable(file: string): boolean {
@@ -128,21 +242,44 @@ function isSymlink(file: string): boolean {
 // look for `node` on the installer's PATH. If neither yields a Node,
 // installation is REFUSED (the throw names the remedy) rather than writing a
 // unit that would run bob under a non-Node runtime.
+//
+// TRUST SCREEN: both branches consider only PATH candidates that pass it. A PATH
+// entry that is empty or not absolute (`bin`, `.`) is skipped. A candidate is
+// kept only when every directory traversed to reach its file, following each
+// symlink hop, passes directoryTrusted: owned by the installer or by root, the
+// holding directory writable by no one else (write by the host's administrators
+// group excepted), an ancestor writable by others only with the sticky bit. A
+// candidate that fails is skipped, and the resolution falls back as it would
+// with no such candidate. The fallback in the node branch, execPath itself, is
+// the running interpreter and is not screened.
 export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   const execPath = deps.execPath ?? process.execPath;
   const pathEnv = deps.pathEnv ?? process.env.PATH ?? "";
   const isExecutable = deps.isExecutable ?? defaultIsExecutable;
   const delimiter = process.platform === "win32" ? ";" : ":";
+  const trust: TrustContext = {
+    uid: (deps.getUid ?? (() => process.getuid?.() ?? 0))(),
+    adminGid:
+      deps.adminGid !== undefined
+        ? deps.adminGid
+        : process.platform === "darwin"
+          ? DARWIN_ADMIN_GID
+          : null,
+    statPath: deps.statPath ?? ((path) => statSync(path)),
+  };
 
-  // Every executable `node` on the installer's PATH, in PATH order. resolve()
-  // against the installer's working directory, so a RELATIVE PATH entry still
-  // yields an ABSOLUTE interpreter in the unit; defaultIsExecutable then
-  // requires a regular file (a directory named `node` is skipped).
+  // Every executable, trusted `node` on the installer's PATH, in PATH order.
+  // Only ABSOLUTE entries count, so the unit never depends on the installer's
+  // working directory; defaultIsExecutable requires a regular file (a directory
+  // named `node` is skipped), and the trust screen above applies.
   const candidates: string[] = [];
+  const untrusted: string[] = [];
   for (const dir of pathEnv.split(delimiter)) {
-    if (!dir) continue;
-    const candidate = resolve(dir, "node");
-    if (isExecutable(candidate)) candidates.push(candidate);
+    if (!dir || !isAbsolute(dir)) continue;
+    const candidate = join(dir, "node");
+    if (!isExecutable(candidate)) continue;
+    if (interpreterPathTrusted(candidate, trust)) candidates.push(candidate);
+    else untrusted.push(candidate);
   }
 
   if (executableBasename(execPath).toLowerCase() === "node") {
@@ -163,10 +300,14 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
     return execPath;
   }
 
-  // The installer is not node: use the first Node found on PATH.
+  // The installer is not node: use the first trusted Node found on PATH.
   if (candidates.length > 0) return candidates[0];
+  const skipped =
+    untrusted.length > 0
+      ? ` Skipped as untrusted: ${untrusted.join(", ")} (every directory on the way must be owned by you or root and not writable by others).`
+      : "";
   throw new Error(
-    `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.`,
+    `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.${skipped}`,
   );
 }
 
@@ -370,9 +511,12 @@ export interface ServiceOpsDeps {
   platform?: ServicePlatform;
   // Node resolution for the unit's interpreter (see resolveNodeExecutable).
   // Injected in tests; defaults to the current process's own interpreter + PATH.
+  // getUid above is also the installer uid the resolution's trust screen uses.
   execPath?: string;
   pathEnv?: string;
   isExecutable?: (file: string) => boolean;
+  statPath?: (path: string) => PathOwnership;
+  adminGid?: number | null;
 }
 
 export interface InstallServiceOptions extends RenderServiceOptions, ServiceOpsDeps {}
