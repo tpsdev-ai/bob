@@ -256,10 +256,12 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   // surfacing. syncFlairSoul verifies registration first — no admin
   // credential required, because align only ever writes the agent's own soul.
   if (noFlair) return;
-  const flair = readFlairBlock(agentDir);
+  // The same canonical tree the session ran from (bob#204), not a re-read of the
+  // requested path.
+  const flair = readFlairBlock(outcome.agentDir);
   const synced = await syncFlairSoul({
     name,
-    role: readAgentRole(agentDir),
+    role: readAgentRole(outcome.agentDir),
     flairUrl: flair.url,
     keyFile: flair.keyFile,
     soulPath: outcome.soulPath,
