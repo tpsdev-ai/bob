@@ -129,7 +129,7 @@ export interface LiveWork {
 // calls the one wiring hook the harness installs on globalThis while this
 // session loads (WIRE_HOOK below), so everything per-session — the scratch
 // state root, the timings, the log — reaches the capability as data.
-const WIRE_HOOK = "__bobWorkTestWire";
+export const WIRE_HOOK = "__bobWorkTestWire";
 const PROBE_SOURCE =
   "export default async function (pi) { await globalThis.__bobWorkTestWire(pi); }\n";
 
@@ -139,13 +139,28 @@ export const FAST: Partial<JobManagerOptions> = {
   drainGraceMs: 250,
 };
 
-export async function workSession(opts: {
+export interface WorkSessionOptions {
   script: Script;
   wire?: Partial<JobManagerOptions>;
   // Reuse a state root (the boot-sweep tests seed it before the session loads).
   stateRoot?: string;
-}): Promise<LiveWork> {
+}
+
+export async function workSession(opts: WorkSessionOptions): Promise<LiveWork> {
   const scratch = mkdtempSync(join(tmpdir(), "bob-work-test-"));
+  // Register this directory's removal BEFORE the setup that can throw. Removal
+  // used to exist only on the returned handle's cleanup(), which a caller never
+  // receives when this function throws — so a failed session load (a load error,
+  // the one-at-a-time guard, a factory failure) leaked the scratch directory.
+  try {
+    return await buildWorkSession(opts, scratch);
+  } catch (err) {
+    rmSync(scratch, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+async function buildWorkSession(opts: WorkSessionOptions, scratch: string): Promise<LiveWork> {
   const cwd = join(scratch, "workspace");
   const piAgentDir = join(scratch, "pi-agent");
   mkdirSync(cwd, { recursive: true });

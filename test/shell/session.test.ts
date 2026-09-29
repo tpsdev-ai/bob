@@ -44,8 +44,17 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Extra temp dirs a helper creates mid-setup, registered as soon as they
+  // exist so removal survives a setup that throws (the helper's own cleanup is
+  // only handed to a caller on a successful return).
+  for (const dir of transientDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
 });
+
+// Extra temp directories registered for removal the moment they are created,
+// drained by afterEach. Declared here (not inside a helper) so a helper that
+// throws during setup cannot leak one.
+const transientDirs: string[] = [];
 
 // A real agent (initAgent writes bob.yaml + .pi-agent/{models,auth}.json) with
 // ONE declared capability, plus every ambient resource pi would otherwise
@@ -248,6 +257,8 @@ describe("the audit", () => {
   async function realProbeSession(extensionText: string) {
     const { cwd, piAgentDir } = scaffold();
     const extDir = mkdtempSync(join(tmpdir(), "bob-ext-"));
+    // Register the removal BEFORE the session factory, which can throw below.
+    transientDirs.push(extDir);
     const extPath = join(extDir, "probe.js");
     writeFileSync(extPath, extensionText);
 
