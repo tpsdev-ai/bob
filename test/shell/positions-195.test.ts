@@ -9,7 +9,7 @@
 // Each test is named for the blocker it discriminates. "Old code" notes name the
 // behaviour on head 3b874cb that the test fails against.
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
   lstatSync,
@@ -66,6 +66,7 @@ interface Scratch {
 }
 
 let s: Scratch;
+const _loadedDirs: string[] = [];
 beforeEach(() => {
   const base = mkdtempSync(join(tmpdir(), "bob-pos-"));
   s = {
@@ -155,6 +156,9 @@ it("hire rejects direct Flair opt-in before scaffolding", async () => {
 });
 afterEach(() => {
   rmSync(s.base, { recursive: true, force: true });
+});
+afterAll(() => {
+  for (const d of _loadedDirs) rmSync(d, { recursive: true, force: true });
 });
 
 // A no-op hiring interview: returns exit 0 and leaves soul.md as scaffolded.
@@ -1342,6 +1346,7 @@ function loadedPosition(
   dirFiles: Record<string, string> = {},
 ): LoadedPosition {
   const dir = mkdtempSync(join(tmpdir(), "bob-pos-dir-"));
+  _loadedDirs.push(dir);
   for (const [rel, content] of Object.entries(dirFiles)) {
     const p = join(dir, rel);
     mkdirSync(dirname(p), { recursive: true });
