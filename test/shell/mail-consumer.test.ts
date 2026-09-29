@@ -23,10 +23,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { MailTurnInput } from "../../src/capabilities/tps-mail/prompt.js";
 import type { ReplyRequest, ReplyResult } from "../../src/capabilities/tps-mail/reply.js";
 import {
+  durableWrite,
   MailConsumer,
   type MailConsumerOptions,
   type TurnOutcome,
@@ -174,6 +176,28 @@ describe("accepting mail (§2)", () => {
       malformed: 1,
     });
     expect(inDir("refused").sort()).toEqual(["1.json", "2.json", "3.json"]);
+  });
+
+  it("a record that cannot be canonicalized (1e400 → Infinity) is REFUSED, not retried forever", async () => {
+    const env = signTestEnvelope(
+      { from: "flint", to: "testbot", body: "x", messageId: "m-inf" },
+      flint,
+    );
+    writeRecord(
+      inbox,
+      "1.json",
+      mailRecord(JSON.stringify(env).replace(/}$/, ',"n":1e400}'), { from: "flint" }),
+    );
+    const h = harness();
+    await h.consumer.poll();
+    expect(inDir("refused")).toEqual(["1.json"]);
+    expect(inDir("new")).toEqual([]);
+    expect(readFileSync(join(inbox, "refused", "1.json.reason"), "utf8")).toMatch(
+      /^reason: malformed\n.*cannot be canonicalized/,
+    );
+    expect(h.consumer.stats.refused.malformed).toBe(1);
+    expect(h.consumer.stats.verifyUnavailable).toBe(0);
+    expect(h.turns).toHaveLength(0);
   });
 
   it("a key lookup Flair cannot answer leaves the mail in new/ (a retry, never a refusal)", async () => {
@@ -504,6 +528,34 @@ describe("the bounded turn through the REAL launcher spawn (§1, Kern 4)", () =>
     await h.consumer.poll(); // backoff: not re-dispatched immediately
     expect(readFileSync(join(root, "launcher.count"), "utf8").trim().split("\n")).toHaveLength(1);
   }, 15_000);
+
+  it("(a7g) the timeout kills the launcher's WHOLE process group — a grandchild dies too", async () => {
+    deliver("1.json");
+    const grandchildPidFile = join(root, "grandchild.pid");
+    const h = realHarness(
+      fakeLauncher(["sleep 60 &", `echo $! > ${grandchildPidFile}`, "exec sleep 30"]),
+      800,
+    );
+    await h.consumer.poll();
+    const grandchild = Number(readFileSync(grandchildPidFile, "utf8").trim());
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      const deadline = Date.now() + 8000;
+      while (alive(grandchild) && Date.now() < deadline)
+        await new Promise((r) => setTimeout(r, 50));
+      expect(alive(grandchild)).toBe(false);
+      expect(h.consumer.stats.timeouts).toBe(1);
+    } finally {
+      if (alive(grandchild)) process.kill(grandchild, "SIGKILL"); // only a pid this test started
+    }
+  }, 20_000);
 });
 
 describe("the consumer lock (§6, Kern 2)", () => {
@@ -540,5 +592,200 @@ describe("the consumer lock (§6, Kern 2)", () => {
     one.consumer.start();
     expect(() => harness().consumer.start()).toThrow(/already running/);
     await one.consumer.stop();
+  });
+});
+
+// ─── Gauge round 4 ──────────────────────────────────────────────────────────
+
+describe("blocker 2 — the replied/ marker is DURABLE and comes before the ack", () => {
+  it("(m1) a marker-write failure: sent once, NOT acked, NOT counted; the retry writes the marker WITHOUT resending", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    let failMarker = true;
+    const h = harness({
+      retryBaseMs: 1000,
+      writeMarkerFile: (path, content) => {
+        if (failMarker) throw new Error("ENOSPC: no space left on device");
+        durableWrite(path, content);
+      },
+    });
+    await h.consumer.poll();
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(inDir("cur")).toEqual([]);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(false);
+    expect(h.consumer.stats).toMatchObject({ processed: 0, replied: 0, markerFailed: 1 });
+    expect(h.logs.join("\n")).toMatch(
+      /could not durably write the replied\/ marker for m-1.*NOT acked/,
+    );
+    await h.consumer.poll(); // backoff: nothing yet
+    expect(inDir("new")).toEqual(["1.json"]);
+    clock += 1001;
+    failMarker = false;
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(1); // no second turn
+    expect(h.replies).toHaveLength(1); // no second send
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(true);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(h.consumer.stats).toMatchObject({ processed: 1, replied: 1, markerFailed: 1 });
+  });
+
+  it("(m2) a restart before the marker lands resends — threaded to the SAME messageId (the stated duplicate)", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const first = harness({
+      writeMarkerFile: () => {
+        throw new Error("EIO");
+      },
+    });
+    await first.consumer.poll();
+    expect(first.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "SMOKE-OK" }]);
+    expect(inDir("new")).toEqual(["1.json"]);
+    const second = harness(); // a new runtime: the in-memory note is gone
+    await second.consumer.poll();
+    expect(second.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "SMOKE-OK" }]);
+    expect(inDir("cur")).toEqual(["1.json"]);
+  });
+
+  it("(m3) a silent turn whose marker fails is not acked, and its retry runs no second turn", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    let failMarker = true;
+    const h = harness({
+      retryBaseMs: 1000,
+      turn: async () => ({ kind: "silent" }),
+      writeMarkerFile: (path, content) => {
+        if (failMarker) throw new Error("EIO");
+        durableWrite(path, content);
+      },
+    });
+    await h.consumer.poll();
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(h.consumer.stats).toMatchObject({ processed: 0, noReply: 0, markerFailed: 1 });
+    clock += 1001;
+    failMarker = false;
+    await h.consumer.poll();
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(0);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(h.consumer.stats).toMatchObject({ processed: 1, noReply: 1 });
+  });
+
+  it("durableWrite writes the whole file and leaves no temp file; a failed write leaves none either", () => {
+    const dir = join(root, "d");
+    mkdirSync(dir);
+    durableWrite(join(dir, "m"), "hello\n");
+    expect(readFileSync(join(dir, "m"), "utf8")).toBe("hello\n");
+    expect(readdirSync(dir)).toEqual(["m"]);
+    mkdirSync(join(dir, "occupied"));
+    writeFileSync(join(dir, "occupied", "x"), "");
+    expect(() => durableWrite(join(dir, "occupied"), "nope")).toThrow();
+    expect(readdirSync(dir).sort()).toEqual(["m", "occupied"]);
+  });
+});
+
+describe("blocker 3 — a dead lock is taken over by EXACTLY one of racing restarts", () => {
+  const consumerModule = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "src",
+    "shell",
+    "mail-consumer.ts",
+  );
+
+  // One racer: waits for `go`, then starts a consumer on the shared lock. The
+  // hook holds every racer just after it judged the holder dead, so all of them
+  // have decided "dead" before any takes the lock — the window a racy takeover
+  // loses in. A holder keeps its lock until `stop` appears.
+  function racerScript(): string {
+    const file = join(root, "racer.ts");
+    writeFileSync(
+      file,
+      [
+        `import { appendFileSync, existsSync } from "node:fs";`,
+        `import { MailConsumer } from ${JSON.stringify(consumerModule)};`,
+        `const [lockFile, inboxRoot, go, stop, out, statsFile] = process.argv.slice(2);`,
+        `const nap = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+        `while (!existsSync(go)) nap(1);`,
+        `const c = new MailConsumer({ name: "testbot", identity: "testbot", inboxRoot, senders: ["flint"],`,
+        `  resolveKey: async () => null, lockFile, statsFile, pollIntervalMs: 3_600_000, log: () => {},`,
+        `  lockHooks: { afterStaleCheck: () => nap(150) }, lockWaitMs: 10_000 });`,
+        `try {`,
+        `  c.start();`,
+        `  appendFileSync(out, \`HOLD \${process.pid}\\n\`);`,
+        `  while (!existsSync(stop)) nap(5);`,
+        `  await c.stop();`,
+        `} catch (err) {`,
+        `  appendFileSync(out, \`REFUSED \${process.pid} \${(err as Error).message.slice(0, 80)}\\n\`);`,
+        `}`,
+        `process.exit(0);`,
+        "",
+      ].join("\n"),
+    );
+    return file;
+  }
+
+  it("(l1) six processes racing one dead lock end with exactly one holder — three rounds", async () => {
+    const script = racerScript();
+    for (let round = 0; round < 3; round++) {
+      const dir = join(root, `round-${round}`);
+      mkdirSync(dir, { recursive: true });
+      const lockFile = join(dir, "testbot.lock");
+      writeFileSync(lockFile, String(await deadPid()));
+      const go = join(dir, "go");
+      const stop = join(dir, "stop");
+      const out = join(dir, "out");
+      writeFileSync(out, "");
+      const racers: ChildProcess[] = [];
+      for (let i = 0; i < 6; i++) {
+        const c = spawn(
+          process.execPath,
+          [script, lockFile, join(dir, "inbox"), go, stop, out, join(dir, `stats-${i}.json`)],
+          { stdio: "ignore" },
+        );
+        racers.push(c);
+        children.push(c);
+      }
+      await new Promise((r) => setTimeout(r, 600)); // every racer is waiting on `go`
+      writeFileSync(go, "");
+      const deadline = Date.now() + 20_000;
+      let lines: string[] = [];
+      while (Date.now() < deadline) {
+        lines = readFileSync(out, "utf8").split("\n").filter(Boolean);
+        if (lines.length === 6) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const holders = lines.filter((l) => l.startsWith("HOLD "));
+      const refused = lines.filter((l) => l.startsWith("REFUSED "));
+      expect(lines).toHaveLength(6);
+      expect(holders).toHaveLength(1);
+      expect(refused.every((l) => l.includes("already running"))).toBe(true);
+      expect(readFileSync(lockFile, "utf8").trim()).toBe(holders[0].split(" ")[1]);
+      expect(readdirSync(dir).filter((f) => f.includes(".takeover-"))).toEqual([]);
+      writeFileSync(stop, "");
+      await Promise.all(
+        racers.map((c) => new Promise((r) => (c.exitCode !== null ? r(0) : c.on("exit", r)))),
+      );
+    }
+  }, 60_000);
+
+  it("(l2) a takeover claim left by a DEAD claimant fails closed, naming the file", async () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    const dead = await deadPid();
+    writeFileSync(lockFile, String(dead));
+    writeFileSync(`${lockFile}.takeover-${dead}`, String(await deadPid()));
+    expect(() => harness().consumer.start()).toThrow(/was interrupted, leaving .*takeover-/);
+    expect(readFileSync(lockFile, "utf8")).toBe(String(dead)); // untouched
+  });
+
+  it("(l3) a claim held by a LIVE claimant is waited on, never broken", async () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    const dead = await deadPid();
+    writeFileSync(lockFile, String(dead));
+    const claimant = spawn("sleep", ["30"]);
+    children.push(claimant);
+    writeFileSync(`${lockFile}.takeover-${dead}`, String(claimant.pid));
+    expect(() => harness({ lockWaitMs: 200 }).consumer.start()).toThrow(
+      /did not settle within 200ms/,
+    );
+    expect(readFileSync(lockFile, "utf8")).toBe(String(dead));
   });
 });

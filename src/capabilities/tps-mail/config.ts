@@ -17,9 +17,9 @@
 //
 // Allow-listing a sender GRANTS IT THE AGENT'S READ SCOPE: whatever a mail turn
 // can read (its Flair memory) can end up in the reply that goes back to that
-// sender. List only principals already entitled to that scope. The mail turn
-// itself holds no filesystem tool and no Discord tool (tool-allowlist.ts
-// MAIL_TURN_EXCLUDED_TOOLS).
+// sender, and flair_write lets a mail influence what the agent remembers. List
+// only principals already entitled to that. A mail turn holds only the reviewed
+// mail allowlist (tool-allowlist.ts MAIL_TURN_ALLOWED_TOOLS).
 
 import { homedir } from "node:os";
 import { type Static, Type } from "typebox";

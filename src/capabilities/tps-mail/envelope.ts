@@ -176,10 +176,32 @@ function isChainEntry(v: unknown): v is ChainEntry {
 }
 
 // Decide one maildir record. Never throws: every outcome is a decision.
+//
+// RETRY IS RESERVED FOR THE KEY SERVICE (Gauge round 4, blocker 4). Only a key
+// lookup that cannot answer yields `unavailable`; that is caught where the
+// lookup happens. Anything ELSE that throws while checking a record is a
+// property of the record, not of the moment — above all a value canonicalize
+// refuses (JSON.parse("1e400") is Infinity, and RFC 8785 has no Infinity), which
+// would throw on every retry forever. So it is REFUSED as malformed and moved
+// to refused/, never left in new/ to loop.
 export async function decideInbound(
   record: unknown,
   opts: DecideOptions,
 ): Promise<InboundDecision> {
+  try {
+    return await decideRecord(record, opts);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    return refuse(
+      "malformed",
+      /^canonicalize:/.test(why)
+        ? `the envelope cannot be canonicalized (${why.slice("canonicalize: ".length)}), so it cannot be verified`
+        : "the record could not be checked",
+    );
+  }
+}
+
+async function decideRecord(record: unknown, opts: DecideOptions): Promise<InboundDecision> {
   if (!isObject(record) || typeof record.from !== "string" || typeof record.body !== "string") {
     return refuse("malformed", "the record is not a TPS mail record (from/body missing)");
   }

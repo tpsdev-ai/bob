@@ -636,6 +636,7 @@ function tpsMailChecks(o: {
         timeouts?: number;
         replyFailed?: Record<string, number>;
         verifyUnavailable?: number;
+        markerFailed?: number;
       }
     | undefined;
   try {
@@ -654,10 +655,13 @@ function tpsMailChecks(o: {
   if (stats) {
     const replyFailed = sum(stats.replyFailed);
     parts.push(
-      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0}`,
+      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0} marker failures=${stats.markerFailed ?? 0}`,
     );
     failing =
-      (stats.dispatchFailed ?? 0) > 0 || replyFailed > 0 || (stats.verifyUnavailable ?? 0) > 0;
+      (stats.dispatchFailed ?? 0) > 0 ||
+      replyFailed > 0 ||
+      (stats.verifyUnavailable ?? 0) > 0 ||
+      (stats.markerFailed ?? 0) > 0;
   } else {
     parts.push("no consumer stats yet (the persistent runtime writes them)");
   }

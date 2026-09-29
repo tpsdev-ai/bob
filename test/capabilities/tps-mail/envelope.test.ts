@@ -204,6 +204,43 @@ describe("decideInbound — the allow-list on the VERIFIED id (F2)", () => {
   });
 });
 
+describe("decideInbound — a canonicalization failure is a REFUSAL, never a retry (Gauge round 4, blocker 4)", () => {
+  // JSON.parse turns 1e400 into Infinity, which RFC 8785 cannot encode: the
+  // canonicalizer throws, and it would throw on every retry forever.
+  const withTopLevelInfinity = FIXTURE.single.replace(/}$/, ',"n":1e400}');
+  const withChainInfinity = FIXTURE.single.replace(
+    '"delegationChain":[{',
+    '"delegationChain":[{"x":1e400,',
+  );
+
+  it("JSON.parse really yields a non-finite number here", () => {
+    expect((JSON.parse(withTopLevelInfinity) as { n: number }).n).toBe(Number.POSITIVE_INFINITY);
+    expect(withChainInfinity).not.toBe(FIXTURE.single);
+  });
+
+  it("refuses a non-finite number in the signed envelope as malformed", async () => {
+    const d = await decideInbound(mailRecord(withTopLevelInfinity), OPTS());
+    expectRefused(d, "malformed");
+    if (d.kind === "refuse") expect(d.detail).toContain("cannot be canonicalized");
+  });
+
+  it("refuses a non-finite number inside a delegation-chain entry as malformed", async () => {
+    const d = await decideInbound(mailRecord(withChainInfinity), OPTS());
+    expectRefused(d, "malformed");
+    if (d.kind === "refuse") expect(d.detail).toContain("cannot be canonicalized");
+  });
+
+  it("keeps retry for the key service only: an outage is still `unavailable`", async () => {
+    const d = await decideInbound(mailRecord(withTopLevelInfinity), {
+      ...OPTS(),
+      resolveKey: async () => {
+        throw new Error("Flair unreachable");
+      },
+    });
+    expect(d.kind).toBe("unavailable");
+  });
+});
+
 describe("decideInbound — shapes", () => {
   it("refuses an unsafe messageId (it becomes a filename and an argv element)", async () => {
     const k = testKey();

@@ -723,6 +723,7 @@ describe("runDoctor — tps-mail", () => {
         timeouts: 1,
         replyFailed: { "cli-missing": 4 },
         verifyUnavailable: 0,
+        markerFailed: 1,
       }),
     );
     const c = check(doctor(), "tps-mail activity");
@@ -732,5 +733,6 @@ describe("runDoctor — tps-mail", () => {
     expect(c?.detail).toContain("sender-not-allowed=1");
     expect(c?.detail).toContain("dispatch failures=2 (timeouts 1)");
     expect(c?.detail).toContain("reply failures=4 (cli-missing=4)");
+    expect(c?.detail).toContain("marker failures=1");
   });
 });

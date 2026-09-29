@@ -594,10 +594,10 @@ export interface RunOptions {
   // capability's FIXED frame, so the untrusted mail body — which is the user
   // message — never reaches the system prompt.
   taskContract?: string;
-  // bob#200: this run answers ONE TPS mail. The session runs with the role's
-  // policy MINUS every pi built-in and the Discord tools
-  // (tool-allowlist.ts MAIL_TURN_EXCLUDED_TOOLS): no filesystem reads, no
-  // shell, no file edits, no Discord.
+  // bob#200: this run answers ONE TPS mail. The session holds only the role's
+  // tools that are on the reviewed mail allowlist (tool-allowlist.ts
+  // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
+  // role or capability, is dropped.
   mailTurn?: boolean;
 }
 
@@ -986,7 +986,7 @@ export interface ResolveRunConfigOptions {
   // `bob run` path leaves this falsy.
   persistent?: boolean;
   // bob#200: the session answers one TPS mail — applyMailTurnPolicy narrows the
-  // resolved policy (no pi built-ins, no Discord tools). Only ever narrows.
+  // resolved policy to the mail allowlist. Only ever narrows.
   mailTurn?: boolean;
 }
 
@@ -1167,8 +1167,7 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
 // with BOB_MAIL_TURN=1 in the environment and the VERIFIED fields as JSON on
 // STDIN (never argv). This is that turn: ONE fresh session, the capability's
 // fixed frame as the task contract (system prompt), the delimited untrusted
-// mail as the user message, and the role's policy minus every pi built-in and
-// the Discord tools.
+// mail as the user message, and only the role's tools on the mail allowlist.
 //
 // It writes ONE result line on stdout and exits 0 when the turn settled —
 // `final` (the compaction contract's final message: the reply) or `silent` (no
@@ -1176,6 +1175,29 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
 // line when the turn FAILED (an error-ended message or a thrown run), which the
 // consumer retries. An input it cannot accept exits 2. The env flag and stdin
 // can only NARROW what the session gets; they select no tool and no model.
+
+// A mail turn runs in its OWN process group (so a timeout can kill everything
+// it started), which also means a crash of the runtime that started it no
+// longer takes it down with the runtime's group. So the turn watches its
+// parent and exits when the parent is gone (reparented): an orphaned turn could
+// never have its reply sent anyway, and must not keep a model busy.
+export function watchParent(
+  opts: { getPpid?: () => number; exit?: (code: number) => void; intervalMs?: number } = {},
+): () => void {
+  const getPpid = opts.getPpid ?? (() => process.ppid);
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const parent = getPpid();
+  const timer = setInterval(() => {
+    if (getPpid() !== parent) {
+      process.stderr.write(
+        "bob launch: the consumer that started this mail turn is gone; ending the turn\n",
+      );
+      exit(1);
+    }
+  }, opts.intervalMs ?? 1000);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 export interface MailTurnLaunchOptions {
   name: string;
@@ -1188,6 +1210,8 @@ export interface MailTurnLaunchOptions {
   write?: (text: string) => Promise<void>;
   // Test seam for the template's marker nonce.
   nonce?: string;
+  // Test seam: the parent watchdog (defaults to watchParent()).
+  watchParent?: () => () => void;
 }
 
 export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<number> {
@@ -1201,6 +1225,18 @@ export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<nu
     return 2;
   }
   const prompt = buildMailTurnPrompt(input, opts.nonce ? { nonce: opts.nonce } : {});
+  const stopWatching = (opts.watchParent ?? watchParent)();
+  try {
+    return await runMailTurn(opts, prompt);
+  } finally {
+    stopWatching();
+  }
+}
+
+async function runMailTurn(
+  opts: MailTurnLaunchOptions,
+  prompt: ReturnType<typeof buildMailTurnPrompt>,
+): Promise<number> {
   const result = await runAgent({
     name: opts.name,
     prompt: prompt.userMessage,
@@ -1348,7 +1384,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // SILENTLY, so a stale name would otherwise look like a working allowlist
   // while the tool is simply absent). Throws naming the offender and the fix.
   const rolePolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
-  // bob#200: a mail turn narrows the role's policy: no pi built-ins, no Discord.
+  // bob#200: a mail turn narrows the role's policy to the mail allowlist.
   const toolPolicy = opts.mailTurn ? applyMailTurnPolicy(rolePolicy) : rolePolicy;
 
   // The agent block (id/name/role). Read through readBlock, but a malformed

@@ -115,8 +115,8 @@ change one, the named test is what tells you.
   signed envelope, binds its `from` to the record, and allow-lists the verified
   id before any session exists; refused mail goes to `refused/` and is never
   answered. Each accepted mail is ONE turn in a fresh session with the role's
-  policy minus every pi built-in and every Discord tool, and its reply is sent
-  only after the turn, as the agent, to the verified sender. *(`test/capabilities/tps-mail/`,
+  policy narrowed to a reviewed allowlist (the Flair memory tools), and its
+  reply is sent only after the turn, as the agent, to the verified sender. *(`test/capabilities/tps-mail/`,
   `test/shell/mail-consumer.test.ts`, `test/shell/mail-turn.test.ts`)*
 - **`bob init` stamps a policy that loads.** A fresh agent of every role is
   stamped with the role's ceiling intersected with the tools that can exist for
@@ -444,13 +444,16 @@ consumer. For each file in `new/`, oldest first by filename:
 - **One fresh session per mail.** Each accepted mail runs ONE turn through the
   agent's launcher (`bin/<name>`, i.e. `bob launch`), never in the warm session,
   so a reply can only draw on what that turn read. The verified fields reach the
-  launcher on stdin, never as an argument. A turn past `turnTimeoutMs` is killed.
-- **What a mail turn can do.** The role's tool policy **minus every pi
-  built-in and every Discord tool**: no `read`, `grep`, `find` or `ls`, no
-  shell, no `edit` or `write`, and no `discord_reply`, `discord_react` or
-  `discord_fetch` — a mail turn cannot read Discord content into a reply or
-  speak anywhere but in its reply to the sender. It keeps its other capability
-  tools — Flair above all. The mail body is framed as
+  launcher on stdin, never as an argument. A turn past `turnTimeoutMs` is killed
+  with its whole process group, so nothing it started outlives it; a turn whose
+  runtime dies ends itself.
+- **What a mail turn can do.** Only the tools on a reviewed **allowlist** —
+  `flair_search`, `flair_get` and `flair_write` — and only those the role also
+  allows. Every other tool, from any role or capability, is dropped: no file
+  tool (pi's `read`/`grep`/`find`/`ls`/`edit`/`write`, or builder-local's
+  `read_lines`/`edit_lines`/`insert_after`/`write_file`), no shell, no Discord.
+  A mail turn cannot read a file or Discord content into a reply, change a file,
+  or speak anywhere but in its reply to the sender. The mail body is framed as
   untrusted data from the verified sender, inside a delimited block, with
   control and bidi characters stripped and a length bound; it never enters the
   system prompt.
@@ -459,21 +462,34 @@ consumer. For each file in `new/`, oldest first by filename:
   `maxReplyChars` and handed to `tps mail send` with the body on stdin, as the
   agent (`TPS_AGENT_ID` is the agent's own id), threaded to the inbound's signed
   `messageId`, to the verified sender only. A tool-only or empty turn sends no
-  reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`, then
-  moves the mail to `cur/`; a re-delivery with that marker is acked without a
-  second reply.
+  reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`
+  durably (temp file, fsync, rename), then moves the mail to `cur/`; a
+  re-delivery with that marker is acked without a second reply. If the marker
+  cannot be written, the mail is not acked: it stays in `new/`, and the retry
+  writes the marker without sending again.
 - **Presence.** A mail turn is not reflected in the presence roster: it runs
   in its own process, outside the warm session and its turn admission, so it
   neither beats busy nor writes a turn summary. The liveness beacon is
   unaffected.
-- **Failures.** A failed or timed-out turn, an unreachable Flair, or a failed
-  send leaves the mail in `new/`, counted and logged, and it is retried with
-  backoff. Delivery is at-least-once: only a crash between the CLI's success and
-  the marker can send a second reply, threaded to the same message.
+- **Failures.** A failed or timed-out turn, an unreachable Flair, a failed
+  send, or a marker that cannot be written leaves the mail in `new/`, counted
+  and logged, and it is retried with backoff. Only an unreachable key service
+  is retried at the accepting step: a record that cannot be checked — a
+  non-finite number the signature canonicalization cannot encode, for one — is
+  refused, not retried. Delivery is at-least-once: a second reply is possible
+  only when the runtime dies between the CLI's success and a durable marker (a
+  crash, or a restart while a marker write keeps failing), and it is threaded to
+  the same `messageId`.
+- **One consumer per agent.** A lock whose process is alive is never taken,
+  however old; a lock whose process is dead is taken over through an exclusive
+  claim, so restarts racing for it end with exactly one consumer.
 
-**Allow-listing a sender grants it the agent's read scope.** Whatever a mail
-turn can read — its Flair memory — can end up in the reply to that sender. The prompt's "do not disclose" rule is defence in depth, not the
-boundary. List only principals already entitled to that scope.
+**Allow-listing a sender grants it the agent's read scope — and mail-influenced
+memory writes.** Whatever a mail turn can read — its Flair memory — can end up
+in the reply to that sender, and because a mail turn keeps `flair_write`, a mail
+can shape what the agent remembers (and so its later turns, mail or not). The
+prompt's "do not disclose" rule is defence in depth, not the boundary. List
+only principals already entitled to both.
 
 `bob doctor <name>` FAILS when `bob.yaml` still carries `channels.tps_mail` (the
 old onboard scaffold, which nothing reads) without the capability; when the

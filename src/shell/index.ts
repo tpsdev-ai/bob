@@ -149,6 +149,7 @@ export {
 } from "./init.js";
 export {
   createTpsMailConsumer,
+  durableWrite,
   launcherTurnRunner,
   MailConsumer,
   type MailConsumerOptions,
@@ -201,6 +202,7 @@ export {
   runLaunch,
   runMailTurnLaunch,
   type SessionManagerLike,
+  watchParent,
 } from "./run.js";
 export {
   type CommandRunner,
@@ -243,7 +245,7 @@ export {
   applyMailTurnPolicy,
   auditToolNames,
   knownToolNames,
-  MAIL_TURN_EXCLUDED_TOOLS,
+  MAIL_TURN_ALLOWED_TOOLS,
   PI_BUILTIN_TOOLS,
   RESIDENT_EXCLUDED_TOOLS,
   type ResolveToolPolicyOptions,

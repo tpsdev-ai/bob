@@ -45,36 +45,30 @@ export const PI_BUILTIN_TOOLS = [
 // unit, with no human at the keyboard to approve a command.
 export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell"] as const;
 
-// What a MAIL TURN never holds (bob#200 §4, F4). A mail turn answers ONE
-// allow-listed peer, and whatever it can read can end up in the reply, so the
-// disclosure boundary is on the READ side:
-//   * every pi built-in — no filesystem reads (`read`, and `grep`/`find`/`ls`,
-//     which read file contents and names too), no shell (`bash`/`powershell`
-//     read the filesystem with no tool boundary at all), and no file edits
-//     (`edit` returns file content; a `write` could rewrite the agent's own
-//     config and so its allow-list, on the strength of a mail);
-//   * the Discord tools — `discord_fetch` would read channel content into a
-//     mail reply, and `discord_reply`/`discord_react` would let a mail make the
-//     agent speak somewhere other than to its sender. A mail turn answers its
-//     sender, deterministically, through the reply the consumer sends — and
-//     nowhere else.
-// The turn keeps its other capability tools — the Flair tools above all,
-// because memory with receipts is the point. Applied after the role ceiling
-// and bob.yaml, so it only ever NARROWS the policy.
-export const MAIL_TURN_EXCLUDED_TOOLS: readonly string[] = [
-  ...PI_BUILTIN_TOOLS,
-  "discord_reply",
-  "discord_react",
-  "discord_fetch",
+// What a MAIL TURN may hold (bob#200 §4, F4): an explicit, reviewed ALLOWLIST,
+// never a denylist. A mail turn answers ONE allow-listed peer and whatever it
+// can reach can end up in the reply, so every tool is dropped unless it is
+// named here — whatever role or capability supplies it. A denylist had to name
+// every file- or network-reaching tool in advance and missed the ones a role
+// or capability added later (builder-local's read_lines/edit_lines/
+// insert_after/write_file): an allowlist cannot fall behind.
+//
+// The three Flair memory tools, because memory with receipts is the point.
+// `flair_write` stays deliberately (spec §4): allow-listing a sender therefore
+// also permits MAIL-INFLUENCED MEMORY WRITES, and the operator docs say so.
+// Adding a tool here is a security review, not a convenience.
+export const MAIL_TURN_ALLOWED_TOOLS: readonly string[] = [
+  "flair_search",
+  "flair_get",
+  "flair_write",
 ];
 
-// The policy a mail turn runs with: the role's resolved policy minus every
-// MAIL_TURN_EXCLUDED_TOOLS name (pi applies excludeTools after tools).
+// The policy a mail turn runs with: the role's resolved allowlist INTERSECTED
+// with MAIL_TURN_ALLOWED_TOOLS (pi's `tools` is strict over built-ins AND
+// capability tools, so anything outside it is never active). Only narrows.
 export function applyMailTurnPolicy(policy: ToolPolicy): ToolPolicy {
-  return {
-    ...policy,
-    excludeTools: [...new Set([...policy.excludeTools, ...MAIL_TURN_EXCLUDED_TOOLS])],
-  };
+  const allowed = new Set(MAIL_TURN_ALLOWED_TOOLS);
+  return { ...policy, tools: policy.tools.filter((name) => allowed.has(name)) };
 }
 
 // Names that existed in the OpenClaw / Claude-Code tool set and DO map onto a
