@@ -1124,7 +1124,7 @@ export class MailConsumer {
     const deadline = Date.now() + this.lockWaitMs;
     // Why the last pass had to wait, so the deadline error names the file an
     // operator must look at (Gauge round 5, blocker 3).
-    let waitingOn: Blocked = { kind: "settling" };
+    let waitingOn: Blocked;
     for (;;) {
       try {
         writeFileSync(this.lockFile, String(process.pid), { flag: "wx", mode: 0o600 });
