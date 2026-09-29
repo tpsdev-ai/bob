@@ -82,6 +82,18 @@ export interface InitOptions {
   // DEFAULT_FLAIR_URL. Set it when the agent belongs to a hub rather than a
   // local spoke.
   flairUrl?: string;
+  // The capabilities: list to stamp (defaults to STAMPED_CAPABILITIES). A
+  // position materializes its own default capability set here.
+  capabilities?: readonly string[];
+  // The tools: allowlist to stamp (defaults to the role's ceiling intersected
+  // with the tools the stamped capabilities can provide). A position supplies
+  // its own requested tool set.
+  toolAllow?: readonly string[];
+  // The persona BODY to write under the identity header (defaults to the role's
+  // template soul). A position supplies its packaged soul here, so the seed soul
+  // is the agent's OWN identity plus the position's persona — never the generic
+  // role template alone.
+  soulBody?: string;
 }
 
 export interface InitResult {
@@ -132,7 +144,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // own identity (#89). The hiring interview overwrites the file with a
   // refined persona; this header is the floor, not the ceiling.
   const soulPath = join(agentDir, "soul.md");
-  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + template.soul);
+  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + (opts.soulBody ?? template.soul));
   written.push(soulPath);
 
   // bob.yaml — canonical config. The tools: allowlist is the role's ceiling
@@ -140,7 +152,16 @@ export function initAgent(opts: InitOptions): InitResult {
   // the stamped capabilities' tools), so a freshly initialised agent of EVERY
   // role loads with a policy that holds.
   const yamlPath = join(agentDir, "bob.yaml");
-  writeFileSync(yamlPath, renderBobYaml(opts, stampedToolAllowlist(template.tools.allow)));
+  writeFileSync(
+    yamlPath,
+    renderBobYaml(
+      opts,
+      opts.toolAllow !== undefined
+        ? [...opts.toolAllow]
+        : stampedToolAllowlist(template.tools.allow),
+      opts.capabilities ?? STAMPED_CAPABILITIES,
+    ),
+  );
   written.push(yamlPath);
 
   // .pi-agent/{models.json,auth.json} — required for pi 0.75+ to find
@@ -187,7 +208,11 @@ function flairUrlFor(opts: Pick<InitOptions, "flairUrl">): string {
   return opts.flairUrl ?? DEFAULT_FLAIR_URL;
 }
 
-function renderBobYaml(opts: InitOptions, toolsAllow: string[]): string {
+function renderBobYaml(
+  opts: InitOptions,
+  toolsAllow: string[],
+  capabilities: readonly string[],
+): string {
   // Hand-rolled to avoid pulling in a yaml dependency for the surface PR.
   // PR-3 (Flair pair) will swap in a real yaml emitter.
   const tools = toolsAllow.map((t) => `    - ${t}`).join("\n");
@@ -222,7 +247,7 @@ tools:
 ${tools}
 
 capabilities:
-${STAMPED_CAPABILITIES.map((c) => `  - ${c}`).join("\n")}
+${capabilities.map((c) => `  - ${c}`).join("\n")}
 
 flair:
   url: ${flairUrlFor(opts)}

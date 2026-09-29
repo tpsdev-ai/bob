@@ -98,6 +98,11 @@ export {
   formatReport,
   runDoctor,
 } from "./doctor.js";
+export type {
+  EffectiveConfig,
+  PositionDiff,
+  ResolvedPositionFile,
+} from "./effective-config.js";
 export {
   ADMIN_PASS_ENV,
   adminPassPath,
@@ -136,6 +141,22 @@ export {
   soulPathFor,
 } from "./flair-soul.js";
 export {
+  BINDING_MARKER,
+  baselinePath,
+  bindingMarkerPath,
+  defaultHostRoot,
+  grantPath,
+  type HostGrant,
+  type PositionBindingMarker,
+  type RatifiedSnapshot,
+  readBaseline,
+  readBindingMarker,
+  readGrant,
+  writeBaseline,
+  writeBindingMarker,
+  writeGrant,
+} from "./host-grant.js";
+export {
   DEFAULT_FLAIR_URL,
   type InitOptions,
   type InitResult,
@@ -156,11 +177,43 @@ export {
   type SessionRunner,
 } from "./onboard.js";
 export {
+  EMPTY_OVERRIDES,
+  initOverrideRepo,
+  loadOverrides,
+  type Overrides,
+  overridesDir,
+  resolvePositionFiles,
+  validateOverrides,
+} from "./overrides.js";
+export {
   type PersistentHandle,
   type RunPersistentOptions,
   runPersistent,
   startPersistent,
 } from "./persistent.js";
+export {
+  type AdoptOptions,
+  type AdoptResult,
+  adoptAgent,
+  type BindHooks,
+  type BindStep,
+  type EffectiveSettings,
+  type HireOptions,
+  type HireResult,
+  hireAgent,
+  positionDiff,
+  readPositionMarker,
+  resolveAdoptedConfig,
+} from "./position-runtime.js";
+export {
+  DEFAULT_POSITIONS_ROOT,
+  type LoadedPosition,
+  loadPosition,
+  type PositionFileSpec,
+  type PositionManifest,
+  positionHash,
+  validateManifest,
+} from "./positions.js";
 export { loadRole, type RoleTemplate } from "./role-loader.js";
 export {
   type ActiveToolSource,
@@ -222,6 +275,7 @@ export {
   runInteractiveSession,
   SETUP_TOOL_POLICY,
   type SessionDeps,
+  setupToolPolicy,
 } from "./session.js";
 export {
   auditToolNames,
