@@ -28,6 +28,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   const client = new DiscordJsClient({ token, botUserId: config.botUserId });
 
+  // The runtime-owned turn admission (one per persistent runtime), read from
+  // pi's per-loader event bus. Its `admitTurn` drives an inbound turn and its
+  // `readOrigin` names the running turn's origin so the outbound tools can stay
+  // inside that turn's channel. Both are absent in a one-shot `bob run`, where
+  // there is no admission and the tools keep today's behaviour.
+  const admission = getTurnAdmission(pi);
+
   // The real ExtensionAPI satisfies the structural PiLike the core needs.
   // wireDiscordCapability registers the tools + listener SYNCHRONOUSLY before
   // returning, so the outbound tools surface even if the gateway is briefly
@@ -36,7 +43,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     pi: pi as unknown as Parameters<typeof wireDiscordCapability>[0]["pi"],
     client,
     config,
-    admitTurn: getTurnAdmission(pi)?.admitTurn,
+    admitTurn: admission?.admitTurn,
+    readOrigin: admission?.readOrigin,
   });
 
   // Open the gateway (inbound listener) ONLY in the persistent runtime. A
