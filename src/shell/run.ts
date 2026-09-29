@@ -71,6 +71,7 @@ import {
   readWorktreeStatus,
   type SilenceReason,
 } from "./compaction-contract.js";
+import { sessionCredentialPaths } from "./confined-read.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import { createRequestUsageTracker } from "./request-usage.js";
@@ -537,6 +538,12 @@ export interface RunSessionConfig {
   // in it).
   tools: string[];
   excludeTools?: string[];
+  // bob#230 — the agent's credential paths: every key or token file bob.yaml
+  // names (identity.key_file, the flair block's keyFile, each capability's
+  // tokenFile/keyFile/officeKeyFile), plus the provider login store. A resident
+  // role that opts into `read` gets a confined read that refuses these even
+  // inside the workspace. Computed once at resolution; the factory reads it.
+  credentialPaths?: string[];
   // #145 — the CONTRACT carried in the system prompt. A one-shot `bob run`
   // carries its TASK (`taskContract`); the persistent runtime carries the
   // agent's STANDING CONTRACT (`standingContract`). They are mutually
@@ -1653,6 +1660,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     extensionSources,
     capabilityBySource,
     capabilityEnv,
+    credentialPaths: sessionCredentialPaths(yamlText, join(agentDir, ".pi-agent")),
     // Always both: resolveAgentToolPolicy refuses an agent without an
     // allowlist, so there is no longer a "declared none" case here.
     tools: toolPolicy.tools,

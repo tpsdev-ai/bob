@@ -417,6 +417,23 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
     };
   }
 
+  // bob#230: a resident agent that holds `read` alongside an inbound chat
+  // surface (discord, tps-mail) keeps a file-read reach while it answers mail or
+  // channel messages. read is now confined to the workspace and refuses the
+  // agent's credentials, but a chat-facing resident role rarely needs any
+  // file-read reach — warn so keeping it is a decision, not an accident.
+  if (policy.resident && !excludedTools.has("read") && policy.tools.includes("read")) {
+    const chat = [...declaredCapabilities].filter((c) => c === "discord" || c === "tps-mail");
+    if (chat.length > 0) {
+      return {
+        name,
+        status: "warn",
+        detail: `resident: true holds read alongside an inbound chat capability (${chat.join(", ")}); read is confined to the workspace, but a chat-facing resident role usually needs no file-read reach`,
+        fix: `drop read from tools.allow, or remove the chat capability (${chat.join(", ")})`,
+      };
+    }
+  }
+
   return {
     name,
     status: "ok",

@@ -28,15 +28,15 @@ function makeHealthyAgent(opts: { home: string; name: string }): {
 
   writeFileSync(join(agentDir, "soul.md"), "stub soul");
   // A healthy agent has a readable role + a tool allowlist: doctor FAILs a
-  // missing policy now, so the healthy fixture must carry one (role ea allows
-  // `read`).
+  // missing policy now, so the healthy fixture must carry one (the reviewer
+  // role allows `read`; ea/jarvis no longer do, bob#230).
   writeFileSync(
     join(agentDir, "bob.yaml"),
     [
       "agent:",
       "  id: testbot",
       "  name: Testbot",
-      "  role: ea",
+      "  role: reviewer",
       "",
       "provider:",
       "  name: anthropic",
@@ -257,7 +257,7 @@ describe("runDoctor", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "tools:",
         "  allow:",
@@ -364,7 +364,7 @@ describe("runDoctor", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "tools:",
         "  allow:",
@@ -436,7 +436,6 @@ describe("runDoctor", () => {
         "",
         "tools:",
         "  allow:",
-        "    - read",
         "    - discord_reply",
         "",
         "capabilities:",
@@ -460,7 +459,7 @@ describe("runDoctor", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",
@@ -479,6 +478,88 @@ describe("runDoctor", () => {
     const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
     const check = report.checks.find((c) => c.name === "tool allowlist");
     expect(check?.status).toBe("ok");
+  });
+
+  it("WARNs when a resident agent holds read beside a chat capability (bob#230)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+        "capabilities:",
+        "  - discord",
+        "",
+        "discord:",
+        "  tokenFile: /tmp/bob-test.token",
+        "  channelIds:",
+        '    - "123"',
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("read");
+    expect(check?.detail).toContain("discord");
+  });
+
+  it("stays quiet when the resident agent does NOT allow read (bob#230)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - discord_reply",
+        "",
+        "capabilities:",
+        "  - discord",
+        "",
+        "discord:",
+        "  tokenFile: /tmp/bob-test.token",
+        "  channelIds:",
+        '    - "123"',
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    expect(report.checks.find((c) => c.name === "tool allowlist")?.status).toBe("ok");
+  });
+
+  it("stays quiet when no chat capability is declared (bob#230)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "resident: true",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    expect(report.checks.find((c) => c.name === "tool allowlist")?.status).toBe("ok");
   });
 
   it("WARN on pi auth.json mode != 0600 (contains API key)", () => {
@@ -608,7 +689,7 @@ describe("runDoctor — tps-mail", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",

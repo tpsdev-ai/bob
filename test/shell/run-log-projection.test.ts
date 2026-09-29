@@ -658,7 +658,7 @@ describe("run-log one-per-run + never-throw (issue #146, round 5)", () => {
         "agent:",
         "  id: testbot",
         "  name: Testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",

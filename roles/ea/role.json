@@ -1,7 +1,6 @@
 {
   "tools": {
     "allow": [
-      "read",
       "flair_search",
       "flair_write",
       "flair_get",
