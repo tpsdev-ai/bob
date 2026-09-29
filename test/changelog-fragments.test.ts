@@ -6,13 +6,31 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cf from "../scripts/changelog-fragments.mjs";
 
 const NOTE = cf.UNRELEASED_NOTE;
-const ENTRIES = (s: string) => s.split("\n").filter((l) => l.startsWith("- "));
+// Whole entries: a `- ` line plus its indented continuation lines and the blank
+// lines between them, so a change past an entry's first line is still seen.
+function ENTRIES(s: string): string[] {
+  const out: string[] = [];
+  let cur: string[] | null = null;
+  for (const line of s.split("\n")) {
+    if (line.startsWith("- ")) {
+      if (cur) out.push(cur.join("\n").trimEnd());
+      cur = [line];
+    } else if (cur && (line.startsWith("  ") || line.trim() === "")) {
+      cur.push(line);
+    } else if (cur) {
+      out.push(cur.join("\n").trimEnd());
+      cur = null;
+    }
+  }
+  if (cur) out.push(cur.join("\n").trimEnd());
+  return out;
+}
 
 let root: string;
 beforeEach(() => {
@@ -96,6 +114,25 @@ describe("changelog fragments — check (bob#236)", () => {
     expect(() => cf.check({ dir, changelogPath })).toThrow(/continuation indent 3/);
   });
 
+  // Each entry is opened once and judged by its descriptor, not by a separate
+  // stat of the path. A link to /dev/null resolves to a character device: the
+  // stat-then-read form read it as an empty file and blamed the content.
+  it("passes on an empty fragment directory (the state right after `promote`)", () => {
+    const { dir, changelogPath } = project();
+    expect(cf.check({ dir, changelogPath })).toEqual({ fragments: 0, entries: 0 });
+  });
+
+  it("REFUSES an entry that is not a regular file (a directory, a device)", () => {
+    const { dir, changelogPath } = project();
+    mkdirSync(join(dir, "fixed-a-directory.md"));
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/unexpected directory/);
+    rmSync(join(dir, "fixed-a-directory.md"), { recursive: true });
+    symlinkSync("/dev/null", join(dir, "fixed-a-device.md"));
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      /fixed-a-device\.md: not a regular file/,
+    );
+  });
+
   it("REFUSES when CHANGELOG.md has no [Unreleased] header (cannot skip the stray check)", () => {
     const { dir, changelogPath } = project();
     writeFileSync(changelogPath, `# Changelog\n\n## [0.0.1] - 2020-01-01\n`);
@@ -134,38 +171,88 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 });
 
 describe("changelog fragments — the migration (bob#236)", () => {
-  // The pre-migration [Unreleased] block, captured in a fixture. The migration
-  // moved every entry into a fragment; `render` must carry that content,
-  // reordered by category and filename.
-  const fixture = readFileSync(
-    join(import.meta.dir, "fixtures", "changelog", "unreleased-pre-bob-236.md"),
-    "utf8",
-  );
-  const fixtureEntries = ENTRIES(fixture);
+  // Pinned to fixtures, never the live directory: `promote` empties
+  // .changelog/unreleased/ at every release, so a migration test that read it
+  // would go red on the release PR. `unreleased-pre-bob-236.md` is the
+  // [Unreleased] block before the migration; `migrated-bob-236/` is the fragment
+  // set the migration made from it.
+  const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-pre-bob-236.md"), "utf8"));
+  const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  it("the repo's fragments pass `check` with no stray [Unreleased] entries", () => {
-    const res = cf.check();
-    expect(res.fragments).toBe(res.entries);
-    expect(res.fragments).toBe(fixtureEntries.length + 1); // + this change's own fragment
+  // The entries the migration had to repair to pass `check`. Every other entry
+  // is byte-for-byte the pre-migration text, so a new difference is a failure
+  // rather than an unnoticed extra repair.
+  const REPAIRED = [
+    // An over-long lede: reshaped.
+    {
+      fragment: "fixed-17-bob-loads-the-raw-32-byte.md",
+      was: "- **bob loads the raw 32-byte seed key",
+      repair: "lede",
+    },
+    // A lede with no closing `**`: reshaped.
+    {
+      fragment: "fixed-19-a-boolean-flag-bob-onboard-s.md",
+      was: "- **A boolean flag — ",
+      repair: "lede",
+    },
+    // A continuation line indented 3 spaces: re-indented to 2, text unchanged.
+    {
+      fragment: "added-09-the-reachy-capability-jarvis-s3-memory.md",
+      was: "- **The `reachy` capability",
+      repair: "indent",
+    },
+  ];
+
+  it("render carries every pre-migration entry verbatim, except the named repairs, each once", () => {
+    const rendered = ENTRIES(cf.assemble(migrated));
+    expect(rendered.length).toBe(before.length);
+    expect(new Set(rendered).size).toBe(rendered.length);
+    const notVerbatim = before.filter((e) => !rendered.includes(e));
+    // An unnamed difference maps to a string naming the entry: `undefined` would
+    // sort last and be ignored by toEqual, so the check could never fire.
+    const named = notVerbatim.map(
+      (e) =>
+        REPAIRED.find((r) => e.startsWith(r.was))?.fragment ?? `not verbatim: ${e.slice(0, 80)}`,
+    );
+    expect(named.sort()).toEqual(REPAIRED.map((r) => r.fragment).sort());
   });
 
-  it("render carries every pre-migration entry (two were repaired for the lede rule) plus this change", () => {
-    const rendered = cf.assemble(cf.readFragments());
-    const renderEntries = ENTRIES(rendered);
-    expect(renderEntries.length).toBe(fixtureEntries.length + 1);
-    // Every fixture entry is present verbatim, except the two the migration had
-    // to repair (one unclosed bold run, one over-long lede) — content preserved.
-    const verbatim = fixtureEntries.filter((e) => renderEntries.includes(e));
-    expect(fixtureEntries.length - verbatim.length).toBe(2);
+  it("each repair changed only what it names", () => {
+    const spans = (s: string) => s.match(/`[^`]+`/g) ?? [];
+    for (const r of REPAIRED) {
+      const was = before.find((e) => e.startsWith(r.was));
+      const now = migrated.find((f) => f.name === r.fragment)?.body;
+      if (was === undefined || now === undefined) throw new Error(`missing: ${r.fragment}`);
+      if (r.repair === "indent") {
+        expect(now.replace(/^ +/gm, "")).toBe(was.replace(/^ +/gm, ""));
+      } else {
+        // The lede moved; every code span (command, flag, path, error) stayed.
+        for (const span of spans(was)) expect(spans(now)).toContain(span);
+      }
+    }
   });
 
   it("render emits ONE heading per category, in Keep a Changelog order", () => {
-    const rendered = cf.assemble(cf.readFragments());
+    const rendered = cf.assemble(migrated);
     const headings = rendered.split("\n").filter((l) => l.startsWith("### "));
     expect(headings).toEqual([...new Set(headings)]); // no duplicates
     const order = headings.map((h) => h.slice(4).toLowerCase());
     const idx = order.map((c) => cf.CATEGORIES.indexOf(c));
     expect(idx).toEqual([...idx].sort((a, b) => a - b)); // KAC order
+  });
+});
+
+describe("changelog fragments — the live directory (release-safe)", () => {
+  // No count is asserted here: every change adds a fragment and every release
+  // empties the directory, and an empty directory passes both assertions.
+  it("the live fragment directory passes `check`, and no entry renders twice", () => {
+    const res = cf.check();
+    expect(res.fragments).toBe(res.entries);
+    // Resolving a CHANGELOG.md conflict as a union re-adds entries that already
+    // live in fragments; converting those again would print them twice.
+    const rendered = ENTRIES(cf.assemble(cf.readFragments()));
+    expect(new Set(rendered).size).toBe(rendered.length);
   });
 });
 

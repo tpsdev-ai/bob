@@ -1,0 +1,1 @@
+- **Over-limit turn origins fail explicitly.** Mail agent names, cron job names and Discord channel IDs share producer and admission limits; cron names with underscores retain cron attribution.

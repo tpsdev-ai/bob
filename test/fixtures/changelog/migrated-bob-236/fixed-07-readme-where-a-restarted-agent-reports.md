@@ -1,0 +1,1 @@
+- **README: where a restarted agent reports what a crashed run left (bob#213).** The boot sweep logs each job a crashed run left that it can inspect to the runtime log and attempts to record it in the job's registry record (`reaped_by`, a write that can fail); none of it enters the restarted session's model context. The README now says so.

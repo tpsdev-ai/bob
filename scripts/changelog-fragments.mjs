@@ -39,10 +39,12 @@
 //                                                    fragments
 
 import {
-  existsSync,
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
   readdirSync,
   readFileSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -234,20 +236,46 @@ export function validateLede(relPath, body) {
 // README.md documents the convention and is not a fragment. EVERYTHING else is
 // parsed, and a file that will not parse throws — a fragment directory that
 // quietly skips files is the silent-drop bug this whole change exists to remove.
+//
+// Each entry is opened ONCE and every question about it is answered from that
+// descriptor. Checking the path (stat) and then reading the path lets the entry
+// be swapped in between, so the file that passed the check need not be the file
+// that was read (CodeQL js/file-system-race). O_NONBLOCK makes opening a FIFO
+// return at once, so it is refused below instead of blocking on a writer.
 export function readFragments(dir = FRAGMENT_DIR) {
-  if (!existsSync(dir)) return [];
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    if (err?.code === "ENOENT") return [];
+    throw err;
+  }
   const out = [];
-  for (const name of readdirSync(dir)) {
+  for (const name of names) {
     if (name.startsWith(".")) continue;
     if (name === "README.md") continue;
     const full = join(dir, name);
-    if (statSync(full).isDirectory()) {
-      throw new FragmentError(
-        `${FRAGMENT_DIR_REL}/${name}: unexpected directory. Fragments are flat files named <category>-<slug>.md.`,
-      );
+    const fd = openSync(full, constants.O_RDONLY | constants.O_NONBLOCK);
+    let category;
+    let slug;
+    let body;
+    try {
+      const st = fstatSync(fd);
+      if (st.isDirectory()) {
+        throw new FragmentError(
+          `${FRAGMENT_DIR_REL}/${name}: unexpected directory. Fragments are flat files named <category>-<slug>.md.`,
+        );
+      }
+      if (!st.isFile()) {
+        throw new FragmentError(
+          `${FRAGMENT_DIR_REL}/${name}: not a regular file. Fragments are flat files named <category>-<slug>.md.`,
+        );
+      }
+      ({ category, slug } = parseFragmentName(name));
+      body = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
     }
-    const { category, slug } = parseFragmentName(name);
-    const body = readFileSync(full, "utf8");
     validateFragmentBody(`${FRAGMENT_DIR_REL}/${name}`, body);
     validateLede(`${FRAGMENT_DIR_REL}/${name}`, body);
     out.push({ name, path: full, category, slug, body: body.replace(/\s+$/, "") });

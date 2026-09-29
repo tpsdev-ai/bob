@@ -1,0 +1,1 @@
+- **Presence stops its beacon on session shutdown.** Repeated shutdown and an already queued beacon callback emit nothing further.
