@@ -9,6 +9,7 @@ import {
   type PiLike,
   wireAnchoredEdit,
 } from "../../../src/capabilities/anchored-edit/capability.js";
+import type { AnchoredEditConfig } from "../../../src/capabilities/anchored-edit/config.js";
 import {
   type AnchoredEditSession,
   anchorToken,
@@ -47,7 +48,9 @@ export interface Harness {
   anchor(name: string, line: number): string;
 }
 
-export function makeHarness(opts: { writeChunk?: WriteChunk } = {}): Harness {
+export function makeHarness(
+  opts: { writeChunk?: WriteChunk; config?: AnchoredEditConfig } = {},
+): Harness {
   const root = mkdtempSync(join(tmpdir(), "bob-anchored-edit-"));
   const tools = new Map<string, RegisteredTool>();
   const pi: PiLike = {
@@ -55,7 +58,12 @@ export function makeHarness(opts: { writeChunk?: WriteChunk } = {}): Harness {
       tools.set(tool.name, tool as unknown as RegisteredTool);
     },
   };
-  const session = wireAnchoredEdit({ pi, log: () => {}, writeChunk: opts.writeChunk });
+  const session = wireAnchoredEdit({
+    pi,
+    log: () => {},
+    writeChunk: opts.writeChunk,
+    config: opts.config,
+  });
   return {
     root,
     tools,

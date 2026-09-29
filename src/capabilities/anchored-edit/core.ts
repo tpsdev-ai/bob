@@ -141,36 +141,69 @@ export function fnv1a32(bytes: Buffer): number {
   return h >>> 0;
 }
 
+// --- the anchor format ---------------------------------------------------------
+//
+// RENDERING has one definition: the parts below. read_lines puts the prefix
+// `L<n>#<h> ` in front of each line, and anchorHashOf, anchorToken and
+// anchorPrefix build the token and the prefix from these parts only.
+//
+// The MATCHERS are literal regexes written to match that format: CI refuses a
+// RegExp built at runtime (Semgrep detect-non-literal-regexp), so they cannot be
+// derived from these parts. They are pinned to the format by the contract test in
+// test/capabilities/anchored-edit/anchor-prefix.test.ts, which checks each
+// literal's source against these parts and the guard against real read_lines
+// output. Change a part here and that test fails until the literals follow.
+export const ANCHOR_FORMAT = Object.freeze({
+  // Opens the token; the line number (decimal) follows it.
+  lead: "L",
+  // Separates the line number from the hash.
+  hashSep: "#",
+  // The hash is FNV-1a 32 written by Number#toString in this radix (lowercase
+  // digits), left-padded with "0" to this many digits.
+  hashRadix: 16,
+  hashDigits: 8,
+  // Separates the token from the line's text in a read_lines line.
+  prefixSep: " ",
+});
+
+// A caller's whole anchor token (edit_lines' from/to, insert_after's anchor),
+// with two groups: the line number and the hash. A literal pinned to
+// ANCHOR_FORMAT by the contract test.
+export const ANCHOR_TOKEN_RE = /^L(\d+)#([0-9a-f]{8})$/;
+
+// The read_lines prefix at the START of a line, separator included. The prefix
+// guard (assertNoAnchorPrefix) uses this and nothing else. A literal pinned to
+// ANCHOR_FORMAT by the contract test.
+export const ANCHOR_PREFIX_RE = /^L\d+#[0-9a-f]{8} /;
+
 export function anchorHashOf(line: RawLine): string {
-  return fnv1a32(hashBytes(line)).toString(16).padStart(8, "0");
+  return fnv1a32(hashBytes(line))
+    .toString(ANCHOR_FORMAT.hashRadix)
+    .padStart(ANCHOR_FORMAT.hashDigits, "0");
 }
 
 export function anchorToken(lineNo: number, line: RawLine): string {
-  return `L${lineNo}#${anchorHashOf(line)}`;
+  return `${ANCHOR_FORMAT.lead}${lineNo}${ANCHOR_FORMAT.hashSep}${anchorHashOf(line)}`;
 }
 
-// The prefix renderReadLines puts in front of each line's text, INCLUDING the
-// separating space: `L<n>#<8 hex> `. This is the single definition of the
-// rendered prefix; ANCHOR_PREFIX_RE (right below) matches the same shape, and
-// the guard uses that regex, so the guard and the renderer cannot drift.
+// The prefix in front of a line's text in read_lines output (and in a stale
+// refusal's re-read window), separator included: `L<n>#<8 hex> `.
 export function anchorPrefix(lineNo: number, line: RawLine): string {
-  return `${anchorToken(lineNo, line)} `;
+  return `${anchorToken(lineNo, line)}${ANCHOR_FORMAT.prefixSep}`;
 }
-
-// The rendered read_lines anchor prefix at the START of a line: `L<n>#<8 hex>`
-// plus a space. ONE regex, shared by every tool's prefix guard below.
-export const ANCHOR_PREFIX_RE = /^L\d+#[0-9a-f]{8} /;
 
 // Refuse `text` when any line still carries a read_lines anchor prefix. A model
 // copied read_lines output straight into new text with the prefixes included,
 // and the tool is the one place that can catch it. Names the tool, the FIRST
-// offending line number and the remedy.
+// offending line number and the remedy. Nothing in a tool call can turn this
+// off; only the operator's anchored-edit config can exempt a file (the session
+// decides that before calling here).
 export function assertNoAnchorPrefix(text: string, tool: string, path: string): void {
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     if (ANCHOR_PREFIX_RE.test(lines[i])) {
       throw new Refusal(
-        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If the file's real content genuinely begins lines with that shape, pass allow_anchor_prefixes: true for this call.`,
+        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If this file's real content genuinely begins lines with that shape, report BLOCKED naming the file: only the operator can allow such lines.`,
       );
     }
   }
@@ -596,9 +629,28 @@ export class AnchoredEditSession {
   // A byte-accepting writer seam (a test forces short writes); the default is
   // node's writeSync, looped by writeAllBytes until every byte is accepted.
   private readonly writeChunk: WriteChunk;
+  // Workspace-relative files whose new text may begin lines with the read_lines
+  // anchor prefix. It comes from the operator's anchored-edit config
+  // (`anchorPrefixPaths`, validated by CONFIG_SCHEMA) when the capability loads;
+  // no tool parameter reaches it. Empty by default: the guard is on everywhere.
+  private readonly anchorPrefixPaths: ReadonlySet<string>;
 
-  constructor(writeChunk: WriteChunk = defaultWriteChunk) {
+  constructor(
+    writeChunk: WriteChunk = defaultWriteChunk,
+    opts: { anchorPrefixPaths?: readonly string[] } = {},
+  ) {
     this.writeChunk = writeChunk;
+    this.anchorPrefixPaths = new Set(opts.anchorPrefixPaths ?? []);
+  }
+
+  // Whether the operator exempted this target from the anchor-prefix guard. The
+  // target's RESOLVED path (symlinks followed) relative to the pinned root must
+  // equal a configured entry exactly, so the exemption belongs to the file the
+  // entry names. An entry that is itself a symlink, or passes through one,
+  // matches nothing, and the guard stays on.
+  private anchorPrefixAllowed(t: ResolvedTarget): boolean {
+    if (this.anchorPrefixPaths.size === 0) return false;
+    return this.anchorPrefixPaths.has(relative(t.root, t.canonical).split(sep).join("/"));
   }
 
   // Run `fn` under the per-path critical section. The canonical path is the key.
@@ -868,7 +920,6 @@ export class AnchoredEditSession {
     toAnchor: string,
     newText: string,
     fingerprint: string,
-    allowAnchorPrefixes = false,
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
@@ -887,7 +938,7 @@ export class AnchoredEditSession {
         );
       }
       this.requireFingerprint(t.canonical, path, fingerprint, fromAnchor, raw, from, signals);
-      if (!allowAnchorPrefixes && newText !== "") {
+      if (newText !== "" && !this.anchorPrefixAllowed(t)) {
         assertNoAnchorPrefix(newText, "edit_lines", path);
       }
       const newLines = newText === "" ? [] : parseNewText(newText, path);
@@ -908,7 +959,6 @@ export class AnchoredEditSession {
     anchor: string,
     text: string,
     fingerprint: string,
-    allowAnchorPrefixes = false,
   ): Promise<ToolOutput> {
     const t = this.resolveWithin(rootArg, path);
     return this.runLocked(t.canonical, () => {
@@ -933,7 +983,7 @@ export class AnchoredEditSession {
         Math.max(1, after),
         signals,
       );
-      if (!allowAnchorPrefixes) assertNoAnchorPrefix(text, "insert_after", path);
+      if (!this.anchorPrefixAllowed(t)) assertNoAnchorPrefix(text, "insert_after", path);
       const newLines = parseNewText(text, path);
       const spliced = applyInsertAfter(raw, after, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
@@ -946,16 +996,11 @@ export class AnchoredEditSession {
 
   // --- write_file ------------------------------------------------------------
 
-  writeFile(
-    rootArg: string,
-    path: string,
-    content: string,
-    allowAnchorPrefixes = false,
-  ): ToolOutput {
+  writeFile(rootArg: string, path: string, content: string): ToolOutput {
     const t = this.resolveWithin(rootArg, path);
-    // A new_text copied from read_lines keeps its `L<n>#<h> ` prefixes; refuse it
+    // Content copied from read_lines keeps its `L<n>#<h> ` prefixes; refuse it
     // here, before anything is opened, so a refused creation leaves nothing.
-    if (!allowAnchorPrefixes) assertNoAnchorPrefix(content, "write_file", path);
+    if (!this.anchorPrefixAllowed(t)) assertNoAnchorPrefix(content, "write_file", path);
     // Validate the creation content BEFORE opening, so a refused creation never
     // leaves an occupied empty file behind.
     if (content.includes("\u0000")) {
@@ -1075,7 +1120,7 @@ export class AnchoredEditSession {
         ["stale_anchor"],
       );
     }
-    const m = /^L(\d+)#([0-9a-f]{8})$/.exec(trimmed);
+    const m = ANCHOR_TOKEN_RE.exec(trimmed);
     if (!m) {
       throw new Refusal(
         `refusing the ${which} anchor "${anchor}" in "${path}": expected L<n>#<8 hex> (a token from read_lines).`,
@@ -1165,7 +1210,7 @@ function windowAround(raw: Buffer, n: number): string {
   const end = Math.min(lines.length, n + radius);
   const out: string[] = [`window around line ${n}:`];
   for (let i = start; i <= end; i++) {
-    out.push(`${anchorToken(i, lines[i - 1])} ${lines[i - 1].content.toString("utf8")}`);
+    out.push(`${anchorPrefix(i, lines[i - 1])}${lines[i - 1].content.toString("utf8")}`);
   }
   return out.join("\n");
 }

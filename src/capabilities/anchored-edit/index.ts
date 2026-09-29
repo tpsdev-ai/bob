@@ -14,9 +14,13 @@ import { wireAnchoredEdit } from "./capability.js";
 import { loadConfigFromEnv } from "./config.js";
 
 export default function (pi: ExtensionAPI): void {
-  // Validate the (empty) config block so a bad bob.yaml block fails at load.
-  loadConfigFromEnv();
-  wireAnchoredEdit({ pi: pi as unknown as Parameters<typeof wireAnchoredEdit>[0]["pi"] });
+  // Validate the config block so a bad bob.yaml block fails at load, then hand
+  // it to the tools (its one knob exempts named files from the prefix guard).
+  const config = loadConfigFromEnv();
+  wireAnchoredEdit({
+    pi: pi as unknown as Parameters<typeof wireAnchoredEdit>[0]["pi"],
+    config,
+  });
 }
 
 export { type PiLike, type WireOptions, wireAnchoredEdit } from "./capability.js";

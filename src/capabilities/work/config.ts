@@ -6,7 +6,8 @@
 // channel yet from a role's role.json to a capability; the role-owned default
 // and the clamp to the run's remaining budget arrive with the supervisor-owned
 // deadline (bob#210 slice 4). Until a knob has a ruled owner this schema stays
-// empty, the same posture as anchored-edit.
+// empty, the posture anchored-edit keeps for every knob but its one
+// operator-owned `anchorPrefixPaths` (bob#223).
 //
 // The extension still reads its resolved (empty) config from the loader's env
 // var, so it goes through the same hand-off every capability uses.

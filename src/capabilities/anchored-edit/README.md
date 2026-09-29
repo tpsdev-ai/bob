@@ -12,9 +12,9 @@ edits. It registers four tools through `pi.registerTool`, **beside** pi's own
 | tool | takes | does |
 | --- | --- | --- |
 | `read_lines` | `path`, `start?`, `end?` | returns a fingerprint header + one `L<n>#<h> <content>` per line |
-| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint`, `allow_anchor_prefixes?` | replaces the range from the `from` anchor to the `to` anchor, inclusive (empty `new_text` deletes) |
-| `insert_after` | `path`, `anchor`, `text`, `fingerprint`, `allow_anchor_prefixes?` | inserts after a line anchor, or `L0` for before line 1 |
-| `write_file` | `path`, `content`, `allow_anchor_prefixes?` | creates a NEW file exclusively; no fingerprint |
+| `edit_lines` | `path`, `from`, `to`, `new_text`, `fingerprint` | replaces the range from the `from` anchor to the `to` anchor, inclusive (empty `new_text` deletes) |
+| `insert_after` | `path`, `anchor`, `text`, `fingerprint` | inserts after a line anchor, or `L0` for before line 1 |
+| `write_file` | `path`, `content` | creates a NEW file exclusively; no fingerprint |
 
 ## Enabling it
 
@@ -102,11 +102,36 @@ A local model that copies `read_lines` output into `new_text` keeps the
 `L<n>#<h> ` prefixes. `edit_lines`, `insert_after` and `write_file` refuse text
 in which any line starts with that rendered shape — `L`, digits, `#`, 8 hex
 characters, then a space — and write nothing. The refusal names the tool, the
-first offending line number and the remedy (strip the prefixes). The shape comes
-from the one place `read_lines` renders it (`anchorPrefix` / `ANCHOR_PREFIX_RE`
-in `core.ts`), so the guard and the renderer cannot drift. For a file whose real
-content genuinely begins lines with that shape, pass `allow_anchor_prefixes:
-true` for that ONE call; it is off by default and is not remembered.
+first offending line number and the remedy (strip the prefixes).
+
+Rendering has one definition: `ANCHOR_FORMAT` in `core.ts` holds the lead, the
+separators, the hash radix and the hash width, and `anchorToken` /
+`anchorPrefix` render from those parts only. The matcher is a literal regex
+pinned to it by a contract test: the guard's `ANCHOR_PREFIX_RE` (like the anchor
+parser's `ANCHOR_TOKEN_RE`) is written as a literal, because CI refuses a regex
+built at runtime. The contract test checks each literal's source against
+`ANCHOR_FORMAT`'s parts, so a part changed without the literals following fails
+it. It also renders real `read_lines` output (lines 1, 9, 10 and 99999) and
+checks that the guard matches exactly each rendered prefix and nothing else in
+that output.
+
+No tool parameter turns the guard off. For a file whose real content genuinely
+begins lines with that shape, the **operator** lists it in the agent's
+`bob.yaml`:
+
+```yaml
+anchored-edit:
+  anchorPrefixPaths:
+    - fixtures/anchor-shaped.txt
+```
+
+Each entry is a workspace-relative path in normal form (no leading `/`, no `.`
+or `..` segment, no empty segment); the schema refuses anything else, and it is
+absent by default. An entry exempts only the file it names: the target's
+resolved path (symlinks followed) relative to the workspace root must equal it
+exactly, so an entry that is itself a symlink, or passes through one, exempts
+nothing. The list is read once when the capability loads. The refusal tells the
+model to report BLOCKED for such a file; it does not name the knob.
 
 ## Signals
 
@@ -135,8 +160,10 @@ guard.
   only. A shell command can still rewrite a tracked file (including a write
   followed by a commit in one command). This is slice 2.
 - **No role-owned overrides.** Slice 1 ships the fixed page, line and tripwire
-  limits; no path from `bob.yaml` can raise them. Role-owned limit overrides and
-  a role-owned replace permission are slice 2.
+  limits; no path from `bob.yaml` can raise them. `bob.yaml`'s one anchored-edit
+  knob, `anchorPrefixPaths`, only exempts named files from the anchor-prefix
+  guard. Role-owned limit overrides and a role-owned replace permission are
+  slice 2.
 - **The tripwire guards byte removal, not semantics.** It refuses corrupting
   rewrites; it does not stop a semantic override such as an appended
   reassignment.
