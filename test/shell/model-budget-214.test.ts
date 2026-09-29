@@ -1198,10 +1198,11 @@ describe("bob#214 — bob align resolves the declared limits of the pair it runs
 
 describe("bob#214 — bob onboard and bob hire refuse a missing --context-window BEFORE writing anything", () => {
   const CLI = join(import.meta.dir, "..", "..", "dist", "cli.js");
-  // What bob wrote under HOME: every entry but the JS runtime's own cache
-  // directory (bun's transpiler cache: ~/Library/Caches on macOS, ~/.cache on
-  // Linux), which the runtime creates before bob runs a line.
-  const RUNTIME_CACHE = new Set(["Library", ".cache"]);
+  // What bob wrote under HOME: every entry but the JS runtime's own
+  // directories (bun's transpiler cache: ~/Library/Caches on macOS, ~/.cache on
+  // Linux; and ~/.bun, which bun creates on Linux CI), which the runtime creates
+  // before bob runs a line.
+  const RUNTIME_CACHE = new Set(["Library", ".cache", ".bun"]);
   const bobWrites = (home: string) => readdirSync(home).filter((e) => !RUNTIME_CACHE.has(e));
   const cli = (args: string[], home: string): { code: number | null; out: string } => {
     try {
