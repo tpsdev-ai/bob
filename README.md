@@ -553,15 +553,23 @@ consumer. For each file in `new/`, oldest first by filename:
   agent's launcher (`bin/<name>`, i.e. `bob launch`), never in the warm session,
   so a reply can only draw on what that turn read. The verified fields reach the
   launcher on stdin, never as an argument. The launcher runs as the leader of
-  its own process group. A turn past `turnTimeoutMs` — and whatever a finished
-  turn left behind — is reaped as a group: SIGTERM, then SIGKILL after a grace,
-  polling until the group is gone, so a descendant that ignores SIGTERM or has
-  closed its output still dies. (Signals go to the numeric group id, sent only
-  while the group exists; once every member has exited nothing is signalled.)
-  The consumer passes its own pid to the turn, which checks it before reading
-  its input and every second after, and ends itself if the consumer is gone
-  (a consumer pid reused within that second reads as alive until the turn's
-  reparenting is noticed).
+  its own process group, and the group is reaped as soon as the launcher
+  process EXITS (or the turn is aborted: past `turnTimeoutMs`, or a shutdown) —
+  not when its output closes, so a descendant holding that output cannot hold
+  up the turn or its result. Reaping sends SIGTERM, then SIGKILL after a grace,
+  and probes the group every 50 ms for at most the grace plus a reap limit
+  (5 s); members still there after that (a process that cannot be killed) are
+  given up on, logged with the group id and counted (`reapExhausted`). Signals
+  go to the numeric group id, and only after a probe found the group; once every
+  member has exited, a reused id could only be signalled in the window from the
+  group's death to the next probe (at most 50 ms) plus that probe to its signal.
+  The consumer passes its own pid to the turn. At start — before it reads its
+  input — the turn requires that pid to BE its parent (the generated launcher
+  `exec`s bob; a custom launcher must too) and ends itself otherwise; after
+  that it ends when that pid is gone or when it is reparented, checked every
+  second. A consumer that dies reparents the turn, so the reparenting check
+  fires even if the pid has been reused. A mail-mode `bob launch` started
+  without that variable only notices a later change of parent.
 - **What a mail turn can do.** Only the tools on a reviewed **allowlist** —
   `flair_search`, `flair_get` and `flair_write` — and only those the role (for
   an agent bound to a position, its host grant) also allows. Every other tool,
@@ -580,14 +588,23 @@ consumer. For each file in `new/`, oldest first by filename:
   `messageId`, to the verified sender only. A tool-only or empty turn sends no
   reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`
   durably — temp file, fsync, rename, then an fsync of the directory — and only
-  then moves the mail to `cur/`. If any step fails, including a directory
-  fsync, the marker is taken back and the mail is not acked: it stays in `new/`,
-  and the retry writes the marker without sending again. A filesystem that
-  cannot fsync a directory gets its own error (and fails `bob doctor`): mail on
-  it is never acked. The marker records the verified sender and a digest of the
-  signed envelope: a re-delivery of that same envelope is acked without a second
-  reply, while a DIFFERENT envelope reusing the `messageId` is refused as an
-  `id-collision` — never acked, never given the first one's reply.
+  then moves the mail to `cur/`. If any step fails, including the directory
+  fsync, the mail is not acked: it stays in `new/`, and the retry writes the
+  marker without sending again. bob also tries to take such a marker back, but
+  that removal can fail too, so an EXISTING marker is never trusted — not to
+  ack a re-delivery, not to refuse a collision — until bob has fsynced the
+  `replied/` directory itself; a failed sync leaves the mail in `new/` for a
+  retry, after a restart as well. A `replied/` directory whose filesystem cannot
+  fsync a directory gets its own error, and fails `bob doctor`, which probes
+  `replied/` itself: mail there is never acked. The marker records the verified
+  sender and a digest of the signed envelope (its outer signature normalized to
+  the verified bytes): a re-delivery of that same envelope is acked without a
+  second reply. Only a marker that was READ and names a DIFFERENT envelope makes
+  a mail an `id-collision` refusal — never acked, never given the first one's
+  reply. A marker that cannot be read (an I/O error) is retried; one that reads
+  but is not a marker bob wrote is not guessed at: the mail is HELD in
+  `<inbox>/held/` with a `.reason` file for a human, counted, and shown by
+  `bob doctor`.
 - **Presence.** A mail turn is not reflected in the presence roster: it runs
   in its own process, outside the warm session and its turn admission, so it
   neither beats busy nor writes a turn summary. The liveness beacon is
@@ -621,9 +638,14 @@ only principals already entitled to both.
 old onboard scaffold, which nothing reads) without the capability; when the
 `tps-mail:` block is invalid — an empty `senders:` above all, which also makes
 the capability refuse to load; when the agent has no Flair identity; when the
-inbox is missing; when this host is not a TPS delivery target (no joined branch
-and no office identity, #134); or when `tps` or the agent's signing key is
-missing. It reports refused mail per reason, turn failures and reply failures.
+inbox is missing, or its `replied/` directory cannot be fsynced; when this host
+is not a TPS delivery target (no joined branch and no office identity, #134); or
+when `tps` or the agent's signing key is missing. It checks the EFFECTIVE
+capabilities — the set the persistent runtime starts — so a `tps-mail` that
+`bob.yaml` declares but an agent's position grant or a local override disables
+is reported as DISABLED, not checked as if it ran. It reports refused mail per
+reason, mail held for inspection, turn failures, reply failures, marker
+failures and an exhausted process-group reap.
 
 **Stated limits.** The reply needs a `tps` that accepts `tps mail send <to>
 --stdin --reply-to <messageId>`; `tps` 0.7.0 takes the body only as an argument

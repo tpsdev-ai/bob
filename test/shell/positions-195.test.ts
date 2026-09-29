@@ -24,6 +24,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { serializeMailTurnInput } from "../../src/capabilities/tps-mail/prompt.js";
+import { runDoctor } from "../../src/shell/doctor.js";
 import {
   adoptAgent,
   BINDING_MARKER,
@@ -618,6 +619,72 @@ describe("bob#200 x bob#195 — an adopted agent's runtime capabilities are the 
     const disabled = resolveRunConfig(opts);
     expect(disabled.capabilities).toEqual([]);
     expect(disabled.config.extensionSources).toEqual([]);
+  });
+
+  // Gauge round 6, blocker 4: `bob doctor` reads the SAME effective set the
+  // persistent runtime starts. Enabled: both have tps-mail and doctor checks
+  // it. Locally disabled: the runtime starts no consumer, and doctor says
+  // DISABLED instead of passing checks for a consumer that never runs.
+  it("runtime and doctor AGREE on tps-mail — enabled, then disabled by a local override", async () => {
+    candidate("mail-post-2", {
+      version: "1.0.0",
+      role: "coder",
+      tools: ["read"],
+      capabilities: { permitted: ["tps-mail"], default: [] },
+      files: [{ path: "soul.md", kind: "soul" }],
+    });
+    await hireAgent({
+      name: "mq",
+      positionName: "mail-post-2",
+      agentsRoot: s.agentsRoot,
+      hostRoot: s.hostRoot,
+      positionsRoot: s.positionsRoot,
+      skipFlair: true,
+      interview: noopInterview,
+    });
+    const yaml = readFileSync(bobYamlPath("mq"), "utf8");
+    writeFileSync(
+      bobYamlPath("mq"),
+      `${yaml.replace("capabilities:\n", "capabilities:\n  - tps-mail\n")}\ntps-mail:\n  inbox: ~/.tps/mail/mq\n  senders:\n    - flint\n`,
+    );
+    const runtime = () =>
+      resolveRunConfig({
+        name: "mq",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: s.positionsRoot,
+        persistent: true,
+      })
+        .capabilities.map((c) => c.name)
+        .includes("tps-mail");
+    const home = join(s.agentsRoot, "..", "doctor-home");
+    mkdirSync(home, { recursive: true });
+    const doctor = () =>
+      runDoctor({
+        name: "mq",
+        agentsRoot: s.agentsRoot,
+        homeDir: home,
+        hostRoot: s.hostRoot,
+        positionsRoot: s.positionsRoot,
+      }).checks;
+
+    expect(runtime()).toBe(true);
+    const on = doctor();
+    expect(on.find((c) => c.name === "tps-mail config")?.status).toBe("ok");
+    expect(on.find((c) => c.name === "tps-mail")).toBeUndefined();
+
+    writeFileSync(
+      join(overridesDir(join(s.agentsRoot, "mq")), "overrides.json"),
+      `${JSON.stringify({ disable: { tools: [], capabilities: ["tps-mail"] }, files: [] })}\n`,
+    );
+    expect(runtime()).toBe(false);
+    const off = doctor();
+    const disabled = off.find((c) => c.name === "tps-mail");
+    expect(disabled?.status).toBe("warn");
+    expect(disabled?.detail).toMatch(
+      /^DISABLED — bob.yaml declares tps-mail, but it is not in this agent's effective capabilities/,
+    );
+    expect(off.find((c) => c.name === "tps-mail config")).toBeUndefined();
   });
 });
 

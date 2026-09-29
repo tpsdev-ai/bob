@@ -49,7 +49,7 @@ import {
   type ToolsBlock,
 } from "./bob-yaml.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
-import { resolveAgentToolPolicy } from "./run.js";
+import { effectiveCapabilities, resolveAgentToolPolicy } from "./run.js";
 import {
   auditToolNames,
   capabilityForTool,
@@ -89,6 +89,10 @@ export interface DoctorOptions {
   homeDir?: string;
   // PATH searched for the tps CLI (tests). Defaults to process.env.PATH.
   pathEnv?: string;
+  // Position grant store + positions root, as the runtime resolves them (tests).
+  // Default: <home>/.bob/host and bob's packaged positions.
+  hostRoot?: string;
+  positionsRoot?: string;
 }
 
 export function runDoctor(opts: DoctorOptions): DoctorReport {
@@ -238,6 +242,9 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     home,
     flairKeysDir,
     pathEnv: opts.pathEnv ?? process.env.PATH ?? "",
+    agentDir,
+    hostRoot: opts.hostRoot ?? join(home, ".bob", "host"),
+    positionsRoot: opts.positionsRoot,
   });
   if (mail.declared) {
     checks.push(...mail.checks);
@@ -553,6 +560,9 @@ function tpsMailChecks(o: {
   home: string;
   flairKeysDir: string;
   pathEnv: string;
+  agentDir: string;
+  hostRoot: string;
+  positionsRoot?: string;
 }): { declared: boolean; checks: DoctorCheck[] } {
   if (o.yamlText === undefined) return { declared: false, checks: [] };
   let capabilities: string[];
@@ -562,7 +572,49 @@ function tpsMailChecks(o: {
     capabilities = [];
   }
   const declared = capabilities.includes(TPS_MAIL_CAPABILITY);
-  if (!declared) {
+
+  // The EFFECTIVE set — what the persistent runtime actually starts (Gauge
+  // round 6, blocker 4). An adopted agent's grant or a local override can
+  // remove tps-mail that bob.yaml declares; doctor then says so rather than
+  // passing checks for a consumer that will never run.
+  let effective: ReturnType<typeof effectiveCapabilities>;
+  try {
+    effective = effectiveCapabilities({
+      name: o.name,
+      agentDir: o.agentDir,
+      yamlText: o.yamlText,
+      hostRoot: o.hostRoot,
+      ...(o.positionsRoot !== undefined ? { positionsRoot: o.positionsRoot } : {}),
+    });
+  } catch (err) {
+    if (!declared) return { declared: false, checks: [] };
+    return {
+      declared: true,
+      checks: [
+        {
+          name: "tps-mail",
+          status: "fail",
+          detail: `the agent's effective capabilities cannot be resolved: ${err instanceof Error ? err.message : String(err)}`,
+          fix: "fix the agent's position grant / overrides (bob position diff) so the runtime can resolve it",
+        },
+      ],
+    };
+  }
+  const enabled = effective.names.includes(TPS_MAIL_CAPABILITY);
+  if (declared && !enabled) {
+    return {
+      declared: true,
+      checks: [
+        {
+          name: "tps-mail",
+          status: "warn",
+          detail: `DISABLED — bob.yaml declares tps-mail, but it is not in this agent's effective capabilities (${effective.adopted ? "its position grant does not permit it, or a local override disables it" : "it did not resolve"}); the runtime starts no mail consumer, so mail to ${o.name} is not answered`,
+          fix: "enable tps-mail through the agent's position (bob position diff shows what the grant and overrides allow), or remove it from capabilities:",
+        },
+      ],
+    };
+  }
+  if (!enabled) {
     if (!declaresLegacyTpsMailChannel(o.yamlText)) return { declared: false, checks: [] };
     return {
       declared: false,
@@ -581,7 +633,11 @@ function tpsMailChecks(o: {
   const checks: DoctorCheck[] = [];
   let config: TpsMailCapabilityConfig;
   try {
-    config = validateTpsMailConfig(readBlock(o.yamlText, TPS_MAIL_CAPABILITY) ?? {});
+    config = validateTpsMailConfig(
+      effective.adopted
+        ? (effective.configs[TPS_MAIL_CAPABILITY] ?? {})
+        : (readBlock(o.yamlText, TPS_MAIL_CAPABILITY) ?? {}),
+    );
   } catch (err) {
     checks.push({
       name: "tps-mail config",
@@ -624,16 +680,24 @@ function tpsMailChecks(o: {
     });
   } else {
     // replied/ markers must be durable before any ack, and that needs fsync on
-    // a directory. A filesystem without it would leave every mail un-acked.
-    const durability = directoryFsyncProblem(inbox);
+    // THE replied/ DIRECTORY itself (Gauge round 6, blocker 1): it can be a
+    // mount or a symlink onto another filesystem. Before the consumer has
+    // created it, the inbox root is where it will be created.
+    const repliedDir = join(inbox, "replied");
+    const probed = existsSync(repliedDir) ? repliedDir : inbox;
+    const durability = directoryFsyncProblem(probed);
     checks.push(
       durability === undefined
-        ? { name: "tps-mail inbox", status: "ok", detail: inbox }
+        ? {
+            name: "tps-mail inbox",
+            status: "ok",
+            detail: `${inbox} (${probed === repliedDir ? "replied/" : "inbox root; replied/ not created yet"} can fsync a directory)`,
+          }
         : {
             name: "tps-mail inbox",
             status: "fail",
-            detail: `${inbox}: cannot fsync the directory (${durability}), so replied/ markers cannot be made durable and no mail would ever be acked`,
-            fix: "put the tps-mail inbox on a filesystem that supports fsync on a directory",
+            detail: `${probed}: cannot fsync the directory (${durability}), so replied/ markers cannot be made durable and no mail would ever be acked`,
+            fix: "put the tps-mail inbox's replied/ directory on a filesystem that supports fsync on a directory",
           },
     );
   }
@@ -671,6 +735,8 @@ function tpsMailChecks(o: {
         replyFailed?: Record<string, number>;
         verifyUnavailable?: number;
         markerFailed?: number;
+        markerReadFailed?: number;
+        reapExhausted?: number;
       }
     | undefined;
   try {
@@ -679,23 +745,29 @@ function tpsMailChecks(o: {
     stats = undefined;
   }
   const refusedTotal = sum(refused);
+  // Mail held for a human (held/ + .reason), by reason: never answered.
+  const held = countRefusedByReason(join(inbox, "held"));
+  const heldTotal = sum(held);
   const pending = countJson(join(inbox, "new"));
   const reasons = Object.fromEntries(REFUSAL_REASONS.map((r) => [r, refused[r] ?? 0]));
   for (const [k, n] of Object.entries(refused)) if (!(k in reasons)) reasons[k] = n;
   const parts = [
-    `new=${pending} cur=${countJson(join(inbox, "cur"))} refused=${refusedTotal}${summarize(reasons)}`,
+    `new=${pending} cur=${countJson(join(inbox, "cur"))} refused=${refusedTotal}${summarize(reasons)} held for inspection=${heldTotal}${summarize(held)}`,
   ];
-  let failing = false;
+  let failing = heldTotal > 0;
   if (stats) {
     const replyFailed = sum(stats.replyFailed);
     parts.push(
-      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0} marker failures=${stats.markerFailed ?? 0}`,
+      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0} marker failures=${stats.markerFailed ?? 0} marker read failures=${stats.markerReadFailed ?? 0} reap exhausted=${stats.reapExhausted ?? 0}`,
     );
     failing =
+      failing ||
       (stats.dispatchFailed ?? 0) > 0 ||
       replyFailed > 0 ||
       (stats.verifyUnavailable ?? 0) > 0 ||
-      (stats.markerFailed ?? 0) > 0;
+      (stats.markerFailed ?? 0) > 0 ||
+      (stats.markerReadFailed ?? 0) > 0 ||
+      (stats.reapExhausted ?? 0) > 0;
   } else {
     parts.push("no consumer stats yet (the persistent runtime writes them)");
   }
@@ -705,7 +777,7 @@ function tpsMailChecks(o: {
     detail: parts.join("; "),
     ...(failing
       ? {
-          fix: "read the runtime log's tps-mail: lines — a failed mail stays in new/ and is retried with backoff",
+          fix: "read the runtime log's tps-mail: lines — a failed mail stays in new/ and is retried with backoff; a HELD mail (held/<file>.reason) needs a human",
         }
       : {}),
   });

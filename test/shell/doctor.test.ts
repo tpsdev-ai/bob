@@ -735,4 +735,38 @@ describe("runDoctor — tps-mail", () => {
     expect(c?.detail).toContain("reply failures=4 (cli-missing=4)");
     expect(c?.detail).toContain("marker failures=1");
   });
+
+  // Gauge round 6, blocker 1: doctor probes the ACTUAL replied/ directory — it
+  // can sit on another filesystem than the inbox root. A replied/ that cannot
+  // be opened for fsync (here: unreadable) fails, while the root is fine.
+  it("(d9) FAILS when the replied/ directory itself cannot be fsynced, even though the inbox root can", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    mkdirSync(replied, { recursive: true });
+    chmodSync(replied, 0o000);
+    try {
+      const c = check(doctor(), "tps-mail inbox");
+      expect(c?.status).toBe("fail");
+      expect(c?.detail).toContain(`${replied}: cannot fsync the directory`);
+    } finally {
+      chmodSync(replied, 0o700);
+    }
+    expect(check(doctor(), "tps-mail inbox")?.detail).toContain("replied/ can fsync a directory");
+  });
+
+  it("(d10) surfaces mail HELD for inspection, marker read failures and an exhausted reap", () => {
+    const heldDir = join(home, ".tps", "mail", "testbot", "held");
+    mkdirSync(heldDir, { recursive: true });
+    writeFileSync(join(heldDir, "h.json"), "{}");
+    writeFileSync(join(heldDir, "h.json.reason"), "reason: marker-malformed\n");
+    mkdirSync(join(home, ".bob"), { recursive: true });
+    writeFileSync(
+      join(home, ".bob", "testbot.tps-mail-stats.json"),
+      JSON.stringify({ markerReadFailed: 2, reapExhausted: 1 }),
+    );
+    const c = check(doctor(), "tps-mail activity");
+    expect(c?.status).toBe("warn");
+    expect(c?.detail).toContain("held for inspection=1 (marker-malformed=1)");
+    expect(c?.detail).toContain("marker read failures=2");
+    expect(c?.detail).toContain("reap exhausted=1");
+  });
 });

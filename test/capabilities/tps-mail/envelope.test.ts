@@ -204,6 +204,40 @@ describe("decideInbound — the allow-list on the VERIFIED id (F2)", () => {
   });
 });
 
+// Gauge round 6: the digest identifies the SIGNED CONTENT, so a valid
+// re-encoding of the same signature bytes (the verifier accepts unpadded
+// base64) is the same envelope, not a collision.
+describe("decideInbound — the envelope digest normalizes the verified signature bytes", () => {
+  const unpad = (sig: string) => sig.replace(/=+$/, "");
+  it("an outer signature re-encoded without padding: same verified envelope, same digest", async () => {
+    const env = JSON.parse(FIXTURE.single) as Record<string, unknown>;
+    const reencoded = { ...env, signature: unpad(env.signature as string) };
+    expect(reencoded.signature).not.toBe(env.signature);
+    const a = await decideInbound(mailRecord(env), OPTS());
+    const b = await decideInbound(mailRecord(reencoded), OPTS());
+    expect(a.kind).toBe("accept");
+    expect(b.kind).toBe("accept");
+    if (a.kind === "accept" && b.kind === "accept") expect(b.digest).toBe(a.digest);
+  });
+
+  it("a CHAIN signature is signed content: re-encoded it does not verify; other content has another digest", async () => {
+    const reencoded = JSON.parse(FIXTURE.twoHop) as {
+      delegationChain: Array<{ signature: string | null }>;
+    };
+    reencoded.delegationChain[1].signature = unpad(
+      reencoded.delegationChain[1].signature as string,
+    );
+    expectRefused(
+      await decideInbound(mailRecord(reencoded as unknown as Record<string, unknown>), OPTS()),
+      "bad-signature",
+    );
+    const a = await decideInbound(mailRecord(FIXTURE.twoHop), OPTS());
+    const c = await decideInbound(mailRecord(FIXTURE.single), OPTS());
+    if (a.kind !== "accept" || c.kind !== "accept") throw new Error("both must verify");
+    expect(c.digest).not.toBe(a.digest);
+  });
+});
+
 describe("decideInbound — a canonicalization failure is a REFUSAL, never a retry (Gauge round 4, blocker 4)", () => {
   // JSON.parse turns 1e400 into Infinity, which RFC 8785 cannot encode: the
   // canonicalizer throws, and it would throw on every retry forever.

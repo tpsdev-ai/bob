@@ -48,7 +48,14 @@ import {
   MAIL_TURN_INPUT_MAX_BYTES,
   parseMailTurnInput,
 } from "../capabilities/tps-mail/prompt.js";
-import { readAgentRole, readBlock, readCron, readResident, readTools } from "./bob-yaml.js";
+import {
+  readAgentRole,
+  readBlock,
+  readCapabilities,
+  readCron,
+  readResident,
+  readTools,
+} from "./bob-yaml.js";
 import {
   capabilityConfigEnv,
   type ResolvedCapability,
@@ -1230,15 +1237,26 @@ export function watchParent(
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const initialPpid = getPpid();
   let fired = false;
+  const end = (why: string) => {
+    fired = true;
+    process.stderr.write(`bob launch: ${why}; ending the turn\n`);
+    exit(1);
+  };
+  // At installation the expected consumer must BE this process's parent (the
+  // generated launcher `exec`s bob, so the consumer spawned this very process).
+  // A mismatch means the consumer is already gone (reparented) or the variable
+  // does not describe this process, and either way the pid proves nothing.
+  if (opts.expectedParentPid !== undefined && initialPpid !== opts.expectedParentPid) {
+    end(
+      `this mail turn's parent is pid ${initialPpid}, not the consumer pid ${opts.expectedParentPid} that should have spawned it (the consumer is gone, or a launcher did not exec bob)`,
+    );
+    return () => {};
+  }
   const check = () => {
     if (fired) return;
     const consumerGone = opts.expectedParentPid !== undefined && !isAlive(opts.expectedParentPid);
     if (consumerGone || getPpid() !== initialPpid) {
-      fired = true;
-      process.stderr.write(
-        "bob launch: the consumer that started this mail turn is gone; ending the turn\n",
-      );
-      exit(1);
+      end("the consumer that started this mail turn is gone");
     }
   };
   check();
@@ -1408,6 +1426,37 @@ function parseCron(yamlText: string): CronEntry[] {
       if (reason) throw new Error(`bob: invalid cron entry name: ${reason}`);
       return { name: e.name, schedule: e.schedule, prompt: e.prompt };
     });
+}
+
+// The agent's EFFECTIVE capabilities — the set the persistent runtime starts
+// (bob#200 x bob#195, Gauge round 6, blocker 4). For an ADOPTED agent that is
+// the grant-resolved set with local disables applied, from the SAME resolver
+// resolveRunConfig uses; for any other agent it is bob.yaml's capabilities:
+// list, the list resolveCapabilities walks. `bob doctor` reads this, so it can
+// never report a capability healthy that the runtime will not start.
+export function effectiveCapabilities(opts: {
+  name: string;
+  agentDir: string;
+  yamlText: string;
+  hostRoot?: string;
+  positionsRoot?: string;
+}): { adopted: boolean; names: string[]; configs: Record<string, Record<string, unknown>> } {
+  const adopted = resolveAdoptedConfig({
+    name: opts.name,
+    agentDir: opts.agentDir,
+    yamlText: opts.yamlText,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    persistent: true,
+  });
+  if (adopted) {
+    return {
+      adopted: true,
+      names: adopted.resolvedCapabilities.map((c) => c.name),
+      configs: Object.fromEntries(adopted.resolvedCapabilities.map((c) => [c.name, c.config])),
+    };
+  }
+  return { adopted: false, names: readCapabilities(opts.yamlText), configs: {} };
 }
 
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {

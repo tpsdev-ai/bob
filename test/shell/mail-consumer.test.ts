@@ -982,15 +982,21 @@ describe("round 5, blocker 2 — per-id state is bound to the sender and the sig
     expect(h.turns).toHaveLength(1);
   });
 
-  it("(c4) a marker that cannot be read fails closed as a collision, never as a re-delivery", async () => {
+  it("(c4) a marker that reads but is not a marker is HELD for a human — never acked, never refused", async () => {
     mkdirSync(join(inbox, "replied"), { recursive: true });
     writeFileSync(join(inbox, "replied", "m-1"), "not json");
     deliver("1.json", { messageId: "m-1" });
     const h = two();
     await h.consumer.poll();
-    expect(inDir("refused")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "held", "1.json"))).toBe(true);
+    expect(readFileSync(join(inbox, "held", "1.json.reason"), "utf8")).toMatch(
+      /^reason: marker-malformed\n.*is not a marker bob wrote/,
+    );
+    expect(inDir("refused")).toEqual([]);
+    expect(inDir("cur")).toEqual([]);
     expect(h.turns).toHaveLength(0);
-    expect(h.consumer.stats.duplicates).toBe(0);
+    expect(h.consumer.stats.held["marker-malformed"]).toBe(1);
+    expect(h.consumer.stats.refused["id-collision"]).toBe(0);
   });
 });
 
@@ -1113,4 +1119,195 @@ describe("round 5, blocker 4 — the turn's process group is supervised until it
       if (alive(pid)) process.kill(pid, "SIGKILL");
     }
   }, 20_000);
+});
+
+// ─── Gauge round 6 ──────────────────────────────────────────────────────────
+
+describe("round 6, blocker 1 — an existing marker is trusted only once its directory is synced", () => {
+  // The directory fsync fails AND the removal of the renamed marker fails, so a
+  // marker is left on disk whose durability was never proven.
+  function syncAndUnlinkFail(): { io: DurableIo; heal: () => void } {
+    let broken = true;
+    const dirFds = new Set<number>();
+    const io = ioWith({
+      openSync: (p, f, m) => {
+        const fd = openSync(p, f, m);
+        if (f === "r") dirFds.add(fd);
+        return fd;
+      },
+      fsyncSync: (fd) => {
+        if (broken && dirFds.has(fd))
+          throw Object.assign(new Error("EIO: dir fsync"), { code: "EIO" });
+        fsyncSync(fd);
+      },
+      unlinkSync: (p) => {
+        if (broken && !p.includes(".tmp-"))
+          throw Object.assign(new Error("EIO: unlink"), { code: "EIO" });
+        unlinkSync(p);
+      },
+    });
+    return { io, heal: () => (broken = false) };
+  }
+
+  it("(d5) fsync-plus-unlink failure leaves a marker behind; it is NOT trusted until a sync succeeds — across a restart too", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { io, heal } = syncAndUnlinkFail();
+    const first = harness({ retryBaseMs: 1000, markerIo: io });
+    await first.consumer.poll();
+    expect(first.replies).toHaveLength(1);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(true); // left behind
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(first.consumer.stats).toMatchObject({ processed: 0, replied: 0, markerFailed: 1 });
+
+    clock += 1001;
+    await first.consumer.poll(); // the leftover marker: sync still fails → not trusted
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(first.replies).toHaveLength(1);
+    expect(first.consumer.stats.markerFailed).toBe(2);
+    expect(first.logs.join("\n")).toMatch(/cannot be proven durable.*NOT acked/);
+
+    const restarted = harness({ retryBaseMs: 1000, markerIo: io }); // in-memory state gone
+    await restarted.consumer.poll();
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(restarted.turns).toHaveLength(0);
+    expect(restarted.replies).toHaveLength(0);
+
+    heal();
+    clock += 1001;
+    await restarted.consumer.poll(); // synced now: the marker is proven, the mail acked
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(restarted.replies).toHaveLength(0);
+    expect(restarted.consumer.stats.duplicates).toBe(1);
+  });
+
+  it("(d6) the same run's own settlement is counted once its leftover marker is proven", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { io, heal } = syncAndUnlinkFail();
+    const h = harness({ retryBaseMs: 1000, markerIo: io });
+    await h.consumer.poll();
+    heal();
+    clock += 1001;
+    await h.consumer.poll();
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(h.replies).toHaveLength(1);
+    expect(h.consumer.stats).toMatchObject({ processed: 1, replied: 1, duplicates: 0 });
+  });
+});
+
+describe("round 6, blocker 2 — only a PROVEN collision refuses", () => {
+  it("(r1) a marker READ error is retried, then the same envelope's redelivery is acked", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    let failRead = false;
+    const h = harness({
+      retryBaseMs: 1000,
+      readMarkerFile: (path) => {
+        if (failRead) throw Object.assign(new Error("EIO: read"), { code: "EIO" });
+        return readFileSync(path, "utf8");
+      },
+    });
+    await h.consumer.poll(); // answered; marker written
+    expect(inDir("cur")).toEqual(["1.json"]);
+    deliver("2.json", { messageId: "m-1" }); // the same signed envelope again
+    failRead = true;
+    await h.consumer.poll();
+    expect(inDir("new")).toEqual(["2.json"]);
+    expect(inDir("refused")).toEqual([]);
+    expect(h.consumer.stats.markerReadFailed).toBe(1);
+    expect(h.logs.join("\n")).toMatch(/marker for m-1 could not be read \(EIO\); left in new/);
+    failRead = false;
+    clock += 1001;
+    await h.consumer.poll();
+    expect(inDir("cur").sort()).toEqual(["1.json", "2.json"]);
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(1);
+    expect(h.consumer.stats.duplicates).toBe(1);
+    expect(h.consumer.stats.refused["id-collision"]).toBe(0);
+  });
+});
+
+describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", () => {
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("(g4) a SIGTERM-resistant descendant that KEEPS stdout neither holds the turn to its timeout nor gets a finished turn retried", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const pidFile = join(root, "holder.pid");
+    const launcher = join(root, "holding-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"done"}'`,
+        // Inherits stdout and stderr: the launcher's `close` cannot fire while it lives.
+        `sh -c 'trap "" TERM; exec sleep 60' &`,
+        `echo $! > ${pidFile}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    const h = harness({
+      launcherPath: launcher,
+      runTurn: undefined,
+      turnTimeoutMs: 20_000,
+      turnRunner: { killGraceMs: 300 },
+    });
+    const t0 = Date.now();
+    await h.consumer.poll();
+    const elapsed = Date.now() - t0;
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(elapsed).toBeLessThan(8000); // not the 20 s turn timeout
+      expect(h.consumer.stats.timeouts).toBe(0);
+      expect(h.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "done" }]);
+      expect(inDir("cur")).toEqual(["1.json"]); // finished, never retried
+      expect(alive(pid)).toBe(false);
+    } finally {
+      if (alive(pid)) process.kill(pid, "SIGKILL"); // only a pid this test started
+    }
+  }, 40_000);
+
+  it("(g5) members left after SIGKILL and the reap limit are LOGGED and COUNTED", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const launcher = join(root, "plain-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"done"}'`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    const signalled: string[] = [];
+    const h = harness({
+      launcherPath: launcher,
+      runTurn: undefined,
+      turnRunner: {
+        killGraceMs: 50,
+        reapLimitMs: 100,
+        // A group that never goes away, whatever it is sent.
+        groupOps: { exists: () => true, signal: (_pgid, sig) => void signalled.push(sig) },
+      },
+    });
+    await h.consumer.poll();
+    const deadline = Date.now() + 3000;
+    while (h.consumer.stats.reapExhausted === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(signalled).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(h.consumer.stats.reapExhausted).toBe(1);
+    expect(h.logs.join("\n")).toMatch(
+      /process group \d+ still has members after SIGKILL and the reap limit; cleanup gave up/,
+    );
+  }, 10_000);
 });

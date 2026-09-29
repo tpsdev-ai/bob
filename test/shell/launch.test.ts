@@ -588,7 +588,38 @@ describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
     });
     child.stdin?.destroy();
     expect(code).toBe(1);
-    expect(stderr).toContain("the consumer that started this mail turn is gone");
+    expect(stderr).toMatch(/this mail turn's parent is pid \d+, not the consumer pid \d+/);
+  }, 15_000);
+
+  // Gauge round 6: a LIVE pid that is not this turn's parent (a forged or stale
+  // BOB_MAIL_TURN_PARENT) is refused at installation — before stdin is read.
+  it("a mail turn whose expected consumer is a live pid but NOT its parent ends before reading stdin", async () => {
+    const stranger = spawn("sleep", ["30"]);
+    try {
+      const child = spawn(process.execPath, [cli, "launch", AGENT], {
+        env: { ...mailEnv(), BOB_MAIL_TURN_PARENT: String(stranger.pid) },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (d) => {
+        stderr += d;
+      });
+      const code = await new Promise<number | null>((resolve) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          resolve(null);
+        }, 8000);
+        child.on("close", (c) => {
+          clearTimeout(timer);
+          resolve(c);
+        });
+      });
+      child.stdin?.destroy();
+      expect(code).toBe(1);
+      expect(stderr).toContain(`not the consumer pid ${stranger.pid}`);
+    } finally {
+      stranger.kill("SIGKILL"); // only a pid this test started
+    }
   }, 15_000);
 
   it("reads stdin written through a pipe in several delayed pieces to EOF", async () => {

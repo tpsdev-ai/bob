@@ -496,6 +496,20 @@ describe("watchParent — an orphaned mail turn ends", () => {
     }
   });
 
+  // Gauge round 6: at installation the expected consumer must BE the parent.
+  it("a live expected pid that is NOT this process's parent ends the turn at install", () => {
+    const exits: number[] = [];
+    const stop = watchParent({
+      expectedParentPid: 100,
+      isAlive: () => true,
+      getPpid: () => 200,
+      exit: (c) => exits.push(c),
+      intervalMs: 60_000,
+    });
+    stop();
+    expect(exits).toEqual([1]);
+  });
+
   it("a consumer pid that is already dead ends the turn IMMEDIATELY, at install", () => {
     const exits: number[] = [];
     const stop = watchParent({

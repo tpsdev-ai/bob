@@ -124,9 +124,11 @@ export interface AcceptedMail {
   messageId: string;
   // The signed body — untrusted data, sanitized later by the prompt template.
   body: string;
-  // sha256 (hex) of the RFC 8785 form of the whole verified envelope, signature
-  // included. The same signed envelope re-delivered has the same digest;
-  // another envelope reusing its messageId does not.
+  // sha256 (hex) of the RFC 8785 form of the whole verified envelope, with the
+  // OUTER signature normalized to its verified bytes (canonical padded base64):
+  // the same signed envelope re-delivered — however that signature was
+  // base64-encoded — has the same digest; another envelope reusing its
+  // messageId does not.
   digest: string;
 }
 
@@ -181,6 +183,23 @@ function isChainEntry(v: unknown): v is ChainEntry {
     typeof v.rationale === "string" &&
     (v.signature === null || typeof v.signature === "string")
   );
+}
+
+// The identity of a verified envelope: its signed content plus the OUTER
+// signature as the bytes that verified. The outer signature is the one field
+// outside the signed payload, and decodeSignature accepts any base64 encoding
+// of it (unpadded, whitespace), so it is replaced by the canonical encoding of
+// those bytes — an encoding difference is never mistaken for a different
+// envelope. The chain entries' signatures are NOT normalized: they are part of
+// what the outer signature covers, so their exact strings are signed content
+// (a re-encoded one does not verify at all).
+function envelopeDigest(envelope: Record<string, unknown>): string {
+  const bytes = decodeSignature(envelope.signature);
+  const identity = {
+    ...envelope,
+    signature: bytes ? `ed25519:${bytes.toString("base64")}` : envelope.signature,
+  };
+  return createHash("sha256").update(canonicalize(identity), "utf8").digest("hex");
 }
 
 // Decide one maildir record. Never throws: every outcome is a decision.
@@ -332,6 +351,6 @@ async function decideRecord(record: unknown, opts: DecideOptions): Promise<Inbou
     return refuse("sender-not-allowed", `${from} is not in tps-mail senders`);
   }
 
-  const digest = createHash("sha256").update(canonicalize(envelope), "utf8").digest("hex");
+  const digest = envelopeDigest(envelope);
   return { kind: "accept", sender: from, messageId, body: envelope.body, digest };
 }

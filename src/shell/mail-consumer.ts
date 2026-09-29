@@ -126,28 +126,64 @@ const TURN_KILL_GRACE_MS = 5000;
 // the consumer's pid in BOB_MAIL_TURN_PARENT and the input on stdin, as the
 // leader of its OWN process group (detached).
 //
-// THE GROUP IS SUPERVISED UNTIL IT IS GONE (Gauge round 5, blocker 4). Once
-// the turn is over — aborted (timeout or shutdown), or the launcher closed —
-// the whole group gets SIGTERM, then SIGKILL after the grace, and the group is
-// polled until it no longer exists. Resolving the turn's outcome does NOT
-// cancel this, so a descendant that ignores SIGTERM and has closed its stdio
-// still dies. Stated limit: signals go to the numeric group id. POSIX keeps a
-// group id in use while any member lives, so it cannot name another group while
-// a descendant survives; once every member has exited, the group is no longer
-// signalled (each signal follows an existence probe), and the only residual
-// risk is the pid counter wrapping onto that id between a probe and its signal.
+// THE GROUP IS REAPED (Gauge rounds 5 and 6, blocker 3/4). Cleanup starts the
+// moment the turn is over — aborted (timeout or shutdown), or the LEADER
+// EXITED (`exit`, not `close`: `close` waits for every inherited pipe, so a
+// descendant holding stdout would otherwise hold cleanup, and the turn's
+// result, until the timeout). The whole group gets SIGTERM, then SIGKILL after
+// the grace; its existence is probed every 50 ms, for at most the grace plus
+// the reap limit. If members remain after that (unkillable: a process in
+// uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
+// with the group id and counted (`reapExhausted`). `close` is kept only to
+// collect the result, which arrives once the reaping has freed the pipes.
+// Stated limit: signals go to the numeric group id. POSIX keeps a group id in
+// use while any member lives, so it cannot name another group while a
+// descendant survives. Once every member has exited, the id is free: the window
+// in which a reused id could be signalled runs from the group's death to the
+// next existence probe (at most 50 ms) plus from that probe to the signal, and
+// needs the pid counter to wrap onto that exact id inside it.
 // Being its own group, the turn is not taken down with the runtime's group on a
 // crash; the mail-turn child watches the consumer pid and ends itself (run.ts).
-export function launcherTurnRunner(opts: {
+// Process-group operations (a seam: tests fake a group that never dies).
+export interface GroupOps {
+  // Does the group still have a member? (EPERM counts: a member we may not signal.)
+  exists(pgid: number): boolean;
+  signal(pgid: number, sig: NodeJS.Signals): void;
+}
+
+const NODE_GROUP_OPS: GroupOps = {
+  exists(pgid) {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+  },
+  signal(pgid, sig) {
+    try {
+      process.kill(-pgid, sig); // the whole group: descendants included
+    } catch {
+      // gone between the probe and the signal
+    }
+  },
+};
+
+export interface LauncherTurnRunnerOptions {
   launcherPath: string;
   // Absolute bob for the launcher's `exec "${BOB_BIN:-bob}"` when the
   // environment does not name one (a service unit's PATH may not reach bob).
   bobBin?: string;
   env?: NodeJS.ProcessEnv;
   killGraceMs?: number;
-  // How long to keep polling for the group after SIGKILL before giving up.
+  // How long to keep probing for the group after SIGKILL before giving up.
   reapLimitMs?: number;
-}): TurnRunner {
+  groupOps?: GroupOps;
+  // Called (with the group id) when members remain after the reap limit.
+  onReapExhausted?: (pgid: number) => void;
+}
+
+export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner {
   return (input, signal) =>
     new Promise<TurnOutcome>((resolve) => {
       const env: NodeJS.ProcessEnv = {
@@ -172,22 +208,11 @@ export function launcherTurnRunner(opts: {
         detached: true,
       });
       const pgid = child.pid;
-      const groupExists = (): boolean => {
-        if (pgid === undefined) return false;
-        try {
-          process.kill(-pgid, 0);
-          return true;
-        } catch (err) {
-          return (err as NodeJS.ErrnoException).code === "EPERM";
-        }
-      };
+      const ops = opts.groupOps ?? NODE_GROUP_OPS;
+      const groupExists = (): boolean => pgid !== undefined && ops.exists(pgid);
       const signalGroup = (sig: NodeJS.Signals) => {
         if (pgid === undefined || !groupExists()) return;
-        try {
-          process.kill(-pgid, sig); // the whole group: descendants included
-        } catch {
-          // gone between the probe and the signal
-        }
+        ops.signal(pgid, sig);
       };
       let reaping = false;
       const reap = () => {
@@ -207,12 +232,18 @@ export function launcherTurnRunner(opts: {
             killed = true;
             signalGroup("SIGKILL");
           }
-          if (elapsed >= grace + reapLimit) clearInterval(tick);
+          if (elapsed >= grace + reapLimit) {
+            clearInterval(tick);
+            opts.onReapExhausted?.(pgid);
+          }
         }, 50);
       };
       const onAbort = () => reap();
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) onAbort();
+      // Cleanup starts when the LEADER exits — not on `close`, which waits for
+      // every inherited pipe (see the note above).
+      child.on("exit", () => reap());
 
       let stdout = "";
       let stdoutBytes = 0;
@@ -232,8 +263,7 @@ export function launcherTurnRunner(opts: {
         });
       });
       child.on("close", (code, sig) => {
-        // The leader is done: whatever it left in its group is reaped too.
-        reap();
+        // Result collection only: the reaping started on `exit`.
         if (signal.aborted) {
           const reason = signal.reason === "timeout" ? "timeout" : "stopped";
           finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
@@ -301,12 +331,20 @@ export interface MailConsumerOptions {
   retryMaxMs?: number;
   now?: () => number;
   log?: (msg: string) => void;
-  // Seam (tests): how a replied/ marker is written. Defaults to durableWrite.
+  // Seam (tests): how a replied/ marker is written. Defaults to durableWrite
+  // over markerIo.
   writeMarkerFile?: (path: string, content: string) => void;
+  // Seam (tests): the file operations for markers (the durable write and the
+  // directory sync done before any existing marker is trusted).
+  markerIo?: DurableIo;
+  // Seam (tests): how an existing replied/ marker is read.
+  readMarkerFile?: (path: string) => string;
   // Seams (tests): a hook right after a lock's holder is judged dead, and how
   // long to wait for another process's takeover to finish.
   lockHooks?: { afterStaleCheck?: () => void };
   lockWaitMs?: number;
+  // Seams (tests): options for the DEFAULT launcher runner.
+  turnRunner?: Pick<LauncherTurnRunnerOptions, "killGraceMs" | "reapLimitMs" | "groupOps">;
 }
 
 export interface MailConsumerStats {
@@ -326,10 +364,23 @@ export interface MailConsumerStats {
   replyFailed: Record<ReplyFailure, number>;
   // Key lookups Flair could not answer — the mail stays in new/.
   verifyUnavailable: number;
-  // replied/ markers that could not be written durably — the mail stays in
-  // new/, un-acked and uncounted, and the marker write is retried.
+  // replied/ markers that could not be written durably, or an existing marker
+  // whose directory could not be synced before it was trusted — the mail
+  // stays in new/, un-acked and uncounted, and is retried.
   markerFailed: number;
+  // An existing marker that could not be READ (an I/O error) — retried.
+  markerReadFailed: number;
+  // Mail set aside for a human, by reason (held/ + a .reason file): never
+  // answered and never refused on the strength of an unproven state.
+  held: Record<HoldReason, number>;
+  // A turn's process group that still had members after SIGKILL and the reap
+  // limit: cleanup gave up (logged with the group id).
+  reapExhausted: number;
 }
+
+// Why a mail is held for manual inspection.
+export const HOLD_REASONS = ["marker-malformed"] as const;
+export type HoldReason = (typeof HOLD_REASONS)[number];
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60_000;
@@ -351,6 +402,9 @@ function emptyStats(): MailConsumerStats {
     replyFailed: { "cli-missing": 0, "no-signing-key": 0, exit: 0, timeout: 0 },
     verifyUnavailable: 0,
     markerFailed: 0,
+    markerReadFailed: 0,
+    held: Object.fromEntries(HOLD_REASONS.map((r) => [r, 0])) as Record<HoldReason, number>,
+    reapExhausted: 0,
   };
 }
 
@@ -432,23 +486,34 @@ export function durableWrite(path: string, content: string, io: DurableIo = NODE
     }
     throw err;
   }
-  const dir = dirname(path);
+  try {
+    syncDirectory(dirname(path), io);
+  } catch (err) {
+    // The rename happened but is not proven durable: take it back. That
+    // removal can itself fail, which is why the consumer never trusts an
+    // EXISTING marker until it has synced the replied/ directory itself
+    // (MailConsumer.markerDirDurable) — this unlink is tidiness, not the control.
+    try {
+      io.unlinkSync(path);
+    } catch {
+      // left behind: the consumer's sync-before-trust covers it
+    }
+    throw err;
+  }
+}
+
+// fsync a directory so the entries renamed into it survive a crash. A
+// filesystem that cannot fsync a directory gets its own operational error.
+export function syncDirectory(dir: string, io: DurableIo = NODE_IO): void {
   let dirFd: number | undefined;
   try {
     dirFd = io.openSync(dir, "r");
     io.fsyncSync(dirFd);
   } catch (err) {
-    // The rename happened but is not proven durable: take it back, so no retry
-    // can ack on a marker that a crash could still erase.
-    try {
-      io.unlinkSync(path);
-    } catch {
-      // gone already
-    }
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP") {
       throw new Error(
-        `tps-mail: the filesystem holding ${dir} cannot fsync a directory (${code}), so a replied/ marker cannot be made durable there and mail is not acked. Put the inbox on a filesystem that supports directory fsync.`,
+        `tps-mail: the filesystem holding ${dir} cannot fsync a directory (${code}), so a replied/ marker cannot be made durable there and mail is not acked. Put the inbox's replied/ directory on a filesystem that supports directory fsync.`,
       );
     }
     throw err;
@@ -537,6 +602,8 @@ export class MailConsumer {
   // retry in this run writes the marker only — no new turn, no new send.
   private readonly awaitingMarker = new Map<string, MarkerRecord>();
   private readonly writeMarkerFile: (path: string, content: string) => void;
+  private readonly markerIo: DurableIo;
+  private readonly readMarkerFile: (path: string) => string;
   private readonly lockHooks: { afterStaleCheck?: () => void };
   private readonly lockWaitMs: number;
   private timer?: ReturnType<typeof setInterval>;
@@ -582,13 +649,23 @@ export class MailConsumer {
       launcherTurnRunner({
         launcherPath: opts.launcherPath ?? join(home, "agents", opts.name, "bin", opts.name),
         bobBin: selfBobBin(),
+        ...opts.turnRunner,
+        onReapExhausted: (pgid) => {
+          this.stats.reapExhausted += 1;
+          this.log(
+            `tps-mail: a mail turn's process group ${pgid} still has members after SIGKILL and the reap limit; cleanup gave up (a member may be unkillable or owned by another user)`,
+          );
+        },
       });
     this.sendReply = opts.sendReply ?? tpsCliReplySender({ identity: opts.identity });
     this.retryBaseMs = opts.retryBaseMs ?? 30_000;
     this.retryMaxMs = opts.retryMaxMs ?? 30 * 60_000;
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((m: string) => console.error(m));
-    this.writeMarkerFile = opts.writeMarkerFile ?? durableWrite;
+    this.markerIo = opts.markerIo ?? NODE_IO;
+    this.writeMarkerFile =
+      opts.writeMarkerFile ?? ((path, content) => durableWrite(path, content, this.markerIo));
+    this.readMarkerFile = opts.readMarkerFile ?? ((path) => readFileSync(path, "utf8"));
     this.lockHooks = opts.lockHooks ?? {};
     this.lockWaitMs = opts.lockWaitMs ?? 5000;
   }
@@ -706,18 +783,54 @@ export class MailConsumer {
 
     // 2. Already answered — a crash after the marker, or a re-delivery of the
     //    SAME signed envelope: ack without a turn and without a reply.
+    //    Nothing about an EXISTING marker is trusted until the replied/
+    //    directory has been synced (Gauge round 6, blocker 1): a marker can be
+    //    left behind by a write whose directory sync failed and whose removal
+    //    failed too, so its presence proves nothing about durability. A read
+    //    error is retried; only a marker that was READ and names another
+    //    envelope is a collision; one that reads but is not a marker is held
+    //    for a human (blocker 2).
     const marker = this.readMarker(messageId);
-    if (marker !== undefined) {
-      if (marker === "unreadable" || !same(marker)) {
-        this.collision(file, messageId, sender, marker === "unreadable" ? undefined : marker);
+    if (marker.kind === "io-error") {
+      this.stats.markerReadFailed += 1;
+      this.log(
+        `tps-mail: the replied/ marker for ${messageId} could not be read (${marker.code}); left in new/ for a retry`,
+      );
+      this.scheduleRetry(file);
+      return;
+    }
+    if (marker.kind !== "none") {
+      if (!this.markerDirDurable(messageId)) {
+        this.stats.markerFailed += 1;
+        this.scheduleRetry(file);
+        return;
+      }
+      if (marker.kind === "malformed") {
+        this.hold(
+          file,
+          "marker-malformed",
+          `replied/${messageId} exists but is not a marker bob wrote, so whether ${messageId} from ${sender} was answered cannot be told`,
+        );
+        return;
+      }
+      if (!same(marker)) {
+        this.collision(file, messageId, sender, marker);
         return;
       }
       if (!this.ack(file)) {
         this.scheduleRetry(file);
         return;
       }
+      const settledHere = this.awaitingMarker.get(messageId);
       this.awaitingMarker.delete(messageId);
-      this.stats.duplicates += 1;
+      if (settledHere && same(settledHere)) {
+        // This run settled it; the marker is now proven durable.
+        this.stats.processed += 1;
+        if (settledHere.outcome === "replied") this.stats.replied += 1;
+        else this.stats.noReply += 1;
+      } else {
+        this.stats.duplicates += 1;
+      }
       this.log(`tps-mail: ${messageId} from ${sender} already answered (replied/ marker); acked`);
       return;
     }
@@ -790,38 +903,76 @@ export class MailConsumer {
     file: string,
     messageId: string,
     sender: string,
-    held: { sender: string; digest: string } | undefined,
+    held: { sender: string; digest: string },
   ): void {
     this.refuse(
       file,
       "id-collision",
-      held === undefined
-        ? `messageId ${messageId} from ${sender}: its replied/ marker cannot be read, so this envelope cannot be shown to be the one answered`
-        : `messageId ${messageId} from ${sender} is already bound to a different signed envelope (from ${held.sender}, digest ${held.digest.slice(0, 12)}…)`,
+      `messageId ${messageId} from ${sender} is already bound to a different signed envelope (from ${held.sender}, digest ${held.digest.slice(0, 12)}…)`,
     );
   }
 
-  // The marker for an id: its binding, undefined when there is none, or
-  // "unreadable" when a marker exists but does not parse to a binding.
+  // Sync the replied/ directory before an existing marker is trusted for
+  // anything. false (logged) when it cannot be proven durable: retry later.
+  private markerDirDurable(messageId: string): boolean {
+    try {
+      syncDirectory(join(this.inboxRoot, "replied"), this.markerIo);
+      return true;
+    } catch (err) {
+      this.log(
+        `tps-mail: the replied/ marker for ${messageId} cannot be proven durable (${(err as Error).message}); NOT acked, left in new/ for a retry`,
+      );
+      return false;
+    }
+  }
+
+  // Set a mail aside for a human: held/<file> + held/<file>.reason. It is
+  // never answered and never refused on an unproven state.
+  private hold(file: string, reason: HoldReason, detail: string): void {
+    this.stats.held[reason] += 1;
+    const heldDir = join(this.inboxRoot, "held");
+    try {
+      mkdirSync(heldDir, { recursive: true });
+      renameSync(join(this.inboxRoot, "new", file), join(heldDir, file));
+      writeFileSync(
+        join(heldDir, `${file}.reason`),
+        `reason: ${reason}\n${detail}\nheld at ${new Date(this.now()).toISOString()}\nInspect the marker; if the mail was NOT answered, remove the marker and move the mail back to new/.\n`,
+        { mode: 0o600 },
+      );
+    } catch (err) {
+      this.log(`tps-mail: could not move ${file} to held/: ${(err as Error).message}`);
+      this.scheduleRetry(file);
+    }
+    this.log(`tps-mail: HELD ${file} for manual inspection (${reason}: ${detail})`);
+  }
+
+  // The marker for an id, as one of four outcomes: none; an I/O error reading
+  // it (retryable); a file that is not a marker bob wrote (malformed); or its
+  // binding.
   private readMarker(
     messageId: string,
-  ): { sender: string; digest: string } | "unreadable" | undefined {
+  ):
+    | { kind: "none" }
+    | { kind: "io-error"; code: string }
+    | { kind: "malformed" }
+    | { kind: "binding"; sender: string; digest: string } {
     let raw: string;
     try {
-      raw = readFileSync(this.markerPath(messageId), "utf8");
+      raw = this.readMarkerFile(this.markerPath(messageId));
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      return "unreadable";
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return { kind: "none" };
+      return { kind: "io-error", code: code ?? (err as Error).message };
     }
     try {
       const m = JSON.parse(raw) as { sender?: unknown; digest?: unknown };
       if (typeof m.sender === "string" && typeof m.digest === "string") {
-        return { sender: m.sender, digest: m.digest };
+        return { kind: "binding", sender: m.sender, digest: m.digest };
       }
     } catch {
       // falls through
     }
-    return "unreadable";
+    return { kind: "malformed" };
   }
 
   // A settled turn: the DURABLE marker, THEN the ack, THEN the count. A marker
