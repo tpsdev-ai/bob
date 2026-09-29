@@ -9,15 +9,16 @@
 //      fail THIS check, not sail through on the "Ran N tests" text alone;
 //   2. the child ran the WHOLE suite — Bun's end summary reports how many files
 //      it ran, and that count must equal the test files discovered under test/;
-//   3. nothing is left behind.
+//   3. no top-level entry other than the runtime's `jiti` cache is left behind.
 //
 // It is OPT-IN: the normal suite skips it (it spawns a whole second suite), and
 // CI runs it in its own job with BOB_LEAK_CHECK=1. A guard env var stops the
 // child from re-running THIS file, which would recurse.
 //
 // The runtime itself creates a couple of paths under TMPDIR during a run. They
-// are named EXPLICITLY below — never excluded by a broad pattern, so a real
-// test leak cannot hide behind the exclusion.
+// are named EXPLICITLY below (today only `jiti`), never by a broad pattern. The
+// exemption covers that whole top-level entry, so a leak INSIDE `jiti` would not
+// be detected; any other top-level leftover fails the check.
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
