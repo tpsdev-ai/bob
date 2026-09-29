@@ -24,6 +24,18 @@ refuses the call, naming the path it resolved, and starts nothing. This fixes
 where a command starts, not what it can reach: the command itself can still
 change directory.
 
+The directory a command STARTS in is the one that was CHECKED. `run` resolves
+and confines `cwd`, then holds the resolved directory open and pins its identity
+(device + inode), and re-checks the path against that pin immediately before the
+spawn — so a directory swapped for a symlink (or anything else) between the
+check and the spawn is refused, and nothing starts. It uses the re-check rather
+than a helper that changes into the pinned directory because Node has no
+`fchdir`, and no way to hand a child a directory descriptor as its working
+directory, so such a helper would be OS-specific. The residual window is between
+the re-check and the child's own `chdir` — a single stat→spawn step; closing it
+entirely needs the operating system's directory-descriptor boundary, which bob
+does not have.
+
 ## Enabling it
 
 The `work` capability is what enables `run`. `roles/builder-local/role.json`

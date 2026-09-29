@@ -335,6 +335,10 @@ export interface JobManagerOptions {
     code: number | null,
     signal: NodeJS.Signals | null,
   ) => { code: number | null; signal: NodeJS.Signals | null };
+  // Test seam: runs after the cwd is resolved and its identity pinned, and
+  // immediately before that identity is re-checked and the command spawned. A
+  // test swaps the checked directory here to prove the re-check refuses it.
+  beforeSpawn?: (resolvedCwd: string) => void | Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -370,6 +374,50 @@ function canonicalPath(p: string): string {
 function isInside(parent: string, child: string): boolean {
   const rel = relative(canonicalPath(parent), canonicalPath(child));
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+// A resolved directory's pinned identity: it is HELD OPEN (the fd keeps the
+// inode alive) so the device + inode can be re-checked against the path just
+// before the command is spawned. The path a child starts in is named by string
+// — Node has no fchdir — so a directory swapped between the check and the spawn
+// is caught by comparing these to a fresh stat of the path (see the README for
+// the residual window).
+interface DirPin {
+  fd: number;
+  dev: number;
+  ino: number;
+}
+
+function openDirectoryForPin(dir: string): DirPin {
+  let fd: number;
+  try {
+    // O_NOFOLLOW: the resolved path must be a real directory, not a symlink
+    // swapped in after resolveCwd canonicalised it.
+    fd = openSync(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "error";
+    throw new RunRefusal(
+      `run refused: the working directory ${dir} could not be opened to pin its identity (${code}). Nothing was started; check the directory exists and is readable.`,
+    );
+  }
+  const st = fstatSync(fd);
+  return { fd, dev: st.dev, ino: st.ino };
+}
+
+function assertDirectoryStillPinned(dir: string, pin: DirPin): void {
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(dir);
+  } catch {
+    throw new RunRefusal(
+      `run refused: the working directory ${dir} is gone (it was removed or replaced after it was checked). Nothing was started.`,
+    );
+  }
+  if (st.dev !== pin.dev || st.ino !== pin.ino) {
+    throw new RunRefusal(
+      `run refused: the working directory ${dir} was replaced after it was checked (device or inode changed). Nothing was started; a directory swapped between the check and the spawn could point outside the workspace.`,
+    );
+  }
 }
 
 // An owner-only directory: a real directory (not a symlink), owned by this user,
@@ -570,6 +618,7 @@ export class JobManager {
   private readonly captureMaxBytes: number;
   private readonly groupOps: GroupOps;
   private readonly observeExit: NonNullable<JobManagerOptions["observeExit"]>;
+  private readonly beforeSpawn: JobManagerOptions["beforeSpawn"];
   private readonly readIdentity: IdentityReader;
   private readonly writeRecord: (path: string, value: unknown) => void;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -586,6 +635,7 @@ export class JobManager {
     this.captureMaxBytes = opts.captureMaxBytes ?? CAPTURE_MAX_BYTES;
     this.groupOps = opts.groupOps ?? NODE_GROUP_OPS;
     this.observeExit = opts.observeExit ?? ((code, signal) => ({ code, signal }));
+    this.beforeSpawn = opts.beforeSpawn;
     this.readIdentity = opts.readIdentity ?? readProcIdentity;
     this.writeRecord = opts.writeRecord ?? writeJsonAtomic;
     this.log = opts.log ?? ((m: string) => console.error(m));
@@ -760,8 +810,16 @@ export class JobManager {
       );
     }
 
+    // The directory the command STARTS in must be the one that was CHECKED.
+    // Hold the resolved directory open, pin its identity, re-check the path
+    // immediately before the spawn, then spawn. The test seam (beforeSpawn)
+    // runs between the pin and the re-check.
+    let cwdPin: DirPin | undefined;
     let child: ChildProcess;
     try {
+      cwdPin = openDirectoryForPin(cwd);
+      await this.beforeSpawn?.(cwd);
+      assertDirectoryStillPinned(cwd, cwdPin);
       // Detached: the child leads its own session and process group
       // (pgid = its pid), as pi's bash tool starts Unix commands. stdin is
       // closed, as in pi's bash; the environment is bob's own (pi's bash also
@@ -776,9 +834,13 @@ export class JobManager {
     } catch (err) {
       closeSync(captureFd);
       rmSync(capturePath, { force: true });
+      // A refusal from the pin re-check (nothing started) is reported as-is.
+      if (err instanceof RunRefusal) throw err;
       throw new RunRefusal(
         `run could not start ${shell.shell}: ${(err as Error).message}. Nothing was started.`,
       );
+    } finally {
+      if (cwdPin !== undefined) closeSync(cwdPin.fd);
     }
     if (child.pid === undefined) {
       const code = await new Promise<string>((done) => {

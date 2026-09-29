@@ -13,13 +13,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
 import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
@@ -746,5 +750,44 @@ describe("run — refusals name actor, state and remedy", () => {
     expect(r.isError).toBe(true);
     expect(r.text).toContain("run refused: this run already has 1 running job (run-1)");
     expect(r.text).toContain("run_cancel");
+  }, 20_000);
+});
+
+describe("run — the directory a command starts in is the one that was checked (bob#224)", () => {
+  it("refuses when the checked cwd is replaced by a symlink to an outside dir between resolution and spawn", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "bob-run-outside-"));
+    try {
+      live = await workSession({
+        wire: {
+          // Swap the CHECKED directory for a symlink to an outside directory, in
+          // the window the pin re-check closes (between resolution and spawn).
+          beforeSpawn: (cwd) => {
+            rmSync(cwd, { recursive: true, force: true });
+            symlinkSync(outside, cwd);
+          },
+        },
+        script: program(call("run", { command: "true", cwd: "sub" })),
+      });
+      mkdirSync(join(live.cwd, "sub"), { recursive: true });
+      await live.prompt();
+      const r = lastOf(live.results, "run");
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/was replaced after it was checked/);
+      expect(r.text).toMatch(/[Nn]othing was started/);
+      // Nothing started: the manager holds no job.
+      expect(live.work.manager.list()).toEqual([]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("a normal in-workspace cwd still runs", async () => {
+    live = await workSession({ script: program(call("run", { command: "true", cwd: "sub" })) });
+    mkdirSync(join(live.cwd, "sub"), { recursive: true });
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.isError).toBe(false);
+    expect(r.details.outcome).toBe("exited");
+    expect(r.details.exit_code).toBe(0);
   }, 20_000);
 });
