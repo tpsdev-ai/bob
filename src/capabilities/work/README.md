@@ -89,11 +89,17 @@ named error.
 ## Output
 
 - stdout and stderr are captured, in arrival order, to `output_ref`: a file
-  (mode 0600) in a per-run directory (0700) under an owner-only state directory,
+  (mode 0600) in the run's own directory under an owner-only state directory,
   `<temp dir>/bob-work-<uid>/` — outside the git worktree, so it can never be a
   committable stray file, and never a shared path. `run` refuses to start when
-  that directory is inside the workspace, is a symlink, belongs to another user,
-  or is readable by group or others.
+  that state directory is inside the workspace, is a symlink, belongs to another
+  user, or is readable by group or others.
+- The run's directory is created by `mkdtemp` under the verified state
+  directory: a fresh, unpredictable name (`run-XXXXXX`), mode 0700, never an
+  existing entry. Each capture file is created inside it exclusively
+  (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600): anything already at the path — a
+  file, or a live or dangling symlink — refuses the call by name, nothing is
+  started, and nothing is written through it.
 - **It is same-user readable.** The permissions keep it off the candidate tree
   and out of shared paths; they are not a confidentiality boundary against code
   running as the same user.
@@ -121,7 +127,7 @@ named error.
 ## Job state and the sweeps
 
 - Every job is recorded on disk, keyed by its process group, in the run's own
-  state directory: `<state dir>/run-<pid>-<ms>-<hex>/jobs/pg-<pgid>.<run_id>.json`
+  state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`
   (supervisor pid, deadline, the group leader's start time, command digest,
   outcome, cleanup).
 - **Run end.** When pi ends the session (`session_shutdown`), every job the run

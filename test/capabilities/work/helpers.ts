@@ -125,6 +125,14 @@ export interface LiveWork {
 }
 
 // Test timings: short grace periods, the production defaults otherwise.
+// The probe extension pi loads: CONSTANT text, with no value built into it. It
+// calls the one wiring hook the harness installs on globalThis while this
+// session loads (WIRE_HOOK below), so everything per-session — the scratch
+// state root, the timings, the log — reaches the capability as data.
+const WIRE_HOOK = "__bobWorkTestWire";
+const PROBE_SOURCE =
+  "export default async function (pi) { await globalThis.__bobWorkTestWire(pi); }\n";
+
 export const FAST: Partial<JobManagerOptions> = {
   killGraceMs: 400,
   reapLimitMs: 1500,
@@ -143,15 +151,11 @@ export async function workSession(opts: {
   mkdirSync(cwd, { recursive: true });
   mkdirSync(piAgentDir, { recursive: true });
   const stateRoot = opts.stateRoot ?? join(scratch, "state");
-  const key = `__bobWorkTestWire_${Math.random().toString(36).slice(2)}`;
   const probePath = join(scratch, "work-probe.js");
-  writeFileSync(
-    probePath,
-    `export default async function (pi) { await globalThis[${JSON.stringify(key)}](pi); }\n`,
-  );
+  writeFileSync(probePath, PROBE_SOURCE);
   const logs: string[] = [];
   let work: WorkSession | undefined;
-  (globalThis as unknown as Record<string, unknown>)[key] = async (pi: unknown) => {
+  const wire = async (pi: unknown) => {
     work = wireWork({
       pi: pi as Parameters<typeof wireWork>[0]["pi"],
       stateRoot,
@@ -205,11 +209,22 @@ export async function workSession(opts: {
     deps: { log: (m) => logs.push(m), exit: () => {} },
     modelRuntime,
   });
-  const runtime = await createAgentSessionRuntime(factory, {
-    cwd,
-    agentDir: piAgentDir,
-    sessionManager: SessionManager.inMemory(cwd),
-  });
+  // The hook is installed only while THIS session loads; one load at a time.
+  const hooks = globalThis as unknown as Record<string, unknown>;
+  if (hooks[WIRE_HOOK] !== undefined) {
+    throw new Error("workSession: another work session is loading; load them one at a time");
+  }
+  hooks[WIRE_HOOK] = wire;
+  let runtime: AgentSessionRuntime;
+  try {
+    runtime = await createAgentSessionRuntime(factory, {
+      cwd,
+      agentDir: piAgentDir,
+      sessionManager: SessionManager.inMemory(cwd),
+    });
+  } finally {
+    delete hooks[WIRE_HOOK];
+  }
   if (!work) throw new Error("the work capability did not load into the session");
   const results: ToolOutcome[] = [];
   runtime.session.subscribe((event: unknown) => {
@@ -252,7 +267,6 @@ export async function workSession(opts: {
           // gone
         }
       }
-      delete (globalThis as unknown as Record<string, unknown>)[key];
       rmSync(scratch, { recursive: true, force: true });
     },
   };

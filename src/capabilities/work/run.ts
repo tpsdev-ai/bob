@@ -34,6 +34,7 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -398,6 +399,8 @@ export function readExcerpt(
   const maxBytes = opts.maxBytes ?? EXCERPT_MAX_BYTES;
   const maxLines = opts.maxLines ?? EXCERPT_MAX_LINES;
   const margin = opts.marginBytes ?? REDACTION_MARGIN_BYTES;
+  // Read-only, never through a symlink, and only a regular file. The runner
+  // passes a capture it created exclusively in its own mkdtemp'd run directory.
   let fd: number;
   try {
     fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
@@ -405,7 +408,9 @@ export function readExcerpt(
     return { text: "", truncated: false, redactions: 0, bytes: 0 };
   }
   try {
-    const size = fstatSync(fd).size;
+    const st = fstatSync(fd);
+    if (!st.isFile()) return { text: "", truncated: false, redactions: 0, bytes: 0 };
+    const size = st.size;
     const start = Math.max(0, size - (maxBytes + margin));
     const buf = Buffer.alloc(size - start);
     let off = 0;
@@ -439,10 +444,9 @@ export function readExcerpt(
 // their registry records and their output captures.
 export class JobManager {
   readonly stateRoot: string;
-  readonly runDir: string;
-  private readonly jobsDir: string;
-  private readonly outDir: string;
-  private runDirReady = false;
+  // The run's own directory, created on the first `run` by mkdtemp under the
+  // state root: a fresh, unpredictable name, mode 0700. Null until then.
+  private dirs: { run: string; jobs: string; out: string } | null = null;
   private readonly jobs = new Map<string, Job>();
   private seq = 0;
   private ended = false;
@@ -459,12 +463,6 @@ export class JobManager {
 
   constructor(opts: JobManagerOptions = {}) {
     this.stateRoot = opts.stateRoot ?? defaultStateRoot();
-    this.runDir = join(
-      this.stateRoot,
-      `run-${process.pid}-${Date.now()}-${randomBytes(3).toString("hex")}`,
-    );
-    this.jobsDir = join(this.runDir, "jobs");
-    this.outDir = join(this.runDir, "out");
     this.defaultTimeoutS = opts.defaultTimeoutS ?? DEFAULT_TIMEOUT_S;
     this.maxTimeoutS = opts.maxTimeoutS ?? MAX_TIMEOUT_S;
     this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
@@ -521,7 +519,7 @@ export class JobManager {
     return dir;
   }
 
-  private ensureRunDir(workspaces: string[]): void {
+  private ensureRunDir(workspaces: string[]): { run: string; jobs: string; out: string } {
     for (const w of workspaces) {
       if (isInside(w, this.stateRoot)) {
         throw new RunRefusal(
@@ -529,18 +527,36 @@ export class JobManager {
         );
       }
     }
-    if (this.runDirReady) return;
+    if (this.dirs !== null) return this.dirs;
+    // The tool's own base: owner-only, verified (not a symlink, this user's,
+    // no group/world bits) before anything is created under it.
     ensurePrivateDir(this.stateRoot, true);
-    mkdirSync(this.runDir, { mode: 0o700 });
-    ensurePrivateDir(this.runDir, false);
-    mkdirSync(this.jobsDir, { mode: 0o700 });
-    mkdirSync(this.outDir, { mode: 0o700 });
-    writeJsonAtomic(join(this.runDir, "run.json"), {
+    // The run's directory: mkdtemp picks a fresh, unpredictable name and
+    // creates it 0700 — never a predictable path, never an existing entry.
+    let run: string;
+    try {
+      run = mkdtempSync(join(this.stateRoot, "run-"));
+    } catch (err) {
+      throw new RunRefusal(
+        `run refused: a private run directory could not be created under ${this.stateRoot} (${(err as NodeJS.ErrnoException).code ?? "error"}). Nothing was started; check the temp directory is writable.`,
+      );
+    }
+    ensurePrivateDir(run, false);
+    const dirs = { run, jobs: join(run, "jobs"), out: join(run, "out") };
+    mkdirSync(dirs.jobs, { mode: 0o700 });
+    mkdirSync(dirs.out, { mode: 0o700 });
+    writeJsonAtomic(join(run, "run.json"), {
       v: 1,
       supervisor_pid: process.pid,
       started_at: new Date().toISOString(),
     });
-    this.runDirReady = true;
+    this.dirs = dirs;
+    return dirs;
+  }
+
+  // The run's own directory, or null before the first `run` created it.
+  get runDir(): string | null {
+    return this.dirs?.run ?? null;
   }
 
   // --- start -----------------------------------------------------------------
@@ -568,7 +584,7 @@ export class JobManager {
         `run refused: this run already has ${live.length} running job${live.length === 1 ? "" : "s"} (${live.map((j) => j.runId).join(", ")}), the most one run may hold. Wait for one to finish (run_status) or stop one (run_cancel), then retry.`,
       );
     }
-    this.ensureRunDir(ctxCwd === undefined ? [cwd] : [ctxCwd, cwd]);
+    const dirs = this.ensureRunDir(ctxCwd === undefined ? [cwd] : [ctxCwd, cwd]);
 
     const shell = PI_PRIMITIVES.getShellConfig();
     if (shell.commandTransport === "stdin") {
@@ -579,12 +595,27 @@ export class JobManager {
 
     this.seq += 1;
     const runId = `run-${this.seq}`;
-    const capturePath = join(this.outDir, `${runId}.log`);
-    const captureFd = openSync(
-      capturePath,
-      fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW,
-      0o600,
-    );
+    const capturePath = join(dirs.out, `${runId}.log`);
+    // Exclusive creation, owner-only, never through an existing entry: O_EXCL
+    // refuses anything already at the path (a file, a dangling or live
+    // symlink), and O_NOFOLLOW refuses a symlink outright.
+    let captureFd: number;
+    try {
+      captureFd = openSync(
+        capturePath,
+        fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW,
+        0o600,
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "error";
+      const why =
+        code === "EEXIST" || code === "ELOOP"
+          ? "something already occupies that path in this run's private directory"
+          : "the file system refused it";
+      throw new RunRefusal(
+        `run refused: the capture file ${capturePath} could not be created exclusively (${code}); ${why}. Nothing was started, and nothing was written through it. Retry: the next job gets a new capture path.`,
+      );
+    }
 
     let child: ChildProcess;
     try {
@@ -642,7 +673,7 @@ export class JobManager {
       commandSha: createHash("sha256").update(command).digest("hex"),
       cwd,
       capturePath,
-      entryPath: join(this.jobsDir, `pg-${child.pid}.${runId}.json`),
+      entryPath: join(dirs.jobs, `pg-${child.pid}.${runId}.json`),
       captureFd,
       captureBytes: 0,
       droppedBytes: 0,
@@ -1073,16 +1104,17 @@ export class JobManager {
   }
 
   private closeRunDir(): void {
-    if (!this.runDirReady) return;
+    const dirs = this.dirs;
+    if (dirs === null) return;
     try {
-      rmSync(this.outDir, { recursive: true, force: true });
-      writeJsonAtomic(join(this.runDir, "ended.json"), {
+      rmSync(dirs.out, { recursive: true, force: true });
+      writeJsonAtomic(join(dirs.run, "ended.json"), {
         v: 1,
         ended_at: new Date().toISOString(),
         supervisor_pid: process.pid,
       });
     } catch (err) {
-      this.log(`work: could not close the run directory ${this.runDir}: ${(err as Error).message}`);
+      this.log(`work: could not close the run directory ${dirs.run}: ${(err as Error).message}`);
     }
   }
 
@@ -1113,9 +1145,9 @@ export class JobManager {
     }
     const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
     for (const name of names) {
-      if (!/^run-\d+-\d+-[0-9a-f]+$/.test(name)) continue;
+      if (!/^run-[A-Za-z0-9-]+$/.test(name)) continue;
       const dir = join(this.stateRoot, name);
-      if (dir === this.runDir) continue;
+      if (dir === this.dirs?.run) continue;
       let st: ReturnType<typeof lstatSync>;
       try {
         st = lstatSync(dir);

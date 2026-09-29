@@ -23,6 +23,18 @@ const CAPABILITY = join(
   "capability.ts",
 );
 
+// The child supervisor: CONSTANT text. What it needs (the capability module,
+// the state root, the workspace) arrives through its environment.
+const SUPERVISOR_SOURCE = `const { wireWork } = await import(process.env.WORK_TEST_CAPABILITY);
+const tools = new Map();
+const pi = { registerTool(t) { tools.set(t.name, t); } };
+const { bootSweep } = wireWork({ pi, stateRoot: process.env.WORK_TEST_STATE_ROOT });
+await bootSweep;
+const res = await tools.get("run").execute("c1", { command: "sleep 30", background: true }, undefined, undefined, { cwd: process.env.WORK_TEST_WORKSPACE });
+process.stdout.write(JSON.stringify({ pgid: res.details.pgid }) + "\\n");
+process.exit(0);
+`;
+
 let scratch: string | undefined;
 let pgid = 0;
 afterEach(() => {
@@ -45,19 +57,19 @@ describe("run end on process exit", () => {
     const workspace = join(scratch, "workspace");
     mkdirSync(workspace);
     const script = join(scratch, "supervisor.ts");
-    writeFileSync(
-      script,
-      `import { wireWork } from ${JSON.stringify(CAPABILITY)};
-const tools = new Map();
-const pi = { registerTool(t) { tools.set(t.name, t); } };
-const { bootSweep } = wireWork({ pi, stateRoot: ${JSON.stringify(stateRoot)} });
-await bootSweep;
-const res = await tools.get("run").execute("c1", { command: "sleep 30", background: true }, undefined, undefined, { cwd: ${JSON.stringify(workspace)} });
-process.stdout.write(JSON.stringify({ pgid: res.details.pgid }) + "\\n");
-process.exit(0);
-`,
-    );
-    const child = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 20_000 });
+    writeFileSync(script, SUPERVISOR_SOURCE);
+    // Every value reaches the child as data (its environment); the script text
+    // is constant.
+    const child = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        WORK_TEST_CAPABILITY: CAPABILITY,
+        WORK_TEST_STATE_ROOT: stateRoot,
+        WORK_TEST_WORKSPACE: workspace,
+      },
+    });
     expect(child.status).toBe(0);
     pgid = Number(JSON.parse(child.stdout.trim().split("\n").pop() ?? "{}").pgid);
     expect(pgid).toBeGreaterThan(1);

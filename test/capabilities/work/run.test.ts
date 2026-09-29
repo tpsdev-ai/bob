@@ -10,8 +10,16 @@
 // leader of a group the tool started) are ever signalled, by pid/pgid.
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, join } from "node:path";
 import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
 
@@ -253,6 +261,76 @@ describe("run — output", () => {
   }, 20_000);
 });
 
+describe("run — private run directory, exclusive capture files", () => {
+  it("the run directory is a fresh mkdtemp directory (0700, unpredictable name); captures are 0600", async () => {
+    live = await workSession({
+      script: program(call("run", { command: "echo a" }), call("run", { command: "echo b" })),
+    });
+    await live.prompt();
+    const runDir = String(live.work.manager.runDir);
+    // mkdtemp's shape: the prefix and random characters only — no pid, no
+    // timestamp, nothing a process could predict and pre-create.
+    expect(basename(runDir)).toMatch(/^run-[A-Za-z0-9]{6}$/);
+    expect(basename(runDir)).not.toContain(String(process.pid));
+    expect(join(runDir, "..")).toBe(live.stateRoot);
+    for (const dir of [live.stateRoot, runDir, join(runDir, "out"), join(runDir, "jobs")]) {
+      const st = lstatSync(dir);
+      expect(st.isDirectory() && !st.isSymbolicLink(), dir).toBe(true);
+      expect(st.mode & 0o777, dir).toBe(0o700);
+    }
+    for (const r of live.results) {
+      const ref = String(r.details.output_ref);
+      expect(join(ref, "..")).toBe(join(runDir, "out"));
+      expect(lstatSync(ref).isFile()).toBe(true);
+      expect(lstatSync(ref).mode & 0o777).toBe(0o600);
+    }
+    for (const f of readdirSync(join(runDir, "jobs"))) {
+      expect(lstatSync(join(runDir, "jobs", f)).mode & 0o777, f).toBe(0o600);
+    }
+  }, 20_000);
+
+  it("a symlink or a file already at a capture path is never written through", async () => {
+    let victim = "";
+    let planted = "";
+    const outDir = () => join(String(live?.work.manager.runDir), "out");
+    live = await workSession({
+      script: program(
+        call("run", { command: "echo first" }),
+        effect(() => {
+          // A symlink at the NEXT capture path, pointing at a file outside.
+          victim = join(String(live?.scratch), "victim.txt");
+          writeFileSync(victim, "victim: untouched\n");
+          symlinkSync(victim, join(outDir(), "run-2.log"));
+        }),
+        call("run", { command: "echo THROUGH-THE-SYMLINK" }),
+        effect(() => {
+          // A plain file at the capture path after that.
+          planted = join(outDir(), "run-3.log");
+          writeFileSync(planted, "planted: untouched\n");
+        }),
+        call("run", { command: "echo INTO-THE-FILE" }),
+        call("run", { command: "echo after" }),
+      ),
+    });
+    await live.prompt();
+    const [first, viaLink, viaFile, after] = live.results;
+    expect(first.details.outcome).toBe("exited");
+    for (const r of [viaLink, viaFile]) {
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("could not be created exclusively (EEXIST)");
+      expect(r.text).toContain("something already occupies that path");
+      expect(r.text).toContain("Nothing was started, and nothing was written through it");
+    }
+    // Nothing was written through either entry, and neither was replaced.
+    expect(readFileSync(victim, "utf8")).toBe("victim: untouched\n");
+    expect(lstatSync(join(outDir(), "run-2.log")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(planted, "utf8")).toBe("planted: untouched\n");
+    // The refused calls started no job; the next call works on a fresh path.
+    expect(after.details).toMatchObject({ run_id: "run-4", outcome: "exited", success: true });
+    expect(live.work.manager.list().map((j) => j.runId)).toEqual(["run-1", "run-4"]);
+  }, 20_000);
+});
+
 // A command whose descendant leaves the job's process group (setsid via a
 // detached spawn) while keeping the job's stdout pipe open for 8 s. It prints
 // the escapee's pid so the test can end it (a process the test's command
@@ -377,7 +455,8 @@ describe("run — background jobs and owned cancellation", () => {
     await live.prompt();
     const pgids = live.results.map((r) => Number(r.details.pgid));
     for (const p of pgids) expect(groupAlive(p)).toBe(true);
-    const runDir = live.work.manager.runDir;
+    const runDir = String(live.work.manager.runDir);
+    expect(existsSync(runDir)).toBe(true);
     // End the run the way pi ends one: session_shutdown, then dispose.
     await live.runtime.dispose();
     for (const p of pgids) expect(await waitFor(() => !groupAlive(p), 3000)).toBe(true);
