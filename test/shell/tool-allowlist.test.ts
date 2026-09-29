@@ -4,14 +4,20 @@
 // the pieces those reach only indirectly.
 import { describe, expect, it } from "bun:test";
 import { BobYamlError, readResident, readTools } from "../../src/shell/bob-yaml.js";
+import { BLESSED_CATALOG } from "../../src/shell/capability-catalog.js";
 import { loadRole } from "../../src/shell/role-loader.js";
 import {
   auditToolNames,
   knownToolNames,
+  PI_BUILTIN_TOOLS,
+  RESIDENT_EXCLUDED_TOOLS,
   type RoleToolCeiling,
   residentDroppedTools,
+  residentExclusions,
   resolveToolNames,
   resolveToolPolicy,
+  TOOL_EFFECTS,
+  unclassifiedToolNames,
 } from "../../src/shell/tool-allowlist.js";
 
 // The block exactly as `bob init` emits it.
@@ -229,7 +235,16 @@ describe("resolveToolPolicy", () => {
       allowResidentShell: true,
     });
     expect(p.allowResidentShell).toBe(false);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 
   it("REFUSES allowResidentShell: true when the role does not grant it", () => {
@@ -270,7 +285,16 @@ describe("resolveToolPolicy", () => {
     const yaml = "resident: true\ntools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, true);
     expect(p.tools).toEqual(["read", "bash"]);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
     expect(residentDroppedTools(p)).toEqual(["bash"]);
   });
 
@@ -278,7 +302,16 @@ describe("resolveToolPolicy", () => {
     const yaml = "tools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, false, true);
     expect(p.resident).toBe(true);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 
   it("keeps the shell when the role opts in with allowResidentShell", () => {
@@ -293,7 +326,16 @@ describe("resolveToolPolicy", () => {
   it("unions a declared exclude with the resident exclusions, without duplicates", () => {
     const yaml =
       "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  exclude:\n    - bash\n";
-    expect(policy(yaml, true).excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(policy(yaml, true).excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 });
 
@@ -345,5 +387,94 @@ describe("shipped roles", () => {
     }
     // Not a pi tool, never indexed as one.
     expect(names).not.toContain("webfetch");
+  });
+});
+
+// bob#213: the resident policy is allowlist-shaped over TOOL_EFFECTS, a reviewed
+// classification of every tool an agent's allowlist can name.
+describe("the reviewed tool classification (TOOL_EFFECTS)", () => {
+  // Enumerated HERE, not through the source's own helpers, from the authority
+  // the name resolution uses: pi's built-ins plus every blessed capability's
+  // manifest `provides.tools`, planned capabilities included.
+  function providedHere(): string[] {
+    const names = new Set<string>(PI_BUILTIN_TOOLS);
+    for (const [capability, entry] of Object.entries(BLESSED_CATALOG)) {
+      const tools = entry.manifest.provides?.tools;
+      // A manifest with no tools array would add nothing, silently.
+      expect({ capability, isArray: Array.isArray(tools) }).toEqual({ capability, isArray: true });
+      for (const tool of tools ?? []) names.add(tool);
+    }
+    return [...names];
+  }
+
+  it("the enumeration reaches the capabilities' tools (it is not empty)", () => {
+    const names = providedHere();
+    for (const name of [
+      "write_file",
+      "edit_lines",
+      "insert_after",
+      "run",
+      "run_cancel",
+      "flair_write",
+      "discord_reply",
+      "reachy_frame",
+      "observatory_report",
+      "bob_fixture_noop",
+      "mail_send",
+    ]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("classifies every tool pi or a blessed capability provides", () => {
+    // Adding a tool to a manifest without a TOOL_EFFECTS row turns this red,
+    // naming the tool.
+    expect(providedHere().filter((name) => !Object.hasOwn(TOOL_EFFECTS, name))).toEqual([]);
+    // The source's own view agrees; it is what the resident exclusion reads.
+    expect(unclassifiedToolNames()).toEqual([]);
+  });
+
+  it("has no row for a name nothing provides", () => {
+    const provided = new Set(providedHere());
+    expect(Object.keys(TOOL_EFFECTS).filter((name) => !provided.has(name))).toEqual([]);
+  });
+
+  it("a resident agent drops exactly the writer rows", () => {
+    expect(RESIDENT_EXCLUDED_TOOLS).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
+    expect(RESIDENT_EXCLUDED_TOOLS).toEqual(
+      Object.keys(TOOL_EFFECTS).filter((name) => TOOL_EFFECTS[name] === "writer"),
+    );
+  });
+
+  it("a resident agent keeps every read-only and effect tool, and nothing else", () => {
+    const all = knownToolNames();
+    const yaml = `tools:\n  allow:\n${all.map((name) => `    - ${name}`).join("\n")}\n`;
+    const p = resolveToolPolicy({ yamlText: yaml, tools: readTools(yaml), resident: true });
+    const kept = p.tools.filter((name) => !p.excludeTools.includes(name));
+    expect(kept).toEqual(
+      all.filter((name) => TOOL_EFFECTS[name] === "read-only" || TOOL_EFFECTS[name] === "effect"),
+    );
+    expect(kept).toContain("flair_write");
+    expect(kept).toContain("discord_reply");
+    expect(kept).toContain("run_cancel");
+    expect(kept).not.toContain("write_file");
+  });
+
+  it("fails closed: a provided name with no row is dropped, not kept", () => {
+    const effects = { read: "read-only", bash: "writer" } as const;
+    expect(unclassifiedToolNames(["read", "bash", "save_file"], effects)).toEqual(["save_file"]);
+    expect(residentExclusions(["read", "bash", "save_file"], effects)).toEqual([
+      "bash",
+      "save_file",
+    ]);
   });
 });

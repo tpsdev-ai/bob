@@ -239,10 +239,15 @@ change one, the named test is what tells you.
   replace pi's `bash` in `roles/builder-local/role.json`. An omitted timeout gets
   the 600 s default (3600 s maximum); the tool owns each job's process group and
   cancels only those, by recorded group id; every job still running when the run
-  ends is cancelled, and a restarted agent reports what a crashed run left,
-  cancelling a job only while its leader's identity can be pinned (Linux). The
-  command's `outcome` and the verified `cleanup_state` are reported separately,
-  and only a clean exit 0 is success. `run` counts as a shell for the resident
+  ends is cancelled. When a restarted agent loads the capability, its boot sweep
+  logs each job a crashed run left that it can inspect, in the runtime log, and
+  attempts to record it in that job's registry record (`reaped_by`; that write
+  can fail, and the log line is written either way); none of it enters the
+  restarted session's model context. The sweep signals a leftover job only while its
+  leader's identity can be pinned (Linux). `run`'s `cwd` must resolve, through
+  symlinks, to a directory inside the workspace. The command's `outcome` and the
+  verified `cleanup_state` are reported separately, and only a clean exit 0 is
+  success. `run` counts as a shell for the resident
   policy. It is a process-group backend running as the same user, not a sandbox.
   There is no in-bob run wall clock yet: an unattended launch must be bounded by
   its launcher. *(`test/capabilities/work/`, `src/capabilities/work/README.md`)*
