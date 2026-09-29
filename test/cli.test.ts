@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -11,6 +11,16 @@ import { operatorCredentialForms } from "./shell/flair-fake.js";
 
 const CLI = join(import.meta.dir, "..", "dist", "cli.js");
 
+// Every scratch HOME this file creates is tracked here and removed in the
+// file-scope afterAll, so a test that returns early or throws still leaves no
+// temporary directory behind (issue #221).
+const _cliTmpDirs: string[] = [];
+function scratchDir(prefix: string): string {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  _cliTmpDirs.push(d);
+  return d;
+}
+
 describe("bob CLI", () => {
   it("hire keeps the agent name positional after a bare --flair", () => {
     expect(parseArgs(["hire", "--flair", "flagged", "--as", "builder"]).positional).toEqual([
@@ -22,7 +32,7 @@ describe("bob CLI", () => {
     ["--flair=false", "flagged"],
     ["--flair", "flagged"],
   ])("hire refuses unsupported %s before creating an agent", (flag, name) => {
-    const home = mkdtempSync(join(tmpdir(), "bob-hire-flair-"));
+    const home = scratchDir("bob-hire-flair-");
     const args =
       flag === "--flair"
         ? [CLI, "hire", flag, name, "--as", "builder"]
@@ -130,7 +140,7 @@ describe("bob CLI", () => {
   });
 
   it("align refuses a URL that differs from bob.yaml before opening the setup session", () => {
-    const home = mkdtempSync(join(tmpdir(), "bob-align-pin-cli-"));
+    const home = scratchDir("bob-align-pin-cli-");
     try {
       const agent = initAgent({
         name: "testbot",
@@ -207,7 +217,7 @@ describe("bob CLI", () => {
 // agent tree.
 describe("--key=value boolean flags (parser-to-CLI)", () => {
   function scratchHome(): string {
-    return mkdtempSync(join(tmpdir(), "bob-boolflag-"));
+    return scratchDir("bob-boolflag-");
   }
   // Run a CLI subcommand with HOME pointed at a scratch dir. `args` is an argv
   // array (no shell, no splitting) passed straight to spawnNode, so a value with
@@ -496,7 +506,7 @@ describe("bob onboard against a Flair that reflects request headers", () => {
   for (const reflect of ["authorization", "decoded-basic"] as const) {
     for (const failAt of ["registration", "soul"] as const) {
       it(`prints no operator credential when ${failAt} fails (${reflect})`, async () => {
-        const home = mkdtempSync(join(tmpdir(), "bob-reflect-cli-"));
+        const home = scratchDir("bob-reflect-cli-");
         const flair = await localFlair(failAt, reflect);
         try {
           const run = await onboardCli({ home, flairUrl: flair.url, filePassword: PLACEHOLDER });
@@ -552,7 +562,7 @@ describe("bob onboard when an operator request fails in transport", () => {
 
   for (const c of cases) {
     it(`prints no operator credential when the ${c.name}`, async () => {
-      const home = mkdtempSync(join(tmpdir(), "bob-transport-cli-"));
+      const home = scratchDir("bob-transport-cli-");
       const flair = await localFlair("none");
       try {
         const preload = fetchPreload(home, c.preload);
@@ -581,7 +591,7 @@ describe("bob onboard takes FLAIR_ADMIN_PASS out of its environment", () => {
   const FILE_PASSWORD = "file-placeholder-not-a-real-admin-credential";
 
   it("before any request, and hands it to registration only", async () => {
-    const home = mkdtempSync(join(tmpdir(), "bob-envpass-cli-"));
+    const home = scratchDir("bob-envpass-cli-");
     const flair = await localFlair("none");
     try {
       const preload = fetchPreload(home, { stage: "none" });
@@ -619,4 +629,8 @@ describe("bob onboard takes FLAIR_ADMIN_PASS out of its environment", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+afterAll(() => {
+  for (const d of _cliTmpDirs) rmSync(d, { recursive: true, force: true });
 });
