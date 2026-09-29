@@ -79,6 +79,8 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
+**Service units run bob under Node.** `bob install-service <name>` writes `<node> <bob> run <name>`, resolving an absolute Node executable at install time — the installer's own interpreter when it is Node, otherwise the `node` found on its PATH — and REFUSES, naming the remedy, when no Node is found. A unit that is already installed keeps its old command until it is rewritten, so after upgrading bob, reinstall it: `bob down <name>`, `bob install-service <name>` (with the same flags as before, e.g. `--model`), then `bob up <name>`.
+
 ## Positions
 
 A **position** is a packaged, role-compatible preset — a starting shape for an
