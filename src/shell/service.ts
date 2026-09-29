@@ -26,9 +26,9 @@
 // real init system.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 // Strict class init.ts/run.ts use — agent names are filesystem paths AND get
 // embedded in the unit Label / file name / ExecStart, so this doubles as path,
@@ -50,11 +50,79 @@ function assertName(name: string): void {
   }
 }
 
+// The Node version range the package requires. Mirrors package.json's
+// `engines.node`; the install-time refusal below names it as the remedy.
+const NODE_ENGINES_FLOOR = ">=22.19.0";
+
+export interface NodeResolutionDeps {
+  // The installing process's own interpreter. Defaults to process.execPath.
+  execPath?: string;
+  // The installing process's PATH. Defaults to process.env.PATH.
+  pathEnv?: string;
+  // Whether a candidate path is a REGULAR EXECUTABLE file. Defaults to an fs
+  // check (regular file + X_OK); injected in tests.
+  isExecutable?: (file: string) => boolean;
+}
+
+function defaultIsExecutable(file: string): boolean {
+  try {
+    if (!statSync(file).isFile()) return false;
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The basename of an executable path, without a Windows extension.
+function executableBasename(file: string): string {
+  const base = basename(file);
+  return process.platform === "win32" ? base.replace(/\.exe$/i, "") : base;
+}
+
+// Resolve an ABSOLUTE Node executable for the unit, at install time.
+//
+// The unit must run bob under NODE — bin/bob's shebang and package.json's
+// `engines` say so — whatever runtime ran install-service. When the installer
+// IS node that is its own process.execPath. Otherwise (e.g. a developer runs
+// install-service under bun) we look for `node` on the installer's PATH. If
+// neither yields a Node, installation is REFUSED (the throw names the remedy)
+// rather than writing a unit that would run bob under a non-Node runtime.
+export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
+  const execPath = deps.execPath ?? process.execPath;
+  if (executableBasename(execPath).toLowerCase() === "node") {
+    return execPath;
+  }
+  const pathEnv = deps.pathEnv ?? process.env.PATH ?? "";
+  const isExecutable = deps.isExecutable ?? defaultIsExecutable;
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  for (const dir of pathEnv.split(delimiter)) {
+    if (!dir) continue;
+    // resolve() against the installer's working directory, so a RELATIVE PATH
+    // entry still yields an ABSOLUTE interpreter in the unit; defaultIsExecutable
+    // then requires a regular file (a directory named `node` is skipped).
+    const candidate = resolve(dir, "node");
+    if (isExecutable(candidate)) return candidate;
+  }
+  throw new Error(
+    `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.`,
+  );
+}
+
 export interface RenderServiceOptions {
   name: string;
   // Absolute path to the `bob` binary the unit runs. Both init systems use a
   // minimal PATH, so this MUST be absolute (the caller resolves it). Required.
   bobBin: string;
+  // Absolute path to the interpreter that runs `bobBin`. The unit must run bob
+  // under NODE (bin/bob's shebang + package.json engines), whatever runtime ran
+  // install-service, so this defaults to the resolved Node executable
+  // (resolveNodeExecutable) — never to the installer's own interpreter when
+  // that is not Node. Both init systems launch the unit with a minimal PATH, so
+  // the interpreter is started by ABSOLUTE path with the bob script as its
+  // first argument and PATH is never consulted. installService resolves it once
+  // and passes it in; this option is also the direct-renderer / test override.
+  interpreter?: string;
   // Optional model override passed through to `bob run` (→ runPersistent).
   model?: string;
   // The agent's home dir for log paths + WorkingDirectory. Defaults to ~. The
@@ -64,6 +132,18 @@ export interface RenderServiceOptions {
 
 // Back-compat alias (the launchd renderer historically took RenderPlistOptions).
 export type RenderPlistOptions = RenderServiceOptions;
+
+// The exact argv the unit runs: the resolved interpreter, the bob script, the
+// `run` subcommand and any model override. BOTH renderers AND the CLI's printed
+// "runs:" line read this ONE list, so the displayed command can never drift from
+// what the unit actually executes (e.g. the CLI dropping `--model`).
+export function serviceCommandArgs(
+  opts: Pick<RenderServiceOptions, "interpreter" | "bobBin" | "name" | "model">,
+): string[] {
+  const args = [opts.interpreter ?? resolveNodeExecutable(), opts.bobBin, "run", opts.name];
+  if (opts.model) args.push("--model", opts.model);
+  return args;
+}
 
 // =========================================================================
 // launchd (macOS)
@@ -84,7 +164,9 @@ export function plistPath(name: string, home: string = homedir()): string {
 }
 
 // Render the per-agent launchd plist. KeepAlive (restart on crash) + RunAtLoad
-// (start on login). ProgramArguments run `bob run <name>`. NO secret.
+// (start on login). ProgramArguments run `<interpreter> <bob> run <name>`, so
+// the interpreter is resolved by absolute path and the unit never depends on
+// launchd's minimal PATH. NO secret.
 export function renderPlist(opts: RenderServiceOptions): string {
   assertName(opts.name);
   const home = opts.home ?? homedir();
@@ -92,8 +174,7 @@ export function renderPlist(opts: RenderServiceOptions): string {
   const workDir = join(home, "agents", opts.name, "work");
   const logDir = join(home, "agents", opts.name);
 
-  const args = [opts.bobBin, "run", opts.name];
-  if (opts.model) args.push("--model", opts.model);
+  const args = serviceCommandArgs(opts);
   const programArgs = args.map((a) => `    <string>${xmlEscape(a)}</string>`).join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -153,17 +234,19 @@ export function systemdUnitPath(name: string, home: string = homedir()): string 
 
 // Render the per-agent systemd USER unit. Restart=always (restart on crash);
 // WantedBy=default.target (start on login/boot when enabled). ExecStart runs
-// `bob run <name>`. NO secret env, NO inline token — see the security note.
+// `<interpreter> <bob> run <name>`, so the interpreter is resolved by absolute
+// path and the unit never depends on systemd's minimal PATH. NO secret env, NO
+// inline token — see the security note.
 // `name` already passed the strict regex, so ExecStart has no whitespace/newline
-// injection surface; bobBin/model are trusted (resolved binary path + a flag).
+// injection surface; interpreter/bobBin/model are trusted (an absolute
+// interpreter + resolved binary path + a flag).
 export function renderSystemdUnit(opts: RenderServiceOptions): string {
   assertName(opts.name);
   const home = opts.home ?? homedir();
   const workDir = join(home, "agents", opts.name, "work");
   const logDir = join(home, "agents", opts.name);
 
-  const exec = [opts.bobBin, "run", opts.name];
-  if (opts.model) exec.push("--model", opts.model);
+  const exec = serviceCommandArgs(opts);
 
   return `# Generated by 'bob install-service ${opts.name}'. Don't edit — re-run to update.
 # The agent runs itself: Restart=always restarts on crash; enable it (bob up) to
@@ -224,6 +307,11 @@ export interface ServiceOpsDeps {
   home?: string;
   // Force a backend (tests; CI runs on Linux). Defaults to the host platform.
   platform?: ServicePlatform;
+  // Node resolution for the unit's interpreter (see resolveNodeExecutable).
+  // Injected in tests; defaults to the current process's own interpreter + PATH.
+  execPath?: string;
+  pathEnv?: string;
+  isExecutable?: (file: string) => boolean;
 }
 
 export interface InstallServiceOptions extends RenderServiceOptions, ServiceOpsDeps {}
@@ -260,21 +348,29 @@ function resolveUid(deps: ServiceOpsDeps): number {
 // systemd, also runs `systemctl --user daemon-reload` so the new/updated unit is
 // picked up. Install + start are separate so re-installing an updated unit while
 // it's running is a `down` → `install` → `up` (or `restart`).
-export async function installService(opts: InstallServiceOptions): Promise<{ path: string }> {
+export async function installService(
+  opts: InstallServiceOptions,
+): Promise<{ path: string; interpreter: string; argv: string[] }> {
   const platform = detectPlatform(opts.platform);
   const write = opts.writeFile ?? defaultWrite;
+  // Resolve the interpreter ONCE, up front, so a refused install (no Node) writes
+  // NOTHING. The renderers receive the resolved absolute path.
+  const interpreter = opts.interpreter ?? resolveNodeExecutable(opts);
+  const renderOpts: RenderServiceOptions = { ...opts, interpreter };
+  // The one command list the renderer writes and the CLI prints.
+  const argv = serviceCommandArgs(renderOpts);
   if (platform === "launchd") {
     const path = plistPath(opts.name, opts.home);
-    write(path, renderPlist(opts));
-    return { path };
+    write(path, renderPlist(renderOpts));
+    return { path, interpreter, argv };
   }
   const path = systemdUnitPath(opts.name, opts.home);
-  write(path, renderSystemdUnit(opts));
+  write(path, renderSystemdUnit(renderOpts));
   await runOrThrow(opts.runSystemctl ?? defaultRunSystemctl, "systemctl", [
     "--user",
     "daemon-reload",
   ]);
-  return { path };
+  return { path, interpreter, argv };
 }
 
 export interface LifecycleOptions extends ServiceOpsDeps {

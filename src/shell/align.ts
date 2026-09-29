@@ -95,12 +95,26 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     name: opts.name,
     requestedAgentDir: opts.agentDir,
   });
-  const { config } = resolveRunConfig({
+  // bob#214: a --model override is resolved the way `bob run --model` resolves
+  // it, so the session carries the declared limits of the model it runs (its
+  // provider.models entry), not those of bob.yaml's provider.model.
+  const { config: resolved } = resolveRunConfig({
     name: opts.name,
     agentsRoot,
+    ...(opts.model !== undefined ? { model: opts.model } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+  // resolveRunConfig has ALREADY mapped bob.yaml's provider to pi's id (run.ts
+  // resolveProviderAndModel), so `resolved.provider` is used as-is; a caller's
+  // provider is a bob name and is mapped here — once, at the boundary where a
+  // bob name enters.
+  const provider =
+    opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : resolved.provider;
+  // bob.yaml declares context windows for its OWN provider only, so a
+  // --provider naming another one leaves the session with no declared window:
+  // the session factory refuses it, naming bob.yaml's provider.
+  const { modelLimits, ...config } = resolved;
   if (!existsSync(soulPath)) {
     throw new Error(`cannot align ${opts.name}: ${soulPath} not found — run 'bob onboard' first`);
   }
@@ -114,12 +128,10 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     // bob.yaml supplies both fields, the same pair `bob run` runs the agent on
     // (#155) — an alignment check-in that ran on some other model was aligning
     // an agent it was not looking at. An override replaces ONLY the field it
-    // names. resolveRunConfig has ALREADY mapped bob.yaml's provider to pi's id
-    // (run.ts resolveProviderAndModel), so `config.provider` is used as-is; a
-    // caller's provider is a bob name and is mapped here — once, at the
-    // boundary where a bob name enters.
-    provider: opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : config.provider,
-    model: opts.model ?? config.model,
+    // names: the model through resolveRunConfig above, the provider here.
+    provider,
+    model: config.model,
+    ...(modelLimits !== undefined && provider === resolved.provider ? { modelLimits } : {}),
     // The session's tools are the setup policy — read + write_soul for every
     // agent, adopted or not — never the role's or the grant's own set.
     tools: [...SETUP_TOOL_POLICY.tools],

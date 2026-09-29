@@ -85,7 +85,7 @@ describe("CodeRabbit positions regressions", () => {
         mkdirSync(dirname(path), { recursive: true });
         writeFileSync(path, JSON.stringify({agent:"roots", role:"coder", position:{name:"ghost", version:"1", hash:"h"}, maxTools:[], maxCapabilities:[], allowResidentShell:false, ratifiedAt:"now"}));
         let seen;
-        await hireAgent({name:"roots", positionName:"builder", agentsRoot:process.env.BOB_AGENTS_ROOT, hostRoot:process.env.BOB_HOST_ROOT, positionsRoot:process.env.BOB_POSITIONS_ROOT, skipFlair:true, interview:async ({policy}) => { seen = policy; return 0; }});
+        await hireAgent({name:"roots", positionName:"builder", agentsRoot:process.env.BOB_AGENTS_ROOT, hostRoot:process.env.BOB_HOST_ROOT, positionsRoot:process.env.BOB_POSITIONS_ROOT, skipFlair:true, contextWindow:200000, interview:async ({policy}) => { seen = policy; return 0; }});
         process.stdout.write(JSON.stringify(seen));
       `,
         {
@@ -129,7 +129,7 @@ describe("CodeRabbit positions regressions", () => {
         const positionsRoot = process.env.BOB_POSITIONS_ROOT;
         const hostRoot = process.env.BOB_HOST_ROOT;
         const p = loadPosition("local", {root:positionsRoot});
-        await hireAgent({name, positionName:"local", agentsRoot:process.env.BOB_AGENTS_ROOT, hostRoot, positionsRoot, skipFlair:true,
+        await hireAgent({name, positionName:"local", agentsRoot:process.env.BOB_AGENTS_ROOT, hostRoot, positionsRoot, skipFlair:true, contextWindow:200000,
           commitHook(step) { if (step === "scaffold") writeGrant(hostRoot, {agent:name, role:p.manifest.role, position:{name:p.manifest.name, version:p.manifest.version, hash:p.hash}, maxTools:p.manifest.tools, maxCapabilities:p.manifest.capabilities.permitted, allowResidentShell:true, ratifiedAt:"now"}); },
           interview:async () => 0});
       `,

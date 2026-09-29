@@ -107,6 +107,7 @@ describe("work — loaded from the blessed catalog, production settings", () => 
       config: {
         provider: "bob-work-prod-stub",
         model: "stub-1",
+        modelLimits: { provider: "bob-work-prod-stub", model: "stub-1", contextWindow: 200_000 },
         appendSystemPrompt: "",
         cwd,
         piAgentDir,

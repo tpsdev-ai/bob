@@ -16,6 +16,13 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
+import {
+  ModelBudgetError,
+  parseSessionBudget,
+  positiveTokens,
+  type SessionBudget,
+} from "./session-budget.js";
+
 // Read the top-level `capabilities:` block as a string list. Supports the
 // block-sequence form bob writes:
 //
@@ -171,6 +178,150 @@ function toToolNames(value: unknown): string[] | undefined {
     names.push(item.trim());
   }
   return names;
+}
+
+// --- `provider:` limits and the `session:` block (bob#214) -----------------
+//
+// The provider block names the model AND its limits:
+//
+//   provider:
+//     name: ollama
+//     model: some-model
+//     context_window: 262144      # REQUIRED to run: the server's context length
+//     max_output_tokens: 32000    # optional: the per-request output cap
+//     models:                     # optional: other models `--model` may name
+//       - id: other-model
+//         context_window: 131072
+//         max_output_tokens: 16384
+//
+// A window is required by the session factory, not here: this reader validates
+// the SHAPE of what is present, and a model with no declared window reaches the
+// factory as "undeclared", which refuses with the remedy. A key it does not
+// recognize is an error, not an ignored setting — a misspelled limit must not
+// read as "no limit".
+const PROVIDER_KEYS = ["name", "model", "context_window", "max_output_tokens", "models"] as const;
+const PROVIDER_MODEL_KEYS = ["id", "context_window", "max_output_tokens"] as const;
+
+export interface DeclaredModelLimits {
+  contextWindow?: number;
+  maxOutputTokens?: number;
+}
+
+export interface ProviderLimitsBlock extends DeclaredModelLimits {
+  // Other models this agent may run on (a per-call `--model`), by model id.
+  models: Record<string, DeclaredModelLimits>;
+}
+
+function tokensFor(yamlText: string, key: string, value: unknown): number {
+  const tokens = positiveTokens(value);
+  if (tokens === undefined) {
+    throw new BobYamlError(
+      "provider",
+      lineOfKey(yamlText, "provider", key),
+      `"${key}" must be a positive whole number of tokens (for example 262144).`,
+    );
+  }
+  return tokens;
+}
+
+export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
+  const raw = readBlock(yamlText, "provider");
+  const out: ProviderLimitsBlock = { models: {} };
+  if (raw === undefined) return out;
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(PROVIDER_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "provider",
+        lineOfKey(yamlText, "provider", key),
+        `unknown key "${key}" — supported keys are ${PROVIDER_KEYS.join(", ")}.`,
+      );
+    }
+    if (key === "context_window") out.contextWindow = tokensFor(yamlText, key, value);
+    else if (key === "max_output_tokens") out.maxOutputTokens = tokensFor(yamlText, key, value);
+    else if (key === "models") {
+      const line = lineOfKey(yamlText, "provider", key);
+      if (!Array.isArray(value)) {
+        throw new BobYamlError(
+          "provider",
+          line,
+          `"models" must be a list of "- id: <model>" entries.`,
+        );
+      }
+      for (const item of value) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          throw new BobYamlError(
+            "provider",
+            line,
+            `each "models" entry must be "- id: <model>" with context_window under it.`,
+          );
+        }
+        const entry = item as Record<string, unknown>;
+        for (const k of Object.keys(entry)) {
+          if (!(PROVIDER_MODEL_KEYS as readonly string[]).includes(k)) {
+            throw new BobYamlError(
+              "provider",
+              line,
+              `unknown key "${k}" in a "models" entry — supported keys are ${PROVIDER_MODEL_KEYS.join(", ")}.`,
+            );
+          }
+        }
+        const id = typeof entry.id === "string" ? entry.id.trim() : "";
+        if (id === "") {
+          throw new BobYamlError(
+            "provider",
+            line,
+            `a "models" entry needs an "id" (the model id).`,
+          );
+        }
+        if (Object.hasOwn(out.models, id)) {
+          throw new BobYamlError("provider", line, `"models" names the same id twice.`);
+        }
+        out.models[id] = {
+          ...(entry.context_window !== undefined
+            ? { contextWindow: tokensFor(yamlText, "models", entry.context_window) }
+            : {}),
+          ...(entry.max_output_tokens !== undefined
+            ? { maxOutputTokens: tokensFor(yamlText, "models", entry.max_output_tokens) }
+            : {}),
+        };
+      }
+    }
+  }
+  return out;
+}
+
+// The agent's own session budget, overriding its role's (role.json `session`):
+//
+//   session:
+//     compaction_threshold: 0.5   # compact between model calls past this fraction
+//     thinking: low               # off | low | high
+//
+// Absent keys fall back to the role. Unknown keys and malformed values throw.
+export function readSessionBudget(yamlText: string): SessionBudget {
+  const inline = /^session[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "session",
+      lineOf(yamlText, /^session[ \t]*:/m),
+      `the inline form is not supported — write "session:" on its own line, then compaction_threshold:/thinking: indented under it.`,
+    );
+  }
+  const raw = readBlock(yamlText, "session");
+  if (raw === undefined) return {};
+  try {
+    return parseSessionBudget(raw, 'bob.yaml "session:" block');
+  } catch (err) {
+    if (!(err instanceof ModelBudgetError)) throw err;
+    const key = Object.keys(raw).find((k) => err.message.includes(`"${k}"`));
+    throw new BobYamlError(
+      "session",
+      key !== undefined
+        ? lineOfKey(yamlText, "session", key)
+        : lineOf(yamlText, /^session[ \t]*:/m),
+      err.message.replace(/^bob\.yaml "session:" block: /, ""),
+    );
+  }
 }
 
 // The role this agent was hired into (bob.yaml `agent.role`). The role is the

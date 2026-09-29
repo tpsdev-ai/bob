@@ -49,7 +49,16 @@ describe("bob CLI", () => {
   it.each(["ea", "jarvis"])(
     "onboard --role %s --dry-run shows the plan without writing",
     (role) => {
-      const out = spawnNode([CLI, "onboard", "testbot", "--role", role, "--dry-run"]);
+      const out = spawnNode([
+        CLI,
+        "onboard",
+        "testbot",
+        "--context-window",
+        "200000",
+        "--role",
+        role,
+        "--dry-run",
+      ]);
       expect(out).toContain("[bob onboard] PLAN (--dry-run)");
       expect(out).toContain("agent.id        = testbot");
       expect(out).toContain(`agent.role      = ${role}`);
@@ -58,7 +67,16 @@ describe("bob CLI", () => {
 
   it("onboard fails for unknown role", () => {
     try {
-      spawnNode([CLI, "onboard", "testbot", "--role", "nonexistent", "--dry-run"]);
+      spawnNode([
+        CLI,
+        "onboard",
+        "testbot",
+        "--context-window",
+        "200000",
+        "--role",
+        "nonexistent",
+        "--dry-run",
+      ]);
       throw new Error("expected non-zero exit");
     } catch (err: any) {
       expect(err.stdout || err.message).toContain("unknown role");
@@ -66,18 +84,46 @@ describe("bob CLI", () => {
   });
 
   it("init is a soft alias for onboard (with deprecation hint)", () => {
-    const out = spawnNode([CLI, "init", "testbot", "--role", "ea", "--dry-run"]);
+    const out = spawnNode([
+      CLI,
+      "init",
+      "testbot",
+      "--context-window",
+      "200000",
+      "--role",
+      "ea",
+      "--dry-run",
+    ]);
     expect(out).toContain("renamed to `bob onboard`");
     expect(out).toContain("[bob onboard] PLAN (--dry-run)");
   });
 
   it("onboard --dry-run states that it will provision the Flair identity (#93/#94)", () => {
-    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
+    const out = spawnNode([
+      CLI,
+      "onboard",
+      "testbot",
+      "--context-window",
+      "200000",
+      "--role",
+      "ea",
+      "--dry-run",
+    ]);
     expect(out).toContain("flair identity  = Agent record + soul at http://127.0.0.1:19926");
   });
 
   it("onboard --dry-run --no-flair states the identity is SKIPPED", () => {
-    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run", "--no-flair"]);
+    const out = spawnNode([
+      CLI,
+      "onboard",
+      "testbot",
+      "--context-window",
+      "200000",
+      "--role",
+      "ea",
+      "--dry-run",
+      "--no-flair",
+    ]);
     expect(out).toContain("flair identity  = SKIPPED (--no-flair)");
   });
 
@@ -86,6 +132,8 @@ describe("bob CLI", () => {
       CLI,
       "onboard",
       "testbot",
+      "--context-window",
+      "200000",
       "--role",
       "ea",
       "--dry-run",
@@ -110,6 +158,8 @@ describe("bob CLI", () => {
       CLI,
       "onboard",
       "testbot",
+      "--context-window",
+      "200000",
       "--role",
       "ea",
       "--dry-run",
@@ -119,7 +169,16 @@ describe("bob CLI", () => {
   });
 
   it("onboard --dry-run plans an interactive pi session by default", () => {
-    const out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run"]);
+    const out = spawnNode([
+      CLI,
+      "onboard",
+      "testbot",
+      "--context-window",
+      "200000",
+      "--role",
+      "ea",
+      "--dry-run",
+    ]);
     expect(out).toContain("interview       = interactive pi session");
   });
 
@@ -224,7 +283,10 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
 
   it("--dry-run=true takes the dry-run branch — prints the plan and creates no agent dir", () => {
     const home = scratchHome();
-    const out = runCli(["onboard", "testbot", "--role", "ea", "--dry-run=true"], home);
+    const out = runCli(
+      ["onboard", "testbot", "--context-window", "200000", "--role", "ea", "--dry-run=true"],
+      home,
+    );
     expect(out).toContain("PLAN (--dry-run)");
     // The dry-run branch returns before initAgent, so no agent dir was written:
     // `--dry-run=true` can no longer scaffold, let alone provision, for real.
@@ -239,6 +301,8 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
       [
         "onboard",
         "testbot",
+        "--context-window",
+        "200000",
         "--role",
         "ea",
         "--dry-run=false",
@@ -259,9 +323,12 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     let threw = false;
     // spawnNode throws on a non-zero exit, which is the signal we expect here.
     try {
-      out = spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run=yes"], {
-        env: { ...process.env, HOME: home },
-      });
+      out = spawnNode(
+        [CLI, "onboard", "testbot", "--context-window", "200000", "--role", "ea", "--dry-run=yes"],
+        {
+          env: { ...process.env, HOME: home },
+        },
+      );
     } catch (err: unknown) {
       threw = true;
       const e = err as { stdout?: string; message?: string };
@@ -282,9 +349,12 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
     let status = 0;
     let out = "";
     try {
-      spawnNode([CLI, "onboard", "testbot", "--role", "ea", "--dry-run="], {
-        env: { ...process.env, HOME: home },
-      });
+      spawnNode(
+        [CLI, "onboard", "testbot", "--context-window", "200000", "--role", "ea", "--dry-run="],
+        {
+          env: { ...process.env, HOME: home },
+        },
+      );
     } catch (err: unknown) {
       const e = err as SpawnError;
       status = e.code ?? -1;
@@ -302,6 +372,8 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
       [
         "onboard",
         "testbot",
+        "--context-window",
+        "200000",
         "--role",
         "ea",
         "--model=",
@@ -322,7 +394,17 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   it("a bare --model on onboard means the default too — never the literal id 'true'", () => {
     const home = scratchHome();
     const out = runCli(
-      ["onboard", "testbot", "--role", "ea", "--model", "--no-flair", "--no-interactive"],
+      [
+        "onboard",
+        "testbot",
+        "--context-window",
+        "200000",
+        "--role",
+        "ea",
+        "--model",
+        "--no-flair",
+        "--no-interactive",
+      ],
       home,
     );
     expect(out).toContain("scaffolded testbot");
@@ -335,7 +417,19 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
   it("bob align refuses a bad --no-flair spelling BEFORE its session can rewrite soul.md", () => {
     const home = scratchHome();
     // A real (filesystem-only) agent to align: no Flair, no interview.
-    runCli(["onboard", "testbot", "--role", "ea", "--no-flair", "--no-interactive"], home);
+    runCli(
+      [
+        "onboard",
+        "testbot",
+        "--context-window",
+        "200000",
+        "--role",
+        "ea",
+        "--no-flair",
+        "--no-interactive",
+      ],
+      home,
+    );
     const soul = join(home, "agents", "testbot", "soul.md");
     expect(existsSync(soul)).toBe(true);
     const before = readFileSync(soul, "utf8");
@@ -479,6 +573,8 @@ async function onboardCli(opts: {
       CLI,
       "onboard",
       "testbot",
+      "--context-window",
+      "200000",
       "--no-interactive",
       "--flair-url",
       opts.flairUrl,

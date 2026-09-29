@@ -39,6 +39,7 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
     return {
       provider: "anthropic",
       model: "claude-sonnet-4-6",
+      modelLimits: { provider: "anthropic", model: "claude-sonnet-4-6", contextWindow: 200_000 },
       appendSystemPrompt: "",
       cwd,
       piAgentDir,
@@ -106,6 +107,7 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
           "provider:",
           "  name: anthropic",
           "  model: claude-sonnet-4-6",
+          "  context_window: 200000",
           "",
           "tools:",
           "  allow:",

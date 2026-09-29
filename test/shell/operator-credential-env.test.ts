@@ -106,6 +106,7 @@ describe("FLAIR_ADMIN_PASS never reaches an agent session", () => {
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       provider: "anthropic",
       model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
       skipFlair: true,
       interview,
     });
