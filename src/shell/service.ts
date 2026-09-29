@@ -119,9 +119,11 @@ function isSymlink(file: string): boolean {
 // Homebrew install process.execPath is the versioned target
 // (…/Cellar/node/<version>/bin/node), and writing that into the unit breaks the
 // service after `brew upgrade node` (the versioned directory is gone). Walking
-// the installer's PATH for a `node` entry whose realpath equals execPath's
-// realpath yields the stable symlink (e.g. /opt/homebrew/bin/node); when no
-// entry resolves to the same binary we fall back to execPath. When the
+// the installer's PATH for a `node` SYMLINK whose realpath equals execPath's
+// realpath yields a stable path (on Homebrew, /opt/homebrew/bin/node). A
+// matching symlink is preferred over a direct match; when no matching symlink
+// exists (only direct matches, or none) we fall back to execPath, which may
+// itself be stable or versioned. When the
 // installer is NOT node (e.g. a developer runs install-service under bun) we
 // look for `node` on the installer's PATH. If neither yields a Node,
 // installation is REFUSED (the throw names the remedy) rather than writing a
