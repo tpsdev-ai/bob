@@ -146,8 +146,8 @@ named error.
   If that first write fails, termination is attempted with the deadline's
   escalation: SIGTERM to the process group only if a first membership probe
   finds members the tool may signal (an empty, unsignallable or unanswerable
-  probe sends nothing), then SIGKILL if the group is not empty after the
-  grace. `run` returns a refusal naming the job's process group and saying
+  probe sends nothing), then SIGKILL is attempted if no probe reports the
+  group empty during the grace. `run` returns a refusal naming the job's process group and saying
   whether that group was verified empty.
 - **Identity.** A pid can be reused, even within one second, so a pid (or a
   1-second `ps` start time) is not an identity. On Linux the tool pins a process
