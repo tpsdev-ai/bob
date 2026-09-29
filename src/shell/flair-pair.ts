@@ -16,7 +16,9 @@
 // placed in an error message or in argv. Every error here names the env var or
 // the FILE PATH, never a value. No error on an operator-authorized request
 // includes the server's response body either: a server or intermediary that
-// reflects request headers would otherwise carry the Basic header into it.
+// reflects request headers would otherwise carry the Basic header into it. An
+// exception from sending the request or reading its response is replaced by
+// one naming only the operation, the target origin and the remedy.
 
 import { generateKeyPairSync, randomUUID, webcrypto } from "node:crypto";
 import {
@@ -258,19 +260,42 @@ export class FlairAdminCredentialError extends Error {
   }
 }
 
+// Take the operator password out of the environment: read FLAIR_ADMIN_PASS
+// ONCE and DELETE it from process.env, so nothing started later in this
+// process gets it through process.env — an agent session, its tools, or a
+// child process started with this process's environment. The caller holds
+// the value and passes it explicitly to the one operator transport that uses
+// it (registerWithFlair's adminPassFromEnv). The variable is deleted even
+// when it is empty. `bob`'s CLI calls this first, before any command runs.
+//
+// This removes the password from process.env only. A same-user process can
+// still read this process's initial environment block (under Bun, so does a
+// child started with no explicit environment), and same-user file access to
+// the admin-pass file is not isolated either; both are tracked separately.
+export function takeFlairAdminPassFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const raw = env[ADMIN_PASS_ENV];
+  delete env[ADMIN_PASS_ENV];
+  const value = raw?.trim();
+  return value ? value : undefined;
+}
+
 export interface AdminPassSources {
+  // The FLAIR_ADMIN_PASS value, already taken out of the environment with
+  // takeFlairAdminPassFromEnv(). Never read from process.env here.
+  adminPassFromEnv?: string;
   // Path to the admin password file. Defaults to ~/.flair/admin-pass.
   adminPassFile?: string;
-  // Environment to read ADMIN_PASS_ENV from. Defaults to process.env.
-  env?: NodeJS.ProcessEnv;
 }
 
 // Resolve the admin password, or undefined when none is available.
 //
-// Precedence mirrors flair's resolveLocalAdminPass: env first, then the 0600
-// file `flair init` writes. There is deliberately NO command-line flag and no
-// prompt — a flag puts the secret in argv, and bob's non-interactive path (the
-// one fleets use) has no one to prompt.
+// Precedence mirrors flair's resolveLocalAdminPass: the environment value
+// first (taken by the caller, see takeFlairAdminPassFromEnv), then the 0600
+// file `flair init` writes, read at call time. There is deliberately NO
+// command-line flag and no prompt — a flag puts the secret in argv, and bob's
+// non-interactive path (the one fleets use) has no one to prompt.
 //
 // Deliberately does NOT fall back to Harper's `authorizeLocal` ambient
 // loopback elevation. That path would let bob register with no credential at
@@ -285,9 +310,8 @@ export function resolveFlairAdminPass(opts: AdminPassSources = {}): string | und
 function resolveAdminPassWithSource(
   opts: AdminPassSources,
 ): { password: string; source: string } | undefined {
-  const env = opts.env ?? process.env;
-  const fromEnv = env[ADMIN_PASS_ENV];
-  if (fromEnv && fromEnv.trim() !== "") return { password: fromEnv.trim(), source: ADMIN_PASS_ENV };
+  const fromEnv = opts.adminPassFromEnv?.trim();
+  if (fromEnv) return { password: fromEnv, source: ADMIN_PASS_ENV };
   const file = adminPassPath(opts.adminPassFile);
   if (!existsSync(file)) return undefined;
   const contents = readFileSync(file, "utf8").trim();
@@ -366,11 +390,16 @@ export interface RegisterWithFlairArgs {
   // derived from it (resolveFlairOpsUrl) unless opsUrl / FLAIR_OPS_TARGET.
   flairUrl: string;
   opsUrl?: string;
+  // The FLAIR_ADMIN_PASS value, already taken out of the environment with
+  // takeFlairAdminPassFromEnv(). Registration never reads the password from
+  // process.env itself.
+  adminPassFromEnv?: string;
   adminPassFile?: string;
   adminUser?: string;
   // Path to the agent's private key. Named only in the missing-credential
   // message so the operator knows what is already done; never read here.
   keyPath?: string;
+  // Read for FLAIR_OPS_TARGET only. Defaults to process.env.
   env?: NodeJS.ProcessEnv;
   fetchImpl?: FlairFetch;
   now?: () => number;
@@ -395,7 +424,10 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
   const env = args.env ?? process.env;
   const opsUrl = resolveFlairOpsUrl(args.flairUrl, args.opsUrl ?? env[OPS_TARGET_ENV]);
   assertOperatorAuthTarget(opsUrl, args.name);
-  const adminPass = resolveAdminPassWithSource({ adminPassFile: args.adminPassFile, env });
+  const adminPass = resolveAdminPassWithSource({
+    adminPassFromEnv: args.adminPassFromEnv,
+    adminPassFile: args.adminPassFile,
+  });
   if (adminPass === undefined) {
     throw new FlairAdminCredentialError(
       args.name,
@@ -413,9 +445,13 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
   const now = args.now ?? (() => Date.now());
 
   const existing = await readAgentRecord(post, args.name);
+  let current = existing;
+  // Why an insert was refused. Kept so that, when the evidence for a race does
+  // not hold up, the operator sees the insert's own failure — not a repair.
+  let insertFailure: Error | undefined;
   if (existing === null) {
-    const inserted = await insertAgentRecord(post, args.name, args.publicKeyBase64, now);
-    if (inserted) {
+    const insert = await insertAgentRecord(post, args.name, args.publicKeyBase64, now);
+    if (insert.inserted) {
       return {
         agentId: args.name,
         flairUrl: args.flairUrl,
@@ -423,11 +459,15 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
         publicKeyBase64: args.publicKeyBase64,
       };
     }
-    // The insert was refused as a duplicate — another process registered this
-    // id between our read and our write. Fall through to the reconcile path
-    // rather than reporting a creation that did not happen.
+    // The insert was refused. That is a race — another process registered
+    // this id between our read and our write — ONLY if a fresh read now FINDS
+    // the row. A refusal that merely looks like a duplicate (a 409, a message
+    // saying so, or a skipped insert) proves nothing on its own: with no row
+    // to reconcile, the insert's failure is the answer.
+    insertFailure = insert.failure;
+    current = await readAgentRecord(post, args.name).catch(() => null);
+    if (current === null) throw insertFailure;
   }
-  const current = existing ?? (await readAgentRecord(post, args.name));
   if (current?.publicKey === args.publicKeyBase64) {
     return {
       agentId: args.name,
@@ -448,6 +488,22 @@ export async function registerWithFlair(args: RegisterWithFlairArgs): Promise<Fl
       },
     ],
   });
+  // A repair is reported only when the stored key now IS the requested one:
+  // an accepted update is not proof that the row changed.
+  let after: AgentRecord | null;
+  try {
+    after = await readAgentRecord(post, args.name);
+  } catch (err: unknown) {
+    throw insertFailure ?? err;
+  }
+  if (after?.publicKey !== args.publicKeyBase64) {
+    throw (
+      insertFailure ??
+      new Error(
+        `flair ops-API update Agent: the Agent record for '${args.name}' does not carry the requested public key after the update, so it was not repaired. Check the target Flair instance, then re-run.`,
+      )
+    );
+  }
   return {
     agentId: args.name,
     flairUrl: args.flairUrl,
@@ -463,24 +519,46 @@ type OpsPoster = (body: Record<string, unknown>) => Promise<unknown>;
 // never the response body: the request carries the operator's Basic header,
 // which a reflecting server or intermediary could echo into that body (the
 // Soul writer in flair-soul.ts refuses to print its response for the same
-// reason). The one fact read from the body — whether an insert was refused
-// because the row already exists — is kept as a boolean, never as text.
+// reason). The body of an error response is not read at all.
 class FlairOpsRequestError extends Error {
   readonly status: number;
-  readonly duplicate: boolean;
-  constructor(
-    operation: string,
-    table: string,
-    status: number,
-    credentialSource: string,
-    duplicate: boolean,
-  ) {
+  constructor(operation: string, table: string, status: number, credentialSource: string) {
     super(
       `flair ops-API ${operation} ${table} -> ${status}: operator request failed; check ${credentialSource} and the target Flair instance.`,
     );
     this.name = "FlairOpsRequestError";
     this.status = status;
-    this.duplicate = duplicate;
+  }
+}
+
+// An exception raised while sending an operator-authorized request or reading
+// its response. fetch() and body readers may put the request — and so the
+// Basic header — in an error's message or cause, so the original exception is
+// DROPPED, never chained: this error carries the operation, the target origin
+// and the remedy, and no `cause`.
+export class FlairOperatorTransportError extends Error {
+  constructor(operation: string, origin: string, stage: "send" | "read", remedy: string) {
+    super(
+      `${operation} to ${origin}: ${
+        stage === "send"
+          ? "the request failed before a response arrived"
+          : "the response could not be read"
+      }; the underlying error is not shown because it can carry the operator credential. ${remedy}`,
+    );
+    this.name = "FlairOperatorTransportError";
+  }
+}
+
+// Run one step of an operator-authorized request (the fetch, or reading the
+// response). Any exception becomes `fail()`'s error; the original is dropped.
+export async function operatorTransportStep<T>(
+  step: () => Promise<T>,
+  fail: () => Error,
+): Promise<T> {
+  try {
+    return await step();
+  } catch {
+    throw fail();
   }
 }
 
@@ -495,25 +573,34 @@ function opsPoster(
     fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FlairFetch>);
   // Built once for this registration call; never rendered in output.
   const authorization = flairOperatorBasicAuth(adminPass, adminUser);
+  const origin = new URL(opsUrl).origin;
+  const remedy = "Check that the Flair ops API at that origin is reachable, then retry.";
   return async (body) => {
-    const res = await doFetch(`${opsUrl}/`, {
-      method: "POST",
-      redirect: "error",
-      headers: { "Content-Type": "application/json", Authorization: authorization },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
+    const operation = `flair ops-API ${String(body.operation)} ${String(body.table)}`;
+    const res = await operatorTransportStep(
+      () =>
+        doFetch(`${opsUrl}/`, {
+          method: "POST",
+          redirect: "error",
+          headers: { "Content-Type": "application/json", Authorization: authorization },
+          body: JSON.stringify(body),
+        }),
+      () => new FlairOperatorTransportError(operation, origin, "send", remedy),
+    );
     if (!res.ok) {
-      // The server's response could echo a header. Never print it or the
-      // secret; never the request body or the operation's records either.
+      // The server's response could echo a header. Never read or print it,
+      // or the secret; never the request body or the operation's records.
       throw new FlairOpsRequestError(
         String(body.operation),
         String(body.table),
         res.status,
         credentialSource,
-        res.status === 409 || /duplicate|already exists|\b409\b/i.test(text),
       );
     }
+    const text = await operatorTransportStep(
+      () => res.text(),
+      () => new FlairOperatorTransportError(operation, origin, "read", remedy),
+    );
     if (text.trim() === "") return undefined;
     try {
       return JSON.parse(text);
@@ -543,18 +630,18 @@ async function readAgentRecord(post: OpsPoster, id: string): Promise<AgentRecord
   return rows[0] ?? null;
 }
 
-// Returns false when the insert was refused because the row already exists.
-// Harper reports that either as an error status carrying "duplicate"/"already
-// exists" or as a 200 listing the id under `skipped_hashes` — a 200 whose body
-// says nothing was written is the more dangerous of the two, because a caller
-// checking only the status reports a successful registration that never
-// happened.
+// `inserted: false` when Flair refused the insert, with the refusal as
+// `failure`. Harper refuses either with an error status or with a 200 that
+// lists the id under `skipped_hashes` — a 200 whose body says nothing was
+// written, which a caller checking only the status would report as a
+// registration that never happened. Neither refusal is taken as proof that
+// the row exists: registerWithFlair re-reads before treating it as a race.
 async function insertAgentRecord(
   post: OpsPoster,
   id: string,
   publicKeyBase64: string,
   now: () => number,
-): Promise<boolean> {
+): Promise<{ inserted: true } | { inserted: false; failure: Error }> {
   const ts = new Date(now()).toISOString();
   // Mirrors flair's seedAgentViaOpsApi exactly. The ops-API insert bypasses
   // the Agent resource layer, so resources/Agent.ts's post() defaults never
@@ -583,12 +670,19 @@ async function insertAgentRecord(
       ],
     });
   } catch (err: unknown) {
-    if (err instanceof FlairOpsRequestError && err.duplicate) return false;
+    if (err instanceof FlairOpsRequestError) return { inserted: false, failure: err };
     throw err;
   }
   const skipped = (result as { skipped_hashes?: unknown[] } | undefined)?.skipped_hashes;
-  if (Array.isArray(skipped) && skipped.some((h) => String(h) === id)) return false;
-  return true;
+  if (Array.isArray(skipped) && skipped.some((h) => String(h) === id)) {
+    return {
+      inserted: false,
+      failure: new Error(
+        `flair ops-API insert Agent -> 200: Flair skipped the insert of '${id}' as already present, but bob could not confirm that Agent record. Check the target Flair instance, then re-run.`,
+      ),
+    };
+  }
+  return { inserted: true };
 }
 
 // ─── Registration verification (no admin credential) ────────────────────────

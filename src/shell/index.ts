@@ -119,6 +119,7 @@ export {
   registerWithFlair,
   resolveFlairAdminPass,
   resolveFlairOpsUrl,
+  takeFlairAdminPassFromEnv,
   verifyRegisteredWithFlair,
 } from "./flair-pair.js";
 export {

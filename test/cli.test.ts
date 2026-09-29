@@ -359,94 +359,152 @@ describe("--key=value boolean flags (parser-to-CLI)", () => {
 });
 
 // The real operator transports, end to end: the built CLI, its real fetch, and
-// a local HTTP server that reflects the request's credential into every error
-// body. What bob prints — stdout and stderr — must not carry it in any form.
+// a local HTTP server. In "registration"/"soul" mode the server reflects the
+// request's credential into that request's error body; in "none" mode every
+// request succeeds. It records each request's method, path and Authorization.
+async function localFlair(
+  failAt: "registration" | "soul" | "none",
+  reflect: "authorization" | "decoded-basic" = "authorization",
+) {
+  const served: string[] = [];
+  const requests: { method: string; path: string; authorization: string }[] = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      requests.push({
+        method: req.method ?? "",
+        path: req.url ?? "",
+        authorization: req.headers.authorization ?? "",
+      });
+      const json = (status: number, body: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      const fail = () => {
+        const auth = req.headers.authorization ?? "";
+        const echoed =
+          reflect === "authorization"
+            ? auth
+            : Buffer.from(auth.replace(/^Basic /, ""), "base64").toString("utf8");
+        const body = `{"error":"refused"} (request credential: ${echoed})`;
+        served.push(body);
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end(body);
+      };
+      if (req.method === "POST" && req.url === "/") {
+        if (failAt === "registration") return fail();
+        const op = JSON.parse(raw) as { operation: string; records?: { id: string }[] };
+        if (op.operation === "search_by_id") return json(200, []);
+        if (op.operation === "insert") {
+          return json(200, {
+            inserted_hashes: (op.records ?? []).map((r) => r.id),
+            skipped_hashes: [],
+          });
+        }
+        return json(400, { error: "unhandled operation" });
+      }
+      if (req.url?.startsWith("/Soul/") && req.method === "GET") {
+        return json(404, { error: "not found" });
+      }
+      if (req.url?.startsWith("/Soul/") && req.method === "PUT") {
+        return failAt === "soul" ? fail() : json(200, { ok: true });
+      }
+      return json(404, { error: "no route" });
+    });
+  });
+  await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return { server, url, served, requests };
+}
+
+// A --preload module for the CLI's interpreter. It wraps fetch: at every call
+// it records whether FLAIR_ADMIN_PASS is still in the CLI's process.env, and it
+// makes the one operator request with `method` fail in TRANSPORT — "fetch"
+// rejects, "text" answers `status` with a body reader that rejects — with the
+// request's Authorization header in the exception's message and the decoded
+// credential in its cause. Every other request goes to the real fetch.
+function fetchPreload(
+  dir: string,
+  opts: { stage: "fetch" | "text" | "none"; method?: string; status?: number },
+): { path: string; envAtFetch: string } {
+  const path = join(dir, "fetch-preload.mjs");
+  const envAtFetch = join(dir, "env-at-fetch.txt");
+  writeFileSync(
+    path,
+    [
+      `import { appendFileSync } from "node:fs";`,
+      `const realFetch = globalThis.fetch;`,
+      `globalThis.fetch = async (url, init = {}) => {`,
+      `  appendFileSync(${JSON.stringify(envAtFetch)}, process.env.FLAIR_ADMIN_PASS === undefined ? "absent\\n" : "present\\n");`,
+      `  const headers = init.headers ?? {};`,
+      `  const auth = headers.Authorization ?? headers.authorization ?? "";`,
+      `  if (${JSON.stringify(opts.stage)} === "none" || init.method !== ${JSON.stringify(opts.method ?? "")} || !auth.startsWith("Basic ")) return realFetch(url, init);`,
+      `  const decoded = Buffer.from(auth.slice(6), "base64").toString("utf8");`,
+      `  const boom = () => new Error("transport failed; request carried Authorization: " + auth, { cause: new Error("authenticated as " + decoded) });`,
+      `  if (${JSON.stringify(opts.stage)} === "fetch") throw boom();`,
+      `  const status = ${opts.status ?? 200};`,
+      `  return { ok: status >= 200 && status < 300, status, text: async () => { throw boom(); } };`,
+      `};`,
+    ].join("\n"),
+  );
+  return { path, envAtFetch };
+}
+
+// `bob onboard <name> --no-interactive` against `flairUrl`, with HOME isolated,
+// the admin-pass file holding `filePassword`, and FLAIR_ADMIN_PASS set only
+// when `envPassword` is given.
+async function onboardCli(opts: {
+  home: string;
+  flairUrl: string;
+  filePassword: string;
+  envPassword?: string;
+  preload?: string;
+}) {
+  const passFile = join(opts.home, "admin-pass");
+  writeFileSync(passFile, `${opts.filePassword}\n`, { mode: 0o600 });
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: opts.home,
+    FLAIR_OPS_TARGET: opts.flairUrl,
+  };
+  delete env.FLAIR_ADMIN_PASS;
+  if (opts.envPassword !== undefined) env.FLAIR_ADMIN_PASS = opts.envPassword;
+  const run = await spawnNodeAsync(
+    [
+      ...(opts.preload ? ["--preload", opts.preload] : []),
+      CLI,
+      "onboard",
+      "testbot",
+      "--no-interactive",
+      "--flair-url",
+      opts.flairUrl,
+      "--admin-pass-file",
+      passFile,
+    ],
+    { env },
+  );
+  return { ...run, passFile };
+}
+
 describe("bob onboard against a Flair that reflects request headers", () => {
   const PLACEHOLDER = "placeholder-not-a-real-admin-credential";
-
-  async function reflectingFlair(
-    failAt: "registration" | "soul",
-    reflect: "authorization" | "decoded-basic",
-  ) {
-    const served: string[] = [];
-    const server = createServer((req, res) => {
-      let raw = "";
-      req.setEncoding("utf8");
-      req.on("data", (chunk: string) => {
-        raw += chunk;
-      });
-      req.on("end", () => {
-        const json = (status: number, body: unknown) => {
-          res.writeHead(status, { "content-type": "application/json" });
-          res.end(JSON.stringify(body));
-        };
-        const fail = () => {
-          const auth = req.headers.authorization ?? "";
-          const echoed =
-            reflect === "authorization"
-              ? auth
-              : Buffer.from(auth.replace(/^Basic /, ""), "base64").toString("utf8");
-          const body = `{"error":"refused"} (request credential: ${echoed})`;
-          served.push(body);
-          res.writeHead(500, { "content-type": "text/plain" });
-          res.end(body);
-        };
-        if (req.method === "POST" && req.url === "/") {
-          if (failAt === "registration") return fail();
-          const op = JSON.parse(raw) as { operation: string; records?: { id: string }[] };
-          if (op.operation === "search_by_id") return json(200, []);
-          if (op.operation === "insert") {
-            return json(200, {
-              inserted_hashes: (op.records ?? []).map((r) => r.id),
-              skipped_hashes: [],
-            });
-          }
-          return json(400, { error: "unhandled operation" });
-        }
-        if (req.url?.startsWith("/Soul/") && req.method === "GET") {
-          return json(404, { error: "not found" });
-        }
-        if (req.url?.startsWith("/Soul/") && req.method === "PUT") return fail();
-        return json(404, { error: "no route" });
-      });
-    });
-    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
-    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    return { server, url, served };
-  }
 
   for (const reflect of ["authorization", "decoded-basic"] as const) {
     for (const failAt of ["registration", "soul"] as const) {
       it(`prints no operator credential when ${failAt} fails (${reflect})`, async () => {
         const home = mkdtempSync(join(tmpdir(), "bob-reflect-cli-"));
-        const flair = await reflectingFlair(failAt, reflect);
+        const flair = await localFlair(failAt, reflect);
         try {
-          const passFile = join(home, "admin-pass");
-          writeFileSync(passFile, `${PLACEHOLDER}\n`, { mode: 0o600 });
-          const env: NodeJS.ProcessEnv = {
-            ...process.env,
-            HOME: home,
-            FLAIR_OPS_TARGET: flair.url,
-          };
-          delete env.FLAIR_ADMIN_PASS;
-          const run = await spawnNodeAsync(
-            [
-              CLI,
-              "onboard",
-              "testbot",
-              "--no-interactive",
-              "--flair-url",
-              flair.url,
-              "--admin-pass-file",
-              passFile,
-            ],
-            { env },
-          );
+          const run = await onboardCli({ home, flairUrl: flair.url, filePassword: PLACEHOLDER });
           expect(run.code).toBe(1);
           expect(run.stderr).toContain(
             failAt === "registration"
-              ? `bob: flair ops-API search_by_id Agent -> 500: operator request failed; check ${passFile}`
-              : `bob: flair Soul PUT testbot:name -> 500: operator write failed; check ${passFile}`,
+              ? `bob: flair ops-API search_by_id Agent -> 500: operator request failed; check ${run.passFile}`
+              : `bob: flair Soul PUT testbot:name -> 500: operator write failed; check ${run.passFile}`,
           );
           // The reflected credential really went back to bob on the wire.
           const [header, , decoded] = operatorCredentialForms(PLACEHOLDER);
@@ -462,4 +520,103 @@ describe("bob onboard against a Flair that reflects request headers", () => {
       }, 20_000);
     }
   }
+});
+
+describe("bob onboard when an operator request fails in transport", () => {
+  const PLACEHOLDER = "placeholder-not-a-real-admin-credential";
+  const cases = [
+    {
+      name: "registration fetch rejects",
+      preload: { stage: "fetch", method: "POST" },
+      expected: (origin: string) =>
+        `bob: flair ops-API search_by_id Agent to ${origin}: the request failed before a response arrived`,
+    },
+    {
+      name: "registration body read rejects",
+      preload: { stage: "text", method: "POST", status: 200 },
+      expected: (origin: string) =>
+        `bob: flair ops-API search_by_id Agent to ${origin}: the response could not be read`,
+    },
+    {
+      name: "Soul PUT fetch rejects",
+      preload: { stage: "fetch", method: "PUT" },
+      expected: (origin: string) =>
+        `bob: flair Soul PUT testbot:name to ${origin}: the request failed before a response arrived`,
+    },
+    {
+      name: "Soul PUT body read rejects on a 500",
+      preload: { stage: "text", method: "PUT", status: 500 },
+      expected: () => "bob: flair Soul PUT testbot:name -> 500: operator write failed",
+    },
+  ] as const;
+
+  for (const c of cases) {
+    it(`prints no operator credential when the ${c.name}`, async () => {
+      const home = mkdtempSync(join(tmpdir(), "bob-transport-cli-"));
+      const flair = await localFlair("none");
+      try {
+        const preload = fetchPreload(home, c.preload);
+        const run = await onboardCli({
+          home,
+          flairUrl: flair.url,
+          filePassword: PLACEHOLDER,
+          preload: preload.path,
+        });
+        expect(run.code).toBe(1);
+        expect(run.stderr).toContain(c.expected(flair.url));
+        for (const form of operatorCredentialForms(PLACEHOLDER)) {
+          expect(run.stdout).not.toContain(form);
+          expect(run.stderr).not.toContain(form);
+        }
+      } finally {
+        flair.server.close();
+        rmSync(home, { recursive: true, force: true });
+      }
+    }, 20_000);
+  }
+});
+
+describe("bob onboard takes FLAIR_ADMIN_PASS out of its environment", () => {
+  const ENV_PASSWORD = "env-placeholder-not-a-real-admin-credential";
+  const FILE_PASSWORD = "file-placeholder-not-a-real-admin-credential";
+
+  it("before any request, and hands it to registration only", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-envpass-cli-"));
+    const flair = await localFlair("none");
+    try {
+      const preload = fetchPreload(home, { stage: "none" });
+      const run = await onboardCli({
+        home,
+        flairUrl: flair.url,
+        filePassword: FILE_PASSWORD,
+        envPassword: ENV_PASSWORD,
+        preload: preload.path,
+      });
+      expect(run.code).toBe(0);
+      // Registration used the environment value, passed explicitly; the Soul
+      // writes used the password file.
+      const basic = (password: string) => operatorCredentialForms(password)[0];
+      const ops = flair.requests.filter((r) => r.method === "POST" && r.path === "/");
+      const puts = flair.requests.filter((r) => r.method === "PUT");
+      expect(ops.length).toBeGreaterThan(0);
+      expect(puts.length).toBeGreaterThan(0);
+      expect(ops.every((r) => r.authorization === basic(ENV_PASSWORD))).toBe(true);
+      expect(puts.every((r) => r.authorization === basic(FILE_PASSWORD))).toBe(true);
+      // At every request — the first registration request included — the
+      // variable was already gone from the CLI's process environment.
+      const seen = readFileSync(preload.envAtFetch, "utf8").trim().split("\n");
+      expect(seen.length).toBe(flair.requests.length);
+      expect(seen.every((line) => line === "absent")).toBe(true);
+      for (const form of [
+        ...operatorCredentialForms(ENV_PASSWORD),
+        ...operatorCredentialForms(FILE_PASSWORD),
+      ]) {
+        expect(run.stdout).not.toContain(form);
+        expect(run.stderr).not.toContain(form);
+      }
+    } finally {
+      flair.server.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

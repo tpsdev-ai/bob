@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import type { FlairRegistration } from "../../src/shell/flair-pair.js";
 import { flairPair } from "../../src/shell/flair-pair.js";
 import {
@@ -172,6 +173,42 @@ describe("pushSoulToFlair (#94)", () => {
       }
     });
   }
+
+  // fetch() rejecting can put the request — and so the Basic header — in the
+  // exception's message or cause; it is replaced, never chained or printed.
+  it("replaces a credential-bearing transport exception on the Soul PUT (fetch)", async () => {
+    const fake = makeFakeFlair({
+      agents: { testbot: { id: "testbot", publicKey: pub } },
+      transportFailure: { stage: "fetch", match: (r) => r.method === "PUT" },
+    });
+    const { error, output } = await captureOutput(() => push(fake, { warn: undefined }));
+    const err = error as Error;
+    expect(err.message).toContain(
+      "flair Soul PUT testbot:name to http://127.0.0.1:19926: the request failed before a response arrived",
+    );
+    expect(err.cause).toBeUndefined();
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect(inspect(err)).not.toContain(form);
+      expect(output).not.toContain(form);
+    }
+  });
+
+  // The Soul writer never reads the response body, so a body reader that
+  // throws with the credential inside cannot reach the error either.
+  it("never reads the Soul response body (text rejects on a 500)", async () => {
+    const fake = makeFakeFlair({
+      agents: { testbot: { id: "testbot", publicKey: pub } },
+      transportFailure: { stage: "text", status: 500, match: (r) => r.method === "PUT" },
+    });
+    const { error, output } = await captureOutput(() => push(fake, { warn: undefined }));
+    const err = error as Error;
+    expect(err.message).toContain("flair Soul PUT testbot:name -> 500: operator write failed");
+    expect(err.cause).toBeUndefined();
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect(inspect(err)).not.toContain(form);
+      expect(output).not.toContain(form);
+    }
+  });
 
   it("marks soul entries permanent — identity must not age out of bootstrap", async () => {
     const fake = registeredFake();

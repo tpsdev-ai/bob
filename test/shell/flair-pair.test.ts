@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import {
   ADMIN_PASS_ENV,
   checkFlairRegistration,
@@ -11,9 +12,15 @@ import {
   registerWithFlair,
   resolveFlairAdminPass,
   resolveFlairOpsUrl,
+  takeFlairAdminPassFromEnv,
   verifyRegisteredWithFlair,
 } from "../../src/shell/flair-pair.js";
-import { captureOutput, makeFakeFlair, operatorCredentialForms } from "./flair-fake.js";
+import {
+  captureOutput,
+  credentialBearingError,
+  makeFakeFlair,
+  operatorCredentialForms,
+} from "./flair-fake.js";
 
 // Obvious placeholder, never a real credential. Every assertion about it is
 // about SHAPE (present / absent / not-echoed), never about the value meaning
@@ -131,30 +138,72 @@ describe("resolveFlairAdminPass", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("prefers the environment over the file", () => {
+  it("prefers the environment value (taken by the caller) over the file", () => {
     const file = join(tmp, "admin-pass");
     writeFileSync(file, "from-file-placeholder\n");
     const got = resolveFlairAdminPass({
       adminPassFile: file,
-      env: { [ADMIN_PASS_ENV]: TEST_ADMIN_CREDENTIAL },
+      adminPassFromEnv: TEST_ADMIN_CREDENTIAL,
     });
     expect(got).toBe(TEST_ADMIN_CREDENTIAL);
+  });
+
+  it("never reads FLAIR_ADMIN_PASS from process.env itself", () => {
+    const saved = process.env[ADMIN_PASS_ENV];
+    process.env[ADMIN_PASS_ENV] = "ambient-placeholder";
+    try {
+      expect(resolveFlairAdminPass({ adminPassFile: join(tmp, "nope") })).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env[ADMIN_PASS_ENV];
+      else process.env[ADMIN_PASS_ENV] = saved;
+    }
   });
 
   it("falls back to the 0600 file flair init writes", () => {
     const file = join(tmp, "admin-pass");
     writeFileSync(file, `${TEST_ADMIN_CREDENTIAL}\n`);
-    expect(resolveFlairAdminPass({ adminPassFile: file, env: {} })).toBe(TEST_ADMIN_CREDENTIAL);
+    expect(resolveFlairAdminPass({ adminPassFile: file })).toBe(TEST_ADMIN_CREDENTIAL);
   });
 
   it("returns undefined when neither is available", () => {
-    expect(resolveFlairAdminPass({ adminPassFile: join(tmp, "nope"), env: {} })).toBeUndefined();
+    expect(resolveFlairAdminPass({ adminPassFile: join(tmp, "nope") })).toBeUndefined();
   });
 
   it("treats an empty file as no credential (not as an empty password)", () => {
     const file = join(tmp, "admin-pass");
     writeFileSync(file, "   \n");
-    expect(resolveFlairAdminPass({ adminPassFile: file, env: {} })).toBeUndefined();
+    expect(resolveFlairAdminPass({ adminPassFile: file })).toBeUndefined();
+  });
+});
+
+describe("takeFlairAdminPassFromEnv", () => {
+  it("returns the trimmed value and deletes it from the environment", () => {
+    const env: NodeJS.ProcessEnv = {
+      [ADMIN_PASS_ENV]: ` ${TEST_ADMIN_CREDENTIAL}\n`,
+      OTHER: "kept",
+    };
+    expect(takeFlairAdminPassFromEnv(env)).toBe(TEST_ADMIN_CREDENTIAL);
+    expect(ADMIN_PASS_ENV in env).toBe(false);
+    expect(env.OTHER).toBe("kept");
+    // Read ONCE: a second take finds nothing.
+    expect(takeFlairAdminPassFromEnv(env)).toBeUndefined();
+  });
+
+  it("deletes an empty value too, and reports no credential", () => {
+    const env: NodeJS.ProcessEnv = { [ADMIN_PASS_ENV]: "  " };
+    expect(takeFlairAdminPassFromEnv(env)).toBeUndefined();
+    expect(ADMIN_PASS_ENV in env).toBe(false);
+  });
+
+  it("defaults to process.env", () => {
+    const saved = process.env[ADMIN_PASS_ENV];
+    process.env[ADMIN_PASS_ENV] = TEST_ADMIN_CREDENTIAL;
+    try {
+      expect(takeFlairAdminPassFromEnv()).toBe(TEST_ADMIN_CREDENTIAL);
+      expect(process.env[ADMIN_PASS_ENV]).toBeUndefined();
+    } finally {
+      if (saved !== undefined) process.env[ADMIN_PASS_ENV] = saved;
+    }
   });
 });
 
@@ -170,12 +219,16 @@ describe("registerWithFlair", () => {
     rmSync(tmpKeys, { recursive: true, force: true });
   });
 
-  const args = (fake: ReturnType<typeof makeFakeFlair>, env: NodeJS.ProcessEnv = {}) => ({
+  const args = (
+    fake: ReturnType<typeof makeFakeFlair>,
+    env: NodeJS.ProcessEnv = {},
+  ): Parameters<typeof registerWithFlair>[0] => ({
     name: "testbot",
     publicKeyBase64: pub,
     flairUrl: FLAIR_URL,
     adminPassFile: join(tmpKeys, "no-such-admin-pass"),
-    env: { [ADMIN_PASS_ENV]: TEST_ADMIN_CREDENTIAL, ...env },
+    adminPassFromEnv: TEST_ADMIN_CREDENTIAL,
+    env,
     fetchImpl: fake.fetchImpl,
   });
 
@@ -217,7 +270,12 @@ describe("registerWithFlair", () => {
     const reg = await registerWithFlair(args(fake));
     expect(reg.outcome).toBe("repaired");
     expect(fake.agents.testbot.publicKey).toBe(pub);
-    expect(fake.sequence()).toEqual(["ops:search_by_id:Agent", "ops:update:Agent"]);
+    // The update is read back: a repair is reported only once the key took.
+    expect(fake.sequence()).toEqual([
+      "ops:search_by_id:Agent",
+      "ops:update:Agent",
+      "ops:search_by_id:Agent",
+    ]);
   });
 
   it("repairs an AgentSeed row still holding the literal 'pending' placeholder", async () => {
@@ -256,7 +314,7 @@ describe("registerWithFlair", () => {
     const fake = makeFakeFlair();
     let thrown: unknown;
     try {
-      await registerWithFlair({ ...args(fake), env: {} });
+      await registerWithFlair({ ...args(fake), adminPassFromEnv: undefined });
     } catch (err) {
       thrown = err;
     }
@@ -266,7 +324,9 @@ describe("registerWithFlair", () => {
 
   it("the missing-credential message names what is missing AND the manual fallback", async () => {
     const fake = makeFakeFlair();
-    const err = await registerWithFlair({ ...args(fake), env: {} }).catch((e) => e as Error);
+    const err = await registerWithFlair({ ...args(fake), adminPassFromEnv: undefined }).catch(
+      (e) => e as Error,
+    );
     const msg = (err as Error).message;
     expect(msg).toContain(ADMIN_PASS_ENV); // what to set
     expect(msg).toContain("admin-pass"); // where the file lives
@@ -309,9 +369,11 @@ describe("registerWithFlair", () => {
     const file = join(tmpKeys, "admin-pass");
     writeFileSync(file, `${TEST_ADMIN_CREDENTIAL}\n`, { mode: 0o600 });
     const fake = makeFakeFlair({ opsStatus: 403, reflect: "authorization" });
-    const err = await registerWithFlair({ ...args(fake), adminPassFile: file, env: {} }).catch(
-      (e) => e as Error,
-    );
+    const err = await registerWithFlair({
+      ...args(fake),
+      adminPassFile: file,
+      adminPassFromEnv: undefined,
+    }).catch((e) => e as Error);
     expect((err as Error).message).toContain(`-> 403: operator request failed; check ${file}`);
     for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
       expect((err as Error).message).not.toContain(form);
@@ -351,6 +413,123 @@ describe("registerWithFlair", () => {
       expect(output).not.toContain(form);
     }
   });
+
+  // ─── A refused insert is a race ONLY when a re-read finds the row ─────────
+  // A fetch that makes the row appear after the FIRST read: the race.
+  const racingFetch = (fake: ReturnType<typeof makeFakeFlair>) => {
+    let seenRead = false;
+    const racing: typeof fake.fetchImpl = async (url, init) => {
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      if (body?.operation === "search_by_id" && !seenRead) {
+        seenRead = true;
+        fake.agents.testbot = { id: "testbot", publicKey: "AAAAotherkeyAAAA" };
+        return { ok: true, status: 200, text: async () => "[]" };
+      }
+      return fake.fetchImpl(url, init);
+    };
+    return racing;
+  };
+
+  it("does NOT repair when an insert fails with a non-duplicate error that mentions 'duplicate' and no row exists", async () => {
+    const fake = makeFakeFlair({
+      insertReply: { status: 500, body: '{"error":"duplicate index entry in an unrelated table"}' },
+    });
+    const err = await registerWithFlair(args(fake)).catch((e) => e as Error);
+    expect((err as Error).message).toContain(
+      "flair ops-API insert Agent -> 500: operator request failed",
+    );
+    // Re-read, found nothing, stopped: no update, no record.
+    expect(fake.sequence()).toEqual([
+      "ops:search_by_id:Agent",
+      "ops:insert:Agent",
+      "ops:search_by_id:Agent",
+    ]);
+    expect(fake.agents.testbot).toBeUndefined();
+  });
+
+  it("does NOT repair on a 409 insert when the re-read finds no row", async () => {
+    const fake = makeFakeFlair({ insertReply: { status: 409, body: '{"error":"conflict"}' } });
+    const err = await registerWithFlair(args(fake)).catch((e) => e as Error);
+    expect((err as Error).message).toContain("flair ops-API insert Agent -> 409");
+    expect(fake.sequence()).not.toContain("ops:update:Agent");
+  });
+
+  it("does NOT repair when an insert is skipped (200 + skipped_hashes) but the re-read finds no row", async () => {
+    const fake = makeFakeFlair({
+      insertReply: {
+        status: 200,
+        body: JSON.stringify({ inserted_hashes: [], skipped_hashes: ["testbot"] }),
+      },
+    });
+    const err = await registerWithFlair(args(fake)).catch((e) => e as Error);
+    expect((err as Error).message).toContain(
+      "Flair skipped the insert of 'testbot' as already present",
+    );
+    expect(fake.sequence()).not.toContain("ops:update:Agent");
+  });
+
+  it("repairs a real duplicate race: a 409 insert, then a re-read that FINDS the row", async () => {
+    const fake = makeFakeFlair({ insertReply: { status: 409, body: '{"error":"conflict"}' } });
+    const reg = await registerWithFlair({ ...args(fake), fetchImpl: racingFetch(fake) });
+    expect(reg.outcome).toBe("repaired");
+    expect(fake.agents.testbot.publicKey).toBe(pub);
+  });
+
+  it("fails — and reports no repair — when the update does not stick", async () => {
+    const fake = makeFakeFlair({
+      agents: { testbot: { id: "testbot", publicKey: "AAAAstalekeyAAAA" } },
+      ignoreUpdates: true,
+    });
+    const err = await registerWithFlair(args(fake)).catch((e) => e as Error);
+    expect((err as Error).message).toContain(
+      "does not carry the requested public key after the update, so it was not repaired",
+    );
+    expect(fake.agents.testbot.publicKey).toBe("AAAAstalekeyAAAA");
+  });
+
+  it("surfaces the ORIGINAL insert error when a raced row's update does not stick", async () => {
+    const fake = makeFakeFlair({
+      insertReply: { status: 409, body: '{"error":"conflict"}' },
+      ignoreUpdates: true,
+    });
+    const err = await registerWithFlair({ ...args(fake), fetchImpl: racingFetch(fake) }).catch(
+      (e) => e as Error,
+    );
+    expect((err as Error).message).toContain("flair ops-API insert Agent -> 409");
+  });
+
+  // ─── Transport exceptions never carry the credential out ─────────────────
+  // fetch() rejecting, or the response body failing to read, can put the
+  // request — and so the Basic header — in the exception's message or cause.
+  it("the fake's transport exception really carries the credential (known-present check)", () => {
+    const [header, , decoded] = operatorCredentialForms(TEST_ADMIN_CREDENTIAL);
+    const probe = credentialBearingError({ Authorization: header });
+    expect(probe.message).toContain(header);
+    expect(inspect(probe)).toContain(decoded);
+  });
+
+  for (const stage of ["fetch", "text"] as const) {
+    for (const op of ["search_by_id", "insert"] as const) {
+      it(`replaces a credential-bearing transport exception on ${op} (${stage})`, async () => {
+        const fake = makeFakeFlair({
+          transportFailure: { stage, match: (r) => r.op === op },
+        });
+        const { error, output } = await captureOutput(() => registerWithFlair(args(fake)));
+        const err = error as Error;
+        expect(err.message).toContain(`flair ops-API ${op} Agent to http://127.0.0.1:19925: `);
+        expect(err.message).toContain(
+          stage === "fetch"
+            ? "the request failed before a response arrived"
+            : "the response could not be read",
+        );
+        expect(err.cause).toBeUndefined();
+        for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+          expect(inspect(err)).not.toContain(form);
+          expect(output).not.toContain(form);
+        }
+      });
+    }
+  }
 
   it("rejects invalid agent names before touching the network", async () => {
     const fake = makeFakeFlair();

@@ -53,6 +53,21 @@ export interface FakeFlairOptions {
   // "authorization" echoes the Authorization header verbatim; "decoded-basic"
   // echoes the decoded user:password of a Basic header.
   reflect?: "authorization" | "decoded-basic";
+  // Answer every ops-API insert with this status and body instead of applying
+  // it (insert-refusal tests).
+  insertReply?: { status: number; body: string };
+  // Answer every ops-API update 200 but change nothing: an update that does
+  // not stick.
+  ignoreUpdates?: boolean;
+  // Fail matching requests in TRANSPORT: "fetch" rejects; "text" answers
+  // `status` (default 200) with a body reader that rejects. Either exception
+  // carries the request's Authorization header in its message and the decoded
+  // credential in its cause (credentialBearingError).
+  transportFailure?: {
+    stage: "fetch" | "text";
+    match: (req: { method: string; path: string; op?: string }) => boolean;
+    status?: number;
+  };
 }
 
 export interface FakeFlair {
@@ -86,6 +101,28 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const errorBodies: string[] = [];
 
   const fetchImpl: FakeFlair["fetchImpl"] = async (url, init) => {
+    const failure = opts.transportFailure;
+    if (failure) {
+      const path = new URL(url).pathname;
+      const op = init.body
+        ? (JSON.parse(init.body) as { operation?: string }).operation
+        : undefined;
+      if (failure.match({ method: init.method, path, op })) {
+        if (failure.stage === "fetch") {
+          calls.push({ method: init.method, url, path, headers: init.headers, op });
+          throw credentialBearingError(init.headers);
+        }
+        const answered = await route(url, init);
+        const status = failure.status ?? answered.status;
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => {
+            throw credentialBearingError(init.headers);
+          },
+        };
+      }
+    }
     const res = await route(url, init);
     if (res.ok) return res;
     let body = await res.text();
@@ -125,6 +162,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
           );
         }
         case "insert": {
+          if (opts.insertReply) return reply(opts.insertReply.status, opts.insertReply.body);
           const skipped: string[] = [];
           const inserted: string[] = [];
           for (const rec of records) {
@@ -138,10 +176,17 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
           return reply(200, { inserted_hashes: inserted, skipped_hashes: skipped });
         }
         case "update": {
+          // Harper's update changes existing rows only; a missing id is skipped.
+          const updated: string[] = [];
+          const skipped: string[] = [];
           for (const rec of records) {
-            agents[rec.id] = { ...(agents[rec.id] ?? { id: rec.id }), ...rec };
+            if (!agents[rec.id]) skipped.push(rec.id);
+            else {
+              if (!opts.ignoreUpdates) agents[rec.id] = { ...agents[rec.id], ...rec };
+              updated.push(rec.id);
+            }
           }
-          return reply(200, { update_hashes: records.map((r) => r.id) });
+          return reply(200, { update_hashes: updated, skipped_hashes: skipped });
         }
         default:
           return reply(400, { error: `fake flair: unhandled operation ${String(body.operation)}` });
@@ -227,6 +272,18 @@ function reflectedCredential(
     ? Buffer.from(raw.slice("Basic ".length), "base64").toString("utf8")
     : raw;
   return `(authenticated as ${decoded})`;
+}
+
+// What a transport failure can carry: the request's Authorization header in
+// the message, and the decoded credential in the cause.
+export function credentialBearingError(headers: Record<string, string>): Error {
+  const raw = headers.authorization ?? headers.Authorization ?? "";
+  const decoded = raw.startsWith("Basic ")
+    ? Buffer.from(raw.slice("Basic ".length), "base64").toString("utf8")
+    : raw;
+  return new Error(`transport failed; request carried Authorization: ${raw}`, {
+    cause: new Error(`authenticated as ${decoded}`),
+  });
 }
 
 // Every form an operator Basic credential can take in output: the header, its

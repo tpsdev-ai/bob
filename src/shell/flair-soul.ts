@@ -43,8 +43,10 @@ import { FlairHttpClient } from "../capabilities/flair/client.js";
 import {
   adminPassPath,
   assertOperatorAuthTarget,
+  FlairOperatorTransportError,
   type FlairRegistration,
   flairOperatorBasicAuth,
+  operatorTransportStep,
 } from "./flair-pair.js";
 
 // Soul keys bob owns. Anything else in an agent's soul (set by hand, by
@@ -173,21 +175,35 @@ export async function pushSoulToFlair(
       i: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
     ) => fetch(u, i));
   const base = registration.flairUrl.replace(/\/+$/, "");
+  const origin = new URL(base).origin;
   const soulSet = async (key: string, value: string): Promise<string> => {
     const id = `${registration.agentId}:${key}`;
-    const res = await doFetch(`${base}/Soul/${encodeURIComponent(id)}`, {
-      method: "PUT",
-      redirect: "error",
-      headers: { Authorization: authorization, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        id,
-        agentId: registration.agentId,
-        key,
-        value,
-        durability: "permanent",
-        createdAt: new Date((opts.now ?? Date.now)()).toISOString(),
-      }),
-    });
+    // An exception from the request may carry it, and so the Basic header, in
+    // its message or cause: it is replaced, never chained or printed.
+    const res = await operatorTransportStep(
+      () =>
+        doFetch(`${base}/Soul/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          redirect: "error",
+          headers: { Authorization: authorization, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id,
+            agentId: registration.agentId,
+            key,
+            value,
+            durability: "permanent",
+            createdAt: new Date((opts.now ?? Date.now)()).toISOString(),
+          }),
+        }),
+      () =>
+        new FlairOperatorTransportError(
+          `flair Soul PUT ${id}`,
+          origin,
+          "send",
+          "Check that the Flair instance at that origin is reachable, then re-run onboard/align.",
+        ),
+    );
+    // The response body is never read.
     if (!res.ok) {
       // The server's response could echo a header. Never print it or the secret.
       throw new Error(

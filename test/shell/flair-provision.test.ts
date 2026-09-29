@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
 import { ADMIN_PASS_ENV, FlairAdminCredentialError } from "../../src/shell/flair-pair.js";
 import {
@@ -55,7 +56,7 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
       keyFile: cfg.keyPath,
       soulPath: join(scaffold.agentDir, "soul.md"),
       adminPassFile: join(keysRoot, "admin-pass"),
-      env: { [ADMIN_PASS_ENV]: TEST_ADMIN_CREDENTIAL },
+      adminPassFromEnv: TEST_ADMIN_CREDENTIAL,
       fetchImpl: fake.fetchImpl,
       warn: () => {},
       ...over,
@@ -183,12 +184,43 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
     }
   }
 
+  // ─── NO OPERATOR CREDENTIAL FROM A TRANSPORT EXCEPTION ────────────────────
+  // fetch() rejecting, or a response body failing to read, with the credential
+  // in the exception's message and cause — on registration and on the Soul PUT.
+  const transportCases = [
+    { name: "registration fetch", stage: "fetch", method: "POST" },
+    { name: "registration body read", stage: "text", method: "POST" },
+    { name: "Soul PUT fetch", stage: "fetch", method: "PUT" },
+  ] as const;
+  for (const c of transportCases) {
+    it(`onboard never surfaces the credential when the ${c.name} fails in transport`, async () => {
+      const fake = makeFakeFlair({
+        transportFailure: { stage: c.stage, match: (r) => r.method === c.method },
+      });
+      const { error, output } = await captureOutput(() => provision(fake, { warn: undefined }));
+      const err = error as Error;
+      expect(err.message).toContain(
+        c.stage === "fetch"
+          ? "the request failed before a response arrived"
+          : "the response could not be read",
+      );
+      expect(err.cause).toBeUndefined();
+      for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+        expect(inspect(err)).not.toContain(form);
+        expect(output).not.toContain(form);
+      }
+    });
+  }
+
   // ─── FAIL LOUDLY ON A MISSING CREDENTIAL ─────────────────────────────────
   it("throws — and writes no soul — when no admin credential is available", async () => {
     const fake = makeFakeFlair();
     let thrown: unknown;
     try {
-      await provision(fake, { env: {}, adminPassFile: join(keysRoot, "missing-admin-pass") });
+      await provision(fake, {
+        adminPassFromEnv: undefined,
+        adminPassFile: join(keysRoot, "missing-admin-pass"),
+      });
     } catch (err) {
       thrown = err;
     }
@@ -202,7 +234,7 @@ describe("provisionFlairIdentity — onboard --no-interactive (#93 + #94)", () =
   it("the credential error names the agent, the env var, the file and the manual fix", async () => {
     const fake = makeFakeFlair();
     const err = (await provision(fake, {
-      env: {},
+      adminPassFromEnv: undefined,
       adminPassFile: join(keysRoot, "missing-admin-pass"),
     }).catch((e) => e)) as Error;
     expect(err.message).toContain("testbot");
@@ -396,6 +428,21 @@ describe("syncFlairSoul — bob align (#94)", () => {
       }
     });
   }
+
+  it("align never surfaces the credential when the Soul PUT fails in transport", async () => {
+    const fake = makeFakeFlair({
+      agents: { testbot: { id: "testbot", publicKey: scaffold.flair?.publicKeyBase64 } },
+      transportFailure: { stage: "fetch", match: (r) => r.method === "PUT" },
+    });
+    const { error, output } = await captureOutput(() => sync(fake, { warn: undefined }));
+    const err = error as Error;
+    expect(err.message).toContain("flair Soul PUT testbot:name to ");
+    expect(err.cause).toBeUndefined();
+    for (const form of operatorCredentialForms(TEST_ADMIN_CREDENTIAL)) {
+      expect(inspect(err)).not.toContain(form);
+      expect(output).not.toContain(form);
+    }
+  });
 
   it("verifies registration FIRST, and the verification precedes every soul call", async () => {
     const fake = registeredFake();

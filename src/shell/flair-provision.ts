@@ -42,6 +42,10 @@ export interface ProvisionFlairIdentityOptions {
   soulPath: string;
   // Overrides / seams.
   opsUrl?: string;
+  // The FLAIR_ADMIN_PASS value the caller already took out of the environment
+  // (takeFlairAdminPassFromEnv). Used for registration only; Soul writes read
+  // the password file.
+  adminPassFromEnv?: string;
   adminPassFile?: string;
   adminUser?: string;
   env?: NodeJS.ProcessEnv;
@@ -69,6 +73,7 @@ export async function provisionFlairIdentity(
     publicKeyBase64: opts.publicKeyBase64,
     flairUrl: opts.flairUrl,
     opsUrl: opts.opsUrl,
+    adminPassFromEnv: opts.adminPassFromEnv,
     adminPassFile: opts.adminPassFile,
     adminUser: opts.adminUser,
     keyPath: opts.keyFile,
@@ -101,7 +106,7 @@ export function operatorSelectedFlairUrl(
 }
 
 export interface SyncFlairSoulOptions
-  extends Omit<ProvisionFlairIdentityOptions, "publicKeyBase64" | "opsUrl"> {
+  extends Omit<ProvisionFlairIdentityOptions, "publicKeyBase64" | "opsUrl" | "adminPassFromEnv"> {
   publicKeyBase64?: string;
   // Selected by the operator at this invocation, never read from bob.yaml.
   operatorFlairUrl: string;
