@@ -18,7 +18,13 @@ const FIXTURE = JSON.parse(
     join(import.meta.dir, "..", "..", "fixtures", "tps-mail", "cli-signed-envelopes.json"),
     "utf8",
   ),
-) as { publicKeys: Record<string, string>; single: string; twoHop: string };
+) as {
+  publicKeys: Record<string, string>;
+  single: string;
+  twoHop: string;
+  reply: string;
+  replyInReplyTo: string;
+};
 
 const cliKeys = Object.fromEntries(
   Object.entries(FIXTURE.publicKeys).map(([agent, b64]) => [agent, Buffer.from(b64, "base64")]),
@@ -272,6 +278,80 @@ describe("decideInbound — a canonicalization failure is a REFUSAL, never a ret
       },
     });
     expect(d.kind).toBe("unavailable");
+  });
+});
+
+// tpsdev-ai/cli#431: `tps mail send --reply-to <messageId>` signs the id it
+// answers as the envelope's `replyToId`, and the CLI's receipt policy refuses
+// one outside its envelope-id rule. A peer answering a bob agent's reply sends
+// exactly this shape.
+describe("decideInbound — a threaded envelope (replyToId, tpsdev-ai/cli#431)", () => {
+  const REPLY_OPTS = () =>
+    OPTS({ identity: "tester-a", senders: new Set(["testbot"]), resolveKey: keyResolver(cliKeys) });
+
+  it("(v5) accepts a reply the CLI signed with --reply-to (the CLI's own envelope)", async () => {
+    const env = JSON.parse(FIXTURE.reply) as Record<string, unknown>;
+    expect(env.replyToId).toBe(FIXTURE.replyInReplyTo);
+    // The record wraps the CLI's exact envelope string, as its maildir writes it.
+    const record = mailRecord(FIXTURE.reply, {
+      from: "testbot",
+      to: "tester-a",
+      headers: { "X-TPS-Sender": "testbot" },
+    });
+    const d = await decideInbound(record, REPLY_OPTS());
+    expect(d.kind).toBe("accept");
+    if (d.kind === "accept") {
+      expect(d.sender).toBe("testbot");
+      expect(d.body).toBe("SMOKE-OK");
+    }
+  });
+
+  it("(v6) the replyToId is signed content: altered or removed, the CLI's envelope does not verify", async () => {
+    const env = JSON.parse(FIXTURE.reply) as Record<string, unknown>;
+    const altered = { ...env, replyToId: "some-other-message" };
+    expectRefused(await decideInbound(mailRecord(altered), REPLY_OPTS()), "bad-signature");
+    const { replyToId: _drop, ...removed } = env;
+    expectRefused(await decideInbound(mailRecord(removed), REPLY_OPTS()), "bad-signature");
+  });
+
+  it("(t1) accepts a signed replyToId inside the CLI's id rule, at both ends of it", async () => {
+    const k = testKey();
+    for (const replyToId of [
+      "0b4f6a8e-1c2d-4e5f-9a0b-1c2d3e4f5a6b",
+      ".lead_dot-ok",
+      "a".repeat(128),
+      "x",
+    ]) {
+      const env = signTestEnvelope({ from: "tester-a", to: "testbot", body: "x", replyToId }, k);
+      const d = await decideInbound(
+        mailRecord(env),
+        OPTS({ resolveKey: keyResolver({ "tester-a": k }) }),
+      );
+      expect(d.kind).toBe("accept");
+    }
+  });
+
+  it("(t2) refuses a SIGNED replyToId outside the CLI's id rule — the CLI dead-letters it too", async () => {
+    const k = testKey();
+    for (const replyToId of [
+      null,
+      "",
+      "a".repeat(129),
+      "a b",
+      "line\nbreak",
+      "../x/y",
+      42,
+      ["m-1"],
+    ]) {
+      const env = signTestEnvelope({ from: "tester-a", to: "testbot", body: "x", replyToId }, k);
+      const d = await decideInbound(
+        mailRecord(env),
+        OPTS({ resolveKey: keyResolver({ "tester-a": k }) }),
+      );
+      expectRefused(d, "malformed");
+      if (d.kind === "refuse")
+        expect(d.detail).toBe("the envelope replyToId is not a valid envelope id");
+    }
   });
 });
 
