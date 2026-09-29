@@ -7,6 +7,8 @@ import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
   admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]>;
+  // The origin of the turn currently admitted, from admission until that
+  // prompt settles — never cleared mid-prompt by an agent_end.
   readOrigin(): TurnOrigin;
 }
 
@@ -31,8 +33,15 @@ export function createTurnAdmission() {
         if (event.type !== "agent_end") return;
         const turn = context.getStore();
         if (turn !== active || !turn) return;
+        // agent_end fires INSIDE a prompt more than once (retries and
+        // continuations), so it only CAPTURES the turn's messages here — it must
+        // not clear the origin. The admitted origin stays current from admission
+        // until the admitted prompt settles, which readOrigin() relies on: the
+        // discord tools bind a turn's outbound reach to readOrigin(), and a
+        // cleared origin mid-turn would restore their allowlist reach. The
+        // origin is cleared once, in admitTurn's own finally, after
+        // session.prompt() has resolved or rejected.
         turn.messages = event.messages;
-        turn.origin = { kind: "run" };
       });
       ready();
     },
