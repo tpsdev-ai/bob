@@ -5,13 +5,16 @@
 //      calls — not only when the run ends;
 //   2. the configured context window reaches the runtime (the session's model,
 //      the provider's request model, pi's registry lookup);
-//   3. a stream that ignores the output cap it was sent is cut at that cap;
+//   3. the output cap is SENT as a token count; a stream that ignores it is
+//      ended by bob's backstop after more streamed pieces than the cap (pieces,
+//      not tokens: never early, possibly late), and the cut message holds only
+//      the pieces bob accepted, even when later events are already queued;
 //   4. the run log carries one usage record per request (prompt, cached-prompt,
 //      completion and thinking tokens, time to first token, model);
 //   5. the thinking level reaches the provider's request.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,13 +27,17 @@ import {
 } from "@earendil-works/pi-ai";
 import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { runAlign } from "../../src/shell/align.js";
 import { readProviderLimits, readSessionBudget } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
 import { checkpointText } from "../../src/shell/model-budget.js";
+import { hireAgent } from "../../src/shell/position-runtime.js";
+import { DEFAULT_POSITIONS_ROOT } from "../../src/shell/positions.js";
 import { createRequestUsageTracker } from "../../src/shell/request-usage.js";
 import type { RunSession, RunSessionConfig } from "../../src/shell/run.js";
 import { resolveRunConfig, runAgent } from "../../src/shell/run.js";
-import { createBobRuntimeFactory } from "../../src/shell/session.js";
+import { createBobRuntimeFactory, sessionModelLimits } from "../../src/shell/session.js";
+import { type SpawnError, spawnNode } from "../cli-spawn.js";
 
 const STUB_PROVIDER = "bob-stub-214";
 const STUB_MODEL = "stub-214";
@@ -384,7 +391,12 @@ describe("bob#214 — the configured context window reaches the runtime", () => 
     await expect(
       liveSession({
         runtime,
-        config: { provider: STUB_PROVIDER, model: STUB_MODEL, modelLimits: undefined },
+        config: {
+          provider: STUB_PROVIDER,
+          model: STUB_MODEL,
+          modelLimits: undefined,
+          yamlModel: { provider: STUB_PROVIDER, model: STUB_MODEL },
+        },
       }),
     ).rejects.toThrow(
       /without a declared context window[\s\S]*context_window: <tokens>[\s\S]*bob\.yaml/,
@@ -516,14 +528,18 @@ describe("bob#214 — bob.yaml and role.json validation", () => {
 
 // ─── 3 + 5. Output cap and thinking level on the OpenAI-compatible path ─────
 
-describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforced; thinking reaches the request", () => {
+describe("bob#214 — the OpenAI-compatible path: max_tokens is sent, a piece-count backstop ends a stream that ignores it; thinking reaches the request", () => {
   const FAKE_PROVIDER = "fake-oai-214";
   const FAKE_MODEL = "fake-model";
   const TOTAL_CHUNKS = 200;
 
   /** A fake OpenAI-compatible server that IGNORES the output cap: it streams
-   *  TOTAL_CHUNKS one-token chunks whatever the request asked for. */
-  function ignoringServer() {
+   *  `pieces` (by default TOTAL_CHUNKS one-token chunks), one SSE chunk each,
+   *  whatever the request asked for. */
+  function ignoringServer(
+    pieces: string[] = Array.from({ length: TOTAL_CHUNKS }, (_, i) => `t${i} `),
+    completionTokens = TOTAL_CHUNKS,
+  ) {
     const bodies: Array<Record<string, unknown>> = [];
     let pulled = 0;
     let aborted = false;
@@ -539,8 +555,8 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
         );
       const body = new ReadableStream<Uint8Array>({
         pull(controller) {
-          if (pulled < TOTAL_CHUNKS) {
-            controller.enqueue(chunk({ content: `t${pulled} ` }, null));
+          if (pulled < pieces.length) {
+            controller.enqueue(chunk({ content: pieces[pulled] }, null));
             pulled += 1;
             return;
           }
@@ -548,7 +564,7 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
             chunk(
               {},
               "stop",
-              `,"usage":{"prompt_tokens":7,"completion_tokens":${TOTAL_CHUNKS},"total_tokens":${TOTAL_CHUNKS + 7}}`,
+              `,"usage":{"prompt_tokens":7,"completion_tokens":${completionTokens},"total_tokens":${completionTokens + 7}}`,
             ),
           );
           controller.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -600,7 +616,24 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
       | (AssistantMessage & { bobOutputCap?: boolean })
       | undefined;
 
-  it("sends max_completion_tokens from provider.max_output_tokens and CUTS the stream there when the server ignores it", async () => {
+  const cappedSession = async (runtime: unknown, maxOutputTokens: number) =>
+    await liveSession({
+      runtime,
+      config: {
+        provider: FAKE_PROVIDER,
+        model: FAKE_MODEL,
+        modelLimits: {
+          provider: FAKE_PROVIDER,
+          model: FAKE_MODEL,
+          contextWindow: 100_000,
+          maxOutputTokens,
+        },
+      },
+    });
+  const textOf = (message: AssistantMessage | undefined) =>
+    (message?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
+
+  it("sends max_completion_tokens from provider.max_output_tokens, and the backstop ends the stream after that many streamed pieces when the server ignores it", async () => {
     const server = ignoringServer();
     const runtime = await fakeRuntime(server.fetchImpl);
     const session = await liveSession({
@@ -618,15 +651,19 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
     });
     try {
       await session.prompt("go", { expandPromptTemplates: false });
-      // Sent: the cap bob.yaml declared.
+      // Sent: the cap bob.yaml declared, as a token count.
       expect(server.bodies[0]?.max_completion_tokens).toBe(50);
-      // Enforced: exactly 50 tokens delivered, ended as a length stop, request aborted.
+      // The backstop: the message keeps the first 50 streamed PIECES, ends as a
+      // length stop, and the request is aborted. Its usage is ASSIGNED, not
+      // measured (the server's final usage never arrived): output is the cap, a
+      // lower bound, so pi keeps the message as a stop at the cap rather than
+      // dropping it as a context-pressure stop; the prompt counts are unknown (0).
       const message = lastAssistant(session);
       expect(message?.stopReason).toBe("length");
       expect(message?.bobOutputCap).toBe(true);
       expect(message?.usage.output).toBe(50);
-      const text = (message?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
-      expect(text).toBe(Array.from({ length: 50 }, (_, i) => `t${i} `).join(""));
+      expect(message?.usage.input).toBe(0);
+      expect(textOf(message)).toBe(Array.from({ length: 50 }, (_, i) => `t${i} `).join(""));
       expect(server.aborted()).toBe(true);
       expect(server.pulled()).toBeLessThan(TOTAL_CHUNKS);
     } finally {
@@ -662,6 +699,49 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
     }
   });
 
+  it("counts PIECES, not tokens: many tiny pieces are ended after the cap in pieces, whatever tokens they form", async () => {
+    // 40 one-character pieces: fewer tokens than pieces for any real tokenizer
+    // of this text, but the backstop has no tokenizer — it ends the stream after
+    // 5 pieces. (A server sends a piece only after generating at least one
+    // token, which is what makes a piece count never early; a server that split
+    // tokens like this fake does would be ended early.)
+    const letters = "the quick brown fox jumps over a lazy dog".split("").slice(0, 40);
+    const server = ignoringServer(letters, 12);
+    const session = await cappedSession(await fakeRuntime(server.fetchImpl), 5);
+    try {
+      await session.prompt("go", { expandPromptTemplates: false });
+      expect(server.bodies[0]?.max_completion_tokens).toBe(5);
+      const message = lastAssistant(session);
+      expect(message?.stopReason).toBe("length");
+      expect(message?.bobOutputCap).toBe(true);
+      expect(textOf(message)).toBe(letters.slice(0, 5).join(""));
+      expect(server.aborted()).toBe(true);
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("possibly LATE: one piece carrying many tokens counts once, so a stream within the cap in pieces is not ended", async () => {
+    // Two pieces, one of them a whole paragraph (far more than 5 tokens), from
+    // a server that ignores a 5-token cap. Two pieces are not more than 5, so
+    // the backstop does not fire: it can be late, never early.
+    const paragraph = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    const server = ignoringServer(["Intro. ", paragraph], 70);
+    const session = await cappedSession(await fakeRuntime(server.fetchImpl), 5);
+    try {
+      await session.prompt("go", { expandPromptTemplates: false });
+      const message = lastAssistant(session);
+      expect(message?.stopReason).toBe("stop");
+      expect(message?.bobOutputCap).toBeUndefined();
+      expect(textOf(message)).toBe(`Intro. ${paragraph}`);
+      // The server's own count, not bob's: 70 tokens against a 5-token cap.
+      expect(message?.usage.output).toBe(70);
+      expect(server.aborted()).toBe(false);
+    } finally {
+      session.dispose();
+    }
+  });
+
   it("the thinking level reaches the provider's request (reasoning_effort)", async () => {
     for (const level of ["low", "high"] as const) {
       const server = ignoringServer();
@@ -686,6 +766,148 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent and enforce
       } finally {
         session.dispose();
       }
+    }
+  });
+});
+
+// ─── 3b. A cut keeps only the pieces bob accepted ──────────────────────────
+
+describe("bob#214 — a cut message holds only the pieces bob accepted, never pi-ai's shared partial", () => {
+  const BUFFERED_PROVIDER = "bob-buffered-214";
+  const BUFFERED_MODEL = "buffered-214";
+
+  /** A provider that streams the way pi-ai's own do — ONE mutable partial
+   *  message, mutated before each event is pushed — with EVERY event of the
+   *  first response (the pieces past the cap and the end of the stream
+   *  included) queued before any consumer reads the first one. The second
+   *  request (after pi fails the truncated tool call) gets a one-piece answer. */
+  function bufferedProvider() {
+    const requests: string[] = [];
+    const streamSimple = (model: Model<string>, context: Context): AssistantMessageEventStream => {
+      requests.push(JSON.stringify(context.messages));
+      const stream = createAssistantMessageEventStream();
+      const partial: AssistantMessage = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: usage(0),
+        stopReason: "pending",
+        timestamp: Date.now(),
+      };
+      stream.push({ type: "start", partial });
+      const text = { type: "text" as const, text: "" };
+      partial.content.push(text);
+      stream.push({ type: "text_start", contentIndex: 0, partial });
+      const textPiece = (delta: string) => {
+        text.text += delta;
+        stream.push({ type: "text_delta", contentIndex: 0, delta, partial });
+      };
+      if (requests.length > 1) {
+        textPiece("done");
+        partial.stopReason = "stop";
+        partial.usage = usage(100, 1);
+        stream.push({ type: "text_end", contentIndex: 0, content: text.text, partial });
+        stream.push({ type: "done", reason: "stop", message: partial });
+        stream.end(partial);
+        return stream;
+      }
+      textPiece("ok1 "); // piece 1
+      textPiece("ok2 "); // piece 2
+      const call = {
+        type: "toolCall" as const,
+        id: "call-1",
+        name: "read",
+        arguments: {} as Record<string, unknown>,
+      };
+      partial.content.push(call);
+      stream.push({ type: "toolcall_start", contentIndex: 1, partial });
+      // pi-ai re-parses a call's arguments into the shared block on every piece.
+      const argPiece = (delta: string, parsed: Record<string, unknown>) => {
+        call.arguments = parsed;
+        stream.push({ type: "toolcall_delta", contentIndex: 1, delta, partial });
+      };
+      argPiece('{"path":"', { path: "" }); // piece 3 — the cap
+      argPiece('LEAK-args.txt"}', { path: "LEAK-args.txt" }); // piece 4 — past the cap: the backstop ends here
+      textPiece("LEAK-text"); // more output the producer queued before the reader got here
+      partial.stopReason = "toolUse";
+      partial.usage = usage(500, 999);
+      stream.push({ type: "text_end", contentIndex: 0, content: text.text, partial });
+      stream.push({ type: "toolcall_end", contentIndex: 1, toolCall: call, partial });
+      stream.push({ type: "done", reason: "toolUse", message: partial });
+      stream.end(partial);
+      return stream;
+    };
+    return { requests, streamSimple };
+  }
+
+  it("a stream whose later pieces are already queued is cut to the accepted pieces: in session history, in every event a listener sees, and in the next request", async () => {
+    const provider = bufferedProvider();
+    const runtime = await ModelRuntime.create({ modelsPath: null });
+    runtime.registerProvider(BUFFERED_PROVIDER, {
+      name: "Buffered 214",
+      apiKey: "stub-key",
+      api: STUB_API,
+      baseUrl: "http://localhost:0",
+      streamSimple: provider.streamSimple as never,
+      models: [
+        {
+          id: BUFFERED_MODEL,
+          name: "Buffered",
+          api: STUB_API,
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 100_000,
+          maxTokens: 4_096,
+        },
+      ],
+    });
+    const session = await liveSession({
+      runtime,
+      config: {
+        provider: BUFFERED_PROVIDER,
+        model: BUFFERED_MODEL,
+        modelLimits: {
+          provider: BUFFERED_PROVIDER,
+          model: BUFFERED_MODEL,
+          contextWindow: 100_000,
+          maxOutputTokens: 3,
+        },
+      },
+    });
+    // Every event, serialized the moment a listener receives it.
+    const seen: string[] = [];
+    session.subscribe((event) => {
+      seen.push(JSON.stringify(event));
+    });
+    try {
+      await session.prompt("go", { expandPromptTemplates: false });
+      const messages = (session as unknown as { messages: AssistantMessage[] }).messages;
+      const cut = messages.find((m) => m.role === "assistant" && m.stopReason === "length") as
+        | (AssistantMessage & { bobOutputCap?: boolean })
+        | undefined;
+      expect(cut?.bobOutputCap).toBe(true);
+      // The two text pieces and the tool call as far as its accepted piece.
+      expect(cut?.content.map((c) => c.type)).toEqual(["text", "toolCall"]);
+      expect(cut?.content[0]).toEqual({ type: "text", text: "ok1 ok2 " });
+      const call = cut?.content[1] as { id?: string; name?: string; arguments?: unknown };
+      expect(call.id).toBe("call-1");
+      expect(call.name).toBe("read");
+      // Assigned usage: the cap, not the provider's 999 (which came after the cut).
+      expect(cut?.usage.output).toBe(3);
+      expect(cut?.usage.input).toBe(0);
+      // Nothing from after the cut anywhere: session history, any event a
+      // listener received, or the next request pi built from the history.
+      expect(JSON.stringify(messages)).not.toContain("LEAK");
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.filter((e) => e.includes("LEAK"))).toEqual([]);
+      expect(provider.requests.length).toBe(2);
+      expect(provider.requests[1]).toContain("ok1 ok2 ");
+      expect(provider.requests[1]).not.toContain("LEAK");
+    } finally {
+      session.dispose();
     }
   });
 });
@@ -772,7 +994,7 @@ describe("bob#214 — the run log carries one usage record per model request", (
     });
   });
 
-  it("prefers the provider's reported thinking tokens, and marks a stream bob cut at the output cap", () => {
+  it("prefers the provider's reported thinking tokens, and marks a stream bob's output backstop ended", () => {
     let t = 1_000;
     const tracker = createRequestUsageTracker(() => t);
     tracker.observe({ type: "message_start", message: { role: "assistant", timestamp: 1_000 } });
@@ -816,5 +1038,258 @@ describe("bob#214 — the run log carries one usage record per model request", (
     });
     expect(record?.ttftMs).toBeNull();
     expect(record?.durationMs).toBe(1_000);
+  });
+});
+
+// ─── Refusals that name the right remedy; onboard, hire and align ──────────
+
+describe("bob#214 — a missing window's refusal names the key that would declare THIS model", () => {
+  const withModelsEntry = () => {
+    const yamlPath = join(agentsRoot, "budgetbot", "bob.yaml");
+    writeFileSync(
+      yamlPath,
+      readFileSync(yamlPath, "utf8").replace(
+        "  context_window: 200000\n",
+        [
+          "  context_window: 200000",
+          "  models:",
+          "    - id: claude-opus-4-7",
+          "      context_window: 1000000",
+          "      max_output_tokens: 64000",
+          "",
+        ].join("\n"),
+      ),
+    );
+  };
+  const refusal = (config: Parameters<typeof sessionModelLimits>[0]): string => {
+    try {
+      sessionModelLimits(config);
+    } catch (err) {
+      return (err as Error).message;
+    }
+    return "";
+  };
+
+  it("an undeclared --model is told to add a provider.models entry for that model — not provider.context_window", () => {
+    const { config } = resolveRunConfig({ name: "budgetbot", agentsRoot, model: "some-other" });
+    expect(config.modelLimits).toBeUndefined();
+    const msg = refusal(config);
+    expect(msg).toMatch(
+      /some-other is not bob\.yaml's provider\.model \(claude-sonnet-4-6\), so its window is a provider\.models entry/,
+    );
+    expect(msg).toContain('"- id: some-other" with "context_window: <tokens>"');
+    expect(msg).not.toContain('add "context_window: <tokens>" under "provider:"');
+  });
+
+  it("bob.yaml's own model with no window is told to add provider.context_window", () => {
+    const yamlPath = join(agentsRoot, "budgetbot", "bob.yaml");
+    writeFileSync(
+      yamlPath,
+      readFileSync(yamlPath, "utf8").replace(
+        / {2}# The context window[^\n]*\n {2}context_window: 200000\n/,
+        "",
+      ),
+    );
+    const { config } = resolveRunConfig({ name: "budgetbot", agentsRoot });
+    expect(config.modelLimits).toBeUndefined();
+    expect(refusal(config)).toMatch(
+      /add "context_window: <tokens>" under "provider:" in .*bob\.yaml, set to the context length the server enforces for claude-sonnet-4-6/,
+    );
+  });
+
+  it("the session factory refuses an undeclared override with that remedy, before any request", async () => {
+    const stub = stubProvider([]);
+    const runtime = await stubRuntime(stub.streamSimple, {
+      contextWindow: 131_072,
+      maxTokens: 4096,
+    });
+    await expect(
+      liveSession({
+        runtime,
+        config: {
+          provider: STUB_PROVIDER,
+          model: "other-model",
+          modelLimits: undefined,
+          yamlModel: { provider: STUB_PROVIDER, model: STUB_MODEL },
+        },
+      }),
+    ).rejects.toThrow(/provider\.models entry[\s\S]*"- id: other-model"/);
+    expect(stub.requests.length).toBe(0);
+  });
+
+  it("a declared --model resolves to its own entry, which the factory's check accepts", () => {
+    withModelsEntry();
+    const { config } = resolveRunConfig({
+      name: "budgetbot",
+      agentsRoot,
+      model: "claude-opus-4-7",
+    });
+    expect(sessionModelLimits(config)).toEqual({
+      provider: "anthropic",
+      model: "claude-opus-4-7",
+      contextWindow: 1_000_000,
+      maxOutputTokens: 64_000,
+    });
+  });
+});
+
+describe("bob#214 — bob align resolves the declared limits of the pair it runs, the way bob run does", () => {
+  const withModelsEntry = () => {
+    const yamlPath = join(agentsRoot, "budgetbot", "bob.yaml");
+    writeFileSync(
+      yamlPath,
+      readFileSync(yamlPath, "utf8").replace(
+        "  context_window: 200000\n",
+        "  context_window: 200000\n  models:\n    - id: claude-opus-4-7\n      context_window: 1000000\n",
+      ),
+    );
+  };
+  const alignConfig = async (overrides: { provider?: string; model?: string }) => {
+    const seen: RunSessionConfig[] = [];
+    await runAlign({
+      name: "budgetbot",
+      agentDir: join(agentsRoot, "budgetbot"),
+      ...overrides,
+      sessionRunner: async ({ config }) => {
+        seen.push(config);
+        return 0;
+      },
+    });
+    expect(seen.length).toBe(1);
+    return seen[0] as RunSessionConfig;
+  };
+
+  it("--model with a provider.models entry runs with THAT model's window, and the factory's check accepts it", async () => {
+    withModelsEntry();
+    const config = await alignConfig({ model: "claude-opus-4-7" });
+    expect(config.model).toBe("claude-opus-4-7");
+    expect(config.modelLimits).toEqual({
+      provider: "anthropic",
+      model: "claude-opus-4-7",
+      contextWindow: 1_000_000,
+    });
+    expect(sessionModelLimits(config).contextWindow).toBe(1_000_000);
+  });
+
+  it("no override runs with bob.yaml's own window", async () => {
+    withModelsEntry();
+    const config = await alignConfig({});
+    expect(sessionModelLimits(config)).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+    });
+  });
+
+  it("an undeclared --model, and a --provider naming another provider, are refused with the key that would fix each", async () => {
+    withModelsEntry();
+    const undeclared = await alignConfig({ model: "some-other" });
+    expect(() => sessionModelLimits(undeclared)).toThrow(
+      /provider\.models entry[\s\S]*"- id: some-other"/,
+    );
+    const otherProvider = await alignConfig({ provider: "ollama-cloud" });
+    expect(otherProvider.provider).toBe("ollama-cloud");
+    expect(otherProvider.modelLimits).toBeUndefined();
+    expect(() => sessionModelLimits(otherProvider)).toThrow(
+      /declares context windows only for its own provider, anthropic \(provider\.name\); this session runs ollama-cloud/,
+    );
+  });
+});
+
+describe("bob#214 — bob onboard and bob hire refuse a missing --context-window BEFORE writing anything", () => {
+  const CLI = join(import.meta.dir, "..", "..", "dist", "cli.js");
+  // What bob wrote under HOME: every entry but the JS runtime's own cache
+  // directory (bun's transpiler cache: ~/Library/Caches on macOS, ~/.cache on
+  // Linux), which the runtime creates before bob runs a line.
+  const RUNTIME_CACHE = new Set(["Library", ".cache"]);
+  const bobWrites = (home: string) => readdirSync(home).filter((e) => !RUNTIME_CACHE.has(e));
+  const cli = (args: string[], home: string): { code: number | null; out: string } => {
+    try {
+      return { code: 0, out: spawnNode([CLI, ...args], { env: { ...process.env, HOME: home } }) };
+    } catch (err) {
+      const e = err as SpawnError;
+      return { code: e.code, out: e.stdout };
+    }
+  };
+
+  it("bob onboard — interactive, --no-interactive and --dry-run alike — exits 2 naming the flag, and HOME stays empty", () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-214-onboard-"));
+    try {
+      for (const extra of [[], ["--no-interactive"], ["--dry-run"]]) {
+        const r = cli(["onboard", "newbot", "--role", "ea", "--no-flair", ...extra], home);
+        expect(r.code, extra.join(" ")).toBe(2);
+        expect(r.out).toContain("--context-window <tokens> is required");
+        expect(r.out).toContain("ollama-cloud/kimi-k2.6");
+        expect(r.out).toContain("Nothing was written");
+        expect(bobWrites(home), extra.join(" ")).toEqual([]);
+      }
+      // Control: the same probe sees a write when the flag is given.
+      const ok = cli(
+        [
+          "onboard",
+          "newbot",
+          "--role",
+          "ea",
+          "--no-flair",
+          "--no-interactive",
+          "--context-window",
+          "262144",
+        ],
+        home,
+      );
+      expect(ok.code).toBe(0);
+      expect(bobWrites(home)).toEqual(["agents"]);
+      expect(readFileSync(join(home, "agents", "newbot", "bob.yaml"), "utf8")).toContain(
+        "context_window: 262144",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("bob hire exits 2 naming the flag, and HOME stays empty", () => {
+    const home = mkdtempSync(join(tmpdir(), "bob-214-hire-"));
+    try {
+      const r = cli(["hire", "newbot", "--as", "builder"], home);
+      expect(r.code).toBe(2);
+      expect(r.out).toContain("--context-window <tokens> is required");
+      expect(bobWrites(home)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("hireAgent refuses before its first write: no agent directory, no host grant", async () => {
+    const hostRoot = join(root, "host");
+    let interviews = 0;
+    const hire = (contextWindow?: number) =>
+      hireAgent({
+        name: "newhire",
+        positionName: "builder",
+        agentsRoot,
+        hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        skipFlair: true,
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+        interview: async () => {
+          interviews += 1;
+          return 0;
+        },
+      });
+    await expect(hire()).rejects.toThrow(
+      /--context-window <tokens> is required — the context window the server enforces for anthropic\/claude-sonnet-4-6[\s\S]*Nothing was written/,
+    );
+    expect(existsSync(join(agentsRoot, "newhire"))).toBe(false);
+    expect(existsSync(hostRoot)).toBe(false);
+    expect(interviews).toBe(0);
+    // Control: with the window the same hire writes the agent and its grant.
+    await hire(200_000);
+    expect(readFileSync(join(agentsRoot, "newhire", "bob.yaml"), "utf8")).toContain(
+      "context_window: 200000",
+    );
+    expect(existsSync(hostRoot)).toBe(true);
+    expect(interviews).toBe(1);
   });
 });

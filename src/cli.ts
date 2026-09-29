@@ -59,14 +59,19 @@ Commands:
   onboard <name>      Hire a new Bob-shaped agent and form them into a role.
                       Registers the Flair Agent record and writes the persona
                       into the agent's Flair soul.
-                      Flags: --role <r> --provider <p> --model <m> --context-window <tokens>
+                      Flags: --context-window <tokens> (required: the model's
+                             context window as the server enforces it)
+                             --role <r> --provider <p> --model <m>
                              --flair-url <u> --no-flair
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
   align <name>        Recurring check-in to refine an existing agent. The session
                       runs on the agent's own bob.yaml provider + model (the same
                       pair 'bob run' uses); --provider / --model override just the
-                      field each names. Mirrors the revised persona into Flair.
+                      field each names. A --model needs its own window under
+                      provider.models in bob.yaml, and bob.yaml declares windows
+                      for its own provider only, so a --provider naming another
+                      provider is refused. Mirrors the revised persona into Flair.
                       Flags: --provider <p> --model <m> --agent-dir <dir>
                              --flair-url <u> (required for Flair sync)
                              --admin-pass-file <path> --admin-user <user>
@@ -84,7 +89,8 @@ Commands:
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check of the agent's setup — prints each check
   hire <name>         Hire a NEW agent from a packaged position.
-                      Flags: --as <position> --provider <p> --model <m> --context-window <tokens> --no-flair
+                      Flags: --as <position> --context-window <tokens> (required)
+                             --provider <p> --model <m> --no-flair
   position adopt <n>  Bind an EXISTING agent to a position (--as <position>).
   position diff <n>   Show the ratified baseline vs the current effective config.
   launch <name>       The agent's session, with its resolved role tool
@@ -117,11 +123,31 @@ function contextWindowFlag(
   const raw = stringFlag(flags, "context-window");
   const n = raw !== undefined && /^[1-9][0-9]*$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(n)) {
-    throw new Error(
+    throw new UsageError(
       `${command}: --context-window must be a positive whole number of tokens (the context length the server enforces for the model)`,
     );
   }
   return n;
+}
+
+// bob#214: onboarding and hiring open a session (the hiring interview), and
+// every session refuses to start without the model's context window. So `bob
+// onboard` and `bob hire` REQUIRE the flag and refuse before anything is
+// written — before the scaffold, the keypair and the Flair registration —
+// rather than scaffold an agent whose interview cannot open. onboard's
+// --dry-run refuses the same way, so its plan never shows a run that would fail.
+function requireContextWindowFlag(
+  flags: Record<string, string | boolean>,
+  command: string,
+  pair: string,
+): number {
+  const contextWindow = contextWindowFlag(flags, command);
+  if (contextWindow === undefined) {
+    throw new UsageError(
+      `${command}: --context-window <tokens> is required — the context window the server enforces for ${pair}. bob writes it to bob.yaml as provider.context_window and refuses to start a session without it. Nothing was written.`,
+    );
+  }
+  return contextWindow;
 }
 
 async function onboard(
@@ -145,7 +171,11 @@ async function onboard(
   const flairUrl = stringFlag(flags, "flair-url") ?? DEFAULT_FLAIR_URL;
   const adminPassFile = stringFlag(flags, "admin-pass-file");
   const adminUser = stringFlag(flags, "admin-user");
-  const contextWindow = contextWindowFlag(flags, "bob onboard");
+  const contextWindow = requireContextWindowFlag(
+    flags,
+    `bob onboard ${name}`,
+    `${provider}/${model}`,
+  );
 
   if (dryRun) {
     const template = loadRole(role);
@@ -154,7 +184,7 @@ async function onboard(
   agent.role      = ${role}
   provider.name   = ${provider}
   provider.model  = ${model}
-  provider.context_window = ${contextWindow ?? "NOT SET (required before the agent runs; pass --context-window <tokens>)"}
+  provider.context_window = ${contextWindow}
   soul (from template, ${template.soul.length} chars) → ~/agents/${name}/soul.md
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
@@ -169,7 +199,7 @@ async function onboard(
     role,
     provider,
     model,
-    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    contextWindow,
     noClobber: !force,
     skipFlair: noFlair,
     flairUrl,
@@ -624,14 +654,20 @@ async function main(): Promise<number> {
         }
         const provider = stringFlag(args.flags, "provider");
         const model = stringFlag(args.flags, "model");
-        const contextWindow = contextWindowFlag(args.flags, "bob hire");
+        // bob#214: refused here as a usage error, before anything is written;
+        // hireAgent refuses a missing window too, before its own first write.
+        const contextWindow = requireContextWindowFlag(
+          args.flags,
+          `bob hire ${name}`,
+          provider !== undefined && model !== undefined ? `${provider}/${model}` : "its model",
+        );
         const result = await hireAgent({
           name,
           positionName: as,
           agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
-          ...(contextWindow !== undefined ? { contextWindow } : {}),
+          contextWindow,
           skipFlair: true,
         });
         console.log(`[bob hire] ${name} hired as position "${as}"`);

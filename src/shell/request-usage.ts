@@ -10,16 +10,21 @@
 // Sources, stated so a reader knows what each number is:
 //   * start          — the assistant message's `timestamp`, which pi-ai sets
 //                      just before it makes the HTTP request;
-//   * first token    — bob's clock at the first streamed delta with content
-//                      (text, thinking or tool call), so `ttftMs` covers
-//                      queueing, load and prefill;
+//   * first token    — bob's clock at the first streamed piece (a text,
+//                      thinking or tool-call delta with content), so `ttftMs`
+//                      covers queueing, load and prefill;
 //   * token counts   — the provider's final usage (`usage` on message_end):
 //                      promptTokens = input + cacheRead + cacheWrite,
-//                      cachedPromptTokens = cacheRead, completionTokens = output;
+//                      cachedPromptTokens = cacheRead, completionTokens = output.
+//                      A stream bob's output backstop ended has no provider
+//                      usage (it never arrives, and bob does not count tokens):
+//                      `outputCapped` marks it, its prompt counts are 0 and its
+//                      completionTokens is the cap bob assigned (a lower bound,
+//                      not a count; model-budget.ts capOutputStream);
 //   * thinking tokens — the provider's `usage.reasoning` when it reports a
 //                      positive count ("provider"); otherwise the number of
-//                      streamed thinking deltas ("stream-deltas"), a lower bound
-//                      (each delta carries at least one token).
+//                      streamed thinking pieces ("stream-deltas"). That is a
+//                      count of pieces, not tokens: a piece can carry several.
 //
 // pi's own summarization calls (compaction) are not agent requests and emit no
 // message events; their usage is on the `compaction_end` record.
@@ -34,12 +39,15 @@ export interface RequestUsageRecord {
   completionTokens: number;
   thinkingTokens: number;
   thinkingTokensSource: "provider" | "stream-deltas";
-  /** ms from the request start to the first streamed delta; null when nothing streamed. */
+  /** ms from the request start to the first streamed piece; null when nothing streamed. */
   ttftMs: number | null;
   /** ms from the request start to the end of the message. */
   durationMs: number | null;
   stopReason: string;
-  /** Present when bob ended the stream at the output cap (the provider ignored it). */
+  /** Present when bob's output backstop ended the stream (more streamed pieces
+   *  than the token cap the provider was sent). The record's token counts are
+   *  then not the provider's: its usage never arrived, so the prompt counts are
+   *  0 and completionTokens is the cap bob assigned, a lower bound. */
   outputCapped?: true;
 }
 

@@ -565,6 +565,11 @@ export interface RunSessionConfig {
   // declared window: there is no default, because a window bob guessed can
   // disagree with the server. Absent here means "not declared".
   modelLimits?: ModelLimits;
+  // bob#214: bob.yaml's own provider (pi's id) and provider.model — the pair
+  // provider.context_window describes. When the session's pair has no declared
+  // window, the factory's refusal uses it to name the key that would declare one
+  // (provider.context_window, or a provider.models entry for a --model override).
+  yamlModel?: { provider: string; model: string };
   // bob#214: compact between model calls once the context passes this fraction
   // of the window (bob.yaml `session:` over role.json `session`). Absent: pi's
   // own threshold (the window minus its reserve).
@@ -1653,6 +1658,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     tools: toolPolicy.tools,
     excludeTools: toolPolicy.excludeTools,
     ...(modelLimits !== undefined ? { modelLimits } : {}),
+    yamlModel: { provider, model: yamlModel },
     ...(budget.compactionThreshold !== undefined
       ? { compactionThreshold: budget.compactionThreshold }
       : {}),

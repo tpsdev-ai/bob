@@ -13,7 +13,8 @@
 //     to what the model declares and hands each provider in that provider's own
 //     request shape;
 //   * the OUTPUT cap — pi sends `maxTokens` (clamped to the room left in the
-//     window) on every request, from the model's `maxTokens`.
+//     window) on every request, from the model's `maxTokens`. That token count,
+//     sent to the server, is the cap.
 //
 // What pi lacks, and bob adds as small hooks on pi's public surfaces:
 //   * a RUNTIME override of a model's context window / output cap. pi reads them
@@ -28,15 +29,17 @@
 //     boundary; pi's own post-run handler then runs its threshold compaction, and
 //     the steer bob queued before stopping makes pi continue the run
 //     (`installMidRunCompaction`);
-//   * ENFORCING the output cap when a provider ignores it. bob wraps the agent's
-//     stream function and ends a stream whose streamed deltas exceed the cap pi
-//     sent (`capOutputStream`).
+//   * a BACKSTOP for a provider that ignores the output cap. bob wraps the
+//     agent's stream function and ends a stream after more streamed pieces than
+//     the token cap pi sent (`capOutputStream`). It counts pieces, not tokens:
+//     never early, possibly late (see there).
 
 import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
   createAssistantMessageEventStream,
+  parseStreamingJson,
 } from "@earendil-works/pi-ai";
 import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
@@ -81,22 +84,43 @@ export function compactionSettingsFor(
  * describe the pair the session runs. Returns the limits; throws a named
  * refusal otherwise. There is no default: a window bob guessed can disagree
  * with the server, which is the defect this exists for.
+ *
+ * The remedy names the key that would declare THIS pair, from bob.yaml's own
+ * provider/model (`yamlModel`, pi's provider id): `provider.context_window` for
+ * bob.yaml's provider.model; a `provider.models` entry with the model's id for
+ * any other model on that provider (a `--model` override); and, for a different
+ * provider, that bob.yaml declares windows for its own provider only.
  */
 export function requireModelLimits(input: {
   provider: string;
   model: string;
   limits: ModelLimits | undefined;
   bobYamlPath: string;
+  /** bob.yaml's own provider (pi's id) and provider.model, when known. */
+  yamlModel?: { provider: string; model: string };
 }): ModelLimits {
-  const { limits } = input;
+  const { limits, yamlModel } = input;
+  const pair = `${input.provider}/${input.model}`;
   if (limits === undefined) {
-    throw new ModelBudgetError(
-      `bob: refusing to start a session for ${input.provider}/${input.model} without a declared context window — bob does not guess it (a model default can disagree with the server). Remedy: add "context_window: <tokens>" under "provider:" in ${input.bobYamlPath}, set to the context length the server enforces for this model.`,
-    );
+    const refusal = `bob: refusing to start a session for ${pair} without a declared context window — bob does not guess it (a model default can disagree with the server).`;
+    const window = `set to the context length the server enforces for ${input.model}`;
+    let remedy: string;
+    if (yamlModel !== undefined && yamlModel.provider !== input.provider) {
+      remedy = `${input.bobYamlPath} declares context windows only for its own provider, ${yamlModel.provider} (provider.name); this session runs ${input.provider}. Run on bob.yaml's provider, or set provider.name, provider.model and provider.context_window in bob.yaml to the pair this session runs.`;
+    } else if (yamlModel !== undefined && yamlModel.model !== input.model) {
+      remedy = `${input.model} is not bob.yaml's provider.model (${yamlModel.model}), so its window is a provider.models entry. Add one under "provider:" in ${input.bobYamlPath}: "models:", then "- id: ${input.model}" with "context_window: <tokens>", ${window}.`;
+    } else if (yamlModel !== undefined) {
+      remedy = `add "context_window: <tokens>" under "provider:" in ${input.bobYamlPath}, ${window}.`;
+    } else {
+      remedy = `in ${input.bobYamlPath}, add "context_window: <tokens>" under "provider:" when ${input.model} is provider.model, otherwise a provider.models entry ("- id: ${input.model}" with "context_window: <tokens>"), ${window}.`;
+    }
+    throw new ModelBudgetError(`${refusal} Remedy: ${remedy}`);
   }
   if (limits.provider !== input.provider || limits.model !== input.model) {
+    // Unreachable from bob's entry paths, which resolve the limits for the pair
+    // they run; a caller that changes provider/model after resolving is refused.
     throw new ModelBudgetError(
-      `bob: the context window in ${input.bobYamlPath} (provider.context_window) describes ${limits.provider}/${limits.model}, but this session runs ${input.provider}/${input.model}. Remedy: set provider.name, provider.model and provider.context_window in bob.yaml to the model this session runs.`,
+      `bob: the declared context window this session was given describes ${limits.provider}/${limits.model}, but this session runs ${pair}. Remedy: resolve the session's config for the model it runs (the way \`bob run --model\` does) instead of changing provider or model afterwards.`,
     );
   }
   if (limits.maxOutputTokens !== undefined && limits.maxOutputTokens >= limits.contextWindow) {
@@ -275,16 +299,16 @@ export function installMidRunCompaction(
   };
 }
 
-// ─── Output cap enforcement ────────────────────────────────────────────────
+// ─── Output cap backstop ────────────────────────────────────────────────────
 
 /** pi's stream-function shape (pi-agent-core StreamFn), derived from the
  *  session so bob does not import pi-agent-core directly. */
 export type StreamFunction = AgentSession["agent"]["streamFunction"];
 
-/** Marker bob sets on a message whose stream it ended at the output cap. */
+/** Marker bob sets on a message whose stream its backstop ended. */
 export const OUTPUT_CAP_MARK = "bobOutputCap";
 
-/** Delta events that carry generated output. */
+/** A delta event that carries generated output: one streamed PIECE. */
 function isOutputDelta(
   event: AssistantMessageEvent,
 ): event is Extract<AssistantMessageEvent, { delta: string }> {
@@ -298,11 +322,11 @@ function isOutputDelta(
 }
 
 /**
- * The output cap pi sends for this request: the caller's `maxTokens`, else the
- * model's, clamped to the room left in the window — pi-ai's own
- * `clampMaxTokensToContext`, applied to the same inputs its providers use.
- * Undefined when no positive cap applies (then pi sends none and bob enforces
- * none).
+ * The output cap pi sends for this request, in tokens: the caller's
+ * `maxTokens`, else the model's, clamped to the room left in the window —
+ * pi-ai's own `clampMaxTokensToContext`, applied to the same inputs its
+ * providers use. Undefined when no positive cap applies (then pi sends none and
+ * bob's backstop does nothing).
  */
 export function effectiveOutputCap(
   model: Parameters<StreamFunction>[0],
@@ -318,21 +342,39 @@ export function effectiveOutputCap(
 }
 
 /**
- * Enforce the output cap on the stream itself. pi sends the cap
- * (`max_completion_tokens`/`max_tokens` on the OpenAI-compatible path); a
- * server that ignores it keeps streaming. bob counts the streamed output deltas
- * (text, thinking and tool-call deltas with content) and, once more than `cap`
- * of them have arrived, aborts the request and ends the message with
- * stopReason "length" — the same outcome as a server that honoured the cap.
+ * A BACKSTOP for a server that ignores the output cap it was sent. The cap is
+ * the token count pi SENDS (`max_completion_tokens`/`max_tokens` on the
+ * OpenAI-compatible path); a server that honours it stops there, and this never
+ * fires. bob cannot count tokens in a stream, so the backstop counts streamed
+ * PIECES (text, thinking and tool-call deltas with content) and, once more
+ * pieces than the token cap have arrived, aborts the request and ends the
+ * message with stopReason "length".
  *
- * Each streamed delta carries at least one token, so the count is a LOWER
- * bound on the tokens generated: a stream is cut only once it has provably
- * exceeded the cap, never early. (A server that packs several tokens into one
- * chunk is cut later than its cap — at most at `cap` chunks.)
+ * Pieces are not tokens. A streaming server sends a piece only after it has
+ * generated at least one token, so the backstop is never early: more pieces
+ * than the cap means more tokens than the cap. It can be late: a piece that
+ * carries several tokens counts once, so a server that packs tokens into pieces
+ * is ended past its cap, or not at all when its whole answer arrives in no more
+ * pieces than the cap. (A server or proxy that split one token across pieces
+ * would break the "never early" premise; bob does not tokenize, so it cannot
+ * detect that.)
  *
- * The cut message is a copy of the stream's last partial, without the one
- * delta that crossed the cap, with `usage.output` set to the cap (the tokens
- * delivered) and OUTPUT_CAP_MARK set, so the run log can say bob cut it.
+ * What the wrapper forwards is built from the pieces it accepted, never copied
+ * from pi-ai's shared partial: pi-ai emits every event with ONE mutable partial
+ * message, and events queue ahead of their reader, so by the time an event is
+ * read the partial can already hold output from later events — past the cut.
+ * The wrapper therefore keeps its own message (`acceptedMessage`), forwards it
+ * as each event's `partial`, and ends a cut stream with a copy of it: text and
+ * thinking from accepted pieces, tool-call arguments parsed from accepted
+ * pieces. OUTPUT_CAP_MARK is set so the run log can say bob cut it.
+ *
+ * The cut message's usage is ASSIGNED, not measured: the server's final count
+ * never arrives, and bob does not count tokens. `usage.output` is the cap — by
+ * the premise above a lower bound on the tokens the kept pieces carry — because
+ * pi reads it to tell a length stop AT the requested cap (kept, as from a server
+ * that honoured it) from one cut short by context pressure, which pi answers by
+ * dropping the message, compacting and retrying (`isRecoverableLength`). The
+ * prompt counts are 0 (unknown).
  */
 export function capOutputStream(
   inner: StreamFunction,
@@ -348,7 +390,8 @@ export function capOutputStream(
     if (cap === undefined) return await inner(model, context, options);
 
     // bob's own abort, linked to the caller's: the caller aborting still aborts
-    // the request, and the cap can abort it without touching the caller's signal.
+    // the request, and the backstop can abort it without touching the caller's
+    // signal.
     const controller = new AbortController();
     const upstream = options?.signal;
     if (upstream) {
@@ -358,25 +401,27 @@ export function capOutputStream(
     }
     const source = await inner(model, context, { ...options, signal: controller.signal });
     const out = createAssistantMessageEventStream();
+    const accepted = acceptedMessage(model);
 
     void (async () => {
-      let deltas = 0;
+      let pieces = 0;
       try {
         for await (const event of source) {
           if (isOutputDelta(event)) {
-            deltas += 1;
-            if (deltas > cap) {
-              const message = cutMessage(event, cap);
-              controller.abort(new Error(`bob: output cap of ${cap} tokens reached`));
+            pieces += 1;
+            if (pieces > cap) {
+              // The piece that crossed the cap is neither applied nor forwarded.
+              const message = accepted.cut(cap);
+              controller.abort(new Error(`bob: output backstop: more than ${cap} streamed pieces`));
               log(
-                `bob: the provider streamed past the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
+                `bob: the provider streamed more than ${cap} pieces against the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
               );
               out.push({ type: "done", reason: "length", message });
               out.end(message);
               return;
             }
           }
-          out.push(event);
+          out.push(accepted.forward(event));
           if (event.type === "done") {
             out.end(event.message);
             return;
@@ -396,14 +441,7 @@ export function capOutputStream(
           api: model.api,
           provider: model.provider,
           model: model.id,
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-          },
+          usage: noUsage(),
           stopReason: "error",
           errorMessage: err instanceof Error ? err.message : String(err),
           timestamp: Date.now(),
@@ -417,35 +455,184 @@ export function capOutputStream(
   return wrapped as StreamFunction;
 }
 
-/** The message a cut stream ends with: a copy of the last partial, minus the
- *  delta that crossed the cap (text and thinking blocks; a tool call cut by a
- *  length stop is failed by pi anyway). */
-function cutMessage(
-  event: Extract<AssistantMessageEvent, { delta: string }>,
-  cap: number,
-): AssistantMessage {
-  const partial = event.partial;
-  const content = partial.content.map((block, index) => {
-    if (index !== event.contentIndex) return { ...block };
-    if (block.type === "text" && block.text.endsWith(event.delta)) {
-      return { ...block, text: block.text.slice(0, block.text.length - event.delta.length) };
-    }
-    if (block.type === "thinking" && block.thinking.endsWith(event.delta)) {
-      return {
-        ...block,
-        thinking: block.thinking.slice(0, block.thinking.length - event.delta.length),
-      };
-    }
-    return { ...block };
-  });
-  const usage = { ...partial.usage, cost: { ...partial.usage.cost } };
-  usage.output = cap;
-  usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+function noUsage(): AssistantMessage["usage"] {
   return {
-    ...partial,
-    content,
-    usage,
-    stopReason: "length",
-    [OUTPUT_CAP_MARK]: true,
-  } as AssistantMessage;
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+type Block = AssistantMessage["content"][number];
+
+/** A block's IDENTITY — the fields that name it, never its generated output —
+ *  whitelisted per type. */
+function identityOf(live: unknown, type: Block["type"]): Record<string, unknown> {
+  const b = (live ?? {}) as Record<string, unknown>;
+  const keys =
+    type === "text"
+      ? ["textSignature"]
+      : type === "thinking"
+        ? ["thinkingSignature", "redacted"]
+        : ["id", "name", "thoughtSignature", "namespace"];
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (b[k] !== undefined) out[k] = b[k];
+  return out;
+}
+
+/**
+ * The message the backstop owns: the output it has ACCEPTED, and nothing else.
+ *
+ * Built only from each event's own values — a delta string, a `*_end` event's
+ * final text, a finished tool call — in the order the wrapper forwards them.
+ * The only reads of pi-ai's shared partial are a block's IDENTITY when an event
+ * introduces or ends that block (a tool call's id and name, a signature), and
+ * the request's start time on `start`; never its text, thinking or arguments.
+ * The one object is forwarded as every event's `partial`, as pi-ai does with its
+ * own, so a listener can be ahead of the event it handles but never sees a piece
+ * the wrapper did not forward.
+ */
+function acceptedMessage(model: Parameters<StreamFunction>[0]): {
+  forward(event: AssistantMessageEvent): AssistantMessageEvent;
+  cut(cap: number): AssistantMessage;
+} {
+  const message: AssistantMessage = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: noUsage(),
+    stopReason: "pending",
+    timestamp: Date.now(),
+  };
+  // The accepted argument text of each tool call, by content index.
+  const toolArgs = new Map<number, string>();
+  const liveBlock = (event: { partial: AssistantMessage; contentIndex: number }): unknown =>
+    event.partial?.content?.[event.contentIndex];
+
+  const at = <T extends Block["type"]>(
+    index: number,
+    type: T,
+  ): Extract<Block, { type: T }> | undefined => {
+    const b = message.content[index];
+    return b?.type === type ? (b as Extract<Block, { type: T }>) : undefined;
+  };
+  const text = (index: number, live: unknown) => {
+    const existing = at(index, "text");
+    if (existing) return existing;
+    const block = { ...identityOf(live, "text"), type: "text", text: "" } as Extract<
+      Block,
+      { type: "text" }
+    >;
+    message.content[index] = block;
+    return block;
+  };
+  const thinking = (index: number, live: unknown) => {
+    const existing = at(index, "thinking");
+    if (existing) return existing;
+    const block = { ...identityOf(live, "thinking"), type: "thinking", thinking: "" } as Extract<
+      Block,
+      { type: "thinking" }
+    >;
+    message.content[index] = block;
+    return block;
+  };
+  const toolCall = (index: number, live: unknown) => {
+    const existing = at(index, "toolCall");
+    if (existing) {
+      // A call's id and name can arrive after its first piece; identity only.
+      const id = identityOf(live, "toolCall");
+      if (!existing.id && typeof id.id === "string") existing.id = id.id;
+      if (!existing.name && typeof id.name === "string") existing.name = id.name;
+      return existing;
+    }
+    toolArgs.set(index, "");
+    const block = {
+      id: "",
+      name: "",
+      ...identityOf(live, "toolCall"),
+      type: "toolCall",
+      arguments: {},
+    } as Extract<Block, { type: "toolCall" }>;
+    message.content[index] = block;
+    return block;
+  };
+
+  return {
+    forward(event) {
+      switch (event.type) {
+        case "start":
+          // The request's start time, stamped once by the provider when it
+          // creates the message (the usage record measures from it).
+          if (typeof event.partial?.timestamp === "number") {
+            message.timestamp = event.partial.timestamp;
+          }
+          break;
+        case "text_start":
+          text(event.contentIndex, liveBlock(event));
+          break;
+        case "text_delta":
+          text(event.contentIndex, liveBlock(event)).text += event.delta;
+          break;
+        case "text_end":
+          message.content[event.contentIndex] = {
+            ...identityOf(liveBlock(event), "text"),
+            type: "text",
+            text: event.content,
+          } as Block;
+          break;
+        case "thinking_start":
+          thinking(event.contentIndex, liveBlock(event));
+          break;
+        case "thinking_delta":
+          thinking(event.contentIndex, liveBlock(event)).thinking += event.delta;
+          break;
+        case "thinking_end":
+          message.content[event.contentIndex] = {
+            ...identityOf(liveBlock(event), "thinking"),
+            type: "thinking",
+            thinking: event.content,
+          } as Block;
+          break;
+        case "toolcall_start":
+          toolCall(event.contentIndex, liveBlock(event));
+          break;
+        case "toolcall_delta": {
+          const block = toolCall(event.contentIndex, liveBlock(event));
+          const args = (toolArgs.get(event.contentIndex) ?? "") + event.delta;
+          toolArgs.set(event.contentIndex, args);
+          block.arguments = parseStreamingJson(args);
+          break;
+        }
+        case "toolcall_end":
+          // The finished call, as the event itself carries it.
+          message.content[event.contentIndex] = {
+            ...identityOf(event.toolCall, "toolCall"),
+            type: "toolCall",
+            arguments: structuredClone(event.toolCall.arguments ?? {}),
+          } as Block;
+          break;
+        default:
+          // done / error carry the provider's own final message: forwarded as is.
+          return event;
+      }
+      return { ...event, partial: message };
+    },
+    cut(cap) {
+      // A copy, so the final message shares nothing with the forwarded partial.
+      const content = structuredClone(message.content.filter((b) => b !== undefined));
+      // Assigned, not measured: see capOutputStream.
+      return {
+        ...message,
+        content,
+        usage: { ...noUsage(), output: cap, totalTokens: cap },
+        stopReason: "length",
+        [OUTPUT_CAP_MARK]: true,
+      } as AssistantMessage;
+    },
+  };
 }

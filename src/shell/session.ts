@@ -56,6 +56,7 @@ import {
   compactionSettingsFor,
   installMidRunCompaction,
   type MidRunCompactionSession,
+  type ModelLimits,
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
@@ -635,8 +636,27 @@ export function isolatedSettings(compaction?: { reserveTokens: number }): Settin
 }
 
 /**
- * bob#214: install the model budget on a session pi just built — the output
- * cap on its stream function and the compaction check between model calls.
+ * bob#214: the declared limits of the pair a session config runs, or the named
+ * refusal (requireModelLimits). The factory's first check, before any key is
+ * read or any runtime built; exported so a caller's resolved config can be
+ * checked the same way without building a session.
+ */
+export function sessionModelLimits(
+  config: Pick<RunSessionConfig, "provider" | "model" | "modelLimits" | "yamlModel" | "piAgentDir">,
+): ModelLimits {
+  return requireModelLimits({
+    provider: config.provider,
+    model: config.model,
+    limits: config.modelLimits,
+    bobYamlPath: join(dirname(config.piAgentDir), "bob.yaml"),
+    ...(config.yamlModel !== undefined ? { yamlModel: config.yamlModel } : {}),
+  });
+}
+
+/**
+ * bob#214: install the model budget on a session pi just built — the
+ * output-cap backstop on its stream function and the compaction check between
+ * model calls.
  * Both hook pi's PUBLIC agent surfaces (`agent.streamFunction`,
  * `agent.shouldStopAfterTurn`); a session without them cannot carry the budget
  * and is refused rather than run unbudgeted.
@@ -655,7 +675,7 @@ export function installSessionBudget(
     typeof s.subscribe !== "function"
   ) {
     throw new Error(
-      "bob: refusing a session that does not expose pi's agent stream function, compaction settings, steer() and subscribe() — bob installs the output cap and the between-calls compaction check on those (bob#214)",
+      "bob: refusing a session that does not expose pi's agent stream function, compaction settings, steer() and subscribe() — bob installs the output-cap backstop and the between-calls compaction check on those (bob#214)",
     );
   }
   s.agent.streamFunction = capOutputStream(s.agent.streamFunction, deps);
@@ -1035,12 +1055,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // bob#214: the model's declared window, for THIS session's provider/model,
     // or a refusal naming the remedy — before any key is read or any runtime
     // built. The compaction threshold becomes pi's own compaction reserve.
-    const limits = requireModelLimits({
-      provider: config.provider,
-      model: config.model,
-      limits: config.modelLimits,
-      bobYamlPath: join(dirname(agentDir), "bob.yaml"),
-    });
+    const limits = sessionModelLimits(config);
     const compaction =
       config.compactionThreshold !== undefined
         ? {
@@ -1226,7 +1241,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       throw err;
     }
 
-    // bob#214: the output cap and the between-calls compaction check. A session
+    // bob#214: the output-cap backstop and the between-calls compaction check. A session
     // that cannot carry them is disposed and refused, like a failed audit.
     try {
       installSessionBudget(result.session, {

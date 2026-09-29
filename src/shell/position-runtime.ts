@@ -243,6 +243,7 @@ export interface HireOptions extends PositionCommonOptions {
   provider?: string;
   model?: string;
   // bob#214: the model's context window, written to bob.yaml (see initAgent).
+  // Required: hireAgent refuses before writing anything without it.
   contextWindow?: number;
   skipFlair?: boolean;
   flairKeysDir?: string;
@@ -302,6 +303,14 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   // The provider/runtime-key refusal the interview session would otherwise raise
   // AFTER the scaffold exists. Run it up front so a missing key leaves nothing.
   assertProviderRunnable(mapBobProviderToPi(provider), `bob hire ${opts.name}`);
+  // bob#214: likewise the context window. The interview is a session, and every
+  // session refuses to start without the model's declared window, so a hire
+  // without one would scaffold and then fail its interview. Refuse it here.
+  if (opts.contextWindow === undefined) {
+    refuse(
+      `bob hire ${opts.name}: --context-window <tokens> is required — the context window the server enforces for ${provider}/${model}. bob writes it to bob.yaml as provider.context_window and refuses to start a session (the hiring interview included) without it. Nothing was written.`,
+    );
+  }
 
   const grant = grantFor(opts.name, position, role.tools.allowResidentShell === true, now);
   // VALIDATE against the materialized defaults BEFORE writing anything, so a
