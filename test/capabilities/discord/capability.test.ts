@@ -6,6 +6,7 @@ import {
 } from "../../../src/capabilities/discord/capability.js";
 import type { DiscordCapabilityConfig } from "../../../src/capabilities/discord/config.js";
 import type { DiscordClient, DiscordMessage } from "../../../src/shell/discord-types.js";
+import type { TurnOrigin } from "../../../src/shell/turn-origin.js";
 
 // --- Fakes (no live gateway, no real token, no LLM) -------------------------
 
@@ -33,8 +34,17 @@ class FakePi implements PiLike {
     }
   }
   private completions: Array<(messages: unknown[]) => void> = [];
-  admitTurn = (_origin: unknown, content: string): Promise<unknown[]> => {
+  // The running turn's origin, as bob's real turn admission exposes it through
+  // `readOrigin`. Turns are serialized (one prompt at a time), so the origin is
+  // single-valued: it names the turn currently running, and {kind:"run"} when
+  // none is. This mirrors the real admission's readOrigin(), which is what the
+  // capability's outbound tools consult to stay inside the running turn's
+  // channel.
+  currentOrigin: TurnOrigin = { kind: "run" };
+  readOrigin = (): TurnOrigin => this.currentOrigin;
+  admitTurn = (origin: TurnOrigin, content: string): Promise<unknown[]> => {
     this.userMessages.push(content);
+    this.currentOrigin = origin;
     return new Promise((resolve) => this.completions.push(resolve));
   };
   // Simulate the agent finishing a turn with the given assistant text. Drives
@@ -45,6 +55,9 @@ class FakePi implements PiLike {
         ? [{ role: "assistant", content: [{ type: "text", text: "" }] }]
         : [{ role: "assistant", content: [{ type: "text", text: assistantText }] }];
     this.completions.shift()?.(messages);
+    // The finished turn is no longer running; if none remains, the origin is
+    // back to run. (A later queued turn takes over via its own admitTurn call.)
+    if (this.completions.length === 0) this.currentOrigin = { kind: "run" };
     await Promise.resolve();
     await Promise.resolve();
   }
@@ -125,6 +138,7 @@ function setup(
   const wired = wireDiscordCapability({
     pi,
     admitTurn: pi.admitTurn,
+    readOrigin: pi.readOrigin,
     client,
     config,
     log: (m) => logs.push(m),
@@ -293,6 +307,97 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
     const haystack = JSON.stringify({ config, replies: client.replies });
     expect(haystack).not.toContain("tok_");
     expect(config.tokenFile).toBe("/secrets/bot.token");
+  });
+});
+
+describe("wireDiscordCapability — each turn owns its destination (issue #227)", () => {
+  it("A then B before A's turn ends: each answer goes to its own channel and message", async () => {
+    const { pi, client } = setup();
+    // A arrives, then B arrives WHILE A's turn is still running (no finish yet).
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> a?", mentionsBot: true });
+    client.fire({ id: "mB", channelId: "channel-B", content: "<@1> b?", mentionsBot: true });
+    expect(pi.userMessages).toEqual(["a?", "b?"]);
+    // A finishes first — its answer must land on channel-A/mA, NOT on B.
+    await pi.finishTurn("answer A");
+    expect(client.replies).toEqual([{ channelId: "channel-A", text: "answer A", replyTo: "mA" }]);
+    // Then B finishes — its answer lands on channel-B/mB.
+    await pi.finishTurn("answer B");
+    expect(client.replies).toEqual([
+      { channelId: "channel-A", text: "answer A", replyTo: "mA" },
+      { channelId: "channel-B", text: "answer B", replyTo: "mB" },
+    ]);
+  });
+});
+
+describe("wireDiscordCapability — a turn's tools are bound to its channel (issue #227)", () => {
+  it("discord_reply to ANOTHER allow-listed channel during a turn is refused", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    // Mid-turn on channel A, the agent tries to post to channel-B (allow-listed).
+    await expect(
+      pi.call("discord_reply", { channelId: "channel-B", text: "sneak" }),
+    ).rejects.toThrow(/bound to channel channel-A.*refusing to use channel channel-B/);
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("discord_reply to the turn's OWN channel is allowed", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    await pi.call("discord_reply", { channelId: "channel-A", text: "ok" });
+    expect(client.replies).toEqual([{ channelId: "channel-A", text: "ok", replyTo: undefined }]);
+  });
+
+  it("discord_fetch during a turn cannot read another channel", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    client.fetchReturns = [
+      {
+        id: "b1",
+        channelId: "channel-B",
+        authorId: "u",
+        authorName: "bob",
+        content: "secret of B",
+        mentionsBot: false,
+      },
+    ];
+    await expect(pi.call("discord_fetch", { channelId: "channel-B" })).rejects.toThrow(
+      /bound to channel channel-A.*refusing to use channel channel-B/,
+    );
+    expect(client.replies).toHaveLength(0);
+  });
+
+  it("discord_fetch during a turn reads the turn's OWN channel", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    client.fetchReturns = [
+      {
+        id: "a1",
+        channelId: "channel-A",
+        authorId: "u",
+        authorName: "alice",
+        content: "hi from A",
+        mentionsBot: false,
+      },
+    ];
+    const res = await pi.call("discord_fetch", { channelId: "channel-A", limit: 5 });
+    expect(res.content[0].text).toContain("alice: hi from A");
+  });
+
+  it("outside a turn, any allow-listed channel is still allowed (today's behaviour)", async () => {
+    const { pi, client } = setup();
+    await pi.call("discord_reply", { channelId: "channel-B", text: "ambient" });
+    expect(client.replies).toEqual([
+      { channelId: "channel-B", text: "ambient", replyTo: undefined },
+    ]);
+  });
+
+  it("an un-allow-listed channel is still refused first (trust boundary unchanged)", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    await expect(pi.call("discord_reply", { channelId: "evil", text: "x" })).rejects.toThrow(
+      /not in the configured allow-list/,
+    );
+    expect(client.replies).toHaveLength(0);
   });
 });
 

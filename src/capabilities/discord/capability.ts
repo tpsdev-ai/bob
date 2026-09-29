@@ -10,10 +10,17 @@
 //      retry-after).
 //   2. An after_provider_response hook that surfaces 429s (per spec §3/§7).
 //   3. An inbound gateway listener: on a message that passes the channel
-//      allow-list + (optionally) mention filter, strip the bot @-mention and
-//      call bob's admitTurn(origin, cleaned). Route its returned final text
-//      back to that inbound message's channel.
-//   4. A typing-indicator heartbeat spanning that turn, so the channel shows
+//      allow-list + (optionally) mention filter, strip the bot @-mention, mint
+//      an IMMUTABLE turn identity for that message and call bob's
+//      admitTurn(origin, cleaned). Route its returned final text back to THAT
+//      turn's own channel and message. A message that arrives while a turn is
+//      running is queued as its own turn (bob's FIFO admission), never merged
+//      into the running turn's destination.
+//   4. During a turn the outbound tools are BOUND to that turn's channel: the
+//      reply tool refuses any other channel (even an allow-listed one) and the
+//      fetch tool reads only the turn's channel. Outside a turn (a cron/heartbeat
+//      prompt, a one-shot `bob run`) today's behaviour is unchanged.
+//   5. A typing-indicator heartbeat spanning that turn, so the channel shows
 //      "<bot> is typing…" for as long as the agent is actually working (see
 //      typing.ts for why it has to repeat).
 
@@ -95,9 +102,42 @@ export interface WiredCapability {
   stop(): Promise<void>;
 }
 
+// A dispatched inbound message owns an IMMUTABLE turn identity: the reply
+// destination (channel + message), the author and the surface kind. It is
+// captured once, at dispatch, and the final reply is addressed to THIS identity
+// — never to a shared "latest message" slot a later message could overwrite.
+// `guildId` is absent for a DM; `isDM` is the explicit projection of that.
+export interface DiscordTurn {
+  readonly id: string;
+  readonly channelId: string;
+  readonly messageId: string;
+  readonly authorId: string;
+  readonly guildId?: string;
+  readonly isDM: boolean;
+}
+
+// Build the immutable turn identity from the inbound message. `id` is a stable
+// composite of the two ids that define the destination, so a turn is addressable
+// and cannot collide with another turn on the same channel.
+export function createDiscordTurn(msg: DiscordMessage): DiscordTurn {
+  return {
+    id: `${msg.channelId}:${msg.id}`,
+    channelId: msg.channelId,
+    messageId: msg.id,
+    authorId: msg.authorId,
+    ...(msg.guildId !== undefined ? { guildId: msg.guildId } : {}),
+    isDM: msg.guildId === undefined,
+  };
+}
+
 export interface WireOptions {
   // Required for inbound service; a one-shot run only registers outbound tools.
   admitTurn?: TurnAdmission["admitTurn"];
+  // The runtime's current-turn origin reader (bob's turn admission). While a
+  // turn is running, readOrigin() names its origin; the reply/fetch tools use it
+  // to stay inside the turn's channel. Outside a turn it returns {kind:"run"},
+  // and the tools keep today's behaviour. Absent in a one-shot `bob run`.
+  readOrigin?: TurnAdmission["readOrigin"];
   pi: PiLike;
   client: DiscordClient;
   config: DiscordCapabilityConfig;
@@ -165,6 +205,21 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     }
   };
 
+  // A turn is bound to ONE channel. While a discord turn is running, the
+  // outbound tools may touch only that channel; a different one is refused, even
+  // if it is on the allow-list (the allow-list is the trust boundary, the turn
+  // binding is the routing boundary). `readOrigin()` names the running turn;
+  // {kind:"run"} (no turn / cron / mail) leaves today's behaviour untouched.
+  const requireTurnChannel = (channelId: string): void => {
+    const origin = opts.readOrigin?.();
+    if (origin?.kind !== "discord") return;
+    if (origin.channelId !== channelId) {
+      throw new Error(
+        `discord: this turn is bound to channel ${origin.channelId}; refusing to use channel ${channelId}.`,
+      );
+    }
+  };
+
   // --- Outbound tool: discord_reply -------------------------------------
   pi.registerTool({
     name: "discord_reply",
@@ -183,6 +238,7 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
       const text = params.text as string;
       const replyTo = params.replyTo as string | undefined;
       requireAllowed(channelId);
+      requireTurnChannel(channelId);
       const trimmed =
         text.length <= DISCORD_MAX_REPLY_CHARS
           ? text
@@ -237,6 +293,7 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
         FETCH_MAX_LIMIT,
       );
       requireAllowed(channelId);
+      requireTurnChannel(channelId);
       const messages = await client.fetchRecent(channelId, limit);
       const rendered = messages.map((m) => `[${m.id}] ${m.authorName}: ${m.content}`).join("\n");
       return ok(rendered.length > 0 ? rendered : "(no messages)");
@@ -262,6 +319,10 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
     if (!config.dispatchAll && !msg.mentionsBot) return;
     const cleaned = cleanContent(msg.content);
     if (cleaned.length === 0) return;
+    // The destination is captured HERE, at dispatch. The reply below is
+    // addressed to THIS turn's channel/message, so a later inbound message on
+    // another channel can never move where this turn's answer lands.
+    const turn = createDiscordTurn(msg);
     const typing = createTypingHeartbeat({
       client,
       intervalMs: opts.typingIntervalMs,
@@ -269,12 +330,12 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
       log,
     });
     typings.add(typing);
-    typing.start(msg.channelId);
+    typing.start(turn.channelId);
     void (async () => {
       try {
         if (!opts.admitTurn) throw new Error("bob turn admission is unavailable");
         const messages = await opts.admitTurn(
-          { kind: "discord", channelId: msg.channelId },
+          { kind: "discord", channelId: turn.channelId },
           cleaned,
         );
         const text = finalAssistantText(messages as AssistantMessageLike[]);
@@ -283,10 +344,10 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
           text.length <= DISCORD_MAX_REPLY_CHARS
             ? text
             : `${text.slice(0, DISCORD_MAX_REPLY_CHARS)}…`;
-        await client.reply(msg.channelId, trimmed, { replyTo: msg.id });
+        await client.reply(turn.channelId, trimmed, { replyTo: turn.messageId });
       } catch (err) {
         const reason = err instanceof Error ? err.message : "inbound turn failed";
-        log(`discord: inbound turn/reply failed for ${msg.channelId}: ${reason}`);
+        log(`discord: inbound turn/reply failed for ${turn.channelId}: ${reason}`);
       } finally {
         typing.stop();
         typings.delete(typing);

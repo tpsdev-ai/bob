@@ -20,6 +20,10 @@ export interface DiscordMessage {
   // True if this message mentioned the agent (bot). The capability filters
   // these vs. ambient channel chatter unless dispatchAll is set.
   mentionsBot: boolean;
+  // The guild the message arrived in, or undefined for a DIRECT MESSAGE. A DM
+  // has no guild, so this is also how a consumer tells the two surfaces apart
+  // (see DiscordTurn.isDM). Optional so a fake/test can omit it.
+  guildId?: string;
 }
 
 export interface DiscordClient {

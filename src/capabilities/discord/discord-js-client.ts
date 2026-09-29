@@ -162,6 +162,7 @@ interface RawApiMessage {
   author: { id: string; username: string };
   content: string;
   mentions?: Array<{ id: string }>;
+  guild_id?: string;
 }
 
 export class DiscordJsClient implements DiscordClient {
@@ -210,6 +211,7 @@ export class DiscordJsClient implements DiscordClient {
         authorName: m.author.username,
         content: m.content,
         mentionsBot,
+        ...(m.guildId !== null ? { guildId: m.guildId } : {}),
       });
     });
   }
@@ -272,6 +274,7 @@ export class DiscordJsClient implements DiscordClient {
       mentionsBot: this.resolvedBotUserId
         ? (m.mentions ?? []).some((u) => u.id === this.resolvedBotUserId)
         : false,
+      ...(m.guild_id !== undefined ? { guildId: m.guild_id } : {}),
     }));
   }
 }
