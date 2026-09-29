@@ -34,6 +34,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -41,8 +42,25 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
-import { readAgentRole, readBlock, readCron, readResident, readTools } from "./bob-yaml.js";
-import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
+import {
+  buildMailTurnPrompt,
+  formatMailTurnResult,
+  MAIL_TURN_INPUT_MAX_BYTES,
+  parseMailTurnInput,
+} from "../capabilities/tps-mail/prompt.js";
+import {
+  readAgentRole,
+  readBlock,
+  readCapabilities,
+  readCron,
+  readResident,
+  readTools,
+} from "./bob-yaml.js";
+import {
+  capabilityConfigEnv,
+  type ResolvedCapability,
+  resolveCapabilities,
+} from "./capability-loader.js";
 import {
   CONTINUE_TURN,
   createCompactionObserver,
@@ -61,7 +79,7 @@ import {
   runInteractiveSession,
   type SessionDeps,
 } from "./session.js";
-import { resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
+import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError } from "./turn-origin.js";
 
@@ -591,6 +609,16 @@ export interface RunOptions {
   // DEFAULT_CONTRACT_CAP_CHARS. A blank task is refused before the session
   // starts, whatever this is.
   contractCapChars?: number;
+  // The TASK contract carried in the system prompt, when it is not the prompt
+  // itself. Defaults to `prompt`. A mail turn (bob#200) sets it to the
+  // capability's FIXED frame, so the untrusted mail body — which is the user
+  // message — never reaches the system prompt.
+  taskContract?: string;
+  // bob#200: this run answers ONE TPS mail. The session holds only the role's
+  // tools that are on the reviewed mail allowlist (tool-allowlist.ts
+  // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
+  // role or capability, is dropped.
+  mailTurn?: boolean;
 }
 
 export interface RunResult {
@@ -609,6 +637,11 @@ export interface RunResult {
   // (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
   // Undefined on exit 0.
   reason?: SilenceReason;
+  // True when the run FAILED rather than settled: the prompt threw, or the last
+  // assistant message ended on an error/abort. Undefined otherwise — a run with
+  // no final message that did NOT fail simply had nothing to say. (A mail turn
+  // retries a failure and sends no reply for silence.)
+  failed?: true;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -634,12 +667,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       "runAgent: refusing to start a session with a blank task — the task is carried in the session's system prompt, and an empty one guarantees nothing",
     );
   }
+  const taskContract = opts.taskContract ?? opts.prompt;
+  if (taskContract.trim().length === 0) {
+    throw new Error("runAgent: refusing to start a session with a blank task contract");
+  }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
   const { agentDir, provider, model, config } = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    ...(opts.mailTurn ? { mailTurn: true } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
@@ -650,7 +688,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // that shows only messages still sees it; see the README's stated limits.)
   const session = await factory({
     ...config,
-    taskContract: opts.prompt,
+    taskContract,
     ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
   });
 
@@ -803,6 +841,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
   let exitCode = 0;
   let reason: SilenceReason | undefined;
+  let failed = false;
 
   // #145: after every non-aborted compaction the observer sends ONE best-effort
   // "what remains" note (a steer: the last thing the agent said, git status,
@@ -870,6 +909,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       }
       outcome = judge();
     }
+    // A run with no final message whose last message ended on an error or an
+    // abort FAILED; one that ended cleanly with nothing to say did not.
+    if (!outcome.ok && observer.lastEndFailed()) failed = true;
     if (!outcome.ok) {
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
@@ -896,6 +938,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     }
   } catch (err) {
     exitCode = 1;
+    failed = true;
     // Surface the error instead of swallowing it: an underscore-ignored catch
     // made a cap-hit look like a silent clean exit. Label a provider
     // rate-limit/cap so a budget stall is distinguishable from a crash.
@@ -941,6 +984,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model,
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(failed ? { failed: true as const } : {}),
   };
 }
 
@@ -963,6 +1007,10 @@ export interface ResolveRunConfigOptions {
   // in) applies even when bob.yaml does not say `resident: true`. The one-shot
   // `bob run` path leaves this falsy.
   persistent?: boolean;
+  // bob#200: the session answers one TPS mail — applyMailTurnPolicy narrows the
+  // resolved policy to the mail allowlist, for an ordinary AND an adopted
+  // (position-bound) agent alike. Only ever narrows.
+  mailTurn?: boolean;
   // Host state root for the position grant store. Defaults to ~/.bob/host. When
   // an agent has no grant it is NOT adopted, and resolution is unchanged.
   hostRoot?: string;
@@ -985,6 +1033,10 @@ export interface ResolvedRunConfig {
   // decision), so a caller that only has the result can still hand the SAME
   // policy to a session it starts itself (`bob launch` does exactly that).
   policy: ToolPolicy;
+  // The resolved, schema-validated capabilities (bob.yaml `capabilities:`), so
+  // the persistent runtime can start the ones it runs itself (tps-mail's inbox
+  // consumer) from the SAME validated config the session loads.
+  capabilities: ResolvedCapability[];
 }
 
 // The tool policy for an agent's bob.yaml. ONE entry point for every launch
@@ -1145,6 +1197,224 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
   return interactive({ config, policy, deps: opts.deps });
 }
 
+// ─── `bob launch` in mail-turn mode (bob#200) ────────────────────────────────
+//
+// The tps-mail consumer runs each accepted mail through the agent's launcher
+// with BOB_MAIL_TURN=1 in the environment and the VERIFIED fields as JSON on
+// STDIN (never argv). This is that turn: ONE fresh session, the capability's
+// fixed frame as the task contract (system prompt), the delimited untrusted
+// mail as the user message, and only the role's tools on the mail allowlist.
+//
+// It writes ONE result line on stdout and exits 0 when the turn settled —
+// `final` (the compaction contract's final message: the reply) or `silent` (no
+// final message: tool-only or empty, so no reply) — and exits 1 with no result
+// line when the turn FAILED (an error-ended message or a thrown run), which the
+// consumer retries. An input it cannot accept exits 2. The env flag and stdin
+// can only NARROW what the session gets; they select no tool and no model.
+
+// A mail turn runs in its OWN process group (so a timeout can kill everything
+// it started), which also means a crash of the runtime that started it no
+// longer takes it down with the runtime's group. So the turn watches the
+// CONSUMER — whose pid the consumer passes at spawn (BOB_MAIL_TURN_PARENT) —
+// and ends when it is gone (Gauge round 5, blocker 4). The first check runs
+// IMMEDIATELY, before stdin is read, so a consumer that died before the turn
+// even started is caught; later checks also catch the turn being reparented.
+// An orphaned turn could never have its reply sent, and must not keep a model
+// busy. Stated limit: a dead consumer whose pid is reused within the check
+// interval reads as alive until the reparenting check fires.
+export function watchParent(
+  opts: {
+    expectedParentPid?: number;
+    getPpid?: () => number;
+    isAlive?: (pid: number) => boolean;
+    exit?: (code: number) => void;
+    intervalMs?: number;
+  } = {},
+): () => void {
+  const getPpid = opts.getPpid ?? (() => process.ppid);
+  const isAlive =
+    opts.isAlive ??
+    ((pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    });
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const initialPpid = getPpid();
+  let fired = false;
+  const end = (why: string) => {
+    fired = true;
+    process.stderr.write(`bob launch: ${why}; ending the turn\n`);
+    exit(1);
+  };
+  // At installation the expected consumer must BE this process's parent (the
+  // generated launcher `exec`s bob, so the consumer spawned this very process).
+  // A mismatch means the consumer is already gone (reparented) or the variable
+  // does not describe this process, and either way the pid proves nothing.
+  if (opts.expectedParentPid !== undefined && initialPpid !== opts.expectedParentPid) {
+    end(
+      `this mail turn's parent is pid ${initialPpid}, not the consumer pid ${opts.expectedParentPid} that should have spawned it (the consumer is gone, or a launcher did not exec bob)`,
+    );
+    return () => {};
+  }
+  const check = () => {
+    if (fired) return;
+    const consumerGone = opts.expectedParentPid !== undefined && !isAlive(opts.expectedParentPid);
+    if (consumerGone || getPpid() !== initialPpid) {
+      end("the consumer that started this mail turn is gone");
+    }
+  };
+  check();
+  const timer = setInterval(check, opts.intervalMs ?? 1000);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+// The consumer pid from BOB_MAIL_TURN_PARENT, when it is one.
+export function mailTurnParentPid(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[0-9]+$/.test(value)) return undefined;
+  const pid = Number(value);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+export interface MailTurnLaunchOptions {
+  name: string;
+  // The raw stdin the consumer wrote (already read, bounded by the caller).
+  input: string;
+  agentsRoot?: string;
+  model?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
+  sessionFactory?: RunSessionFactory;
+  // Where the result line goes. Defaults to stdout, awaited until flushed.
+  write?: (text: string) => Promise<void>;
+  // Test seam for the template's marker nonce.
+  nonce?: string;
+}
+
+export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<number> {
+  let input: ReturnType<typeof parseMailTurnInput>;
+  try {
+    input = parseMailTurnInput(opts.input);
+  } catch (err) {
+    process.stderr.write(
+      `bob launch ${opts.name}: mail turn refused — ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return 2;
+  }
+  const prompt = buildMailTurnPrompt(input, opts.nonce ? { nonce: opts.nonce } : {});
+  // The consumer watchdog is installed by the CLI BEFORE stdin is read
+  // (cli.ts), so it covers this whole call.
+  return runMailTurn(opts, prompt);
+}
+
+async function runMailTurn(
+  opts: MailTurnLaunchOptions,
+  prompt: ReturnType<typeof buildMailTurnPrompt>,
+): Promise<number> {
+  const result = await runAgent({
+    name: opts.name,
+    prompt: prompt.userMessage,
+    taskContract: prompt.contract,
+    mailTurn: true,
+    model: opts.model,
+    agentsRoot: opts.agentsRoot,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    captureStdout: true,
+    sessionFactory: opts.sessionFactory,
+  });
+  const write =
+    opts.write ??
+    ((text: string) =>
+      new Promise<void>((resolve) => {
+        process.stdout.write(text, () => resolve());
+      }));
+  const text = (result.stdout ?? "").trim();
+  if (result.exitCode === 0 && text.length > 0) {
+    await write(formatMailTurnResult({ outcome: "final", text }));
+    return 0;
+  }
+  if (result.failed) {
+    process.stderr.write(
+      `bob launch ${opts.name}: mail turn FAILED (no reply; the consumer retries the mail)\n`,
+    );
+    return 1;
+  }
+  // Settled with nothing to say: silence is a valid mail outcome.
+  await write(formatMailTurnResult({ outcome: "silent" }));
+  return 0;
+}
+
+// Read the mail-turn input: fd 0 (stdin), synchronously, until EOF.
+//
+// NOT through `process.stdin` (bob#203). Under bun, a `process.stdin` that was
+// created in an earlier tick yields NOTHING when fd 0 is a regular file — and
+// bob's module graph creates it at import (pi-coding-agent touches the getter),
+// so every read came back empty. On Linux, bun's spawnSync hands a child its
+// `input` as a memfd, which is a regular file: the mail-turn test failed there
+// with "not JSON" while passing on macOS, where it is a pipe. Node was never
+// affected. Reading the descriptor directly has no stream state to lose and
+// behaves the same in both runtimes, for a pipe, a file or a memfd, in one
+// chunk or many.
+//
+// It reads until read(2) returns 0 (EOF) — every chunk, however the writer
+// split it. A pipe may be non-blocking (node makes fd 0 non-blocking once
+// `process.stdin` exists), so EAGAIN waits briefly and reads again. More than
+// `maxBytes` is refused rather than truncated. A writer that never closes the
+// pipe blocks the read; the consumer's turn timeout kills the process.
+export interface MailTurnInputReadOptions {
+  fd?: number;
+  maxBytes?: number;
+  // Seams (tests): the read(2) and the EAGAIN wait.
+  readSync?: (fd: number, buf: Buffer, offset: number, length: number, position: null) => number;
+  sleep?: (ms: number) => void;
+}
+
+const EAGAIN_WAIT_MS = 5;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export function readMailTurnInput(opts: MailTurnInputReadOptions = {}): string {
+  const fd = opts.fd ?? 0;
+  const maxBytes = opts.maxBytes ?? MAIL_TURN_INPUT_MAX_BYTES;
+  const read = opts.readSync ?? ((f, b, o, l, p) => readSync(f, b, o, l, p));
+  const sleep = opts.sleep ?? sleepSync;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const buf = Buffer.alloc(64 * 1024);
+  for (;;) {
+    let n: number;
+    try {
+      n = read(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+        sleep(EAGAIN_WAIT_MS);
+        continue;
+      }
+      if (code === "EOF") break;
+      throw err;
+    }
+    if (n === 0) break; // EOF: the writer closed its end
+    size += n;
+    if (size > maxBytes) {
+      throw new Error(
+        `mail turn input exceeds ${maxBytes} bytes; refusing it rather than reading a truncated mail`,
+      );
+    }
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 // Parse + validate bob.yaml `cron:` into CronEntry[]. Drops any entry missing
 // name/schedule/prompt — a single malformed entry shouldn't stop the agent from
 // starting (the scheduler additionally skips an unparseable schedule).
@@ -1164,6 +1434,37 @@ function parseCron(yamlText: string): CronEntry[] {
       if (reason) throw new Error(`bob: invalid cron entry name: ${reason}`);
       return { name: e.name, schedule: e.schedule, prompt: e.prompt };
     });
+}
+
+// The agent's EFFECTIVE capabilities — the set the persistent runtime starts
+// (bob#200 x bob#195, Gauge round 6, blocker 4). For an ADOPTED agent that is
+// the grant-resolved set with local disables applied, from the SAME resolver
+// resolveRunConfig uses; for any other agent it is bob.yaml's capabilities:
+// list, the list resolveCapabilities walks. `bob doctor` reads this, so it can
+// never report a capability healthy that the runtime will not start.
+export function effectiveCapabilities(opts: {
+  name: string;
+  agentDir: string;
+  yamlText: string;
+  hostRoot?: string;
+  positionsRoot?: string;
+}): { adopted: boolean; names: string[]; configs: Record<string, Record<string, unknown>> } {
+  const adopted = resolveAdoptedConfig({
+    name: opts.name,
+    agentDir: opts.agentDir,
+    yamlText: opts.yamlText,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    persistent: true,
+  });
+  if (adopted) {
+    return {
+      adopted: true,
+      names: adopted.resolvedCapabilities.map((c) => c.name),
+      configs: Object.fromEntries(adopted.resolvedCapabilities.map((c) => [c.name, c.config])),
+    };
+  }
+  return { adopted: false, names: readCapabilities(opts.yamlText), configs: {} };
 }
 
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
@@ -1201,6 +1502,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   let extensionSources: string[];
   let capabilityBySource: Record<string, string>;
   let capabilityEnv: Record<string, string>;
+  let capabilities: ResolvedCapability[];
   if (adopted) {
     toolPolicy = {
       tools: adopted.tools,
@@ -1211,6 +1513,9 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     extensionSources = adopted.extensionSources;
     capabilityBySource = adopted.capabilityBySource;
     capabilityEnv = adopted.capabilityEnv;
+    // The grant-narrowed set (local disables applied), from the SAME resolution
+    // as the extension sources above — never bob.yaml's raw capabilities: list.
+    capabilities = adopted.resolvedCapabilities;
   } else {
     // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
     // the blessed catalog, validating each config block. Throws fast on an
@@ -1229,7 +1534,14 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
       resolution.capabilities.map((c) => [c.piPackage, c.name]),
     );
     capabilityEnv = capabilityConfigEnv(resolution);
+    capabilities = resolution.capabilities;
   }
+
+  // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
+  // applied HERE, after both branches, so it binds an ADOPTED agent's grant
+  // tools exactly as it binds an ordinary agent's role tools: no branch can
+  // hand a mail turn a tool outside MAIL_TURN_ALLOWED_TOOLS.
+  if (opts.mailTurn) toolPolicy = applyMailTurnPolicy(toolPolicy);
 
   // The agent block (id/name/role). Read through readBlock, but a malformed
   // `agent:` block must not stop the agent from running: it is only used to
@@ -1269,6 +1581,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     cron: parseCron(yamlText),
     agent,
     policy: toolPolicy,
+    capabilities,
   };
 }
 

@@ -31,7 +31,11 @@ import {
   type ToolsBlock,
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
-import { capabilityConfigEnv, resolveCapabilities } from "./capability-loader.js";
+import {
+  capabilityConfigEnv,
+  type ResolvedCapability,
+  resolveCapabilities,
+} from "./capability-loader.js";
 import type { HostGrant, RatifiedSnapshot } from "./host-grant.js";
 import { loadOverrides, type Overrides, resolvePositionFiles } from "./overrides.js";
 import type { LoadedPosition } from "./positions.js";
@@ -56,6 +60,12 @@ export interface EffectiveConfig {
   extensionSources: string[];
   capabilityBySource: Record<string, string>;
   capabilityEnv: Record<string, string>;
+  // The resolved, schema-validated capabilities behind `capabilities` (the same
+  // resolution the extension sources and env come from). The persistent runtime
+  // starts the capabilities it runs itself (tps-mail's inbox consumer, bob#200)
+  // from THIS set, so a capability the grant or a local disable removed is never
+  // started from bob.yaml's raw list.
+  resolvedCapabilities: ResolvedCapability[];
 }
 
 export interface EffectiveConfigInputs {
@@ -256,6 +266,7 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
       resolution.capabilities.map((c) => [c.piPackage, c.name]),
     ),
     capabilityEnv: capabilityConfigEnv(resolution),
+    resolvedCapabilities: resolution.capabilities,
   };
 }
 

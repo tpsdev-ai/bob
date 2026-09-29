@@ -23,17 +23,22 @@ import {
   installService,
   LaunchArgError,
   loadRole,
+  MAIL_TURN_ENV,
+  MAIL_TURN_PARENT_ENV,
+  mailTurnParentPid,
   operatorSelectedFlairUrl,
   parseArgs,
   parseLaunchArgs,
   positionDiff,
   provisionFlairIdentity,
   readBlock,
+  readMailTurnInput,
   restart,
   runAgent,
   runAlign,
   runDoctor,
   runLaunch,
+  runMailTurnLaunch,
   runOnboard,
   runPersistent,
   servicePath,
@@ -42,6 +47,7 @@ import {
   takeFlairAdminPassFromEnv,
   UsageError,
   up,
+  watchParent,
 } from "./shell/index.js";
 
 function help(): void {
@@ -510,6 +516,37 @@ async function main(): Promise<number> {
         // parseLaunchArgs, which refuses any other argument BY NAME.
         try {
           const launch = parseLaunchArgs(args.positional, args.flags);
+          // bob#200: the tps-mail consumer runs each mail as ONE turn through
+          // this launcher, with the verified fields as JSON on STDIN. Mail-turn
+          // mode takes no prompt argument and never opens the TUI.
+          if (process.env[MAIL_TURN_ENV] === "1") {
+            if (launch.prompt !== undefined) {
+              console.error(
+                "bob launch: a mail turn takes its input on stdin, never as an argument",
+              );
+              return 2;
+            }
+            // The consumer watchdog FIRST: before stdin is read, so a consumer
+            // that is already gone is noticed now (see watchParent).
+            const stopWatching = watchParent({
+              expectedParentPid: mailTurnParentPid(process.env[MAIL_TURN_PARENT_ENV]),
+            });
+            try {
+              let input: string;
+              try {
+                // fd 0 until EOF — never process.stdin (see readMailTurnInput).
+                input = readMailTurnInput();
+              } catch (err) {
+                console.error(
+                  `bob launch ${launch.name}: mail turn refused — ${err instanceof Error ? err.message : String(err)}`,
+                );
+                return 2;
+              }
+              return await runMailTurnLaunch({ name: launch.name, input });
+            } finally {
+              stopWatching();
+            }
+          }
           return await runLaunch(launch);
         } catch (err: unknown) {
           if (err instanceof LaunchArgError) {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readCapabilities } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
 import { createPiRunSession, resolveRunConfig } from "../../src/shell/run.js";
 import { knownToolNames } from "../../src/shell/tool-allowlist.js";
@@ -114,6 +115,23 @@ describe("initAgent", () => {
     // Memory tools come from the flair capability (not the dead mcp__flair__* names).
     expect(yaml).toContain("- flair_write");
     expect(yaml).toContain("- flair_search");
+  });
+
+  it("bob#200: scaffolds NO channels.tps_mail it cannot honour — tps-mail stays a commented template", () => {
+    const res = initAgent(baseOpts());
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    const live = yaml
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("#"))
+      .join("\n");
+    expect(live).not.toContain("channels:");
+    expect(live).not.toContain("tps_mail");
+    expect(live).not.toContain("tps-mail");
+    expect(readCapabilities(yaml)).not.toContain("tps-mail");
+    // The template tells the operator the allow-list is required and what it grants.
+    expect(yaml).toContain("# tps-mail:");
+    expect(yaml).toContain("#   senders:");
+    expect(yaml).toContain("grants it this agent's read scope");
   });
 
   it("stamps real pi + capability tool names for EVERY shipped role", () => {

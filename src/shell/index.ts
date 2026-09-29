@@ -38,6 +38,9 @@ export interface IdentityConfig {
 }
 
 export interface ChannelsConfig {
+  // Legacy: `bob onboard` used to scaffold this block, but nothing reads it.
+  // TPS mail is the `tps-mail` capability (bob#200); `bob doctor` FAILS an
+  // agent that still declares channels.tps_mail without it.
   tps_mail?: {
     inbox: string;
   };
@@ -66,6 +69,7 @@ export interface BobConfig {
   cron?: CronEntry[];
 }
 
+export { MAIL_TURN_ENV, MAIL_TURN_PARENT_ENV } from "../capabilities/tps-mail/prompt.js";
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
 export { type Args, BOOLEAN_FLAGS, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
 export {
@@ -167,10 +171,20 @@ export {
   stampedToolAllowlist,
 } from "./init.js";
 export {
+  createTpsMailConsumer,
+  type DurableIo,
+  durableWrite,
+  launcherTurnRunner,
   MailConsumer,
   type MailConsumerOptions,
   type MailConsumerStats,
   type MailMessage,
+  readTpsMailIdentity,
+  type TpsMailIdentity,
+  type TpsMailRuntimeOptions,
+  type TurnOutcome,
+  type TurnRunner,
+  tpsMailStatsPath,
 } from "./mail-consumer.js";
 export {
   type OnboardOptions,
@@ -225,6 +239,9 @@ export {
   type ExtensionErrorSource,
   LaunchArgError,
   type LaunchOptions,
+  type MailTurnInputReadOptions,
+  type MailTurnLaunchOptions,
+  mailTurnParentPid,
   mapBobProviderToPi,
   parseLaunchArgs,
   type ResolvedRunConfig,
@@ -235,11 +252,14 @@ export {
   type RunSessionConfig,
   type RunSessionFactory,
   readAgentToolPolicy,
+  readMailTurnInput,
   resolveAgentToolPolicy,
   resolveRunConfig,
   runAgent,
   runLaunch,
+  runMailTurnLaunch,
   type SessionManagerLike,
+  watchParent,
 } from "./run.js";
 export {
   type CommandRunner,
@@ -279,8 +299,10 @@ export {
   type SessionDeps,
 } from "./session.js";
 export {
+  applyMailTurnPolicy,
   auditToolNames,
   knownToolNames,
+  MAIL_TURN_ALLOWED_TOOLS,
   PI_BUILTIN_TOOLS,
   RESIDENT_EXCLUDED_TOOLS,
   type ResolveToolPolicyOptions,

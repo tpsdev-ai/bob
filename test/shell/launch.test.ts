@@ -12,8 +12,17 @@
 //   * the REAL generated launcher + the mail consumer — the chain reaches
 //     `bob launch` with the prompt as the one argument, and never the pi binary.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +36,13 @@ import {
   type RunSessionConfig,
   runLaunch,
 } from "../../src/shell/run.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 import { CLI_SPAWN_TIMEOUT_MS } from "../cli-spawn.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -422,12 +438,17 @@ describe("the mail consumer", () => {
     launcher = join(res.agentDir, "bin", AGENT);
     recorded = join(root, "bob-argv.txt");
     writeFileSync(recorded, "");
+    // A BOB_BIN shim standing in for `bob launch`: it records its argv, the
+    // mail-turn flag and its stdin, then answers with a result line.
     const shim = join(root, "bob-record");
     writeFileSync(
       shim,
       [
         "#!/bin/sh",
         `for a in "$@"; do printf "%s\\n" "$a" >> ${recorded}; done`,
+        `printf "%s" "$BOB_MAIL_TURN" > ${join(root, "mode")}`,
+        `cat > ${join(root, "stdin")}`,
+        `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"pong"}'`,
         "exit 0",
         "",
       ].join("\n"),
@@ -446,38 +467,207 @@ describe("the mail consumer", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("drives the agent's session through bob — the mail body as the ONE prompt", async () => {
+  it("drives the agent's session through bob — `bob launch <name> --`, the mail on STDIN, never argv", async () => {
     const inboxRoot = join(root, "inbox");
-    mkdirSync(join(inboxRoot, "new"), { recursive: true });
-    mkdirSync(join(inboxRoot, "cur"), { recursive: true });
-    writeFileSync(
-      join(inboxRoot, "new", "1-mail.json"),
-      JSON.stringify({
-        id: "m1",
-        from: "flint",
-        to: AGENT,
-        body: "ping",
-        timestamp: "2026-09-25T00:00:00Z",
-      }),
+    const flint = testKey();
+    const envelope = signTestEnvelope(
+      { from: "flint", to: AGENT, body: "--tools bash; ping", messageId: "m1" },
+      flint,
     );
+    writeRecord(inboxRoot, "1-mail.json", mailRecord(envelope));
 
+    const replies: unknown[] = [];
     const consumer = new MailConsumer({
       name: AGENT,
+      identity: AGENT,
       inboxRoot,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
       launcherPath: launcher,
       lockFile: join(root, "lock"),
+      statsFile: join(root, "stats.json"),
+      sendReply: async (r) => {
+        replies.push(r);
+        return { ok: true };
+      },
     });
     await consumer.poll();
     expect(consumer.stats.processed).toBe(1);
-    expect(consumer.stats.failed).toBe(0);
+    expect(consumer.stats.dispatchFailed).toBe(0);
 
     const argv = readFileSync(recorded, "utf8")
       .split("\n")
       .filter((l) => l !== "");
-    expect(argv).toEqual(["launch", AGENT, "--", "ping"]);
+    // No prompt argument at all: the mail body never reaches an argv.
+    expect(argv).toEqual(["launch", AGENT, "--"]);
+    expect(readFileSync(join(root, "mode"), "utf8")).toBe("1");
+    expect(JSON.parse(readFileSync(join(root, "stdin"), "utf8"))).toEqual({
+      v: 1,
+      sender: "flint",
+      messageId: "m1",
+      body: "--tools bash; ping",
+    });
+    expect(replies).toEqual([{ to: "flint", inReplyTo: "m1", body: "pong" }]);
     // …and the agent's bob.yaml (which the policy is resolved from) is the one
     // this agent dir carries: the chain drives THIS agent.
     expect(readFileSync(join(root, "agents", AGENT, "bob.yaml"), "utf8")).toContain("allow:");
     expect(loadRole("ea").tools.allow).toContain("read");
+  });
+});
+
+describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
+  const cli = join(repoRoot, "dist", "cli.js");
+  // An input the CLI refuses for its extra field — which it can only say after
+  // reading ALL of it. (Refused before any agent lookup, so no agent dir.)
+  const refusable = (bodyBytes = 1) =>
+    JSON.stringify({
+      v: 1,
+      sender: "flint",
+      messageId: "m1",
+      body: "x".repeat(bodyBytes),
+      tools: ["bash"],
+    });
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "bob-mailturn-cli-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+  const mailEnv = () => ({ ...process.env, HOME: home, BOB_MAIL_TURN: "1" });
+
+  // bob#203: bun's spawnSync hands a child its `input` as a memfd on Linux — a
+  // REGULAR FILE, not a pipe. Under bun, reading a regular-file stdin through
+  // `process.stdin` (which bob's imports create early) came back EMPTY for any
+  // file up to 64 KiB — every real mail — and whole above it. A regular file
+  // reproduces that on any OS, so all three sizes are pinned: the CI's own
+  // shape, a mid-size mail, and one that needs several read(2) chunks.
+  for (const bodyBytes of [1, 32_000, 150_000]) {
+    it(`reads stdin that is a REGULAR FILE to EOF (the Linux spawnSync-input case, ${bodyBytes}-byte body)`, () => {
+      const file = join(home, "input.json");
+      writeFileSync(file, refusable(bodyBytes));
+      const fd = openSync(file, "r");
+      try {
+        const run = spawnSync(process.execPath, [cli, "launch", AGENT], {
+          env: mailEnv(),
+          stdio: [fd, "pipe", "pipe"],
+          encoding: "utf8",
+          timeout: CLI_SPAWN_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        });
+        expect(run.stderr).toContain('unknown field "tools"');
+        expect(run.status).toBe(2);
+      } finally {
+        closeSync(fd);
+      }
+    });
+  }
+
+  // Gauge round 5, blocker 4: the consumer watchdog runs BEFORE stdin is read.
+  // Here the consumer pid is dead and stdin is never closed: a watchdog
+  // installed after the read would block on stdin forever.
+  it("a mail turn whose consumer is already gone ends BEFORE reading stdin", async () => {
+    const gone = spawnSync("true");
+    const child = spawn(process.execPath, [cli, "launch", AGENT], {
+      env: { ...mailEnv(), BOB_MAIL_TURN_PARENT: String(gone.pid) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve(null);
+      }, 8000);
+      child.on("close", (c) => {
+        clearTimeout(timer);
+        resolve(c);
+      });
+    });
+    child.stdin?.destroy();
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/this mail turn's parent is pid \d+, not the consumer pid \d+/);
+  }, 15_000);
+
+  // Gauge round 6: a LIVE pid that is not this turn's parent (a forged or stale
+  // BOB_MAIL_TURN_PARENT) is refused at installation — before stdin is read.
+  it("a mail turn whose expected consumer is a live pid but NOT its parent ends before reading stdin", async () => {
+    const stranger = spawn("sleep", ["30"]);
+    try {
+      const child = spawn(process.execPath, [cli, "launch", AGENT], {
+        env: { ...mailEnv(), BOB_MAIL_TURN_PARENT: String(stranger.pid) },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (d) => {
+        stderr += d;
+      });
+      const code = await new Promise<number | null>((resolve) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          resolve(null);
+        }, 8000);
+        child.on("close", (c) => {
+          clearTimeout(timer);
+          resolve(c);
+        });
+      });
+      child.stdin?.destroy();
+      expect(code).toBe(1);
+      expect(stderr).toContain(`not the consumer pid ${stranger.pid}`);
+    } finally {
+      stranger.kill("SIGKILL"); // only a pid this test started
+    }
+  }, 15_000);
+
+  it("reads stdin written through a pipe in several delayed pieces to EOF", async () => {
+    const bytes = Buffer.from(refusable(100_000));
+    const child = spawn(process.execPath, [cli, "launch", AGENT], {
+      env: mailEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+    child.stdin?.on("error", () => {});
+    const cuts = [5, 37, 4096, 70_000, bytes.length];
+    let at = 0;
+    for (const cut of cuts) {
+      child.stdin?.write(bytes.subarray(at, cut));
+      at = cut;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    child.stdin?.end();
+    expect(await closed).toBe(2);
+    expect(stderr).toContain('unknown field "tools"');
+  }, 20_000);
+
+  it("refuses a prompt argument: a mail turn takes its input on stdin only", () => {
+    const run = spawnSync(process.execPath, [cli, "launch", AGENT, "--", "hello"], {
+      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      input: "",
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain("a mail turn takes its input on stdin");
+  });
+
+  it("refuses stdin that is not a v1 mail-turn input, before any session", () => {
+    const run = spawnSync(process.execPath, [cli, "launch", AGENT], {
+      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      input: JSON.stringify({ v: 1, sender: "flint", messageId: "m1", body: "x", tools: ["bash"] }),
+      encoding: "utf8",
+      timeout: CLI_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('unknown field "tools"');
+    expect(run.stdout).toBe("");
   });
 });

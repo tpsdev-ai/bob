@@ -53,7 +53,7 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 | Soul / persona      | Flair soul (canonical) ← mirrored from `~/agents/<name>/soul.md` by `bob onboard` / `bob align` |
 | Identity            | Ed25519 keypair + Flair Agent record, both provisioned at onboard (Bob) |
 | Memory              | [Flair](https://github.com/tpsdev-ai/flair)                    |
-| Inbound mail        | TPS mail consumer (Bob)                                        |
+| Inbound mail        | The `tps-mail` capability: `bob run <name>` answers each verified, allow-listed TPS mail with ONE turn in a fresh session and replies to the sender (Bob) |
 | Discord             | Listener + reply via discord.js binding (Bob)                  |
 | Cron                | The persistent `bob run` runtime's in-process scheduler — it fires bob.yaml `cron:` entries into the live session (Bob)             |
 | Tool allowlist      | `roles/<role>/role.json` is the ceiling, `bob.yaml` may only narrow it, and bob's session factory applies the result to every session |
@@ -69,7 +69,7 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 | `bob launch <name> [prompt]` | The agent's session with its resolved tool allowlist. No prompt opens the interactive TUI; one prompt (quote a multi-word one) runs as a task. This is what `bin/<name>` runs |
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
-| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox)                                          |
+| `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
 | `bob hire <name> --as <position>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository |
 | `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
 | `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
@@ -150,6 +150,11 @@ positions, presented as a local identity. An ADOPTED agent's setup session
 (`bob onboard`, `bob align`) runs the agent's grant-resolved configuration under
 the same fixed setup policy as every other agent's — exactly `read` and
 `write_soul` (see "Stated exceptions") — never the grant's own tools.
+An adopted agent's TPS mail turn (bob#200) only narrows: it holds the grant's
+resolved tools that are also on the mail allowlist (`flair_search`, `flair_get`,
+`flair_write`) and nothing else. The shipped `builder` and `reviewer` positions
+request none of those tools (and do not permit `tps-mail`), so a mail turn for
+either holds no tools at all.
 
 An agent with no grant is not adopted: it resolves exactly as before, so every
 existing `bob init` agent keeps booting unchanged. The one exception is the
@@ -207,6 +212,16 @@ change one, the named test is what tells you.
   is refused BY NAME, so no caller-controlled flag can reach a session.
   `bob launch a -- --tools` sends the literal prompt `--tools`;
   `bob launch a --tools` is refused. *(`test/shell/launch.test.ts`)*
+- **A TPS mail reaches a turn only verified, bound and allow-listed, and the
+  turn holds no filesystem tool.** The `tps-mail` consumer verifies the inner
+  signed envelope, binds its `from` to the record, and allow-lists the verified
+  id before any session exists; refused mail goes to `refused/` and is never
+  answered. Each accepted mail is ONE turn in a fresh session with the role's
+  policy — or, for an agent bound to a position, its grant's resolved policy —
+  narrowed to a reviewed allowlist (the Flair memory tools), and its
+  reply is sent only after the turn, as the agent, to the verified sender. *(`test/capabilities/tps-mail/`,
+  `test/shell/mail-consumer.test.ts`, `test/shell/mail-turn.test.ts`,
+  `test/shell/positions-195.test.ts`)*
 - **`bob init` stamps a policy that loads.** A fresh agent of every role is
   stamped with the role's ceiling intersected with the tools that can exist for
   it: pi's built-ins plus the tools of the capabilities bob stamps (currently
@@ -517,6 +532,160 @@ stay textual, like a Discord snowflake.
 
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
+
+### `tps-mail` — answering TPS mail
+
+An agent answers TPS mail through the `tps-mail` capability. It is off until you
+configure it: `bob onboard` writes it only as a commented template, because the
+`senders:` allow-list is a decision only the operator can make.
+
+```yaml
+capabilities:
+  - flair
+  - tps-mail
+
+tps-mail:
+  inbox: ~/.tps/mail/rocky     # the agent's TPS inbox (holds new/ and cur/)
+  senders:                     # REQUIRED, non-empty: exact TPS agent ids, no globs
+    - flint
+  turnTimeoutMs: 600000        # optional: wall-clock bound on one mail turn (default 10 min)
+  maxReplyChars: 4000          # optional: reply cap (default 4000, at most 16000)
+
+flair:                         # required: senders are verified against Flair,
+  url: http://127.0.0.1:19926  # and replies are signed as this identity
+  agentId: rocky
+  keyFile: ~/.flair/keys/rocky.key
+```
+
+The persistent runtime (`bob run <name>`, what the service unit runs) runs the
+consumer. For each file in `new/`, oldest first by filename:
+
+- **Accepting, before any session exists.** The inner signed envelope is
+  verified against the sender's key as registered in the agent's Flair (the same
+  source `tps` verifies against); its signed `from` must equal the record's
+  `from` and any `X-TPS-Sender` header; it must be addressed to this agent; and
+  the verified id must be on `senders:`. Anything else — unsigned, a bad
+  signature, an unregistered key, a mismatch, a sender not on the list — is moved
+  to `<inbox>/refused/` with a `.reason` file, counted, and never answered.
+  `X-TPS-Trust` is not consulted.
+- **One fresh session per mail.** Each accepted mail runs ONE turn through the
+  agent's launcher (`bin/<name>`, i.e. `bob launch`), never in the warm session,
+  so a reply can only draw on what that turn read. The verified fields reach the
+  launcher on stdin, never as an argument. The launcher runs as the leader of
+  its own process group, and the group is reaped as soon as the launcher
+  process EXITS (or the turn is aborted: past `turnTimeoutMs`, or a shutdown) —
+  not when its output closes, so a descendant holding that output cannot hold
+  up the turn or its result — except a member cleanup cannot kill: one that
+  survives the reap and keeps the output open still delays the result until the
+  turn timeout. Reaping sends SIGTERM, then SIGKILL after a grace, and probes the
+  group on a nominal 50 ms poll interval (with no hard bound under event-loop
+  delay) for up to the grace plus a reap limit (5 s); members still there after
+  that are given up on, logged with the group id and counted (`reapExhausted`).
+  Signals go to the numeric group id, and only after a probe found the group;
+  once every member has exited, a reused id could only be signalled in the
+  window from the group's death to the next probe (a nominal 50 ms poll
+  interval, with no hard bound under event-loop delay) plus that probe to its
+  signal.
+  The consumer passes its own pid to the turn. At start — before it reads its
+  input — the turn requires that pid to BE its parent (the generated launcher
+  `exec`s bob; a custom launcher must too) and ends itself otherwise; after
+  that it ends when that pid is gone or when it is reparented, checked every
+  second. A consumer that dies reparents the turn, so the reparenting check
+  fires even if the pid has been reused. A mail-mode `bob launch` started
+  without that variable only notices a later change of parent.
+- **What a mail turn can do.** Only the tools on a reviewed **allowlist** —
+  `flair_search`, `flair_get` and `flair_write` — and only those the role (for
+  an agent bound to a position, its host grant) also allows. Every other tool,
+  from any role, position grant or capability, is dropped: no file
+  tool (pi's `read`/`grep`/`find`/`ls`/`edit`/`write`, or builder-local's
+  `read_lines`/`edit_lines`/`insert_after`/`write_file`), no shell, no Discord.
+  A mail turn cannot read a file or Discord content into a reply, change a file,
+  or speak anywhere but in its reply to the sender. The mail body is framed as
+  untrusted data from the verified sender, inside a delimited block, with
+  control and bidi characters stripped and a length bound; it never enters the
+  system prompt.
+- **The reply.** The turn's final message — the same finality rule as `bob run`:
+  the last assistant message that ended after the last compaction — is capped at
+  `maxReplyChars` and handed to `tps mail send` with the body on stdin, as the
+  agent (`TPS_AGENT_ID` is the agent's own id), threaded to the inbound's signed
+  `messageId`, to the verified sender only. A tool-only or empty turn sends no
+  reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`
+  durably — temp file, fsync, rename, then an fsync of the directory — and only
+  then moves the mail to `cur/`. If any step fails, including the directory
+  fsync, the mail is not acked: it stays in `new/`, and the retry writes the
+  marker without sending again. bob also tries to take such a marker back, but
+  that removal can fail too, so an EXISTING marker is never trusted — not to
+  ack a re-delivery, not to refuse a collision — until bob has fsynced the
+  `replied/` directory itself; a failed sync leaves the mail in `new/` for a
+  retry, after a restart as well. A `replied/` directory whose filesystem cannot
+  fsync a directory gets its own error, and fails `bob doctor`, which inspects
+  the `replied/` entry itself without following it (a broken symlink or a
+  non-directory fails; the inbox root is probed only when `replied/` does not
+  exist yet): mail there is never acked. The marker records the verified
+  sender and a digest of the signed envelope (its outer signature normalized to
+  the verified bytes): a re-delivery of that same envelope is acked without a
+  second reply. A marker is used only after schema validation: every field bob
+  writes (`sender`, `digest`, `inboundId` equal to this inbound, `outcome`, `at`)
+  must be present and well-formed. These fields cannot prove who wrote the file,
+  only that it has the shape bob writes. An `id-collision` refusal — never
+  acked, never given the first one's reply — comes from an existing marker only
+  after a successful read and schema validation show it names a DIFFERENT
+  envelope; it also comes from state this run holds for the id and a different
+  envelope: pending settlement (a settled turn whose marker is not yet written)
+  or a pending reply (a composed reply awaiting a send retry). A marker that
+  cannot be read (an I/O error) is retried; one that reads but fails schema
+  validation is not guessed at: the mail is HELD in `<inbox>/held/` with a
+  `.reason` file (written before the move, so a held mail always has its
+  reason) for a human, counted, and shown by `bob doctor`.
+- **Presence.** A mail turn is not reflected in the presence roster: it runs
+  in its own process, outside the warm session and its turn admission, so it
+  neither beats busy nor writes a turn summary. The liveness beacon is
+  unaffected.
+- **Failures.** A failed or timed-out turn, an unreachable Flair, a failed
+  send, or a marker that cannot be written leaves the mail in `new/`, counted
+  and logged, and it is retried with backoff. Only an unreachable key service
+  is retried at the accepting step: a record that cannot be checked — a
+  non-finite number the signature canonicalization cannot encode, for one — is
+  refused, not retried. Delivery is at-least-once, and a second reply is
+  possible in two cases, both threaded to the same `messageId`: the runtime dies
+  between the CLI's success and a durable marker (a crash, or a restart while a
+  marker write keeps failing), or the CLI timed out or exited non-zero after it
+  may already have delivered — bob cannot tell, so it retries. There is no
+  end-to-end idempotency key in this slice.
+- **One consumer per agent.** A lock whose process is alive is never taken,
+  however old; a lock whose process is dead is taken over through an exclusive
+  claim, so restarts racing for it end with exactly one consumer. A start or a
+  takeover killed in the middle can leave an empty lock, an empty claim, or a
+  claim naming a dead process; the next start does not guess — it fails,
+  naming that file and when it is safe to remove it.
+
+**Allow-listing a sender grants it the agent's read scope — and mail-influenced
+memory writes.** Whatever a mail turn can read — its Flair memory — can end up
+in the reply to that sender, and because a mail turn keeps `flair_write`, a mail
+can shape what the agent remembers (and so its later turns, mail or not). The
+prompt's "do not disclose" rule is defence in depth, not the boundary. List
+only principals already entitled to both.
+
+`bob doctor <name>` FAILS when `bob.yaml` still carries `channels.tps_mail` (the
+old onboard scaffold, which nothing reads) without the capability; when the
+`tps-mail:` block is invalid — an empty `senders:` above all, which also makes
+the capability refuse to load; when the agent has no Flair identity; when the
+inbox is missing, or its `replied/` directory cannot be fsynced; when this host
+is not a TPS delivery target (no joined branch and no office identity, #134); or
+when `tps` or the agent's signing key is missing. It checks the EFFECTIVE
+capabilities — the set the persistent runtime starts — so a `tps-mail` that
+`bob.yaml` declares but an agent's position grant or a local override disables
+is reported as DISABLED, not checked as if it ran. It reports refused mail per
+reason, mail held for inspection, turn failures, reply failures, marker
+failures and an exhausted process-group reap.
+
+**Stated limits.** The reply needs a `tps` that accepts `tps mail send <to>
+--stdin --reply-to <messageId>`; `tps` 0.7.0 takes the body only as an argument
+and has no reply-to option, so with it every reply fails closed — counted and
+retried, never sent unthreaded or with the body on a command line. `tps` signs
+with `~/.flair/keys/<agent>.key` and, as of 0.7.0, does not read the PEM key
+`bob onboard` writes there. `bob doctor` checks `tps` on its own `PATH`; a
+service unit's `PATH` can differ.
 
 ### `reachy` (jarvis) — S3 skeleton
 

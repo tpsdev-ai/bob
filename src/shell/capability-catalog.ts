@@ -24,6 +24,7 @@ import { flairManifest } from "../capabilities/flair/manifest.js";
 import { observatoryManifest } from "../capabilities/observatory/manifest.js";
 import { presenceManifest } from "../capabilities/presence/manifest.js";
 import { reachyManifest } from "../capabilities/reachy/manifest.js";
+import { tpsMailManifest } from "../capabilities/tps-mail/manifest.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 
 // Planned capabilities whose extensions don't exist yet (later PRs). Listed so
@@ -58,6 +59,10 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   // heartbeat — one liveness system (beacon + activity stamp + turn summary).
   presence: { manifest: presenceManifest },
   reachy: { manifest: reachyManifest },
+  // bob#200: answer TPS mail — one fresh-session turn per verified, allow-listed
+  // mail, run by the persistent runtime. The planned free-form `mail` capability
+  // (a mail_send tool with a recipient allow-list) below is a later slice.
+  "tps-mail": { manifest: tpsMailManifest },
   // --- planned, not yet implemented (later PRs) ---
   mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
 });

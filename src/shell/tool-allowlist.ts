@@ -45,6 +45,32 @@ export const PI_BUILTIN_TOOLS = [
 // unit, with no human at the keyboard to approve a command.
 export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell"] as const;
 
+// What a MAIL TURN may hold (bob#200 §4, F4): an explicit, reviewed ALLOWLIST,
+// never a denylist. A mail turn answers ONE allow-listed peer and whatever it
+// can reach can end up in the reply, so every tool is dropped unless it is
+// named here — whatever role or capability supplies it. A denylist had to name
+// every file- or network-reaching tool in advance and missed the ones a role
+// or capability added later (builder-local's read_lines/edit_lines/
+// insert_after/write_file): an allowlist cannot fall behind.
+//
+// The three Flair memory tools, because memory with receipts is the point.
+// `flair_write` stays deliberately (spec §4): allow-listing a sender therefore
+// also permits MAIL-INFLUENCED MEMORY WRITES, and the operator docs say so.
+// Adding a tool here is a security review, not a convenience.
+export const MAIL_TURN_ALLOWED_TOOLS: readonly string[] = [
+  "flair_search",
+  "flair_get",
+  "flair_write",
+];
+
+// The policy a mail turn runs with: the role's resolved allowlist INTERSECTED
+// with MAIL_TURN_ALLOWED_TOOLS (pi's `tools` is strict over built-ins AND
+// capability tools, so anything outside it is never active). Only narrows.
+export function applyMailTurnPolicy(policy: ToolPolicy): ToolPolicy {
+  const allowed = new Set(MAIL_TURN_ALLOWED_TOOLS);
+  return { ...policy, tools: policy.tools.filter((name) => allowed.has(name)) };
+}
+
 // Names that existed in the OpenClaw / Claude-Code tool set and DO map onto a
 // real name here — used only to say which one in the error and in doctor's fix
 // line. Keyed lowercase.

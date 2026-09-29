@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatReport, runDoctor } from "../../src/shell/doctor.js";
+import { MailConsumer, tpsMailStatsPath } from "../../src/shell/mail-consumer.js";
+import {
+  keyResolver,
+  mailRecord,
+  signTestEnvelope,
+  testKey,
+  writeRecord,
+} from "../capabilities/tps-mail/helpers.js";
 
 // Build a complete-and-healthy agent layout for doctor to scan. Tests
 // then delete/chmod individual pieces to drive specific failure paths.
@@ -559,5 +567,278 @@ describe("formatReport", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+// ─── tps-mail (bob#200 §6, §7; F2, F9, F10; #134) ───────────────────────────
+//
+// ACCEPTANCE (doctor half): "an empty allow-list makes the capability refuse
+// to load, and doctor fails" — (d2).
+describe("runDoctor — tps-mail", () => {
+  let home: string;
+  let pathDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "bob-doctor-mail-"));
+    makeHealthyAgent({ home, name: "testbot" });
+    // A fake tps on a private PATH (never the real CLI), an office identity so
+    // this host is a delivery target, and the tps-mail capability declared.
+    pathDir = join(home, "bin");
+    mkdirSync(pathDir, { recursive: true });
+    writeFileSync(join(pathDir, "tps"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(pathDir, "tps"), 0o755);
+    mkdirSync(join(home, ".tps", "identity"), { recursive: true });
+    writeFileSync(join(home, ".tps", "identity", "host.seed"), "stub");
+    writeYaml({});
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function writeYaml(o: {
+    senders?: string[];
+    flair?: boolean;
+    capability?: boolean;
+    legacy?: boolean;
+  }) {
+    const senders = o.senders ?? ["flint"];
+    writeFileSync(
+      join(home, "agents", "testbot", "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "",
+        ...(o.legacy ? ["channels:", "  tps_mail:", "    inbox: ~/.tps/mail/testbot", ""] : []),
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+        ...(o.capability === false ? [] : ["capabilities:", "  - tps-mail", ""]),
+        ...(o.capability === false
+          ? []
+          : [
+              "tps-mail:",
+              "  inbox: ~/.tps/mail/testbot",
+              "  senders:",
+              ...senders.map((s) => `    - ${s}`),
+              "",
+            ]),
+        ...(o.flair === false
+          ? []
+          : [
+              "flair:",
+              "  url: http://127.0.0.1:19926",
+              "  agentId: testbot",
+              "  keyFile: ~/.flair/keys/testbot.key",
+              "",
+            ]),
+      ].join("\n"),
+    );
+  }
+
+  const doctor = (pathEnv?: string) =>
+    runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+      pathEnv: pathEnv ?? pathDir,
+    });
+  const check = (report: ReturnType<typeof runDoctor>, name: string) =>
+    report.checks.find((c) => c.name === name);
+
+  it("(d1) a configured tps-mail agent on a delivery target is green", () => {
+    const report = doctor();
+    expect(report.summary.fail).toBe(0);
+    expect(check(report, "tps-mail config")?.detail).toContain("flint");
+    expect(check(report, "tps-mail inbox")?.status).toBe("ok");
+    expect(check(report, "tps-mail delivery")?.status).toBe("ok");
+    expect(check(report, "tps-mail reply transport")?.detail).toBe(join(pathDir, "tps"));
+    // The capability's own inbox check replaces the generic one.
+    expect(check(report, "TPS mail inbox")).toBeUndefined();
+  });
+
+  it("(d2) FAILS on an empty senders allow-list", () => {
+    writeYaml({ senders: [] });
+    const report = doctor();
+    const c = check(report, "tps-mail config");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toMatch(/\/senders/);
+    expect(report.summary.fail).toBeGreaterThan(0);
+  });
+
+  it("(d3) FAILS on a channels.tps_mail nothing honours (the old onboard scaffold)", () => {
+    writeYaml({ capability: false, legacy: true });
+    const c = check(doctor(), "tps-mail");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("looks mail-capable and is not");
+  });
+
+  it("(d4) FAILS when the inbox is missing", () => {
+    rmSync(join(home, ".tps", "mail", "testbot"), { recursive: true });
+    expect(check(doctor(), "tps-mail inbox")?.status).toBe("fail");
+  });
+
+  it("(d5) FAILS when this host is not a TPS delivery target (#134)", () => {
+    rmSync(join(home, ".tps", "identity"), { recursive: true });
+    const c = check(doctor(), "tps-mail delivery");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("not a TPS delivery target");
+  });
+
+  it("a joined branch is a target; a stopped branch daemon WARNs", () => {
+    rmSync(join(home, ".tps", "identity", "host.seed"));
+    writeFileSync(join(home, ".tps", "identity", "host.json"), "{}");
+    expect(check(doctor(), "tps-mail delivery")?.status).toBe("warn");
+    writeFileSync(join(home, ".tps", "branch.pid"), String(process.pid));
+    expect(check(doctor(), "tps-mail delivery")?.status).toBe("ok");
+  });
+
+  it("(d6) FAILS when the tps CLI is not on PATH, or the signing key is missing", () => {
+    expect(check(doctor(join(home, "empty-path")), "tps-mail reply transport")?.status).toBe(
+      "fail",
+    );
+    rmSync(join(home, ".flair", "keys", "testbot.key"));
+    const c = check(doctor(), "tps-mail reply transport");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("unsigned");
+  });
+
+  it("(d7) FAILS when the agent has no Flair identity to verify and sign with", () => {
+    writeYaml({ flair: false });
+    expect(check(doctor(), "tps-mail identity")?.status).toBe("fail");
+  });
+
+  it("(d8) surfaces refused counts per reason, dispatch failures and reply failures", () => {
+    const refused = join(home, ".tps", "mail", "testbot", "refused");
+    mkdirSync(refused, { recursive: true });
+    writeFileSync(join(refused, "a.json"), "{}");
+    writeFileSync(join(refused, "a.json.reason"), "reason: bad-signature\n");
+    writeFileSync(join(refused, "b.json"), "{}");
+    writeFileSync(join(refused, "b.json.reason"), "reason: sender-not-allowed\n");
+    mkdirSync(join(home, ".bob"), { recursive: true });
+    writeFileSync(
+      join(home, ".bob", "testbot.tps-mail-stats.json"),
+      JSON.stringify({
+        replied: 3,
+        noReply: 1,
+        dispatchFailed: 2,
+        timeouts: 1,
+        replyFailed: { "cli-missing": 4 },
+        verifyUnavailable: 0,
+        markerFailed: 1,
+      }),
+    );
+    const c = check(doctor(), "tps-mail activity");
+    expect(c?.status).toBe("warn");
+    expect(c?.detail).toContain("refused=2");
+    expect(c?.detail).toContain("bad-signature=1");
+    expect(c?.detail).toContain("sender-not-allowed=1");
+    expect(c?.detail).toContain("dispatch failures=2 (timeouts 1)");
+    expect(c?.detail).toContain("reply failures=4 (cli-missing=4)");
+    expect(c?.detail).toContain("marker failures=1");
+  });
+
+  // Gauge round 6, blocker 1: doctor probes the ACTUAL replied/ directory — it
+  // can sit on another filesystem than the inbox root. A replied/ that cannot
+  // be opened for fsync (here: unreadable) fails, while the root is fine.
+  it("(d9) FAILS when the replied/ directory itself cannot be fsynced, even though the inbox root can", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    mkdirSync(replied, { recursive: true });
+    chmodSync(replied, 0o000);
+    try {
+      const c = check(doctor(), "tps-mail inbox");
+      expect(c?.status).toBe("fail");
+      expect(c?.detail).toContain(`${replied}: cannot fsync the directory`);
+    } finally {
+      chmodSync(replied, 0o700);
+    }
+    expect(check(doctor(), "tps-mail inbox")?.detail).toContain("replied/ can fsync a directory");
+  });
+
+  // Round 7: doctor inspects the ACTUAL replied/ entry without following it.
+  it("(d11) FAILS a replied/ that is a BROKEN symlink — never falls back to the healthy root", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    symlinkSync(join(home, "no-such-dir"), replied);
+    const c = check(doctor(), "tps-mail inbox");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain(`${replied}: cannot fsync the directory (a broken symlink)`);
+  });
+
+  it("(d12) FAILS a replied/ that is not a directory", () => {
+    const replied = join(home, ".tps", "mail", "testbot", "replied");
+    writeFileSync(replied, "a regular file");
+    const c = check(doctor(), "tps-mail inbox");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain(`${replied}: cannot fsync the directory (not a directory)`);
+  });
+
+  // Round 7: an exhausted reap that fires AFTER stop() reaches doctor, which
+  // reads the stats FILE.
+  it("(d13) an exhausted reap after stop() is visible to doctor", async () => {
+    const inbox = join(home, ".tps", "mail", "testbot");
+    const flint = testKey();
+    writeRecord(
+      inbox,
+      "1.json",
+      mailRecord(
+        signTestEnvelope({ from: "flint", to: "testbot", body: "x", messageId: "m-1" }, flint),
+      ),
+    );
+    const launcher = join(home, "launcher");
+    writeFileSync(
+      launcher,
+      `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"ok"}'\nexit 0\n`,
+    );
+    chmodSync(launcher, 0o755);
+    const consumer = new MailConsumer({
+      name: "testbot",
+      identity: "testbot",
+      inboxRoot: inbox,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
+      launcherPath: launcher,
+      lockFile: join(home, ".bob", "testbot.lock"),
+      statsFile: tpsMailStatsPath(home, "testbot"),
+      pollIntervalMs: 60_000,
+      log: () => {},
+      sendReply: async () => ({ ok: true }),
+      turnRunner: {
+        killGraceMs: 50,
+        reapLimitMs: 150,
+        groupOps: { exists: () => true, signal: () => {} }, // a group that never goes away
+      },
+    });
+    consumer.start();
+    await consumer.poll();
+    await consumer.stop(); // its last stats write happens BEFORE the reap gives up
+    const deadline = Date.now() + 3000;
+    while (consumer.stats.reapExhausted === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(consumer.stats.reapExhausted).toBe(1);
+    expect(check(doctor(), "tps-mail activity")?.detail).toContain("reap exhausted=1");
+  }, 10_000);
+
+  it("(d10) surfaces mail HELD for inspection, marker read failures and an exhausted reap", () => {
+    const heldDir = join(home, ".tps", "mail", "testbot", "held");
+    mkdirSync(heldDir, { recursive: true });
+    writeFileSync(join(heldDir, "h.json"), "{}");
+    writeFileSync(join(heldDir, "h.json.reason"), "reason: marker-malformed\n");
+    mkdirSync(join(home, ".bob"), { recursive: true });
+    writeFileSync(
+      join(home, ".bob", "testbot.tps-mail-stats.json"),
+      JSON.stringify({ markerReadFailed: 2, reapExhausted: 1 }),
+    );
+    const c = check(doctor(), "tps-mail activity");
+    expect(c?.status).toBe("warn");
+    expect(c?.detail).toContain("held for inspection=1 (marker-malformed=1)");
+    expect(c?.detail).toContain("marker read failures=2");
+    expect(c?.detail).toContain("reap exhausted=1");
   });
 });
