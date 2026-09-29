@@ -26,7 +26,15 @@
 // real init system.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -91,6 +99,18 @@ function realpathOrUndefined(file: string): string | undefined {
   }
 }
 
+// Whether a path's final component is a symlink. A stable Homebrew entry
+// (/opt/homebrew/bin/node) is a symlink to the versioned target; a versioned
+// Cellar entry (…/Cellar/node/<version>/bin/node) is a real file. Detected by
+// lstat, so a symlinked PARENT directory does not count as a symlink here.
+function isSymlink(file: string): boolean {
+  try {
+    return lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // Resolve an ABSOLUTE Node executable for the unit, at install time.
 //
 // The unit must run bob under NODE — bin/bob's shebang and package.json's
@@ -124,14 +144,18 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   }
 
   if (executableBasename(execPath).toLowerCase() === "node") {
-    // The installer IS node: prefer a PATH `node` that resolves to the SAME
-    // binary (compared by realpath, so a PATH `node` symlinked to a DIFFERENT
-    // binary is NOT chosen), then fall back to the running interpreter's own
-    // path.
+    // The installer IS node: prefer a PATH `node` that is a SYMLINK resolving to
+    // the SAME binary, so a versioned target becomes its stable symlink. A
+    // direct (non-symlink) match does not help — a versioned Cellar binary on
+    // PATH is still versioned — so when only direct matches exist (or none) we
+    // fall back to the running interpreter's own path, which can be versioned.
+    // A PATH `node` symlinked to a DIFFERENT binary is not a match; the first
+    // matching symlink in PATH order wins.
     const execReal = realpathOrUndefined(execPath);
     if (execReal !== undefined) {
       for (const candidate of candidates) {
-        if (realpathOrUndefined(candidate) === execReal) return candidate;
+        if (realpathOrUndefined(candidate) !== execReal) continue;
+        if (isSymlink(candidate)) return candidate;
       }
     }
     return execPath;

@@ -426,6 +426,54 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
   });
 });
 
+describe("installService prefers a stable PATH symlink over a direct match (bob#228)", () => {
+  it("writes the symlink path in BOTH units even when a direct match comes FIRST on PATH", async () => {
+    const versionedDir = mkdtempSync(join(tmpdir(), "bob-node-versioned-"));
+    const stableDir = mkdtempSync(join(tmpdir(), "bob-node-stable-"));
+    const versioned = join(versionedDir, "node");
+    writeFileSync(versioned, "#!/bin/sh\n");
+    chmodSync(versioned, 0o755);
+    const stable = join(stableDir, "node");
+    symlinkSync(versioned, stable);
+    const delimiter = process.platform === "win32" ? ";" : ":";
+    // The versioned Cellar directory comes BEFORE the stable symlink on PATH.
+    const pathEnv = `${versionedDir}${delimiter}${stableDir}`;
+    try {
+      const launchdWritten: Array<{ path: string; contents: string }> = [];
+      const launchd = await installService({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        platform: "launchd",
+        execPath: versioned,
+        pathEnv,
+        writeFile: (path, contents) => launchdWritten.push({ path, contents }),
+      });
+      expect(launchd.interpreter).toBe(stable);
+      expect(launchdWritten[0].contents).toContain(stable);
+      expect(launchdWritten[0].contents).not.toContain(versioned);
+
+      const systemdWritten: Array<{ path: string; contents: string }> = [];
+      const systemd = await installService({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        platform: "systemd",
+        execPath: versioned,
+        pathEnv,
+        writeFile: (path, contents) => systemdWritten.push({ path, contents }),
+        runSystemctl: async () => ({ code: 0, stderr: "" }),
+      });
+      expect(systemd.interpreter).toBe(stable);
+      expect(systemdWritten[0].contents).toContain(`ExecStart=${stable} ${BOB_BIN} run pulse`);
+      expect(systemdWritten[0].contents).not.toContain(versioned);
+    } finally {
+      rmSync(versionedDir, { recursive: true, force: true });
+      rmSync(stableDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("installService resolves the interpreter at install time (bob#218)", () => {
   it("a bun-launched install writes the Node path, not bun", async () => {
     const written: Array<{ path: string; contents: string }> = [];
