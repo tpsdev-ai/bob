@@ -6,6 +6,7 @@ import {
 } from "../../../src/capabilities/discord/capability.js";
 import type { DiscordCapabilityConfig } from "../../../src/capabilities/discord/config.js";
 import type { DiscordClient, DiscordMessage } from "../../../src/shell/discord-types.js";
+import { createTurnAdmission } from "../../../src/shell/turn-admission.js";
 import type { TurnOrigin } from "../../../src/shell/turn-origin.js";
 
 // --- Fakes (no live gateway, no real token, no LLM) -------------------------
@@ -310,21 +311,119 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
   });
 });
 
-describe("wireDiscordCapability — each turn owns its destination (issue #227)", () => {
-  it("A then B before A's turn ends: each answer goes to its own channel and message", async () => {
-    const { pi, client } = setup();
-    // A arrives, then B arrives WHILE A's turn is still running (no finish yet).
-    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> a?", mentionsBot: true });
-    client.fire({ id: "mB", channelId: "channel-B", content: "<@1> b?", mentionsBot: true });
-    expect(pi.userMessages).toEqual(["a?", "b?"]);
-    // A finishes first — its answer must land on channel-A/mA, NOT on B.
-    await pi.finishTurn("answer A");
-    expect(client.replies).toEqual([{ channelId: "channel-A", text: "answer A", replyTo: "mA" }]);
-    // Then B finishes — its answer lands on channel-B/mB.
-    await pi.finishTurn("answer B");
-    expect(client.replies).toEqual([
-      { channelId: "channel-A", text: "answer A", replyTo: "mA" },
-      { channelId: "channel-B", text: "answer B", replyTo: "mB" },
+// A harness that wires the capability to the REAL turn admission (bob's FIFO),
+// so an inbound message admitted while another turn is running actually QUEUES.
+// Only the pi surface, the Discord transport and the session's prompt body are
+// fakes — the serialization and the origin binding are production code. The
+// fake session records that each prompt STARTED and with which origin, runs an
+// optional per-turn body (where the test drives tool calls, exactly as the
+// agent would mid-turn), blocks until the test releases it, then emits agent_end
+// so the admission captures the turn's messages.
+function setupRealAdmission() {
+  const pi = new FakePi();
+  const client = new FakeDiscordClient();
+  const logs: string[] = [];
+  const admission = createTurnAdmission();
+  const started: string[] = [];
+  const originAtStart: TurnOrigin[] = [];
+  const releases = new Map<string, () => void>();
+  let onTurn: ((text: string) => void | Promise<void>) | undefined;
+  let listener: ((event: { type: string; messages?: unknown[] }) => void) | undefined;
+  const session = {
+    subscribe(l: (event: { type: string; messages?: unknown[] }) => void) {
+      listener = l;
+      return () => {};
+    },
+    async waitForIdle(): Promise<void> {},
+    async prompt(text: string): Promise<void> {
+      started.push(text);
+      originAtStart.push(admission.readOrigin());
+      await onTurn?.(text);
+      await new Promise<void>((resolve) => releases.set(text, resolve));
+      listener?.({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: `${text}::answer` }] }],
+      });
+    },
+    dispose(): void {},
+  };
+  admission.bind(session as never);
+  wireDiscordCapability({
+    pi,
+    client,
+    config: {
+      tokenFile: "/secrets/bot.token",
+      channelIds: ["111", "222"],
+      dispatchAll: false,
+    },
+    admitTurn: admission.admitTurn,
+    readOrigin: admission.readOrigin,
+    log: (m) => logs.push(m),
+  });
+  return {
+    pi,
+    client,
+    started,
+    originAtStart,
+    setOnTurn(fn: (text: string) => void | Promise<void>) {
+      onTurn = fn;
+    },
+    release(text: string) {
+      releases.get(text)?.();
+    },
+    // Let the FIFO's microtask chain settle.
+    flush: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+  };
+}
+
+describe("wireDiscordCapability — a real queued turn keeps its own origin (issue #227)", () => {
+  it("holds A open, queues B, refuses A's tools on B's channel, then runs B with B's origin", async () => {
+    const h = setupRealAdmission();
+    const refused: string[] = [];
+    // Mid-turn on channel 111, the agent tries EVERY outbound tool on channel 222.
+    h.setOnTurn(async (text) => {
+      if (text !== "A?") return;
+      for (const [name, params] of [
+        ["discord_reply", { channelId: "222", text: "sneak" }],
+        ["discord_react", { channelId: "222", messageId: "mB", emoji: "✅" }],
+        ["discord_fetch", { channelId: "222" }],
+      ] as const) {
+        await expect(h.pi.call(name, params)).rejects.toThrow(
+          /bound to channel 111.*refusing to use channel 222/,
+        );
+        refused.push(name);
+      }
+      // Its OWN channel is allowed.
+      await h.pi.call("discord_reply", { channelId: "111", text: "ok on A" });
+    });
+
+    // A arrives; its turn starts with channel 111's origin.
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    await h.flush();
+    expect(h.started).toEqual(["A?"]);
+    expect(h.originAtStart).toEqual([{ kind: "discord", channelId: "111" }]);
+
+    // B arrives WHILE A is still running: it QUEUES — its prompt has NOT started.
+    h.client.fire({ id: "mB", channelId: "222", content: "<@1> B?", mentionsBot: true });
+    await h.flush();
+    expect(h.started, "B is queued while A runs; it must not start").toEqual(["A?"]);
+
+    // Release A: it finishes, then B starts with channel 222's origin.
+    h.release("A?");
+    await h.flush();
+    expect(h.started).toEqual(["A?", "B?"]);
+    expect(h.originAtStart[1]).toEqual({ kind: "discord", channelId: "222" });
+
+    // Release B: it finishes. Each reply is a regression pin — routing to each
+    // message's own channel/message was ALREADY correct on main (each message's
+    // callback captures its own destination); this PR does not change routing.
+    h.release("B?");
+    await h.flush();
+    expect(refused).toEqual(["discord_reply", "discord_react", "discord_fetch"]);
+    expect(h.client.replies).toEqual([
+      { channelId: "111", text: "ok on A", replyTo: undefined },
+      { channelId: "111", text: "A?::answer", replyTo: "mA" },
+      { channelId: "222", text: "B?::answer", replyTo: "mB" },
     ]);
   });
 });
@@ -345,6 +444,28 @@ describe("wireDiscordCapability — a turn's tools are bound to its channel (iss
     client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
     await pi.call("discord_reply", { channelId: "channel-A", text: "ok" });
     expect(client.replies).toEqual([{ channelId: "channel-A", text: "ok", replyTo: undefined }]);
+  });
+
+  it("discord_react to ANOTHER allow-listed channel during a turn is refused", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    await expect(
+      pi.call("discord_react", { channelId: "channel-B", messageId: "mB", emoji: "✅" }),
+    ).rejects.toThrow(/bound to channel channel-A.*refusing to use channel channel-B/);
+    expect(client.reactions).toHaveLength(0);
+  });
+
+  it("discord_react to the turn's OWN channel is allowed", async () => {
+    const { pi, client } = setup();
+    client.fire({ id: "mA", channelId: "channel-A", content: "<@1> x", mentionsBot: true });
+    await pi.call("discord_react", { channelId: "channel-A", messageId: "mA", emoji: "✅" });
+    expect(client.reactions).toEqual([{ channelId: "channel-A", messageId: "mA", emoji: "✅" }]);
+  });
+
+  it("outside a turn, discord_react on any allow-listed channel is still allowed", async () => {
+    const { pi, client } = setup();
+    await pi.call("discord_react", { channelId: "channel-B", messageId: "m9", emoji: "👍" });
+    expect(client.reactions).toEqual([{ channelId: "channel-B", messageId: "m9", emoji: "👍" }]);
   });
 
   it("discord_fetch during a turn cannot read another channel", async () => {

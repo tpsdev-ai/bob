@@ -266,6 +266,7 @@ export function wireDiscordCapability(opts: WireOptions): WiredCapability {
       const messageId = params.messageId as string;
       const emoji = params.emoji as string;
       requireAllowed(channelId);
+      requireTurnChannel(channelId);
       await client.react(channelId, messageId, emoji);
       return ok(`reacted ${emoji} on ${messageId}`);
     },
