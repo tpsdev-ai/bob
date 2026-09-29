@@ -873,7 +873,7 @@ export class JobManager {
       this.jobs.delete(runId);
       const clean = job.cleanup === "group_empty" || job.cleanup === "group_killed";
       throw new RunRefusal(
-        `run refused: the job record for ${runId} could not be written (${code}) right after the job started, so termination was attempted (SIGTERM, then SIGKILL after a grace, only while the group could be verified). Its process group ${job.pgid} ${
+        `run refused: the job record for ${runId} could not be written (${code}) right after the job started, so termination was attempted (SIGTERM to its process group only if a first membership probe found members it may signal, then SIGKILL if the group was not empty after a grace). Its process group ${job.pgid} ${
           clean
             ? `was verified empty (cleanup_state ${job.cleanup}): nothing from it is left running`
             : `could NOT be verified empty (cleanup_state ${job.cleanup}): something from it may survive`

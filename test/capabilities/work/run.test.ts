@@ -401,7 +401,7 @@ describe("run — a failed first record write terminates the job", () => {
     const pgid = Number(m?.[1]);
     try {
       expect(refused.text).toContain(
-        "could not be written (ENOSPC) right after the job started, so termination was attempted",
+        "could not be written (ENOSPC) right after the job started, so termination was attempted (SIGTERM to its process group only if a first membership probe found members it may signal, then SIGKILL if the group was not empty after a grace)",
       );
       expect(refused.text).toContain("nothing from it is left running");
       // No process from that job remains.

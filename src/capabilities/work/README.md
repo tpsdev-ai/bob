@@ -144,8 +144,11 @@ named error.
   outcome, cleanup). The first record is written right after spawn — the
   command is already running by then — and before the job's deadline is armed.
   If that first write fails, termination is attempted with the deadline's
-  escalation (no signal is sent to a group that cannot be verified), and `run` returns a refusal naming the job's process group and
-  saying whether that group was verified empty.
+  escalation: SIGTERM to the process group only if a first membership probe
+  finds members the tool may signal (an empty, unsignallable or unanswerable
+  probe sends nothing), then SIGKILL if the group is not empty after the
+  grace. `run` returns a refusal naming the job's process group and saying
+  whether that group was verified empty.
 - **Identity.** A pid can be reused, even within one second, so a pid (or a
   1-second `ps` start time) is not an identity. On Linux the tool pins a process
   as the boot id plus the start time in clock ticks, the process group and the
