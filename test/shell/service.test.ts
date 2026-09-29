@@ -1,6 +1,14 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -354,6 +362,66 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
       );
     } finally {
       rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveNodeExecutable — a stable path over a versioned target (bob#228)", () => {
+  // A real, executable file standing in for the running interpreter (the
+  // versioned Homebrew Cellar target on macOS).
+  function versionedNode(): { dir: string; file: string } {
+    const dir = mkdtempSync(join(tmpdir(), "bob-node-versioned-"));
+    const file = join(dir, "node");
+    writeFileSync(file, "#!/bin/sh\n");
+    chmodSync(file, 0o755);
+    return { dir, file };
+  }
+
+  it("writes a PATH symlink that resolves to the running interpreter, not the versioned target", () => {
+    const versioned = versionedNode();
+    const stableDir = mkdtempSync(join(tmpdir(), "bob-node-stable-"));
+    const stable = join(stableDir, "node");
+    symlinkSync(versioned.file, stable); // /opt/homebrew/bin/node -> .../Cellar/node/<v>/bin/node
+    try {
+      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: stableDir });
+      expect(resolved).toBe(stable);
+      expect(resolved).not.toBe(versioned.file);
+    } finally {
+      rmSync(versioned.dir, { recursive: true, force: true });
+      rmSync(stableDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the running interpreter when no PATH node resolves to it", () => {
+    const versioned = versionedNode();
+    const emptyDir = mkdtempSync(join(tmpdir(), "bob-node-empty-"));
+    try {
+      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: emptyDir });
+      expect(resolved).toBe(versioned.file);
+    } finally {
+      rmSync(versioned.dir, { recursive: true, force: true });
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT choose a PATH node that is a symlink to a DIFFERENT binary", () => {
+    const versioned = versionedNode();
+    const otherDir = mkdtempSync(join(tmpdir(), "bob-node-other-"));
+    const other = join(otherDir, "node");
+    writeFileSync(other, "#!/bin/sh\n");
+    chmodSync(other, 0o755);
+    const stableDir = mkdtempSync(join(tmpdir(), "bob-node-elsewhere-"));
+    const elsewhere = join(stableDir, "node");
+    symlinkSync(other, elsewhere); // points at a DIFFERENT binary
+    try {
+      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: stableDir });
+      // The non-matching symlink is not chosen; the fallback is execPath.
+      expect(resolved).not.toBe(elsewhere);
+      expect(resolved).toBe(versioned.file);
+    } finally {
+      rmSync(versioned.dir, { recursive: true, force: true });
+      rmSync(otherDir, { recursive: true, force: true });
+      rmSync(stableDir, { recursive: true, force: true });
     }
   });
 });

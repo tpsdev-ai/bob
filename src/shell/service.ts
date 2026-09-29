@@ -26,7 +26,7 @@
 // real init system.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -80,30 +80,65 @@ function executableBasename(file: string): string {
   return process.platform === "win32" ? base.replace(/\.exe$/i, "") : base;
 }
 
+// A path's realpath (symlinks followed), or undefined when it does not resolve.
+// Used only to decide whether a PATH entry names the SAME binary as execPath; a
+// path that does not resolve yields no match, and the caller falls back.
+function realpathOrUndefined(file: string): string | undefined {
+  try {
+    return realpathSync(file);
+  } catch {
+    return undefined;
+  }
+}
+
 // Resolve an ABSOLUTE Node executable for the unit, at install time.
 //
 // The unit must run bob under NODE — bin/bob's shebang and package.json's
 // `engines` say so — whatever runtime ran install-service. When the installer
-// IS node that is its own process.execPath. Otherwise (e.g. a developer runs
-// install-service under bun) we look for `node` on the installer's PATH. If
-// neither yields a Node, installation is REFUSED (the throw names the remedy)
-// rather than writing a unit that would run bob under a non-Node runtime.
+// IS node we prefer a STABLE path that resolves to the SAME binary: on a
+// Homebrew install process.execPath is the versioned target
+// (…/Cellar/node/<version>/bin/node), and writing that into the unit breaks the
+// service after `brew upgrade node` (the versioned directory is gone). Walking
+// the installer's PATH for a `node` entry whose realpath equals execPath's
+// realpath yields the stable symlink (e.g. /opt/homebrew/bin/node); when no
+// entry resolves to the same binary we fall back to execPath. When the
+// installer is NOT node (e.g. a developer runs install-service under bun) we
+// look for `node` on the installer's PATH. If neither yields a Node,
+// installation is REFUSED (the throw names the remedy) rather than writing a
+// unit that would run bob under a non-Node runtime.
 export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   const execPath = deps.execPath ?? process.execPath;
-  if (executableBasename(execPath).toLowerCase() === "node") {
-    return execPath;
-  }
   const pathEnv = deps.pathEnv ?? process.env.PATH ?? "";
   const isExecutable = deps.isExecutable ?? defaultIsExecutable;
   const delimiter = process.platform === "win32" ? ";" : ":";
+
+  // Every executable `node` on the installer's PATH, in PATH order. resolve()
+  // against the installer's working directory, so a RELATIVE PATH entry still
+  // yields an ABSOLUTE interpreter in the unit; defaultIsExecutable then
+  // requires a regular file (a directory named `node` is skipped).
+  const candidates: string[] = [];
   for (const dir of pathEnv.split(delimiter)) {
     if (!dir) continue;
-    // resolve() against the installer's working directory, so a RELATIVE PATH
-    // entry still yields an ABSOLUTE interpreter in the unit; defaultIsExecutable
-    // then requires a regular file (a directory named `node` is skipped).
     const candidate = resolve(dir, "node");
-    if (isExecutable(candidate)) return candidate;
+    if (isExecutable(candidate)) candidates.push(candidate);
   }
+
+  if (executableBasename(execPath).toLowerCase() === "node") {
+    // The installer IS node: prefer a PATH `node` that resolves to the SAME
+    // binary (compared by realpath, so a PATH `node` symlinked to a DIFFERENT
+    // binary is NOT chosen), then fall back to the running interpreter's own
+    // path.
+    const execReal = realpathOrUndefined(execPath);
+    if (execReal !== undefined) {
+      for (const candidate of candidates) {
+        if (realpathOrUndefined(candidate) === execReal) return candidate;
+      }
+    }
+    return execPath;
+  }
+
+  // The installer is not node: use the first Node found on PATH.
+  if (candidates.length > 0) return candidates[0];
   throw new Error(
     `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.`,
   );
