@@ -62,6 +62,7 @@ import {
   type SilenceReason,
 } from "./compaction-contract.js";
 import type { BobRole, CronEntry } from "./index.js";
+import { resolveAdoptedConfig } from "./position-runtime.js";
 import { loadRole } from "./role-loader.js";
 import {
   createBobRuntimeFactory,
@@ -565,6 +566,10 @@ export interface RunOptions {
   captureStdout?: boolean;
   // Override the agents root dir (tests). Defaults to ~/agents.
   agentsRoot?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
   // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
@@ -658,6 +663,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     agentsRoot: root,
     model: opts.model,
     ...(opts.mailTurn ? { mailTurn: true } : {}),
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
 
   const factory = opts.sessionFactory ?? createPiRunSession;
@@ -986,8 +993,14 @@ export interface ResolveRunConfigOptions {
   // `bob run` path leaves this falsy.
   persistent?: boolean;
   // bob#200: the session answers one TPS mail — applyMailTurnPolicy narrows the
-  // resolved policy to the mail allowlist. Only ever narrows.
+  // resolved policy to the mail allowlist, for an ordinary AND an adopted
+  // (position-bound) agent alike. Only ever narrows.
   mailTurn?: boolean;
+  // Host state root for the position grant store. Defaults to ~/.bob/host. When
+  // an agent has no grant it is NOT adopted, and resolution is unchanged.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
 }
 
 export interface ResolvedRunConfig {
@@ -1068,6 +1081,10 @@ export interface LaunchOptions {
   agentsRoot?: string;
   // Per-invocation model override (same semantics as `bob run --model`).
   model?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
   // Test seam for the one-shot path (defaults to the real SDK factory).
   sessionFactory?: RunSessionFactory;
   // Test seam for the interactive path (defaults to pi's InteractiveMode in a
@@ -1143,6 +1160,8 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
       prompt: opts.prompt,
       model: opts.model,
       agentsRoot: opts.agentsRoot,
+      ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+      ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
       captureStdout: true,
       sessionFactory: opts.sessionFactory,
     });
@@ -1156,6 +1175,8 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     name: opts.name,
     agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
     model: opts.model,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
   return interactive({ config, policy, deps: opts.deps });
@@ -1205,6 +1226,10 @@ export interface MailTurnLaunchOptions {
   input: string;
   agentsRoot?: string;
   model?: string;
+  // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
+  hostRoot?: string;
+  // Positions root (tests). Defaults to bob's packaged positions/ directory.
+  positionsRoot?: string;
   sessionFactory?: RunSessionFactory;
   // Where the result line goes. Defaults to stdout, awaited until flushed.
   write?: (text: string) => Promise<void>;
@@ -1244,6 +1269,8 @@ async function runMailTurn(
     mailTurn: true,
     model: opts.model,
     agentsRoot: opts.agentsRoot,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
     captureStdout: true,
     sessionFactory: opts.sessionFactory,
   });
@@ -1371,21 +1398,64 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   const model = opts.model ?? yamlModel;
   const appendSystemPrompt = readSoul(agentDir);
 
-  // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
-  // the blessed catalog, validating each config block. Throws fast on an
-  // unknown / unbuilt / misconfigured capability — better than running an
-  // under-equipped agent. Produces the pi extension sources the session loads
-  // plus the per-capability config env each extension reads (no secrets).
-  const resolution = resolveCapabilities({ yamlText });
+  // The ONE effective-config resolver. For an ADOPTED agent (a host grant
+  // exists) it applies the grant/position/override/secret layers through every
+  // session entry path. For an agent with NO grant it returns undefined and the
+  // ordinary resolution below is used untouched — that is what keeps an existing
+  // `bob init` agent booting unchanged.
+  const adopted = resolveAdoptedConfig({
+    name: opts.name,
+    agentDir,
+    yamlText,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    ...(opts.persistent !== undefined ? { persistent: opts.persistent } : {}),
+  });
 
-  // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
-  // may only narrow it; a missing allowlist is a load error; every name must be
-  // one pi or a loaded capability can enable (pi drops an unknown name
-  // SILENTLY, so a stale name would otherwise look like a working allowlist
-  // while the tool is simply absent). Throws naming the offender and the fix.
-  const rolePolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
-  // bob#200: a mail turn narrows the role's policy to the mail allowlist.
-  const toolPolicy = opts.mailTurn ? applyMailTurnPolicy(rolePolicy) : rolePolicy;
+  let toolPolicy: ToolPolicy;
+  let extensionSources: string[];
+  let capabilityBySource: Record<string, string>;
+  let capabilityEnv: Record<string, string>;
+  let capabilities: ResolvedCapability[];
+  if (adopted) {
+    toolPolicy = {
+      tools: adopted.tools,
+      excludeTools: adopted.excludeTools,
+      resident: adopted.resident,
+      allowResidentShell: adopted.allowResidentShell,
+    };
+    extensionSources = adopted.extensionSources;
+    capabilityBySource = adopted.capabilityBySource;
+    capabilityEnv = adopted.capabilityEnv;
+    // The grant-narrowed set (local disables applied), from the SAME resolution
+    // as the extension sources above — never bob.yaml's raw capabilities: list.
+    capabilities = adopted.resolvedCapabilities;
+  } else {
+    // Resolve the agent's declared capabilities (bob.yaml `capabilities:`) against
+    // the blessed catalog, validating each config block. Throws fast on an
+    // unknown / unbuilt / misconfigured capability — better than running an
+    // under-equipped agent. Produces the pi extension sources the session loads
+    // plus the per-capability config env each extension reads (no secrets).
+    const resolution = resolveCapabilities({ yamlText });
+    // Resolve the role's tool allowlist: role.json is the ceiling and bob.yaml
+    // may only narrow it; a missing allowlist is a load error; every name must be
+    // one pi or a loaded capability can enable (pi drops an unknown name
+    // SILENTLY, so a stale name would otherwise look like a working allowlist
+    // while the tool is simply absent). Throws naming the offender and the fix.
+    toolPolicy = resolveAgentToolPolicy(yamlText, { persistent: opts.persistent });
+    extensionSources = resolution.extensionSources;
+    capabilityBySource = Object.fromEntries(
+      resolution.capabilities.map((c) => [c.piPackage, c.name]),
+    );
+    capabilityEnv = capabilityConfigEnv(resolution);
+    capabilities = resolution.capabilities;
+  }
+
+  // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
+  // applied HERE, after both branches, so it binds an ADOPTED agent's grant
+  // tools exactly as it binds an ordinary agent's role tools: no branch can
+  // hand a mail turn a tool outside MAIL_TURN_ALLOWED_TOOLS.
+  if (opts.mailTurn) toolPolicy = applyMailTurnPolicy(toolPolicy);
 
   // The agent block (id/name/role). Read through readBlock, but a malformed
   // `agent:` block must not stop the agent from running: it is only used to
@@ -1409,11 +1479,9 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     appendSystemPrompt,
     cwd: join(agentDir, "work"),
     piAgentDir: join(agentDir, ".pi-agent"),
-    extensionSources: resolution.extensionSources,
-    capabilityBySource: Object.fromEntries(
-      resolution.capabilities.map((c) => [c.piPackage, c.name]),
-    ),
-    capabilityEnv: capabilityConfigEnv(resolution),
+    extensionSources,
+    capabilityBySource,
+    capabilityEnv,
     // Always both: resolveAgentToolPolicy refuses an agent without an
     // allowlist, so there is no longer a "declared none" case here.
     tools: toolPolicy.tools,
@@ -1427,7 +1495,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     cron: parseCron(yamlText),
     agent,
     policy: toolPolicy,
-    capabilities: resolution.capabilities,
+    capabilities,
   };
 }
 
@@ -1542,6 +1610,20 @@ function readBobYaml(agentDir: string, name: string): string {
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
 // block (name + model) — the exact shape init.ts emits. The bob provider is
 // mapped to pi's provider id the same way init.ts's resolvePiProvider does.
+// The provider/runtime-key refusal the session resolver applies, factored out so
+// callers that write BEFORE a session exists (hire scaffolds and runs the
+// interview) can run it up front and leave nothing behind on a missing key.
+// `provider` is pi's provider id (already mapped by mapBobProviderToPi); `label`
+// names the caller for the message (e.g. "bob run <name>").
+export function assertProviderRunnable(provider: string, label: string): void {
+  if (provider !== "openrouter") return;
+  if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
+  if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
+  throw new Error(
+    `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+  );
+}
+
 function resolveProviderAndModel(
   yamlText: string,
   name: string,
@@ -1554,14 +1636,9 @@ function resolveProviderAndModel(
   const provider = mapBobProviderToPi(bobProvider);
   // The openrouter key is read from the environment AT RUN TIME and never written
   // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
-  // request is made (bob#183).
-  if (provider === "openrouter" && !(process.env.OPENROUTER_API_KEY ?? "").trim()) {
-    if (openrouterKeyWasConsumed())
-      throw new Error(`bob run ${name}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
-    throw new Error(
-      `bob run ${name}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
-    );
-  }
+  // request is made (bob#183). The check is shared with `bob hire`'s pre-write
+  // validation so both refuse identically.
+  assertProviderRunnable(provider, `bob run ${name}`);
   return { provider, model };
 }
 

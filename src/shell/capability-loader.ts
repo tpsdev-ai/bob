@@ -50,6 +50,11 @@ export interface ResolveCapabilitiesOptions {
   // Turns a manifest's `piPackage` into a source pi can load. Injectable for
   // tests; defaults to Node ESM package resolution from the shell package.
   resolveSource?: (capability: string, spec: string) => string;
+  // When set, only these DECLARED capability names are resolved and loaded;
+  // others are skipped. The caller (the position resolver) has already validated
+  // the skipped names against the grant/position, so this is how a capability
+  // disabled by the local override layer is not loaded.
+  only?: readonly string[];
 }
 
 // Resolve + validate an agent's declared capabilities. Throws a single,
@@ -61,10 +66,22 @@ export interface ResolveCapabilitiesOptions {
 export function resolveCapabilities(opts: ResolveCapabilitiesOptions): CapabilityResolution {
   const lookup = opts.lookup ?? defaultLookup;
   const resolveSource = opts.resolveSource ?? defaultResolveSource;
-  const names = readCapabilities(opts.yamlText);
+  const declared = readCapabilities(opts.yamlText);
+  const only = opts.only === undefined ? undefined : new Set(opts.only);
+  const names = only === undefined ? declared : declared.filter((n) => only.has(n));
 
   const resolved: ResolvedCapability[] = [];
   const seen = new Set<string>();
+
+  // Duplicate detection runs over the FULL declared list, so a capability
+  // declared twice is refused even when only one occurrence would be loaded.
+  const declaredSeen = new Set<string>();
+  for (const name of declared) {
+    if (declaredSeen.has(name)) {
+      throw new Error(`capability "${name}" is declared more than once in capabilities:`);
+    }
+    declaredSeen.add(name);
+  }
 
   for (const name of names) {
     if (seen.has(name)) {

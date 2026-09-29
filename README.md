@@ -68,11 +68,111 @@ If the two diverge (you edited `soul.md` after onboarding, or something else wro
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
+| `bob hire <name> --as <position>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository |
+| `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
+| `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
 | `bob help`                 | Show this usage                                                                               |
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
-Turn origin fields have these limits: mail agent names and cron job names are at most 64 characters; Discord channel IDs are at most 20 digits. Cron names use lowercase letters, digits, hyphens or underscores. Over-limit origins are refused before a turn starts rather than silently relabelled as `run`.
+## Positions
+
+A **position** is a packaged, role-compatible preset — a starting shape for an
+agent. `positions/builder` and `positions/reviewer` ship with bob. A position
+names an existing **role** (it never carries or edits one), and declares the
+tools it requests, the capabilities it permits (and which are on by default),
+and the packaged files it uses (a seed soul; skill, prompt and threshold files
+are later slices, and a manifest that declares one is REFUSED until it loads).
+`builder-local` (bob#185) ships as a **role**; a `builder-local` position over it is a
+later slice.
+
+Presence follows the same capability rule: a bound agent can request it only if
+its position permits it and the host grant covers it.
+
+The trust layers, from the top down:
+
+1. **Role** — `roles/<role>/role.json` ships with bob and is the tool ceiling.
+   Unchanged by positions.
+2. **Host grant** — the per-agent trust root. At `bob hire` (or `bob position
+   adopt`) the operator ratifies the role name, the position name, version and
+   hash, the maximum tool set and the maximum capability set into host state.
+   Every boot loads the current packaged role and compares the manifest name,
+   version, hash and role against the grant, refuses BY NAME each tool or
+   capability outside the grant maxima before any intersection, then applies
+   the narrow-only local disables. It passes the narrowed tools to
+   `resolveToolPolicy`, which enforces the packaged role's ceiling, and the
+   narrowed capabilities to `resolveCapabilities`. Changing `bob.yaml` cannot
+   select another role or add a grant.
+
+   The grant is stored under the host state root (`~/.bob/host`), outside the
+   agent's directory and its session cwd — but that placement is NOT a
+   containment boundary. Any same-user writer can edit the grant file, and that
+   includes the agent's own built-in file tools (`write`, `edit`), which resolve
+   paths outside the session cwd; the sandbox work (bob#189) is the real
+   boundary, and slice 1 does not ship it. What the grant gives is boot checks,
+   not authentication. Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189. Every boot compares the grant's pinned name, version, hash and role against the packaged position, AND compares the grant's frozen agent, tool set, capability set and resident-shell flag against the booted agent, the selected manifest's sets and the packaged role's flag, refusing each mismatch by field (the field, the grant value, the packaged value and the remedy). The PACKAGED role's resident-shell flag — never the grant's — is what tool-policy resolution receives. A
+   previously bound agent is pinned by a binding marker in its directory: if the
+   marker's directory entry is present and the grant is missing, boot REFUSES —
+   never a silent fallback to unratified legacy resolution.
+3. **Position** — the declared requests, which the grant must cover.
+4. **Instance** — the agent's `bob.yaml`, which may only narrow within the grant.
+5. **Overrides** — `~/agents/<name>/overrides/`, a per-agent Git repository that
+   may only SUBTRACT: named, schema-checked disable lists for tools and
+   capabilities, and allow-listed files that replace a packaged position file at
+   the same relative path. Every other key is refused by name. A local file may
+   only replace a packaged file; an additional path must be allow-listed by the
+   manifest. The **soul** is not overridable: a local file may never replace the
+   persona. (Slice 1 positions ship only a soul file, so in practice every
+   present override file is refused.)
+
+**Secrets** are deferred to a later slice: slice 1 ships NO host secret
+bindings. A position that declares a secret is REFUSED at hire and adoption, so
+no position that names a secret can be bound. (None of the shipped positions
+declares one.)
+
+**Adoption** binds an existing agent without rewriting it: `bob position adopt`
+independently resolves the agent before and after binding and REQUIRES the two
+effective configurations to be equal — otherwise it refuses — then verifies its
+requests against the position, role and new grant, records the binding,
+ratification and normalized baseline, and initializes the override repository —
+leaving the pre-existing `bob.yaml` and `soul.md` byte-for-byte unchanged.
+Immediately after, `bob position diff` is empty. The diff compares every
+effective setting the spec covers — role, tools, tool exclusions, the residency
+decision, the resident-shell grant, capabilities, resolved files and the soul.
+
+**Hire** (`bob hire`) validates the candidate, scaffolds the agent, runs the
+existing hiring interview, and keeps the agent's OWN identity in its seed soul —
+the seed soul is the identity header plus the position's persona, never the
+generic packaged soul alone. Hire without Flair stays the default for the shipped
+positions, presented as a local identity. An ADOPTED agent's setup session
+(`bob onboard`, `bob align`) gets the grant's resolved tools plus EXACTLY the one
+`write` tool the interview needs to write `soul.md` — that single `write` is an
+explicit allowance that may exceed the grant's tool set, and nothing else does.
+An adopted agent's TPS mail turn (bob#200) only narrows: it holds the grant's
+resolved tools that are also on the mail allowlist (`flair_search`, `flair_get`,
+`flair_write`) and nothing else. The shipped `builder` and `reviewer` positions
+request none of those tools (and do not permit `tps-mail`), so a mail turn for
+either holds no tools at all.
+
+An agent with no grant is not adopted: it resolves exactly as before, so every
+existing `bob init` agent keeps booting unchanged. The one exception is the
+binding marker: an agent whose marker's directory entry is present but whose
+grant is missing is treated as BOUND, and boot refuses rather than falling back.
+
+**Later slices:** position upgrade (staged, verified, atomic), arbitrary
+`path:`/`npm:`/`git:` sources (with their own security review), host secret
+bindings, skill/prompt/threshold files and their consumers, the model selector,
+the performance review, full jarvis and new comms. Slice 1 loads only positions
+shipped under bob's own `positions/` directory, referenced by a single top-level
+name — a bare name or the `path:<name>` spelling — after realpath confinement to
+that directory.
+
+## Turn origins
+
+Turn origin fields have these limits: mail agent names and cron job names are at
+most 64 characters; Discord channel IDs are at most 20 digits. Cron names use
+lowercase letters, digits, hyphens or underscores. Over-limit origins are
+refused before a turn starts rather than silently relabelled as `run`.
 
 ## Operator guarantees, and the tests that pin them
 
@@ -115,9 +215,11 @@ change one, the named test is what tells you.
   signed envelope, binds its `from` to the record, and allow-lists the verified
   id before any session exists; refused mail goes to `refused/` and is never
   answered. Each accepted mail is ONE turn in a fresh session with the role's
-  policy narrowed to a reviewed allowlist (the Flair memory tools), and its
+  policy — or, for an agent bound to a position, its grant's resolved policy —
+  narrowed to a reviewed allowlist (the Flair memory tools), and its
   reply is sent only after the turn, as the agent, to the verified sender. *(`test/capabilities/tps-mail/`,
-  `test/shell/mail-consumer.test.ts`, `test/shell/mail-turn.test.ts`)*
+  `test/shell/mail-consumer.test.ts`, `test/shell/mail-turn.test.ts`,
+  `test/shell/positions-195.test.ts`)*
 - **`bob init` stamps a policy that loads.** A fresh agent of every role is
   stamped with the role's ceiling intersected with the tools that can exist for
   it: pi's built-ins plus the tools of the capabilities bob stamps (currently
@@ -181,11 +283,16 @@ change one, the named test is what tells you.
 ### Stated exceptions
 
 1. **Onboarding and alignment are privileged local setup commands**, available
-   to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
-   `read` and `write`, which may exceed the role's ceiling — the interview's job
-   is to write `soul.md`. A model can only reach them through a shell tool, and
-   a shell can already write files, so read + write grants it nothing new. *(`test/shell/onboard.test.ts`,
-   `align.test.ts`)*
+   to whoever runs `bob` as that OS user. For an ordinary agent they run under a
+   FIXED setup policy of `read` and `write`, which may exceed the role's ceiling —
+   the interview's job is to write `soul.md`. A model can only reach them through
+   a shell tool, and a shell can already write files, so read + write grants it
+   nothing new. For an ADOPTED agent the setup session gets the grant's resolved
+   tools PLUS one explicit `write` exception: exactly the single `write` tool the
+   interview needs to write `soul.md`. That one `write` may exceed the grant's
+   tool set — no other tool is added or unexcluded — so the interview can rewrite
+   the persona it was hired to shape. *(`test/shell/onboard.test.ts`, `align.test.ts`,
+   `test/shell/positions-195.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
 3. **The contract costs tokens, per request.** The task is sent in the first
@@ -353,6 +460,7 @@ src/
     observatory/        team-view producer
     fixture/            a no-op capability that proves the loader end to end
 roles/                  ea, jarvis, writer, reviewer, coder, qa, builder-local, custom
+positions/              packaged position presets — builder, reviewer
 test/                   mirrors src/
 ```
 
@@ -448,8 +556,9 @@ consumer. For each file in `new/`, oldest first by filename:
   with its whole process group, so nothing it started outlives it; a turn whose
   runtime dies ends itself.
 - **What a mail turn can do.** Only the tools on a reviewed **allowlist** —
-  `flair_search`, `flair_get` and `flair_write` — and only those the role also
-  allows. Every other tool, from any role or capability, is dropped: no file
+  `flair_search`, `flair_get` and `flair_write` — and only those the role (for
+  an agent bound to a position, its host grant) also allows. Every other tool,
+  from any role, position grant or capability, is dropped: no file
   tool (pi's `read`/`grep`/`find`/`ls`/`edit`/`write`, or builder-local's
   `read_lines`/`edit_lines`/`insert_after`/`write_file`), no shell, no Discord.
   A mail turn cannot read a file or Discord content into a reply, change a file,
