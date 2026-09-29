@@ -530,8 +530,8 @@ export interface RunSessionConfig {
   contractCapChars?: number;
   // bob#204: the `soul.md` of the agent the session runs as, set ONLY by the
   // setup sessions (`bob onboard`'s hiring interview and `bob align`) from
-  // bindSetupSoulTarget (write-soul.ts): canonical, absolute, in the directory
-  // resolveRunConfig resolved. When present, bob's session factory registers
+  // bindSetupSoulTarget (write-soul.ts): absolute, under the agents root that
+  // was canonicalized once and that the session's config was resolved from. When present, bob's session factory registers
   // the bob-owned `write_soul` tool bound to this path — the setup policy's one
   // write, never a tool argument. No other path sets it, so no other session
   // gets the tool.

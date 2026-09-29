@@ -6,10 +6,12 @@
 //      path component, pins the agent directory and refuses a swap before the
 //      rename, writes every byte of a short-writing filesystem, creates its temp
 //      exclusively, holds it open so a recycled inode number cannot pass for it,
-//      never unlinks a name it did not create, sweeps stale temps, and keeps an
-//      existing soul.md's mode (a new one is 0600);
+//      never unlinks a name it did not create, never deletes a file on
+//      name-and-age evidence, and keeps an existing soul.md's mode (a new one
+//      is 0600);
 //   2. bindSetupSoulTarget — the binding a setup session gets BEFORE it starts:
-//      the directory the session runs as, never a different requested one;
+//      the agents root canonicalized once, and the directory the session runs
+//      as, never a different requested one;
 //   3. a REAL pi setup session (through bob's ONE factory, stub model): the
 //      setup policy activates read + write_soul and NOT pi's generic `write`,
 //      the registered tool's schema is content-only, executing it writes
@@ -56,7 +58,6 @@ import {
   SOUL_TEMP_PATTERN,
   type SoulToolOutput,
   type SoulWritePi,
-  STALE_TEMP_MS,
   type WireSoulWriteOptions,
   WRITE_SOUL_TOOL,
   wireSoulWrite,
@@ -395,29 +396,20 @@ describe("write_soul tool core", () => {
     expect(tempClosed).toBe(true);
   });
 
-  it("removes STALE temps of its own pattern, and nothing else", async () => {
-    const old = (Date.now() - STALE_TEMP_MS - 60_000) / 1000;
-    const stale = join(agentDir, tempNameFor(3));
-    const fresh = join(agentDir, tempNameFor(4));
-    const foreign = join(agentDir, ".soul.md.tmp-somebody-else");
-    const target = join(dir, "link-target.md");
-    const staleLink = join(agentDir, tempNameFor(5));
-    writeFileSync(stale, "crashed call\n");
-    writeFileSync(fresh, "a live call\n");
-    writeFileSync(foreign, "not ours\n");
-    writeFileSync(target, "keep\n");
-    symlinkSync(target, staleLink);
-    utimesSync(stale, old, old);
-    utimesSync(foreign, old, old);
+  it("never deletes a file on name-and-age evidence: an OLD file matching its temp pattern stays", async () => {
+    // What a crash leaves behind looks exactly like this: an old file in the
+    // tool's own name pattern. write_soul did not create it in THIS call, so it
+    // is left in place (it is safe to delete by hand).
+    const hourAgo = (Date.now() - 60 * 60 * 1000) / 1000;
+    const orphan = join(agentDir, tempNameFor(3));
+    writeFileSync(orphan, "a crashed call's draft\n");
+    utimesSync(orphan, hourAgo, hourAgo);
 
-    const tool = wire(soulPath);
-    const res = await tool.execute("c1", { content: "# swept\n" });
+    const res = await wire(soulPath).execute("c1", { content: "# new persona\n" });
     expect(res.details.refused).toBeUndefined();
-    expect(existsSync(stale)).toBe(false);
-    expect(readFileSync(fresh, "utf-8")).toBe("a live call\n");
-    expect(readFileSync(foreign, "utf-8")).toBe("not ours\n");
-    expect(readFileSync(target, "utf-8")).toBe("keep\n");
-    expect(readdirSync(agentDir)).toContain(tempNameFor(5));
+    expect(readFileSync(soulPath, "utf-8")).toBe("# new persona\n");
+    expect(readFileSync(orphan, "utf-8")).toBe("a crashed call's draft\n");
+    expect(temps(agentDir)).toEqual([tempNameFor(3)]);
   });
 
   it("keeps an existing soul.md's permission bits", async () => {
@@ -566,7 +558,6 @@ describe("bindSetupSoulTarget", () => {
         command: "bob align",
         name: "testbot",
         requestedAgentDir: join(dir, "other"),
-        runAgentDir: join(dir, "testbot"),
       }),
     ).toThrow(
       new RegExp(
@@ -579,24 +570,23 @@ describe("bindSetupSoulTarget", () => {
     const target = bindSetupSoulTarget({
       command: "bob align",
       name: "testbot",
-      requestedAgentDir: `${join(dir, "other", "..", "testbot")}/`,
-      runAgentDir: join(dir, "testbot"),
+      requestedAgentDir: `${dir}/other/../testbot/`,
     });
     expect(target).toEqual({
+      agentsRoot: dir,
       agentDir: join(dir, "testbot"),
       soulPath: join(dir, "testbot", "soul.md"),
     });
   });
 
-  it("canonicalizes the agents root ONCE, so a linked root binds to the real path", () => {
+  it("canonicalizes the agents root ONCE: a linked root binds to the real path, and the ROOT is returned for the config", () => {
     symlinkSync(dir, join(dir, "root-link"));
-    const viaLink = join(dir, "root-link", "testbot");
     const target = bindSetupSoulTarget({
       command: "bob align",
       name: "testbot",
-      requestedAgentDir: viaLink,
-      runAgentDir: viaLink,
+      requestedAgentDir: join(dir, "root-link", "testbot"),
     });
+    expect(target.agentsRoot).toBe(dir);
     expect(target.soulPath).toBe(join(dir, "testbot", "soul.md"));
   });
 
@@ -607,7 +597,6 @@ describe("bindSetupSoulTarget", () => {
         command: "bob align",
         name: "alias",
         requestedAgentDir: join(dir, "alias"),
-        runAgentDir: join(dir, "alias"),
       }),
     ).toThrow(/is a symlink/);
   });
@@ -620,9 +609,18 @@ describe("bindSetupSoulTarget", () => {
         command: "bob onboard",
         name: "testbot",
         requestedAgentDir: join(dir, "testbot"),
-        runAgentDir: join(dir, "testbot"),
       }),
     ).toThrow(/soul\.md is a symlink/);
+  });
+
+  it("refuses a missing agent directory, naming the remedy", () => {
+    expect(() =>
+      bindSetupSoulTarget({
+        command: "bob align",
+        name: "ghost",
+        requestedAgentDir: join(dir, "ghost"),
+      }),
+    ).toThrow(/the agent directory \S*ghost does not exist\. Run 'bob onboard ghost' first/);
   });
 });
 
@@ -722,8 +720,8 @@ describe("setup session gets write_soul and never pi's write", () => {
     const result = await buildSession({ setupSoulPath: soulPath });
     try {
       const active = result.session.getActiveToolNames();
-      expect(active).toContain("write_soul");
-      expect(active).toContain("read");
+      // The model holds EXACTLY these two tools: no shell, no other writer.
+      expect(active.slice().sort()).toEqual(["read", "write_soul"]);
       expect(active).not.toContain("write");
       expect(active).not.toContain("edit");
       expect(active).not.toContain("bash");

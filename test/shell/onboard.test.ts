@@ -10,7 +10,15 @@
 // user, and the interview's whole job is to WRITE the persona (see README
 // "Stated exceptions").
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runOnboard, type SessionRunner } from "../../src/shell/onboard.js";
@@ -164,6 +172,16 @@ describe("runOnboard", () => {
     );
     expect(runs).toEqual([]);
     expect(readFileSync(join(other, "soul.md"), "utf8")).toBe("other persona\n");
+  });
+
+  it("resolves a linked agents root once: the config and the soul come from the canonical tree (bob#204)", async () => {
+    scaffoldAgent();
+    const link = join(dirname(agentDir), "agents-link");
+    symlinkSync(dirname(agentDir), link);
+    const { runner, runs } = fakeRunner({});
+    await runOnboard(options({ agentDir: join(link, "testbot"), sessionRunner: runner }));
+    expect(runs[0]?.config.cwd).toBe(join(agentDir, "work"));
+    expect(runs[0]?.config.setupSoulPath).toBe(join(agentDir, "soul.md"));
   });
 
   it("maps a bob provider name to pi's provider id", async () => {

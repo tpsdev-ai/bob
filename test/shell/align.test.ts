@@ -14,6 +14,8 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +23,7 @@ import { dirname, join } from "node:path";
 import { runAlign } from "../../src/shell/align.js";
 import { stringFlag } from "../../src/shell/argv.js";
 import type { SessionRunner } from "../../src/shell/onboard.js";
+import type { RunSessionConfig } from "../../src/shell/run.js";
 import { SETUP_TOOL_POLICY } from "../../src/shell/session.js";
 
 interface Run {
@@ -256,6 +259,43 @@ describe("runAlign", () => {
     const { runner, runs } = fakeRunner({});
     await runAlign({ name: "testbot", agentDir: `${agentDir}/work/../`, sessionRunner: runner });
     expect(runs[0].config.setupSoulPath).toBe(join(agentDir, "soul.md"));
+  });
+
+  // bob#204: the agents root is canonicalized ONCE, before the config is read,
+  // so the config, the session's paths and write_soul come from ONE tree.
+  it("resolves a linked agents root once: config, session paths and soul come from the canonical tree", async () => {
+    scaffoldAgent(); // the canonical tree: <root>/testbot, model claude-sonnet-4-6
+    const root = dirname(agentDir);
+    const treeB = join(root, "tree-b");
+    mkdirSync(join(treeB, "testbot", "work"), { recursive: true });
+    writeFileSync(join(treeB, "testbot", "soul.md"), "tree b persona\n");
+    writeFileSync(
+      join(treeB, "testbot", "bob.yaml"),
+      readFileSync(join(agentDir, "bob.yaml"), "utf8").replace("claude-sonnet-4-6", "tree-b-model"),
+    );
+    const link = join(root, "agents-link");
+    symlinkSync(root, link);
+    // The runner retargets the link as the session starts: nothing the setup
+    // flow resolved may follow it.
+    const seen: RunSessionConfig[] = [];
+    const runner: SessionRunner = async (input) => {
+      seen.push(input.config);
+      unlinkSync(link);
+      symlinkSync(treeB, link);
+      return 0;
+    };
+    const res = await runAlign({
+      name: "testbot",
+      agentDir: join(link, "testbot"),
+      sessionRunner: runner,
+    });
+    expect(seen[0]?.cwd).toBe(join(agentDir, "work"));
+    expect(seen[0]?.piAgentDir).toBe(join(agentDir, ".pi-agent"));
+    expect(seen[0]?.setupSoulPath).toBe(join(agentDir, "soul.md"));
+    expect(seen[0]?.model).toBe("claude-sonnet-4-6");
+    expect(res.agentDir).toBe(agentDir);
+    expect(res.soulPath).toBe(join(agentDir, "soul.md"));
+    expect(res.soulUpdated).toBe(false);
   });
 });
 

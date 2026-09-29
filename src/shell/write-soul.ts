@@ -8,15 +8,25 @@
 // `bob.yaml`, capability overrides, grants, launcher scripts, or files outside
 // the agent directory. It was never limited to `soul.md`.
 //
-// WHAT `write_soul` IS. A pi tool (registered as an inline extension) whose ONLY
-// target is `soul.md` in the directory the setup session RUNS AS - bound by bob,
-// NEVER read from a tool argument. It takes CONTENT ONLY. Defenses, all at the
-// one write:
+// THREAT MODEL. The actor this defends against is the setup session's OWN tool
+// calls. The model in a setup session holds exactly two tools, `read` and
+// `write_soul`, and no shell, so it cannot start a second process or change a
+// file except through `write_soul`. What is guaranteed is about those calls:
+// whatever arguments the model sends, `write_soul` writes only the soul.md it
+// was bound to before the session started, never a file named by an argument,
+// and never through a symlink. A concurrent local process that can rename
+// directories inside the agents tree already holds the operator's write access,
+// and defending against it is OUT OF SCOPE (that needs the OS boundary of
+// bob#189). The directory checks below narrow what such a process can do to a
+// call in flight, best effort; they are not a guarantee against it.
 //
-//   - BINDING. onboard/align bind the tool to the agent directory
-//     resolveRunConfig resolved (the agent whose bob.yaml the session runs),
-//     and refuse, BEFORE the session starts, a requested agent directory that
-//     is not that one (bindSetupSoulTarget).
+// WHAT `write_soul` DOES, all at its one write:
+//
+//   - BINDING. Before the session starts, onboard and align canonicalize the
+//     agents root ONCE (realpath) and use that one directory for the session's
+//     config (resolveRunConfig), its paths and this binding
+//     (bindSetupSoulTarget). A requested agent directory that is not
+//     `<agents root>/<name>` is refused before the session starts.
 //   - ARGUMENTS. The schema is `{ content }` with additionalProperties false,
 //     and execute refuses EVERY other key (an allowlist, not a list of
 //     path-like names), a non-string or empty `content`, and content over
@@ -24,42 +34,33 @@
 //   - NO SYMLINK IN ANY COMPONENT. On every call each component of the bound
 //     agent directory is lstat'ed from the filesystem root down: a symlink or a
 //     non-directory anywhere is refused, and so is a symlinked or non-regular
-//     soul.md. The agents root is canonicalized ONCE, when the session is bound
-//     (realpath), so a root the operator reaches through a link (macOS's /var,
-//     a moved ~/agents) is resolved before the session starts; after that no
-//     component may be, or become, a symlink.
-//   - A PINNED DIRECTORY. Each call opens the agent directory once
+//     soul.md.
+//   - ONE DIRECTORY PER CALL. Each call opens the agent directory once
 //     (O_DIRECTORY|O_NOFOLLOW) and requires the handle to be the directory the
-//     walk saw (same dev and ino). Node has no openat/renameat/unlinkat, so:
-//       * Linux (with /proc): the temp creation, the rename and every unlink go
-//         through /proc/self/fd/<fd>/<name>, which the kernel resolves THROUGH
-//         the open handle rather than by walking the path again, so a later
-//         swap of the agent directory or of any ancestor cannot redirect them.
-//       * macOS, and any host without a usable /proc: those calls use the bound
-//         path, so the walk + (dev, ino) check is repeated IMMEDIATELY before
-//         the temp creation, before the rename and before every unlink, and
-//         again after the creation (the temp must be in the pinned directory).
-//         A swap before a check is refused. A swap in the window between a
-//         check and its system call is not prevented: a redirected creation or
-//         rename is detected afterwards and never reported as a success; a
-//         redirected unlink can at most remove a same-named entry of the
-//         swapped-in directory.
-//     On both, the path is re-verified immediately before the temp creation and
-//     the rename (any change refuses), and success is reported only if, after
-//     the rename, the bound path is still the pinned directory and its soul.md
-//     IS the inode written.
+//     walk saw (same dev and ino). On Linux, when /proc is usable (checked on
+//     every call), the temp creation, the rename and the cleanup unlink go
+//     through /proc/self/fd/<fd>/<name>, which the kernel resolves through the
+//     open handle. Node has no openat/renameat/unlinkat, so on macOS (and on a
+//     host without a usable /proc) those calls use the bound path, and the walk
+//     plus the (dev, ino) check is repeated immediately before each of them.
+//     For the session's own calls both reach the same directory. Against a
+//     concurrent directory swap the path checks are best effort, not a
+//     guarantee (see THREAT MODEL).
 //   - EVERY BYTE. The UTF-8 buffer is written in a loop that honors each
 //     partial write and refuses zero progress, then fsync'ed; soul.md is
 //     replaced (rename) only after every byte is written and synced. The
 //     directory is fsync'ed after the rename (best effort).
-//   - TEMP FILES. Named `.soul.md.write_soul-<pid>-<24 hex>.tmp` and created
-//     exclusively (O_EXCL|O_NOFOLLOW). A call removes only the temp IT created,
-//     matched by name AND inode, through the pinned directory - never a name it
-//     found. The temp stays open until the rename is confirmed and cleanup is
-//     done, so its inode number cannot be recycled for another file while its
-//     identity is compared (ext4 reuses a freed inode number at once). A crash can strand a temp: every call first removes regular files
-//     in the agent directory that match that pattern and are older than
-//     STALE_TEMP_MS.
+//   - TEMP FILES. Named `.soul.md.write_soul-<pid>-<24 hex>.tmp`
+//     (SOUL_TEMP_PATTERN) and created exclusively (O_EXCL|O_NOFOLLOW). On a
+//     failure a call removes only the temp IT created: it checks that the name
+//     still holds that temp's inode, then unlinks it. The temp is held open
+//     until then, so its inode number cannot be recycled for another file
+//     (ext4 reuses a freed number at once). A concurrent local process could
+//     still replace the entry between that check and the unlink; that is out
+//     of scope, and the check is best effort against it. write_soul never
+//     deletes a file on name-and-age evidence: a crash between the temp's
+//     creation and its rename leaves the temp in the agent directory. bob never
+//     reads it, and it is safe to delete by hand.
 //   - MODE. Replacing soul.md keeps its permission bits; a new soul.md is 0600.
 //
 // LIMIT, STATED. An agent running as the operator's OS user with a shell or
@@ -105,13 +106,10 @@ export const SOUL_FILE = "soul.md";
  *  keeps its own bits. */
 export const NEW_SOUL_MODE = 0o600;
 
-/** The name of every temp file write_soul creates: pid + 96 random bits. Only
- *  names matching this are ever swept. */
+/** The name of every temp file write_soul creates: pid + 96 random bits. A
+ *  crash can leave one behind in the agent directory; nothing deletes it
+ *  automatically, and it is safe to delete by hand. */
 export const SOUL_TEMP_PATTERN = /^\.soul\.md\.write_soul-\d+-[0-9a-f]{24}\.tmp$/;
-
-/** A matching temp older than this is a crashed call's leftover; a write takes
- *  milliseconds, so ten minutes cannot catch a live one. */
-export const STALE_TEMP_MS = 10 * 60 * 1000;
 
 const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
@@ -190,7 +188,10 @@ export interface WireSoulWriteOptions {
 
 /** The directory write_soul is bound to, and its one target. */
 export interface SoulTarget {
-  /** Canonical absolute agent directory: every component a real directory. */
+  /** The agents root, canonicalized ONCE (realpath). The session's config is
+   *  resolved from THIS root, so config and soul come from one tree. */
+  agentsRoot: string;
+  /** `<agentsRoot>/<name>`: every component a real directory. */
   agentDir: string;
   /** `<agentDir>/soul.md`. */
   soulPath: string;
@@ -277,44 +278,51 @@ function assertBoundSoulPath(soulPath: string): void {
 }
 
 /**
- * Bind a setup session's write_soul BEFORE the session starts.
+ * Bind a setup session BEFORE it starts: canonicalize the agents root ONCE and
+ * return the one tree the session uses for its config, its paths and
+ * write_soul.
  *
- * `runAgentDir` is the directory resolveRunConfig resolved - the agent the
- * session actually runs as. `requestedAgentDir` is the directory the caller
- * named (`bob align --agent-dir`). They must be the same directory: otherwise
- * the session would run as one agent and write another agent's soul.md.
- * The agents root is canonicalized once (realpath); the agent directory itself
- * must be a real directory and soul.md, if present, a regular file.
- * Throws an actor/state/remedy error; returns the canonical target.
+ * `requestedAgentDir` is the directory the caller named (`bob align
+ * --agent-dir`). The session runs as `name` from `<canonical root>/<name>`, so
+ * a requested directory with another basename is refused: otherwise the session
+ * would run as one agent and write another agent's soul.md. The agent directory
+ * must be a real directory (no symlink in any component) and soul.md, if
+ * present, a regular file. The caller resolves the session's config with
+ * `agentsRoot` from the result, never by re-deriving it from the request.
+ * Throws an actor/state/remedy error.
  */
 export function bindSetupSoulTarget(input: {
   /** The command, for the error: "bob align" or "bob onboard". */
   command: string;
   name: string;
   requestedAgentDir: string;
-  runAgentDir: string;
 }): SoulTarget {
   const who = `${input.command} ${input.name}`;
   const requested = resolve(input.requestedAgentDir);
-  const run = resolve(input.runAgentDir);
-  if (requested !== run) {
-    throw new Error(
-      `${who}: refusing to start - the agent directory ${requested} is not ${input.name}'s. ` +
-        `The session runs as ${input.name} from ${run} (its bob.yaml), so write_soul would be ` +
-        `bound to a different agent's soul.md. Point --agent-dir at ${run}, or run ` +
-        `'${input.command} ${basename(requested)}' for the agent in ${requested}.`,
-    );
-  }
-  let root: string;
+  let agentsRoot: string;
   try {
-    root = realpathSync(dirname(run));
+    agentsRoot = realpathSync(dirname(requested));
   } catch (err) {
     throw new Error(
-      `${who}: refusing to start - the agents root ${dirname(run)} cannot be resolved (${errText(err)}). ` +
+      `${who}: refusing to start - the agents root ${dirname(requested)} cannot be resolved (${errText(err)}). ` +
         `Point --agent-dir at an existing agent directory.`,
     );
   }
-  const agentDir = join(root, basename(run));
+  const agentDir = join(agentsRoot, input.name);
+  if (basename(requested) !== input.name) {
+    throw new Error(
+      `${who}: refusing to start - the agent directory ${requested} is not ${input.name}'s. ` +
+        `The session runs as ${input.name} from ${agentDir} (its bob.yaml), so write_soul would be ` +
+        `bound to a different agent's soul.md. Point --agent-dir at ${agentDir}, or run ` +
+        `'${input.command} ${basename(requested)}' for the agent in ${requested}.`,
+    );
+  }
+  if (lstatIfPresent(NODE_FS, agentDir) === undefined) {
+    throw new Error(
+      `${who}: refusing to start - the agent directory ${agentDir} does not exist. ` +
+        `Run 'bob onboard ${input.name}' first, or point --agent-dir at an existing agent directory.`,
+    );
+  }
   const walked = checkDirPath(NODE_FS, agentDir);
   if (!walked.ok) {
     throw new Error(
@@ -331,7 +339,7 @@ export function bindSetupSoulTarget(input: {
         `and write_soul will not replace it. Replace it with a regular file holding the persona, then retry.`,
     );
   }
-  return { agentDir, soulPath };
+  return { agentsRoot, agentDir, soulPath };
 }
 
 interface WriteIo {
@@ -416,7 +424,7 @@ function writeSoulFile(
   if (pin !== undefined && state.temp !== undefined && !state.renamed) {
     const cleanup = removeOwnTemp(fs, agentDir, pin, state.temp);
     if (cleanup === "left") {
-      const note = ` The temp file ${state.temp.name} this call created could not be removed safely and was left where it was created; if that is the agent directory, a later write_soul call removes it once it is stale.`;
+      const note = ` The temp file ${state.temp.name} this call created could not be removed safely and was left where it was created; nothing deletes it automatically, and it is safe to delete by hand.`;
       const text = `${result.content[0]?.text ?? ""}${note}`;
       result = {
         content: [{ type: "text", text }],
@@ -483,9 +491,6 @@ function writeThroughPin(
   const { fs } = io;
   const at = (name: string) => join(pin.base, name);
   const verify = (when: string) => verifyPinned(fs, agentDir, pin, when);
-
-  // Recover what a crashed call stranded, before adding a temp of our own.
-  sweepStaleTemps(fs, agentDir, pin);
 
   // The soul.md being replaced: never a symlink or a non-file; its mode is kept.
   let mode = NEW_SOUL_MODE;
@@ -568,9 +573,13 @@ function writeThroughPin(
 }
 
 /**
- * Remove the temp THIS call created - matched by name AND inode, through the
- * pinned directory. In the path-verified mode the path is re-verified first; a
- * directory that is no longer the pinned one is not touched.
+ * Remove the temp THIS call created, on a failure: check that its name in the
+ * pinned directory still holds the temp's inode (the temp is still open, so the
+ * number cannot have been recycled), then unlink that name. In the
+ * path-verified mode the path is re-verified first, and a directory that is no
+ * longer the pinned one is not touched. The check and the unlink are two calls:
+ * a concurrent local process could replace the entry between them. That actor
+ * is out of scope (see THREAT MODEL); against it this is best effort.
  */
 function removeOwnTemp(
   fs: SoulFs,
@@ -594,39 +603,6 @@ function removeOwnTemp(
     return "removed";
   } catch {
     return "left";
-  }
-}
-
-/**
- * Remove temps a crashed write_soul call stranded: regular files in the pinned
- * directory whose names match SOUL_TEMP_PATTERN and whose mtime is older than
- * STALE_TEMP_MS. Anything else - another name, a symlink, a directory, a fresh
- * temp that may belong to a live call - is left alone. Best effort.
- */
-function sweepStaleTemps(fs: SoulFs, agentDir: string, pin: Pinned): void {
-  let names: string[];
-  try {
-    names = fs.readdir(pin.base);
-  } catch {
-    return;
-  }
-  const now = Date.now();
-  for (const name of names) {
-    if (!SOUL_TEMP_PATTERN.test(name)) continue;
-    const path = join(pin.base, name);
-    try {
-      const st = fs.lstat(path);
-      if (!st.isFile() || now - Number(st.mtimeMs) < STALE_TEMP_MS) continue;
-      if (
-        !pin.fdRelative &&
-        verifyPinned(fs, agentDir, pin, "before the stale-temp sweep") !== undefined
-      ) {
-        return;
-      }
-      fs.unlink(path);
-    } catch {
-      /* best effort: a temp that cannot be removed now is tried again next call */
-    }
   }
 }
 

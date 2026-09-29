@@ -8,13 +8,11 @@
 // Same session shape as onboard — bob's factory through pi's InteractiveMode,
 // under the fixed setup policy (read + write_soul) — and the same soul.md
 // hash-before/after test of whether the alignment actually produced a persona
-// update. `write_soul` is bob's own tool (write-soul.ts): it takes content only
-// and can write the soul.md of the agent the session runs as, and nothing else
-// (bob#204).
+// update. `write_soul` is bob's own tool (write-soul.ts): it takes content only,
+// and its one target is the soul.md of the agent the session runs as (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import type { SessionRunner } from "./onboard.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
@@ -45,6 +43,9 @@ export interface AlignOptions {
 export interface AlignResult {
   exitCode: number;
   soulUpdated: boolean;
+  // The canonical agent directory the session ran from (bob#204): the caller
+  // reads anything else it needs (the flair block) from this same tree.
+  agentDir: string;
   soulPath: string;
   soulHashBefore: string;
   soulHashAfter: string;
@@ -64,8 +65,9 @@ Your job in this session:
    - Pet peeves the founder has voiced lately
 3. Ask short, specific questions. Don't fish — anchor on concrete signals.
 4. When the human signals they're done ("ship it", "looks good", or similar),
-   write the UPDATED full persona to ${soulPath} via the write_soul tool (it writes
-   your own soul.md and nothing else), OVERWRITING the previous version.
+   write the UPDATED full persona to ${soulPath} via the write_soul tool (its only
+   argument is the content; its target is your own soul.md, bound by bob),
+   OVERWRITING the previous version.
 5. Summarize the deltas in one sentence after writing, then wait for exit.
 
 Do NOT:
@@ -83,22 +85,21 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
   }
-  // bob#204: the session runs as the agent resolveRunConfig resolves, and
-  // write_soul is bound to THAT directory. An --agent-dir naming a different
-  // directory is refused here, before the session starts - otherwise the
-  // check-in would run as one agent and write another agent's soul.md.
-  const requestedAgentDir = resolve(opts.agentDir);
-  const { config, agentDir: runAgentDir } = resolveRunConfig({
-    name: opts.name,
-    agentsRoot: dirname(requestedAgentDir),
-    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
-    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
-  });
-  const { soulPath } = bindSetupSoulTarget({
+  // bob#204: the agents root is canonicalized ONCE, before anything is read,
+  // and that one tree supplies the session's config, its paths and the
+  // write_soul binding. An --agent-dir naming a different agent's directory is
+  // refused here, before the session starts - otherwise the check-in would run
+  // as one agent and write another agent's soul.md.
+  const { agentsRoot, agentDir, soulPath } = bindSetupSoulTarget({
     command: "bob align",
     name: opts.name,
-    requestedAgentDir,
-    runAgentDir,
+    requestedAgentDir: opts.agentDir,
+  });
+  const { config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   if (!existsSync(soulPath)) {
     throw new Error(`cannot align ${opts.name}: ${soulPath} not found — run 'bob onboard' first`);
@@ -137,6 +138,7 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   return {
     exitCode,
     soulUpdated: soulHashBefore !== soulHashAfter,
+    agentDir,
     soulPath,
     soulHashBefore,
     soulHashAfter,

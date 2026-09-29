@@ -13,12 +13,11 @@
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated
 // exceptions"). `write_soul` is bob's own tool (write-soul.ts): it takes content
-// only and can write the soul.md of the agent the session runs as, and nothing
-// else (bob#204).
+// only, and its one target is the soul.md of the agent the session runs as
+// (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
@@ -84,8 +83,8 @@ Your job in this session:
    - What's the founder's pet peeve about people in this role?
 3. As you learn, refine the persona DRAFT in your head. Don't write to disk yet.
 4. When the human signals they're done ("ship it", "that's enough", "we're good", or similar),
-   write the FULL refined persona to ${soulPath} using the write_soul tool (it writes your
-   own soul.md and nothing else), OVERWRITING whatever is there.
+   write the FULL refined persona to ${soulPath} using the write_soul tool (its only argument
+   is the content; its target is your own soul.md, bound by bob), OVERWRITING whatever is there.
    The persona should be markdown, first-person, written in YOUR voice as ${name}.
 5. After writing, summarize in one sentence what you wrote, then wait for the human to exit.
 
@@ -114,20 +113,21 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   // setup policy (read + write_soul) — never the role's or the grant's own tools,
   // for an ordinary agent and an ADOPTED one alike (bob#204). An adopted agent's
   // config is still resolved from its grant (capabilities, cwd).
-  const requestedAgentDir = resolve(opts.agentDir);
-  const { config, agentDir: runAgentDir } = resolveRunConfig({
-    name: opts.name,
-    agentsRoot: dirname(requestedAgentDir),
-    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
-    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
-  });
-  // bob#204: write_soul is bound to the directory the session RUNS AS; an
-  // agent directory that is not that one is refused before the session starts.
-  const { soulPath } = bindSetupSoulTarget({
+  //
+  // bob#204: the agents root is canonicalized ONCE, before anything is read,
+  // and that one tree supplies the config, the session's paths and the
+  // write_soul binding. An agent directory that is not `<root>/<name>` is
+  // refused before the session starts.
+  const { agentsRoot, soulPath } = bindSetupSoulTarget({
     command: "bob onboard",
     name: opts.name,
-    requestedAgentDir,
-    runAgentDir,
+    requestedAgentDir: opts.agentDir,
+  });
+  const { config } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot,
+    ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
+    ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const soulHashBefore = hashFile(soulPath);
   const sessionConfig: RunSessionConfig = {

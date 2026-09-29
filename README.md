@@ -272,20 +272,28 @@ change one, the named test is what tells you.
    `read` and `write_soul`, for an ordinary agent and an ADOPTED one alike (never
    the grant's own tools), which may exceed the role's ceiling — the interview's
    job is to write `soul.md`. `write_soul` is bob's OWN tool (`src/shell/write-soul.ts`):
-   it takes `content` and nothing else, and its one target is `soul.md` in the
-   directory the session runs as — bound by bob before the session starts (an
-   `--agent-dir` naming a different directory is refused), never by a tool
-   argument. It refuses a symlink in any component of that path and pins the
-   agent directory with one open handle: on Linux the temp creation, rename and
-   cleanup resolve through that handle; on macOS, where Node has no fd-relative
-   calls, the path is re-verified against it immediately before each of them, so
-   a directory swapped inside that window is not prevented, but a redirected
-   creation or rename is detected and never reported as a success. A setup
-   session can write that `soul.md` and nothing else — not `bob.yaml`, not an
-   override, not a grant, not a file outside the agent directory. A model can
-   only reach these commands through a shell tool, and a shell can already write
-   files; the exception is now a single soul.md write rather than pi's
-   unrestricted `write`. *(`test/shell/onboard.test.ts`,
+   it takes `content` and no other argument, and its one target is `soul.md` in
+   the directory the session runs as. Before the session starts, bob
+   canonicalizes the agents root once, uses that one tree for the session's
+   config, paths and binding, and refuses an `--agent-dir` that names a different
+   agent's directory. It refuses a symlink in any component of that path.
+
+   **Threat model.** What this defends against is the setup session's OWN tool
+   calls. The model holds only `read` and `write_soul`, with no shell and no way
+   to start a second process, so whatever arguments it sends, the one file it can
+   write is the bound `soul.md` — not `bob.yaml`, an override, a grant, or a file
+   outside the agent directory. A concurrent local process that renames
+   directories inside the agents tree is OUT OF SCOPE: it already has the user's
+   write access. On Linux the tool's temp creation, rename and cleanup resolve
+   through an open handle on the agent directory. On macOS, where Node has no
+   directory-relative calls, they use the path, re-checked immediately before each
+   step: that protects the session's own calls and is only a best-effort check
+   against such a process. A crash mid-write can leave a temp named
+   `.soul.md.write_soul-<pid>-<24 hex>.tmp` in the agent directory; bob never
+   deletes files on name-and-age evidence, never reads that temp, and it is safe
+   to delete by hand. A model can only reach these commands through a shell tool,
+   and a shell can already write files; the exception is now a single soul.md
+   write rather than pi's unrestricted `write`. *(`test/shell/onboard.test.ts`,
    `align.test.ts`, `write-soul.test.ts`, `positions-195.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.
