@@ -753,8 +753,8 @@ describe("run — refusals name actor, state and remedy", () => {
 });
 
 // #221: a setup that throws must not leave the scratch directory behind. The
-// work harness registers its removal BEFORE the session load, so this holds even
-// though a caller never receives a handle to clean up when setup fails.
+// work harness removes it in a catch when the session load throws, so this holds
+// even though a caller never receives a handle to clean up when setup fails.
 describe("workSession — a failed setup leaves no scratch directory", () => {
   it("removes its scratch directory when setup throws", async () => {
     // Force setup to throw: a wire hook that is ALREADY installed trips the

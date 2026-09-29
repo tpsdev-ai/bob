@@ -148,7 +148,7 @@ export interface WorkSessionOptions {
 
 export async function workSession(opts: WorkSessionOptions): Promise<LiveWork> {
   const scratch = mkdtempSync(join(tmpdir(), "bob-work-test-"));
-  // Register this directory's removal BEFORE the setup that can throw. Removal
+  // Remove this directory if the setup below throws (catch and remove). Removal
   // used to exist only on the returned handle's cleanup(), which a caller never
   // receives when this function throws — so a failed session load (a load error,
   // the one-at-a-time guard, a factory failure) leaked the scratch directory.
