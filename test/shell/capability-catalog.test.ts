@@ -105,6 +105,16 @@ describe("blessed catalog", () => {
     expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/anchored-edit");
   });
 
+  it("blesses the work capability (the managed run tool, bob#211) as implemented", () => {
+    const entry = lookupCapability("work");
+    expect(entry).toBeDefined();
+    expect(entry?.notYetImplemented).toBeFalsy();
+    expect(entry?.manifest.name).toBe("work");
+    expect(entry?.manifest.provides?.tools).toEqual(["run", "run_status", "run_cancel"]);
+    expect(entry?.manifest.provides?.serves).toBe(false);
+    expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/work");
+  });
+
   it("lists the still-planned capabilities as not-yet-implemented", () => {
     for (const name of ["mail"]) {
       const entry = lookupCapability(name);

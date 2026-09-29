@@ -50,6 +50,14 @@ const SECRET_PATTERNS: RegExp[] = [
   // Long opaque base64/hex runs (>= 40 chars) — JWT segments, raw key material.
   /\b[A-Za-z0-9+/]{40,}={0,2}\b/g,
   /\b[0-9a-fA-F]{40,}\b/g,
+  // Environment-style assignments whose NAME ends in a secret word
+  // (GITHUB_TOKEN=…, DB_PASSWORD: …, AWS_SECRET_ACCESS_KEY=…). The assignment rule
+  // above needs a word boundary before the secret word, which an underscore-joined
+  // name does not have. The name part is bounded so the rule stays linear.
+  /\b[A-Za-z0-9_]{0,120}_(?:TOKEN|SECRET|PASSWORD|PASSWD|PWD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)\b\s*[:=]\s*["']?[^\s"']{6,}["']?/gi,
+  // Credentials in a URL's userinfo (https://user:pass@host). The whole
+  // scheme://user:pass@ prefix is replaced; the host stays.
+  /\b[A-Za-z][A-Za-z0-9+.-]{0,20}:\/\/[^\s/:@]{1,256}:[^\s/@]{1,256}@/g,
 ];
 
 // --- filesystem path patterns ---------------------------------------------
@@ -65,13 +73,28 @@ const PATH_PATTERNS: RegExp[] = [
   /\b[A-Za-z]:[\\/](?:Users|home)[\\/][^\s"'`)]*/g,
 ];
 
+// redactSecrets — the SECRET rules alone, with a count of what they replaced.
+// Pure; never throws. sanitizeString (below) is this plus the path rules; the
+// `work` capability's `run` tool uses this alone on command output, where paths
+// are the builder's own working information and not a leak.
+export function redactSecrets(input: string): { text: string; redactions: number } {
+  let out = input;
+  let redactions = 0;
+  for (const re of SECRET_PATTERNS) {
+    out = out.replace(re, () => {
+      redactions += 1;
+      return REDACTED;
+    });
+  }
+  return { text: out, redactions };
+}
+
 // sanitizeString — redact one free-text field. Pure; never throws on any input.
 export function sanitizeString(input: unknown): string {
   if (typeof input !== "string" || input.length === 0) return "";
-  let out = input;
   // Secrets first (a secret may contain path-like / base64-like substrings; redact
   // the whole token before path rules nibble at it).
-  for (const re of SECRET_PATTERNS) out = out.replace(re, REDACTED);
+  let out = redactSecrets(input).text;
   for (const re of PATH_PATTERNS) out = out.replace(re, REDACTED);
   // Collapse runs of the placeholder ("[redacted][redacted]" → "[redacted]") so
   // overlapping rules don't produce noise.

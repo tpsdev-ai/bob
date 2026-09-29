@@ -110,16 +110,18 @@ guard.
 - **Containment is checked at resolution time, not bound to the I/O.** Paths are
   resolved and checked inside the pinned root before each operation; a directory
   (or the root) swapped by another process between that check and the I/O is not
-  guarded — the same class as the cross-process race above (and `bash` stays
-  outside every guard in slice 1).
+  guarded — the same class as the cross-process race above (and the shell —
+  builder-local's `run`, or `bash` in other roles — stays outside every guard in
+  slice 1).
 - **The checks compare canonical pathnames.** A directory (or the root) replaced
   by another directory at the SAME pathname passes the check, even before it runs;
   only a replacement that resolves elsewhere (for example a symlink leading outside
   the root) is refused.
-- **`bash` is outside every guard.** The tripwire and the anchored rules govern
-  `read_lines`/`edit_lines`/`insert_after`/`write_file` only. A shell command can
-  still rewrite a tracked file (including a write followed by a commit in one
-  command). This is slice 2.
+- **The shell is outside every guard.** builder-local's shell is the work
+  capability's `run` (bob#211), which replaced `bash` there. The tripwire and
+  the anchored rules govern `read_lines`/`edit_lines`/`insert_after`/`write_file`
+  only. A shell command can still rewrite a tracked file (including a write
+  followed by a commit in one command). This is slice 2.
 - **No role-owned overrides.** Slice 1 ships the fixed page, line and tripwire
   limits; no path from `bob.yaml` can raise them. Role-owned limit overrides and
   a role-owned replace permission are slice 2.

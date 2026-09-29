@@ -1,0 +1,113 @@
+// The excerpt the model sees (bob#211): a bounded tail of the capture, run
+// through bob's existing secret redaction BEFORE it is cut, so a secret that
+// straddles a cut cannot survive as a fragment.
+
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { redactSecrets, sanitizeString } from "../../../src/capabilities/observatory/sanitize.js";
+import { readExcerpt } from "../../../src/capabilities/work/run.js";
+
+let dir: string;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "bob-work-excerpt-"));
+});
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+const TOKEN = `ghp_${"Z9y8X7w6V5".repeat(4)}`;
+
+describe("readExcerpt", () => {
+  it("a small capture comes back whole", () => {
+    const p = join(dir, "a.log");
+    writeFileSync(p, "one\ntwo\n");
+    expect(readExcerpt(p)).toEqual({
+      text: "one\ntwo\n",
+      truncated: false,
+      redactions: 0,
+      bytes: 8,
+    });
+  });
+
+  it("a secret straddling the READ WINDOW's start shows no fragment (the partial line is dropped)", () => {
+    const p = join(dir, "b.log");
+    const secretLine = `export GITHUB_TOKEN=${TOKEN}`;
+    const tail = "t ".repeat(45).trimEnd();
+    writeFileSync(p, `${"x".repeat(500)}\n${secretLine}\n${tail}\n`);
+    // Window = 100 + 20 bytes from the end: it starts inside the secret line.
+    const e = readExcerpt(p, { maxBytes: 100, marginBytes: 20 });
+    expect(e.truncated).toBe(true);
+    for (let n = 6; n <= TOKEN.length; n++) {
+      expect(e.text).not.toContain(TOKEN.slice(TOKEN.length - n));
+    }
+    expect(e.text).toContain(tail);
+  });
+
+  it("a secret straddling the EXCERPT cut is redacted whole before the cut", () => {
+    const p = join(dir, "c.log");
+    // One long last line: the tail cut falls inside the token. Redaction first
+    // replaces the token, so no tail fragment of it can be shown.
+    // Unredacted, the last 100 bytes would start 19 bytes before the token's end.
+    writeFileSync(p, `${"w ".repeat(100)}${TOKEN} ${"z ".repeat(40)}\n`);
+    const e = readExcerpt(p, { maxBytes: 100, marginBytes: 4096 });
+    expect(e.truncated).toBe(true);
+    expect(e.redactions).toBe(1);
+    expect(e.text).toContain("[redacted]");
+    for (let n = 6; n <= TOKEN.length; n++) {
+      expect(e.text).not.toContain(TOKEN.slice(TOKEN.length - n));
+    }
+  });
+
+  it("terminal escapes and stray control bytes are stripped", () => {
+    const p = join(dir, "d.log");
+    writeFileSync(p, "\u001b[31mred\u001b[0m\u0007 plain\ttab\n");
+    expect(readExcerpt(p).text).toBe("red plain\ttab\n");
+  });
+
+  it("a missing capture is an empty excerpt, not a throw", () => {
+    expect(readExcerpt(join(dir, "none.log"))).toEqual({
+      text: "",
+      truncated: false,
+      redactions: 0,
+      bytes: 0,
+    });
+  });
+});
+
+describe("the shared redaction set (observatory sanitize.ts)", () => {
+  it("redactSecrets counts what it replaced and leaves paths alone", () => {
+    const r = redactSecrets(`token=abcdef123456 at /Users/someone/work ${TOKEN}`);
+    expect(r.redactions).toBe(2);
+    expect(r.text).toContain("/Users/someone/work");
+    expect(r.text).not.toContain(TOKEN);
+  });
+
+  it("covers env-style *_TOKEN / *_PASSWORD / *_SECRET_ACCESS_KEY assignments", () => {
+    for (const line of [
+      "GITHUB_TOKEN=abc123def456",
+      "DB_PASSWORD: hunter2hunter2",
+      "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG",
+      "npm_config__auth_token=s3cr3tvalue",
+    ]) {
+      const r = redactSecrets(line);
+      expect(r.redactions, line).toBeGreaterThanOrEqual(1);
+      expect(r.text, line).toContain("[redacted]");
+    }
+    // A plain word that merely ends in TOKEN with no assignment is left alone.
+    expect(redactSecrets("the CSRF_TOKEN header is required").redactions).toBe(0);
+  });
+
+  it("covers credentials in a URL's userinfo, keeping the host", () => {
+    const r = redactSecrets("cloning https://bob:pa55word@github.com/org/repo.git");
+    expect(r.text).not.toContain("pa55word");
+    expect(r.text).toContain("github.com/org/repo.git");
+  });
+
+  it("sanitizeString (the observatory boundary) still redacts secrets AND paths", () => {
+    const out = sanitizeString(`GITHUB_TOKEN=${TOKEN} in /Users/someone/x`);
+    expect(out).not.toContain(TOKEN);
+    expect(out).not.toContain("/Users/someone");
+  });
+});

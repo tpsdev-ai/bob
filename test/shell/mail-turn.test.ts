@@ -237,8 +237,21 @@ describe("(a9) a mail turn holds no Discord tool — a REAL pi session with the 
 
 describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (Gauge round 4, blocker 1)", () => {
   // builder-local's role allows the anchored file tools (read_lines, edit_lines,
-  // insert_after, write_file) that a denylist of pi built-ins never named. Its
-  // mail turn must hold exactly the reviewed mail allowlist and nothing else.
+  // insert_after, write_file) and the work capability's run tools (bob#211) that
+  // a denylist of pi built-ins never named. Its mail turn must hold exactly the
+  // reviewed mail allowlist and nothing else.
+  //
+  // The work capability keeps job state under the temp directory and sweeps it
+  // when it loads; point that at this test's scratch dir, never a shared one.
+  let savedTmpdir: string | undefined;
+  beforeEach(() => {
+    savedTmpdir = process.env.TMPDIR;
+    process.env.TMPDIR = agentsRoot;
+  });
+  afterEach(() => {
+    if (savedTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmpdir;
+  });
   beforeEach(() => {
     const agentDir = join(agentsRoot, "builder");
     mkdirSync(join(agentDir, "work"), { recursive: true });
@@ -260,7 +273,9 @@ describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (G
         "    - edit_lines",
         "    - insert_after",
         "    - write_file",
-        "    - bash",
+        "    - run",
+        "    - run_status",
+        "    - run_cancel",
         "    - grep",
         "    - find",
         "    - ls",
@@ -270,6 +285,7 @@ describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (G
         "",
         "capabilities:",
         "  - anchored-edit",
+        "  - work",
         "  - flair",
         "",
         "flair:",
@@ -311,9 +327,8 @@ describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (G
     return tools;
   }
 
-  it("the same agent's ordinary run holds the anchored file tools and the shell (the control)", async () => {
+  it("the same agent's ordinary run holds the anchored file tools and the run tools (the control)", async () => {
     expect(await realTools({ mailTurn: false })).toEqual([
-      "bash",
       "edit_lines",
       "find",
       "flair_get",
@@ -323,6 +338,9 @@ describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (G
       "insert_after",
       "ls",
       "read_lines",
+      "run",
+      "run_cancel",
+      "run_status",
       "write_file",
     ]);
   });

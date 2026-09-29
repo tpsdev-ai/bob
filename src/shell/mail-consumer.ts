@@ -92,6 +92,7 @@ import {
 } from "../capabilities/tps-mail/reply.js";
 import { readBlock } from "./bob-yaml.js";
 import { ORIGIN_FIELD_LIMITS } from "./origin-limits.js";
+import { type GroupOps, NODE_GROUP_OPS } from "./process-group.js";
 
 // A maildir record as TPS writes it. Every field is an unsigned claim; the
 // consumer trusts only the verified inner envelope (envelope.ts).
@@ -148,30 +149,9 @@ const TURN_KILL_GRACE_MS = 5000;
 // needs the pid counter to wrap onto that exact id inside it.
 // Being its own group, the turn is not taken down with the runtime's group on a
 // crash; the mail-turn child watches the consumer pid and ends itself (run.ts).
-// Process-group operations (a seam: tests fake a group that never dies).
-export interface GroupOps {
-  // Does the group still have a member? (EPERM counts: a member we may not signal.)
-  exists(pgid: number): boolean;
-  signal(pgid: number, sig: NodeJS.Signals): void;
-}
-
-const NODE_GROUP_OPS: GroupOps = {
-  exists(pgid) {
-    try {
-      process.kill(-pgid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "EPERM";
-    }
-  },
-  signal(pgid, sig) {
-    try {
-      process.kill(-pgid, sig); // the whole group: descendants included
-    } catch {
-      // gone between the probe and the signal
-    }
-  },
-};
+// Process-group operations live in process-group.ts (shared with the `work`
+// capability's `run` tool); `GroupOps` is re-exported for existing importers.
+export type { GroupOps };
 
 export interface LauncherTurnRunnerOptions {
   launcherPath: string;

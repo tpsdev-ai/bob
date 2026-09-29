@@ -28,7 +28,7 @@ import { BLESSED_CATALOG } from "./capability-catalog.js";
 // ("Built-in tools: read, bash, powershell (Windows), edit, write, grep, find,
 // ls") and core/tools/*. `find` is pi's file-glob equivalent — there is no
 // `glob`. Note `powershell` is Windows' shell, so a policy that drops the shell
-// must drop both names.
+// must drop both names — and the work capability's `run` too (see below).
 export const PI_BUILTIN_TOOLS = [
   "read",
   "bash",
@@ -43,7 +43,13 @@ export const PI_BUILTIN_TOOLS = [
 // What a resident agent must not hold unless its role opts in: a shell and the
 // tools that write files. A resident agent runs unattended behind its service
 // unit, with no human at the keyboard to approve a command.
-export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell"] as const;
+//
+// `run` (the work capability, bob#211) executes arbitrary commands, so it is
+// shell-equivalent and dropped with `bash` and `powershell`: without it here, a
+// resident role listing `run` would hold arbitrary execution without the
+// `allowResidentShell` opt-in. `run_status` and `run_cancel` execute nothing and
+// are not gated.
+export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell", "run"] as const;
 
 // What a MAIL TURN may hold (bob#200 §4, F4): an explicit, reviewed ALLOWLIST,
 // never a denylist. A mail turn answers ONE allow-listed peer and whatever it
