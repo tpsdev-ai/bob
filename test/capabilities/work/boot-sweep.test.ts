@@ -21,6 +21,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -515,4 +516,62 @@ describe("the process identity reader", () => {
       expect(readProcIdentity(process.pid)).toBe("unsupported");
     },
   );
+});
+
+describe("run's cwd stays inside the workspace (bob#213)", () => {
+  let live: LiveWork | undefined;
+
+  afterEach(() => {
+    live?.cleanup();
+    live = undefined;
+  });
+
+  it("accepts a relative path that resolves inside the workspace", async () => {
+    live = await workSession({ script: program() });
+    const subDir = join(live.cwd, "sub");
+    mkdirSync(subDir);
+    const j = await live.work.manager.start({ command: "echo ok", cwd: "sub" }, live.cwd);
+    await j.done;
+    expect(j.outcome).toBe("exited");
+    expect(j.exitCode).toBe(0);
+    await live.work.manager.endRun();
+  });
+
+  it("refuses a cwd that escapes outside the workspace", async () => {
+    live = await workSession({ script: program() });
+    let err: Error | undefined;
+    try {
+      await live.work.manager.start({ command: "echo out", cwd: ".." }, live.cwd);
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect((err as Error).message).toContain("workspace");
+    expect((err as Error).message).toContain(live.cwd);
+    await live.work.manager.endRun();
+  });
+
+  it("refuses a symlink that resolves outside the workspace", async () => {
+    live = await workSession({ script: program() });
+    const linkPath = join(live.cwd, "outside-link");
+    const realTarget = join(tmpdir(), "tmp");
+    try {
+      symlinkSync(realTarget, linkPath, "dir");
+    } catch {
+      await live.work.manager.endRun();
+      return;
+    }
+    // The symlink targets tmpdir(), which is outside this workspace.
+    // The test checks that the resolved path is rejected.
+    let err: Error | undefined;
+    try {
+      await live.work.manager.start({ command: "echo out", cwd: "outside-link" }, live.cwd);
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect((err as Error).message).toContain("workspace");
+    expect((err as Error).message).toContain(live.cwd);
+    await live.work.manager.endRun();
+  });
 });

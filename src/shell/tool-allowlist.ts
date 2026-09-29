@@ -49,7 +49,16 @@ export const PI_BUILTIN_TOOLS = [
 // resident role listing `run` would hold arbitrary execution without the
 // `allowResidentShell` opt-in. `run_status` and `run_cancel` execute nothing and
 // are not gated.
-export const RESIDENT_EXCLUDED_TOOLS = ["bash", "write", "edit", "powershell", "run"] as const;
+export const RESIDENT_EXCLUDED_TOOLS = [
+  "bash",
+  "write",
+  "edit",
+  "powershell",
+  "run",
+  "write_file",
+  "edit_lines",
+  "insert_after",
+] as const;
 
 // What a MAIL TURN may hold (bob#200 §4, F4): an explicit, reviewed ALLOWLIST,
 // never a denylist. A mail turn answers ONE allow-listed peer and whatever it

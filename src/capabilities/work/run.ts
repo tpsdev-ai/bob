@@ -630,7 +630,17 @@ export class JobManager {
         `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not an existing directory. Pass an existing directory, relative to the workspace, or omit cwd.`,
       );
     }
-    return dir;
+    // Containment: the resolved path must stay inside the workspace.
+    // Resolve symlinks first (realpath) for both workspace and cwd to catch
+    // a symlink inside the workspace pointing outside.
+    const workspace = canonicalPath(ctxCwd);
+    const resolved = canonicalPath(dir);
+    if (!isInside(workspace, resolved)) {
+      throw new RunRefusal(
+        `run refused: cwd resolves outside the workspace ${ctxCwd} (resolved to ${resolved}). Pass a path inside the workspace.`,
+      );
+    }
+    return resolved;
   }
 
   private ensureRunDir(workspaces: string[]): { run: string; jobs: string; out: string } {

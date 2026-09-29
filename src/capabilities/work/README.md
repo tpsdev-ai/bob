@@ -19,7 +19,7 @@ It registers three tools through `pi.registerTool`:
 
 ## Enabling it
 
-`roles/builder-local/role.json` allows `run`, `run_status` and `run_cancel`, and
+The `work` capability is what enables `run`. `roles/builder-local/role.json` allows `run`, `run_status` and `run_cancel`, and
 does not allow `bash`: in that role, `run` replaces pi's shell, and that is a
 fact of the config (tool availability is a per-role allow-list), not of load
 order. An agent opts in the same way as for `anchored-edit`: `work` under

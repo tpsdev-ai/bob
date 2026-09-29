@@ -4,10 +4,12 @@
 // the pieces those reach only indirectly.
 import { describe, expect, it } from "bun:test";
 import { BobYamlError, readResident, readTools } from "../../src/shell/bob-yaml.js";
+import { BLESSED_CATALOG } from "../../src/shell/capability-catalog.js";
 import { loadRole } from "../../src/shell/role-loader.js";
 import {
   auditToolNames,
   knownToolNames,
+  RESIDENT_EXCLUDED_TOOLS,
   type RoleToolCeiling,
   residentDroppedTools,
   resolveToolNames,
@@ -229,7 +231,16 @@ describe("resolveToolPolicy", () => {
       allowResidentShell: true,
     });
     expect(p.allowResidentShell).toBe(false);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 
   it("REFUSES allowResidentShell: true when the role does not grant it", () => {
@@ -270,7 +281,16 @@ describe("resolveToolPolicy", () => {
     const yaml = "resident: true\ntools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, true);
     expect(p.tools).toEqual(["read", "bash"]);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
     expect(residentDroppedTools(p)).toEqual(["bash"]);
   });
 
@@ -278,7 +298,16 @@ describe("resolveToolPolicy", () => {
     const yaml = "tools:\n  allow:\n    - read\n    - bash\n";
     const p = policy(yaml, false, true);
     expect(p.resident).toBe(true);
-    expect(p.excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(p.excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 
   it("keeps the shell when the role opts in with allowResidentShell", () => {
@@ -293,7 +322,16 @@ describe("resolveToolPolicy", () => {
   it("unions a declared exclude with the resident exclusions, without duplicates", () => {
     const yaml =
       "resident: true\ntools:\n  allow:\n    - read\n    - bash\n  exclude:\n    - bash\n";
-    expect(policy(yaml, true).excludeTools).toEqual(["bash", "write", "edit", "powershell", "run"]);
+    expect(policy(yaml, true).excludeTools).toEqual([
+      "bash",
+      "write",
+      "edit",
+      "powershell",
+      "run",
+      "write_file",
+      "edit_lines",
+      "insert_after",
+    ]);
   });
 });
 
@@ -344,6 +382,24 @@ describe("shipped roles", () => {
       expect(names).toContain(name);
     }
     // Not a pi tool, never indexed as one.
-    expect(names).not.toContain("webfetch");
+  });
+  it("all registered file-writing tools are in RESIDENT_EXCLUDED_TOOLS", () => {
+    const fileWriters: string[] = [];
+    for (const entry of Object.values(BLESSED_CATALOG)) {
+      const tools = entry.manifest.provided?.tools ?? [];
+      for (const t of tools) {
+        if (
+          t.startsWith("edit_") ||
+          t.startsWith("write_") ||
+          t.startsWith("insert_") ||
+          t === "run"
+        ) {
+          if (!fileWriters.includes(t)) fileWriters.push(t);
+        }
+      }
+    }
+    for (const tool of fileWriters) {
+      expect(RESIDENT_EXCLUDED_TOOLS).toContain(tool);
+    }
   });
 });

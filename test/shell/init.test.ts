@@ -176,6 +176,20 @@ describe("initAgent", () => {
     expect(names.join(",")).not.toContain("mcp__");
   });
 
+  it("builder-local stamps neither bash nor run (work capability is not declared)", () => {
+    // builder-local's role allows run/run_status/run_cancel, but only the
+    // flair capability is stamped by bob init. work is NOT stamped, so those
+    // tools cannot exist. bash is a pi built-in but also NOT in the builder-local
+    // role's ceiling. A stamped builder-local agent carries only grip tools
+    // (grep, find, ls) and the flair trio.
+    const res = initAgent({ ...baseOpts(), name: "bot-bl-check", role: "builder-local" });
+    const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("run");
+    expect(names).not.toContain("run_status");
+    expect(names).not.toContain("run_cancel");
+  });
+
   it("loads a freshly initialised agent of EVERY role (allowlist ⊆ what can exist)", () => {
     // The consequence the round-3 spec names: every role's stamped agent must
     // resolve a policy that holds. Anything the role's ceiling allows but no
