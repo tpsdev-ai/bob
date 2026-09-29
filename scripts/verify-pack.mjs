@@ -206,7 +206,16 @@ try {
   // other branch, that WITHOUT the opt-out bob refuses rather than shipping a
   // half-provisioned agent (#93).
   check("bob onboard --no-interactive --no-flair (scaffolds a real agent)", () => {
-    const r = cli("onboard", "packbot", "--role", "ea", "--context-window", "131072", "--no-interactive", "--no-flair");
+    const r = cli(
+      "onboard",
+      "packbot",
+      "--role",
+      "ea",
+      "--context-window",
+      "131072",
+      "--no-interactive",
+      "--no-flair",
+    );
     if (r.status !== 0) throw new Error(`exit ${r.status}\n${r.stderr}`);
     return "exit 0";
   });
@@ -216,7 +225,15 @@ try {
     // Agent record cannot be created. The published artifact must FAIL here —
     // a zero exit would mean it shipped an agent with a keypair and no
     // identity, which is the defect the flag above exists to opt out of.
-    const r = cli("onboard", "packbot-unregistered", "--role", "ea", "--context-window", "131072", "--no-interactive");
+    const r = cli(
+      "onboard",
+      "packbot-unregistered",
+      "--role",
+      "ea",
+      "--context-window",
+      "131072",
+      "--no-interactive",
+    );
     if (r.status === 0) throw new Error("exit 0 — onboard silently skipped registration");
     const out = `${r.stdout}${r.stderr}`;
     if (!out.includes("no admin credential available")) {
