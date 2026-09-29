@@ -49,11 +49,14 @@ import {
   parseMailTurnInput,
 } from "../capabilities/tps-mail/prompt.js";
 import {
+  type ProviderLimitsBlock,
   readAgentRole,
   readBlock,
   readCapabilities,
   readCron,
+  readProviderLimits,
   readResident,
+  readSessionBudget,
   readTools,
 } from "./bob-yaml.js";
 import {
@@ -70,6 +73,7 @@ import {
 } from "./compaction-contract.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
+import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
 import {
   createBobRuntimeFactory,
@@ -79,6 +83,7 @@ import {
   runInteractiveSession,
   type SessionDeps,
 } from "./session.js";
+import type { ModelLimits, ThinkingSetting } from "./session-budget.js";
 import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError } from "./turn-origin.js";
@@ -554,6 +559,19 @@ export interface RunSessionConfig {
   // write, never a tool argument. No other path sets it, so no other session
   // gets the tool.
   setupSoulPath?: string;
+  // bob#214: the declared limits of the model — bob.yaml's `provider:`
+  // context_window (and optional max_output_tokens), bound to the provider/model
+  // pair they describe. The session factory REFUSES a session whose pair has no
+  // declared window: there is no default, because a window bob guessed can
+  // disagree with the server. Absent here means "not declared".
+  modelLimits?: ModelLimits;
+  // bob#214: compact between model calls once the context passes this fraction
+  // of the window (bob.yaml `session:` over role.json `session`). Absent: pi's
+  // own threshold (the window minus its reserve).
+  compactionThreshold?: number;
+  // bob#214: the thinking level handed to pi (bob.yaml `session:` over
+  // role.json `session`). Absent: pi's default.
+  thinking?: ThinkingSetting;
 }
 
 // The injectable seam. Production builds a real pi AgentSession through bob's
@@ -839,6 +857,16 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     );
   });
 
+  // bob#214: one flat usage record per model request (prompt, cached-prompt,
+  // completion and thinking tokens, time to first token, model), written when
+  // the request's assistant message ends. A NON-delta record: the delta cap
+  // never drops it.
+  const usageTracker = createRequestUsageTracker(() => now().getTime());
+  const unsubscribeUsage = session.subscribe((event) => {
+    const record = usageTracker.observe(event);
+    if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);
+  });
+
   let exitCode = 0;
   let reason: SilenceReason | undefined;
   let failed = false;
@@ -952,6 +980,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // Stop recording first: the done line below is this log's last record, and the
     // run is over whatever the turn did.
     unsubscribeRunLog();
+    unsubscribeUsage();
     unsubscribeContract();
 
     // Final record, so a reader can tell a clean completion from a truncated log.
@@ -1467,6 +1496,45 @@ export function effectiveCapabilities(opts: {
   return { adopted: false, names: readCapabilities(opts.yamlText), configs: {} };
 }
 
+// bob#214: the declared limits for `model` on `provider`: the provider block's
+// own window when `model` is provider.model, else the provider.models entry
+// for it. Undefined when that model declares no window.
+export function declaredModelLimits(
+  block: ProviderLimitsBlock,
+  provider: string,
+  yamlModel: string,
+  model: string,
+): ModelLimits | undefined {
+  const declared = model === yamlModel ? block : block.models[model];
+  if (declared?.contextWindow === undefined) return undefined;
+  return {
+    provider,
+    model,
+    contextWindow: declared.contextWindow,
+    ...(declared.maxOutputTokens !== undefined
+      ? { maxOutputTokens: declared.maxOutputTokens }
+      : {}),
+  };
+}
+
+// bob#214: the agent's session budget — bob.yaml's `session:` block over its
+// role's role.json `session`, key by key. The role is read the same way the tool
+// policy reads it (bob.yaml `agent.role`); a role that cannot be loaded is the
+// same load error it is there.
+export function resolveSessionBudget(yamlText: string): {
+  compactionThreshold?: number;
+  thinking?: ThinkingSetting;
+} {
+  const own = readSessionBudget(yamlText);
+  const role = loadRole(readAgentRole(yamlText) as BobRole).session ?? {};
+  const compactionThreshold = own.compactionThreshold ?? role.compactionThreshold;
+  const thinking = own.thinking ?? role.thinking;
+  return {
+    ...(compactionThreshold !== undefined ? { compactionThreshold } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
+  };
+}
+
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -1480,8 +1548,15 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
 
   const yamlText = readBobYaml(agentDir, opts.name);
   const { provider, model: yamlModel } = resolveProviderAndModel(yamlText, opts.name);
+
   // Per-call override wins, mirroring the old `--model` flag semantics.
   const model = opts.model ?? yamlModel;
+  // bob#214: the declared limits of the model this session runs — bob.yaml's
+  // provider.context_window for provider.model, or a provider.models entry for
+  // a per-call override. Bound to the pair it describes; a model with no
+  // declared window leaves this undefined, and the factory refuses that session
+  // with the remedy.
+  const modelLimits = declaredModelLimits(readProviderLimits(yamlText), provider, yamlModel, model);
   const appendSystemPrompt = readSoul(agentDir);
 
   // The ONE effective-config resolver. For an ADOPTED agent (a host grant
@@ -1537,6 +1612,11 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilities = resolution.capabilities;
   }
 
+  // bob#214: the session budget (bob.yaml `session:` over role.json `session`),
+  // resolved after the tool policy so a config the policy already refuses is
+  // reported by that refusal first.
+  const budget = resolveSessionBudget(yamlText);
+
   // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
   // applied HERE, after both branches, so it binds an ADOPTED agent's grant
   // tools exactly as it binds an ordinary agent's role tools: no branch can
@@ -1572,6 +1652,11 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     // allowlist, so there is no longer a "declared none" case here.
     tools: toolPolicy.tools,
     excludeTools: toolPolicy.excludeTools,
+    ...(modelLimits !== undefined ? { modelLimits } : {}),
+    ...(budget.compactionThreshold !== undefined
+      ? { compactionThreshold: budget.compactionThreshold }
+      : {}),
+    ...(budget.thinking !== undefined ? { thinking: budget.thinking } : {}),
   };
   return {
     agentDir,

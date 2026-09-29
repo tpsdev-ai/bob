@@ -189,6 +189,7 @@ export async function workSession(opts: {
   const config: RunSessionConfig = {
     provider: STUB_PROVIDER,
     model: STUB_MODEL,
+    modelLimits: { provider: STUB_PROVIDER, model: STUB_MODEL, contextWindow: 200_000 },
     appendSystemPrompt: "",
     cwd,
     piAgentDir,

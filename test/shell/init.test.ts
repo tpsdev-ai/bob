@@ -68,6 +68,7 @@ describe("initAgent", () => {
     role: "ea" as const,
     provider: "ollama-cloud",
     model: "kimi-k2.6",
+    contextWindow: 262_144,
     agentsRoot: tmpRoot,
     flairKeysDir: keysRoot,
   });
@@ -509,5 +510,67 @@ describe("initAgent", () => {
       );
       expect(messages.some((m) => m.includes("nudge-gw"))).toBe(false);
     });
+  });
+});
+
+// bob#214: the context window is written into bob.yaml, never guessed.
+describe("initAgent — the context window (bob#214)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bob-init-214-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  const opts = (name: string) => ({
+    name,
+    role: "builder-local" as const,
+    provider: "ollama-cloud",
+    model: "kimi-k2.6",
+    agentsRoot: root,
+    skipFlair: true,
+  });
+
+  it("writes provider.context_window when given, and resolveRunConfig binds it to the model", () => {
+    initAgent({ ...opts("cw-set"), contextWindow: 262_144 });
+    const yaml = readFileSync(join(root, "cw-set", "bob.yaml"), "utf8");
+    expect(yaml).toMatch(/^ {2}context_window: 262144$/m);
+    const { config } = resolveRunConfig({ name: "cw-set", agentsRoot: root });
+    expect(config.modelLimits).toEqual({
+      provider: "ollama-cloud",
+      model: "kimi-k2.6",
+      contextWindow: 262_144,
+    });
+    // The builder-local role's session budget reaches the config.
+    expect(config.compactionThreshold).toBe(0.5);
+    expect(config.thinking).toBe("low");
+  });
+
+  it("without one, writes a commented placeholder, warns, and leaves the window UNDECLARED", () => {
+    const originalError = console.error;
+    const calls: string[] = [];
+    console.error = (...args: unknown[]) => {
+      calls.push(args.join(" "));
+    };
+    try {
+      initAgent(opts("cw-unset"));
+    } finally {
+      console.error = originalError;
+    }
+    const yaml = readFileSync(join(root, "cw-unset", "bob.yaml"), "utf8");
+    expect(yaml).toContain("# context_window: <tokens>");
+    expect(yaml).not.toMatch(/^ {2}context_window:/m);
+    expect(calls.some((m) => m.includes("provider.context_window"))).toBe(true);
+    const { config } = resolveRunConfig({ name: "cw-unset", agentsRoot: root });
+    expect(config.modelLimits).toBeUndefined();
+  });
+
+  it("refuses a context window that is not a positive whole number", () => {
+    expect(() => initAgent({ ...opts("cw-bad"), contextWindow: 0 })).toThrow(
+      /positive whole number/,
+    );
+    expect(() => initAgent({ ...opts("cw-bad2"), contextWindow: 1.5 })).toThrow(
+      /positive whole number/,
+    );
   });
 });

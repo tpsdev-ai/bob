@@ -242,6 +242,8 @@ function soulHashOf(agentDir: string): string {
 export interface HireOptions extends PositionCommonOptions {
   provider?: string;
   model?: string;
+  // bob#214: the model's context window, written to bob.yaml (see initAgent).
+  contextWindow?: number;
   skipFlair?: boolean;
   flairKeysDir?: string;
   flairUrl?: string;
@@ -340,6 +342,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       ...(soulFile !== undefined ? { soulBody: soulFile.content } : {}),
       ...(opts.flairKeysDir !== undefined ? { flairKeysDir: opts.flairKeysDir } : {}),
       ...(opts.flairUrl !== undefined ? { flairUrl: opts.flairUrl } : {}),
+      ...(opts.contextWindow !== undefined ? { contextWindow: opts.contextWindow } : {}),
     });
     opts.commitHook?.("scaffold");
 
