@@ -92,6 +92,8 @@ export async function makeDiscordRestRequest(
     redirect: "manual",
   });
   if (res.status >= 300 && res.status < 400) {
+    // Release the unread body so a refused redirect does not hold its connection.
+    await res.body?.cancel();
     throw new Error(
       `discord REST: refusing to follow a redirect (HTTP ${res.status} to ${redirectTargetHost(
         res.headers.get("location"),

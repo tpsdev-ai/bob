@@ -91,3 +91,34 @@ describe("makeDiscordRestRequest — redirects", () => {
     }
   });
 });
+
+describe("makeDiscordRestRequest — a refused redirect releases its body", () => {
+  it("cancels the 3xx response body before rejecting", async () => {
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    const stub = (async () => {
+      const body = new ReadableStream({
+        pull() {},
+        cancel() {
+          cancelled = true;
+        },
+      });
+      return new Response(body, {
+        status: 302,
+        headers: { location: "http://elsewhere.invalid/" },
+      });
+    }) as typeof fetch;
+    (globalThis as { fetch: typeof fetch }).fetch = stub;
+    try {
+      await expect(
+        makeDiscordRestRequest("http://discord.invalid/v10/x", {
+          method: "GET",
+          headers: { authorization: "Bot tok" },
+        } as unknown as MakeRequestInit),
+      ).rejects.toThrow(/HTTP 302/);
+      expect(cancelled).toBe(true);
+    } finally {
+      (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
+    }
+  });
+});
