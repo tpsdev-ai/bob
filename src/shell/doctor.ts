@@ -18,10 +18,12 @@
 //     capability to honour it, when the capability's config is invalid (an
 //     empty senders allow-list above all), when the agent has no Flair identity,
 //     when the inbox is missing, when this host is not a TPS delivery target
-//     (#134), or when the reply transport (the tps CLI, the signing key) is
-//     missing; and surfaces refused counts per reason, dispatch failures and
-//     reply failures.
+//     (#134), when the reply transport (the tps CLI, the signing key) is
+//     missing, or when the tps CLI on PATH does not take the reply contract
+//     (`mail send --stdin --reply-to`); and surfaces refused counts per reason,
+//     dispatch failures and reply failures.
 
+import { spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -90,6 +92,8 @@ export interface DoctorOptions {
   homeDir?: string;
   // PATH searched for the tps CLI (tests). Defaults to process.env.PATH.
   pathEnv?: string;
+  // Wall-clock bound on the tps reply-contract probe (tests). Default 10 s.
+  tpsProbeTimeoutMs?: number;
   // Position grant store + positions root, as the runtime resolves them (tests).
   // Default: <home>/.bob/host and bob's packaged positions.
   hostRoot?: string;
@@ -243,6 +247,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     home,
     flairKeysDir,
     pathEnv: opts.pathEnv ?? process.env.PATH ?? "",
+    tpsProbeTimeoutMs: opts.tpsProbeTimeoutMs ?? TPS_PROBE_TIMEOUT_MS,
     agentDir,
     hostRoot: opts.hostRoot ?? join(home, ".bob", "host"),
     positionsRoot: opts.positionsRoot,
@@ -588,6 +593,53 @@ function findOnPath(bin: string, pathEnv: string): string | undefined {
   return undefined;
 }
 
+// ─── The reply contract ─────────────────────────────────────────────────────
+//
+// bob sends every reply as `tps mail send <to> --stdin --reply-to <messageId>`
+// (reply.ts). A tps that does not take those flags — @tpsdev-ai/cli 0.7.0 and
+// older; the contract landed with tpsdev-ai/cli#431 — fails every reply
+// closed, so an agent that passes every other check would still look
+// mail-capable and never answer. Doctor asks the CLI itself: `tps mail --help`
+// prints its mail usage and exits without acting, and a CLI that takes the
+// contract names both flags there.
+//
+// An unknown answer never passes: a probe that cannot start, is killed at its
+// timeout, exits non-zero, or prints neither flag is a FAIL naming what it saw.
+// The probe runs with a fixed argv, no shell, and an environment of PATH and
+// HOME only, so no ambient variable reaches the child.
+export const TPS_PROBE_TIMEOUT_MS = 10_000;
+export const TPS_REPLY_CONTRACT_FLAGS = ["--stdin", "--reply-to"] as const;
+
+export function tpsReplyContractProblem(
+  tps: string,
+  o: { pathEnv: string; home: string; timeoutMs: number },
+): string | undefined {
+  const res = spawnSync(tps, ["mail", "--help"], {
+    encoding: "utf8",
+    env: { PATH: o.pathEnv, HOME: o.home },
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+    timeout: o.timeoutMs,
+    killSignal: "SIGKILL",
+    maxBuffer: 256 * 1024,
+  });
+  if (res.error) {
+    const code = (res.error as NodeJS.ErrnoException).code ?? res.error.message;
+    return code === "ETIMEDOUT"
+      ? `'${tps} mail --help' did not finish within ${o.timeoutMs}ms`
+      : `'${tps} mail --help' could not be run (${code})`;
+  }
+  if (res.status !== 0) {
+    return `'${tps} mail --help' exited ${res.status ?? res.signal}`;
+  }
+  const usage = typeof res.stdout === "string" ? res.stdout : "";
+  const missing = TPS_REPLY_CONTRACT_FLAGS.filter((flag) => !usage.includes(flag));
+  if (missing.length > 0) {
+    return `${tps} does not take 'mail send --stdin --reply-to' (its mail usage names no ${missing.join(" or ")}), so every reply would fail closed`;
+  }
+  return undefined;
+}
+
 function countRefusedByReason(refusedDir: string): Record<string, number> {
   const counts: Record<string, number> = {};
   if (!existsSync(refusedDir)) return counts;
@@ -636,6 +688,7 @@ function tpsMailChecks(o: {
   home: string;
   flairKeysDir: string;
   pathEnv: string;
+  tpsProbeTimeoutMs: number;
   agentDir: string;
   hostRoot: string;
   positionsRoot?: string;
@@ -801,6 +854,27 @@ function tpsMailChecks(o: {
     });
   } else {
     checks.push({ name: "tps-mail reply transport", status: "ok", detail: tps });
+  }
+  if (tps) {
+    const problem = tpsReplyContractProblem(tps, {
+      pathEnv: o.pathEnv,
+      home: o.home,
+      timeoutMs: o.tpsProbeTimeoutMs,
+    });
+    checks.push(
+      problem === undefined
+        ? {
+            name: "tps-mail reply contract",
+            status: "ok",
+            detail: `${tps} takes 'mail send --stdin --reply-to'`,
+          }
+        : {
+            name: "tps-mail reply contract",
+            status: "fail",
+            detail: problem,
+            fix: "install an @tpsdev-ai/cli release that includes tpsdev-ai/cli#431 ('tps mail send --stdin --reply-to'); 0.7.0 and older do not take it",
+          },
+    );
   }
 
   // Activity: refused per reason (durable, from refused/), what is waiting,
