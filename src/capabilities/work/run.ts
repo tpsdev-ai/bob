@@ -860,7 +860,7 @@ export class JobManager {
     // deadline is armed. The command is already running by now: the shell
     // starts at spawn. A job the registry does not know about could outlive a
     // crashed supervisor with nothing left to find it, so if this write fails
-    // the job is terminated (the deadline's escalation) and the refusal says
+    // termination is attempted (the deadline's escalation) and the refusal says
     // whether its group was verified empty.
     try {
       this.writeEntry(job);
@@ -873,7 +873,7 @@ export class JobManager {
       this.jobs.delete(runId);
       const clean = job.cleanup === "group_empty" || job.cleanup === "group_killed";
       throw new RunRefusal(
-        `run refused: the job record for ${runId} could not be written (${code}) right after the job started, so the job was terminated (SIGTERM, then SIGKILL after a grace). Its process group ${job.pgid} ${
+        `run refused: the job record for ${runId} could not be written (${code}) right after the job started, so termination was attempted (SIGTERM, then SIGKILL after a grace, only while the group could be verified). Its process group ${job.pgid} ${
           clean
             ? `was verified empty (cleanup_state ${job.cleanup}): nothing from it is left running`
             : `could NOT be verified empty (cleanup_state ${job.cleanup}): something from it may survive`

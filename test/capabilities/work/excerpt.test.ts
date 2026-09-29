@@ -117,6 +117,20 @@ describe("the shared redaction set (observatory sanitize.ts)", () => {
     expect(redactSecrets("the CSRF_TOKEN header is required").redactions).toBe(0);
   });
 
+  it("redacts an Authorization value after any amount of spacing, and a value that only STARTS with the placeholder", () => {
+    const spaced = redactSecrets("Authorization:         Basic short-secret\n");
+    expect(spaced.text).toBe("Authorization: [redacted]\n");
+    expect(spaced.redactions).toBe(1);
+    const prefixed = redactSecrets('Authorization: [redacted], nonce="secret123"\n');
+    expect(prefixed.text).not.toContain("secret123");
+    expect(prefixed.text).toBe("Authorization: [redacted]\n");
+    expect(prefixed.redactions).toBe(1);
+    // Only a value that IS entirely the placeholder is left alone (no double count).
+    const done = redactSecrets("Authorization: [redacted]\n");
+    expect(done.text).toBe("Authorization: [redacted]\n");
+    expect(done.redactions).toBe(0);
+  });
+
   it("redacts Authorization header values whatever the scheme, keeping the header name", () => {
     for (const [line, secret] of [
       ["Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"],

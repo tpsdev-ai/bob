@@ -27,15 +27,6 @@ export const REDACTED = "[redacted]";
 // runs, key= / token= assignments, bearer headers, PEM bodies) rather than
 // trying to recognize "a secret" semantically.
 const SECRET_PATTERNS: RegExp[] = [
-  // Authorization / Proxy-Authorization header VALUES, whatever the scheme
-  // (Basic, Bearer, Token, Digest with quoted parameters, a bare credential …)
-  // and whatever the length: EVERYTHING after the separator through the end of
-  // the line is replaced, quotes and all. The header name stays. First in the
-  // list, so a scheme-specific rule below never double-counts it; a value that
-  // is already "[redacted]" is left alone. The separator and the value must be
-  // on the header's own line. The lookbehind is bounded and the value runs to
-  // the line end, so the rule stays linear.
-  /(?<=\b(?:proxy-)?authorization["']?[ \t]{0,8}[:=][ \t]{0,8})(?!\[redacted\])[^\s][^\r\n]*/gi,
   // GitHub tokens: ghp_, gho_, ghu_, ghs_, ghr_, github_pat_…
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
@@ -86,9 +77,21 @@ const PATH_PATTERNS: RegExp[] = [
 // Pure; never throws. sanitizeString (below) is this plus the path rules; the
 // `work` capability's `run` tool uses this alone on command output, where paths
 // are the builder's own working information and not a leak.
+// Authorization / Proxy-Authorization header VALUES, whatever the scheme (Basic, Bearer, Token, Digest with
+// quoted parameters, a bare credential …) and whatever the length or spacing: EVERYTHING after the separator
+// through the end of the line is replaced, quotes and all; the header name and separator stay. A value is left
+// alone only when the WHOLE value is already the placeholder. A replace callback instead of a lookbehind: no
+// bounded-spacing window, and the match (literal name, then the rest of one line) stays linear.
+const AUTH_HEADER_RE = /\b((?:proxy-)?authorization["']?[ \t]*[:=])([^\r\n]*)/gi;
+
 export function redactSecrets(input: string): { text: string; redactions: number } {
-  let out = input;
   let redactions = 0;
+  let out = input.replace(AUTH_HEADER_RE, (whole: string, head: string, value: string) => {
+    const v = value.trim();
+    if (v === "" || v === REDACTED) return whole;
+    redactions += 1;
+    return `${head} ${REDACTED}`;
+  });
   for (const re of SECRET_PATTERNS) {
     out = out.replace(re, () => {
       redactions += 1;

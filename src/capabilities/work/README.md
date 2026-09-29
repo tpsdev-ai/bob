@@ -143,8 +143,8 @@ named error.
   (supervisor pid, deadline, the group leader's pinned identity, command digest,
   outcome, cleanup). The first record is written right after spawn — the
   command is already running by then — and before the job's deadline is armed.
-  If that first write fails, the job is terminated with the deadline's
-  escalation, and `run` returns a refusal naming the job's process group and
+  If that first write fails, termination is attempted with the deadline's
+  escalation (no signal is sent to a group that cannot be verified), and `run` returns a refusal naming the job's process group and
   saying whether that group was verified empty.
 - **Identity.** A pid can be reused, even within one second, so a pid (or a
   1-second `ps` start time) is not an identity. On Linux the tool pins a process

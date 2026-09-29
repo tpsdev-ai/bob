@@ -274,7 +274,7 @@ describe("run — output", () => {
       script: program(
         call("run", {
           command:
-            "echo 'Authorization: Basic dXNlcjpwYXNz'; echo 'authorization: Token t0k3nvalue'",
+            "echo 'Authorization: Basic dXNlcjpwYXNz'; echo 'authorization: Token t0k3nvalue'; echo 'Authorization:         Basic sp4cedsecret'; echo 'Authorization: [redacted], nonce=\"n0ncesecret\"'",
         }),
       ),
     });
@@ -282,8 +282,10 @@ describe("run — output", () => {
     const r = lastOf(live.results, "run");
     expect(r.text).not.toContain("dXNlcjpwYXNz");
     expect(r.text).not.toContain("t0k3nvalue");
+    expect(r.text).not.toContain("sp4cedsecret");
+    expect(r.text).not.toContain("n0ncesecret");
     expect(r.text).toContain("Authorization: [redacted]");
-    expect(r.details.redactions).toBe(2);
+    expect(r.details.redactions).toBe(4);
   }, 20_000);
 
   it("a quoted Digest header and a long Basic value are redacted whole in the run result", async () => {
@@ -399,7 +401,7 @@ describe("run — a failed first record write terminates the job", () => {
     const pgid = Number(m?.[1]);
     try {
       expect(refused.text).toContain(
-        "could not be written (ENOSPC) right after the job started, so the job was terminated",
+        "could not be written (ENOSPC) right after the job started, so termination was attempted",
       );
       expect(refused.text).toContain("nothing from it is left running");
       // No process from that job remains.
