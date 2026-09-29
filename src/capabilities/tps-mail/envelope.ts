@@ -32,7 +32,7 @@
 // shape. The CLI's replay ledger is replaced by the consumer's replied/ marker,
 // keyed on the same signed messageId.
 
-import { createPublicKey, verify as verifyEd25519 } from "node:crypto";
+import { createHash, createPublicKey, verify as verifyEd25519 } from "node:crypto";
 import { TPS_AGENT_ID } from "./config.js";
 
 // ─── RFC 8785 canonicalization ──────────────────────────────────────────────
@@ -103,6 +103,10 @@ export const REFUSAL_REASONS = [
   "from-mismatch",
   "wrong-recipient",
   "sender-not-allowed",
+  // A second, DIFFERENT signed envelope reusing a messageId this agent already
+  // answered (or is answering). Refused, never acked as a re-delivery: the
+  // consumer's state for an id is bound to the sender and envelope digest.
+  "id-collision",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 
@@ -120,6 +124,10 @@ export interface AcceptedMail {
   messageId: string;
   // The signed body — untrusted data, sanitized later by the prompt template.
   body: string;
+  // sha256 (hex) of the RFC 8785 form of the whole verified envelope, signature
+  // included. The same signed envelope re-delivered has the same digest;
+  // another envelope reusing its messageId does not.
+  digest: string;
 }
 
 export type InboundDecision =
@@ -324,5 +332,6 @@ async function decideRecord(record: unknown, opts: DecideOptions): Promise<Inbou
     return refuse("sender-not-allowed", `${from} is not in tps-mail senders`);
   }
 
-  return { kind: "accept", sender: from, messageId, body: envelope.body };
+  const digest = createHash("sha256").update(canonicalize(envelope), "utf8").digest("hex");
+  return { kind: "accept", sender: from, messageId, body: envelope.body, digest };
 }

@@ -69,7 +69,7 @@ export interface BobConfig {
   cron?: CronEntry[];
 }
 
-export { MAIL_TURN_ENV } from "../capabilities/tps-mail/prompt.js";
+export { MAIL_TURN_ENV, MAIL_TURN_PARENT_ENV } from "../capabilities/tps-mail/prompt.js";
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
 export { type Args, BOOLEAN_FLAGS, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
 export {
@@ -170,6 +170,7 @@ export {
 } from "./init.js";
 export {
   createTpsMailConsumer,
+  type DurableIo,
   durableWrite,
   launcherTurnRunner,
   MailConsumer,
@@ -238,6 +239,7 @@ export {
   type LaunchOptions,
   type MailTurnInputReadOptions,
   type MailTurnLaunchOptions,
+  mailTurnParentPid,
   mapBobProviderToPi,
   parseLaunchArgs,
   type ResolvedRunConfig,

@@ -563,6 +563,34 @@ describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
     });
   }
 
+  // Gauge round 5, blocker 4: the consumer watchdog runs BEFORE stdin is read.
+  // Here the consumer pid is dead and stdin is never closed: a watchdog
+  // installed after the read would block on stdin forever.
+  it("a mail turn whose consumer is already gone ends BEFORE reading stdin", async () => {
+    const gone = spawnSync("true");
+    const child = spawn(process.execPath, [cli, "launch", AGENT], {
+      env: { ...mailEnv(), BOB_MAIL_TURN_PARENT: String(gone.pid) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve(null);
+      }, 8000);
+      child.on("close", (c) => {
+        clearTimeout(timer);
+        resolve(c);
+      });
+    });
+    child.stdin?.destroy();
+    expect(code).toBe(1);
+    expect(stderr).toContain("the consumer that started this mail turn is gone");
+  }, 15_000);
+
   it("reads stdin written through a pipe in several delayed pieces to EOF", async () => {
     const bytes = Buffer.from(refusable(100_000));
     const child = spawn(process.execPath, [cli, "launch", AGENT], {

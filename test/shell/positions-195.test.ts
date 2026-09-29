@@ -494,7 +494,6 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       positionsRoot,
       sessionFactory: capturingFactory(sink),
       write: async () => {},
-      watchParent: () => () => {},
     });
     expect(code).toBe(0);
     expect(sink).toHaveLength(1);

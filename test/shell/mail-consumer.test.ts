@@ -13,14 +13,20 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,7 +34,9 @@ import { fileURLToPath } from "node:url";
 import type { MailTurnInput } from "../../src/capabilities/tps-mail/prompt.js";
 import type { ReplyRequest, ReplyResult } from "../../src/capabilities/tps-mail/reply.js";
 import {
+  type DurableIo,
   durableWrite,
+  launcherTurnRunner,
   MailConsumer,
   type MailConsumerOptions,
   type TurnOutcome,
@@ -440,6 +448,7 @@ describe("the bounded turn through the REAL launcher spawn (§1, Kern 4)", () =>
         `echo $$ > ${join(root, "launcher.pid")}`,
         `echo "$#" > ${join(root, "launcher.argc")}`,
         `printf "%s" "$BOB_MAIL_TURN" > ${join(root, "launcher.mode")}`,
+        `printf "%s" "$BOB_MAIL_TURN_PARENT" > ${join(root, "launcher.parent")}`,
         `cat > ${join(root, "launcher.stdin")}`,
         `echo x >> ${join(root, "launcher.count")}`,
         ...script,
@@ -484,6 +493,8 @@ describe("the bounded turn through the REAL launcher spawn (§1, Kern 4)", () =>
     await h.consumer.poll();
     expect(readFileSync(join(root, "launcher.argc"), "utf8").trim()).toBe("0");
     expect(readFileSync(join(root, "launcher.mode"), "utf8")).toBe("1");
+    // The consumer's own pid, for the turn's watchdog (round 5, blocker 4).
+    expect(readFileSync(join(root, "launcher.parent"), "utf8")).toBe(String(process.pid));
     expect(JSON.parse(readFileSync(join(root, "launcher.stdin"), "utf8"))).toEqual({
       v: 1,
       sender: "flint",
@@ -702,8 +713,9 @@ describe("blocker 3 — a dead lock is taken over by EXACTLY one of racing resta
       [
         `import { appendFileSync, existsSync } from "node:fs";`,
         `import { MailConsumer } from ${JSON.stringify(consumerModule)};`,
-        `const [lockFile, inboxRoot, go, stop, out, statsFile] = process.argv.slice(2);`,
+        `const [lockFile, inboxRoot, go, stop, out, statsFile, ready] = process.argv.slice(2);`,
         `const nap = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+        `appendFileSync(ready, \`READY \${process.pid}\\n\`);`,
         `while (!existsSync(go)) nap(1);`,
         `const c = new MailConsumer({ name: "testbot", identity: "testbot", inboxRoot, senders: ["flint"],`,
         `  resolveKey: async () => null, lockFile, statsFile, pollIntervalMs: 3_600_000, log: () => {},`,
@@ -733,18 +745,35 @@ describe("blocker 3 — a dead lock is taken over by EXACTLY one of racing resta
       const go = join(dir, "go");
       const stop = join(dir, "stop");
       const out = join(dir, "out");
+      const ready = join(dir, "ready");
       writeFileSync(out, "");
+      writeFileSync(ready, "");
       const racers: ChildProcess[] = [];
       for (let i = 0; i < 6; i++) {
         const c = spawn(
           process.execPath,
-          [script, lockFile, join(dir, "inbox"), go, stop, out, join(dir, `stats-${i}.json`)],
+          [
+            script,
+            lockFile,
+            join(dir, "inbox"),
+            go,
+            stop,
+            out,
+            join(dir, `stats-${i}.json`),
+            ready,
+          ],
           { stdio: "ignore" },
         );
         racers.push(c);
         children.push(c);
       }
-      await new Promise((r) => setTimeout(r, 600)); // every racer is waiting on `go`
+      // A readiness barrier, not a sleep: `go` only after all six are loaded
+      // and spinning on it.
+      const readyBy = Date.now() + 20_000;
+      while (readFileSync(ready, "utf8").split("\n").filter(Boolean).length < 6) {
+        if (Date.now() > readyBy) throw new Error("racers never became ready");
+        await new Promise((r) => setTimeout(r, 10));
+      }
       writeFileSync(go, "");
       const deadline = Date.now() + 20_000;
       let lines: string[] = [];
@@ -784,8 +813,304 @@ describe("blocker 3 — a dead lock is taken over by EXACTLY one of racing resta
     children.push(claimant);
     writeFileSync(`${lockFile}.takeover-${dead}`, String(claimant.pid));
     expect(() => harness({ lockWaitMs: 200 }).consumer.start()).toThrow(
-      /did not settle within 200ms/,
+      new RegExp(`pid ${claimant.pid} has held the takeover claim .*takeover-${dead} for 200ms`),
     );
     expect(readFileSync(lockFile, "utf8")).toBe(String(dead));
   });
+});
+
+// ─── Gauge round 5 ──────────────────────────────────────────────────────────
+
+// Real file operations, with a chosen failure injected.
+function ioWith(over: Partial<DurableIo>): DurableIo {
+  const real: DurableIo = {
+    openSync: (p, f, m) => openSync(p, f, m),
+    writeSync: (fd, b, o, l) => writeSync(fd, b, o, l),
+    fsyncSync: (fd) => fsyncSync(fd),
+    closeSync: (fd) => closeSync(fd),
+    renameSync: (a, b) => renameSync(a, b),
+    unlinkSync: (p) => unlinkSync(p),
+  };
+  return { ...real, ...over };
+}
+
+// fsync fails on the DIRECTORY fd only (the one opened with "r").
+function dirSyncFails(code: string): DurableIo {
+  const dirFds = new Set<number>();
+  return ioWith({
+    openSync: (p, f, m) => {
+      const fd = openSync(p, f, m);
+      if (f === "r") dirFds.add(fd);
+      return fd;
+    },
+    fsyncSync: (fd) => {
+      if (dirFds.has(fd)) throw Object.assign(new Error(`${code}: fsync on a directory`), { code });
+      fsyncSync(fd);
+    },
+  });
+}
+
+describe("round 5, blocker 1 — no ack unless the marker's directory is synced", () => {
+  it("(d1) a failed directory fsync FAILS the write and takes the marker back", () => {
+    const dir = join(root, "d");
+    mkdirSync(dir);
+    expect(() => durableWrite(join(dir, "m"), "x\n", dirSyncFails("EIO"))).toThrow(/EIO/);
+    expect(readdirSync(dir)).toEqual([]); // no marker, no temp
+  });
+
+  it("(d2) a filesystem that cannot fsync a directory gets an explicit operational error", () => {
+    const dir = join(root, "d");
+    mkdirSync(dir);
+    for (const code of ["EINVAL", "ENOTSUP"]) {
+      expect(() => durableWrite(join(dir, "m"), "x\n", dirSyncFails(code))).toThrow(
+        /cannot fsync a directory .*cannot be made durable there and mail is not acked/,
+      );
+      expect(readdirSync(dir)).toEqual([]);
+    }
+  });
+
+  it("(d3) a write that makes no progress throws instead of spinning", () => {
+    const dir = join(root, "d");
+    mkdirSync(dir);
+    let calls = 0;
+    const io = ioWith({
+      writeSync: () => {
+        calls += 1;
+        if (calls > 1000) throw new Error("SPIN: the write loop never gave up");
+        return 0;
+      },
+    });
+    expect(() => durableWrite(join(dir, "m"), "x\n", io)).toThrow(
+      /made no progress \(0\/2 bytes\)/,
+    );
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("(d4) the consumer does NOT ack on an unsynced directory, and the retry marks without resending", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    let broken = true;
+    const h = harness({
+      retryBaseMs: 1000,
+      writeMarkerFile: (p, c) => durableWrite(p, c, broken ? dirSyncFails("EINVAL") : undefined),
+    });
+    await h.consumer.poll();
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("new")).toEqual(["1.json"]);
+    expect(existsSync(join(inbox, "replied", "m-1"))).toBe(false);
+    expect(h.consumer.stats).toMatchObject({ processed: 0, replied: 0, markerFailed: 1 });
+    expect(h.logs.join("\n")).toMatch(/cannot fsync a directory/);
+    clock += 1001;
+    broken = false;
+    await h.consumer.poll();
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(h.consumer.stats).toMatchObject({ processed: 1, replied: 1 });
+  });
+});
+
+describe("round 5, blocker 2 — per-id state is bound to the sender and the signed envelope", () => {
+  let kern: TestKey;
+  beforeEach(() => {
+    kern = testKey();
+  });
+  const two = (overrides: Partial<MailConsumerOptions> & Parameters<typeof harness>[0] = {}) =>
+    harness({
+      senders: ["flint", "kern"],
+      resolveKey: keyResolver({ flint, mallory, kern }),
+      ...overrides,
+    });
+
+  it("(c1) a DIFFERENT envelope reusing an answered messageId is refused as an id collision", async () => {
+    deliver("1.json", { messageId: "m-1", body: "first" });
+    deliver("2.json", { messageId: "m-1", body: "second, a different envelope" });
+    const h = two();
+    await h.consumer.poll();
+    expect(h.turns).toEqual([{ sender: "flint", messageId: "m-1", body: "first" }]);
+    expect(h.replies).toHaveLength(1);
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(inDir("refused")).toEqual(["2.json"]);
+    expect(readFileSync(join(inbox, "refused", "2.json.reason"), "utf8")).toMatch(
+      /^reason: id-collision\n.*already bound to a different signed envelope/,
+    );
+    expect(h.consumer.stats.refused["id-collision"]).toBe(1);
+    expect(h.consumer.stats.duplicates).toBe(0);
+  });
+
+  it("(c2) in the marker-failure window, another envelope with the id is refused — never settled on the first one's behalf", async () => {
+    deliver("1.json", { messageId: "m-1", body: "first" });
+    let failMarker = true;
+    const h = two({
+      retryBaseMs: 1000,
+      writeMarkerFile: (p, c) => {
+        if (failMarker) throw new Error("EIO");
+        durableWrite(p, c);
+      },
+    });
+    await h.consumer.poll(); // first: replied, marker failed, pending
+    expect(inDir("new")).toEqual(["1.json"]);
+    deliver("2.json", { from: "kern", key: kern, messageId: "m-1", body: "second" });
+    await h.consumer.poll(); // 1.json is backing off; 2.json meets the pending state
+    expect(inDir("refused")).toEqual(["2.json"]);
+    expect(h.turns).toHaveLength(1);
+    expect(h.replies).toHaveLength(1);
+    clock += 1001;
+    failMarker = false;
+    await h.consumer.poll(); // the first settles on its own retry, without resending
+    expect(inDir("cur")).toEqual(["1.json"]);
+    expect(h.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "SMOKE-OK" }]);
+    const marker = JSON.parse(readFileSync(join(inbox, "replied", "m-1"), "utf8"));
+    expect(marker.sender).toBe("flint");
+  });
+
+  it("(c3) in the failed-send window, another sender's envelope with the id never gets the composed reply", async () => {
+    deliver("1.json", { messageId: "m-1", body: "first" });
+    let sendOk = false;
+    const h = two({
+      retryBaseMs: 1000,
+      reply: async () =>
+        sendOk ? { ok: true } : { ok: false, reason: "exit", detail: "tps exited 1" },
+    });
+    await h.consumer.poll(); // composed, send failed, pending reply
+    deliver("2.json", { from: "kern", key: kern, messageId: "m-1", body: "second" });
+    await h.consumer.poll();
+    expect(inDir("refused")).toEqual(["2.json"]);
+    expect(h.replies.every((r) => r.to === "flint")).toBe(true);
+    clock += 1001;
+    sendOk = true;
+    await h.consumer.poll();
+    expect(h.replies.map((r) => r.to)).toEqual(["flint", "flint"]);
+    expect(h.turns).toHaveLength(1);
+  });
+
+  it("(c4) a marker that cannot be read fails closed as a collision, never as a re-delivery", async () => {
+    mkdirSync(join(inbox, "replied"), { recursive: true });
+    writeFileSync(join(inbox, "replied", "m-1"), "not json");
+    deliver("1.json", { messageId: "m-1" });
+    const h = two();
+    await h.consumer.poll();
+    expect(inDir("refused")).toEqual(["1.json"]);
+    expect(h.turns).toHaveLength(0);
+    expect(h.consumer.stats.duplicates).toBe(0);
+  });
+});
+
+describe("round 5, blocker 3 — a wedged lock names the file and the remedy", () => {
+  it("(l4) a dead lock plus an EMPTY leftover claim fails closed naming the claim", async () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    const dead = await deadPid();
+    writeFileSync(lockFile, String(dead));
+    const claim = `${lockFile}.takeover-${dead}`;
+    writeFileSync(claim, "");
+    let err: Error | undefined;
+    try {
+      harness({ lockWaitMs: 200 }).consumer.start();
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err?.message).toContain(`the takeover claim ${claim} stayed EMPTY for 200ms`);
+    expect(err?.message).toContain(`If no mail consumer for testbot is running`);
+    expect(err?.message).toContain(
+      `remove ${claim}, and ${lockFile} if it still names pid ${dead}`,
+    );
+    expect(readFileSync(lockFile, "utf8")).toBe(String(dead)); // nothing broken
+    expect(existsSync(claim)).toBe(true);
+  });
+
+  it("(l5) an EMPTY lock (a start interrupted before its pid) fails closed naming the lock", () => {
+    mkdirSync(join(root, "lock"), { recursive: true });
+    writeFileSync(lockFile, "");
+    expect(() => harness({ lockWaitMs: 200 }).consumer.start()).toThrow(
+      new RegExp(
+        `consumer lock ${lockFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} stayed EMPTY for 200ms.*remove`,
+      ),
+    );
+  });
+});
+
+describe("round 5, blocker 4 — the turn's process group is supervised until it is gone", () => {
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  async function diesWithin(pid: number, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (alive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    return !alive(pid);
+  }
+  // A launcher that leaves a descendant which IGNORES SIGTERM and has closed its
+  // stdio, so the launcher's close does not wait for it.
+  function resistantLauncher(tail: string[]): { launcher: string; pidFile: string } {
+    const pidFile = join(root, "resistant.pid");
+    const launcher = join(root, "resistant-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        `sh -c 'trap "" TERM; exec sleep 60' </dev/null >/dev/null 2>&1 &`,
+        `echo $! > ${pidFile}`,
+        ...tail,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    return { launcher, pidFile };
+  }
+  function supervised(launcher: string, turnTimeoutMs: number): Harness {
+    const replies: ReplyRequest[] = [];
+    const consumer = new MailConsumer({
+      name: "testbot",
+      identity: "testbot",
+      inboxRoot: inbox,
+      senders: ["flint"],
+      resolveKey: keyResolver({ flint }),
+      lockFile,
+      statsFile,
+      turnTimeoutMs,
+      pollIntervalMs: 60_000,
+      now: () => clock,
+      log: () => {},
+      runTurn: launcherTurnRunner({ launcherPath: launcher, killGraceMs: 300 }),
+      sendReply: async (r) => {
+        replies.push(r);
+        return { ok: true };
+      },
+    });
+    return { consumer, turns: [], replies, logs: [] };
+  }
+
+  it("(g2) a timed-out turn: a SIGTERM-resistant descendant with closed stdio is still killed", async () => {
+    deliver("1.json");
+    const { launcher, pidFile } = resistantLauncher(["exec sleep 30"]);
+    const h = supervised(launcher, 800);
+    await h.consumer.poll();
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.consumer.stats.timeouts).toBe(1);
+      expect(await diesWithin(pid, 6000)).toBe(true);
+    } finally {
+      if (alive(pid)) process.kill(pid, "SIGKILL"); // only a pid this test started
+    }
+  }, 20_000);
+
+  it("(g3) a turn that ENDED normally: what its launcher left behind is reaped too", async () => {
+    deliver("1.json");
+    const { launcher, pidFile } = resistantLauncher([
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"done"}'`,
+      "exit 0",
+    ]);
+    const h = supervised(launcher, 60_000);
+    await h.consumer.poll();
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.replies).toEqual([{ to: "flint", inReplyTo: "id-1.json", body: "done" }]);
+      expect(await diesWithin(pid, 6000)).toBe(true);
+    } finally {
+      if (alive(pid)) process.kill(pid, "SIGKILL");
+    }
+  }, 20_000);
 });

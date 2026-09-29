@@ -11,7 +11,9 @@
 // the agent's own identity, never anything from the mail, so the CLI signs the
 // reply as the agent. The exit code is authoritative: 0 is sent, anything else
 // (or a missing CLI, or a timeout) is a counted failure and the inbound stays
-// in new/ for a later retry.
+// in new/ for a later retry. A timeout or a non-zero exit is AMBIGUOUS — the CLI
+// may have handed the reply on before failing — so that retry can deliver a
+// second reply, threaded to the same messageId (the stated at-least-once case).
 //
 // CLI CONTRACT (finding, stated in the PR): the argv below asks the CLI for the
 // body on stdin (`--stdin`) and for threading (`--reply-to <messageId>`).

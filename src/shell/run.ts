@@ -1199,25 +1199,59 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
 
 // A mail turn runs in its OWN process group (so a timeout can kill everything
 // it started), which also means a crash of the runtime that started it no
-// longer takes it down with the runtime's group. So the turn watches its
-// parent and exits when the parent is gone (reparented): an orphaned turn could
-// never have its reply sent anyway, and must not keep a model busy.
+// longer takes it down with the runtime's group. So the turn watches the
+// CONSUMER — whose pid the consumer passes at spawn (BOB_MAIL_TURN_PARENT) —
+// and ends when it is gone (Gauge round 5, blocker 4). The first check runs
+// IMMEDIATELY, before stdin is read, so a consumer that died before the turn
+// even started is caught; later checks also catch the turn being reparented.
+// An orphaned turn could never have its reply sent, and must not keep a model
+// busy. Stated limit: a dead consumer whose pid is reused within the check
+// interval reads as alive until the reparenting check fires.
 export function watchParent(
-  opts: { getPpid?: () => number; exit?: (code: number) => void; intervalMs?: number } = {},
+  opts: {
+    expectedParentPid?: number;
+    getPpid?: () => number;
+    isAlive?: (pid: number) => boolean;
+    exit?: (code: number) => void;
+    intervalMs?: number;
+  } = {},
 ): () => void {
   const getPpid = opts.getPpid ?? (() => process.ppid);
+  const isAlive =
+    opts.isAlive ??
+    ((pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    });
   const exit = opts.exit ?? ((code: number) => process.exit(code));
-  const parent = getPpid();
-  const timer = setInterval(() => {
-    if (getPpid() !== parent) {
+  const initialPpid = getPpid();
+  let fired = false;
+  const check = () => {
+    if (fired) return;
+    const consumerGone = opts.expectedParentPid !== undefined && !isAlive(opts.expectedParentPid);
+    if (consumerGone || getPpid() !== initialPpid) {
+      fired = true;
       process.stderr.write(
         "bob launch: the consumer that started this mail turn is gone; ending the turn\n",
       );
       exit(1);
     }
-  }, opts.intervalMs ?? 1000);
+  };
+  check();
+  const timer = setInterval(check, opts.intervalMs ?? 1000);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+// The consumer pid from BOB_MAIL_TURN_PARENT, when it is one.
+export function mailTurnParentPid(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[0-9]+$/.test(value)) return undefined;
+  const pid = Number(value);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 export interface MailTurnLaunchOptions {
@@ -1235,8 +1269,6 @@ export interface MailTurnLaunchOptions {
   write?: (text: string) => Promise<void>;
   // Test seam for the template's marker nonce.
   nonce?: string;
-  // Test seam: the parent watchdog (defaults to watchParent()).
-  watchParent?: () => () => void;
 }
 
 export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<number> {
@@ -1250,12 +1282,9 @@ export async function runMailTurnLaunch(opts: MailTurnLaunchOptions): Promise<nu
     return 2;
   }
   const prompt = buildMailTurnPrompt(input, opts.nonce ? { nonce: opts.nonce } : {});
-  const stopWatching = (opts.watchParent ?? watchParent)();
-  try {
-    return await runMailTurn(opts, prompt);
-  } finally {
-    stopWatching();
-  }
+  // The consumer watchdog is installed by the CLI BEFORE stdin is read
+  // (cli.ts), so it covers this whole call.
+  return runMailTurn(opts, prompt);
 }
 
 async function runMailTurn(

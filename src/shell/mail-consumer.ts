@@ -34,12 +34,18 @@
 // with backoff, and a retry in this run writes the marker again WITHOUT a new
 // turn or a new send.
 //
-// At-least-once, stated (Kern 5): the ack follows the marker, which follows the
-// CLI's exit 0. A crash mid-turn re-delivers and the reply is sent once; a
-// crash after the marker acks without replying again. A second reply can be
-// sent only when the process dies between the CLI's success and a durable
-// marker — a crash, or a restart while a marker write keeps failing — and it is
-// threaded to the same signed messageId: the accepted duplicate.
+// At-least-once, stated (Kern 5; Gauge round 5, blocker 5): the ack follows the
+// marker, which follows the CLI's exit 0. A crash mid-turn re-delivers and the
+// reply is sent once; a crash after the marker acks without replying again. A
+// second reply can be sent in exactly two situations, both threaded to the same
+// signed messageId (the accepted duplicate):
+//   * the runtime dies between the CLI's success and a durable marker (a
+//     crash, or a restart while a marker write keeps failing); or
+//   * the CLI's outcome was AMBIGUOUS — it timed out, or exited non-zero after
+//     it may already have handed the reply on. bob cannot tell a send that
+//     failed from one that failed after delivering, so it retries.
+// There is no end-to-end idempotency key in this slice; the recipient sees the
+// duplicate threaded to the message it answers.
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -73,6 +79,7 @@ import {
 import { createFlairKeyResolver } from "../capabilities/tps-mail/keys.js";
 import {
   MAIL_TURN_ENV,
+  MAIL_TURN_PARENT_ENV,
   type MailTurnInput,
   parseMailTurnResult,
   serializeMailTurnInput,
@@ -115,13 +122,22 @@ export type TurnRunner = (input: MailTurnInput, signal: AbortSignal) => Promise<
 const TURN_STDOUT_MAX_BYTES = 1024 * 1024;
 const TURN_KILL_GRACE_MS = 5000;
 
-// The default runner: spawn the agent's launcher with NO argument, BOB_MAIL_TURN=1
-// and the input on stdin, as the leader of its OWN process group (detached).
-// On abort (the timeout, or a shutdown) the WHOLE group — the launcher, which
-// `exec`s bob, and anything bob started — gets SIGTERM, then SIGKILL after a
-// grace, so no descendant outlives a killed turn. (Being its own group, the
-// turn is not taken down with the runtime's process group on a crash; the
-// mail-turn child watches its parent and exits when it goes — run.ts.)
+// The default runner: spawn the agent's launcher with NO argument, BOB_MAIL_TURN=1,
+// the consumer's pid in BOB_MAIL_TURN_PARENT and the input on stdin, as the
+// leader of its OWN process group (detached).
+//
+// THE GROUP IS SUPERVISED UNTIL IT IS GONE (Gauge round 5, blocker 4). Once
+// the turn is over — aborted (timeout or shutdown), or the launcher closed —
+// the whole group gets SIGTERM, then SIGKILL after the grace, and the group is
+// polled until it no longer exists. Resolving the turn's outcome does NOT
+// cancel this, so a descendant that ignores SIGTERM and has closed its stdio
+// still dies. Stated limit: signals go to the numeric group id. POSIX keeps a
+// group id in use while any member lives, so it cannot name another group while
+// a descendant survives; once every member has exited, the group is no longer
+// signalled (each signal follows an existence probe), and the only residual
+// risk is the pid counter wrapping onto that id between a probe and its signal.
+// Being its own group, the turn is not taken down with the runtime's group on a
+// crash; the mail-turn child watches the consumer pid and ends itself (run.ts).
 export function launcherTurnRunner(opts: {
   launcherPath: string;
   // Absolute bob for the launcher's `exec "${BOB_BIN:-bob}"` when the
@@ -129,17 +145,23 @@ export function launcherTurnRunner(opts: {
   bobBin?: string;
   env?: NodeJS.ProcessEnv;
   killGraceMs?: number;
+  // How long to keep polling for the group after SIGKILL before giving up.
+  reapLimitMs?: number;
 }): TurnRunner {
   return (input, signal) =>
     new Promise<TurnOutcome>((resolve) => {
-      const env: NodeJS.ProcessEnv = { ...(opts.env ?? process.env), [MAIL_TURN_ENV]: "1" };
+      const env: NodeJS.ProcessEnv = {
+        ...(opts.env ?? process.env),
+        [MAIL_TURN_ENV]: "1",
+        [MAIL_TURN_PARENT_ENV]: String(process.pid),
+      };
       if (!env.BOB_BIN && opts.bobBin) env.BOB_BIN = opts.bobBin;
+      const grace = opts.killGraceMs ?? TURN_KILL_GRACE_MS;
+      const reapLimit = opts.reapLimitMs ?? 5000;
       let settled = false;
-      let killTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = (outcome: TurnOutcome) => {
         if (settled) return;
         settled = true;
-        if (killTimer) clearTimeout(killTimer);
         signal.removeEventListener("abort", onAbort);
         resolve(outcome);
       };
@@ -149,25 +171,46 @@ export function launcherTurnRunner(opts: {
         shell: false,
         detached: true,
       });
-      const signalGroup = (sig: NodeJS.Signals) => {
-        if (child.pid === undefined) return;
+      const pgid = child.pid;
+      const groupExists = (): boolean => {
+        if (pgid === undefined) return false;
         try {
-          process.kill(-child.pid, sig); // the whole group: descendants included
-        } catch {
-          try {
-            child.kill(sig);
-          } catch {
-            // already gone
-          }
+          process.kill(-pgid, 0);
+          return true;
+        } catch (err) {
+          return (err as NodeJS.ErrnoException).code === "EPERM";
         }
       };
-      const onAbort = () => {
-        signalGroup("SIGTERM");
-        killTimer = setTimeout(
-          () => signalGroup("SIGKILL"),
-          opts.killGraceMs ?? TURN_KILL_GRACE_MS,
-        );
+      const signalGroup = (sig: NodeJS.Signals) => {
+        if (pgid === undefined || !groupExists()) return;
+        try {
+          process.kill(-pgid, sig); // the whole group: descendants included
+        } catch {
+          // gone between the probe and the signal
+        }
       };
+      let reaping = false;
+      const reap = () => {
+        if (reaping || pgid === undefined) return;
+        reaping = true;
+        if (!groupExists()) return;
+        signalGroup("SIGTERM");
+        const started = Date.now();
+        let killed = false;
+        const tick = setInterval(() => {
+          if (!groupExists()) {
+            clearInterval(tick);
+            return;
+          }
+          const elapsed = Date.now() - started;
+          if (!killed && elapsed >= grace) {
+            killed = true;
+            signalGroup("SIGKILL");
+          }
+          if (elapsed >= grace + reapLimit) clearInterval(tick);
+        }, 50);
+      };
+      const onAbort = () => reap();
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) onAbort();
 
@@ -189,6 +232,8 @@ export function launcherTurnRunner(opts: {
         });
       });
       child.on("close", (code, sig) => {
+        // The leader is done: whatever it left in its group is reaped too.
+        reap();
         if (signal.aborted) {
           const reason = signal.reason === "timeout" ? "timeout" : "stopped";
           finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
@@ -325,47 +370,96 @@ function atomicWrite(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
-// Write `content` to `path` DURABLY and atomically: an exclusive temp file,
-// fsynced, renamed over `path`, then the directory fsynced so the rename itself
-// survives a crash. Throws on any failure, leaving no temp file behind; a
-// reader sees either the old state or the whole new file, never a torn one.
-export function durableWrite(path: string, content: string): void {
+// The file operations durableWrite uses (a seam: tests inject failures).
+export interface DurableIo {
+  openSync(path: string, flags: string, mode?: number): number;
+  writeSync(fd: number, buf: Buffer, offset: number, length: number): number;
+  fsyncSync(fd: number): void;
+  closeSync(fd: number): void;
+  renameSync(from: string, to: string): void;
+  unlinkSync(path: string): void;
+}
+
+const NODE_IO: DurableIo = {
+  openSync: (p, f, m) => openSync(p, f, m),
+  writeSync: (fd, b, o, l) => writeSync(fd, b, o, l),
+  fsyncSync: (fd) => fsyncSync(fd),
+  closeSync: (fd) => closeSync(fd),
+  renameSync: (a, b) => renameSync(a, b),
+  unlinkSync: (p) => unlinkSync(p),
+};
+
+// Write `content` to `path` DURABLY and atomically, or throw (Gauge round 5,
+// blocker 1): an exclusive temp file, written in full, fsynced, renamed over
+// `path`, then the DIRECTORY fsynced so the rename itself survives a crash.
+//
+// Nothing here is best-effort. A write that makes no progress throws (it would
+// otherwise spin). A directory that cannot be opened or fsynced FAILS the write
+// — including a filesystem that does not support fsync on a directory, which
+// gets its own operational error — and the renamed file is removed again, so a
+// marker whose durability is unproven never exists for a retry to trust. The
+// caller (settle) then leaves the mail un-acked in new/.
+export function durableWrite(path: string, content: string, io: DurableIo = NODE_IO): void {
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   let fd: number | undefined;
   try {
-    fd = openSync(tmp, "wx", 0o600);
+    fd = io.openSync(tmp, "wx", 0o600);
     const bytes = Buffer.from(content, "utf8");
     let off = 0;
-    while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
-    fsyncSync(fd);
-    closeSync(fd);
+    while (off < bytes.length) {
+      const n = io.writeSync(fd, bytes, off, bytes.length - off);
+      if (!(n > 0)) {
+        throw new Error(`durable write of ${path} made no progress (${off}/${bytes.length} bytes)`);
+      }
+      off += n;
+    }
+    io.fsyncSync(fd);
+    io.closeSync(fd);
     fd = undefined;
-    renameSync(tmp, path);
+    io.renameSync(tmp, path);
   } catch (err) {
     if (fd !== undefined) {
       try {
-        closeSync(fd);
+        io.closeSync(fd);
       } catch {
         // the write error is the one that matters
       }
     }
     try {
-      unlinkSync(tmp);
+      io.unlinkSync(tmp);
     } catch {
       // never created, or already renamed
     }
     throw err;
   }
+  const dir = dirname(path);
   let dirFd: number | undefined;
   try {
-    dirFd = openSync(dirname(path), "r");
-    fsyncSync(dirFd);
+    dirFd = io.openSync(dir, "r");
+    io.fsyncSync(dirFd);
   } catch (err) {
-    // Some filesystems cannot fsync a directory; the rename is still atomic.
+    // The rename happened but is not proven durable: take it back, so no retry
+    // can ack on a marker that a crash could still erase.
+    try {
+      io.unlinkSync(path);
+    } catch {
+      // gone already
+    }
     const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EBADF" && code !== "EPERM") throw err;
+    if (code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP") {
+      throw new Error(
+        `tps-mail: the filesystem holding ${dir} cannot fsync a directory (${code}), so a replied/ marker cannot be made durable there and mail is not acked. Put the inbox on a filesystem that supports directory fsync.`,
+      );
+    }
+    throw err;
   } finally {
-    if (dirFd !== undefined) closeSync(dirFd);
+    if (dirFd !== undefined) {
+      try {
+        io.closeSync(dirFd);
+      } catch {
+        // the fsync outcome is what matters
+      }
+    }
   }
 }
 
@@ -396,6 +490,22 @@ function readPidFile(path: string, name: string): PidRead {
   return { kind: "pid", pid: Number(raw) };
 }
 
+// What the lock acquisition is waiting on.
+type Blocked =
+  | { kind: "settling" }
+  | { kind: "empty-lock" }
+  | { kind: "empty-claim"; claim: string; dead: number }
+  | { kind: "live-claim"; claim: string; claimant: number };
+
+// What a replied/ marker (and a pending one) records: the outcome, and the
+// verified sender + signed-envelope digest it belongs to.
+interface MarkerRecord {
+  sender: string;
+  digest: string;
+  outcome: "replied" | "no-reply";
+  to?: string;
+}
+
 export class MailConsumer {
   readonly stats: MailConsumerStats = emptyStats();
   private readonly name: string;
@@ -419,13 +529,13 @@ export class MailConsumer {
   private readonly retry = new Map<string, { attempts: number; nextAt: number }>();
   // A reply composed by a settled turn whose send failed: a retry resends it
   // instead of running the turn again. Keyed by the signed messageId.
-  private readonly pendingReplies = new Map<string, string>();
+  private readonly pendingReplies = new Map<
+    string,
+    { sender: string; digest: string; text: string }
+  >();
   // A settled turn (replied or silent) whose marker could not be written: a
   // retry in this run writes the marker only — no new turn, no new send.
-  private readonly awaitingMarker = new Map<
-    string,
-    { outcome: "replied" | "no-reply"; to?: string }
-  >();
+  private readonly awaitingMarker = new Map<string, MarkerRecord>();
   private readonly writeMarkerFile: (path: string, content: string) => void;
   private readonly lockHooks: { afterStaleCheck?: () => void };
   private readonly lockWaitMs: number;
@@ -585,11 +695,23 @@ export class MailConsumer {
       this.scheduleRetry(file);
       return;
     }
-    const { sender, messageId, body } = decision;
+    const { sender, messageId, body, digest } = decision;
+    // Every piece of state kept for a messageId is bound to WHO sent it and
+    // WHICH signed envelope it was (Gauge round 5, blocker 2): the id is the
+    // sender's choice, so another envelope reusing it must never inherit this
+    // one's marker, pending marker or composed reply. It is refused instead.
+    const bound = { sender, digest };
+    const same = (b: { sender: string; digest: string }) =>
+      b.sender === sender && b.digest === digest;
 
-    // 2. Already answered (a crash after the marker, or a re-delivery of the
-    //    same signed message): ack without a turn and without a reply.
-    if (existsSync(this.markerPath(messageId))) {
+    // 2. Already answered — a crash after the marker, or a re-delivery of the
+    //    SAME signed envelope: ack without a turn and without a reply.
+    const marker = this.readMarker(messageId);
+    if (marker !== undefined) {
+      if (marker === "unreadable" || !same(marker)) {
+        this.collision(file, messageId, sender, marker === "unreadable" ? undefined : marker);
+        return;
+      }
       if (!this.ack(file)) {
         this.scheduleRetry(file);
         return;
@@ -604,12 +726,21 @@ export class MailConsumer {
     //     write the marker only — never a new turn, never a new send.
     const unmarked = this.awaitingMarker.get(messageId);
     if (unmarked) {
+      if (!same(unmarked)) {
+        this.collision(file, messageId, sender, unmarked);
+        return;
+      }
       this.settle(file, messageId, unmarked);
       return;
     }
 
     // 3. The turn — unless an earlier attempt already composed the reply.
-    let replyText = this.pendingReplies.get(messageId);
+    const pending = this.pendingReplies.get(messageId);
+    if (pending && !same(pending)) {
+      this.collision(file, messageId, sender, pending);
+      return;
+    }
+    let replyText = pending?.text;
     if (replyText === undefined) {
       this.log(`tps-mail: ${messageId} from ${sender}: running one fresh-session turn`);
       const outcome = await this.runBoundedTurn({ sender, messageId, body });
@@ -627,7 +758,7 @@ export class MailConsumer {
       }
       if (outcome.kind === "silent") {
         this.log(`tps-mail: ${messageId} settled with no final message; no reply sent`);
-        this.settle(file, messageId, { outcome: "no-reply" });
+        this.settle(file, messageId, { ...bound, outcome: "no-reply" });
         return;
       }
       replyText = capReply(outcome.text, this.maxReplyChars);
@@ -637,7 +768,7 @@ export class MailConsumer {
     const sent = await this.sendReply({ to: sender, inReplyTo: messageId, body: replyText });
     if (!sent.ok) {
       this.stats.replyFailed[sent.reason] += 1;
-      this.pendingReplies.set(messageId, replyText);
+      this.pendingReplies.set(messageId, { ...bound, text: replyText });
       this.log(
         `tps-mail: reply to ${sender} for ${messageId} FAILED (${sent.reason}: ${sent.detail}); left in new/ for a retry`,
       );
@@ -649,7 +780,48 @@ export class MailConsumer {
       `tps-mail: replied to ${sender} (in reply to ${messageId}, ${replyText.length} chars)`,
     );
     // The reply went out: record it durably and ack, even if a stop arrived.
-    this.settle(file, messageId, { outcome: "replied", to: sender });
+    this.settle(file, messageId, { ...bound, outcome: "replied", to: sender });
+  }
+
+  // A second signed envelope under a messageId this consumer already holds
+  // state for: refused and reported, never acked as a re-delivery and never
+  // given the first one's reply.
+  private collision(
+    file: string,
+    messageId: string,
+    sender: string,
+    held: { sender: string; digest: string } | undefined,
+  ): void {
+    this.refuse(
+      file,
+      "id-collision",
+      held === undefined
+        ? `messageId ${messageId} from ${sender}: its replied/ marker cannot be read, so this envelope cannot be shown to be the one answered`
+        : `messageId ${messageId} from ${sender} is already bound to a different signed envelope (from ${held.sender}, digest ${held.digest.slice(0, 12)}…)`,
+    );
+  }
+
+  // The marker for an id: its binding, undefined when there is none, or
+  // "unreadable" when a marker exists but does not parse to a binding.
+  private readMarker(
+    messageId: string,
+  ): { sender: string; digest: string } | "unreadable" | undefined {
+    let raw: string;
+    try {
+      raw = readFileSync(this.markerPath(messageId), "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      return "unreadable";
+    }
+    try {
+      const m = JSON.parse(raw) as { sender?: unknown; digest?: unknown };
+      if (typeof m.sender === "string" && typeof m.digest === "string") {
+        return { sender: m.sender, digest: m.digest };
+      }
+    } catch {
+      // falls through
+    }
+    return "unreadable";
   }
 
   // A settled turn: the DURABLE marker, THEN the ack, THEN the count. A marker
@@ -658,11 +830,7 @@ export class MailConsumer {
   // without resending. Only if the process dies before a marker lands can the
   // reply be sent again, threaded to the same messageId (the stated
   // at-least-once case).
-  private settle(
-    file: string,
-    messageId: string,
-    what: { outcome: "replied" | "no-reply"; to?: string },
-  ): void {
+  private settle(file: string, messageId: string, what: MarkerRecord): void {
     try {
       mkdirSync(join(this.inboxRoot, "replied"), { recursive: true });
       this.writeMarkerFile(
@@ -777,6 +945,9 @@ export class MailConsumer {
   private acquireLock(): void {
     mkdirSync(dirname(this.lockFile), { recursive: true });
     const deadline = Date.now() + this.lockWaitMs;
+    // Why the last pass had to wait, so the deadline error names the file an
+    // operator must look at (Gauge round 5, blocker 3).
+    let waitingOn: Blocked = { kind: "settling" };
     for (;;) {
       try {
         writeFileSync(this.lockFile, String(process.pid), { flag: "wx", mode: 0o600 });
@@ -792,33 +963,64 @@ export class MailConsumer {
           `mail consumer for ${this.name} already running (pid ${lock.pid}, lock ${this.lockFile})`,
         );
       }
-      if (lock.kind === "pid") {
+      if (lock.kind === "empty") {
+        waitingOn = { kind: "empty-lock" };
+      } else {
         this.lockHooks.afterStaleCheck?.();
         const outcome = this.takeOverDeadLock(lock.pid);
-        if (outcome === "held") {
+        if (outcome.kind === "held") {
           this.holdsLock = true;
           return;
         }
-        if (outcome === "changed") continue;
+        if (outcome.kind === "changed") continue;
+        waitingOn = outcome.blocked;
       }
-      // "empty" (being written) or "busy" (another takeover in progress): wait.
-      if (Date.now() > deadline) {
-        throw new Error(
-          `tps-mail: the consumer lock ${this.lockFile} did not settle within ${this.lockWaitMs}ms (another process is creating or taking it over)`,
-        );
-      }
+      if (Date.now() > deadline) throw this.lockWedged(waitingOn);
       sleepSync(20);
     }
   }
 
-  private takeOverDeadLock(dead: number): "held" | "changed" | "busy" {
+  // The deadline error: WHICH file is in the way, and what to do about it —
+  // conditional on no consumer running, because only a human can know that
+  // an empty or claimed file belongs to a dead process rather than a slow one.
+  private lockWedged(blocked: Blocked): Error {
+    const ifIdle = `If no mail consumer for ${this.name} is running (check its service)`;
+    switch (blocked.kind) {
+      case "empty-lock":
+        return new Error(
+          `tps-mail: the consumer lock ${this.lockFile} stayed EMPTY for ${this.lockWaitMs}ms — a start was interrupted between creating it and writing its pid. ${ifIdle}, remove ${this.lockFile} and start again.`,
+        );
+      case "empty-claim":
+        return new Error(
+          `tps-mail: the takeover claim ${blocked.claim} stayed EMPTY for ${this.lockWaitMs}ms — a takeover of the dead lock ${this.lockFile} (pid ${blocked.dead}) was interrupted between creating the claim and writing its pid. ${ifIdle}, remove ${blocked.claim}, and ${this.lockFile} if it still names pid ${blocked.dead}, then start again.`,
+        );
+      case "live-claim":
+        return new Error(
+          `tps-mail: pid ${blocked.claimant} has held the takeover claim ${blocked.claim} for ${this.lockWaitMs}ms without finishing. ${ifIdle} and pid ${blocked.claimant} is not one, remove ${blocked.claim} and start again.`,
+        );
+      default:
+        return new Error(
+          `tps-mail: the consumer lock ${this.lockFile} did not settle within ${this.lockWaitMs}ms`,
+        );
+    }
+  }
+
+  private takeOverDeadLock(
+    dead: number,
+  ): { kind: "held" } | { kind: "changed" } | { kind: "busy"; blocked: Blocked } {
     const claim = `${this.lockFile}.takeover-${dead}`;
     try {
       writeFileSync(claim, String(process.pid), { flag: "wx", mode: 0o600 });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       const claimant = readPidFile(claim, this.name);
-      if (claimant.kind !== "pid" || pidAlive(claimant.pid)) return "busy";
+      if (claimant.kind === "missing") return { kind: "busy", blocked: { kind: "settling" } };
+      if (claimant.kind === "empty") {
+        return { kind: "busy", blocked: { kind: "empty-claim", claim, dead } };
+      }
+      if (pidAlive(claimant.pid)) {
+        return { kind: "busy", blocked: { kind: "live-claim", claim, claimant: claimant.pid } };
+      }
       throw new Error(
         `tps-mail: a takeover of the consumer lock ${this.lockFile} (dead pid ${dead}) by pid ${claimant.pid} was interrupted, leaving ${claim}. Remove that file (and the lock, if no consumer for ${this.name} is running) to continue.`,
       );
@@ -827,10 +1029,10 @@ export class MailConsumer {
       // Only the claimant is here. Replace the lock ONLY if it still names the
       // dead pid: anything else means someone else already moved it on.
       const current = readPidFile(this.lockFile, this.name);
-      if (current.kind !== "pid" || current.pid !== dead) return "changed";
+      if (current.kind !== "pid" || current.pid !== dead) return { kind: "changed" };
       atomicWrite(this.lockFile, String(process.pid));
       this.log(`tps-mail: took over the consumer lock from dead pid ${dead}`);
-      return "held";
+      return { kind: "held" };
     } finally {
       try {
         unlinkSync(claim);

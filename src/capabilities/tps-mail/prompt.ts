@@ -30,6 +30,10 @@ export const MAIL_BODY_MAX_CHARS = 16_000;
 // with "-" is a flag to more parsers than one). BOB_MAIL_TURN=1 in the
 // launcher's environment selects this mode in `bob launch`.
 export const MAIL_TURN_ENV = "BOB_MAIL_TURN";
+// The consumer's own pid, set by the consumer when it spawns the launcher. The
+// mail-turn child checks it BEFORE reading stdin and then while it runs, and
+// ends itself if that process is gone (run.ts watchParent).
+export const MAIL_TURN_PARENT_ENV = "BOB_MAIL_TURN_PARENT";
 export const MAIL_TURN_INPUT_MAX_BYTES = 256 * 1024;
 
 export interface MailTurnInput {

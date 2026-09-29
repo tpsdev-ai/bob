@@ -552,9 +552,16 @@ consumer. For each file in `new/`, oldest first by filename:
 - **One fresh session per mail.** Each accepted mail runs ONE turn through the
   agent's launcher (`bin/<name>`, i.e. `bob launch`), never in the warm session,
   so a reply can only draw on what that turn read. The verified fields reach the
-  launcher on stdin, never as an argument. A turn past `turnTimeoutMs` is killed
-  with its whole process group, so nothing it started outlives it; a turn whose
-  runtime dies ends itself.
+  launcher on stdin, never as an argument. The launcher runs as the leader of
+  its own process group. A turn past `turnTimeoutMs` — and whatever a finished
+  turn left behind — is reaped as a group: SIGTERM, then SIGKILL after a grace,
+  polling until the group is gone, so a descendant that ignores SIGTERM or has
+  closed its output still dies. (Signals go to the numeric group id, sent only
+  while the group exists; once every member has exited nothing is signalled.)
+  The consumer passes its own pid to the turn, which checks it before reading
+  its input and every second after, and ends itself if the consumer is gone
+  (a consumer pid reused within that second reads as alive until the turn's
+  reparenting is noticed).
 - **What a mail turn can do.** Only the tools on a reviewed **allowlist** —
   `flair_search`, `flair_get` and `flair_write` — and only those the role (for
   an agent bound to a position, its host grant) also allows. Every other tool,
@@ -572,10 +579,15 @@ consumer. For each file in `new/`, oldest first by filename:
   agent (`TPS_AGENT_ID` is the agent's own id), threaded to the inbound's signed
   `messageId`, to the verified sender only. A tool-only or empty turn sends no
   reply. After the CLI exits 0, bob writes `<inbox>/replied/<messageId>`
-  durably (temp file, fsync, rename), then moves the mail to `cur/`; a
-  re-delivery with that marker is acked without a second reply. If the marker
-  cannot be written, the mail is not acked: it stays in `new/`, and the retry
-  writes the marker without sending again.
+  durably — temp file, fsync, rename, then an fsync of the directory — and only
+  then moves the mail to `cur/`. If any step fails, including a directory
+  fsync, the marker is taken back and the mail is not acked: it stays in `new/`,
+  and the retry writes the marker without sending again. A filesystem that
+  cannot fsync a directory gets its own error (and fails `bob doctor`): mail on
+  it is never acked. The marker records the verified sender and a digest of the
+  signed envelope: a re-delivery of that same envelope is acked without a second
+  reply, while a DIFFERENT envelope reusing the `messageId` is refused as an
+  `id-collision` — never acked, never given the first one's reply.
 - **Presence.** A mail turn is not reflected in the presence roster: it runs
   in its own process, outside the warm session and its turn admission, so it
   neither beats busy nor writes a turn summary. The liveness beacon is
@@ -585,13 +597,18 @@ consumer. For each file in `new/`, oldest first by filename:
   and logged, and it is retried with backoff. Only an unreachable key service
   is retried at the accepting step: a record that cannot be checked — a
   non-finite number the signature canonicalization cannot encode, for one — is
-  refused, not retried. Delivery is at-least-once: a second reply is possible
-  only when the runtime dies between the CLI's success and a durable marker (a
-  crash, or a restart while a marker write keeps failing), and it is threaded to
-  the same `messageId`.
+  refused, not retried. Delivery is at-least-once, and a second reply is
+  possible in two cases, both threaded to the same `messageId`: the runtime dies
+  between the CLI's success and a durable marker (a crash, or a restart while a
+  marker write keeps failing), or the CLI timed out or exited non-zero after it
+  may already have delivered — bob cannot tell, so it retries. There is no
+  end-to-end idempotency key in this slice.
 - **One consumer per agent.** A lock whose process is alive is never taken,
   however old; a lock whose process is dead is taken over through an exclusive
-  claim, so restarts racing for it end with exactly one consumer.
+  claim, so restarts racing for it end with exactly one consumer. A start or a
+  takeover killed in the middle can leave an empty lock, an empty claim, or a
+  claim naming a dead process; the next start does not guess — it fails,
+  naming that file and when it is safe to remove it.
 
 **Allow-listing a sender grants it the agent's read scope — and mail-influenced
 memory writes.** Whatever a mail turn can read — its Flair memory — can end up

@@ -24,6 +24,8 @@ import {
   LaunchArgError,
   loadRole,
   MAIL_TURN_ENV,
+  MAIL_TURN_PARENT_ENV,
+  mailTurnParentPid,
   parseArgs,
   parseLaunchArgs,
   positionDiff,
@@ -43,6 +45,7 @@ import {
   syncFlairSoul,
   UsageError,
   up,
+  watchParent,
 } from "./shell/index.js";
 
 function help(): void {
@@ -472,17 +475,26 @@ async function main(): Promise<number> {
               );
               return 2;
             }
-            let input: string;
+            // The consumer watchdog FIRST: before stdin is read, so a consumer
+            // that is already gone is noticed now (see watchParent).
+            const stopWatching = watchParent({
+              expectedParentPid: mailTurnParentPid(process.env[MAIL_TURN_PARENT_ENV]),
+            });
             try {
-              // fd 0 until EOF — never process.stdin (see readMailTurnInput).
-              input = readMailTurnInput();
-            } catch (err) {
-              console.error(
-                `bob launch ${launch.name}: mail turn refused — ${err instanceof Error ? err.message : String(err)}`,
-              );
-              return 2;
+              let input: string;
+              try {
+                // fd 0 until EOF — never process.stdin (see readMailTurnInput).
+                input = readMailTurnInput();
+              } catch (err) {
+                console.error(
+                  `bob launch ${launch.name}: mail turn refused — ${err instanceof Error ? err.message : String(err)}`,
+                );
+                return 2;
+              }
+              return await runMailTurnLaunch({ name: launch.name, input });
+            } finally {
+              stopWatching();
             }
-            return await runMailTurnLaunch({ name: launch.name, input });
           }
           return await runLaunch(launch);
         } catch (err: unknown) {

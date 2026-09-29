@@ -496,26 +496,30 @@ describe("watchParent — an orphaned mail turn ends", () => {
     }
   });
 
-  it("the mail-turn launch installs it and removes it when the turn ends", async () => {
-    let installed = 0;
-    let removed = 0;
-    const { session } = scriptedSession({
-      content: [{ type: "text", text: "ok" }],
-      stopReason: "stop",
+  it("a consumer pid that is already dead ends the turn IMMEDIATELY, at install", () => {
+    const exits: number[] = [];
+    const stop = watchParent({
+      expectedParentPid: 999_999,
+      isAlive: () => false,
+      getPpid: () => 4242,
+      exit: (c) => exits.push(c),
+      intervalMs: 60_000,
     });
-    await runMailTurnLaunch({
-      name: "testbot",
-      input: INPUT,
-      agentsRoot,
-      sessionFactory: async () => session,
-      write: async () => {},
-      watchParent: () => {
-        installed += 1;
-        return () => {
-          removed += 1;
-        };
-      },
+    stop();
+    expect(exits).toEqual([1]); // before any interval could run
+  });
+
+  it("a live consumer and a steady parent never fire", async () => {
+    const exits: number[] = [];
+    const stop = watchParent({
+      expectedParentPid: 4242,
+      isAlive: () => true,
+      getPpid: () => 4242,
+      exit: (c) => exits.push(c),
+      intervalMs: 5,
     });
-    expect([installed, removed]).toEqual([1, 1]);
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(exits).toEqual([]);
   });
 });

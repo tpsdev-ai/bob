@@ -22,7 +22,15 @@
 //     missing; and surfaces refused counts per reason, dispatch failures and
 //     reply failures.
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -469,6 +477,20 @@ function deliveryTargetCheck(tpsRoot: string): DoctorCheck {
   };
 }
 
+// Can this directory be fsynced? undefined when it can; the error code when not.
+function directoryFsyncProblem(dir: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, "r");
+    fsyncSync(fd);
+    return undefined;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code ?? String(err);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function findOnPath(bin: string, pathEnv: string): string | undefined {
   for (const dir of pathEnv.split(":")) {
     if (dir === "") continue;
@@ -601,7 +623,19 @@ function tpsMailChecks(o: {
       fix: `point tps-mail.inbox at the agent's TPS inbox, or create it: mkdir -p ${join(inbox, "new")} ${join(inbox, "cur")}`,
     });
   } else {
-    checks.push({ name: "tps-mail inbox", status: "ok", detail: inbox });
+    // replied/ markers must be durable before any ack, and that needs fsync on
+    // a directory. A filesystem without it would leave every mail un-acked.
+    const durability = directoryFsyncProblem(inbox);
+    checks.push(
+      durability === undefined
+        ? { name: "tps-mail inbox", status: "ok", detail: inbox }
+        : {
+            name: "tps-mail inbox",
+            status: "fail",
+            detail: `${inbox}: cannot fsync the directory (${durability}), so replied/ markers cannot be made durable and no mail would ever be acked`,
+            fix: "put the tps-mail inbox on a filesystem that supports fsync on a directory",
+          },
+    );
   }
 
   checks.push(deliveryTargetCheck(join(o.home, ".tps")));
