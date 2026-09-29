@@ -365,6 +365,9 @@ function setupRealAdmission() {
     client,
     started,
     originAtStart,
+    // The real admission's reader. It is bound to the prompt's async context,
+    // so it names a turn only when called from inside that turn's body.
+    readOrigin: admission.readOrigin,
     setOnTurn(fn: (text: string) => void | Promise<void>) {
       onTurn = fn;
     },
@@ -376,39 +379,91 @@ function setupRealAdmission() {
   };
 }
 
+// A latch the test controls: the promise settles only when the test says so.
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+// Run one outbound tool and record how it ended: "ok", or the refusal message.
+async function attempt(pi: FakePi, name: string, params: Record<string, unknown>): Promise<string> {
+  try {
+    await pi.call(name, params);
+    return "ok";
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 describe("wireDiscordCapability — a real queued turn keeps its own origin (issue #227)", () => {
-  it("holds A open, queues B, refuses A's tools on B's channel, then runs B with B's origin", async () => {
+  it("holds A mid-turn while B is admitted, then checks A's origin and tool binding before A ends", async () => {
     const h = setupRealAdmission();
-    const refused: string[] = [];
-    // Mid-turn on channel 111, the agent tries EVERY outbound tool on channel 222.
+    // A's prompt parks on this latch BEFORE any tool call, so B is admitted
+    // while A is still active and has not yet touched Discord.
+    const resumeA = deferred();
+    // What A observed once resumed. The origin read and the tool calls happen
+    // INSIDE A's prompt body, because the real admission binds the origin to
+    // the prompt's async context (the test body itself always reads run).
+    const aReport = deferred<{
+      origin: TurnOrigin;
+      crossChannel: Array<{ tool: string; outcome: string }>;
+      ownChannel: string;
+    }>();
     h.setOnTurn(async (text) => {
       if (text !== "A?") return;
-      for (const [name, params] of [
+      await resumeA.promise;
+      const origin = h.readOrigin();
+      const crossChannel: Array<{ tool: string; outcome: string }> = [];
+      for (const [tool, params] of [
         ["discord_reply", { channelId: "222", text: "sneak" }],
         ["discord_react", { channelId: "222", messageId: "mB", emoji: "✅" }],
         ["discord_fetch", { channelId: "222" }],
       ] as const) {
-        await expect(h.pi.call(name, params)).rejects.toThrow(
-          /bound to channel 111.*refusing to use channel 222/,
-        );
-        refused.push(name);
+        crossChannel.push({ tool, outcome: await attempt(h.pi, tool, params) });
       }
       // Its OWN channel is allowed.
-      await h.pi.call("discord_reply", { channelId: "111", text: "ok on A" });
+      const ownChannel = await attempt(h.pi, "discord_reply", {
+        channelId: "111",
+        text: "ok on A",
+      });
+      aReport.resolve({ origin, crossChannel, ownChannel });
     });
 
-    // A arrives; its turn starts with channel 111's origin.
+    // 1. A arrives; its turn starts with channel 111's origin and parks on the
+    //    latch before any tool call.
     h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
     await h.flush();
     expect(h.started).toEqual(["A?"]);
     expect(h.originAtStart).toEqual([{ kind: "discord", channelId: "111" }]);
 
-    // B arrives WHILE A is still running: it QUEUES — its prompt has NOT started.
+    // 2. B arrives on the other channel WHILE A is active: it QUEUES — its
+    //    prompt has NOT started.
     h.client.fire({ id: "mB", channelId: "222", content: "<@1> B?", mentionsBot: true });
     await h.flush();
     expect(h.started, "B is queued while A runs; it must not start").toEqual(["A?"]);
 
-    // Release A: it finishes, then B starts with channel 222's origin.
+    // 3. Resume A, with B already admitted. A's origin is still channel 111,
+    //    and every outbound tool aimed at B's channel is refused.
+    resumeA.resolve();
+    const report = await aReport.promise;
+    expect(report.origin).toEqual({ kind: "discord", channelId: "111" });
+    const refusal = expect.stringMatching(/bound to channel 111.*refusing to use channel 222/);
+    expect(report.crossChannel).toEqual([
+      { tool: "discord_reply", outcome: refusal },
+      { tool: "discord_react", outcome: refusal },
+      { tool: "discord_fetch", outcome: refusal },
+    ]);
+    expect(report.ownChannel).toBe("ok");
+    // Nothing reached B's channel, and B still has not started.
+    expect(h.client.replies).toEqual([{ channelId: "111", text: "ok on A", replyTo: undefined }]);
+    expect(h.client.reactions).toEqual([]);
+    await h.flush();
+    expect(h.started, "B stays queued until A ends").toEqual(["A?"]);
+
+    // 4. Only now finish A. B then starts with channel 222's origin.
     h.release("A?");
     await h.flush();
     expect(h.started).toEqual(["A?", "B?"]);
@@ -419,7 +474,6 @@ describe("wireDiscordCapability — a real queued turn keeps its own origin (iss
     // callback captures its own destination); this PR does not change routing.
     h.release("B?");
     await h.flush();
-    expect(refused).toEqual(["discord_reply", "discord_react", "discord_fetch"]);
     expect(h.client.replies).toEqual([
       { channelId: "111", text: "ok on A", replyTo: undefined },
       { channelId: "111", text: "A?::answer", replyTo: "mA" },
