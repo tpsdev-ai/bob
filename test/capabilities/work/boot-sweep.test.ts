@@ -537,6 +537,17 @@ describe("run's cwd stays inside the workspace (bob#213)", () => {
     await live.work.manager.endRun();
   });
 
+   it("accepts a directory whose name starts with dots (e.g. ..cache)", async () => {
+     live = await workSession({ script: program() });
+     const dotDir = join(live.cwd, "..cache");
+     mkdirSync(dotDir);
+     const j = await live.work.manager.start({ command: "echo ok", cwd: "..cache" }, live.cwd);
+    await j.done;
+    expect(j.outcome).toBe("exited");
+    expect(j.exitCode).toBe(0);
+    await live.work.manager.endRun();
+  });
+
   it("refuses a cwd that escapes outside the workspace", async () => {
     live = await workSession({ script: program() });
     let err: Error | undefined;
@@ -554,24 +565,26 @@ describe("run's cwd stays inside the workspace (bob#213)", () => {
   it("refuses a symlink that resolves outside the workspace", async () => {
     live = await workSession({ script: program() });
     const linkPath = join(live.cwd, "outside-link");
-    const realTarget = join(tmpdir(), "tmp");
-    try {
-      symlinkSync(realTarget, linkPath, "dir");
-    } catch {
+    // Create a real directory OUTSIDE the workspace (the target must exist
+      // or statSync rejects before the realpath check can trigger).
+      const outside = mkdtempSync(join(tmpdir(), "bob-outside-"));
+       expect(existsSync(outside)).toBe(true);
+      try {
+        symlinkSync(outside, linkPath, "dir");
+       } catch {
+        await live.work.manager.endRun();
+        throw new Error("symlink setup failed");
+       }
+       // The symlink now points outside the workspace; the run tool must refuse.
+      let err: Error | undefined;
+      try {
+        await live.work.manager.start({ command: "echo out", cwd: "outside-link" }, live.cwd);
+       } catch (e) {
+        err = e as Error;
+       }
+      expect(err).toBeDefined();
+       expect((err as Error).message).toContain("workspace");
+      expect((err as Error).message).toContain(live.cwd);
       await live.work.manager.endRun();
-      return;
-    }
-    // The symlink targets tmpdir(), which is outside this workspace.
-    // The test checks that the resolved path is rejected.
-    let err: Error | undefined;
-    try {
-      await live.work.manager.start({ command: "echo out", cwd: "outside-link" }, live.cwd);
-    } catch (e) {
-      err = e as Error;
-    }
-    expect(err).toBeDefined();
-    expect((err as Error).message).toContain("workspace");
-    expect((err as Error).message).toContain(live.cwd);
-    await live.work.manager.endRun();
-  });
+});
 });

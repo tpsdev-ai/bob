@@ -55,7 +55,8 @@ export const RESIDENT_EXCLUDED_TOOLS = [
   "edit",
   "powershell",
   "run",
-  "write_file",
+
+   "write_file",
   "edit_lines",
   "insert_after",
 ] as const;

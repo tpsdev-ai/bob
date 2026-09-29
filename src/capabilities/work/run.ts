@@ -367,7 +367,7 @@ function canonicalPath(p: string): string {
 
 function isInside(parent: string, child: string): boolean {
   const rel = relative(canonicalPath(parent), canonicalPath(child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel));
 }
 
 // An owner-only directory: a real directory (not a symlink), owned by this user,

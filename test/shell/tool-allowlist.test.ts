@@ -386,7 +386,7 @@ describe("shipped roles", () => {
   it("all registered file-writing tools are in RESIDENT_EXCLUDED_TOOLS", () => {
     const fileWriters: string[] = [];
     for (const entry of Object.values(BLESSED_CATALOG)) {
-      const tools = entry.manifest.provided?.tools ?? [];
+      const tools = entry.manifest.provides?.tools ?? [];
       for (const t of tools) {
         if (
           t.startsWith("edit_") ||
@@ -398,6 +398,20 @@ describe("shipped roles", () => {
         }
       }
     }
+    for (const tool of fileWriters) {
+      expect(RESIDENT_EXCLUDED_TOOLS).toContain(tool);
+    }
+  });
+  it("goes RED when a writer tool is not in RESIDENT_EXCLUDED_TOOLS", () => {
+    const hypotheticalTool = "write_xxx";
+    const isWriter =
+      hypotheticalTool.startsWith("edit_") ||
+      hypotheticalTool.startsWith("write_") ||
+      hypotheticalTool.startsWith("insert_") ||
+      hypotheticalTool === "run";
+    expect(isWriter).toBe(true);
+    const fileWriters: string[] = [];
+    if (isWriter) fileWriters.push(hypotheticalTool);
     for (const tool of fileWriters) {
       expect(RESIDENT_EXCLUDED_TOOLS).toContain(tool);
     }
