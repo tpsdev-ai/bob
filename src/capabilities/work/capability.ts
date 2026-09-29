@@ -17,6 +17,7 @@
 import { type TSchema, Type } from "typebox";
 import {
   type BootReap,
+  CAPTURE_MAX_BYTES,
   DEFAULT_TIMEOUT_S,
   JobManager,
   type JobManagerOptions,
@@ -61,8 +62,8 @@ const RUN_DESCRIPTION =
   `outcome is one of exited, timed_out (escalated: true means SIGKILL was needed), signalled (a signal from outside the deadline), cancelled, no_exit_status; ` +
   `cleanup_state is one of group_empty, group_killed, escaped_or_unverified, verify_unavailable. ` +
   `Only outcome exited with exit_code 0 and cleanup_state group_empty or group_killed is success. ` +
-  `stdout and stderr are captured in full to output_ref, an owner-only file outside the workspace, deleted when the bob run ends; it is same-user readable, so it is not a confidentiality boundary. ` +
-  `You get a bounded tail excerpt with secrets redacted; output_complete: false says the capture itself was cut short. ` +
+  `stdout and stderr are captured to output_ref up to ${CAPTURE_MAX_BYTES / (1024 * 1024)} MiB (bytes past that cap are counted, not kept); it is an owner-only file outside the workspace, deleted when the bob run ends, and same-user readable, so it is not a confidentiality boundary. ` +
+  `You get a bounded tail excerpt with secrets redacted; until the capture is complete, an unterminated final line is withheld. output_complete: false says the capture itself was cut short (the cap, a stopped drain, a failed write) or has gone missing. ` +
   `background: true returns a run_id at once: check it with run_status, stop it with run_cancel. Every job still running when the bob run ends is cancelled. ` +
   `Limits: A process-group backend cannot promise cleanup of descendants that leave the group. cleanup_state reports what was verified. ` +
   `run does not stop arbitrary same-user code from signalling the supervisor. It removes the builder's reason to do that; it is not a sandbox. ` +
@@ -107,6 +108,16 @@ function outputBlock(r: JobReport): string {
     notes.push(`${r.redactions} secret${r.redactions === 1 ? "" : "s"} redacted`);
   if (r.output_dropped_bytes > 0) {
     notes.push(`${PI_PRIMITIVES.formatSize(r.output_dropped_bytes)} not captured`);
+  }
+  if (r.output_tail_withheld_bytes > 0) {
+    notes.push(
+      `an unterminated final line (${PI_PRIMITIVES.formatSize(r.output_tail_withheld_bytes)}) withheld until the capture is complete`,
+    );
+  }
+  if (r.output_missing) {
+    notes.push(
+      "the capture file is GONE (removed by something outside the tool after it was written), so no excerpt can be shown",
+    );
   }
   if (r.output_excerpt.length === 0) {
     return `--- no output${r.output_bytes > 0 ? ` shown (${size} captured)` : ""}${notes.length > 0 ? `; ${notes.join("; ")}` : ""} ---`;

@@ -27,6 +27,8 @@ describe("readExcerpt", () => {
       text: "one\ntwo\n",
       truncated: false,
       redactions: 0,
+      withheld: 0,
+      missing: false,
       bytes: 8,
     });
   });
@@ -66,13 +68,29 @@ describe("readExcerpt", () => {
     expect(readExcerpt(p).text).toBe("red plain\ttab\n");
   });
 
-  it("a missing capture is an empty excerpt, not a throw", () => {
+  it("a missing capture is an empty excerpt that SAYS it is missing, not a throw", () => {
     expect(readExcerpt(join(dir, "none.log"))).toEqual({
       text: "",
       truncated: false,
       redactions: 0,
       bytes: 0,
+      withheld: 0,
+      missing: true,
     });
+  });
+
+  it("an incomplete capture withholds its unterminated final line BEFORE redaction", () => {
+    const p = join(dir, "e.log");
+    // A capture cut mid-token: the prefix and 14 of the token's 40 characters,
+    // too short for any token rule to recognize — the fragment must never show.
+    const fragment = TOKEN.slice(0, 18);
+    writeFileSync(p, `safe line\n${fragment}`);
+    const e = readExcerpt(p, { complete: false });
+    expect(e.text).toBe("safe line\n");
+    expect(e.withheld).toBe(Buffer.byteLength(fragment));
+    expect(e.text).not.toContain("ghp_");
+    // The same bytes as a COMPLETE capture show the final line (it is the end).
+    expect(readExcerpt(p, { complete: true }).text).toContain(fragment);
   });
 });
 
@@ -97,6 +115,24 @@ describe("the shared redaction set (observatory sanitize.ts)", () => {
     }
     // A plain word that merely ends in TOKEN with no assignment is left alone.
     expect(redactSecrets("the CSRF_TOKEN header is required").redactions).toBe(0);
+  });
+
+  it("redacts Authorization header values whatever the scheme, keeping the header name", () => {
+    for (const [line, secret] of [
+      ["Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"],
+      ["authorization: Token abcdef", "abcdef"],
+      ['curl -H "Authorization: Bearer abcdefgh12345678" https://x', "abcdefgh12345678"],
+      ['{"Authorization": "Digest username=u, response=r"}', "response=r"],
+      ["Proxy-Authorization: Basic Zm9vOmJhcg==", "Zm9vOmJhcg=="],
+    ]) {
+      const r = redactSecrets(line);
+      expect(r.text, line).not.toContain(secret);
+      expect(r.text, line).toMatch(/authorization["']?\s*[:=]\s*["']?\[redacted\]/i);
+      expect(r.redactions, line).toBe(1);
+    }
+    // Already redacted: not counted again. A prose mention is left alone.
+    expect(redactSecrets("Authorization: [redacted]").redactions).toBe(0);
+    expect(redactSecrets("the authorization step passed").redactions).toBe(0);
   });
 
   it("covers credentials in a URL's userinfo, keeping the host", () => {

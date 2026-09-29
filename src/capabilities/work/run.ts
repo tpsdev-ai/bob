@@ -26,7 +26,7 @@
 // user, not a sandbox. A descendant that leaves the job's process group is
 // beyond a group kill; `cleanup_state` reports only what was verified.
 
-import { type ChildProcess, execFile, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -43,6 +43,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -89,6 +90,12 @@ export const REDACTION_MARGIN_BYTES = 8 * 1024;
 // A finished run's job records are kept this long after the run ended, then the
 // next boot sweep deletes them. Output captures are deleted when the run ends.
 export const REGISTRY_RETENTION_MS = 24 * 60 * 60 * 1000;
+// A live run refreshes its run record this often. Where no sub-second process
+// identity exists (see readProcIdentity), a live pid counts as the run's
+// supervisor only while that record is fresher than HEARTBEAT_STALE_MS, so a
+// reused pid cannot hold a dead run's directory forever.
+export const HEARTBEAT_MS = 60 * 1000;
+export const HEARTBEAT_STALE_MS = 10 * 60 * 1000;
 const POLL_MS = 20;
 
 // The closing line of every result: what this tool is not.
@@ -107,7 +114,7 @@ export type CleanupState =
   | "group_killed" // the tool signalled the group and verified it empty
   | "escaped_or_unverified" // something may survive (see README)
   | "verify_unavailable"; // the tool could not check at all
-export type CancelReason = "run_cancel" | "run_end" | "abort" | "boot_reap";
+export type CancelReason = "run_cancel" | "run_end" | "abort" | "boot_reap" | "record_failed";
 export type TimeoutSource = "default" | "requested" | "clamped";
 
 type Phase = "running" | "exited" | "timing_out" | "cancelling" | "finished";
@@ -118,6 +125,75 @@ export class RunRefusal extends Error {
     super(message);
     this.name = "RunRefusal";
   }
+}
+
+// --- process identity ---------------------------------------------------------
+
+// A process pinned finer than its pid: the kernel boot, the start time in clock
+// ticks since boot, and the process group and session from the SAME /proc
+// record (Linux). A pid can be reused, even within one second; a pid AND its
+// start tick cannot in practice — the pid space would have to wrap within one
+// clock tick.
+export interface ProcIdentity {
+  boot: string;
+  start: string;
+  pgid: number;
+  sid: number;
+}
+
+// null: the process is gone (or only a zombie is left). "unsupported": this
+// platform gives no sub-second start time, so no identity can be pinned — and
+// the boot sweep then signals nothing.
+export type IdentityReader = (pid: number) => ProcIdentity | null | "unsupported";
+
+let linuxBootId: string | null | undefined;
+
+export function readProcIdentity(pid: number): ProcIdentity | null | "unsupported" {
+  if (process.platform !== "linux") return "unsupported";
+  if (linuxBootId === undefined) {
+    try {
+      linuxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+    } catch {
+      linuxBootId = null;
+    }
+  }
+  if (linuxBootId === null) return "unsupported";
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return null;
+  }
+  // "pid (comm) state ppid pgrp session ..." — comm may hold spaces or parens,
+  // so the fields are counted from the LAST ")".
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  const f = stat.slice(close + 2).split(" ");
+  const state = f[0];
+  if (state === "Z" || state === "X" || state === "x") return null;
+  const pgid = Number(f[2]);
+  const sid = Number(f[3]);
+  const start = f[19];
+  if (!Number.isSafeInteger(pgid) || !Number.isSafeInteger(sid) || !/^\d+$/.test(start ?? "")) {
+    return null;
+  }
+  return { boot: linuxBootId, start, pgid, sid };
+}
+
+export function sameIdentity(a: ProcIdentity, b: ProcIdentity): boolean {
+  return a.boot === b.boot && a.start === b.start && a.pgid === b.pgid && a.sid === b.sid;
+}
+
+function isIdentity(v: unknown): v is ProcIdentity {
+  if (v === null || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.boot === "string" &&
+    typeof o.start === "string" &&
+    typeof o.pgid === "number" &&
+    typeof o.sid === "number"
+  );
 }
 
 // --- the on-disk registry ------------------------------------------------------
@@ -137,9 +213,10 @@ export interface RegistryEntry {
   cwd: string;
   background: boolean;
   output_ref: string;
-  // `ps -o lstart=` of the group leader, taken after spawn. The boot sweep
-  // signals a dead run's group only when its leader still matches this.
-  leader_start: string | null;
+  // The group leader's pinned identity (readProcIdentity), taken right after
+  // spawn and before this record is first written. Null where the platform
+  // gives none: the boot sweep never signals a group it cannot pin.
+  leader_identity: ProcIdentity | null;
   state: "running" | "finished";
   outcome?: Outcome;
   exit_code?: number | null;
@@ -173,6 +250,11 @@ export interface JobReport {
   output_dropped_bytes: number;
   output_excerpt: string;
   output_excerpt_truncated: boolean;
+  // Bytes of an unterminated final line held back because the capture is not
+  // complete (it may be a fragment of a secret the redactor cannot recognize).
+  output_tail_withheld_bytes: number;
+  // The capture file is gone (removed by something outside the tool).
+  output_missing: boolean;
   redactions: number;
   cancel_reason: CancelReason | null;
 }
@@ -205,7 +287,7 @@ interface Job {
   cleanup: CleanupState | null;
   cancelReason: CancelReason | null;
   finishedAt: number | null;
-  leaderStart: string | null;
+  leaderIdentity: ProcIdentity | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   eof: Promise<void>;
   done: Promise<void>;
@@ -224,6 +306,10 @@ export interface JobManagerOptions {
   maxLiveJobs?: number;
   captureMaxBytes?: number;
   groupOps?: GroupOps;
+  // Seam: the process identity reader (default readProcIdentity).
+  readIdentity?: IdentityReader;
+  // Seam: the durable record writer (default: a 0600 temp file renamed into place).
+  writeRecord?: (path: string, value: unknown) => void;
   // Test seam: rewrite the leader's exit report as the OS gave it (code, signal).
   observeExit?: (
     code: number | null,
@@ -334,23 +420,6 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// The group leader's start time, as `ps` prints it (1 s resolution), in a fixed
-// locale and zone so two readings compare as strings. Null when `ps` cannot say.
-export function readLeaderStart(pid: number, timeoutMs = 2000): Promise<string | null> {
-  return new Promise((done) => {
-    execFile(
-      "ps",
-      ["-o", "lstart=", "-p", String(pid)],
-      { timeout: timeoutMs, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } },
-      (err, stdout) => {
-        if (err) return done(null);
-        const s = String(stdout).trim();
-        done(s === "" ? null : s);
-      },
-    );
-  });
-}
-
 // How many NON-zombie processes are in group `pgid`, from `ps` (synchronous, for
 // the exit path). Null when `ps` cannot say.
 function liveGroupMembers(pgid: number): number | null {
@@ -385,16 +454,27 @@ export interface Excerpt {
   truncated: boolean;
   redactions: number;
   bytes: number;
+  // Bytes of an unterminated final line withheld (only when `complete` is false).
+  withheld: number;
+  // The capture could not be opened as a regular file (removed, or replaced).
+  missing: boolean;
 }
+
+const NO_EXCERPT = { text: "", truncated: false, redactions: 0, bytes: 0, withheld: 0 };
 
 // The tail of a capture file, redacted BEFORE it is cut. The window read is the
 // excerpt size plus a margin; when it does not start at the top of the file, the
 // partial first line is dropped, so a secret straddling the window start is not
 // half-shown. The redactor runs over the whole window, then pi's truncateTail
 // makes the cut — so a secret straddling the excerpt cut is already replaced.
+//
+// `complete: false` (a running job, a capture that hit its cap, a drain that was
+// cut): the capture may end in the MIDDLE of a line — a token cut there is a
+// fragment no redaction rule recognizes — so the unterminated final line is
+// withheld before redaction. Only a complete capture shows it.
 export function readExcerpt(
   path: string,
-  opts: { maxBytes?: number; maxLines?: number; marginBytes?: number } = {},
+  opts: { maxBytes?: number; maxLines?: number; marginBytes?: number; complete?: boolean } = {},
 ): Excerpt {
   const maxBytes = opts.maxBytes ?? EXCERPT_MAX_BYTES;
   const maxLines = opts.maxLines ?? EXCERPT_MAX_LINES;
@@ -405,11 +485,11 @@ export function readExcerpt(
   try {
     fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
   } catch {
-    return { text: "", truncated: false, redactions: 0, bytes: 0 };
+    return { ...NO_EXCERPT, missing: true };
   }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile()) return { text: "", truncated: false, redactions: 0, bytes: 0 };
+    if (!st.isFile()) return { ...NO_EXCERPT, missing: true };
     const size = st.size;
     const start = Math.max(0, size - (maxBytes + margin));
     const buf = Buffer.alloc(size - start);
@@ -425,6 +505,13 @@ export function readExcerpt(
       const nl = text.indexOf("\n");
       text = nl >= 0 ? text.slice(nl + 1) : "";
     }
+    let withheld = 0;
+    if (opts.complete === false) {
+      const last = text.lastIndexOf("\n");
+      const kept = last >= 0 ? text.slice(0, last + 1) : "";
+      withheld = Buffer.byteLength(text.slice(kept.length), "utf8");
+      text = kept;
+    }
     const red = redactSecrets(plainText(text));
     const tail = truncateTail(red.text, { maxBytes, maxLines });
     return {
@@ -432,6 +519,8 @@ export function readExcerpt(
       truncated: headCut || tail.truncated,
       redactions: red.redactions,
       bytes: size,
+      withheld,
+      missing: false,
     };
   } finally {
     closeSync(fd);
@@ -459,6 +548,9 @@ export class JobManager {
   private readonly captureMaxBytes: number;
   private readonly groupOps: GroupOps;
   private readonly observeExit: NonNullable<JobManagerOptions["observeExit"]>;
+  private readonly readIdentity: IdentityReader;
+  private readonly writeRecord: (path: string, value: unknown) => void;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
   private readonly log: (msg: string) => void;
 
   constructor(opts: JobManagerOptions = {}) {
@@ -472,6 +564,8 @@ export class JobManager {
     this.captureMaxBytes = opts.captureMaxBytes ?? CAPTURE_MAX_BYTES;
     this.groupOps = opts.groupOps ?? NODE_GROUP_OPS;
     this.observeExit = opts.observeExit ?? ((code, signal) => ({ code, signal }));
+    this.readIdentity = opts.readIdentity ?? readProcIdentity;
+    this.writeRecord = opts.writeRecord ?? writeJsonAtomic;
     this.log = opts.log ?? ((m: string) => console.error(m));
     liveManagers().add(this);
   }
@@ -545,11 +639,28 @@ export class JobManager {
     const dirs = { run, jobs: join(run, "jobs"), out: join(run, "out") };
     mkdirSync(dirs.jobs, { mode: 0o700 });
     mkdirSync(dirs.out, { mode: 0o700 });
-    writeJsonAtomic(join(run, "run.json"), {
+    // Who supervises this run: the pid, this process's random instance id, and
+    // (where the platform gives one) the process's pinned identity. The boot
+    // sweep of a later bob tells a live supervisor from a reused pid with these.
+    const identity = this.readIdentity(process.pid);
+    this.writeRecord(join(run, "run.json"), {
       v: 1,
       supervisor_pid: process.pid,
+      supervisor_instance: processInstanceId(),
+      supervisor_identity: typeof identity === "object" ? identity : null,
       started_at: new Date().toISOString(),
     });
+    // The heartbeat: the run record's mtime, refreshed while this run lives.
+    const record = join(run, "run.json");
+    this.heartbeat = setInterval(() => {
+      try {
+        const now = new Date();
+        utimesSync(record, now, now);
+      } catch {
+        // the next sweep sees a stale heartbeat; nothing else depends on it
+      }
+    }, HEARTBEAT_MS);
+    this.heartbeat.unref?.();
     this.dirs = dirs;
     return dirs;
   }
@@ -689,7 +800,12 @@ export class JobManager {
       cleanup: null,
       cancelReason: null,
       finishedAt: null,
-      leaderStart: null,
+      // Pinned now, before the first durable record: the boot sweep of a later
+      // bob signals this group only if its leader still has this identity.
+      leaderIdentity: ((): ProcIdentity | null => {
+        const id = this.readIdentity(child.pid);
+        return typeof id === "object" && id !== null && id.pgid === child.pid ? id : null;
+      })(),
       deadlineTimer: null,
       eof,
       done,
@@ -720,18 +836,34 @@ export class JobManager {
     });
     child.once("exit", (code, signal) => this.onLeaderExit(job, code, signal));
 
+    // The first durable record. A job the registry does not know about could
+    // outlive a crashed supervisor with nothing left to find it, so if this
+    // write fails the job is stopped (the deadline's escalation) and verified
+    // before the refusal is returned.
+    try {
+      this.writeEntry(job);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? (err as Error).message;
+      job.phase = "cancelling";
+      job.outcome = "cancelled";
+      job.cancelReason = "record_failed";
+      await this.complete(job);
+      this.jobs.delete(runId);
+      const clean = job.cleanup === "group_empty" || job.cleanup === "group_killed";
+      throw new RunRefusal(
+        `run refused: the job record for ${runId} could not be written (${code}), so the job was stopped before it could run unrecorded. Its process group ${job.pgid} ${
+          clean
+            ? `was verified empty (cleanup_state ${job.cleanup}): nothing from it is left running`
+            : `could NOT be verified empty (cleanup_state ${job.cleanup}): something from it may survive`
+        }. Check that the job state directory ${dirs.run} is writable (a full disk?), then retry.`,
+      );
+    }
+
     // The deadline: a timer of the tool's own, independent of the child's I/O.
     job.deadlineTimer = setTimeout(
       () => void this.onDeadline(job),
       Math.max(0, job.deadlineAt - Date.now()),
     );
-
-    this.writeEntry(job);
-    const leaderStart = await readLeaderStart(job.pgid);
-    if (leaderStart !== null && job.phase !== "finished") {
-      job.leaderStart = leaderStart;
-      this.writeEntry(job);
-    }
     return job;
   }
 
@@ -892,6 +1024,52 @@ export class JobManager {
     };
   }
 
+  // The boot sweep's escalation for a group whose supervisor died: the same
+  // SIGTERM → grace → SIGKILL as the deadline, but each signal only while the
+  // leader still has its pinned identity. Identity lost before SIGTERM: nothing
+  // is signalled. Lost before escalation: SIGKILL is NOT sent. Either way the
+  // result is escaped_or_unverified, never a clean state.
+  private async terminatePinnedGroup(
+    pgid: number,
+    pinned: () => boolean,
+  ): Promise<{ signalled: boolean; escalated: boolean; cleanup: CleanupState; note: string }> {
+    if (!pinned()) {
+      return {
+        signalled: false,
+        escalated: false,
+        cleanup: "escaped_or_unverified",
+        note: "its leader's identity was lost before SIGTERM, so it was NOT signalled",
+      };
+    }
+    this.groupOps.signal(pgid, "SIGTERM");
+    if (await this.waitGroupEmpty(pgid, this.killGraceMs)) {
+      return {
+        signalled: true,
+        escalated: false,
+        cleanup: "group_killed",
+        note: "cancelled by its pinned process group (SIGTERM)",
+      };
+    }
+    if (!pinned()) {
+      return {
+        signalled: true,
+        escalated: false,
+        cleanup: "escaped_or_unverified",
+        note: "SIGTERM was sent, but its leader's identity was lost before escalation, so SIGKILL was NOT sent; members may survive",
+      };
+    }
+    this.groupOps.signal(pgid, "SIGKILL");
+    const empty = await this.waitGroupEmpty(pgid, this.reapLimitMs);
+    return {
+      signalled: true,
+      escalated: true,
+      cleanup: empty ? "group_killed" : "escaped_or_unverified",
+      note: empty
+        ? "cancelled by its pinned process group (escalated to SIGKILL)"
+        : "SIGKILL was sent to its pinned process group, but members remain",
+    };
+  }
+
   private async waitGroupEmpty(pgid: number, ms: number): Promise<boolean> {
     const until = Date.now() + ms;
     for (;;) {
@@ -947,7 +1125,7 @@ export class JobManager {
       cwd: job.cwd,
       background: job.background,
       output_ref: job.capturePath,
-      leader_start: job.leaderStart,
+      leader_identity: job.leaderIdentity,
       state: job.phase === "finished" ? "finished" : "running",
     };
     if (job.phase === "finished") {
@@ -960,7 +1138,7 @@ export class JobManager {
       if (job.cancelReason !== null) entry.cancel_reason = job.cancelReason;
       entry.finished_at = new Date(job.finishedAt ?? Date.now()).toISOString();
     }
-    writeJsonAtomic(job.entryPath, entry);
+    this.writeRecord(job.entryPath, entry);
   }
 
   // --- reports ---------------------------------------------------------------
@@ -984,9 +1162,10 @@ export class JobManager {
 
   report(job: Job, withExcerpt = true): JobReport {
     const finished = job.phase === "finished";
-    const excerpt = withExcerpt
-      ? readExcerpt(job.capturePath)
-      : { text: "", truncated: false, redactions: 0, bytes: job.captureBytes };
+    const captureComplete = this.outputComplete(job);
+    const excerpt: Excerpt = withExcerpt
+      ? readExcerpt(job.capturePath, { complete: captureComplete })
+      : { ...NO_EXCERPT, bytes: job.captureBytes, missing: false };
     const cleanup = finished ? (job.cleanup ?? "verify_unavailable") : null;
     const outcome = finished ? (job.outcome ?? "no_exit_status") : null;
     const success =
@@ -1010,11 +1189,14 @@ export class JobManager {
       pgid: job.pgid,
       elapsed_s: Math.round((end - job.startedAt) / 100) / 10,
       output_ref: job.capturePath,
-      output_complete: this.outputComplete(job),
+      // A capture that vanished after it was written is not complete either.
+      output_complete: captureComplete && !excerpt.missing,
       output_bytes: job.captureBytes,
       output_dropped_bytes: job.droppedBytes,
       output_excerpt: excerpt.text,
       output_excerpt_truncated: excerpt.truncated,
+      output_tail_withheld_bytes: excerpt.withheld,
+      output_missing: excerpt.missing,
       redactions: excerpt.redactions,
       cancel_reason: job.cancelReason,
     };
@@ -1104,11 +1286,13 @@ export class JobManager {
   }
 
   private closeRunDir(): void {
+    if (this.heartbeat !== null) clearInterval(this.heartbeat);
+    this.heartbeat = null;
     const dirs = this.dirs;
     if (dirs === null) return;
     try {
       rmSync(dirs.out, { recursive: true, force: true });
-      writeJsonAtomic(join(dirs.run, "ended.json"), {
+      this.writeRecord(join(dirs.run, "ended.json"), {
         v: 1,
         ended_at: new Date().toISOString(),
         supervisor_pid: process.pid,
@@ -1120,10 +1304,11 @@ export class JobManager {
 
   // --- boot sweep ------------------------------------------------------------
 
-  // Jobs left by a bob run whose supervisor died (its run-end sweep never ran):
-  // find them in the registry, cancel each by its recorded process group when
-  // the group's leader still matches the record, report every one, delete the
-  // dead run's output captures, and delete run records past the retention bound.
+  // Jobs left by a bob run whose supervisor is gone (its run-end sweep never
+  // ran): find them in the registry and report every one, signalling a job's
+  // group only while its leader still has the identity pinned at spawn
+  // (re-checked before each signal); delete the dead run's output captures; and
+  // sweep ENDED runs by the retention bound alone.
   async bootSweep(now = Date.now()): Promise<BootReap[]> {
     const reaped: BootReap[] = [];
     try {
@@ -1157,11 +1342,25 @@ export class JobManager {
       if (!st.isDirectory() || st.isSymbolicLink() || (uid !== undefined && st.uid !== uid)) {
         continue;
       }
-      const meta = readJson(join(dir, "run.json"));
+      const runRecord = join(dir, "run.json");
+      const meta = readJson(runRecord);
       const sup = meta?.supervisor_pid;
-      if (typeof sup !== "number" || !Number.isSafeInteger(sup) || sup <= 0) continue;
-      if (isPidAlive(sup)) continue;
+      if (meta === null || typeof sup !== "number" || !Number.isSafeInteger(sup) || sup <= 0) {
+        continue;
+      }
+      const endedPath = join(dir, "ended.json");
+      const ended = readJson(endedPath);
+      const endedAt = typeof ended?.ended_at === "string" ? Date.parse(ended.ended_at) : Number.NaN;
+      if (!Number.isNaN(endedAt)) {
+        // An ENDED run is swept by the retention bound alone, whoever holds its
+        // supervisor's pid now: captures go at once, records after the bound.
+        rmSync(join(dir, "out"), { recursive: true, force: true });
+        if (now - endedAt > REGISTRY_RETENTION_MS) rmSync(dir, { recursive: true, force: true });
+        continue;
+      }
+      if (this.supervisorAlive(meta, runRecord, now)) continue;
 
+      // The supervisor is gone (or its pid now belongs to another process).
       const jobsDir = join(dir, "jobs");
       let files: string[] = [];
       try {
@@ -1178,26 +1377,43 @@ export class JobManager {
       reaped.push(...results);
 
       rmSync(join(dir, "out"), { recursive: true, force: true });
-      const endedPath = join(dir, "ended.json");
-      const ended = readJson(endedPath);
-      let endedAt = typeof ended?.ended_at === "string" ? Date.parse(ended.ended_at) : Number.NaN;
-      if (Number.isNaN(endedAt)) {
-        endedAt = now;
-        try {
-          writeJsonAtomic(endedPath, {
-            v: 1,
-            ended_at: new Date(now).toISOString(),
-            reaped_by: process.pid,
-          });
-        } catch {
-          // best effort
-        }
-      }
-      if (now - endedAt > REGISTRY_RETENTION_MS) {
-        rmSync(dir, { recursive: true, force: true });
+      try {
+        this.writeRecord(endedPath, {
+          v: 1,
+          ended_at: new Date(now).toISOString(),
+          reaped_by: process.pid,
+        });
+      } catch {
+        // best effort: the next sweep finds the run again and retries
       }
     }
     return reaped;
+  }
+
+  // Is the recorded supervisor of a run still that process? A pid alone is not
+  // enough — pids are reused — so:
+  //   * this process's own pid counts only with this process's instance id;
+  //   * a gone pid is a dead supervisor;
+  //   * a live pid with a pinned identity on record counts only if it still
+  //     has that identity;
+  //   * a live pid with no pinned identity (a platform without one) counts
+  //     only while the run's heartbeat (its record's mtime) is fresh.
+  private supervisorAlive(meta: Record<string, unknown>, record: string, now: number): boolean {
+    const pid = meta.supervisor_pid as number;
+    if (pid === process.pid) return meta.supervisor_instance === processInstanceId();
+    if (!isPidAlive(pid)) return false;
+    const recorded = meta.supervisor_identity;
+    const current = this.readIdentity(pid);
+    if (isIdentity(recorded) && current !== "unsupported") {
+      return current !== null && sameIdentity(recorded, current);
+    }
+    let mtime: number;
+    try {
+      mtime = statSync(record).mtimeMs;
+    } catch {
+      return false;
+    }
+    return now - mtime <= HEARTBEAT_STALE_MS;
   }
 
   private async reapEntry(
@@ -1226,18 +1442,31 @@ export class JobManager {
         cleanup = "escaped_or_unverified";
         note = "its process group has a member this user may not signal";
       } else {
-        const leader = await readLeaderStart(pgid);
-        if (entry.leader_start && leader !== null && leader === entry.leader_start) {
-          const t = await this.terminateGroup(pgid);
-          cleanup = t.cleanup;
-          escalated = t.escalated;
-          signalled = true;
-          outcome = "cancelled";
-          note = "cancelled by its recorded process group";
-        } else {
+        const recorded = isIdentity(entry.leader_identity) ? entry.leader_identity : null;
+        // The group is this job's only while its leader (pid == pgid) still has
+        // the identity pinned at spawn: a group id stays in use while its leader
+        // lives, so a pinned leader pins the group. Checked again immediately
+        // before EVERY signal.
+        const pinned = (): boolean => {
+          if (recorded === null) return false;
+          const now = this.readIdentity(pgid);
+          return typeof now === "object" && now !== null && sameIdentity(recorded, now);
+        };
+        if (recorded === null) {
           cleanup = "escaped_or_unverified";
           note =
-            "its process group exists but its leader does not match the record (gone, or started at another time), so it was NOT signalled";
+            "no sub-second identity was recorded for its leader (this platform gives none), so it was NOT signalled";
+        } else if (!pinned()) {
+          cleanup = "escaped_or_unverified";
+          note =
+            "its process group exists but its leader no longer has the identity pinned at spawn (gone, or its pid was reused), so it was NOT signalled";
+        } else {
+          const t = await this.terminatePinnedGroup(pgid, pinned);
+          cleanup = t.cleanup;
+          escalated = t.escalated;
+          signalled = t.signalled;
+          if (signalled) outcome = "cancelled";
+          note = t.note;
         }
       }
     }
@@ -1256,12 +1485,12 @@ export class JobManager {
     };
     if (signalled) updated.cancel_reason = "boot_reap";
     try {
-      writeJsonAtomic(path, updated);
+      this.writeRecord(path, updated);
     } catch {
       // the log line below still reports it
     }
     this.log(
-      `work: boot sweep: ${entry.run_id} (process group ${pgid}) left by bob pid ${supervisor}, which is gone: outcome=${outcome} cleanup_state=${cleanup} — ${note}`,
+      `work: boot sweep: ${entry.run_id} (process group ${pgid}) left by bob pid ${supervisor}, which is gone or no longer that bob: outcome=${outcome} cleanup_state=${cleanup} — ${note}`,
     );
     return {
       run_id: entry.run_id,
@@ -1294,13 +1523,28 @@ const LIVE_KEY = Symbol.for("@tpsdev-ai/bob/work/live-managers");
 
 interface LiveRegistry {
   managers: Set<JobManager>;
+  // This process's random instance id, written into every run record it
+  // supervises. A later process that happens to get the same pid has another.
+  instance: string;
+}
+
+function liveRegistry(): LiveRegistry {
+  liveManagers();
+  return (globalThis as unknown as Record<symbol, LiveRegistry>)[LIVE_KEY];
+}
+
+export function processInstanceId(): string {
+  return liveRegistry().instance;
 }
 
 function liveManagers(): Set<JobManager> {
   const g = globalThis as unknown as Record<symbol, LiveRegistry | undefined>;
   let reg = g[LIVE_KEY];
   if (!reg) {
-    const created: LiveRegistry = { managers: new Set() };
+    const created: LiveRegistry = {
+      managers: new Set(),
+      instance: randomBytes(16).toString("hex"),
+    };
     reg = created;
     g[LIVE_KEY] = created;
     process.once("exit", () => {

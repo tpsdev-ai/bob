@@ -17,9 +17,10 @@ import {
   readFileSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, sep } from "node:path";
 import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
 
@@ -246,6 +247,83 @@ describe("run — output", () => {
     expect(readFileSync(String(r.details.output_ref), "utf8")).toContain(token);
   }, 20_000);
 
+  it("a secret cut exactly at the capture cap never reaches the model", async () => {
+    const token = `ghp_${"Q1w2E3r4T5".repeat(4)}`;
+    // The cap falls 14 characters into the token: "safe line\n" + "ghp_" + 14.
+    const cap = Buffer.byteLength("safe line\n") + 4 + 14;
+    live = await workSession({
+      wire: { captureMaxBytes: cap },
+      script: program(call("run", { command: `printf 'safe line\\n${token}\\nafter\\n'` })),
+    });
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.details.output_bytes).toBe(cap);
+    expect(r.details.output_complete).toBe(false);
+    expect(r.details.output_tail_withheld_bytes).toBe(18);
+    expect(r.details.output_excerpt).toBe("safe line\n");
+    // No piece of the token — not even the unrecognizable 14-character stub.
+    expect(r.text).not.toContain("ghp_");
+    expect(r.text).not.toContain(token.slice(4, 18));
+    expect(r.text).toContain("withheld until the capture is complete");
+    // The command itself still succeeded; the capture is what was cut.
+    expect(r.details.outcome).toBe("exited");
+  }, 20_000);
+
+  it("Authorization header values are redacted whatever the scheme", async () => {
+    live = await workSession({
+      script: program(
+        call("run", {
+          command:
+            "echo 'Authorization: Basic dXNlcjpwYXNz'; echo 'authorization: Token t0k3nvalue'",
+        }),
+      ),
+    });
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.text).not.toContain("dXNlcjpwYXNz");
+    expect(r.text).not.toContain("t0k3nvalue");
+    expect(r.text).toContain("Authorization: [redacted]");
+    expect(r.details.redactions).toBe(2);
+  }, 20_000);
+
+  it("a running job's unterminated final line is withheld until its capture completes", async () => {
+    live = await workSession({
+      script: program(
+        call("run", { command: "printf 'done-line\\npartial'; sleep 30", background: true }),
+        pause(400),
+        call("run_status", { run_id: "run-1" }),
+      ),
+    });
+    await live.prompt();
+    const s = lastOf(live.results, "run_status");
+    expect(s.details.state).toBe("running");
+    expect(s.details.output_excerpt).toBe("done-line\n");
+    expect(s.details.output_tail_withheld_bytes).toBe(7);
+    expect(s.text).not.toContain("partial");
+  }, 20_000);
+
+  it("a capture removed after completion is reported missing, never complete", async () => {
+    live = await workSession({
+      script: program(
+        call("run", { command: "echo hello" }),
+        effect((r) => {
+          unlinkSync(String(lastOf(r, "run").details.output_ref));
+        }),
+        call("run_status", { run_id: "run-1" }),
+      ),
+    });
+    await live.prompt();
+    const [ran, status] = live.results;
+    expect(ran.details.output_complete).toBe(true);
+    expect(status.details).toMatchObject({
+      output_missing: true,
+      output_complete: false,
+      output_excerpt: "",
+      outcome: "exited",
+    });
+    expect(status.text).toContain("the capture file is GONE");
+  }, 20_000);
+
   it("the capture lives in an owner-only directory outside the workspace", async () => {
     live = await workSession({ script: program(call("run", { command: "echo x" })) });
     await live.prompt();
@@ -258,6 +336,51 @@ describe("run — output", () => {
     expect(statSync(live.stateRoot).mode & 0o777).toBe(0o700);
     // No stray file in the workspace.
     expect(readdirSync(live.cwd)).toEqual([]);
+  }, 20_000);
+});
+
+describe("run — a job is never left running without its durable record", () => {
+  it("a failed first registry write stops the job and verifies no process from it remains", async () => {
+    let failed = false;
+    live = await workSession({
+      wire: {
+        // The first write of a JOB record fails once, as a full disk would.
+        writeRecord: (path, value) => {
+          if (!failed && path.includes(`${sep}jobs${sep}pg-`)) {
+            failed = true;
+            const err = new Error("no space left on device") as NodeJS.ErrnoException;
+            err.code = "ENOSPC";
+            throw err;
+          }
+          writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+        },
+      },
+      script: program(
+        // A command that ignores SIGTERM: stopping it needs the full escalation.
+        call("run", { command: "trap '' TERM; sleep 30 & wait", background: true }),
+        call("run_status", {}),
+        call("run", { command: "echo recovered" }),
+      ),
+    });
+    await live.prompt();
+    const [refused, list, next] = live.results;
+    expect(refused.isError).toBe(true);
+    const m = /process group (\d+)/.exec(refused.text);
+    expect(m).not.toBeNull();
+    const pgid = Number(m?.[1]);
+    try {
+      expect(refused.text).toContain("could not be written (ENOSPC)");
+      expect(refused.text).toContain("nothing from it is left running");
+      // No process from that job remains.
+      expect(groupAlive(pgid)).toBe(false);
+      // It is not an owned job, and the next job runs normally.
+      expect(list.text).toContain("This bob run has started no jobs");
+      expect(next.details).toMatchObject({ outcome: "exited", success: true });
+    } finally {
+      // If a regression left the job's group running, end it: a group id still
+      // in use cannot have been reused, so this is the tool's own job.
+      if (groupAlive(pgid)) process.kill(-pgid, "SIGKILL");
+    }
   }, 20_000);
 });
 

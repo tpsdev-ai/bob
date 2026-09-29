@@ -88,7 +88,8 @@ named error.
 
 ## Output
 
-- stdout and stderr are captured, in arrival order, to `output_ref`: a file
+- stdout and stderr are captured, in arrival order and up to a 64 MiB cap, to
+  `output_ref`: a file
   (mode 0600) in the run's own directory under an owner-only state directory,
   `<temp dir>/bob-work-<uid>/` — outside the git worktree, so it can never be a
   committable stray file, and never a shared path. `run` refuses to start when
@@ -105,15 +106,24 @@ named error.
   running as the same user.
 - The model sees a bounded tail excerpt (16 KiB, 400 lines). Before the cut, the
   window is passed through bob's existing secret redaction (the observatory's
-  `redactSecrets`: provider token shapes, bearer headers, `key=`/`token=` and
-  `*_TOKEN=`/`*_PASSWORD=`-style assignments, URL userinfo, PEM blocks, long
-  opaque runs), with a margin before the excerpt so a secret that straddles the
-  cut is redacted whole. `redactions` counts what was replaced. The full capture
-  stays local: it is never in the model transcript or a tool result, and the run
-  log records only the redacted excerpt.
-- `output_complete: false` says the capture itself was cut short: draining was
+  `redactSecrets`: provider token shapes, `Authorization` / `Proxy-Authorization`
+  header values of any scheme, `key=`/`token=` and `*_TOKEN=`/`*_PASSWORD=`-style
+  assignments, URL userinfo, PEM blocks, long opaque runs), with a margin before
+  the excerpt so a secret that straddles the cut is redacted whole. `redactions`
+  counts what was replaced. The full capture stays local: it is never in the
+  model transcript or a tool result, and the run log records only the redacted
+  excerpt.
+- **An unterminated final line is withheld until the capture is complete.**
+  While a job runs, or when its capture hit the cap, its drain was stopped or a
+  write failed, the capture can end in the middle of a line — and a token cut
+  there is a fragment no redaction rule recognizes. So the excerpt ends at the
+  last complete line, before redaction, and `output_tail_withheld_bytes` says
+  how much was held back. A finished, complete capture shows its final line.
+- `output_complete: false` says the capture itself was cut short — draining was
   stopped (see below), the capture reached its 64 MiB cap
-  (`output_dropped_bytes` counts the rest), or a write failed.
+  (`output_dropped_bytes` counts the rest), or a write failed — or that the
+  capture file has gone missing since it was written (`output_missing: true`,
+  named in the result rather than shown as an empty excerpt).
 - Draining is bounded, never by EOF: once the job's group is gone the tool waits
   at most 500 ms for the pipes to close, then stops. A pipe still open then is
   held by a descendant that left the group; the result says
@@ -128,24 +138,43 @@ named error.
 
 - Every job is recorded on disk, keyed by its process group, in the run's own
   state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`
-  (supervisor pid, deadline, the group leader's start time, command digest,
-  outcome, cleanup).
+  (supervisor pid, deadline, the group leader's pinned identity, command digest,
+  outcome, cleanup). The record is written before the job's deadline is armed;
+  if that first write fails, the job is stopped with the deadline's escalation
+  and verified, and `run` returns a refusal naming the job's process group and
+  whether it was verified empty — a job never runs without its record.
+- **Identity.** A pid can be reused, even within one second, so a pid (or a
+  1-second `ps` start time) is not an identity. On Linux the tool pins a process
+  as the boot id plus the start time in clock ticks, the process group and the
+  session, all read from `/proc/<pid>/stat`. Elsewhere (macOS included) there is
+  no sub-second start time, and nothing is pinned.
+- The run record (`run.json`) carries the supervisor's pid, a random instance id
+  for its process, its pinned identity where there is one, and a heartbeat (the
+  record's modification time, refreshed every minute while the run lives).
 - **Run end.** When pi ends the session (`session_shutdown`), every job the run
   still owns is cancelled (SIGTERM, grace, SIGKILL, verify) and each one's
   cleanup is logged. When the process exits without that event (`bob run`
   disposes its session and exits), an exit hook SIGKILLs every group the run
   still owns, records it and logs it.
-- **Boot sweep.** When the capability loads, it looks for runs whose supervisor
-  process is gone. For each job still recorded as running, it cancels the group
-  only when the group's leader still has the start time recorded for it; a
-  group it cannot match is not signalled and is reported
-  `escaped_or_unverified`. Every such job is recorded and logged
-  (`work: boot sweep: …`).
-- **Not a run-level wall clock.** `run` bounds each command; it does not bound
-  the run, and this slice changes nothing that does. The tps-mail consumer
-  bounds a mail turn with its turn timeout; `bob run` itself has no run-level
-  wall clock, so whatever starts an unattended builder must still bound it,
-  until the supervisor-owned run deadline lands (bob#210 slice 4).
+- **Boot sweep.** When the capability loads, it looks at every earlier run:
+  - An **ended** run is swept by the retention bound alone, whoever holds its
+    supervisor's pid now: its captures go at once, its records after 24 hours.
+  - A run whose supervisor is **gone** — its pid is dead; or the pid is this
+    process but the instance id is another's; or the pid is live but no longer
+    has the pinned identity; or, with no identity on record, the heartbeat is
+    more than 10 minutes stale — has its captures deleted, is marked ended, and
+    each job still recorded as running is reported.
+  - Such a job's group is signalled **only while its leader has the identity
+    pinned at spawn**, checked again immediately before every signal: SIGTERM,
+    then SIGKILL after the grace. If the identity was never pinned (no
+    sub-second start time on this platform), does not match (a reused pid, even
+    in the same second), or is lost before a signal, that signal is not sent and
+    the job is reported `escaped_or_unverified`. Every such job is recorded and
+    logged (`work: boot sweep: …`).
+- **No run-level wall clock in S1.** `run` bounds each command, not the run:
+  there is no in-bob run wall clock in this slice. An unattended launch must be
+  bounded by its launcher. An in-bob `--max-runtime` supervisor lands with S4
+  (bob#210).
 
 ## Limits (read this before trusting it as a sandbox)
 
@@ -165,9 +194,15 @@ named error.
   exits on its own after the tool last looked and before the signal lands — the
   tool reports `cancelled`: never a success, so the error is in the safe
   direction.
-- **The boot sweep is conservative.** A dead supervisor whose pid was reused
-  reads as alive and its jobs are left alone; a group whose leader is gone or
-  does not match is reported, not signalled.
+- **The boot sweep signals only what it can pin.** Where the platform gives no
+  sub-second start time (macOS included), it signals nothing: orphans of a
+  crashed run are reported `escaped_or_unverified`, and ending them is left to
+  the operator. A group whose leader is gone (its descendants still running) is
+  reported, not signalled. Between the last identity check and the signal there
+  is one system call: POSIX has no handle for a process group, so that window
+  cannot be closed from here. A live supervisor with no pinned identity whose
+  event loop stalls for more than 10 minutes reads as dead to another bob's
+  sweep, which then deletes that run's captures.
 - **POSIX only.** On Windows `run` refuses with a named error.
 
 ## Reuse
