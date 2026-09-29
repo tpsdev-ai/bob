@@ -47,6 +47,12 @@ checked. It narrows the window in which the two can differ:
 4. It releases the pin, and only then spawns, so no pin step can fail after a
    command has started.
 
+When a close of the pin's descriptor fails — on the release, or on the cleanup
+after another failed step — `run` still refuses and starts nothing, and its
+refusal says that whether the descriptor is still open is unknown: a failed
+close may or may not have released it. The refusal says the descriptor was
+closed only when the close returned.
+
 The re-check NARROWS the race; it does not close it. A window remains from the
 last re-check until the child has changed directory, because the child's
 `chdir` re-resolves the path by name: a component replaced inside that window

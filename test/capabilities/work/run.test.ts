@@ -14,6 +14,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -1026,7 +1027,7 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     await expectNothingStarted(m.file);
   }, 20_000);
 
-  it("an fstat that throws after the pin opened closes the descriptor and refuses", async () => {
+  it("an fstat that throws after the pin opened: run refuses and closes the descriptor, and says closed only because the close returned", async () => {
     const opened: number[] = [];
     const closed: number[] = [];
     const dirPinOps: DirPinOps = {
@@ -1052,7 +1053,7 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
         live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
       );
       expect(err.message).toContain("its identity could not be read (EIO)");
-      expect(err.message).toContain("The descriptor was closed");
+      expect(err.message).toContain("The descriptor that pinned it was closed.");
       expect(opened.length).toBe(1);
       expect(closed).toEqual(opened);
       await expectNothingStarted(m.file);
@@ -1068,7 +1069,7 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     }
   }, 20_000);
 
-  it("a pin close that throws refuses BEFORE anything is spawned", async () => {
+  it("a pin release whose close throws refuses BEFORE anything is spawned, and does not claim the descriptor closed", async () => {
     const dirPinOps: DirPinOps = {
       ...NODE_DIR_PIN_OPS,
       close: (fd) => {
@@ -1082,9 +1083,61 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     const err = await refusalOf(
       live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
     );
-    expect(err.message).toContain("could not be closed (EIO)");
+    expect(err.message).toContain("closing the descriptor that pinned the working directory");
+    expect(err.message).toContain(
+      "failed (EIO), so whether that descriptor is still open is unknown",
+    );
+    expect(err.message).not.toMatch(/\b(was|is) closed\b/i);
     expect(err.message).toContain("Nothing was started");
     await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a cleanup close that throws BEFORE closing is reported: run refuses, starts nothing, and does not claim the descriptor closed", async () => {
+    const opened: number[] = [];
+    let closeAttempts = 0;
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      open: (p, flags) => {
+        const fd = NODE_DIR_PIN_OPS.open(p, flags);
+        opened.push(fd);
+        return fd;
+      },
+      fstat: () => {
+        throw failure("EIO");
+      },
+      // Throws WITHOUT closing: the descriptor really is still open afterwards.
+      close: () => {
+        closeAttempts += 1;
+        throw failure("EINTR");
+      },
+    };
+    live = await workSession({ script: program(), wire: { dirPinOps } });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    try {
+      const err = await refusalOf(
+        live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+      );
+      expect(err.message).toContain("its identity could not be read (EIO)");
+      expect(err.message).toContain("Closing the descriptor that pinned it then failed (EINTR)");
+      expect(err.message).toContain("whether that descriptor is still open is unknown");
+      expect(err.message).not.toMatch(/\b(was|is) closed\b/i);
+      expect(err.message).toContain("Nothing was started");
+      expect(closeAttempts).toBe(1);
+      // The case is real: the descriptor the refusal does not vouch for IS open.
+      expect(opened.length).toBe(1);
+      expect(fstatSync(opened[0]).isDirectory()).toBe(true);
+      await expectNothingStarted(m.file);
+    } finally {
+      // The injected close never closed it; close it here so it does not leak.
+      for (const fd of opened) {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed
+        }
+      }
+    }
   }, 20_000);
 
   it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(

@@ -417,8 +417,9 @@ const errCode = (err: unknown): string =>
 
 // The file-system calls the pin makes, as a seam (like GroupOps) so a test can
 // make one of them fail — a realpath or stat that errors, an fstat that throws
-// after the open, a close that throws — and see the refusal and that nothing
-// starts. Production uses NODE_DIR_PIN_OPS.
+// after the open, a close that throws before or after it closes — and see the
+// refusal, what it says about the descriptor, and that nothing starts.
+// Production uses NODE_DIR_PIN_OPS.
 export interface DirStat {
   dev: number;
   ino: number;
@@ -491,8 +492,10 @@ function assertStillPinned(
   }
 }
 
-// Open and verify the pin. On ANY failure after the open, the descriptor is
-// closed before the refusal is thrown.
+// Open and verify the pin. On a failure after the open, the descriptor is
+// closed before the refusal is thrown, and the refusal says how that close went:
+// "closed" only when the close returned, "unknown" when it failed (a failed close
+// may or may not have released the descriptor, and this code cannot tell).
 function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
   let fd: number;
   try {
@@ -511,13 +514,14 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
       `run refused: the working directory ${dir} could not be opened to pin its identity (${code}). Nothing was started; ${remedy}.`,
     );
   }
+  let failure: RunRefusal;
   try {
     let st: DirStat;
     try {
       st = ops.fstat(fd);
     } catch (err) {
       throw new RunRefusal(
-        `run refused: the working directory ${dir} was opened to pin its identity, but its identity could not be read (${errCode(err)}). The descriptor was closed and nothing was started; retry.`,
+        `run refused: the working directory ${dir} was opened to pin its identity, but its identity could not be read (${errCode(err)}). Nothing was started; retry.`,
       );
     }
     const pin: DirPin = { fd, dev: st.dev, ino: st.ino };
@@ -525,24 +529,35 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
     assertStillPinned(ops, dir, workspace, pin, "when it was pinned");
     return pin;
   } catch (err) {
-    try {
-      ops.close(fd);
-    } catch {
-      // The refusal being thrown is what the caller needs; a failed close of a
-      // descriptor this function opened leaves nothing further it can do.
-    }
-    throw err;
+    failure =
+      err instanceof RunRefusal
+        ? err
+        : new RunRefusal(
+            `run refused: pinning the working directory ${dir} failed (${errCode(err)}). Nothing was started.`,
+          );
   }
+  // Still refusing, whatever the close does: nothing is started either way. A
+  // failed close is REPORTED, never suppressed, so the refusal never claims a
+  // closure that did not happen.
+  try {
+    ops.close(fd);
+  } catch (err) {
+    throw new RunRefusal(
+      `${failure.message} Closing the descriptor that pinned it then failed (${errCode(err)}), so whether that descriptor is still open is unknown.`,
+    );
+  }
+  throw new RunRefusal(`${failure.message} The descriptor that pinned it was closed.`);
 }
 
 // Release the pin. Called BEFORE the spawn, so a failed close refuses with
-// nothing started instead of failing after a child exists.
+// nothing started instead of failing after a child exists. A failed close may or
+// may not have released the descriptor: the refusal says that it is unknown.
 function releasePin(ops: DirPinOps, dir: string, pin: DirPin): void {
   try {
     ops.close(pin.fd);
   } catch (err) {
     throw new RunRefusal(
-      `run refused: the descriptor pinning the working directory ${dir} could not be closed (${errCode(err)}). Nothing was started: the pin is released before the spawn, so no command starts after a failed release; retry.`,
+      `run refused: closing the descriptor that pinned the working directory ${dir} failed (${errCode(err)}), so whether that descriptor is still open is unknown. Nothing was started: the pin is released before the spawn, so no command starts after a failed release; retry.`,
     );
   }
 }
