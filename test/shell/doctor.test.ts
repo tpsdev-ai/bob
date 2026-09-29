@@ -48,6 +48,8 @@ function makeHealthyAgent(opts: { home: string; name: string }): {
       "",
       "provider:",
       "  name: anthropic",
+      "  model: claude-x",
+      "  context_window: 262144",
       "",
       "tools:",
       "  allow:",
@@ -539,6 +541,78 @@ describe("runDoctor", () => {
     const mail = report.checks.find((c) => c.name === "TPS mail inbox");
     expect(mail?.detail).toContain("new=1");
     expect(mail?.detail).toContain("cur=2");
+  });
+
+  // bob#225 (item 4): a session REFUSES to start without provider.context_window
+  // (bob does not guess a window — a guess can disagree with the server). Doctor
+  // reports it first, with the exact line to add.
+  it("OK when bob.yaml declares provider.context_window", () => {
+    makeHealthyAgent({ home, name: "testbot" });
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("ok");
+    expect(c?.detail).toContain("262144");
+    expect(c?.detail).toContain("claude-x");
+  });
+
+  it("FAIL when bob.yaml declares provider.model but no provider.context_window, naming the exact line to add", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toMatch(/provider\.context_window is not declared/);
+    expect(c?.detail).toContain("claude-x");
+    expect(c?.detail).toMatch(/refuses to start/);
+    // The remedy is the exact line to add, in this agent's bob.yaml.
+    expect(c?.fix).toBe(
+      `add "context_window: <tokens>" under "provider:" in ${join(agentDir, "bob.yaml")}`,
+    );
+    expect(report.summary.fail).toBeGreaterThanOrEqual(1);
+  });
+
+  it("SKIPs the window check when bob.yaml declares no provider.model to key it to", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      ["agent:", "  id: testbot", "  role: ea", "", "provider:", "  name: anthropic", ""].join(
+        "\n",
+      ),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("skip");
   });
 });
 

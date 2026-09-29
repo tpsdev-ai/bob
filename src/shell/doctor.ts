@@ -12,6 +12,9 @@
 //   - Ed25519 keypair (private 0600, public exists)
 //   - .pi-agent/auth.json + models.json (PR-16a wrote these when
 //     provider was exe-dev-gateway)
+//   - provider.context_window (bob#225): FAILS when bob.yaml declares no
+//     context window, because a session refuses to start without one — doctor
+//     says so first, with the exact line to add
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 //   - tps-mail (bob#200): FAILS when channels.tps_mail is declared with no
@@ -44,9 +47,11 @@ import {
 } from "../capabilities/tps-mail/config.js";
 import { REFUSAL_REASONS } from "../capabilities/tps-mail/envelope.js";
 import {
+  type ProviderLimitsBlock,
   readAgentRole,
   readBlock,
   readCapabilities,
+  readProviderLimits,
   readResident,
   readTools,
   type ToolsBlock,
@@ -142,6 +147,13 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   // used to stamp) leaves the agent without a tool its role asked for and says
   // nothing. Report every offender with the fix.
   checks.push(toolAllowlistCheck(join(agentDir, "bob.yaml")));
+
+  // bob#225 (item 4): the model's context window. A session REFUSES to start
+  // without it (bob does not guess a window — a guess can disagree with the
+  // server), and the refusal fires at session creation. Report it here first,
+  // with the exact line to add, so it is heard from doctor and not from a
+  // failed run.
+  checks.push(contextWindowCheck(join(agentDir, "bob.yaml")));
 
   // Launcher — exists + executable
   const launcherPath = join(agentDir, "bin", opts.name);
@@ -288,6 +300,54 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 // drops. NEVER throws: a malformed block or a bad `resident:` value is a FAIL
 // with a fix, not a doctor crash (doctor is what you run when something is
 // wrong).
+// bob#225 (item 4): the declared context window. Every session refuses to start
+// without one (requireModelLimits), so doctor reports the SAME problem early,
+// naming the exact line to add. Read through the module the resolver reads
+// (readProviderLimits) so doctor and a session agree on what is declared.
+function contextWindowCheck(yamlPath: string): DoctorCheck {
+  const name = "provider.context_window";
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(yamlPath, "utf8");
+  } catch {
+    return { name, status: "skip", detail: `${yamlPath} unreadable` };
+  }
+
+  let block: ProviderLimitsBlock;
+  let providerBlock: Record<string, unknown> | undefined;
+  try {
+    block = readProviderLimits(yamlText);
+    providerBlock = readBlock(yamlText, "provider");
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "fix the shape of the provider: block in bob.yaml",
+    };
+  }
+
+  const model = providerBlock?.model;
+  const forModel = typeof model === "string" && model !== "" ? ` for ${model}` : "";
+  if (block.contextWindow !== undefined) {
+    return { name, status: "ok", detail: `context_window: ${block.contextWindow}${forModel}` };
+  }
+  if (typeof model !== "string" || model === "") {
+    // No provider.model to key a window to: a session refuses a bob.yaml that
+    // declares no provider pair for THAT reason, before any window is read.
+    return { name, status: "skip", detail: "no provider.model declared" };
+  }
+  return {
+    name,
+    status: "fail",
+    detail:
+      providerBlock === undefined
+        ? "no provider: block in bob.yaml — a session refuses to start without the model's context window"
+        : `provider.context_window is not declared${forModel} — a session refuses to start without the model's context window`,
+    fix: `add "context_window: <tokens>" under "provider:" in ${yamlPath}`,
+  };
+}
+
 function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   const name = "tool allowlist";
   let yamlText: string;

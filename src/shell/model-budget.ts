@@ -232,6 +232,14 @@ export interface StopAfterTurnContext {
  * compact after a checkpoint (it declined, or the compaction failed), further
  * checkpoints are off until a compaction succeeds, so a failing compaction is
  * not retried on every turn.
+ *
+ * A checkpoint is allowed ONCE PER THRESHOLD CROSSING. A compaction can succeed
+ * yet leave the context over the threshold — the context is then summarized, but
+ * a long run keeps growing, so every following turn is over it again. Without a
+ * bound, each such turn would queue another checkpoint and pi would compact on
+ * every call. So after a checkpoint, the next one waits until the context has
+ * dropped at or below the threshold; dropping below re-arms it, and a genuine
+ * re-crossing later checkpoints again.
  */
 export function installMidRunCompaction(
   session: MidRunCompactionSession,
@@ -241,6 +249,12 @@ export function installMidRunCompaction(
   // idle: may checkpoint; stopped: a checkpoint is waiting for pi's compaction;
   // suppressed: pi did not compact after the last checkpoint.
   let state: "idle" | "stopped" | "suppressed" = "idle";
+  // The threshold a checkpoint has already fired for since the context last
+  // dropped at or below it. A compaction that does not bring the context under
+  // the threshold would otherwise checkpoint again on EVERY turn; one checkpoint
+  // per crossing bounds that (see the note above).
+  let checkpointedThreshold: number | null = null;
+  let suppressLogged = false;
   const unsubscribe = session.subscribe(((event: { type?: string; result?: unknown }) => {
     if (event?.type !== "compaction_end") return;
     if (event.result !== undefined) {
@@ -274,13 +288,28 @@ export function installMidRunCompaction(
       const usage = context.message.usage;
       if (!settings.enabled || contextWindow <= 0 || usage === undefined) return false;
       const contextTokens = calculateContextTokens(usage as never);
+      const thresholdTokens = contextWindow - settings.reserveTokens;
       if (contextTokens <= 0 || !shouldCompact(contextTokens, contextWindow, settings)) {
+        // At or below the threshold: a later crossing may checkpoint again.
+        checkpointedThreshold = null;
+        suppressLogged = false;
         return false;
       }
-      const thresholdTokens = contextWindow - settings.reserveTokens;
+      if (checkpointedThreshold === thresholdTokens) {
+        // This crossing already checkpointed; a compaction (successful or not)
+        // left the context over the threshold. Wait for it to drop below.
+        if (!suppressLogged) {
+          suppressLogged = true;
+          log(
+            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint; not checkpointing again until it drops below, so a compaction that cannot shrink the context is not repeated on every call`,
+          );
+        }
+        return false;
+      }
       // Queue the continuation FIRST: a stop without a queued message would end
       // the run after pi's compaction. A steer that cannot be queued means no stop.
       await session.steer(checkpointText({ contextTokens, thresholdTokens, contextWindow }));
+      checkpointedThreshold = thresholdTokens;
       state = "stopped";
       log(
         `bob: context ${contextTokens} tokens is over the compaction threshold (${thresholdTokens} of ${contextWindow}); compacting between model calls`,
