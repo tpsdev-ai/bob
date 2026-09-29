@@ -1,0 +1,1 @@
+- **`bob init` stamps a policy that loads for every role:** the role's ceiling intersected with the tools that can exist for that agent (pi's built-ins plus the tools of the capabilities bob stamps). A fresh agent no longer carries a name nothing can register. (`test/shell/init.test.ts`)

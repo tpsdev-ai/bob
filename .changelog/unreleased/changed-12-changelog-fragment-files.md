@@ -1,0 +1,1 @@
+- **Changelog entries are now one file per change under `.changelog/unreleased/` (bob#236).** Two pull requests no longer edit the same `[Unreleased]` lines, so they stop conflicting; `scripts/changelog-fragments.mjs` checks, renders, lists and promotes them, CI runs `check`, and the entries that were in `[Unreleased]` moved into fragments in the same change.

@@ -1,0 +1,1 @@
+- **Non-interactive prompts are sent as text:** bob's own runner passes `expandPromptTemplates: false`, so no command, prompt-template or skill expansion can interpret a mail body or a task prompt. (`test/shell/session.test.ts`, `run.test.ts`)

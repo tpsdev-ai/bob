@@ -1,0 +1,67 @@
+# Changelog fragments
+
+One file per change. Two pull requests never edit the same file, so the
+`[Unreleased]` section of `CHANGELOG.md` stopped being a guaranteed merge
+conflict — and nobody loses a review round to resolving one (bob#236).
+
+## Adding an entry
+
+Create `<category>-<slug>.md` in this directory:
+
+```
+.changelog/unreleased/fixed-doctor-reply-transport.md
+```
+
+- **category** — the text before the first hyphen. One of `added`, `changed`,
+  `deprecated`, `removed`, `fixed`, `security` ([Keep a
+  Changelog](https://keepachangelog.com/en/1.1.0/)). It determines which
+  `### Heading` the entry lands under.
+- **slug** — everything after it. Make it descriptive; you own uniqueness. A
+  PR number works but is not expected — the branch is usually pushed before the
+  PR number exists.
+
+The file contains the entry **exactly as it should appear** under its heading,
+including the leading `- ` and a 2-space indent on continuation lines:
+
+```markdown
+- **The thing that changed, in bold.** What it means for someone running bob,
+  and what they have to do about it (usually nothing).
+
+  A second paragraph, indented two spaces so it stays inside the list item.
+```
+
+**The bold lede is required, ≤ 25 words and one sentence.** The GitHub release
+renderer keeps that lede, up to three issue links, and any Heads-up lines —
+nothing else. A long lede *is* the dump; move detail into the body. `check`
+fails naming the fragment, its word count, and this rule.
+
+Assembly is a pure join — no reflow, no re-indent, no rewrapping — so tables and
+nested code blocks survive verbatim. The flip side is that a fragment which is
+not already a well-formed list item is a hard error rather than something the
+tooling quietly fixes up: silent normalisation is how content goes missing.
+
+## Checking your work
+
+```bash
+node scripts/changelog-fragments.mjs render   # preview the assembled section
+node scripts/changelog-fragments.mjs list     # what is staged, by category
+node scripts/changelog-fragments.mjs check    # what CI runs
+```
+
+CI runs `check` on every PR: it fails on a malformed fragment (a bad name, a
+missing or over-long bold lede, a body that is not a list item, an odd
+continuation indent, or a fragment holding more than one entry) and on a
+hand-written entry left in `[Unreleased]`.
+
+## At release time
+
+`node scripts/changelog-fragments.mjs promote <version> [--date=YYYY-MM-DD]`
+assembles every fragment into a `## [<version>] - <date>` section in
+`CHANGELOG.md`, in Keep a Changelog category order and by filename within each
+category, then deletes the fragments. Entry order within a category carries no
+meaning; stability does, and filename sort is stable across machines and
+filesystems.
+
+Do not add entries directly to `## [Unreleased]` in `CHANGELOG.md`. `promote`
+replaces that section's body, so a hand-written entry there is lost — which is
+why both `check` and `promote` refuse when they find one.
