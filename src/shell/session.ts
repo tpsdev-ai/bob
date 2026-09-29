@@ -49,6 +49,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { ADMIN_PASS_ENV } from "./flair-pair.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -994,6 +995,12 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       process.env[key] = value;
     }
     process.env.BOB_PERSISTENT = config.persistent ? "1" : "";
+    // The operator's Flair password never enters an agent session: bob's CLI
+    // takes it out of the environment at startup (takeFlairAdminPassFromEnv),
+    // and every session — onboard's interview, align's check-in, run, launch,
+    // persistent — is built here, so this door removes it again for any other
+    // entry path before a capability, extension, tool or child process starts.
+    delete process.env[ADMIN_PASS_ENV];
 
     const modelRuntime =
       (input.modelRuntime as ModelRuntime | undefined) ??
