@@ -176,12 +176,20 @@ change one, the named test is what tells you.
    to whoever runs `bob` as that OS user. They run under a FIXED setup policy of
    `read` and `write_soul`, which may exceed the role's ceiling — the interview's
    job is to write `soul.md`. `write_soul` is bob's OWN tool (`src/shell/write-soul.ts`):
-   it takes content only and its one target is the agent's own `soul.md`,
-   resolved by bob and never by a tool argument, so a setup session can write
-   `soul.md` and nothing else — not `bob.yaml`, not an override, not a grant, not
-   a file outside the agent directory. A model can only reach these commands
-   through a shell tool, and a shell can already write files; the exception is
-   now a single soul.md write rather than pi's unrestricted `write`. *(`test/shell/onboard.test.ts`,
+   it takes `content` and nothing else, and its one target is `soul.md` in the
+   directory the session runs as — bound by bob before the session starts (an
+   `--agent-dir` naming a different directory is refused), never by a tool
+   argument. It refuses a symlink in any component of that path and pins the
+   agent directory with one open handle: on Linux the temp creation, rename and
+   cleanup resolve through that handle; on macOS, where Node has no fd-relative
+   calls, the path is re-verified against it immediately before each of them, so
+   a directory swapped inside that window is not prevented, but a redirected
+   creation or rename is detected and never reported as a success. A setup
+   session can write that `soul.md` and nothing else — not `bob.yaml`, not an
+   override, not a grant, not a file outside the agent directory. A model can
+   only reach these commands through a shell tool, and a shell can already write
+   files; the exception is now a single soul.md write rather than pi's
+   unrestricted `write`. *(`test/shell/onboard.test.ts`,
    `align.test.ts`, `write-soul.test.ts`)*
 2. **The policy governs MODEL-callable tools.** The interactive TUI's `!` and
    `!!` run the operator's own shell and are out of scope.

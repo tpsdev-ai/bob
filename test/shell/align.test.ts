@@ -3,10 +3,19 @@
 // Same session shape as onboarding (bob's ONE factory through pi's
 // InteractiveMode, under the fixed setup policy), so this file asserts the
 // alignment-specific parts: soul.md must exist, the meta-prompt frames drift,
-// the setup policy is the fixed read + write, and the soul hash tells us
+// the setup policy is the fixed read + write_soul, write_soul is bound to the
+// directory the session runs as, and the soul hash tells us
 // whether the check-in actually produced an update.
 import { afterEach, describe, expect, it } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runAlign } from "../../src/shell/align.js";
@@ -60,7 +69,8 @@ function scaffoldAgent(
   role = "ea",
   provider: { name: string; model: string } = { name: "anthropic", model: "claude-sonnet-4-6" },
 ): void {
-  const root = mkdtempSync(join(tmpdir(), "bob-align-"));
+  // Canonical: write_soul is bound to the realpath of the agents root.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-align-")));
   agentDir = join(root, "testbot");
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
   mkdirSync(join(agentDir, "work"), { recursive: true });
@@ -217,6 +227,35 @@ describe("runAlign", () => {
         sessionRunner: fakeRunner({}).runner,
       }),
     ).rejects.toThrow(/invalid agent name/);
+  });
+
+  // bob#204: write_soul is bound to the directory the session RUNS AS
+  // (resolveRunConfig's), never to a requested --agent-dir naming another agent.
+  it("refuses `align testbot --agent-dir <other>` before the session starts; other's soul.md is untouched", async () => {
+    scaffoldAgent();
+    const other = join(dirname(agentDir), "other");
+    mkdirSync(other);
+    writeFileSync(join(other, "soul.md"), "other persona\n");
+    // A runner that does what write_soul does: write the soul.md it is BOUND to.
+    const bound: string[] = [];
+    const runner: SessionRunner = async (input) => {
+      bound.push(String(input.config.setupSoulPath));
+      if (input.config.setupSoulPath) writeFileSync(input.config.setupSoulPath, "rewritten\n");
+      return 0;
+    };
+    await expect(
+      runAlign({ name: "testbot", agentDir: other, sessionRunner: runner }),
+    ).rejects.toThrow(/refusing to start - the agent directory \S*other is not testbot's/);
+    expect(bound).toEqual([]);
+    expect(readFileSync(join(other, "soul.md"), "utf8")).toBe("other persona\n");
+    expect(readFileSync(join(agentDir, "soul.md"), "utf8")).toBe("current persona\n");
+  });
+
+  it("binds write_soul to the directory resolveRunConfig resolved, whatever spelling names it", async () => {
+    scaffoldAgent();
+    const { runner, runs } = fakeRunner({});
+    await runAlign({ name: "testbot", agentDir: `${agentDir}/work/../`, sessionRunner: runner });
+    expect(runs[0].config.setupSoulPath).toBe(join(agentDir, "soul.md"));
   });
 });
 

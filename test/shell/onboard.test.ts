@@ -5,12 +5,12 @@
 // seam is a session runner, not a fake child process.
 //
 // The exception this file pins: onboarding and alignment run under the FIXED
-// setup policy (read + write) — which may EXCEED the role's ceiling. They are
+// setup policy (read + write_soul) — which may EXCEED the role's ceiling. They are
 // privileged local setup commands available to whoever runs bob as that OS
 // user, and the interview's whole job is to WRITE the persona (see README
 // "Stated exceptions").
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runOnboard, type SessionRunner } from "../../src/shell/onboard.js";
@@ -61,7 +61,8 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
 let agentDir: string;
 
 function scaffoldAgent(role = "ea"): void {
-  const root = mkdtempSync(join(tmpdir(), "bob-onboard-"));
+  // Canonical: write_soul is bound to the realpath of the agents root.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-onboard-")));
   agentDir = join(root, "testbot");
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
   mkdirSync(join(agentDir, "work"), { recursive: true });
@@ -150,6 +151,19 @@ describe("runOnboard", () => {
     // registers write_soul bound to it and to nothing else.
     expect(run.config.setupSoulPath).toBe(join(agentDir, "soul.md"));
     expect(run.initialMessage).toContain("testbot");
+  });
+
+  it("refuses an agent directory that is not the one the interview runs as (bob#204)", async () => {
+    scaffoldAgent();
+    const other = join(dirname(agentDir), "other");
+    mkdirSync(other);
+    writeFileSync(join(other, "soul.md"), "other persona\n");
+    const { runner, runs } = fakeRunner({});
+    await expect(runOnboard(options({ agentDir: other, sessionRunner: runner }))).rejects.toThrow(
+      /refusing to start - the agent directory \S*other is not testbot's/,
+    );
+    expect(runs).toEqual([]);
+    expect(readFileSync(join(other, "soul.md"), "utf8")).toBe("other persona\n");
   });
 
   it("maps a bob provider name to pi's provider id", async () => {

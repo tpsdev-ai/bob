@@ -13,14 +13,16 @@
 // ceiling: onboarding and alignment are privileged local setup commands
 // available to whoever runs bob as that OS user (see README "Stated
 // exceptions"). `write_soul` is bob's own tool (write-soul.ts): it takes content
-// only and can write the agent's own soul.md and nothing else (bob#204).
+// only and can write the soul.md of the agent the session runs as, and nothing
+// else (bob#204).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, resolve } from "node:path";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
+import { bindSetupSoulTarget } from "./write-soul.js";
 
 export interface OnboardOptions {
   // Agent identity (must already exist on disk via initAgent).
@@ -101,17 +103,24 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   if (!ROLE_NAME.test(opts.role)) {
     throw new Error(`invalid role: ${JSON.stringify(opts.role)} (must match ${ROLE_NAME})`);
   }
-  const soulPath = join(opts.agentDir, "soul.md");
-  const soulHashBefore = hashFile(soulPath);
-
   // The interview session runs the agent's OWN config (bob.yaml capabilities,
   // cwd, credentials) with the interview meta-prompt appended, and the fixed
   // setup policy — never the role's ceiling, which is what makes the interview
   // able to write soul.md at all.
-  const { config } = resolveRunConfig({
+  const requestedAgentDir = resolve(opts.agentDir);
+  const { config, agentDir: runAgentDir } = resolveRunConfig({
     name: opts.name,
-    agentsRoot: dirname(opts.agentDir),
+    agentsRoot: dirname(requestedAgentDir),
   });
+  // bob#204: write_soul is bound to the directory the session RUNS AS; an
+  // agent directory that is not that one is refused before the session starts.
+  const { soulPath } = bindSetupSoulTarget({
+    command: "bob onboard",
+    name: opts.name,
+    requestedAgentDir,
+    runAgentDir,
+  });
+  const soulHashBefore = hashFile(soulPath);
   const sessionConfig: RunSessionConfig = {
     ...config,
     provider: mapBobProviderToPi(opts.provider),
