@@ -19,8 +19,117 @@
 //     connect() (login). Only the PERSISTENT runtime calls connect(); a one-shot
 //     run gets the outbound REST tools with no gateway, no duplicate login.
 
-import { Client, Events, GatewayIntentBits, type Message, Routes } from "discord.js";
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  type Message,
+  type RESTOptions,
+  Routes,
+} from "discord.js";
 import type { DiscordClient, DiscordMessage } from "../../shell/discord-types.js";
+
+// The REST request function this binding hands to discord.js, replacing
+// @discordjs/rest's own strategy.
+//
+// @discordjs/rest returns a response built with `new Headers(res.headers)`.
+// Under Node, its default strategy uses the `undici` package the lockfile
+// pins, and undici negotiates HTTP/2 by default; Discord's edge serves h2, and
+// Node's http2 client tags the response headers object with a
+// `Symbol(sensitiveHeaders)` key. undici's Headers constructor rejects that
+// symbol ("Key Symbol(sensitiveHeaders) in init is a symbol, which cannot be
+// converted to a ByteString"), so EVERY REST call fails — the gateway never
+// connects and no Discord message is sent or received.
+//
+// The runtime's global `fetch` does not go through the pinned `undici` package
+// and has no such problem, so the capability performs the request itself. The
+// REST manager builds the init: an uppercase `method`, a `body` (a JSON string
+// for this binding's calls, or null for GET/HEAD), `headers` (a plain object of
+// string values) and an `AbortSignal`. We forward exactly those, copying the
+// headers by their OWN enumerable string keys only, so no symbol-keyed entry
+// (the `sensitiveHeaders` one included) can reach a Headers constructor.
+//
+// Two things the manager offers are deliberately NOT forwarded:
+//
+//   * `dispatcher` / agent. @discordjs/rest only sets one when a caller gives
+//     the manager an agent, and this binding never does (DiscordJsClient never
+//     calls setAgent); in this capability the value is always absent. When a
+//     caller did set one it is an npm-undici dispatcher, and Node's global
+//     fetch rejects a foreign dispatcher ("invalid onRequestStart method"), so
+//     forwarding it would fail every request — the same class of failure this
+//     function exists to remove. We drop it instead of passing it through.
+//
+//   * redirects. A followed cross-origin redirect drops the Authorization
+//     header, so an authenticated call could leave the process unauthenticated;
+//     and the Discord API does not redirect. We ask fetch not to follow and turn
+//     any 3xx into an error that names the status and the target host.
+//
+// Derive the host a redirect points at, for the error text. A missing or
+// unparseable Location is named as such, never assumed benign.
+function redirectTargetHost(location: string | null, base: string): string {
+  if (!location) return "an unspecified location";
+  try {
+    return new URL(location, base).host;
+  } catch {
+    return "an unparseable location";
+  }
+}
+
+/**
+ * Copy the string-valued headers of any HeadersInit form: a Headers-like object
+ * (anything with forEach, including another fetch implementation's Headers), an
+ * array of [name, value] pairs, or a plain object. Only string names and values
+ * are kept; a symbol-keyed entry (what undici attaches to raw response headers)
+ * never reaches the runtime's Headers constructor.
+ */
+export function copyStringHeaders(source: unknown): Headers {
+  const headers = new Headers();
+  if (source == null) return headers;
+  if (Array.isArray(source)) {
+    for (const pair of source) {
+      if (Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") {
+        headers.append(pair[0], pair[1]);
+      }
+    }
+  } else if (typeof (source as { forEach?: unknown }).forEach === "function") {
+    (source as { forEach: (cb: (value: unknown, name: unknown) => void) => void }).forEach(
+      (value, name) => {
+        if (typeof name === "string" && typeof value === "string") headers.append(name, value);
+      },
+    );
+  } else if (typeof source === "object") {
+    for (const [name, value] of Object.entries(source as Record<string, unknown>)) {
+      if (typeof value === "string") headers.set(name, value);
+    }
+  }
+  return headers;
+}
+
+export async function makeDiscordRestRequest(
+  url: string,
+  init: Parameters<RESTOptions["makeRequest"]>[1],
+): Promise<Response> {
+  const headers = copyStringHeaders(init.headers);
+  const res = await fetch(url, {
+    method: init.method ?? "GET",
+    headers,
+    body: (init.body ?? undefined) as NonNullable<Parameters<typeof fetch>[1]>["body"],
+    signal: init.signal ?? undefined,
+    redirect: "manual",
+  });
+  if (res.status >= 300 && res.status < 400) {
+    // Attempt to cancel the unread body before rejecting the redirect; a failed
+    // cancel must not replace the redirect error below.
+    await res.body?.cancel().catch(() => {});
+    throw new Error(
+      `discord REST: refusing to follow a redirect (HTTP ${res.status} to ${redirectTargetHost(
+        res.headers.get("location"),
+        url,
+      )})`,
+    );
+  }
+  return res;
+}
 
 export interface DiscordJsClientOptions {
   // Bot token. Read from a secret file in production; passed inline in
@@ -71,6 +180,10 @@ export class DiscordJsClient implements DiscordClient {
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.MessageContent,
       ],
+      // Give the REST manager a request path that never builds a Headers from an
+      // h2-tagged response (see makeDiscordRestRequest). Without this, the
+      // capability cannot make ANY REST call under Node.
+      rest: { makeRequest: makeDiscordRestRequest as RESTOptions["makeRequest"] },
     });
     // Enable the REST manager WITHOUT logging in — outbound works in a one-shot
     // run with no gateway connection. (login() also sets the token; doing it

@@ -28,9 +28,10 @@
 // version, chain length and shape, chain tip == from, human entries unsigned,
 // every agent-kind chain entry verified over jcs({prior, entry-without-sig}),
 // the outer signature over jcs(envelope-without-signature), the wrapper/
-// envelope `from` binding, recipient == this mailbox, messageId and timestamp
-// shape. The CLI's replay ledger is replaced by the consumer's replied/ marker,
-// keyed on the same signed messageId.
+// envelope `from` binding, recipient == this mailbox, messageId shape, the
+// replyToId shape when the envelope carries one (tpsdev-ai/cli#431), and the
+// timestamp shape. The CLI's replay ledger is replaced by the consumer's
+// replied/ marker, keyed on the same signed messageId.
 
 import { createHash, createPublicKey, verify as verifyEd25519 } from "node:crypto";
 import { TPS_AGENT_ID } from "./config.js";
@@ -115,6 +116,13 @@ export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 // re-delivery and across a relay hop, unlike the record's local `id` — and it
 // becomes a filename and an argv element, so its shape is strict.
 export const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+// The CLI's ONE envelope-id rule (tpsdev-ai/cli#431, envelope-id.ts), which
+// its receipt policy applies to a signed `replyToId` when one is present: 1-128
+// letters, digits, dots, underscores or hyphens. bob never reads the reply-to,
+// but it must not accept an envelope the CLI's own consumer dead-letters, so it
+// applies the CLI's rule exactly — neither wider nor narrower.
+export const ENVELOPE_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 export interface AcceptedMail {
   kind: "accept";
@@ -338,6 +346,13 @@ async function decideRecord(record: unknown, opts: DecideOptions): Promise<Inbou
   const messageId = envelope.messageId;
   if (typeof messageId !== "string" || !MESSAGE_ID.test(messageId)) {
     return refuse("malformed", "the envelope messageId is missing or not a safe id");
+  }
+  // A threaded envelope (`tps mail send --reply-to`) signs the id it answers.
+  // Present but outside the CLI's id rule — null included — is refused, as
+  // the CLI refuses it on receipt. The value is never echoed.
+  const replyToId = envelope.replyToId;
+  if (replyToId !== undefined && (typeof replyToId !== "string" || !ENVELOPE_ID.test(replyToId))) {
+    return refuse("malformed", "the envelope replyToId is not a valid envelope id");
   }
   if (typeof envelope.timestamp !== "string" || Number.isNaN(Date.parse(envelope.timestamp))) {
     return refuse("malformed", "the envelope timestamp is missing or not ISO-8601");

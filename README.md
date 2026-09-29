@@ -585,7 +585,9 @@ consumer. For each file in `new/`, oldest first by filename:
 - **Accepting, before any session exists.** The inner signed envelope is
   verified against the sender's key as registered in the agent's Flair (the same
   source `tps` verifies against); its signed `from` must equal the record's
-  `from` and any `X-TPS-Sender` header; it must be addressed to this agent; and
+  `from` and any `X-TPS-Sender` header; it must be addressed to this agent; a
+  signed `replyToId`, when the envelope carries one, must fit the CLI's
+  envelope-id rule (the CLI's own consumer refuses one that does not); and
   the verified id must be on `senders:`. Anything else — unsigned, a bad
   signature, an unregistered key, a mismatch, a sender not on the list — is moved
   to `<inbox>/refused/` with a `.reason` file, counted, and never answered.
@@ -693,8 +695,12 @@ old onboard scaffold, which nothing reads) without the capability; when the
 `tps-mail:` block is invalid — an empty `senders:` above all, which also makes
 the capability refuse to load; when the agent has no Flair identity; when the
 inbox is missing, or its `replied/` directory cannot be fsynced; when this host
-is not a TPS delivery target (no joined branch and no office identity, #134); or
-when `tps` or the agent's signing key is missing. It checks the EFFECTIVE
+is not a TPS delivery target (no joined branch and no office identity, #134);
+when `tps` or the agent's signing key is missing; or when that `tps` does not
+take the reply contract, `mail send --stdin --reply-to` — doctor asks the CLI
+itself (`tps mail --help`, fixed argv, no shell, an environment of `PATH` and
+`HOME` only, a 10 s bound) and fails unless its mail usage names both flags; a
+probe that cannot start, times out or exits non-zero fails too. It checks the EFFECTIVE
 capabilities — the set the persistent runtime starts — so a `tps-mail` that
 `bob.yaml` declares but an agent's position grant or a local override disables
 is reported as DISABLED, not checked as if it ran. It reports refused mail per
@@ -702,12 +708,13 @@ reason, mail held for inspection, turn failures, reply failures, marker
 failures and an exhausted process-group reap.
 
 **Stated limits.** The reply needs a `tps` that accepts `tps mail send <to>
---stdin --reply-to <messageId>`; `tps` 0.7.0 takes the body only as an argument
-and has no reply-to option, so with it every reply fails closed — counted and
-retried, never sent unthreaded or with the body on a command line. `tps` signs
-with `~/.flair/keys/<agent>.key` and, as of 0.7.0, does not read the PEM key
-`bob onboard` writes there. `bob doctor` checks `tps` on its own `PATH`; a
-service unit's `PATH` can differ.
+--stdin --reply-to <messageId>`. tpsdev-ai/cli#431 added that, together with
+reading the PEM key `bob onboard` writes to `~/.flair/keys/<agent>.key` and
+refusing any send it cannot sign. `tps` 0.7.0 and older take the body only as an
+argument, have no reply-to option and do not read that key, so with them every
+reply fails closed — counted and retried, never sent unthreaded or with the
+body on a command line — and `bob doctor` fails the reply contract. Doctor
+checks the `tps` on its own `PATH`; a service unit's `PATH` can differ.
 
 ### `reachy` (jarvis) — S3 skeleton
 
