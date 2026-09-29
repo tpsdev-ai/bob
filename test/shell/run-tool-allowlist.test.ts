@@ -95,10 +95,10 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
       // Outside the workspace is refused — the ACTIVE tool is the confined one.
       await expect(
         read.execute("c", { path: join(outside, "secret.txt") }, undefined, undefined),
-      ).rejects.toThrow(/outside the agent's workspace/);
+      ).rejects.toThrow(/does not resolve to a file inside the agent's workspace/);
       // A credential file inside the workspace is refused.
       await expect(read.execute("c", { path: "auth.json" }, undefined, undefined)).rejects.toThrow(
-        /credential path/,
+        /credential file/,
       );
     } finally {
       resident.dispose();

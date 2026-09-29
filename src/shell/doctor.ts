@@ -277,6 +277,11 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   return finalize(opts.name, agentDir, checks);
 }
 
+// bob#230: the capabilities that open an INBOUND chat surface. Each is served
+// only by the persistent runtime (discord's gateway opens under BOB_PERSISTENT;
+// the tps-mail consumer is started by startPersistent).
+const INBOUND_CHAT_CAPABILITIES: ReadonlySet<string> = new Set(["discord", "tps-mail"]);
+
 // The `tools:` allowlist check. Audits every name in the agent's bob.yaml
 // against the tools pi and the blessed capabilities can actually enable, and
 // reports a resident agent whose allowlist asks for a tool the resident policy
@@ -396,7 +401,35 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
     };
   }
 
-  const dropped = residentDroppedTools(policy);
+  // bob#230: judge residency as the SERVICE runs it. An inbound chat surface
+  // (discord's gateway, the tps-mail consumer) is served only by the persistent
+  // runtime, and the persistent runtime is resident whether or not bob.yaml
+  // says `resident: true` (persistent.ts resolves with persistent: true). So a
+  // chat-facing agent is checked against the policy its service holds.
+  const chat = [...declaredCapabilities].filter((c) => INBOUND_CHAT_CAPABILITIES.has(c));
+  const persistentService = chat.length > 0 && !policy.resident;
+  let servicePolicy = policy;
+  if (persistentService) {
+    try {
+      servicePolicy = resolveAgentToolPolicy(yamlText, { persistent: true });
+    } catch (err) {
+      return {
+        name,
+        status: "fail",
+        detail: err instanceof Error ? err.message : String(err),
+        fix: "fix the tools: block (or the agent.role it widens past) in bob.yaml",
+      };
+    }
+  }
+  const residency = persistentService
+    ? `the persistent service (resident by definition; it serves ${chat.join(", ")})`
+    : "resident: true";
+
+  // Every warning that applies is reported — none returns before another is
+  // checked, so a dropped writer tool cannot hide the read-and-chat warning.
+  const warnings: Array<{ detail: string; fix: string }> = [];
+
+  const dropped = residentDroppedTools(servicePolicy);
   if (dropped.length > 0) {
     // The grant lives in the ROLE (roles/<role>/role.json), not in bob.yaml:
     // bob.yaml may only narrow the role's list, so setting
@@ -407,14 +440,12 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
     // still leave the tools dropped.
     const role = readAgentRole(yamlText) ?? "<role>";
     const denial = block.allowResidentShell === false;
-    return {
-      name,
-      status: "warn",
-      detail: `resident: true drops ${dropped.join(", ")}, which the role allows`,
+    warnings.push({
+      detail: `${residency} drops ${dropped.join(", ")}, which the role allows`,
       fix: denial
         ? `grant it in roles/${role}/role.json (tools.allowResidentShell: true) AND remove tools.allowResidentShell: false from bob.yaml — the grant lives in the role, and bob.yaml may only narrow it, but the explicit false in bob.yaml denies the grant even once the role gives it — or drop ${dropped.join(", ")} from tools.allow`
         : `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
-    };
+    });
   }
 
   // bob#230: a resident agent that holds `read` alongside an inbound chat
@@ -422,16 +453,25 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   // channel messages. read is now confined to the workspace and refuses the
   // agent's credentials, but a chat-facing resident role rarely needs any
   // file-read reach — warn so keeping it is a decision, not an accident.
-  if (policy.resident && !excludedTools.has("read") && policy.tools.includes("read")) {
-    const chat = [...declaredCapabilities].filter((c) => c === "discord" || c === "tps-mail");
-    if (chat.length > 0) {
-      return {
-        name,
-        status: "warn",
-        detail: `resident: true holds read alongside an inbound chat capability (${chat.join(", ")}); read is confined to the workspace, but a chat-facing resident role usually needs no file-read reach`,
-        fix: `drop read from tools.allow, or remove the chat capability (${chat.join(", ")})`,
-      };
-    }
+  if (
+    servicePolicy.resident &&
+    chat.length > 0 &&
+    servicePolicy.tools.includes("read") &&
+    !servicePolicy.excludeTools.includes("read")
+  ) {
+    warnings.push({
+      detail: `${residency} holds read alongside an inbound chat capability (${chat.join(", ")}); read is confined to the workspace, but a chat-facing resident role usually needs no file-read reach`,
+      fix: `drop read from tools.allow, or remove the chat capability (${chat.join(", ")})`,
+    });
+  }
+
+  if (warnings.length > 0) {
+    return {
+      name,
+      status: "warn",
+      detail: warnings.map((w) => w.detail).join("; AND "),
+      fix: warnings.map((w) => w.fix).join("; AND "),
+    };
   }
 
   return {

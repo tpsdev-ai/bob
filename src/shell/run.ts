@@ -71,7 +71,7 @@ import {
   readWorktreeStatus,
   type SilenceReason,
 } from "./compaction-contract.js";
-import { sessionCredentialPaths } from "./confined-read.js";
+import { collectCredentialPaths } from "./confined-read.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import { createRequestUsageTracker } from "./request-usage.js";
@@ -538,12 +538,21 @@ export interface RunSessionConfig {
   // in it).
   tools: string[];
   excludeTools?: string[];
-  // bob#230 — the agent's credential paths: every key or token file bob.yaml
-  // names (identity.key_file, the flair block's keyFile, each capability's
-  // tokenFile/keyFile/officeKeyFile), plus the provider login store. A resident
-  // role that opts into `read` gets a confined read that refuses these even
-  // inside the workspace. Computed once at resolution; the factory reads it.
+  // bob#230 — the RESOLVED residency decision (bob.yaml `resident: true`, or
+  // the persistent runtime), as resolveRunConfig's tool policy decided it. The
+  // factory confines `read` for a resident session from THIS, so a one-shot
+  // `bob run` of a resident agent is confined exactly like its persistent
+  // runtime. Absent: not resident unless `persistent` says so.
+  resident?: boolean;
+  // bob#230 — the agent's credential files, from bob's own PARSED config
+  // (collectCredentialPaths: identity.key_file, the flair block's keyFile, each
+  // capability's validated tokenFile/keyFile/officeKeyFile), plus pi's provider
+  // stores under `.pi-agent`. A resident role that opts into `read` gets a
+  // confined read that refuses these even inside the workspace. When the list
+  // could not be built, `credentialPathsUnavailable` says why, and the factory
+  // REFUSES to compose a resident read — it never falls back to an empty list.
   credentialPaths?: string[];
+  credentialPathsUnavailable?: string;
   // #145 — the CONTRACT carried in the system prompt. A one-shot `bob run`
   // carries its TASK (`taskContract`); the persistent runtime carries the
   // agent's STANDING CONTRACT (`standingContract`). They are mutually
@@ -1651,6 +1660,17 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     ...(typeof agentBlock?.role === "string" ? { role: agentBlock.role } : {}),
   };
 
+  // bob#230: the agent's credential files, collected from bob's own parsed
+  // config: the validated capability configs resolved above, and bob.yaml's
+  // `identity:`/`flair:` blocks read with the same block reader. A failure is
+  // carried as a reason, never as an empty list.
+  const credentials = collectCredentialPaths({
+    yamlText,
+    capabilities,
+    piAgentDir: join(agentDir, ".pi-agent"),
+    workspaceRoot: join(agentDir, "work"),
+  });
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -1660,7 +1680,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     extensionSources,
     capabilityBySource,
     capabilityEnv,
-    credentialPaths: sessionCredentialPaths(yamlText, join(agentDir, ".pi-agent")),
+    // bob#230: the residency decision the policy made, and the credential files
+    // from the SAME parsed + validated config the capabilities receive.
+    resident: toolPolicy.resident,
+    ...(credentials.ok
+      ? { credentialPaths: credentials.paths }
+      : { credentialPathsUnavailable: credentials.reason }),
     // Always both: resolveAgentToolPolicy refuses an agent without an
     // allowlist, so there is no longer a "declared none" case here.
     tools: toolPolicy.tools,
@@ -1718,7 +1743,10 @@ export async function createPiRunSession(
     // resolveToolPolicy already folded the resident exclusions into
     // excludeTools, so the factory's job is simply to hand pi the resolved pair.
     excludeTools: config.excludeTools ?? [],
-    resident: config.persistent === true,
+    // bob#230: the RESOLVED residency decision — bob.yaml `resident: true` OR
+    // the persistent runtime — never `persistent` alone, so a one-shot run of a
+    // resident agent gets the confined read too.
+    resident: config.resident === true || config.persistent === true,
     allowResidentShell: false,
   };
   const makeSessionManager =

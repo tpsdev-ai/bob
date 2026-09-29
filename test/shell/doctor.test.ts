@@ -512,6 +512,63 @@ describe("runDoctor", () => {
     expect(check?.detail).toContain("discord");
   });
 
+  // bob#230: an inbound chat capability is served only by the persistent
+  // runtime, which is resident by definition — so doctor judges a chat-facing
+  // agent by the policy its service holds, `resident: true` or not.
+  function chatAgentYaml(opts: { resident: boolean; tools: string[] }): string {
+    return [
+      "agent:",
+      "  id: testbot",
+      "  role: reviewer",
+      "",
+      ...(opts.resident ? ["resident: true", ""] : []),
+      "tools:",
+      "  allow:",
+      ...opts.tools.map((t) => `    - ${t}`),
+      "",
+      "capabilities:",
+      "  - discord",
+      "",
+      "discord:",
+      "  tokenFile: /tmp/bob-test.token",
+      "  channelIds:",
+      '    - "123"',
+      "",
+    ].join("\n");
+  }
+
+  it("WARNs on read beside discord even WITHOUT `resident: true` (the persistent service) (bob#230)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(join(agentDir, "bob.yaml"), chatAgentYaml({ resident: false, tools: ["read"] }));
+    const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+    const check = report.checks.find((c) => c.name === "tool allowlist");
+    expect(check?.status).toBe("warn");
+    expect(check?.detail).toContain("persistent service");
+    expect(check?.detail).toMatch(/holds read alongside an inbound chat capability \(discord\)/);
+    expect(check?.fix).toContain("drop read from tools.allow");
+  });
+
+  it("reports BOTH the dropped writer tool and read-beside-discord when both apply (bob#230)", () => {
+    for (const resident of [false, true]) {
+      const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+      writeFileSync(
+        join(agentDir, "bob.yaml"),
+        chatAgentYaml({ resident, tools: ["read", "bash"] }),
+      );
+      const report = runDoctor({ name: "testbot", agentsRoot: join(home, "agents") });
+      const check = report.checks.find((c) => c.name === "tool allowlist");
+      expect(check?.status, `resident: ${resident}`).toBe("warn");
+      // The dropped writer tool …
+      expect(check?.detail, `resident: ${resident}`).toMatch(/drops bash, which the role allows/);
+      expect(check?.fix).toContain("roles/reviewer/role.json");
+      // … does not hide the read-and-chat warning.
+      expect(check?.detail, `resident: ${resident}`).toMatch(
+        /holds read alongside an inbound chat capability \(discord\)/,
+      );
+      expect(check?.fix).toContain("drop read from tools.allow");
+    }
+  });
+
   it("stays quiet when the resident agent does NOT allow read (bob#230)", () => {
     const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
     writeFileSync(
