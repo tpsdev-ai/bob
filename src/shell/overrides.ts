@@ -363,12 +363,20 @@ export function initOverrideRepo(agentDir: string): string {
   return dir;
 }
 
+// bob#248: no automatic housekeeping in this repository. After `git commit`,
+// Git starts `git maintenance run --auto` (older Git: `git gc --auto`), which
+// can detach and keep working inside the repository after `git commit` has
+// returned, so whoever removes or copies the agent directory next races it.
+// `maintenance.auto=false` turns the maintenance run off and `gc.auto=0` the
+// automatic gc; this small bookkeeping repository needs neither.
+const NO_AUTO_HOUSEKEEPING = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
 function git(args: string[], cwd: string): void {
   try {
     // Internal bookkeeping must not read the operator's global/system config
     // or copy an operator template with executable hooks into this new repo.
     const { GIT_TEMPLATE_DIR: _templateDir, ...env } = process.env;
-    execFileSync("git", args, {
+    execFileSync("git", [...NO_AUTO_HOUSEKEEPING, ...args], {
       cwd,
       stdio: "ignore",
       env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
