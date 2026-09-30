@@ -1,13 +1,17 @@
 // bob#225 item 3 — the refresh test. #215 wrapped pi's model-runtime `getModel`
-// so the model's declared context window (and output cap) resolve everywhere pi
-// looks the model up, "including after pi refreshes the session's model"
-// (`applyModelLimits`, src/shell/model-budget.ts). #215 checked that LOOKUP
-// directly (`runtime.getModel(...)`) but never EXECUTED a refresh.
+// so a `getModel` lookup of the session's declared provider/model pair returns
+// its declared context window (and output cap), "including after pi refreshes
+// the session's model" (`applyModelLimits`, src/shell/model-budget.ts). The
+// wrapper covers `getModel` only; pi also lists models through `getModels()`
+// (for example to resolve a CLI model pattern), which the wrapper does not
+// change and this file does not exercise.
+// #215 checked the `getModel` lookup directly (`runtime.getModel(...)`) but
+// never EXECUTED a refresh.
 //
 // This file builds REAL pi sessions through bob's ONE factory (fake provider, no
-// network) and drives the refresh path the way it happens for real: an extension
-// that registers a provider, which makes pi re-resolve the session's model from
-// the runtime (`AgentSession._refreshCurrentModelFromRegistry` -> `getModel`).
+// network) and drives pi's refresh path through a real extension that registers
+// a provider, which makes pi re-resolve the session's model from the runtime
+// (`AgentSession._refreshCurrentModelFromRegistry` -> `getModel`).
 // The assertion is end to end — the refreshed session model, and the next
 // request pi builds from it, carry bob.yaml's window and cap, not the registry's.
 
@@ -122,8 +126,9 @@ function stubProvider() {
   return { requests, streamSimple };
 }
 
-/** A ModelRuntime whose REGISTRY declares the model with the DISAGREEING
- *  numbers, so any lookup that bypasses bob's wrapper reads 131072. */
+/** A ModelRuntime whose REGISTRY declares this stub pair with the DISAGREEING
+ *  numbers, so a `getModel` lookup of this pair that bypasses bob's wrapper
+ *  reads 131072 (and 32000 max tokens). */
 async function stubRuntime(streamSimple: ReturnType<typeof stubProvider>["streamSimple"]) {
   const runtime = await ModelRuntime.create({ modelsPath: null });
   runtime.registerProvider(STUB_PROVIDER, {
@@ -150,9 +155,10 @@ async function stubRuntime(streamSimple: ReturnType<typeof stubProvider>["stream
 
 /**
  * A real extension source that registers a provider every time an agent run
- * starts. That registration is exactly what a capability does, and it is what
- * makes pi re-resolve the session's model from the runtime
- * (`_refreshCurrentModelFromRegistry`) — the refresh path this test executes.
+ * starts, through pi's extension API (`pi.registerProvider`), an API a
+ * capability CAN use; no capability bob ships registers a provider today. The
+ * registration makes pi re-resolve the session's model from the runtime
+ * (`_refreshCurrentModelFromRegistry`), the refresh path this test executes.
  */
 function refreshExtensionPath(): string {
   const path = join(root, "bob-refresh-extension.js");
@@ -189,9 +195,12 @@ async function liveSession(input: {
   runtime: ModelRuntime;
   extensionSources?: string[];
 }): Promise<LiveSession> {
-  // The provider/model pair AND its limits come from the fixture bob.yaml via
-  // resolveRunConfig; the test injects no session config of its own beyond the
-  // extension source it drives.
+  // The session's provider/model pair AND its limits come from the fixture
+  // bob.yaml via resolveRunConfig; the test does not override them. It does
+  // override two other fields of the resolved config, `extensionSources` (the
+  // refresh extension it drives) and `capabilityBySource` (set to `{}`), and it
+  // passes its own tool policy and a stub model runtime whose registry declares
+  // the same pair with disagreeing limits (stubRuntime).
   const base = resolveRunConfig({ name: "budgetbot", agentsRoot }).config;
   const factory = createBobRuntimeFactory({
     config: {
