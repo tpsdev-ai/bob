@@ -233,13 +233,22 @@ export interface StopAfterTurnContext {
  * checkpoints are off until a compaction succeeds, so a failing compaction is
  * not retried on every turn.
  *
- * A checkpoint is allowed ONCE PER THRESHOLD CROSSING. A compaction can succeed
- * yet leave the context over the threshold — the context is then summarized, but
- * a long run keeps growing, so every following turn is over it again. Without a
- * bound, each such turn would queue another checkpoint and pi would compact on
- * every call. So after a checkpoint, the next one waits until the context has
- * dropped at or below the threshold; dropping below re-arms it, and a genuine
- * re-crossing later checkpoints again.
+ * After a checkpoint, the check does not checkpoint again for the same
+ * threshold until it sees the context at or below that threshold. A compaction
+ * can succeed yet leave the context over the threshold; without this rule, each
+ * following tool turn whose usage is still over the threshold would queue
+ * another checkpoint, and pi would compact again after each one. Two things
+ * re-arm the check: a tool turn evaluated here whose reported usage is at or
+ * below the threshold, and a successful compaction whose `estimatedTokensAfter`
+ * is at or below the current threshold. A compaction result with no usable
+ * estimate, or an estimate above the threshold, leaves the check suppressed.
+ *
+ * Limits: pi's estimate counts the session's messages, not the system prompt or
+ * the tool definitions, so a compaction estimated at or below the threshold can
+ * be followed by a tool turn whose reported usage is over it; that turn
+ * checkpoints again. While the check is suppressed, the context can keep growing
+ * past the threshold until pi's own compaction check when the run ends (or its
+ * overflow recovery).
  */
 export function installMidRunCompaction(
   session: MidRunCompactionSession,
@@ -249,16 +258,41 @@ export function installMidRunCompaction(
   // idle: may checkpoint; stopped: a checkpoint is waiting for pi's compaction;
   // suppressed: pi did not compact after the last checkpoint.
   let state: "idle" | "stopped" | "suppressed" = "idle";
-  // The threshold a checkpoint has already fired for since the context last
-  // dropped at or below it. A compaction that does not bring the context under
-  // the threshold would otherwise checkpoint again on EVERY turn; one checkpoint
-  // per crossing bounds that (see the note above).
+  // The threshold the last checkpoint fired for, until the check sees the
+  // context at or below it (see the note above). While it is set, a tool turn
+  // over that same threshold does not checkpoint again.
   let checkpointedThreshold: number | null = null;
   let suppressLogged = false;
+  // Whether a successful compaction's result puts the context at or below the
+  // CURRENT threshold, by pi's own post-compaction estimate
+  // (`estimatedTokensAfter`). An estimate above the threshold, a missing or
+  // non-numeric one, or a threshold that cannot be computed is "not known to be
+  // below": the suppression stays.
+  const compactedAtOrBelowThreshold = (result: unknown): boolean => {
+    try {
+      const after =
+        result !== null && typeof result === "object"
+          ? (result as { estimatedTokensAfter?: unknown }).estimatedTokensAfter
+          : undefined;
+      if (typeof after !== "number" || !Number.isFinite(after) || after < 0) return false;
+      const contextWindow = session.model?.contextWindow ?? 0;
+      if (contextWindow <= 0) return false;
+      const { reserveTokens } = session.settingsManager.getCompactionSettings();
+      return after <= contextWindow - reserveTokens;
+    } catch {
+      return false;
+    }
+  };
   const unsubscribe = session.subscribe(((event: { type?: string; result?: unknown }) => {
     if (event?.type !== "compaction_end") return;
     if (event.result !== undefined) {
       state = "idle";
+      if (compactedAtOrBelowThreshold(event.result)) {
+        // pi's estimate of the compacted context is at or below the threshold:
+        // the compaction itself brought the context under it, so re-arm.
+        checkpointedThreshold = null;
+        suppressLogged = false;
+      }
     } else if (state === "stopped") {
       state = "suppressed";
       log(
@@ -290,18 +324,21 @@ export function installMidRunCompaction(
       const contextTokens = calculateContextTokens(usage as never);
       const thresholdTokens = contextWindow - settings.reserveTokens;
       if (contextTokens <= 0 || !shouldCompact(contextTokens, contextWindow, settings)) {
-        // At or below the threshold: a later crossing may checkpoint again.
+        // At or below the threshold: re-arm, so a later tool turn over it may
+        // checkpoint again.
         checkpointedThreshold = null;
         suppressLogged = false;
         return false;
       }
       if (checkpointedThreshold === thresholdTokens) {
-        // This crossing already checkpointed; a compaction (successful or not)
-        // left the context over the threshold. Wait for it to drop below.
+        // A checkpoint already fired for this threshold. Reaching here means a
+        // compaction succeeded since (a failed or declined one returns above),
+        // but neither its estimate nor a later tool turn's usage has been at or
+        // below the threshold. Do not checkpoint again yet.
         if (!suppressLogged) {
           suppressLogged = true;
           log(
-            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint; not checkpointing again until it drops below, so a compaction that cannot shrink the context is not repeated on every call`,
+            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint and a compaction; not checkpointing again until a tool turn's usage or a compaction's estimate is at or below it (pi still checks when the run ends)`,
           );
         }
         return false;

@@ -12,9 +12,11 @@
 //   - Ed25519 keypair (private 0600, public exists)
 //   - .pi-agent/auth.json + models.json (PR-16a wrote these when
 //     provider was exe-dev-gateway)
-//   - provider.context_window (bob#225): FAILS when bob.yaml declares no
-//     context window, because a session refuses to start without one — doctor
-//     says so first, with the exact line to add
+//   - provider.context_window (bob#225): FAILS when bob.yaml declares
+//     provider.model without provider.context_window (a session for that model
+//     refuses to start without it), naming the exact line to add; FAILS when
+//     bob.yaml cannot be read or its provider: block cannot be parsed; SKIPS
+//     when bob.yaml declares no provider.model
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 //   - tps-mail (bob#200): FAILS when channels.tps_mail is declared with no
@@ -57,7 +59,7 @@ import {
   type ToolsBlock,
 } from "./bob-yaml.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
-import { effectiveCapabilities, resolveAgentToolPolicy } from "./run.js";
+import { declaredProviderModel, effectiveCapabilities, resolveAgentToolPolicy } from "./run.js";
 import {
   auditToolNames,
   capabilityForTool,
@@ -148,11 +150,10 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   // nothing. Report every offender with the fix.
   checks.push(toolAllowlistCheck(join(agentDir, "bob.yaml")));
 
-  // bob#225 (item 4): the model's context window. A session REFUSES to start
-  // without it (bob does not guess a window — a guess can disagree with the
-  // server), and the refusal fires at session creation. Report it here first,
-  // with the exact line to add, so it is heard from doctor and not from a
-  // failed run.
+  // bob#225 (item 4): the context window of bob.yaml's provider.model. A
+  // session for that model refuses to start without one (bob does not guess a
+  // window; a guess can disagree with the server), at session creation. Report
+  // it here first, with the exact line to add.
   checks.push(contextWindowCheck(join(agentDir, "bob.yaml")));
 
   // Launcher — exists + executable
@@ -299,30 +300,31 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 // the tps-mail consumer is started by startPersistent).
 const INBOUND_CHAT_CAPABILITIES: ReadonlySet<string> = new Set(["discord", "tps-mail"]);
 
-// The `tools:` allowlist check. Audits every name in the agent's bob.yaml
-// against the tools pi and the blessed capabilities can actually enable, and
-// reports a resident agent whose allowlist asks for a tool the resident policy
-// drops. NEVER throws: a malformed block or a bad `resident:` value is a FAIL
-// with a fix, not a doctor crash (doctor is what you run when something is
-// wrong).
-// bob#225 (item 4): the declared context window. Every session refuses to start
-// without one (requireModelLimits), so doctor reports the SAME problem early,
-// naming the exact line to add. Read through the module the resolver reads
-// (readProviderLimits) so doctor and a session agree on what is declared.
+// bob#225 (item 4): the declared context window for bob.yaml's provider.model.
+// A session for that model refuses to start without one (requireModelLimits),
+// so doctor reports it early, naming the exact line to add. The window is read
+// through the reader the resolver uses (readProviderLimits), and provider.model
+// through the resolver's own interpretation (declaredProviderModel), so doctor
+// and a session agree on what is declared. Only provider.model is checked: a
+// `--model` override's provider.models entry is not.
 function contextWindowCheck(yamlPath: string): DoctorCheck {
   const name = "provider.context_window";
   let yamlText: string;
   try {
     yamlText = readFileSync(yamlPath, "utf8");
-  } catch {
-    return { name, status: "skip", detail: `${yamlPath} unreadable` };
+  } catch (err) {
+    // A file doctor cannot read is not a window it has checked: FAIL, never SKIP.
+    return {
+      name,
+      status: "fail",
+      detail: `${yamlPath} unreadable (${err instanceof Error ? err.message : String(err)}), so the context window cannot be checked`,
+      fix: `make ${yamlPath} a regular file this user can read, then re-run bob doctor`,
+    };
   }
 
   let block: ProviderLimitsBlock;
-  let providerBlock: Record<string, unknown> | undefined;
   try {
     block = readProviderLimits(yamlText);
-    providerBlock = readBlock(yamlText, "provider");
   } catch (err) {
     return {
       name,
@@ -332,27 +334,29 @@ function contextWindowCheck(yamlPath: string): DoctorCheck {
     };
   }
 
-  const model = providerBlock?.model;
-  const forModel = typeof model === "string" && model !== "" ? ` for ${model}` : "";
-  if (block.contextWindow !== undefined) {
-    return { name, status: "ok", detail: `context_window: ${block.contextWindow}${forModel}` };
-  }
-  if (typeof model !== "string" || model === "") {
-    // No provider.model to key a window to: a session refuses a bob.yaml that
-    // declares no provider pair for THAT reason, before any window is read.
+  const model = declaredProviderModel(yamlText);
+  if (model === undefined) {
+    // No provider.model to key a window to: a session refuses this bob.yaml for
+    // THAT reason (missing provider.model) before any window is read.
     return { name, status: "skip", detail: "no provider.model declared" };
+  }
+  if (block.contextWindow !== undefined) {
+    return { name, status: "ok", detail: `context_window: ${block.contextWindow} for ${model}` };
   }
   return {
     name,
     status: "fail",
-    detail:
-      providerBlock === undefined
-        ? "no provider: block in bob.yaml — a session refuses to start without the model's context window"
-        : `provider.context_window is not declared${forModel} — a session refuses to start without the model's context window`,
+    detail: `provider.context_window is not declared for ${model}; a session for ${model} refuses to start without a declared context window`,
     fix: `add "context_window: <tokens>" under "provider:" in ${yamlPath}`,
   };
 }
 
+// The `tools:` allowlist check. Audits every name in the agent's bob.yaml
+// against the tools pi and the blessed capabilities can actually enable, and
+// reports a resident agent whose allowlist asks for a tool the resident policy
+// drops. NEVER throws: a malformed block or a bad `resident:` value is a FAIL
+// with a fix, not a doctor crash (doctor is what you run when something is
+// wrong).
 function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   const name = "tool allowlist";
   let yamlText: string;
