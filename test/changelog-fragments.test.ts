@@ -3,7 +3,7 @@
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` carries the migrated list
 // entries reordered by category and filename, and apart from that order they
-// differ only by the nine repairs the migration tests name and the whitespace
+// differ only by the ten repairs the migration tests name and the whitespace
 // trimmed at the end of each fragment (the block body's two HTML comment
 // markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
 // and do not render); `promote`
@@ -464,19 +464,19 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
-  // would go red on the release PR. `unreleased-main-1b30709e.md` is the body
-  // of main's [Unreleased] block (its heading excluded) at 1b30709e, the main
+  // would go red on the release PR. `unreleased-main-17a3f7f0.md` is the body
+  // of main's [Unreleased] block (its heading excluded) at 17a3f7f0, the main
   // commit whose entries were migrated, before they moved into fragments;
   // `migrated-bob-236/` is the fragment set made from it, every list entry of
   // that body included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
-  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-1b30709e.md"), "utf8"));
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-17a3f7f0.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The nine entries the migration changed, each as EXACT edits of main's text
+  // The ten entries the migration changed, each as EXACT edits of main's text
   // (applied in order, each `from` found exactly once) plus every word that
-  // disappears from the entry (`dropped`). Three were changed to pass `check`
-  // (fixed-17, fixed-19, added-09; fixed-19 was also corrected), and six more were
+  // disappears from the entry (`dropped`). Four were changed to pass `check`
+  // (fixed-17, fixed-19, added-09, fixed-bob225; fixed-19 was also corrected), and six more were
   // corrected because they no longer matched bob's code or the rendered order.
   // Every other entry is main's text unchanged (whitespace at its end aside). A
   // new difference, or a word that vanishes without being listed, fails. That
@@ -531,6 +531,18 @@ describe("changelog fragments — the migration (bob#236)", () => {
       was: "- **The `reachy` capability",
       why: "A continuation line indented 3 spaces, re-indented to 2.",
       edits: [["\n   OrgEvent record id is", "\n  OrgEvent record id is"]],
+      dropped: [],
+    },
+    {
+      fragment: "fixed-bob225-mid-run-checkpoint-latch-and-doctor-context-window.md",
+      was: "- **After a mid-run compaction checkpoint",
+      why: "An over-long lede (36 words), reshaped; the text it moved opens the body, and no word is dropped.",
+      edits: [
+        [
+          "- **After a mid-run compaction checkpoint, over-threshold tool turns do not checkpoint again for the same threshold until a valid reading at or below the threshold re-arms the check, and `bob doctor` reports a missing `provider.context_window` (bob#225).**",
+          "- **After a mid-run compaction checkpoint, the check does not checkpoint again for that threshold until it re-arms, and `bob doctor` reports a missing `provider.context_window` (bob#225).** Over-threshold tool turns do not checkpoint again for the same threshold until a valid reading at or below the threshold re-arms the check.",
+        ],
+      ],
       dropped: [],
     },
     {
