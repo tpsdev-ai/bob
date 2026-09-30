@@ -401,7 +401,7 @@ const errCode = (err: unknown): string =>
 // BE the one it checked; it narrows the window in which they can differ:
 //   1. resolve the cwd and the workspace through symlinks (realpath) and confine
 //      the one to the other (resolveCwd);
-//   2. open the resolved directory (O_DIRECTORY | O_NOFOLLOW) and hold it open:
+//   2. open the resolved path (O_DIRECTORY | O_NOFOLLOW) and hold it open:
 //      the PIN. While it is held the inode stays allocated (on a local POSIX file
 //      system), so no other directory can take its device + inode;
 //   3. immediately after pinning, and again immediately before the spawn,
@@ -453,7 +453,7 @@ interface DirPin {
 
 type PinStage = "when it was pinned" | "immediately before the spawn";
 
-// The cwd must still be the directory that was checked: the same canonical path,
+// The cwd must still be the checked canonical path and the directory pinned at open: the same canonical path,
 // inside the checked canonical workspace, and (no-follow) the pinned device +
 // inode. Throws a RunRefusal naming the failed check or mismatch.
 function assertStillPinned(
@@ -529,7 +529,7 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
       );
     }
     const pin: DirPin = { fd, dev: st.dev, ino: st.ino };
-    // The pin must be the directory that was checked: re-resolve now it is open.
+    // The pin must be the checked canonical path and the directory pinned at open: re-resolve now it is open.
     assertStillPinned(ops, dir, workspace, pin, "when it was pinned");
     return pin;
   } catch (err) {
@@ -1001,10 +1001,10 @@ export class JobManager {
       );
     }
 
-    // The directory the command starts in should be the one that was checked.
+    // The command should start at the checked canonical path, in the directory pinned at open.
     // Node names a child's cwd by string, so this NARROWS the window in which they
     // can differ rather than closing it (see "the cwd pin" above, and the README):
-    // pin the resolved directory and verify it, re-check it, release the pin, and
+    // open the resolved path as the pin and verify it, re-check it, release the pin, and
     // only then spawn. A failure in any pin step refuses with nothing started, and
     // no pin step runs after the spawn. The test seams are synchronous and called
     // only when set.

@@ -33,7 +33,7 @@ checked. It narrows the window in which the two can differ:
 
 1. It resolves `cwd` and the workspace through symlinks and confines the one to
    the other, keeping that canonical workspace.
-2. It opens the resolved directory (no-follow on the final component) and holds
+2. It opens the resolved path (no-follow on the final component) and holds
    it open: the pin. While the pin is held, the directory's inode stays
    allocated (on a local POSIX file system), so no other directory can take its
    device + inode.
