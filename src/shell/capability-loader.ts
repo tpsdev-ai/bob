@@ -19,6 +19,7 @@ import { readBlock, readCapabilities } from "./bob-yaml.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 import { lookupCapability as defaultLookup } from "./capability-catalog.js";
 import { resolveExtensionSource as defaultResolveSource } from "./capability-resolve.js";
+import { assertWebComposition, capabilityListView } from "./data-class.js";
 
 // One resolved, validated capability.
 export interface ResolvedCapability {
@@ -60,8 +61,9 @@ export interface ResolveCapabilitiesOptions {
 // Resolve + validate an agent's declared capabilities. Throws a single,
 // actionable error on the first problem (unknown capability, not-yet-built
 // capability, a config block written in a YAML shape the reader doesn't support
-// — `BobYamlError` from readBlock, a config block that fails its schema, or a
-// capability package that isn't installed) so a misconfigured agent fails fast
+// — `BobYamlError` from readBlock, a config block that fails its schema, a
+// capability package that isn't installed, or a set that composes `web` with a
+// private-class capability) so a misconfigured agent fails fast
 // at session setup rather than silently running under-equipped.
 export function resolveCapabilities(opts: ResolveCapabilitiesOptions): CapabilityResolution {
   const lookup = opts.lookup ?? defaultLookup;
@@ -121,6 +123,13 @@ export function resolveCapabilities(opts: ResolveCapabilitiesOptions): Capabilit
       piPackage: resolveSource(name, entry.manifest.piPackage),
     });
   }
+
+  // bob#244: the composition rule at YAML load. A set that holds `web` may hold
+  // only public-class capabilities (data-class.ts); the session factory checks
+  // the rest of the session — tools, startup context, history — at creation,
+  // bind and reload. Over the capabilities that will actually LOAD (`only`
+  // applied): a disabled capability composes nothing.
+  assertWebComposition(capabilityListView(resolved.map((c) => c.name)), lookup);
 
   return {
     capabilities: resolved,

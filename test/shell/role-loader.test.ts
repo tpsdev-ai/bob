@@ -50,6 +50,9 @@ describe("role-loader", () => {
     const t = loadRole("jarvis");
     expect(t.role).toBe("jarvis");
     expect(t.soul.trim().length).toBeGreaterThan(0);
+    // bob#244: the ceiling also names the two web tools (egress, resident only
+    // with allowResidentWeb). The web composition rule keeps them out of any
+    // session that also holds flair or discord.
     expect(t.tools.allow).toEqual([
       "flair_search",
       "flair_write",
@@ -57,7 +60,10 @@ describe("role-loader", () => {
       "discord_reply",
       "discord_fetch",
       "discord_react",
+      "web_fetch",
+      "web_search",
     ]);
+    expect(t.tools.allowResidentWeb).toBe(true);
     // bob#230: jarvis answers chat, so it drops `read` (the seed role files are
     // pinned so this cannot quietly come back).
     expect(t.tools.allow).not.toContain("read");

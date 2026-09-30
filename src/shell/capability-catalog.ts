@@ -25,6 +25,7 @@ import { observatoryManifest } from "../capabilities/observatory/manifest.js";
 import { presenceManifest } from "../capabilities/presence/manifest.js";
 import { reachyManifest } from "../capabilities/reachy/manifest.js";
 import { tpsMailManifest } from "../capabilities/tps-mail/manifest.js";
+import { webManifest } from "../capabilities/web/manifest.js";
 import { workManifest } from "../capabilities/work/manifest.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 
@@ -69,8 +70,14 @@ export const BLESSED_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.fr
   // It replaces raw `bash` in that role; `run` is shell-equivalent, so it is in
   // RESIDENT_EXCLUDED_TOOLS (tool-allowlist.ts).
   work: { manifest: workManifest },
+  // bob#152 (spec v3, slice R1a): the web capability's manifest, config schema
+  // and extension. It registers NO tool yet (web_fetch is slice R1c). Its data
+  // class is public, and a session that holds it may compose only public-class
+  // capabilities (data-class.ts).
+  web: { manifest: webManifest },
   // --- planned, not yet implemented (later PRs) ---
-  mail: placeholder("mail", { tools: ["mail_send"], serves: true }),
+  // Private: a mail capability carries mail.
+  mail: placeholder("mail", { tools: ["mail_send"], serves: true, dataClass: "private" }),
 });
 
 // Look up a capability by name. Returns undefined when the name isn't blessed.

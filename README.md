@@ -27,7 +27,10 @@ owner, and Discord conversation. Hire one with
 interview gives the class seed an individual persona. The role allows only
 `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and
 `discord_react`, with `allowResidentShell: false`; it does not allow `read`
-(bob#230). Onboarding stamps only
+(bob#230). It also lists `web_fetch` and `web_search` with `allowResidentWeb: true`,
+but neither tool exists yet, and bob refuses a session that holds web together
+with Flair or Discord (see [Data classes](#data-classes-and-what-a-web-session-may-hold)),
+so a jarvis agent has no web access. Onboarding stamps only
 the Flair capability: configure `discord` with its token file and channel
 allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
 conversation there. The body and automatic decision loop come later. An admitted Discord turn binds the outbound Discord tools to that turn's channel; in a cron turn, and outside an admitted turn (a one-shot `bob run`), the channel allow-list is the only boundary. This binds only the outbound tools: the conversation context is still shared across channels and DMs, so channel isolation is not provided until per-channel history lands (tracked in bob#234).
@@ -238,7 +241,16 @@ change one, the named test is what tells you.
 - **Doctor points at the right file.** A resident agent whose allowlist names a
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
-  narrow it. *(`test/shell/doctor.test.ts`)*
+  narrow it. A dropped web tool names `tools.allowResidentWeb`, never the shell
+  grant. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
+- **A web session holds nothing private.** A session that holds the `web`
+  capability, or allows a web tool, is refused unless every capability in it is
+  public-class, it holds no pi built-in tool, and it carries no `soul.md`
+  content, standing contract, unclassified startup context or restored history.
+  Checked at `bob.yaml` load and by the session factory before anything is
+  built, at creation, after the mode binds extensions and after every reload;
+  there is no override. See [Data classes](#data-classes-and-what-a-web-session-may-hold).
+  *(`test/shell/data-class.test.ts`, `test/shell/web-composition-session.test.ts`)*
 - **builder-local runs commands only through `run`, and `run` always has a
   deadline.** The `work` capability's `run` / `run_status` / `run_cancel`
   replace pi's `bash` in `roles/builder-local/role.json`. An omitted timeout gets
@@ -555,6 +567,72 @@ stay textual, like a Discord snowflake.
 
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
+
+### Data classes, and what a web session may hold
+
+Every capability's manifest states a data class, `provides.dataClass`: what the
+capability can bring into a session is `public` or `private`.
+
+| Class     | Capabilities                                                                              |
+| --------- | ----------------------------------------------------------------------------------------- |
+| `public`  | `fixture`, `presence` (imports no context), `web`                                         |
+| `private` | `flair`, `discord`, `anchored-edit`, `work`, `reachy`, `observatory`, `tps-mail`, planned `mail` |
+
+A manifest without a class counts as private; moving a capability to public is a
+reviewed change, and a test fails if a shipped capability states no class.
+
+The `web` capability sends model-influenced data to hosts outside the office,
+so until bob can attribute every input of a session to its source, a session
+that holds `web` (or allows `web_fetch` or `web_search`) must hold nothing
+private. bob refuses it, naming each problem, when it would also hold:
+
+- a private-class capability, or an extension bob cannot attribute to a capability;
+- any pi built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
+  `powershell`: each reads or writes local data), or a tool bob cannot attribute;
+- `soul.md` content, or the persistent runtime's standing contract (its agent
+  block and cron duties);
+- a context file, skill, prompt template or custom system prompt, including one a
+  capability adds when the mode binds extensions or on a reload;
+- restored history, such as a resumed session whose history held a private
+  capability.
+
+The one-shot task of `bob run <name> "<task>"` is the admitted prompt and is
+allowed. bob's own post-compaction "what remains" note carries workspace data,
+so it is not sent into a web session. The rule is checked when `bob.yaml`'s
+capabilities are resolved, and by the session factory before anything is built,
+at creation, after the mode binds extensions and after every reload. There is
+no override. In practice web composes only with `fixture` and `presence`, in a
+session with an empty `soul.md`, and never beside Flair or Discord.
+
+### `web` — configuration only in this release
+
+`web` ships its manifest, catalog entry, extension and config block. It
+registers no tool and has no network code yet. The block is flat, and every
+field is optional:
+
+```yaml
+capabilities: [web]
+web:
+  allow_http: false
+  fetch_max_chars: 20000
+  fetch_per_turn: 10
+  text_per_turn: 100000
+```
+
+| Field             | Default  | Bounds         |
+| ----------------- | -------- | -------------- |
+| `allow_http`      | `false`  | boolean        |
+| `fetch_max_chars` | `20000`  | 1 to 100000    |
+| `fetch_per_turn`  | `10`     | 1 to 10        |
+| `text_per_turn`   | `100000` | 1 to 100000    |
+
+The block is validated when `bob.yaml` is loaded and again when the extension
+reads it from `BOB_CAP_WEB`; an unknown key, a wrong type or a value out of
+bounds is refused at both. `web_fetch` and `web_search` are classified `egress`:
+a resident agent drops them unless its role sets `tools.allowResidentWeb: true`
+(`jarvis` and `ea` do; `allowResidentShell` does not cover them), and a mail
+turn never holds them. *(`test/capabilities/web/config.test.ts`,
+`test/shell/web-policy.test.ts`)*
 
 ### `tps-mail` — answering TPS mail
 

@@ -57,6 +57,7 @@ import {
   auditToolNames,
   capabilityForTool,
   residentDroppedTools,
+  residentDroppedWebTools,
   type ToolPolicy,
 } from "./tool-allowlist.js";
 
@@ -450,6 +451,21 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
       fix: denial
         ? `grant it in roles/${role}/role.json (tools.allowResidentShell: true) AND remove tools.allowResidentShell: false from bob.yaml — the grant lives in the role, and bob.yaml may only narrow it, but the explicit false in bob.yaml denies the grant even once the role gives it — or drop ${dropped.join(", ")} from tools.allow`
         : `set tools.allowResidentShell: true in roles/${role}/role.json — the grant lives in the role, and bob.yaml may only narrow the role, so it cannot grant this — or drop ${dropped.join(", ")} from tools.allow`,
+    });
+  }
+
+  // bob#244: the egress (web) tools have their own grant. The shell grant does
+  // not cover them, so this warning names allowResidentWeb, never
+  // allowResidentShell.
+  const droppedWeb = residentDroppedWebTools(servicePolicy);
+  if (droppedWeb.length > 0) {
+    const role = readAgentRole(yamlText) ?? "<role>";
+    const denial = block.allowResidentWeb === false;
+    warnings.push({
+      detail: `${residency} drops ${droppedWeb.join(", ")}, which the role allows (web tools need their own resident grant)`,
+      fix: denial
+        ? `grant it in roles/${role}/role.json (tools.allowResidentWeb: true) AND remove tools.allowResidentWeb: false from bob.yaml — the grant lives in the role, bob.yaml may only narrow it, and the explicit false in bob.yaml denies it; tools.allowResidentShell does not cover web — or drop ${droppedWeb.join(", ")} from tools.allow`
+        : `set tools.allowResidentWeb: true in roles/${role}/role.json — the grant lives in the role, bob.yaml may only narrow it, and tools.allowResidentShell does not cover web — or drop ${droppedWeb.join(", ")} from tools.allow`,
     });
   }
 

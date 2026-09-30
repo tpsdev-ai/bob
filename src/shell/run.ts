@@ -72,6 +72,7 @@ import {
   type SilenceReason,
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
+import { gatedNoteInjection } from "./data-class.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import { createRequestUsageTracker } from "./request-usage.js";
@@ -900,7 +901,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // final-message boundary the judge reads.
   const observer = createCompactionObserver({
     worktreeStatus: () => readWorktreeStatus(config.cwd),
-    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    // bob#244: the note carries workspace data (git status), so a web session
+    // refuses it; the observer logs the refusal and the run carries on.
+    inject: gatedNoteInjection(config, "compaction-note", (text) =>
+      session.prompt(text, { streamingBehavior: "steer" }),
+    ),
     log: (m) => process.stderr.write(`${m}\n`),
   });
   const unsubscribeContract = session.subscribe((event) => observer.observe(event));
@@ -1116,6 +1121,7 @@ export function resolveAgentToolPolicy(
       name: roleName,
       allow: role.tools.allow,
       allowResidentShell: role.tools.allowResidentShell,
+      allowResidentWeb: role.tools.allowResidentWeb,
     },
     resident: readResident(yamlText),
     persistent: opts?.persistent,

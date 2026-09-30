@@ -23,7 +23,9 @@
 //       either. The only extensions that load are the declared capabilities'
 //       paths. A reload re-reads exactly these isolated sources — it cannot reach
 //       anything else;
-//   (c) the audit runs at creation, again after the mode binds extensions (that
+//   (c) the audit — the tool policy, and for a session that holds `web` the
+//       composition rule (data-class.ts, bob#244) — runs at creation, again
+//       after the mode binds extensions (that
 //       is a bindExtensions, which emits session_start and extends resources
 //       from the extensions) and after EVERY session.reload() — NOT from inside
 //       the reload, where pi has not rebuilt the tool list yet. pi's TUI shows
@@ -50,6 +52,15 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { confinedReadCustomTools } from "./confined-read.js";
+import {
+  assertWebComposition,
+  configCompositionView,
+  holdsWeb,
+  restoredHistoryEntries,
+  type StartupSource,
+  sessionCompositionView,
+  sessionWebSurface,
+} from "./data-class.js";
 import { ADMIN_PASS_ENV } from "./flair-pair.js";
 import {
   applyModelLimits,
@@ -798,6 +809,60 @@ export function auditCreatedSession(
   auditToolSources(config, extensions.getExtensions().extensions);
 }
 
+// bob#244: the web composition rule on what pi ACTUALLY composed — the loaded
+// extensions, the active tools and their sources, the startup context the
+// resource loader holds (context files, skills, prompt templates, the system
+// prompt and every appended entry), and the session's history source. Runs with
+// the tool audit: at creation, after the mode binds extensions and after every
+// reload, because a bind or a reload can add startup context (an extension's
+// `resources_discover` skills and prompt templates) that creation never saw. A
+// session that holds no web returns at once, and its loader is never read.
+//
+// History is counted at creation, before anything is built (the factory's
+// config view); here it is the history SOURCE that is checked: a session
+// manager other than the one checked at creation is history bob cannot
+// attribute.
+export function auditWebSession(input: {
+  session: AuditSession & { sessionManager?: unknown };
+  loader: AuditExtensions & StartupSource;
+  config: Pick<
+    RunSessionConfig,
+    "capabilityBySource" | "appendSystemPrompt" | "taskContract" | "standingContract"
+  >;
+  contractBlock?: string;
+  // The session manager whose history the factory counted before building.
+  checkedSessionManager: unknown;
+}): void {
+  const extensions = input.loader.getExtensions().extensions;
+  const activeTools = input.session.getActiveToolNames();
+  const surface = sessionWebSurface({
+    extensions,
+    activeTools,
+    capabilityBySource: input.config.capabilityBySource,
+  });
+  if (!holdsWeb(surface)) return;
+  const historySourceChanged = input.session.sessionManager !== input.checkedSessionManager;
+  const contractSource =
+    input.config.taskContract !== undefined
+      ? ("task-contract" as const)
+      : input.config.standingContract !== undefined
+        ? ("standing-contract" as const)
+        : undefined;
+  assertWebComposition(
+    sessionCompositionView({
+      extensions,
+      activeTools,
+      capabilityBySource: input.config.capabilityBySource,
+      loader: input.loader,
+      soul: input.config.appendSystemPrompt,
+      ...(input.contractBlock !== undefined ? { contractBlock: input.contractBlock } : {}),
+      ...(contractSource !== undefined ? { contractSource } : {}),
+      restoredHistory: 0,
+      historySourceChanged,
+    }),
+  );
+}
+
 // On a failed audit: dispose the session, then end the process with the named
 // error. pi's TUI shows a reload error and carries on, so a throw from a reload
 // hook would leave a session running whose policy no longer holds. Never
@@ -1061,6 +1126,24 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // pi's own read.
     const confinedRead = confinedReadCustomTools(policy, config);
 
+    // bob#244: the web composition rule on what this session is ABOUT to
+    // compose (data-class.ts), decided with the confined read — before any
+    // environment change, key read or runtime build — so a web session that
+    // would hold private data is refused with nothing to undo and no capability
+    // started. It counts the history this session manager already holds: a web
+    // session restores none. A session that holds no web is not affected.
+    const composing = configCompositionView({
+      ...config,
+      tools: policy.tools,
+      excludeTools: policy.excludeTools,
+    });
+    if (holdsWeb(composing)) {
+      assertWebComposition({
+        ...composing,
+        restoredHistory: restoredHistoryEntries(sessionManager),
+      });
+    }
+
     // bob#214: the model's declared window, for THIS session's provider/model,
     // or a refusal naming the remedy — before any key is read or any runtime
     // built. The compaction threshold becomes pi's own compaction reserve.
@@ -1189,13 +1272,23 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const assertActive = (session: AuditSession) => {
       assertAllowedToolsActive(session, policy);
     };
-    const runAudit = () =>
+    const runAudit = () => {
       auditCreatedSession(
         result.session as unknown as AuditSession,
         services.resourceLoader,
         { ...config, tools: policy.tools, excludeTools: policy.excludeTools },
         assertActive,
       );
+      // bob#244: the web composition rule on the composed session (a no-op for
+      // a session that holds no web).
+      auditWebSession({
+        session: result.session as unknown as AuditSession & { sessionManager?: unknown },
+        loader: services.resourceLoader as unknown as AuditExtensions & StartupSource,
+        config,
+        ...(contractBlock !== undefined ? { contractBlock } : {}),
+        checkedSessionManager: sessionManager,
+      });
+    };
 
     // Creation: a throw is enough. The caller (run.ts/persistent.ts/the
     // launcher) is about to use the session, so failing loudly here means no

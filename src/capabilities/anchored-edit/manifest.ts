@@ -19,5 +19,7 @@ export const anchoredEditManifest: BobCapabilityManifest = {
   provides: {
     tools: ["read_lines", "edit_lines", "insert_after", "write_file"],
     serves: false,
+    // Private: read_lines returns the bytes of workspace files.
+    dataClass: "private",
   },
 };

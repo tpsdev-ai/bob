@@ -35,6 +35,7 @@ import {
   readWorktreeStatus,
 } from "./compaction-contract.js";
 import { type CronSchedulerHandle, startCronScheduler } from "./cron.js";
+import { gatedNoteInjection } from "./data-class.js";
 import {
   createTpsMailConsumer,
   type MailConsumer,
@@ -209,7 +210,10 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // submit a new bob admission or supply an origin.
   const observer = createCompactionObserver({
     worktreeStatus: () => readWorktreeStatus(config.cwd),
-    inject: (text) => session.prompt(text, { streamingBehavior: "steer" }),
+    // bob#244: refused in a web session (the note carries workspace data).
+    inject: gatedNoteInjection(config, "compaction-note", (text) =>
+      session.prompt(text, { streamingBehavior: "steer" }),
+    ),
     log,
   });
   const unsubscribeContract = session.subscribe((event) => observer.observe(event));

@@ -93,6 +93,20 @@ export {
   resolveCapabilities,
 } from "./capability-loader.js";
 export { resolveExtensionSource } from "./capability-resolve.js";
+export {
+  assertWebComposition,
+  BOB_EXTENSION_DATA_CLASS,
+  BOB_INJECTION_DATA_CLASS,
+  BUILTIN_TOOL_DATA_CLASS,
+  type CompositionView,
+  capabilityDataClass,
+  type DataClass,
+  holdsWeb,
+  STARTUP_CONTEXT_CLASS,
+  WEB_CAPABILITY,
+  WebCompositionError,
+  webCompositionProblems,
+} from "./data-class.js";
 export type { DiscordClient, DiscordMessage } from "./discord-types.js";
 export {
   type CheckStatus,
@@ -289,6 +303,7 @@ export {
   type AuditSession,
   auditOrExit,
   auditToolSources,
+  auditWebSession,
   createBobRuntimeFactory,
   installSessionAudits,
   isolatedLoaderOptions,
@@ -304,10 +319,12 @@ export {
   knownToolNames,
   MAIL_TURN_ALLOWED_TOOLS,
   PI_BUILTIN_TOOLS,
+  RESIDENT_EGRESS_TOOLS,
   RESIDENT_EXCLUDED_TOOLS,
   type ResolveToolPolicyOptions,
   type RoleToolCeiling,
   residentDroppedTools,
+  residentDroppedWebTools,
   resolveToolNames,
   resolveToolPolicy,
   type ToolNameAudit,

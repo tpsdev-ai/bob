@@ -31,5 +31,8 @@ export const presenceManifest: BobCapabilityManifest = {
     // surface. The presence beat writes /Presence; the turn summary writes
     // /Memory; neither is a pi tool.
     tools: [],
+    // Public: presence imports no context. Its beats and turn summaries are
+    // metadata written OUT to Flair; nothing it does enters the model's context.
+    dataClass: "public",
   },
 };

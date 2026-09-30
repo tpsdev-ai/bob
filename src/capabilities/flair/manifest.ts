@@ -20,5 +20,7 @@ export const flairManifest: BobCapabilityManifest = {
   provides: {
     tools: ["flair_search", "flair_write", "flair_get"],
     serves: false,
+    // Private: recalled memory can carry operator-personal content.
+    dataClass: "private",
   },
 };
