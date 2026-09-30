@@ -69,7 +69,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
 let agentDir: string;
 
 function scaffoldAgent(
-  role = "ea",
+  role = "reviewer",
   provider: { name: string; model: string } = { name: "anthropic", model: "claude-sonnet-4-6" },
 ): void {
   // Canonical: write_soul is bound to the realpath of the agents root.
@@ -321,7 +321,7 @@ describe("runAlign — the agent's own provider and model (#155)", () => {
     // bob's `exe-dev-gateway` is pi's `anthropic` (see run.ts
     // mapBobProviderToPi): the resolved value arrives already mapped, and
     // runAlign must not map it a second time or hand pi bob's own name.
-    scaffoldAgent("ea", { name: "exe-dev-gateway", model: "claude-opus-4-7" });
+    scaffoldAgent("reviewer", { name: "exe-dev-gateway", model: "claude-opus-4-7" });
     const { runner, runs } = fakeRunner({});
     await runAlign({ name: "testbot", agentDir, sessionRunner: runner });
     expect(runs[0].config.provider).toBe("anthropic");
@@ -342,7 +342,7 @@ describe("runAlign — the agent's own provider and model (#155)", () => {
   });
 
   it("--provider alone replaces the provider and keeps bob.yaml's model", async () => {
-    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    scaffoldAgent("reviewer", { name: "ollama-cloud", model: "kimi-k2.6" });
     const { runner, runs } = fakeRunner({});
     await runAlign({
       name: "testbot",
@@ -373,7 +373,7 @@ describe("runAlign — the agent's own provider and model (#155)", () => {
   });
 
   it("a bare --provider (no value) is not a value: bob.yaml's provider stays", async () => {
-    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    scaffoldAgent("reviewer", { name: "ollama-cloud", model: "kimi-k2.6" });
     const { runner, runs } = fakeRunner({});
     await runAlign({
       name: "testbot",
@@ -402,7 +402,7 @@ describe("runAlign — an override cannot change the credential source (#170)", 
     // names a DIFFERENT bob provider (exe-dev-gateway -> anthropic) and a
     // different model. The provider + model fields must follow the override, while
     // piAgentDir must stay the agent's own dir — the credential source is fixed.
-    scaffoldAgent("ea", { name: "ollama-cloud", model: "kimi-k2.6" });
+    scaffoldAgent("reviewer", { name: "ollama-cloud", model: "kimi-k2.6" });
     // A capability whose config names a credential file, so capabilityEnv is
     // not empty and the comparison below can fail.
     appendFileSync(

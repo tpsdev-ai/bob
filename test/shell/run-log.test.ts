@@ -158,7 +158,7 @@ describe("run-log sizing + retention (issue #146)", () => {
         "agent:",
         "  id: testbot",
         "  name: Testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",

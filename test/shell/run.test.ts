@@ -110,7 +110,7 @@ describe("runAgent", () => {
         "agent:",
         "  id: testbot",
         "  name: Testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",
@@ -210,7 +210,7 @@ describe("runAgent", () => {
         "agent:",
         "  id: testbot",
         "  name: Testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: exe-dev-gateway",
@@ -333,7 +333,7 @@ describe("runAgent", () => {
         "agent:",
         "  id: testbot",
         "  name: Testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",
@@ -568,7 +568,8 @@ describe("runAgent — the role tool allowlist binds the session", () => {
   // Write the agent's bob.yaml. `allow` renders as the block list `bob init`
   // emits, so the test exercises the real reader, not a hand-built object.
   //
-  // `role` defaults to "ea". The ROLE is the ceiling on the allowlist, so a
+  // `role` defaults to "reviewer" (it allows `read`; ea/jarvis no longer do,
+  // bob#230). The ROLE is the ceiling on the allowlist, so a
   // test that wants a shell or a file-writing tool names the role that has one.
   function writeBobYaml(opts: {
     allow?: string[];
@@ -585,7 +586,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       "agent:",
       "  id: testbot",
       "  name: Testbot",
-      `  role: ${opts.role ?? "ea"}`,
+      `  role: ${opts.role ?? "reviewer"}`,
       "",
       "provider:",
       "  name: anthropic",
@@ -673,7 +674,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",
@@ -774,7 +775,7 @@ describe("runAgent — the completion contract (#145)", () => {
       [
         "agent:",
         "  id: testbot",
-        "  role: ea",
+        "  role: reviewer",
         "",
         "provider:",
         "  name: anthropic",

@@ -68,7 +68,7 @@ function fakeRunner(opts: { exitCode?: number; writeSoul?: string; onRun?: (run:
 
 let agentDir: string;
 
-function scaffoldAgent(role = "ea"): void {
+function scaffoldAgent(role = "reviewer"): void {
   // Canonical: write_soul is bound to the realpath of the agents root.
   const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-onboard-")));
   agentDir = join(root, "testbot");
@@ -98,7 +98,7 @@ function scaffoldAgent(role = "ea"): void {
 function options(overrides: Partial<Parameters<typeof runOnboard>[0]> = {}) {
   return {
     name: "testbot",
-    role: "ea",
+    role: "reviewer",
     agentDir,
     provider: "anthropic",
     model: "claude-sonnet-4-6",
