@@ -866,8 +866,10 @@ provider:
 bob restart <agent>
 ```
 
-`bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while one of those
-providers is declared and the agent's store holds no credential pi accepts for it.
+`bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while `openai-codex`,
+`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no credential pi
+accepts for it. (anthropic is a pi subscription provider too, but bob authenticates anthropic by an
+API key, so doctor does not require a login credential for it.)
 
 ## Model budget
 

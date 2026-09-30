@@ -243,12 +243,12 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     yamlText = undefined;
   }
 
-  // bob#241: when bob.yaml names a provider that pi authenticates by a
-  // subscription OAuth (SUBSCRIPTION_PROVIDERS — pi's bundles with
-  // `isSubscription: true`), the agent's own auth store must hold a credential
-  // pi accepts for it, or `bob login` is the remedy. A store pi would reject,
-  // or one that cannot be read, is a FAIL, never a pass. A provider outside
-  // that set produces no check at all.
+  // bob#241: when bob.yaml names one of SUBSCRIPTION_PROVIDERS — the providers
+  // bob authenticates by a subscription login (pi's `isSubscription` set minus
+  // anthropic, which bob authenticates by an API key) — the agent's own auth
+  // store must hold a credential pi accepts for it, or `bob login` is the
+  // remedy. A store pi would reject, or one that cannot be read, is a FAIL,
+  // never a pass. A provider outside that set produces no check at all.
   if (yamlText !== undefined) {
     let providerName: string | undefined;
     try {

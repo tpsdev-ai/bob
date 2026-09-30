@@ -342,8 +342,12 @@ describe("bob#241 — doctor fails a subscription provider with no usable creden
     expect(check?.detail).toContain("pi would reject");
   });
 
-  it("does not add a check for a provider that is not a subscription provider", () => {
+  it("does not add a check outside the check's scope (an API-key provider, and pi-subscription anthropic)", () => {
     makeAgent("apibot", "openai");
     expect(subscriptionCheck("apibot")).toBeUndefined();
+    // anthropic is a pi subscription OAuth provider but bob authenticates it by
+    // an API key, so the check does not cover it either.
+    makeAgent("antbot", "anthropic");
+    expect(subscriptionCheck("antbot")).toBeUndefined();
   });
 });

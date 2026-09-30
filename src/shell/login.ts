@@ -30,14 +30,15 @@ import { resolveRunConfig } from "./run.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
-// pi's subscription OAuth providers: the provider bundles whose OAuth config
-// carries `isSubscription: true` —
-// node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/{anthropic,
-// openai-codex,github-copilot,xai,kimi-coding}.js. These are the providers
-// `bob login` is for and the set the doctor check covers. pi also offers an
-// API-key path for some of them (xAI, Kimi), so a stored API key counts.
+// The providers `bob login` is for and the set the doctor check covers: pi's
+// subscription OAuth providers minus anthropic. pi's provider bundles mark
+// anthropic, openai-codex, github-copilot, xai and kimi-coding with
+// `isSubscription: true` (dist/bundle/chunks/*.js); bob authenticates anthropic
+// with an API key instead (its scaffold writes one, and `bob doctor` treats an
+// absent anthropic credential as a legitimate skip), so the check does not
+// cover anthropic. pi also offers an API-key path for some of the rest, so a
+// stored API key counts.
 export const SUBSCRIPTION_PROVIDERS: ReadonlySet<string> = new Set([
-  "anthropic",
   "openai-codex",
   "github-copilot",
   "xai",
