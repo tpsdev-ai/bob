@@ -1,6 +1,7 @@
 // bob#230 — a resident role's `read` is confined to the workspace and refuses
-// the agent's credential files. Every refusal here is exercised through pi's
-// OWN read tool definition (bob plugs its checked file operations into it), and
+// the agent's credential files. The tool-level refusals are exercised through
+// pi's OWN read tool definition (bob plugs its checked file operations into it);
+// the check-to-open refusal cases call the checked file operations directly; and
 // the resolved-session cases go through resolveRunConfig → createPiRunSession,
 // the path `bob run` takes.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";

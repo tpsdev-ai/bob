@@ -1,8 +1,9 @@
 // Confined `read` for resident roles.
 //
 // pi's built-in read tool reads any path the agent's OS user can read. A
-// resident agent runs unattended behind its service unit and answers a chat
-// surface, so that reach includes the agent's OWN credentials — its Flair
+// resident agent may run unattended behind a service unit and answer a chat
+// surface (a one-shot run is resident too when bob.yaml sets `resident: true`),
+// so that reach includes the agent's OWN credentials — its Flair
 // identity key, a chat bot token file, a capability key file, and the provider
 // login store. A resident role that opts into `read` gets a confined one
 // instead: bob hands pi a custom tool named `read` (pi's tool registry is keyed
@@ -474,8 +475,9 @@ export async function openCheckedReadTarget(
 // ─── Image sniffing on the verified descriptor ──────────────────────────────
 //
 // pi's read asks its operations for an image MIME type before it reads. pi's own
-// detector opens the path again, so the confined operations sniff the verified
-// descriptor instead, recognising the same formats pi supports (JPEG, PNG, GIF,
+// detector opens the path again, so the confined operations sniff a descriptor
+// they open and verify the same way as the read (a separate open; pi calls
+// detection and reading separately), recognising the same formats pi supports (JPEG, PNG, GIF,
 // WebP, BMP; not an animated PNG, not JPEG-LS). A test pins parity with pi's own
 // read on the same files.
 
