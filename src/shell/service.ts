@@ -86,10 +86,11 @@ export interface NodeResolutionDeps {
   // fs.statSync. A throw makes the candidate UNTRUSTED. Injected in tests.
   statPath?: (path: string) => PathOwnership;
   // The host's administrators group. A directory writable by its owner and this
-  // group, and by no one else, is accepted: the group's members can already act
-  // as root. Defaults to 80 (`admin`) on macOS, the group stock Homebrew makes
-  // its prefix writable by, and to null (no group-writable directory is
-  // accepted) elsewhere. Injected in tests.
+  // group, and by no one else, is accepted: a policy that TRUSTS this group.
+  // Defaults to 80 (`admin`) on macOS, for Homebrew prefixes that are
+  // admin-writable (observed: /opt/homebrew/bin as drwxrwxr-x <user> admin),
+  // and to null elsewhere (then group write passes only in a sticky ancestor).
+  // Injected in tests.
   adminGid?: number | null;
 }
 
@@ -111,12 +112,13 @@ interface TrustContext {
 
 // Whether one directory on the way to a candidate interpreter is trusted. Every
 // directory must be owned by the installer or by root; a failed stat is
-// untrusted. A HOLDER, a directory whose entry names the interpreter (the PATH
-// entry holding `node`, and the directory holding the last name of any symlink
-// target), must be writable by no one but its owner, except that write by the
-// host's administrators group is accepted. An ANCESTOR, any other directory
-// traversed, may also be group- or other-writable when it has the sticky bit
-// (as /tmp does), which stops others renaming entries they do not own.
+// untrusted. A HOLDER, a directory whose entry the resolution depends on
+// directly (it holds a symlink met on the way, or the final name of the
+// candidate or of a symlink target), must be writable by no one but its owner,
+// except that write by the host's administrators group is accepted (a policy
+// that trusts that group). An ANCESTOR, any other directory traversed, may also
+// be group- or other-writable when it has the sticky bit (as /tmp does), which
+// stops others renaming entries they do not own.
 function directoryTrusted(dir: string, role: "holder" | "ancestor", ctx: TrustContext): boolean {
   let st: PathOwnership;
   try {
@@ -132,35 +134,56 @@ function directoryTrusted(dir: string, role: "holder" | "ancestor", ctx: TrustCo
   return role === "ancestor" && (st.mode & STICKY) !== 0;
 }
 
+// One name for the walk to look up, and whether the directory it is looked up
+// in must pass the HOLDER rule: true for the final name of the candidate and
+// for the final name of every symlink target (the entry the link lands on).
+interface WalkStep {
+  name: string;
+  holder: boolean;
+}
+
+// A path's names, its final one marked HOLDER. Trailing "." names are dropped;
+// a path left with no name, or whose final name is "..", names no entry for a
+// directory to hold, so it yields undefined and the candidate is untrusted.
+function walkSteps(path: string): WalkStep[] | undefined {
+  const names = path
+    .slice(parse(path).root.length)
+    .split(sep)
+    .filter((n) => n.length > 0);
+  while (names.length > 0 && names[names.length - 1] === ".") names.pop();
+  if (names.length === 0 || names[names.length - 1] === "..") return undefined;
+  return names.map((name, i) => ({ name, holder: i === names.length - 1 }));
+}
+
 // Whether a candidate interpreter path is trusted: every directory traversed to
 // reach the file passes directoryTrusted. The walk resolves the path one name at
-// a time and follows each symlink hop, the `node` entry's own target included,
-// so a symlinked directory is judged both by the directory holding the link and
-// by every directory the link leads through. A candidate the walk cannot follow
-// (a failed lstat or readlink, more than MAX_SYMLINK_HOPS hops, a non-directory
-// on the way, or a final entry that is not a regular file) is untrusted, and so
-// is a relative path.
+// a time and follows each symlink hop. It applies the HOLDER rule to the
+// directory holding each symlink met on the way (intermediate directory links
+// included), to the directory holding each symlink target's final name, and to
+// the directory holding the candidate's own final name; every other directory
+// traversed gets the ANCESTOR rule. So a symlink in a directory others can
+// write, sticky or not, is never trusted, whatever it points to: its owner
+// could retarget it after the unit is written. A candidate the walk cannot
+// follow (a failed lstat or readlink, more than MAX_SYMLINK_HOPS hops, a
+// symlink target that names no entry, a non-directory on the way, or a final
+// entry that is not a regular file) is untrusted, and so is a relative path.
 function interpreterPathTrusted(file: string, ctx: TrustContext): boolean {
   if (!isAbsolute(file)) return false;
-  const names = (path: string): string[] =>
-    path
-      .slice(parse(path).root.length)
-      .split(sep)
-      .filter((n) => n.length > 0);
   let dir = parse(file).root;
   if (!directoryTrusted(dir, "ancestor", ctx)) return false;
-  let pending = names(file);
+  let pending = walkSteps(file);
+  if (pending === undefined) return false;
   let hops = 0;
   while (pending.length > 0) {
-    const name = pending.shift() as string;
-    if (name === ".") continue;
-    if (name === "..") {
+    const step = pending.shift() as WalkStep;
+    if (step.name === ".") continue;
+    if (step.name === "..") {
       dir = dirname(dir);
       continue;
     }
     const last = pending.length === 0;
-    if (last && !directoryTrusted(dir, "holder", ctx)) return false;
-    const entry = join(dir, name);
+    if (step.holder && !directoryTrusted(dir, "holder", ctx)) return false;
+    const entry = join(dir, step.name);
     let target: string | undefined;
     try {
       const st = lstatSync(entry);
@@ -175,13 +198,17 @@ function interpreterPathTrusted(file: string, ctx: TrustContext): boolean {
       if (!directoryTrusted(dir, "ancestor", ctx)) return false;
       continue;
     }
+    // A symlink met anywhere on the way must sit in a HOLDER-grade directory.
+    if (!directoryTrusted(dir, "holder", ctx)) return false;
     hops += 1;
     if (hops > MAX_SYMLINK_HOPS) return false;
+    const targetSteps = walkSteps(target);
+    if (targetSteps === undefined) return false;
     if (isAbsolute(target)) {
       dir = parse(target).root;
       if (!directoryTrusted(dir, "ancestor", ctx)) return false;
     }
-    pending = [...names(target), ...pending];
+    pending = [...targetSteps, ...pending];
   }
   return false;
 }
@@ -213,8 +240,8 @@ function realpathOrUndefined(file: string): string | undefined {
   }
 }
 
-// Whether a path's final component is a symlink. A stable Homebrew entry
-// (/opt/homebrew/bin/node) is a symlink to the versioned target; a versioned
+// Whether a path's final component is a symlink. A Homebrew entry such as
+// /opt/homebrew/bin/node is a symlink to the versioned target; a versioned
 // Cellar entry (…/Cellar/node/<version>/bin/node) is a real file. Detected by
 // lstat, so a symlinked PARENT directory does not count as a symlink here.
 function isSymlink(file: string): boolean {
@@ -229,27 +256,32 @@ function isSymlink(file: string): boolean {
 //
 // The unit must run bob under NODE — bin/bob's shebang and package.json's
 // `engines` say so — whatever runtime ran install-service. When the installer
-// IS node we prefer a STABLE path that resolves to the SAME binary: on a
-// Homebrew install process.execPath is the versioned target
+// is NOT node (e.g. a developer runs install-service under bun) we use the first
+// trusted `node` on the installer's PATH; with none, installation is REFUSED
+// (the throw names the remedy, and each executable `node` from an absolute PATH
+// entry that the trust screen rejected) rather than writing a unit that would
+// run bob under a non-Node runtime.
+//
+// When the installer IS node we use its own interpreter, execPath, with one
+// exception. On a Homebrew install execPath is the versioned target
 // (…/Cellar/node/<version>/bin/node), and writing that into the unit breaks the
-// service after `brew upgrade node` (the versioned directory is gone). Walking
-// the installer's PATH for a `node` SYMLINK whose realpath equals execPath's
-// realpath yields a stable path (on Homebrew, /opt/homebrew/bin/node). A
-// matching symlink is preferred over a direct match; when no matching symlink
-// exists (only direct matches, or none) we fall back to execPath, which may
-// itself be stable or versioned. When the
-// installer is NOT node (e.g. a developer runs install-service under bun) we
-// look for `node` on the installer's PATH. If neither yields a Node,
-// installation is REFUSED (the throw names the remedy) rather than writing a
-// unit that would run bob under a non-Node runtime.
+// service after `brew upgrade node` removes that directory. So when a TRUSTED
+// PATH `node` whose FINAL entry is a symlink has the same realpath as execPath,
+// we write that symlink path instead (on Homebrew, /opt/homebrew/bin/node), even
+// when a direct match comes earlier on PATH. That path keeps working only while
+// whatever maintains the symlink keeps it pointing at a working Node. Without a
+// trusted matching symlink we fall back to execPath, which may itself be stable
+// or versioned.
 //
 // TRUST SCREEN: both branches consider only PATH candidates that pass it. A PATH
 // entry that is empty or not absolute (`bin`, `.`) is skipped. A candidate is
-// kept only when every directory traversed to reach its file, following each
-// symlink hop, passes directoryTrusted: owned by the installer or by root, the
-// holding directory writable by no one else (write by the host's administrators
-// group excepted), an ancestor writable by others only with the sticky bit. A
-// candidate that fails is skipped, and the resolution falls back as it would
+// kept only when interpreterPathTrusted accepts the whole path to its file,
+// following EVERY symlink on the way (a symlinked PATH directory included):
+// every directory owned by the installer or by root; the directory holding each
+// symlink met, each symlink target's final name and the candidate's own final
+// name writable by no one else (write by the host's administrators group
+// excepted); any other directory writable by others only with the sticky bit.
+// A candidate that fails is skipped, and the resolution falls back as it would
 // with no such candidate. The fallback in the node branch, execPath itself, is
 // the running interpreter and is not screened.
 export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
@@ -283,13 +315,13 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   }
 
   if (executableBasename(execPath).toLowerCase() === "node") {
-    // The installer IS node: prefer a PATH `node` that is a SYMLINK resolving to
-    // the SAME binary, so a versioned target becomes its stable symlink. A
-    // direct (non-symlink) match does not help — a versioned Cellar binary on
-    // PATH is still versioned — so when only direct matches exist (or none) we
-    // fall back to the running interpreter's own path, which can be versioned.
-    // A PATH `node` symlinked to a DIFFERENT binary is not a match; the first
-    // matching symlink in PATH order wins.
+    // The installer IS node: prefer a trusted PATH `node` whose FINAL entry is a
+    // SYMLINK resolving to the SAME binary, so a versioned target is written as
+    // that symlink path. A direct (non-symlink) match does not help — a
+    // versioned Cellar binary on PATH is still versioned — so without a trusted
+    // matching symlink we fall back to the running interpreter's own path, which
+    // can be versioned. A PATH `node` symlinked to a DIFFERENT binary is not a
+    // match; the first trusted matching symlink in PATH order wins.
     const execReal = realpathOrUndefined(execPath);
     if (execReal !== undefined) {
       for (const candidate of candidates) {
@@ -304,7 +336,7 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   if (candidates.length > 0) return candidates[0];
   const skipped =
     untrusted.length > 0
-      ? ` Skipped as untrusted: ${untrusted.join(", ")} (every directory on the way must be owned by you or root and not writable by others).`
+      ? ` Skipped as untrusted: ${untrusted.join(", ")} (fix: make every directory on the way owned by you or root and not writable by others).`
       : "";
   throw new Error(
     `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.${skipped}`,

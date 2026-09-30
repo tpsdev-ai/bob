@@ -1,7 +1,9 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
+  accessSync,
   chmodSync,
+  constants,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -54,8 +56,9 @@ function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
 
 // The installer uid every test that resolves an interpreter injects: the
 // running uid, which owns the temp directories the tests create. TRUST also
-// turns the administrators-group exception off, so no result depends on the
-// host's identity or group database; tests about those rules override it.
+// turns the administrators-group exception off, so no resolution result
+// depends on the host's group database; tests about those rules override it.
+// (The owner test is skipped when the suite runs as root.)
 const ME = process.getuid?.() ?? 0;
 const TRUST = { getUid: () => ME, adminGid: null };
 
@@ -80,8 +83,10 @@ function stubNodeDir(prefix: string): { dir: string; node: string } {
 // A REAL Node binary, for the acceptance tests that EXECUTE the rendered unit's
 // command (`bob --help`). It is a fixture to run, not the resolution under test,
 // so it is found without the trust screen: BOB_TEST_NODE when set, else the
-// first executable `node` on this process's PATH. With neither, those tests are
-// skipped, except under CI, where they run and fail naming this remedy.
+// first `node` on this process's PATH that is a regular file with execute
+// permission. This lookup is the one place these tests read the host's PATH.
+// With neither, those tests are skipped, except under CI, where they run and
+// fail naming this remedy.
 function findRealNode(): string | undefined {
   const fromEnv = process.env.BOB_TEST_NODE;
   if (fromEnv) return fromEnv;
@@ -89,7 +94,9 @@ function findRealNode(): string | undefined {
     if (!dir.startsWith("/")) continue;
     const candidate = join(dir, "node");
     try {
-      if (statSync(candidate).isFile()) return candidate;
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
     } catch {
       // not here
     }
@@ -461,7 +468,7 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
   });
 });
 
-describe("resolveNodeExecutable — a stable path over a versioned target (bob#228)", () => {
+describe("resolveNodeExecutable — a PATH symlink over a versioned target (bob#228)", () => {
   // A real, executable file standing in for the running interpreter (the
   // versioned Homebrew Cellar target on macOS).
   function versionedNode(): { dir: string; file: string } {
@@ -535,9 +542,12 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
 
 // The trust screen: a PATH `node` is a candidate only when it is reached through
 // an ABSOLUTE PATH entry and every directory on the way to its file, symlink
-// targets included, is owned by the installer or root and not writable by
-// others (see resolveNodeExecutable). Temp directories are created with explicit
-// modes; the running uid is the installer.
+// targets included, is owned by the installer or root; a directory holding a
+// symlink or the final name of the path or of a link target is writable by no
+// one else (write by the injected administrators group excepted), and any
+// other directory is writable by others only with the sticky bit (see
+// resolveNodeExecutable). Temp directories here get explicit modes; the
+// running uid is the installer.
 describe("resolveNodeExecutable — only trusted, absolute PATH entries supply node (bob#233)", () => {
   const delimiter = process.platform === "win32" ? ";" : ":";
   const BUN = "/opt/bun/bin/bun"; // a non-Node installer
@@ -687,14 +697,80 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: linked })).toThrow(
         NO_NODE,
       );
-      // premise: a PATH directory link into a TRUSTED directory is chosen.
-      const good = tempDir("bob-trust-gooddir-");
+      // premise: a PATH directory link into a TRUSTED directory is chosen (the
+      // directory is nested in a 0700 parent, since the entry a link lands on
+      // must sit in a holder-grade directory, which a sticky /tmp is not).
+      const good = subdirs(tempDir("bob-trust-gooddir-"), "good");
       nodeFile(good);
       const goodLink = join(parent, "good");
       symlinkSync(good, goodLink);
       expect(resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: goodLink })).toBe(
         join(goodLink, "node"),
       );
+    });
+
+    // Every symlink met while resolving the path, a PATH directory link
+    // included, must sit in a HOLDER-grade directory, and so must the entry each
+    // link lands on. A sticky, world-writable directory (like /tmp) protects
+    // entries its users do not own, but a link there could be retargeted by its
+    // owner after the unit is written.
+    describe("every symlink on the resolution path meets the holder rule", () => {
+      // A 0755 directory holding a node symlink to `versioned`, nested in a 0700
+      // parent, so only the link under test decides the outcome.
+      function trustedNodeHome(versioned: string): string {
+        const home = subdirs(tempDir("bob-sym-target-"), "bin");
+        nodeLink(home, versioned);
+        return home;
+      }
+
+      it("a PATH entry that is a directory symlink in a sticky, world-writable directory is refused; the fallback applies", () => {
+        const versioned = nodeFile(tempDir("bob-sym-versioned-"));
+        const target = trustedNodeHome(versioned);
+        const sticky = tempDir("bob-sym-sticky-");
+        makeSticky(sticky);
+        const link = join(sticky, "bin");
+        symlinkSync(target, link);
+        // A Node installer does not take the matching link: the fallback is execPath.
+        expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: link })).toBe(
+          versioned,
+        );
+        // A non-Node installer refuses, naming the skipped path.
+        expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: link })).toThrow(
+          `Skipped as untrusted: ${join(link, "node")}`,
+        );
+      });
+
+      it("positive control: the same directory symlink in a trusted (0700) holder is chosen", () => {
+        const versioned = nodeFile(tempDir("bob-sym-versioned-"));
+        const target = trustedNodeHome(versioned);
+        const link = join(tempDir("bob-sym-holder-"), "bin");
+        symlinkSync(target, link);
+        expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: link })).toBe(
+          join(link, "node"),
+        );
+        expect(resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: link })).toBe(
+          join(link, "node"),
+        );
+      });
+
+      it("a symlink whose target lands on an entry in a sticky, world-writable directory is refused", () => {
+        const versioned = nodeFile(tempDir("bob-sym-versioned-"));
+        const sticky = tempDir("bob-sym-sticky-target-");
+        makeSticky(sticky);
+        // The installer's own 0755 directory, holding node, directly in the sticky one.
+        const landing = subdirs(sticky, "real");
+        nodeLink(landing, versioned);
+        // premise: named directly (no link), it is chosen: the sticky directory
+        // is then only an ancestor of the PATH entry.
+        expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: landing })).toBe(
+          join(landing, "node"),
+        );
+        const link = join(tempDir("bob-sym-holder-"), "bin");
+        symlinkSync(landing, link);
+        expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: link })).toBe(
+          versioned,
+        );
+      });
     });
 
     it("a Homebrew-shaped relative link (bin/node -> ../Cellar/node/<v>/bin/node) in trusted directories is chosen", () => {
@@ -793,7 +869,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const open = tempDir("bob-ci-usr-local-bin-", 0o777); // like the runner's /usr/local/bin
       const link = nodeLink(open, binary); // a node symlink ...
       const openToo = tempDir("bob-ci-other-bin-", 0o777);
-      const file = nodeFile(openToo); // ... and a node file, both world-writable
+      const file = nodeFile(openToo); // ... and a node file, each in a world-writable directory
       const deps = { ...TRUST, execPath: BUN, pathEnv: `${open}${delimiter}${openToo}` };
       // premise: the same link in a 0700 directory IS chosen
       const closed = tempDir("bob-ci-trusted-");
@@ -884,7 +960,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
   });
 });
 
-describe("installService prefers a stable PATH symlink over a direct match (bob#228)", () => {
+describe("installService prefers a trusted PATH symlink over a direct match (bob#228)", () => {
   it("writes the symlink path in BOTH units even when a direct match comes FIRST on PATH", async () => {
     const versionedDir = mkdtempSync(join(tmpdir(), "bob-node-versioned-"));
     const stableDir = mkdtempSync(join(tmpdir(), "bob-node-stable-"));
@@ -894,7 +970,7 @@ describe("installService prefers a stable PATH symlink over a direct match (bob#
     const stable = join(stableDir, "node");
     symlinkSync(versioned, stable);
     const delimiter = process.platform === "win32" ? ";" : ":";
-    // The versioned Cellar directory comes BEFORE the stable symlink on PATH.
+    // The versioned Cellar directory comes BEFORE the symlink on PATH.
     const pathEnv = `${versionedDir}${delimiter}${stableDir}`;
     try {
       const launchdWritten: Array<{ path: string; contents: string }> = [];
@@ -1053,7 +1129,8 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
   });
 
   // The installer is Node (the real-node fixture) with an EMPTY PATH, so the
-  // resolution is its own interpreter; nothing reads the host's PATH or trust.
+  // resolution returns that interpreter: the resolution reads neither the
+  // host's PATH nor its trust (only the fixture lookup above reads the PATH).
   itWithRealNode(
     "launchd: the rendered command runs under the resolved Node and gets bob --help to exit 0",
     () => {
