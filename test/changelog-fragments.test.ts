@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -556,6 +557,33 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       "CHANGELOG.md was replaced after it was read",
     );
     expect(readFileSync(changelogPath, "utf8")).toBe("another file\n");
+  });
+
+  // Device and inode are compared as BigInt: as numbers, 2^53 and 2^53+1 are
+  // equal, so a different file with an adjacent high inode would pass. Driven
+  // through promote's stat seam, the write must refuse before truncating
+  // CHANGELOG.md or deleting a fragment.
+  it("promote REFUSES a CHANGELOG.md whose inode differs only above 2^53 (2^53 read, 2^53+1 at write), and changes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    let calls = 0;
+    const fstat = (fd: number) => {
+      const real = fstatSync(fd, { bigint: true });
+      calls += 1;
+      return {
+        isFile: () => real.isFile(),
+        dev: 7n,
+        ino: calls === 1 ? 2n ** 53n : 2n ** 53n + 1n,
+      };
+    };
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath, fstat })).toThrow(
+      "CHANGELOG.md was replaced after it was read",
+    );
+    expect(calls).toBe(2);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
   // Permission bits do not bind root, so these two cannot fail a write as root.

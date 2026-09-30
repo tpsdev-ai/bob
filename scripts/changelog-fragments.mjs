@@ -295,7 +295,12 @@ function decodeUtf8OrThrow(bytes, what) {
 const CHANGELOG_READ_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 const CHANGELOG_WRITE_FLAGS = constants.O_WRONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 
-function openRegularChangelog(changelogPath, flags) {
+// Device and inode as BigInt: as JS numbers, distinct values above 2^53 can
+// round to the same number, and the identity check would accept another file.
+// `fstat` is a test seam; every caller but a test uses this default.
+const fstatBigint = (fd) => fstatSync(fd, { bigint: true });
+
+function openRegularChangelog(changelogPath, flags, fstat = fstatBigint) {
   let fd;
   try {
     fd = openSync(changelogPath, flags);
@@ -308,7 +313,7 @@ function openRegularChangelog(changelogPath, flags) {
     }
     throw err;
   }
-  const st = fstatSync(fd);
+  const st = fstat(fd);
   if (!st.isFile()) {
     closeSync(fd);
     throw new FragmentError(
@@ -320,8 +325,8 @@ function openRegularChangelog(changelogPath, flags) {
 }
 
 /** CHANGELOG.md's text and the identity (device, inode) of the file read. */
-export function readChangelog(changelogPath) {
-  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_READ_FLAGS);
+export function readChangelog(changelogPath, { fstat = fstatBigint } = {}) {
+  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_READ_FLAGS, fstat);
   try {
     return { text: decodeUtf8OrThrow(readFileSync(fd), "CHANGELOG.md"), dev: st.dev, ino: st.ino };
   } finally {
@@ -330,8 +335,8 @@ export function readChangelog(changelogPath) {
 }
 
 /** Replace CHANGELOG.md's content, only if it is still the regular file `read` came from. */
-export function writeChangelog(changelogPath, text, read) {
-  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_WRITE_FLAGS);
+export function writeChangelog(changelogPath, text, read, { fstat = fstatBigint } = {}) {
+  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_WRITE_FLAGS, fstat);
   try {
     if (st.dev !== read.dev || st.ino !== read.ino) {
       throw new FragmentError(
@@ -581,7 +586,7 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 
 export function promote(
   version,
-  { date, changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {},
+  { date, changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR, fstat } = {},
 ) {
   if (!isReleaseVersion(version)) {
     throw new FragmentError(
@@ -602,7 +607,7 @@ export function promote(
         `Add the entries for this release before running the release step.`,
     );
   }
-  const changelogRead = readChangelog(changelogPath);
+  const changelogRead = readChangelog(changelogPath, { fstat });
   const text = changelogRead.text;
   const lines = text.split("\n");
   const heading = findUnreleasedHeading(lines);
@@ -656,7 +661,7 @@ export function promote(
   // A failure part-way must say what state it left and how to recover: the
   // section is written first, and the fragments are deleted only after that.
   try {
-    writeChangelog(changelogPath, next.join("\n"), changelogRead);
+    writeChangelog(changelogPath, next.join("\n"), changelogRead, { fstat });
   } catch (err) {
     if (err instanceof FragmentError) {
       throw new FragmentError(`promote: ${err.message} No fragment was deleted.`);
