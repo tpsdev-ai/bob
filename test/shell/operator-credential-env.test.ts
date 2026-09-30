@@ -16,7 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -47,14 +47,20 @@ function probingRunner(seen: Probe[]): SessionRunner {
       ...input,
       modeFactory: (runtime) => ({
         run: async () => {
-          const bash = runtime.session.agent.state.tools.find((t) => t.name === "bash");
-          const result = bash ? await bash.execute("probe-env", { command: "env" }) : undefined;
-          seen.push({
-            hasBash: bash !== undefined,
-            inProcess: process.env[ADMIN_PASS_ENV],
-            toolEnv: JSON.stringify(result?.content ?? null),
-            childEnv: spawnSync("/usr/bin/env", { encoding: "utf8", env: process.env }).stdout,
-          });
+          try {
+            const bash = runtime.session.agent.state.tools.find((t) => t.name === "bash");
+            const result = bash ? await bash.execute("probe-env", { command: "env" }) : undefined;
+            seen.push({
+              hasBash: bash !== undefined,
+              inProcess: process.env[ADMIN_PASS_ENV],
+              toolEnv: JSON.stringify(result?.content ?? null),
+              childEnv: spawnSync("/usr/bin/env", { encoding: "utf8", env: process.env }).stdout,
+            });
+          } finally {
+            // Await the runtime's disposal before returning, as pi's interactive
+            // mode does when it quits.
+            await runtime.dispose();
+          }
         },
       }),
     });
@@ -87,13 +93,22 @@ describe("FLAIR_ADMIN_PASS never reaches an agent session", () => {
     process.env[VISIBLE] = "yes";
   });
   afterEach(() => {
-    rmSync(base, { recursive: true, force: true });
     for (const [key, value] of [
       [ADMIN_PASS_ENV, saved.pass],
       [VISIBLE, saved.visible],
     ] as const) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
+    }
+    rmSync(base, { recursive: true, force: true });
+    // bob#248: before the override repository's Git calls stopped starting
+    // automatic maintenance, rmSync under Bun sometimes returned without an
+    // error and left this tree. Check, so a leftover fails this test by name
+    // instead of leaking silently.
+    if (existsSync(base)) {
+      throw new Error(
+        `cleanup left ${base} behind: ${readdirSync(base, { recursive: true }).slice(0, 20).join(", ")}`,
+      );
     }
   });
 
