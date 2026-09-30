@@ -125,11 +125,13 @@ export function resolveCapabilities(opts: ResolveCapabilitiesOptions): Capabilit
   }
 
   // bob#244: the composition rule at YAML load. A set that holds `web` may hold
-  // only public-class capabilities (data-class.ts); the session factory checks
-  // the rest of the session — tools, startup context, history — at creation,
-  // bind and reload. Over the capabilities that will actually LOAD (`only`
-  // applied): a disabled capability composes nothing.
-  assertWebComposition(capabilityListView(resolved.map((c) => c.name)), lookup);
+  // only public-class capabilities (data-class.ts). This check sees only the
+  // capability set; the session factory checks the rest of the session —
+  // tools, startup context, history — at creation, bind and reload. Over the
+  // capabilities that will actually LOAD (`only` applied): a disabled
+  // capability composes nothing. A config block that fails its schema is
+  // refused above, before this check runs.
+  assertWebComposition(capabilityListView(resolved.map((c) => c.name)), lookup, "capabilities");
 
   return {
     capabilities: resolved,

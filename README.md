@@ -248,10 +248,11 @@ change one, the named test is what tells you.
   capability in it is public-class, it holds no pi built-in tool, it carries no
   `soul.md` content, standing contract, unclassified startup context or restored
   history, and the system prompt pi assembles for it is exactly bob's reviewed
-  web prompt (a web session has no workspace: pi's working directory is `/`).
-  Checked at `bob.yaml` load and by the session factory before anything is
-  built, at creation, after the mode binds extensions and after every reload;
-  there is no override. The admitted prompt itself is not classified yet: which
+  web prompt (a web session has no agent workspace: pi's working directory is
+  `/`). Checked at `bob.yaml` load over the capability set, by the session
+  factory before it builds pi's runtime (so before any extension loads), and on
+  the composed session at creation, after the mode binds extensions and after
+  every reload; there is no override. The admitted prompt itself is not classified yet: which
   prompts may reach a web tool is decided before a web tool is registered. See
   [Data classes](#data-classes-and-what-a-web-session-may-hold).
   *(`test/shell/data-class.test.ts`, `test/shell/web-composition-session.test.ts`)*
@@ -589,9 +590,9 @@ Once its tools land, the `web` capability will send model-influenced data to
 hosts outside the office (a fetched URL, a search query); this release registers
 neither tool. So until bob can attribute every input of a session to its
 source, a session that holds `web` (or allows `web_fetch` or `web_search`) must
-hold nothing private beyond its admitted prompt. For a config whose capability
-blocks are otherwise valid, bob refuses such a session with one composition
-error that names every composition problem, when it would also hold:
+hold nothing private beyond its admitted prompt. A session that holds web
+because it allows an egress tool, without the capability, counts too. bob
+refuses such a session when it would also hold:
 
 - a private-class capability, or an extension bob cannot attribute to a capability;
 - any pi built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
@@ -605,15 +606,24 @@ error that names every composition problem, when it would also hold:
 - a system prompt other than bob's reviewed web prompt. pi's own template names
   local paths: the install paths of its documentation and, in every template,
   the working directory. So a web session gets bob's reviewed prompt instead,
-  and no workspace (pi's working directory is `/`), and the prompt pi assembles
-  is compared with the reviewed one, character for character.
+  and no agent workspace (pi's working directory is `/`), and the prompt pi
+  assembles is compared with the reviewed one, character for character.
+
+Each check reports, in one error, every problem that check can see. The check
+at `bob.yaml` load sees only the capability set, and runs after each capability
+block has passed its own schema (a block that fails is refused first, on its
+own). So a config that is wrong in more than one place can be refused at load
+for its capabilities and then, once those are fixed, in the session factory for
+its tools, startup context or history. The refusal says why the session is a web
+session and names the remedy: remove `web` from `capabilities:`, or remove the
+egress tool from `tools.allow` when that is what made it one.
 
 The one-shot task of `bob run <name> "<task>"` is the admitted prompt and is
 allowed; the system prompt carries a capped copy of it. bob's own post-compaction "what remains" note carries workspace data,
 so it is not sent into a web session. The rule is checked when `bob.yaml`'s
-capabilities are resolved, and by the session factory before anything is built,
-at creation, after the mode binds extensions and after every reload. There is
-no override. In practice web composes only with `fixture` and `presence`, in a
+capabilities are resolved, by the session factory before it builds pi's runtime,
+and on the composed session at creation, after the mode binds extensions and
+after every reload. There is no override. In practice web composes only with `fixture` and `presence`, in a
 session with an empty `soul.md`, and never beside Flair or Discord.
 
 ### `web` — configuration only in this release

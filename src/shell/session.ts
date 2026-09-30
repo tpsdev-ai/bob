@@ -827,7 +827,7 @@ export function auditCreatedSession(
 // `resources_discover` skills and prompt templates) that creation never saw. A
 // session that holds no web returns at once, and its loader is never read.
 //
-// History is counted at creation, before anything is built (the factory's
+// History is counted at creation, before pi's runtime is built (the factory's
 // config view); here it is the history SOURCE that is checked: a session
 // manager other than the one checked at creation is history bob cannot
 // attribute.
@@ -1139,11 +1139,13 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const confinedRead = confinedReadCustomTools(policy, config);
 
     // bob#244: the web composition rule on what this session is ABOUT to
-    // compose (data-class.ts), decided with the confined read — before any
-    // environment change, key read or runtime build — so a web session that
-    // would hold private data is refused with nothing to undo and no capability
-    // started. It counts the history this session manager already holds: a web
-    // session restores none. A session that holds no web is not affected.
+    // compose (data-class.ts), decided with the confined read — before bob sets
+    // the capability environment, reads a key or builds pi's model runtime and
+    // session services — so a web session that would hold private data is
+    // refused before any extension has loaded. It counts the history this
+    // session manager already holds: a web session restores none, and a history
+    // it cannot read is a problem, not an empty one. A session that holds no web
+    // is not affected.
     const composing = configCompositionView({
       ...config,
       tools: policy.tools,
@@ -1151,14 +1153,17 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     });
     const webSession = holdsWeb(composing);
     if (webSession) {
+      const restored = restoredHistoryEntries(sessionManager);
       assertWebComposition({
         ...composing,
-        restoredHistory: restoredHistoryEntries(sessionManager),
+        restoredHistory: restored ?? 0,
+        ...(restored === undefined ? { historyUnreadable: true } : {}),
       });
     }
-    // A web session has no workspace: pi's working directory is "/", because
-    // every prompt template pi has ends with that directory (data-class.ts).
-    // Every other session runs in the agent's own work directory.
+    // A web session has no agent workspace: pi's working directory is "/",
+    // because every prompt template pi has ends with that directory
+    // (data-class.ts). Every other session runs in the agent's own work
+    // directory.
     const cwd = webSession ? WEB_SESSION_CWD : config.cwd;
 
     // bob#214: the model's declared window, for THIS session's provider/model,

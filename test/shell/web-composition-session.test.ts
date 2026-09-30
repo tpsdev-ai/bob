@@ -2,7 +2,7 @@
 // sessions, built by bob's one session factory. Refusal is proven at the three
 // points the factory audits:
 //
-//   CREATION  before anything is built (a web session that would hold a private
+//   CREATION  before pi's runtime is built (a web session that would hold a private
 //             capability, a private-data built-in, a soul, a standing contract,
 //             or history — including history that once held a private
 //             capability — is refused before any extension loads);
@@ -173,7 +173,7 @@ function probe(name: string, body: string): string {
   return path;
 }
 
-describe("the control: a public-only web session is composed", () => {
+describe("the control: a web session with only public-class inputs is composed", () => {
   it("web + fixture, no soul, the admitted task, fresh history: created, and the web extension loads with no tool", async () => {
     const agent = scaffold();
     const built = await build(
@@ -218,7 +218,7 @@ describe("the system prompt a web session sends names nothing local", () => {
     });
     const built = await build(agent, composed);
     try {
-      expect(built.cwd, "a web session has no workspace").toBe("/");
+      expect(built.cwd, "a web session has no agent workspace").toBe("/");
       const block = contractBlockFor(composed.config) as string;
       expect(built.session.systemPrompt).toBe(webSessionSystemPrompt([block]));
       expect(built.session.systemPrompt).not.toContain(MARKER);
@@ -294,7 +294,7 @@ describe("the system prompt a web session sends names nothing local", () => {
   });
 });
 
-describe("refused at CREATION, before anything is built", () => {
+describe("refused at CREATION, before any extension loads", () => {
   // A probe that records its own load: its marker proves whether the factory
   // got as far as loading extensions.
   const markerProbe = (marker: string) =>
@@ -316,6 +316,68 @@ describe("refused at CREATION, before anything is built", () => {
     );
     accepted.session.dispose();
     expect(existsSync(marker), "the control reached extension load").toBe(true);
+  });
+
+  it("each check names every problem it sees: the YAML-load check the capabilities, the factory the rest too", async () => {
+    const agent = scaffold();
+    // At bob.yaml load only the capability set is visible, and it refuses first.
+    expect(() => compose(agent, { capabilities: ["anchored-edit", "web"] })).toThrow(
+      "sees only the capability set",
+    );
+    // The factory, handed the same composition (the real anchored-edit
+    // extension, attributed to its capability), names every problem it sees in
+    // ONE error.
+    const anchoredEdit = resolveCapabilities({ yamlText: "capabilities:\n  - anchored-edit\n" })
+      .extensionSources[0] as string;
+    const refusal = await build(
+      agent,
+      compose(agent, {
+        capabilities: ["web"],
+        probes: [{ path: anchoredEdit, as: "anchored-edit" }],
+        tools: ["read_lines", "read"],
+        soul: "a private persona",
+      }),
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(refusal).toBeInstanceOf(WebCompositionError);
+    expect((refusal as WebCompositionError).problems).toEqual([
+      'capability "anchored-edit" is private-class',
+      `tool "read_lines" comes from capability "anchored-edit", which is private-class`,
+      `pi's built-in tool "read" reads or writes local data`,
+      'startup context "soul" is private',
+    ]);
+    expect((refusal as Error).message).not.toContain("sees only the capability set");
+  });
+
+  it("a session web only through an allowed egress tool is refused with a remedy that names the tool", async () => {
+    // No web capability: web_fetch in the allowlist is what makes it a web
+    // session, so removing the capability cannot be the remedy.
+    const agent = scaffold();
+    const refusal = await build(
+      agent,
+      compose(agent, { capabilities: ["anchored-edit"], tools: ["read_lines", "web_fetch"] }),
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(refusal).toBeInstanceOf(WebCompositionError);
+    const message = (refusal as Error).message;
+    expect(message).toContain('capability "anchored-edit" is private-class');
+    expect(message).toContain(
+      "This is a web session because it allows the egress tool web_fetch (without the web capability).",
+    );
+    expect(message).toContain("remove web_fetch from tools.allow in bob.yaml");
+    expect(message).not.toContain("remove web from capabilities");
+  });
+
+  it("a history source bob cannot read is refused, not read as empty", async () => {
+    const agent = scaffold();
+    const unreadable = {} as unknown as ReturnType<typeof SessionManager.inMemory>;
+    await expect(
+      build(agent, compose(agent, { capabilities: ["fixture", "web"] }), unreadable),
+    ).rejects.toThrow("the session's history cannot be read, so bob cannot show it holds none");
   });
 
   it("web + a private-data built-in (read) is refused", async () => {
