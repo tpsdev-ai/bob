@@ -298,7 +298,7 @@ describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", 
       err: cap.err,
     });
     expect(code).toBe(1);
-    expect(cap.lines.join("\n")).toContain("did not complete");
+    expect(cap.lines.join("\n")).toContain("bob cannot confirm the sign-in completed");
   });
 
   it("refuses an unknown agent, naming the agents directory", async () => {
@@ -391,6 +391,51 @@ describe("bob#241 — bob logout", () => {
     expect(cap.lines.join("\n")).toContain("no credential was removed");
   });
 
+  it("does not report a removal when a stored record only becomes unusable (its NAME is still stored)", async () => {
+    // The record is still there after the run — as an unusable api_key — so no
+    // provider name was removed even though the usable set changed.
+    writeStubPi({ afterAuthJson: '{"openai-codex":{"type":"api_key"}}\n' });
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    const cap = capture();
+    const code = await runLogout({
+      name: "alpha",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("no credential was removed");
+    expect(cap.lines.join("\n")).not.toContain("removed openai-codex");
+  });
+
+  it("reports success when an ALREADY-UNUSABLE stored record is removed", async () => {
+    writeStubPi({ afterAuthJson: "{}\n" }); // the unusable record is gone
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(join(dir, ".pi-agent", "auth.json"), `{"openai-codex":{"type":"api_key"}}\n`, {
+      mode: 0o600,
+    });
+    const cap = capture();
+    const code = await runLogout({
+      name: "alpha",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(0);
+    expect(cap.lines.join("\n")).toContain("removed openai-codex");
+  });
+
   it("the CLI refuses a provider argument to logout", () => {
     try {
       spawnNode([CLI, "logout", "alpha", "openai-codex"], { env: { ...process.env, HOME: root } });
@@ -419,6 +464,20 @@ describe("bob#241 — bob logout", () => {
 describe("bob#241 — the doctor subscription-auth check", () => {
   it("fails with the `bob login` remedy when only a scaffold placeholder is stored", () => {
     makeAgent("subbot", "openai-codex"); // scaffold writes a placeholder api key
+    const check = subscriptionCheck("subbot");
+    expect(check?.status).toBe("fail");
+    expect(check?.fix).toBe("bob login subbot openai-codex");
+  });
+
+  it("fails when a scaffold placeholder is supplied through an environment reference", () => {
+    // The STORED key is "$BOB_R6_PLACEHOLDER", but it RESOLVES to a placeholder:
+    // doctor must reject the resolved value, not just a literal one.
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"api_key","key":"$BOB_R6_PLACEHOLDER","env":{"BOB_R6_PLACEHOLDER":"REPLACE_WITH_YOUR_API_KEY"}}}\n`,
+      { mode: 0o600 },
+    );
     const check = subscriptionCheck("subbot");
     expect(check?.status).toBe("fail");
     expect(check?.fix).toBe("bob login subbot openai-codex");
@@ -480,6 +539,24 @@ describe("bob#241 — the doctor subscription-auth check", () => {
       expect(subscriptionCheck("subbot")?.status).toBe("ok");
     } finally {
       delete process.env.BOB_R5_SET_243;
+    }
+  });
+
+  it("matches pi's resolver: an EMPTY stored env value falls back to the process variable", () => {
+    // pi resolves `env?.[name] || process.env[name] || undefined`
+    // (resolve-config-value.js:72), so a stored empty value falls back to the
+    // process variable rather than resolving to no key.
+    const dir = makeAgent("subbot", "openai-codex");
+    process.env.BOB_R6_FALLBACK = "resolved-key";
+    try {
+      writeFileSync(
+        join(dir, ".pi-agent", "auth.json"),
+        `{"openai-codex":{"type":"api_key","key":"$BOB_R6_FALLBACK","env":{"BOB_R6_FALLBACK":""}}}\n`,
+        { mode: 0o600 },
+      );
+      expect(subscriptionCheck("subbot")?.status).toBe("ok");
+    } finally {
+      delete process.env.BOB_R6_FALLBACK;
     }
   });
 

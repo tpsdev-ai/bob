@@ -17,8 +17,8 @@
 // composer — `resolveRunConfig`, whose `config.piAgentDir` IS the agent's
 // `.pi-agent` directory — and never re-derives the path. bob READS the agent's
 // auth store locally to decide whether a sign-in happened (it parses auth.json);
-// it never prints, logs or copies a credential VALUE — it reports only WHICH
-// providers the store holds a usable credential for.
+// it does not print credential fields — it reports only WHICH providers the
+// store holds a usable credential for.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -133,13 +133,20 @@ function piAcceptsCredential(entry: unknown): boolean {
 }
 
 // A credential pi accepts (above) that is also not one of bob's scaffold
-// placeholders — the value is only ever compared to bob's own constants.
+// placeholders — the value is only ever compared to bob's own constants. A stored
+// reference is not itself a placeholder, so an api_key's `key` is resolved (the
+// same way pi and bob resolve it) before the comparison: `$KEY` where KEY holds a
+// scaffold placeholder is a placeholder, and an unresolved reference is not one.
 function isPlaceholder(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
   const e = entry as Record<string, unknown>;
   for (const field of ["key", "access", "refresh", "token", "apiKey"]) {
     const value = e[field];
     if (typeof value === "string" && PLACEHOLDER_CREDENTIALS.has(value)) return true;
+  }
+  if (e.type === "api_key") {
+    const resolved = resolveStoredKey(e.key, e.env);
+    if (resolved !== undefined && PLACEHOLDER_CREDENTIALS.has(resolved)) return true;
   }
   return false;
 }
@@ -153,10 +160,12 @@ function isPlaceholder(entry: unknown): boolean {
 //
 // pi resolves a stored api_key's `key` when it reads it (dist/core/auth-storage.js:369-376,
 // `AuthStorage.read`, which returns `{...credential, key: resolveConfigValue(credential.key, credential.env)}`),
-// and a reference to a missing or EMPTY environment variable resolves to no key
-// (dist/core/resolve-config-value.js:83, `resolveTemplate`). bob mirrors that
-// resolution WITHOUT executing a command reference: a `!cmd` key is treated as
-// unresolved rather than run to make doctor pass.
+// resolving each `$NAME` with `env?.[name] || process.env[name] || undefined`
+// (dist/core/resolve-config-value.js:72, `resolveEnvConfigValue`): a stored value
+// that is empty falls back to the process variable, and only a name unset in BOTH
+// resolves to no key (dist/core/resolve-config-value.js:85, `resolveTemplate`).
+// bob mirrors that resolution WITHOUT executing a command reference: a `!cmd` key
+// is treated as unresolved rather than run to make doctor pass.
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENV_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
 
@@ -167,10 +176,10 @@ function resolveStoredKey(key: unknown, entryEnv: unknown): string | undefined {
     entryEnv && typeof entryEnv === "object" && !Array.isArray(entryEnv)
       ? (entryEnv as Record<string, string>)
       : {};
-  const lookup = (name: string): string | undefined => {
-    const value = env[name] !== undefined ? env[name] : process.env[name];
-    return value !== undefined && value !== "" ? value : undefined;
-  };
+  // pi's resolver, mirrored: a stored value that is empty falls back to the
+  // process variable (dist/core/resolve-config-value.js:72, `resolveEnvConfigValue`:
+  // `env?.[name] || process.env[name] || undefined`).
+  const lookup = (name: string): string | undefined => env[name] || process.env[name] || undefined;
   let out = "";
   let i = 0;
   while (i < key.length) {
@@ -263,7 +272,7 @@ function readAuthStore(piAgentDir: string): AuthStoreRead {
   const entries = parsed as Record<string, unknown>;
   for (const [provider, entry] of Object.entries(entries)) {
     // bob's conservative rule (above): one entry it refuses makes the whole store
-    // untrustworthy, so bob never reads a credential out of a partly-bad store.
+    // untrustworthy, so bob refuses to count entries from a partly invalid store.
     if (!piAcceptsCredential(entry)) {
       return {
         ok: false,
@@ -492,7 +501,7 @@ export async function runLogin(
   });
   if (exit.code !== 0) {
     err(
-      `bob login ${opts.name}: pi exited ${exit.signal ? `on signal ${exit.signal}` : `with status ${exit.code}`} — the sign-in did not complete.`,
+      `bob login ${opts.name}: pi exited ${exit.signal ? `on signal ${exit.signal}` : `with status ${exit.code}`} — bob cannot confirm the sign-in completed.`,
     );
     return 1;
   }
@@ -519,7 +528,7 @@ export async function runLogin(
     before.fingerprint !== after.fingerprint;
   if (!added && !changed) {
     err(
-      `bob login ${opts.name}: the credential for ${target} was already present and unchanged — nothing was signed in for it (did you cancel, or sign in to another provider?).`,
+      `bob login ${opts.name}: the credential for ${target} was already present and unchanged — bob cannot confirm a sign-in for it (did you cancel, or sign in to another provider?).`,
     );
     return 1;
   }
@@ -556,19 +565,23 @@ export async function runLogout(opts: { name: string } & LoginDeps): Promise<num
   });
   if (exit.code !== 0) {
     err(
-      `bob logout ${opts.name}: pi exited ${exit.signal ? `on signal ${exit.signal}` : `with status ${exit.code}`} — the logout did not complete.`,
+      `bob logout ${opts.name}: pi exited ${exit.signal ? `on signal ${exit.signal}` : `with status ${exit.code}`} — bob cannot confirm the logout completed.`,
     );
     return 1;
   }
 
-  // The post-condition: a credential was actually removed. A zero exit with an
-  // unchanged store (the operator cancelled) is a failure.
+  // The post-condition: a credential was actually removed. Every stored provider
+  // NAME is compared for actual absence — a record that merely became unusable is
+  // still stored, so it was not removed. A zero exit with an unchanged store (the
+  // operator cancelled) is a failure.
   const after = storedCredentialProviders(piAgentDir);
   if (!after.ok) {
     err(`bob logout ${opts.name}: ${after.reason}`);
     return 1;
   }
-  const removed = before.providers.filter((p) => !after.providers.includes(p));
+  const beforeNames = [...before.providers, ...before.unusable];
+  const afterNames = [...after.providers, ...after.unusable];
+  const removed = beforeNames.filter((p) => !afterNames.includes(p));
   if (removed.length === 0) {
     err(
       `bob logout ${opts.name}: no credential was removed (stored: ${after.providers.join(", ") || "none"}).`,

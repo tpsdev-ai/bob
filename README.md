@@ -875,9 +875,10 @@ bob restart <agent>
 
 `bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while `openai-codex`,
 `github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no usable credential
-for it (a keyless entry, an unresolved `$VAR` reference, or a placeholder does not count). This set is
-the check's scope, not a limit on `bob login`; anthropic is simply outside it, so doctor requires no
-login credential for anthropic.
+for it (a keyless entry, an unresolved `$VAR` reference, or a placeholder does not count). A store
+that cannot be read or fails bob's conservative validation is a different failure: its remedy is to
+repair `auth.json`. This set is the check's scope, not a limit on `bob login`; anthropic is simply
+outside it, so doctor requires no login credential for anthropic.
 
 ## Model budget
 
