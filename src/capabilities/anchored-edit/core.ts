@@ -171,9 +171,10 @@ export const ANCHOR_FORMAT = Object.freeze({
 // ANCHOR_FORMAT by the contract test.
 export const ANCHOR_TOKEN_RE = /^L(\d+)#([0-9a-f]{8})$/;
 
-// The read_lines prefix at the START of a line, separator included. The prefix
-// guard (assertNoAnchorPrefix) uses this and nothing else. A literal pinned to
-// ANCHOR_FORMAT by the contract test.
+// The SHAPE of the read_lines prefix at the START of a line, separator
+// included. It matches any line that begins that way, whether or not the line
+// came from read_lines. The prefix guard (assertNoAnchorPrefix) uses this and
+// nothing else. A literal pinned to ANCHOR_FORMAT by the contract test.
 export const ANCHOR_PREFIX_RE = /^L\d+#[0-9a-f]{8} /;
 
 export function anchorHashOf(line: RawLine): string {
@@ -192,17 +193,21 @@ export function anchorPrefix(lineNo: number, line: RawLine): string {
   return `${anchorToken(lineNo, line)}${ANCHOR_FORMAT.prefixSep}`;
 }
 
-// Refuse `text` when any line still carries a read_lines anchor prefix. A model
-// copied read_lines output straight into new text with the prefixes included,
-// and the tool is the one place that can catch it. Names the tool, the FIRST
-// offending line number and the remedy. Every mutating tool calls it on every
-// non-empty new text; nothing in a call or in config turns it off.
+// Refuse `text` when any line matches the read_lines anchor prefix shape
+// (ANCHOR_PREFIX_RE). bob#223: a model copied read_lines output into new text
+// with the prefixes included. The guard sees only the shape, so it cannot tell
+// a copied prefix from genuine content that begins the same way, and it
+// refuses both. Names the tool, the FIRST matching line number and the remedy.
+// edit_lines and insert_after call it only after their budget, anchor and
+// fingerprint checks pass, and write_file after its path resolves; a call that
+// an earlier check refuses gets that refusal instead. Nothing in a call or in
+// config turns it off.
 export function assertNoAnchorPrefix(text: string, tool: string, path: string): void {
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     if (ANCHOR_PREFIX_RE.test(lines[i])) {
       throw new Refusal(
-        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`,
+        `refusing ${tool} on "${path}": line ${i + 1} of the new text matches the read_lines anchor prefix shape (L<n>#<8 hex> at the start of the line). If the text was copied from read_lines output, strip the leading "L<n>#<h> " from its lines and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`,
       );
     }
   }
@@ -976,8 +981,8 @@ export class AnchoredEditSession {
 
   writeFile(rootArg: string, path: string, content: string): ToolOutput {
     const t = this.resolveWithin(rootArg, path);
-    // Content copied from read_lines keeps its `L<n>#<h> ` prefixes; refuse it
-    // here, before anything is opened, so a refused creation leaves nothing.
+    // Refuse content with a line that matches the anchor prefix shape here,
+    // before anything is opened, so a refused creation leaves nothing.
     assertNoAnchorPrefix(content, "write_file", path);
     // Validate the creation content BEFORE opening, so a refused creation never
     // leaves an occupied empty file behind.

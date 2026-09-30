@@ -1,7 +1,7 @@
-// bob#223: a model that copies read_lines output into new text keeps the
-// `L<n>#<8 hex> ` prefixes. edit_lines / insert_after / write_file refuse text
-// in which any line starts with that rendered shape, naming the first offending
-// line. No tool argument and no config turns the guard off, and there is no
+// bob#223: a model copied read_lines output into new text with its
+// `L<n>#<8 hex> ` prefixes intact. edit_lines / insert_after / write_file refuse
+// text in which any line matches that shape (copied or not); when the call's
+// earlier checks pass, the refusal names the first matching line. No tool argument and no config turns the guard off, and there is no
 // escape hatch: #223 asked for one, but no channel the agent cannot write exists
 // for it yet, so such content is written outside these tools.
 
@@ -17,6 +17,7 @@ import {
   ANCHOR_PREFIX_RE,
   ANCHOR_TOKEN_RE,
   assertNoAnchorPrefix,
+  fnv1a32,
   Refusal,
   renderReadLines,
 } from "../../../src/capabilities/anchored-edit/core.js";
@@ -32,7 +33,7 @@ afterEach(() => {
 });
 
 // The body of a read_lines result that was not cut: the header is line 0, then
-// one rendered line per file line — exactly what a model copies back. Taken by
+// one rendered line per file line — the lines a model would copy back. Taken by
 // position, not by the guard's regex, so these helpers do not depend on the
 // code under test.
 function bodyLines(readText: string, lineCount: number): string[] {
@@ -72,7 +73,7 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     });
     expect(out.details.refused).toBe(true);
     expect(out.text).toContain(
-      'refusing edit_lines on "a.txt": line 1 of the new text starts with a read_lines anchor prefix',
+      'refusing edit_lines on "a.txt": line 1 of the new text matches the read_lines anchor prefix shape',
     );
     expect(readFileSync(join(h.root, "a.txt"))).toEqual(before);
   });
@@ -89,7 +90,7 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     });
     expect(out.details.refused).toBe(true);
     expect(out.text).toContain(
-      'refusing insert_after on "b.txt": line 1 of the new text starts with a read_lines anchor prefix',
+      'refusing insert_after on "b.txt": line 1 of the new text matches the read_lines anchor prefix shape',
     );
     expect(readFileSync(join(h.root, "b.txt"))).toEqual(before);
   });
@@ -100,15 +101,15 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     const out = await h.call("write_file", { path: "new.txt", content: body.join("\n") });
     expect(out.details.refused).toBe(true);
     expect(out.text).toContain(
-      'refusing write_file on "new.txt": line 1 of the new text starts with a read_lines anchor prefix',
+      'refusing write_file on "new.txt": line 1 of the new text matches the read_lines anchor prefix shape',
     );
     expect(existsSync(join(h.root, "new.txt"))).toBe(false);
   });
 
-  it("names the FIRST of several offending lines (each tool)", async () => {
+  it("names the FIRST of several matching lines (each tool)", async () => {
     writeFileSync(join(h.root, "f.txt"), "a\nb\nc\nd\ne\n");
     const { body, fp } = await readBody("f.txt");
-    // Offending lines at 3 AND 5 of the new text; the refusal must name 3.
+    // Matching lines at 3 AND 5 of the new text; the refusal must name 3.
     const mixed = [strip(body[0]), "clean", body[2], "clean too", body[4]].join("\n");
     const before = readFileSync(join(h.root, "f.txt"));
     const outs = [
@@ -129,7 +130,9 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     ];
     for (const out of outs) {
       expect(out.details.refused).toBe(true);
-      expect(out.text).toContain("line 3 of the new text starts with a read_lines anchor prefix");
+      expect(out.text).toContain(
+        "line 3 of the new text matches the read_lines anchor prefix shape",
+      );
       expect(out.text).not.toContain("line 5 of the new text");
     }
     expect(readFileSync(join(h.root, "f.txt"))).toEqual(before);
@@ -175,6 +178,44 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     expectSucceeded(created);
     expect(readFileSync(join(h.root, "copy.txt"))).toEqual(readFileSync(join(h.root, "d.txt")));
   });
+
+  it("a call an earlier check refuses gets that refusal, not the prefix refusal, and writes NOTHING", async () => {
+    writeFileSync(join(h.root, "s.txt"), "one\ntwo\nthree\n");
+    const { body, fp } = await readBody("s.txt");
+    const prefixed = body.join("\n");
+    const before = readFileSync(join(h.root, "s.txt"));
+    const staleFp = "0".repeat(16);
+    const outs = [
+      // A stale fingerprint (edit_lines, then insert_after).
+      await h.call("edit_lines", {
+        path: "s.txt",
+        from: h.anchor("s.txt", 1),
+        to: h.anchor("s.txt", 1),
+        new_text: prefixed,
+        fingerprint: staleFp,
+      }),
+      await h.call("insert_after", {
+        path: "s.txt",
+        anchor: h.anchor("s.txt", 3),
+        text: prefixed,
+        fingerprint: staleFp,
+      }),
+      // A stale anchor with the current fingerprint.
+      await h.call("edit_lines", {
+        path: "s.txt",
+        from: "L1#00000000",
+        to: "L1#00000000",
+        new_text: prefixed,
+        fingerprint: fp,
+      }),
+    ];
+    for (const out of outs) {
+      expect(out.details.refused).toBe(true);
+      expect(out.details.signals).toContain("stale_anchor");
+      expect(out.text).not.toContain("anchor prefix shape");
+    }
+    expect(readFileSync(join(h.root, "s.txt"))).toEqual(before);
+  });
 });
 
 describe("anchored-edit — no argument and no config turns the prefix guard off (bob#223)", () => {
@@ -203,7 +244,7 @@ describe("anchored-edit — no argument and no config turns the prefix guard off
     { force: true, override: true, skip_guard: true },
   ];
 
-  it("an extra argument never changes the outcome: prefixed text stays refused and clean text stays written (each tool)", async () => {
+  it("an extra argument never changes the outcome: the same refused flag, raw result text, details and file bytes (each tool)", async () => {
     const base = "one\ntwo\nthree\nfour\n";
     writeFileSync(join(h.root, "src.txt"), base);
     // Lines 1-2 of a real read: with their prefixes, and stripped.
@@ -218,38 +259,48 @@ describe("anchored-edit — no argument and no config turns the prefix guard off
       insert_after: { prefixed: base, clean: `${base}one\ntwo\n` },
       write_file: { prefixed: null, clean: "one\ntwo" },
     };
-    let n = 0;
+    const file = "t.txt";
     for (const tool of ["edit_lines", "insert_after", "write_file"]) {
       for (const kind of ["prefixed", "clean"] as const) {
-        const observed: Array<{ refused: boolean; text: string; bytes: string | null }> = [];
+        const observed: Array<{
+          refused: boolean;
+          text: string;
+          details: Record<string, unknown>;
+          bytes: string | null;
+        }> = [];
         for (const extra of [{}, ...EXTRAS]) {
-          // A fresh target per call, with the same bytes as src.txt (so the same
-          // fingerprint and anchors).
-          n++;
-          const file = `t${n}.txt`;
-          let params: Record<string, unknown>;
-          if (tool === "write_file") {
-            params = { path: file, content: texts[kind] };
-          } else {
-            writeFileSync(join(h.root, file), base);
-            params =
-              tool === "edit_lines"
-                ? {
-                    path: file,
-                    from: h.anchor(file, 1),
-                    to: h.anchor(file, 1),
-                    new_text: texts[kind],
-                    fingerprint: fp,
-                  }
-                : { path: file, anchor: h.anchor(file, 4), text: texts[kind], fingerprint: fp };
+          // Each call runs in its own fresh session and workspace, on the same
+          // relative path with the same bytes as src.txt (so the same
+          // fingerprint and anchors), so the raw result text compares as is.
+          const one = makeHarness();
+          try {
+            let params: Record<string, unknown>;
+            if (tool === "write_file") {
+              params = { path: file, content: texts[kind] };
+            } else {
+              writeFileSync(join(one.root, file), base);
+              params =
+                tool === "edit_lines"
+                  ? {
+                      path: file,
+                      from: one.anchor(file, 1),
+                      to: one.anchor(file, 1),
+                      new_text: texts[kind],
+                      fingerprint: fp,
+                    }
+                  : { path: file, anchor: one.anchor(file, 4), text: texts[kind], fingerprint: fp };
+            }
+            const out = await one.call(tool, { ...params, ...extra });
+            const target = join(one.root, file);
+            observed.push({
+              refused: out.details.refused === true,
+              text: out.text,
+              details: out.details,
+              bytes: existsSync(target) ? readFileSync(target, "utf8") : null,
+            });
+          } finally {
+            one.cleanup();
           }
-          const out = await h.call(tool, { ...params, ...extra });
-          const target = join(h.root, file);
-          observed.push({
-            refused: out.details.refused === true,
-            text: out.text.split(file).join("<path>"),
-            bytes: existsSync(target) ? readFileSync(target, "utf8") : null,
-          });
         }
         // Without extras the call does what the guard says ...
         expect(observed[0].refused).toBe(kind === "prefixed");
@@ -282,8 +333,9 @@ describe("anchored-edit — no argument and no config turns the prefix guard off
 
 // Rendering has one definition (ANCHOR_FORMAT). The matchers are literal regexes
 // (CI refuses a RegExp built at runtime), pinned to that definition here: their
-// source must spell ANCHOR_FORMAT's parts, and the guard must match exactly what
-// read_lines renders.
+// source must spell ANCHOR_FORMAT's parts, the guard must match exactly the
+// prefixes read_lines renders, and the anchor parser must read each rendered
+// token back.
 describe("anchored-edit — the guard matches exactly what read_lines renders (contract, bob#223)", () => {
   // Lines 1-10 are near misses of the prefix shape; the guard must match none
   // of them as content. Every other line is plain.
@@ -337,6 +389,15 @@ describe("anchored-edit — the guard matches exactly what read_lines renders (c
         // What read_lines put in front of this line's text, taken by position.
         expect(line.endsWith(content)).toBe(true);
         const prefix = line.slice(0, line.length - content.length);
+        // The anchor parser's literal reads the rendered token back: the whole
+        // token, its line number, and its hash (FNV-1a 32 of the line's bytes,
+        // 8 lowercase hex). It does not match the whole rendered line.
+        const token = line.slice(0, line.indexOf(" "));
+        const m = ANCHOR_TOKEN_RE.exec(token);
+        expect(m?.[0]).toBe(token);
+        expect(m?.[1]).toBe(String(n));
+        expect(m?.[2]).toBe(fnv1a32(Buffer.from(content, "utf8")).toString(16).padStart(8, "0"));
+        expect(ANCHOR_TOKEN_RE.test(line)).toBe(false);
         expect(prefix.startsWith(`L${n}#`)).toBe(true);
         // The guard's regex matches exactly that prefix: no shorter, no longer.
         expect(ANCHOR_PREFIX_RE.exec(line)?.[0]).toBe(prefix);
@@ -347,7 +408,7 @@ describe("anchored-edit — the guard matches exactly what read_lines renders (c
       });
       // The whole result as new text: the first body line (line 2) is named.
       expect(() => assertNoAnchorPrefix(out.join("\n"), "t", "p")).toThrow(
-        "line 2 of the new text starts with a read_lines anchor prefix",
+        "line 2 of the new text matches the read_lines anchor prefix shape",
       );
     }
     for (const n of [1, 9, 10, TOTAL]) expect(seen).toContain(n);

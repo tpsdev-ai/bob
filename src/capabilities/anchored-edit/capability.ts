@@ -51,10 +51,11 @@ export interface WireOptions {
 const ANCHOR_DOC =
   "An anchor token is `L<n>#<h>`: line number n, and h = 8 lowercase hex of FNV-1a 32 over the line's UTF-8 bytes with its terminator and a trailing CR stripped. `L0` addresses the position before line 1. The token is stable and unseeded; a line number is never folded into h.";
 
-// The anchor-prefix guard, as each mutating tool describes it: exactly what the
-// guard does, and what to do when the text is refused.
+// The anchor-prefix guard, as each mutating tool describes it: what it matches
+// (a shape, not where the text came from), when its refusal is the one returned,
+// and what to do about it.
 const PREFIX_GUARD_DOC = (field: string): string =>
-  `If any line of ${field} begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused and nothing is written; the refusal names the first such line. Strip the copied prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
+  `If any line of ${field} begins with the read_lines anchor prefix shape (L<n>#<8 hex> ), the call is refused and nothing is written. When the call's earlier checks pass, that refusal names the first matching line; a call an earlier check refuses gets that refusal instead. If the text was copied from read_lines output, strip the prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
 
 function ok(text: string, details: Record<string, unknown>): ToolOutput {
   return { content: [{ type: "text", text }], details };
