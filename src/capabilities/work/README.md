@@ -19,10 +19,60 @@ It registers three tools through `pi.registerTool`:
 
 `cwd` is relative to the workspace, or an absolute path inside it; omitted, the
 command starts in the workspace. It must be an existing directory, and after
-symlinks are resolved it must still be inside the workspace; otherwise `run`
-refuses the call, naming the path it resolved, and starts nothing. This fixes
-where a command starts, not what it can reach: the command itself can still
-change directory.
+symlinks are resolved it must be inside the workspace when it is checked;
+otherwise `run` refuses the call, naming the path it resolved, and starts
+nothing. A path that cannot be resolved is refused too: whether it is inside is
+then unknown. This confines where a command starts (up to the windows described
+next), not what it can reach: the command itself can still change directory.
+
+**Where a command starts, and the windows that remain (bob#224).** Checking
+`cwd` and starting the command are separate steps, and Node names a child's
+working directory by a string that the child resolves again when it changes into
+it. So `run` cannot make the directory a command starts in *be* the one it
+checked. It narrows the window in which the two can differ:
+
+1. It resolves `cwd` and the workspace through symlinks and confines the one to
+   the other, keeping that canonical workspace.
+2. It opens the resolved path (no-follow on the final component) and holds
+   it open: the pin. While the pin is held, the directory's inode stays
+   allocated (on a local POSIX file system), so no other directory can take its
+   device + inode.
+3. As the pin is taken, and again immediately before the spawn, it re-resolves
+   `cwd`. The result must still be the same canonical path, inside the canonical
+   workspace it kept, and a no-follow stat of it must still be a directory with
+   the pin's device + inode. If, at either re-check, a path component — the
+   final one or an intermediate one — has been replaced or moved so that this no
+   longer holds, `run` refuses and starts nothing. It also refuses when any step
+   cannot establish its fact (a realpath, stat, open, fstat or close that fails);
+   a realpath that fails (when `cwd` is first resolved, or at a re-check) and a
+   re-check's no-follow stat that fails are reported as a failure to resolve or
+   check the directory, without a cause assigned to it.
+4. It then releases the pin (closes its descriptor), and only then spawns. A
+   release that fails refuses, so no pin step can fail after a command has
+   started.
+
+When a close of the pin's descriptor fails — on the release, or on the cleanup
+after another failed step — `run` still refuses and starts nothing, and its
+refusal says that whether the descriptor is still open is unknown: a failed
+close may or may not have released it. When the final re-check failed as well,
+the refusal reports both failures. The refusal says the descriptor was closed
+only when the close returned.
+
+The re-check NARROWS the race; it does not close it. Among the windows that
+remain, one is before the pin: the pin is taken after `cwd` is resolved (step 1
+comes before step 2; see Limits). Another runs from the last re-check until the
+child has changed directory, because the child's `chdir` re-resolves the path
+by name. A component replaced in that window can change where the command
+starts or prevent startup; the re-check cannot detect a later replacement.
+Closing that window needs a directory-descriptor boundary (`fchdir`, or
+resolution beneath an open directory) that Node does not offer a child; a
+helper that changes into the pinned directory before running the command would
+be OS-specific, so bob does not ship one. See Limits.
+
+The pin opens the directory for reading: Node has no search-only open. A
+directory with search but not read permission is therefore refused, although a
+command could start in it. That is the safe direction; make it readable
+(`chmod u+r`) or pass another directory.
 
 ## Enabling it
 
@@ -220,6 +270,16 @@ named error.
   cannot be closed from here. A live supervisor with no pinned identity whose
   event loop stalls for more than 10 minutes reads as dead to another bob's
   sweep, which then deletes that run's captures.
+- **The pin is taken after `cwd` is resolved.** A replacement between the
+  resolution and the pin that keeps the same canonical path inside the workspace
+  becomes the pinned directory, and the re-checks, which compare against the
+  pin, do not detect it. Containment still holds: the re-check as the pin is
+  taken still requires that path to resolve inside the workspace.
+- **The `cwd` re-check narrows the race between the check and the start; it
+  does not close it.** A path component replaced after the last re-check and
+  before the child has changed directory is not detected (see "Where a command
+  starts" above). It matters where another process can rename entries in the
+  workspace while `run` starts a command.
 - **POSIX only.** On Windows `run` refuses with a named error.
 
 ## Reuse
