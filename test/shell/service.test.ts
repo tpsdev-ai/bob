@@ -54,11 +54,13 @@ function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
   return { runner, calls };
 }
 
-// The installer uid every test that resolves an interpreter injects: the
-// running uid, which owns the temp directories the tests create. TRUST also
-// turns the administrators-group exception off, so no resolution result
-// depends on the host's group database; tests about those rules override it.
-// (The owner test is skipped when the suite runs as root.)
+// The installer uid the direct resolver tests, and the installService tests
+// that resolve, inject: the running uid, which owns the temp directories the
+// tests create. TRUST also turns the administrators-group exception off, so
+// those results do not depend on the host's group database; tests about those
+// rules override it. The CLI test's child process resolves with its own real
+// uid and the host's default group policy. (The owner test is skipped when the
+// suite runs as root.)
 const ME = process.getuid?.() ?? 0;
 const TRUST = { getUid: () => ME, adminGid: null };
 
@@ -545,10 +547,11 @@ describe("resolveNodeExecutable — a PATH symlink over a versioned target (bob#
 // targets included, is owned by the installer or root; a directory holding a
 // symlink or the final name of the path or of a link target is writable by no
 // one else (write by the injected administrators group excepted), and any
-// other directory is writable by others only with the sticky bit (see
-// resolveNodeExecutable). Temp directories here get explicit modes; the
+// other directory is group- or other-writable only with the sticky bit (see
+// resolveNodeExecutable). The directories these tests create get explicit
+// modes; inherited ancestors (the temp root and above) keep the host's. The
 // running uid is the installer.
-describe("resolveNodeExecutable — only trusted, absolute PATH entries supply node (bob#233)", () => {
+describe("resolveNodeExecutable — a PATH node is a candidate only through a trusted, absolute entry (bob#233)", () => {
   const delimiter = process.platform === "win32" ? ";" : ":";
   const BUN = "/opt/bun/bin/bun"; // a non-Node installer
   const NO_NODE = /no Node executable found/;
@@ -624,7 +627,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       ).toThrow(NO_NODE);
     });
 
-    it("group write by the administrators group is accepted (stock Homebrew); other-write never is", () => {
+    it("group write by the administrators group is accepted (an admin-group-shaped fixture with an injected gid); other-write never is", () => {
       const dir = tempDir("bob-trust-admin-", 0o775);
       const node = nodeFile(dir);
       const gid = statSync(dir).gid;

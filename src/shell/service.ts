@@ -116,9 +116,10 @@ interface TrustContext {
 // directly (it holds a symlink met on the way, or the final name of the
 // candidate or of a symlink target), must be writable by no one but its owner,
 // except that write by the host's administrators group is accepted (a policy
-// that trusts that group). An ANCESTOR, any other directory traversed, may also
-// be group- or other-writable when it has the sticky bit (as /tmp does), which
-// stops others renaming entries they do not own.
+// that trusts that group) in any directory that is not other-writable. An
+// ANCESTOR, any other directory traversed, may also be group- or other-writable
+// when it has the sticky bit (as /tmp does), which stops others renaming
+// entries they do not own.
 function directoryTrusted(dir: string, role: "holder" | "ancestor", ctx: TrustContext): boolean {
   let st: PathOwnership;
   try {
@@ -161,8 +162,9 @@ function walkSteps(path: string): WalkStep[] | undefined {
 // directory holding each symlink met on the way (intermediate directory links
 // included), to the directory holding each symlink target's final name, and to
 // the directory holding the candidate's own final name; every other directory
-// traversed gets the ANCESTOR rule. So a symlink in a directory others can
-// write, sticky or not, is never trusted, whatever it points to: its owner
+// traversed gets the ANCESTOR rule. So a symlink in an other-writable
+// directory, sticky or not, or in one writable by any group but the trusted
+// administrators group, is never trusted, whatever it points to: its owner
 // could retarget it after the unit is written. A candidate the walk cannot
 // follow (a failed lstat or readlink, more than MAX_SYMLINK_HOPS hops, a
 // symlink target that names no entry, a non-directory on the way, or a final
@@ -263,11 +265,11 @@ function isSymlink(file: string): boolean {
 // run bob under a non-Node runtime.
 //
 // When the installer IS node we use its own interpreter, execPath, with one
-// exception. On a Homebrew install execPath is the versioned target
-// (…/Cellar/node/<version>/bin/node), and writing that into the unit breaks the
-// service after `brew upgrade node` removes that directory. So when a TRUSTED
-// PATH `node` whose FINAL entry is a symlink has the same realpath as execPath,
-// we write that symlink path instead (on Homebrew, /opt/homebrew/bin/node), even
+// exception. On a Homebrew install execPath can be a versioned target
+// (observed: …/Cellar/node/<version>/bin/node), and writing that into the unit
+// breaks the service after `brew upgrade node` removes that directory. So when
+// a TRUSTED PATH `node` whose FINAL entry is a symlink has the same realpath as
+// execPath, we write that symlink path instead (e.g. /opt/homebrew/bin/node), even
 // when a direct match comes earlier on PATH. That path keeps working only while
 // whatever maintains the symlink keeps it pointing at a working Node. Without a
 // trusted matching symlink we fall back to execPath, which may itself be stable
@@ -280,7 +282,8 @@ function isSymlink(file: string): boolean {
 // every directory owned by the installer or by root; the directory holding each
 // symlink met, each symlink target's final name and the candidate's own final
 // name writable by no one else (write by the host's administrators group
-// excepted); any other directory writable by others only with the sticky bit.
+// excepted); any other directory group- or other-writable only with the sticky
+// bit (or, besides its owner, writable only by that administrators group).
 // A candidate that fails is skipped, and the resolution falls back as it would
 // with no such candidate. The fallback in the node branch, execPath itself, is
 // the running interpreter and is not screened.
