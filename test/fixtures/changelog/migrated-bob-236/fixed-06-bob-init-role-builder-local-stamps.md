@@ -1,0 +1,1 @@
+- **`bob init --role builder-local` stamps neither `bash` nor `run` (bob#213).** A test pins the stamped list (`grep`, `find`, `ls` and the three Flair tools) and shows the run tools are stamped only when `work` is among the capabilities; the `work` capability's README says it is what enables `run`. (`test/shell/init.test.ts`)

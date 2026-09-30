@@ -1,0 +1,1 @@
+- **Logging never throws into the run** — including creating the runs directory. If the run log cannot be set up at all, the run still completes and warns once, naming the error and the directory it happened in rather than guessing a step. (`test/shell/run-log-projection.test.ts`)

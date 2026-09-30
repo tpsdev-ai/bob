@@ -1,0 +1,1 @@
+- **One log per run, and the lock belongs to that log alone.** The file name carries the run's start timestamp, its pid and a random suffix, and the file is created exclusively, so two runs started in the same millisecond get distinct files — and therefore distinct sidecar locks. The lock is taken BEFORE the log file is created. (`test/shell/run-log-projection.test.ts`)

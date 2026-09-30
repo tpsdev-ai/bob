@@ -1,0 +1,1 @@
+- **The builder-local role's seed soul gains an Operating rules section** (start from the given head, never kill by pattern, report instead of investigating past the brief, never rewrite pushed history, use your own identity, apply-only means apply-only, finish with evidence).

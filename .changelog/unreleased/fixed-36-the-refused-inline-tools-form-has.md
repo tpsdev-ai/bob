@@ -1,0 +1,1 @@
+- **The refused inline `tools:` form has a dedicated test.** `tools: {allow: [read]}` reads as an empty block — and empty is one step away from pi's defaults — so it is refused outright, naming the block shape to use. (`test/shell/tool-allowlist.test.ts`)
