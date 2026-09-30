@@ -21,5 +21,7 @@ export const fixtureManifest: BobCapabilityManifest = {
   provides: {
     tools: ["bob_fixture_noop"],
     serves: false,
+    // Public: its one tool echoes its own argument; it loads nothing.
+    dataClass: "public",
   },
 };

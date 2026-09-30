@@ -63,7 +63,16 @@ export const PI_BUILTIN_TOOLS = [
 //              a status report, a robot action, or cancelling a job this run
 //              started. A resident agent keeps these (the jarvis role holds
 //              flair_write and discord_reply without the shell opt-in).
-export type ToolEffect = "read-only" | "writer" | "effect";
+//   egress     this policy's category for the web tools (bob#244, web spec v3),
+//              which send model-influenced data to a host outside the office.
+//              Other effects can be outbound too (discord_reply posts a
+//              message; the planned mail_send sends a mail): egress sets the
+//              web tools apart so they get their own resident grant. A resident
+//              agent's policy excludes these unless its role opts in with
+//              `allowResidentWeb`, which removes only that exclusion (an
+//              explicit tools.exclude entry still wins); the shell opt-in
+//              (`allowResidentShell`) does not cover them.
+export type ToolEffect = "read-only" | "writer" | "effect" | "egress";
 
 // The writer rows come first, in the order RESIDENT_EXCLUDED_TOOLS lists them.
 export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze({
@@ -84,6 +93,12 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze(
   reachy_frame: "effect", // reachy: asks the robot for a camera frame
   run_cancel: "effect", // work: stops a job this run started
   mail_send: "effect", // mail (planned): sends a mail
+  // Both web tools carry model-influenced data out of the office: web_fetch to
+  // the host of a URL the model chose (its host, path and query), web_search to
+  // the search provider (the query the model writes). Neither is registered yet
+  // (web registers no tool in slice R1a).
+  web_fetch: "egress", // web: fetches a URL
+  web_search: "egress", // web (planned for R2): sends a search query to the provider
   read: "read-only", // pi
   grep: "read-only", // pi
   find: "read-only", // pi
@@ -128,6 +143,19 @@ export function residentExclusions(
   return [...new Set([...writers, ...unclassifiedToolNames(provided, effects)])];
 }
 
+// The egress rows: what a resident agent's policy excludes unless its role opts
+// in with `allowResidentWeb` (bob#244), which removes only this exclusion; an
+// explicit tools.exclude entry still wins. Separate from the shell opt-in on purpose:
+// the shell grant does not grant `web_fetch` or `web_search`; shell commands
+// may themselves make outbound requests.
+export function residentEgressTools(
+  effects: Readonly<Record<string, ToolEffect>> = TOOL_EFFECTS,
+): string[] {
+  return Object.keys(effects).filter((name) => effects[name] === "egress");
+}
+
+export const RESIDENT_EGRESS_TOOLS: readonly string[] = Object.freeze(residentEgressTools());
+
 // What a resident agent must not hold unless its role opts in
 // (`allowResidentShell`). A resident agent runs unattended behind its service
 // unit, with no human at the keyboard to approve a command or a file write.
@@ -148,7 +176,9 @@ export const RESIDENT_EXCLUDED_TOOLS: readonly string[] = Object.freeze(resident
 // The three Flair memory tools, because memory with receipts is the point.
 // `flair_write` stays deliberately (spec §4): allow-listing a sender therefore
 // also permits MAIL-INFLUENCED MEMORY WRITES, and the operator docs say so.
-// Adding a tool here is a security review, not a convenience.
+// Adding a tool here is a security review, not a convenience. No egress tool is
+// on it (bob#244): the web tools stay out of mail turns because the
+// intersection below drops them, not because of a separate mechanism.
 export const MAIL_TURN_ALLOWED_TOOLS: readonly string[] = [
   "flair_search",
   "flair_get",
@@ -338,6 +368,10 @@ export interface RoleToolCeiling {
   // True when the role itself opts the agent back into the resident shell +
   // file-writing tools (role.json `tools.allowResidentShell`).
   allowResidentShell?: boolean;
+  // bob#244: true when the role itself removes the resident egress exclusion
+  // for the web tools (role.json `tools.allowResidentWeb`); an explicit
+  // tools.exclude entry still wins. Independent of allowResidentShell.
+  allowResidentWeb?: boolean;
 }
 
 export interface ResolveToolPolicyOptions {
@@ -370,6 +404,10 @@ export interface ToolPolicy {
   excludeTools: string[];
   resident: boolean;
   allowResidentShell: boolean;
+  // bob#244: whether the resident egress exclusion is lifted for the web tools
+  // (an explicit tools.exclude entry still wins). Absent means no: a policy
+  // built without it excludes them for a resident agent.
+  allowResidentWeb?: boolean;
 }
 
 export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
@@ -406,6 +444,7 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
   // edit, so without this the role would be a default rather than a bound.
   const ceiling = opts.role;
   let allowResidentShell = block.allowResidentShell === true;
+  let allowResidentWeb = block.allowResidentWeb === true;
   if (ceiling) {
     const roleAllows = new Set(roleToolNames(ceiling));
     const widened = tools.filter((name) => !roleAllows.has(name));
@@ -425,11 +464,32 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
         `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: tools.allowResidentShell is true, but the role does not grant it. A resident agent loses the shell + the file-writing tools unless its ROLE opts back in (roles/${ceiling.name}/role.json).`,
       );
     }
+    if (allowResidentWeb && ceiling.allowResidentWeb !== true) {
+      throw new BobYamlError(
+        "tools",
+        lineOf(opts.yamlText, /^tools[ \t]*:/m),
+        `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: tools.allowResidentWeb is true, but the role does not grant it. Only the ROLE's opt-in (roles/${ceiling.name}/role.json) removes the resident egress exclusion from the web tools; an explicit tools.exclude entry still wins.`,
+      );
+    }
     // The role's grant is inherited; bob.yaml may still narrow it away.
     allowResidentShell = ceiling.allowResidentShell === true && block.allowResidentShell !== false;
+    allowResidentWeb = ceiling.allowResidentWeb === true && block.allowResidentWeb !== false;
   }
 
-  const residentExclusions = resident && !allowResidentShell ? [...RESIDENT_EXCLUDED_TOOLS] : [];
+  // The shell opt-in removes the resident writer exclusion; only the web opt-in
+  // removes the resident egress exclusion; an explicit tools.exclude entry stays
+  // excluded under either. The
+  // egress exclusion lists only the egress names this allowlist asks for: pi
+  // applies excludeTools after the strict allowlist, so an unlisted name is
+  // inert either way, and every existing agent's effective tool and exclusion
+  // lists (and a bound agent's ratified baseline) stay exactly as they were;
+  // the returned policy gains only the allowResidentWeb flag.
+  const residentExclusions = resident
+    ? [
+        ...(allowResidentShell ? [] : RESIDENT_EXCLUDED_TOOLS),
+        ...(allowResidentWeb ? [] : RESIDENT_EGRESS_TOOLS.filter((name) => tools.includes(name))),
+      ]
+    : [];
 
   return {
     tools,
@@ -438,6 +498,7 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
     excludeTools: [...new Set([...declaredExclusions, ...residentExclusions])],
     resident,
     allowResidentShell,
+    allowResidentWeb,
   };
 }
 
@@ -456,10 +517,24 @@ function roleToolNames(ceiling: RoleToolCeiling): string[] {
   return resolved;
 }
 
-// The tools a resident agent's own allowlist asked for that the resident policy
-// drops — doctor's warning, so the drop is never silent either.
+// The tools a resident agent's own allowlist asked for that the effective
+// exclusion list drops while the SHELL grant (allowResidentShell) is absent:
+// its non-egress names — doctor's warning, so the drop is never silent either.
+// That list includes explicit tools.exclude entries, which stay excluded after
+// the shell grant is given. The egress names, whose grant is allowResidentWeb,
+// are residentDroppedWebTools'.
 export function residentDroppedTools(policy: ToolPolicy): string[] {
   if (!policy.resident || policy.allowResidentShell) return [];
   const allowed = new Set(policy.tools);
-  return policy.excludeTools.filter((tool) => allowed.has(tool));
+  const egress = new Set(RESIDENT_EGRESS_TOOLS);
+  return policy.excludeTools.filter((tool) => allowed.has(tool) && !egress.has(tool));
+}
+
+// bob#244: the egress (web) tools a resident agent's allowlist asked for that
+// the effective resident policy drops: allowResidentWeb is not in effect,
+// because the role does not grant it or bob.yaml narrows it away.
+export function residentDroppedWebTools(policy: ToolPolicy): string[] {
+  if (!policy.resident || policy.allowResidentWeb === true) return [];
+  const excluded = new Set(policy.excludeTools);
+  return RESIDENT_EGRESS_TOOLS.filter((tool) => policy.tools.includes(tool) && excluded.has(tool));
 }

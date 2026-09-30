@@ -18,5 +18,7 @@ export const tpsMailManifest: BobCapabilityManifest = {
   provides: {
     tools: [],
     serves: true,
+    // Private: mail bodies from allow-listed peers.
+    dataClass: "private",
   },
 };

@@ -11,6 +11,14 @@
 
 import type { TSchema } from "typebox";
 
+// bob#244 (web spec v3, R1): the class of the data a capability can bring into a
+// session. `public` is a reviewed claim that everything the capability loads
+// into a turn is public; `private` is everything else. A manifest without a
+// class is PRIVATE (data-class.ts capabilityDataClass): classification is
+// opt-in to public, never opt-out of private, and moving a capability to public
+// is a reviewed change.
+export type DataClass = "public" | "private";
+
 // What a capability declares about itself. Self-describing IN the capability's
 // own package (so a capability is fully portable), AND mirrored in Bob's
 // blessed catalog (the trust layer pi doesn't ship). Decision per spec §4:
@@ -53,6 +61,12 @@ export interface BobCapabilityManifest {
     // read command with no request/response correlation). Labelled so the
     // manifest and README can say so instead of implying the tool works.
     placeholderTools?: string[];
+    // bob#244: the class of the data this capability can load into a session
+    // (see DataClass above). Every shipped manifest states it, and a test fails
+    // on one that does not; at runtime a missing class still reads as private.
+    // A session that holds `web` may compose only `public` capabilities until
+    // the participation ledger lands (data-class.ts).
+    dataClass?: DataClass;
   };
 }
 

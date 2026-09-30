@@ -629,13 +629,13 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
-  // would go red on the release PR. `unreleased-main-3a41dad7.md` is the body
-  // of main's [Unreleased] block (its heading excluded) at 3a41dad7, the main
+  // would go red on the release PR. `unreleased-main-6238e2e8.md` is the body
+  // of main's [Unreleased] block (its heading excluded) at 6238e2e8, the main
   // commit whose entries were migrated, before they moved into fragments;
   // `migrated-bob-236/` is the fragment set made from it, every list entry of
   // that body included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
-  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-3a41dad7.md"), "utf8"));
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-6238e2e8.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
   // The eleven entries the migration changed, each as EXACT edits of main's text
