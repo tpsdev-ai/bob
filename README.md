@@ -77,6 +77,8 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
+| `bob login <name> [provider]` | Start pi from the agent's own directory (its config dir set); type `/login [provider]` at the prompt to sign in. Run it in a terminal |
+| `bob logout <name>` | Start pi and type `/logout` (an interactive selector over any stored credential — takes no provider) |
 | `bob hire <name> --as <position> --context-window <tokens>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository. Without `--context-window` it refuses before writing anything |
 | `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
 | `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
@@ -934,6 +936,58 @@ entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a com
 `openrouter` model resolves from bob's in-memory provider. **bob holds the OpenRouter key; pi does not.** It lives in bob's runtime-factory closure (so `/new` and `/resume` reuse it) and in the transport function built from it, which sends only to `https://openrouter.ai/api/v1`; pi's auth and registered provider config hold a NON-SECRET placeholder, and pi's model data carries no key. The first session the runtime factory builds reads `OPENROUTER_API_KEY` once and DELETES it from `process.env`, after pi's model runtime is created and before capabilities, extensions and tools load (`(r2)`); the transport refuses a model whose `baseUrl`/`api` is not bob's (`(t1, unit)`), refuses the listed credential header names (`authorization`, `proxy-authorization`, `cf-aig-authorization`, `x-api-key`, `api-key`, `x-auth-token`, `cookie`) (`(t4, unit)`, `(r3)`), and its fetch wrapper refuses a non-canonical URL or a `Request` (`(t5, unit)`, `(r4)`); a real session turn carries `Bearer <the real key>` to `<base>/chat/completions` (`(t2, session path)`); the key is in none of pi's auth, registered provider config or model data (`(t3)`); a `ModelRuntime.refresh()` with a tampered `models.json` can install pi's BUILT-IN provider as the effective one — bob's transport is then not on the request path — so what holds instead is key containment: the key is no longer in `process.env` or in pi's data, so the fallback provider that pi's request path prepares has no key to send and `getAuth("openrouter")` resolves none (`(r1)`, whose control phase shows the same path DOES send the key to another host while the environment still holds it). STATED LIMIT: this removes the IN-PROCESS path only — a same-user process can still read a process's initial environment block (`/proc/<pid>/environ` on Linux, `ps eww` on macOS); isolating the agent's own tools from that is bob#189, not this change. The key also lives in the bob process's memory — the runtime-factory and transport closures — so a same-user process that can read another process's memory (a debugger, `/proc/<pid>/mem`, or a core dump) can recover it; isolating that is likewise bob#189. Operator symptom of the refresh fallback: after a `refresh()` that breaks composition, pi's built-in `openrouter` provider is the effective one and has none of bob's key, so a turn fails with an auth error even though the operator's key is valid — check first whether a `.pi-agent/models.json` entry defines `openrouter` (an extension cannot: bob's registration guard refuses it). An
 unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
 path's persisted files (`(c)`).
+
+### Moving an agent to a subscription model
+
+Some providers pi authenticates by a subscription OAuth login — pi's `isSubscription` providers:
+`anthropic` (Claude Pro/Max), `openai-codex` (ChatGPT Plus/Pro), `github-copilot`, `xai` (SuperGrok /
+X Premium) and `kimi-coding`. (pi also offers an API key for some of them.) pi's login is an
+interactive TUI command (`/login`); pi ships no `login` subcommand or flag, so `bob login` starts
+pi's TUI **in the agent's own directory**, with `PI_CODING_AGENT_DIR` set to the agent's
+`.pi-agent`, and you type the command at the prompt. bob composes that directory for every session
+and reuses the same path, so pi writes the credential to the agent's own `.pi-agent/auth.json` —
+the store path bob composes for every session:
+
+```bash
+bob login <agent> [provider]   # starts pi; type '/login [provider]' at the prompt
+```
+
+Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. bob reads the
+agent's store locally to decide the result (it parses auth.json) and never prints a credential VALUE;
+when pi exits, `bob login` reports success only when the provider it targeted now holds a credential
+that passes bob's local credential checks and is new or changed. `bob logout <agent>` starts pi for
+`/logout` (an interactive selector over any stored credential, so it takes no provider).
+
+Then point the agent at the subscription model and restart it. Choose a model from pi's **built-in**
+catalog for that provider — pi also merges custom model IDs you add under a provider alongside its
+built-in ones (see pi's `docs/models.md`); the table lists a built-in choice for each:
+
+| provider | a model pi lists |
+| --- | --- |
+| `openai-codex` | `gpt-5.4` |
+| `xai` | `grok-4.3` |
+| `kimi-coding` | `k3` |
+| `github-copilot` | `claude-sonnet-4` |
+| `anthropic` | `claude-sonnet-4-6` |
+
+```yaml
+provider:
+  name: openai-codex
+  model: gpt-5.4
+  context_window: <tokens>    # REQUIRED (see Model budget)
+```
+
+```bash
+bob restart <agent>
+```
+
+`bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while `openai-codex`,
+`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no credential
+for it that passes bob's local credential checks (a keyless entry, an unresolved `$VAR` reference,
+or a placeholder does not count). A store
+that cannot be read or fails bob's conservative validation is a different failure: its remedy is to
+repair `auth.json`. This set is the check's scope, not a limit on `bob login`; anthropic is simply
+outside it, so doctor requires no login credential for anthropic.
 
 ## Model budget
 
