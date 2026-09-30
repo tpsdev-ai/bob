@@ -85,8 +85,9 @@ export interface NodeResolutionDeps {
   // Ownership and mode of a directory (symlinks followed). Defaults to
   // fs.statSync. A throw makes the candidate UNTRUSTED. Injected in tests.
   statPath?: (path: string) => PathOwnership;
-  // The host's administrators group. A directory writable by its owner and this
-  // group, and by no one else, is accepted: a policy that TRUSTS this group.
+  // The host's administrators group. A directory owned by the installer or by
+  // root, and writable by its owner and this group but by no one else, is
+  // accepted: a policy that TRUSTS this group.
   // Defaults to 80 (`admin`) on macOS, for Homebrew prefixes that are
   // admin-writable (observed: /opt/homebrew/bin as drwxrwxr-x <user> admin),
   // and to null elsewhere (then group write passes only in a sticky ancestor).

@@ -549,7 +549,8 @@ describe("resolveNodeExecutable — a PATH symlink over a versioned target (bob#
 // targets included, is owned by the installer or root; a directory holding a
 // symlink or the final name of the path or of a link target is writable by no
 // one else (write by the injected administrators group excepted), and any
-// other directory is group- or other-writable only with the sticky bit (see
+// other directory is group- or other-writable only with the sticky bit or,
+// besides its owner, writable only by the injected administrators group (see
 // resolveNodeExecutable). The directories these tests create get explicit
 // modes; inherited ancestors (the temp root and above) keep the host's. The
 // running uid is the installer.
