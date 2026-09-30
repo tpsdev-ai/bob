@@ -345,7 +345,7 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   if (candidates.length > 0) return candidates[0];
   const skipped =
     untrusted.length > 0
-      ? ` Skipped as untrusted: ${untrusted.join(", ")} (fix: make every directory on the way owned by you or root and not writable by others).`
+      ? ` Skipped as untrusted: ${untrusted.join(", ")} (to be trusted, every directory on the way must be owned by you or root; the directory holding node and every directory holding a symlink or the entry a symlink points to must not be writable by group or others, and any other directory may be only if it has the sticky bit; on macOS, write access for the admin group, but not for others, is allowed).`
       : "";
   throw new Error(
     `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.${skipped}`,

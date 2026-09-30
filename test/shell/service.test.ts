@@ -558,6 +558,9 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
   const delimiter = process.platform === "win32" ? ";" : ":";
   const BUN = "/opt/bun/bin/bun"; // an installer whose execPath is not named node
   const NO_NODE = /no Node executable found/;
+  // The refusal's remedy: the trust rule's requirements, stated exactly.
+  const REMEDY =
+    "(to be trusted, every directory on the way must be owned by you or root; the directory holding node and every directory holding a symlink or the entry a symlink points to must not be writable by group or others, and any other directory may be only if it has the sticky bit; on macOS, write access for the admin group, but not for others, is allowed)";
   const scratch: string[] = [];
   afterAll(() => {
     for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
@@ -893,7 +896,7 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
       expect(message).toContain(">=22.19.0");
       expect(message).toContain("put it on PATH");
       expect(message).toContain(`Skipped as untrusted: ${link}, ${file}`);
-      expect(message).toContain("owned by you or root and not writable by others");
+      expect(message).toContain(REMEDY);
 
       const opts = { name: "pulse", bobBin: BOB_BIN, home: HOME, ...deps };
       expect(() => renderPlist(opts)).toThrow(message);
@@ -912,6 +915,21 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
   });
 
   describe("the branch for an installer not named node (finding 3)", () => {
+    it("a group-writable (0775) holder is refused with a remedy that names group write", () => {
+      // Like an nvm, fnm or ~/.local bin created under umask 002.
+      const dir = tempDir("bob-nn-group-bin-", 0o775);
+      const node = nodeFile(dir);
+      expect(statSync(dir).mode & 0o777).toBe(0o775); // premise: group-writable, not other-writable
+      let message = "";
+      try {
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir });
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toContain(`Skipped as untrusted: ${node}`);
+      expect(message).toContain(REMEDY);
+    });
+
     it("skips an untrusted first match for a trusted later one, and refuses when only untrusted or relative entries hold node", () => {
       const open = tempDir("bob-nn-0777-", 0o777);
       nodeFile(open);
