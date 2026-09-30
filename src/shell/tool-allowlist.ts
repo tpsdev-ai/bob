@@ -68,9 +68,10 @@ export const PI_BUILTIN_TOOLS = [
 //              Other effects can be outbound too (discord_reply posts a
 //              message; the planned mail_send sends a mail): egress sets the
 //              web tools apart so they get their own resident grant. A resident
-//              agent drops these unless its role opts in with
-//              `allowResidentWeb`; the shell opt-in (`allowResidentShell`) does
-//              not cover them.
+//              agent's policy excludes these unless its role opts in with
+//              `allowResidentWeb`, which removes only that exclusion (an
+//              explicit tools.exclude entry still wins); the shell opt-in
+//              (`allowResidentShell`) does not cover them.
 export type ToolEffect = "read-only" | "writer" | "effect" | "egress";
 
 // The writer rows come first, in the order RESIDENT_EXCLUDED_TOOLS lists them.
@@ -142,8 +143,9 @@ export function residentExclusions(
   return [...new Set([...writers, ...unclassifiedToolNames(provided, effects)])];
 }
 
-// The egress rows: what a resident agent drops unless its role opts in with
-// `allowResidentWeb` (bob#244). Separate from the shell opt-in on purpose:
+// The egress rows: what a resident agent's policy excludes unless its role opts
+// in with `allowResidentWeb` (bob#244), which removes only this exclusion; an
+// explicit tools.exclude entry still wins. Separate from the shell opt-in on purpose:
 // the shell grant does not grant `web_fetch` or `web_search`; shell commands
 // may themselves make outbound requests.
 export function residentEgressTools(
@@ -366,9 +368,9 @@ export interface RoleToolCeiling {
   // True when the role itself opts the agent back into the resident shell +
   // file-writing tools (role.json `tools.allowResidentShell`).
   allowResidentShell?: boolean;
-  // bob#244: true when the role itself lets a resident agent keep the egress
-  // (web) tools (role.json `tools.allowResidentWeb`). Independent of
-  // allowResidentShell.
+  // bob#244: true when the role itself removes the resident egress exclusion
+  // for the web tools (role.json `tools.allowResidentWeb`); an explicit
+  // tools.exclude entry still wins. Independent of allowResidentShell.
   allowResidentWeb?: boolean;
 }
 
@@ -402,8 +404,9 @@ export interface ToolPolicy {
   excludeTools: string[];
   resident: boolean;
   allowResidentShell: boolean;
-  // bob#244: whether a resident agent keeps the egress (web) tools. Absent
-  // means no: a policy built without it drops them.
+  // bob#244: whether the resident egress exclusion is lifted for the web tools
+  // (an explicit tools.exclude entry still wins). Absent means no: a policy
+  // built without it excludes them for a resident agent.
   allowResidentWeb?: boolean;
 }
 
@@ -465,7 +468,7 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
       throw new BobYamlError(
         "tools",
         lineOf(opts.yamlText, /^tools[ \t]*:/m),
-        `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: tools.allowResidentWeb is true, but the role does not grant it. A resident agent loses the web tools unless its ROLE opts in (roles/${ceiling.name}/role.json).`,
+        `bob.yaml widens the tool allowlist beyond the "${ceiling.name}" role: tools.allowResidentWeb is true, but the role does not grant it. Only the ROLE's opt-in (roles/${ceiling.name}/role.json) removes the resident egress exclusion from the web tools; an explicit tools.exclude entry still wins.`,
       );
     }
     // The role's grant is inherited; bob.yaml may still narrow it away.
@@ -473,7 +476,9 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
     allowResidentWeb = ceiling.allowResidentWeb === true && block.allowResidentWeb !== false;
   }
 
-  // The shell opt-in keeps the writers; only the web opt-in keeps egress. The
+  // The shell opt-in removes the resident writer exclusion; only the web opt-in
+  // removes the resident egress exclusion; an explicit tools.exclude entry stays
+  // excluded under either. The
   // egress exclusion lists only the egress names this allowlist asks for: pi
   // applies excludeTools after the strict allowlist, so an unlisted name is
   // inert either way, and every existing agent's effective tool and exclusion

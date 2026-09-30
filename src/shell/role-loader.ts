@@ -14,8 +14,9 @@ export interface RoleTemplate {
   tools: {
     allow: string[];
     allowResidentShell?: boolean;
-    // bob#244: lets a resident agent keep the egress (web) tools. The shell
-    // grant above does not cover them.
+    // bob#244: removes the resident egress exclusion for the web tools (an
+    // explicit tools.exclude entry still wins). The shell grant above does not
+    // cover them.
     allowResidentWeb?: boolean;
   };
   default_provider?: string;

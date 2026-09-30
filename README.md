@@ -242,9 +242,11 @@ change one, the named test is what tells you.
 - **Doctor points at the right file.** A resident agent whose allowlist names a
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
-  narrow it. For a dropped web tool, doctor recommends `tools.allowResidentWeb`
-  as the grant, and says the shell grant (`allowResidentShell`) does not cover
-  web. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
+  narrow it. For a web tool dropped while the resident web grant is absent,
+  doctor recommends `tools.allowResidentWeb` as the grant, and says the shell
+  grant (`allowResidentShell`) does not cover web; if the tool is also in
+  `tools.exclude`, the fix says to remove it from there as well. An exclusion
+  alone, with the grant in effect, does not trigger this warning. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
 - **A web session holds nothing private beyond its admitted prompt.** A session
   that holds the `web` capability, or allows a web tool, is refused unless every
   capability in it is public-class, it holds no pi built-in tool, it carries no
@@ -659,9 +661,10 @@ web:
 The block is validated when `bob.yaml` is loaded and again when the extension
 reads it from `BOB_CAP_WEB`; an unknown key, a wrong type or a value out of
 bounds is refused at both. `web_fetch` and `web_search` are classified `egress`:
-a resident agent drops them unless its role sets `tools.allowResidentWeb: true`
-(`jarvis` and `ea` do; `allowResidentShell` does not cover them), and a mail
-turn never holds them. *(`test/capabilities/web/config.test.ts`,
+a resident agent's policy excludes them unless its role sets
+`tools.allowResidentWeb: true` (`jarvis` and `ea` do; `allowResidentShell` does
+not cover them). The grant removes only that resident egress exclusion: an
+explicit `tools.exclude` entry still wins. A mail turn never holds them. *(`test/capabilities/web/config.test.ts`,
 `test/shell/web-policy.test.ts`)*
 
 ### `tps-mail` — answering TPS mail

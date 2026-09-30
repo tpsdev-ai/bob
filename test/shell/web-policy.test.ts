@@ -70,7 +70,8 @@ describe("the resident rule for egress tools", () => {
     expect(p.allowResidentWeb).toBe(false);
     for (const name of WEB_TOOLS) expect(p.excludeTools).toContain(name);
     expect(residentDroppedWebTools(p)).toEqual(WEB_TOOLS);
-    // Doctor's shell warning names only what the SHELL grant would keep.
+    // Doctor's shell warning names only the non-egress names in the exclusion
+    // list (the SHELL grant's; explicit exclusions would stay after it).
     expect(residentDroppedTools(p)).toEqual(["bash"]);
   });
 

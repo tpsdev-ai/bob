@@ -107,9 +107,10 @@ export interface ToolsBlock {
   // Opt a resident agent back into the shell + file-writing tools the resident
   // policy drops (see tool-allowlist.ts, RESIDENT_EXCLUDED_TOOLS).
   allowResidentShell?: boolean;
-  // bob#244: opt a resident agent back into the egress (web) tools the resident
-  // policy drops (tool-allowlist.ts, RESIDENT_EGRESS_TOOLS). Like
-  // allowResidentShell, bob.yaml may only narrow the role's grant.
+  // bob#244: lift the resident egress exclusion for the web tools
+  // (tool-allowlist.ts, RESIDENT_EGRESS_TOOLS); an explicit `exclude` entry
+  // still wins. Like allowResidentShell, bob.yaml may only narrow the role's
+  // grant.
   allowResidentWeb?: boolean;
 }
 
