@@ -6,8 +6,9 @@ on:
   push:
     branches: [main]
 
-# Read-only: every job here only reads the repo, installs dependencies and runs
-# checks/tests. No job needs write access, and no secret is added for one.
+# The GitHub repository permission is read-only (contents: read): the workflow
+# token cannot write to the repository. No job needs write access, and no
+# secret is added for one.
 permissions:
   contents: read
 
@@ -58,8 +59,8 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
-      # The changelog fragment gate (bob#236): refuses a malformed fragment or a
-      # hand-written entry left in [Unreleased]. Read-only, no secret.
+      # The changelog fragment gate (bob#236): refuses a malformed fragment, and
+      # anything but the managed note under [Unreleased]. Read-only, no secret.
       - name: changelog fragments (check)
         run: node scripts/changelog-fragments.mjs check
       # Provision the unprivileged user the jarvis key-read proof runs as (the

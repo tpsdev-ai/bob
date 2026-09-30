@@ -1,8 +1,10 @@
 # Changelog fragments
 
-One file per change. Two pull requests never edit the same file, so the
-`[Unreleased]` section of `CHANGELOG.md` stopped being a guaranteed merge
-conflict — and nobody loses a review round to resolving one (bob#236).
+One file per change. Pull requests whose fragments have distinct filenames no
+longer share an edit to the `[Unreleased]` section of `CHANGELOG.md`, so adding
+a changelog entry stops being a routine merge conflict, and a review round is
+no longer spent resolving one (bob#236). Two pull requests that pick the same
+filename still conflict, on that file, so make the slug specific.
 
 ## Adding an entry
 
@@ -20,8 +22,8 @@ Create `<category>-<slug>.md` in this directory:
   PR number works but is not expected — the branch is usually pushed before the
   PR number exists.
 
-The file contains the entry **exactly as it should appear** under its heading,
-including the leading `- ` and a 2-space indent on continuation lines:
+The file contains the entry as it should appear under its heading, including
+the leading `- ` and a 2-space indent on every continuation line:
 
 ```markdown
 - **The thing that changed, in bold.** What it means for someone running bob,
@@ -30,15 +32,22 @@ including the leading `- ` and a 2-space indent on continuation lines:
   A second paragraph, indented two spaces so it stays inside the list item.
 ```
 
-**The bold lede is required, ≤ 25 words and one sentence.** The GitHub release
-renderer keeps that lede, up to three issue links, and any Heads-up lines —
-nothing else. A long lede *is* the dump; move detail into the body. `check`
-fails naming the fragment, its word count, and this rule.
+**The bold lede is required: non-empty, ≤ 25 words and one sentence.** It is
+the entry's summary, the line a reader skims first. The GitHub release carries
+the whole `## [<version>]` section (`scripts/changelog-extract.mjs`), so detail
+is never cut; it belongs in the body, where it reads as detail. `check` fails
+naming the fragment and this rule, and gives the word count when the lede is
+too long.
 
-Assembly is a pure join — no reflow, no re-indent, no rewrapping — so tables and
-nested code blocks survive verbatim. The flip side is that a fragment which is
-not already a well-formed list item is a hard error rather than something the
-tooling quietly fixes up: silent normalisation is how content goes missing.
+Reading a fragment trims the whitespace at the end of the file; nothing else is
+changed. Assembly joins the fragments as read — no reflow, no re-indent, no
+rewrapping — so tables and nested code blocks come through unchanged. The flip
+side is that a fragment which is not already a well-formed list item is a hard
+error rather than something the tooling quietly fixes up: silent normalisation
+is how content goes missing.
+
+A fragment is a regular file in this directory. A symbolic link, a directory or
+any other kind of entry is refused.
 
 ## Checking your work
 
@@ -48,20 +57,29 @@ node scripts/changelog-fragments.mjs list     # what is staged, by category
 node scripts/changelog-fragments.mjs check    # what CI runs
 ```
 
-CI runs `check` on every PR: it fails on a malformed fragment (a bad name, a
-missing or over-long bold lede, a body that is not a list item, an odd
-continuation indent, or a fragment holding more than one entry) and on a
-hand-written entry left in `[Unreleased]`.
+CI runs `check` on every PR. It fails on a malformed fragment (a bad name; a
+missing, empty or over-long bold lede; a body that is not a list item; a
+continuation line indented by an odd number of spaces or not at all; a fragment
+holding more than one entry), on an entry that is not a regular file, on a
+missing fragment directory, and on anything but the managed note under
+`[Unreleased]`.
 
 ## At release time
 
 `node scripts/changelog-fragments.mjs promote <version> [--date=YYYY-MM-DD]`
-assembles every fragment into a `## [<version>] - <date>` section in
-`CHANGELOG.md`, in Keep a Changelog category order and by filename within each
-category, then deletes the fragments. Entry order within a category carries no
-meaning; stability does, and filename sort is stable across machines and
-filesystems.
+keeps `## [Unreleased]` with its note, writes every fragment into a new
+`## [<version>] - <date>` section below it (in Keep a Changelog category order,
+and by filename within each category), then deletes the fragments. `--date`
+must be a real date written `YYYY-MM-DD`; without it the date is today's (UTC).
+An invalid date is refused before anything is written. Entry order within a
+category carries no meaning; stability does, and filename sort is stable across
+machines and filesystems.
 
-Do not add entries directly to `## [Unreleased]` in `CHANGELOG.md`. `promote`
-replaces that section's body, so a hand-written entry there is lost — which is
-why both `check` and `promote` refuse when they find one.
+If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
+delete a fragment after writing the section, it names each one left: those are
+already in the new section, so delete them, or restore both
+(`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.
+
+Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`
+rewrites that section's body to the note, so `check` and `promote` both refuse
+while it holds a list entry or any other text.

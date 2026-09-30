@@ -3,16 +3,17 @@
 // scripts/changelog-fragments.mjs (flair#835).
 //
 // PROBLEM. Every PR was required to add its entry to the single `[Unreleased]`
-// block at the top of CHANGELOG.md. That made those lines a guaranteed conflict
-// point: with N concurrent PRs, the last to merge conflicts N-1 times. The cost
-// is not the resolution — it is that a merge/rebase to resolve DISMISSES the
-// existing approvals, so every conflict buys a full second review round for zero
-// content change. (bob's own [Unreleased] had also drifted into repeated
+// block at the top of CHANGELOG.md, so two PRs that each added an entry edited
+// the same lines and the second to merge conflicted. The cost is not the
+// resolution — it is that a merge/rebase to resolve DISMISSES the existing
+// approvals, so every conflict buys a full second review round for zero content
+// change. (bob's own [Unreleased] had also drifted into repeated
 // `### Fixed`/`### Changed` headers from earlier resolutions.)
 //
-// FIX. One file per change under `.changelog/unreleased/`. Two PRs never touch
-// the same file, so the conflict cannot occur. `promote` assembles the fragments
-// into a `## [X.Y.Z]` section and deletes them.
+// FIX. One file per change under `.changelog/unreleased/`. PRs whose fragments
+// have distinct filenames no longer share an edit to `[Unreleased]`; two PRs
+// that pick the same filename still conflict, on that file. `promote` writes the
+// fragments into a `## [X.Y.Z]` section below `[Unreleased]` and deletes them.
 //
 // FILE NAMING: `.changelog/unreleased/<category>-<slug>.md`
 //   category  one of added|changed|deprecated|removed|fixed|security
@@ -21,10 +22,11 @@
 //             number is a fine slug, but is not required — the branch is pushed
 //             before the PR number exists)
 //
-// FILE CONTENT: the entry exactly as it should appear under its `### Category`
-// heading, INCLUDING the leading `- ` and a 2-space indent on continuation
-// lines. Assembly is then a pure join: no reflow, no re-indent, no re-wrapping.
-// That is deliberate. The failure this design exists to prevent is silent
+// FILE CONTENT: the entry as it should appear under its `### Category` heading,
+// INCLUDING the leading `- ` and a 2-space indent on every continuation line.
+// Reading trims the whitespace at the end of the file; assembly then joins the
+// fragments as read: no reflow, no re-indent, no re-wrapping. That is
+// deliberate. The failure this design exists to prevent is silent
 // content loss, and every normalisation step is somewhere content can be
 // silently altered. A fragment that does not already look like a list item is a
 // hard error, not something to be helpfully fixed up.
@@ -36,7 +38,8 @@
 //   node scripts/changelog-fragments.mjs promote <version> [--date=YYYY-MM-DD]
 //                                                    write the section into
 //                                                    CHANGELOG.md and delete the
-//                                                    fragments
+//                                                    fragments; --date must be a
+//                                                    real date (default: today, UTC)
 
 import {
   closeSync,
@@ -68,24 +71,25 @@ const HEADING = {
   security: "Security",
 };
 
-// The body `## [Unreleased]` carries once entries live in fragments. Kept as a
-// constant so `check` and `promote` agree on it.
+// The body `## [Unreleased]` carries once entries live in fragments, and the
+// ONLY body `check` and `promote` accept there (blank lines around it aside).
+// Kept as a constant so both agree on it and `promote` can restore it.
 export const UNRELEASED_NOTE = [
   "Entries for the next release live as **fragment files** under [`.changelog/unreleased/`](.changelog/unreleased/) —",
-  "one file per change, so two pull requests never edit the same lines and never conflict here.",
+  "one file per change, so pull requests with distinct fragment filenames do not share an edit to this section.",
   "",
-  "Add `.changelog/unreleased/<category>-<slug>.md` containing your entry exactly as it should read",
-  "under its `### Category` heading, leading `- ` included. Categories: `added`, `changed`,",
-  "`deprecated`, `removed`, `fixed`, `security`.",
+  "Add `.changelog/unreleased/<category>-<slug>.md` containing your entry as it should read under",
+  "its `### Category` heading, leading `- ` included. Categories: `added`, `changed`, `deprecated`,",
+  "`removed`, `fixed`, `security`.",
   "",
   "```bash",
   "node scripts/changelog-fragments.mjs render   # preview the assembled section",
   "node scripts/changelog-fragments.mjs check    # what CI checks",
   "```",
   "",
-  "`node scripts/changelog-fragments.mjs promote <version>` assembles them into a `## [X.Y.Z]`",
-  "section and deletes them as part of a version cut. **Do not add entries to this section by hand**",
-  "— the release step replaces its body, so a hand-written entry here is lost.",
+  "`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [X.Y.Z]` section",
+  "below this one and deletes them as part of a version cut. **Do not add anything to this section by",
+  "hand**: `check` and `promote` refuse while it holds anything but this note.",
 ].join("\n");
 
 // ─── Fragment reading ─────────────────────────────────────────────────────────
@@ -137,28 +141,13 @@ export function validateFragmentBody(relPath, body) {
   if (!body.startsWith("- ")) {
     throw new FragmentError(
       `${relPath}: fragment must start with '- ' (the markdown list marker) so it can be placed under its ` +
-        `### heading verbatim. Indent continuation lines by 2 spaces.`,
+        `### heading as written. Indent continuation lines by 2 spaces.`,
     );
-  }
-  // A whitespace convention, independent of Markdown syntax or fence state.
-  const lines = body.split("\n");
-  for (let index = 1; index < lines.length; index++) {
-    const leading = lines[index].match(/^[ \t]*/)[0];
-    const indent = lines[index].match(/^ */)[0].length;
-    const hasTab = leading.includes("\t");
-    if (hasTab || indent % 2 !== 0) {
-      throw new FragmentError(
-        `${relPath}:${index + 1}: continuation indent ${indent}; ` +
-          (hasTab ? "tabs are not allowed; " : "") +
-          "indent continuation lines by an even number of spaces: 2 for the entry, 4 or more for nested content.",
-        relPath,
-        index + 1,
-      );
-    }
   }
 
   // One entry per file, checked HERE rather than only at assembly, so the author
-  // hears it while the change is still theirs to fix.
+  // hears it while the change is still theirs to fix. Checked before the indent
+  // rule below, so a second top-level entry is named as such.
   //
   // Fenced code blocks are stripped before counting: fragments routinely quote
   // terminal output, and a line like `- foo` inside a fence is content, not a
@@ -173,14 +162,43 @@ export function validateFragmentBody(relPath, body) {
         `and reviewed on its own. Indent continuation lines by 2 spaces so they stay part of their entry.`,
     );
   }
+
+  // A whitespace convention, independent of Markdown syntax or fence state. Every
+  // nonblank continuation line is indented by at least 2 spaces: a line at column
+  // 0 (a heading, a paragraph) would render outside the entry.
+  const lines = body.split("\n");
+  for (let index = 1; index < lines.length; index++) {
+    const leading = lines[index].match(/^[ \t]*/)[0];
+    const indent = lines[index].match(/^ */)[0].length;
+    const hasTab = leading.includes("\t");
+    if (hasTab || indent % 2 !== 0) {
+      throw new FragmentError(
+        `${relPath}:${index + 1}: continuation indent ${indent}; ` +
+          (hasTab ? "tabs are not allowed; " : "") +
+          "indent continuation lines by an even number of spaces: 2 for the entry, 4 or more for nested content.",
+        relPath,
+        index + 1,
+      );
+    }
+    if (indent < 2 && lines[index].trim().length > 0) {
+      throw new FragmentError(
+        `${relPath}:${index + 1}: continuation line is not indented, so it would render outside the entry; ` +
+          "indent it by 2 spaces (4 or more for nested content).",
+        relPath,
+        index + 1,
+      );
+    }
+  }
 }
 
-// ─── Lede (flair#1392; bob also refuses a MISSING lede, bob#236) ─────────────
+// ─── Lede (flair#1392; bob also refuses a MISSING or EMPTY lede, bob#236) ────
 //
-// GitHub release notes keep only the bold lede + issue links + Heads-up lines.
-// A 105-word lede is not a lede — it IS the entry. The renderer will not invent a
-// summary, so the source must be short: <= 25 words, one sentence. Historical
-// CHANGELOG.md is not rewritten; this rule is fragments only.
+// The lede is the entry's one-sentence summary, the line a reader skims first.
+// bob's GitHub release publishes the whole `## [<version>]` section
+// (release-publish.yml runs scripts/changelog-extract.mjs), so nothing is cut
+// from an entry; but a 105-word lede is not a summary, it IS the entry. Hence
+// <= 25 words, one sentence: the rule flair#1392 set. Historical CHANGELOG.md is
+// not rewritten; this rule is fragments only.
 
 export const LEDE_WORD_LIMIT = 25;
 
@@ -204,16 +222,22 @@ export function countLedeSentences(lede) {
 
 /**
  * Null when the fragment is fine. Otherwise a message naming the fragment, the
- * problem and the rule. bob refuses a fragment with NO bold lede at all (the
- * release renderer keeps only that lede, so an entry without one renders empty),
- * and one whose lede is over budget.
+ * problem and the rule. bob refuses a fragment with NO bold lede, one whose bold
+ * run is empty (`- **** detail`), and one whose lede is over budget; only the
+ * last reports a word count.
  */
 export function ledeViolation(relPath, body) {
   const lede = extractFragmentLede(body);
   if (lede == null) {
     return (
-      `${relPath}: no bold lede. Start the entry with '- **<one sentence>**' (<= ${LEDE_WORD_LIMIT} words); ` +
-      `the release-notes renderer keeps only that lede, so an entry without one renders empty.`
+      `${relPath}: no bold lede. Start the entry with '- **<one sentence>**' (<= ${LEDE_WORD_LIMIT} words): ` +
+      `the lede is the entry's summary, the line a reader skims first.`
+    );
+  }
+  if (lede.length === 0) {
+    return (
+      `${relPath}: empty bold lede. Put the entry's one-sentence summary (<= ${LEDE_WORD_LIMIT} words) ` +
+      `inside the leading '**...**'.`
     );
   }
   const words = countLedeWords(lede);
@@ -221,9 +245,8 @@ export function ledeViolation(relPath, body) {
   if (words <= LEDE_WORD_LIMIT && sentences <= 1) return null;
   const extra = sentences > 1 ? ` in ${sentences} sentences` : "";
   return (
-    `${relPath}: bold lede is ${words} words${extra}; the release-notes renderer ` +
-    `keeps only that lede, so it must be <= ${LEDE_WORD_LIMIT} words and one sentence ` +
-    `(flair#1392). Move detail below the bold run.`
+    `${relPath}: bold lede is ${words} words${extra}; a lede is the entry's one-sentence summary, ` +
+    `so it must be <= ${LEDE_WORD_LIMIT} words and one sentence (flair#1392). Move detail below the bold run.`
   );
 }
 
@@ -237,17 +260,29 @@ export function validateLede(relPath, body) {
 // parsed, and a file that will not parse throws — a fragment directory that
 // quietly skips files is the silent-drop bug this whole change exists to remove.
 //
+// A MISSING directory is refused, not read as "no fragments": `check` would
+// otherwise pass a tree whose fragments were deleted along with the directory.
+//
 // Each entry is opened ONCE and every question about it is answered from that
 // descriptor. Checking the path (stat) and then reading the path lets the entry
 // be swapped in between, so the file that passed the check need not be the file
 // that was read (CodeQL js/file-system-race). O_NONBLOCK makes opening a FIFO
 // return at once, so it is refused below instead of blocking on a writer.
+// O_NOFOLLOW refuses a symbolic link: a fragment is a regular file in this
+// directory, never a pointer to content elsewhere.
+const FRAGMENT_OPEN_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
+
 export function readFragments(dir = FRAGMENT_DIR) {
   let names;
   try {
     names = readdirSync(dir);
   } catch (err) {
-    if (err?.code === "ENOENT") return [];
+    if (err?.code === "ENOENT") {
+      throw new FragmentError(
+        `${FRAGMENT_DIR_REL}/: directory not found. It holds the changelog fragments and their README.md; ` +
+          `restore it (git checkout -- ${FRAGMENT_DIR_REL}). An empty directory is fine.`,
+      );
+    }
     throw err;
   }
   const out = [];
@@ -255,7 +290,18 @@ export function readFragments(dir = FRAGMENT_DIR) {
     if (name.startsWith(".")) continue;
     if (name === "README.md") continue;
     const full = join(dir, name);
-    const fd = openSync(full, constants.O_RDONLY | constants.O_NONBLOCK);
+    let fd;
+    try {
+      fd = openSync(full, FRAGMENT_OPEN_FLAGS);
+    } catch (err) {
+      if (err?.code === "ELOOP") {
+        throw new FragmentError(
+          `${FRAGMENT_DIR_REL}/${name}: a symbolic link. Fragments are regular files named ` +
+            `<category>-<slug>.md; commit the entry itself in place of the link.`,
+        );
+      }
+      throw err;
+    }
     let category;
     let slug;
     let body;
@@ -323,11 +369,35 @@ export function locateUnreleased(lines) {
   return { start, end, body: lines.slice(start + 1, end).join("\n") };
 }
 
-// Hand-written entries under `## [Unreleased]` are a data-loss trap now that
-// promote REPLACES that body: they would be silently discarded at the version
-// cut. Detect them by their list marker (prose edits to the note are fine).
+// `promote` rewrites the `## [Unreleased]` body to UNRELEASED_NOTE, so anything
+// else there would be dropped at the version cut. Both `check` and `promote`
+// therefore refuse unless that body is the note (blank lines around it aside).
+// A list entry gets its own message, because its remedy is a fragment.
 export function strayUnreleasedEntries(body) {
   return body.split("\n").filter((l) => l.startsWith("- "));
+}
+
+/**
+ * Null when the `[Unreleased]` body located by `locateUnreleased` is the managed
+ * note. Otherwise where it first differs: a 1-based CHANGELOG.md line number and
+ * that line's text ("(end of section)" when the note is cut short).
+ */
+export function unreleasedNoteMismatch(loc) {
+  if (loc.body.trim() === UNRELEASED_NOTE) return null;
+  const bodyLines = loc.body.split("\n");
+  let lead = 0;
+  while (lead < bodyLines.length && bodyLines[lead].trim() === "") lead++;
+  const got = loc.body.trim().split("\n");
+  const want = UNRELEASED_NOTE.split("\n");
+  let i = 0;
+  while (i < got.length && i < want.length && got[i] === want[i]) i++;
+  // Report the first NONBLANK line from the difference on, so an added paragraph
+  // is shown by its text rather than by the blank line before it.
+  let j = i;
+  while (j < got.length && got[j].trim() === "") j++;
+  // Body line k (0-based, untrimmed) is CHANGELOG.md line loc.start + 2 + k.
+  if (j < got.length) return { line: loc.start + 2 + lead + j, text: got[j].slice(0, 80) };
+  return { line: loc.start + 2 + lead + i, text: "(end of section)" };
 }
 
 // ─── check (what CI runs) ─────────────────────────────────────────────────────
@@ -365,6 +435,15 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
         `move ${stray.length === 1 ? "it" : "them"} into ${FRAGMENT_DIR_REL}/.`,
     );
   }
+  const drift = unreleasedNoteMismatch(loc);
+  if (drift) {
+    throw new FragmentError(
+      `CHANGELOG.md '## [Unreleased]' holds text other than the managed note (line ${drift.line}: ` +
+        `${drift.text}). 'promote' rewrites that section to the note, so move any change into ` +
+        `${FRAGMENT_DIR_REL}/<category>-<slug>.md and restore the note (UNRELEASED_NOTE in ` +
+        `scripts/changelog-fragments.mjs).`,
+    );
+  }
   return { fragments: fragments.length, entries };
 }
 
@@ -376,6 +455,11 @@ export function promote(
 ) {
   if (!/^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$/.test(version ?? "")) {
     throw new FragmentError(`promote: invalid version '${version}'. Expected semver, e.g. 0.31.0.`);
+  }
+  if (date !== undefined && !isCalendarDate(date)) {
+    throw new FragmentError(
+      `promote: invalid --date '${date}'. Expected a real date as YYYY-MM-DD, e.g. 2026-09-29; nothing was written.`,
+    );
   }
   const fragments = readFragments(dir);
   if (fragments.length === 0) {
@@ -397,6 +481,14 @@ export function promote(
         `${FRAGMENT_DIR_REL}/<category>-<slug>.md first. First one: ${stray[0].slice(0, 80)}`,
     );
   }
+  const drift = unreleasedNoteMismatch(loc);
+  if (drift) {
+    throw new FragmentError(
+      `promote: '## [Unreleased]' holds text other than the managed note (line ${drift.line}: ${drift.text}), ` +
+        `which this step would overwrite. Move any change into ${FRAGMENT_DIR_REL}/<category>-<slug>.md and ` +
+        `restore the note first.`,
+    );
+  }
 
   const section = assemble(fragments);
   const entries = countEntries(section);
@@ -410,9 +502,40 @@ export function promote(
   const day = date ?? new Date().toISOString().slice(0, 10);
   const replacement = ["", UNRELEASED_NOTE, "", `## [${version}] - ${day}`, "", section, ""];
   const next = [...lines.slice(0, loc.start + 1), ...replacement, ...lines.slice(loc.end)];
-  writeFileSync(changelogPath, next.join("\n"));
-  for (const f of fragments) unlinkSync(f.path);
+  // A failure part-way must say what state it left and how to recover: the
+  // section is written first, and the fragments are deleted only after that.
+  try {
+    writeFileSync(changelogPath, next.join("\n"));
+  } catch (err) {
+    throw new FragmentError(
+      `promote: could not write CHANGELOG.md (${err?.code ?? err}); no fragment was deleted. Restore it ` +
+        `(git checkout -- CHANGELOG.md) and run promote again.`,
+    );
+  }
+  const left = [];
+  for (const f of fragments) {
+    try {
+      unlinkSync(f.path);
+    } catch (err) {
+      left.push(`${f.name} (${err?.code ?? err})`);
+    }
+  }
+  if (left.length > 0) {
+    throw new FragmentError(
+      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.length} fragment(s) could ` +
+        `not be deleted: ${left.join(", ")}. They are already in that section: delete them before the next ` +
+        `check or promote, or restore both (git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}) and run promote again.`,
+    );
+  }
   return { version, date: day, entries, removed: fragments.map((f) => f.name) };
+}
+
+// `YYYY-MM-DD` naming a day that exists (no 2026-02-30).
+export function isCalendarDate(s) {
+  if (typeof s !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s)) return false;
+  const [y, m, d] = s.split("-").map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -438,10 +561,16 @@ if (isMain) {
     } else if (cmd === "check") {
       const res = check();
       process.stdout.write(
-        `✓ ${res.fragments} fragment(s), ${res.entries} entr(ies), no stray [Unreleased] entries.\n`,
+        `✓ ${res.fragments} fragment(s), ${res.entries} entr(ies), [Unreleased] holds only the managed note.\n`,
       );
     } else if (cmd === "promote") {
       const version = process.argv[3];
+      const unknown = process.argv.slice(4).filter((a) => !a.startsWith("--date="));
+      if (unknown.length > 0) {
+        throw new FragmentError(
+          `promote: unexpected argument(s): ${unknown.join(" ")}. Usage: promote <version> [--date=YYYY-MM-DD].`,
+        );
+      }
       const dateArg = process.argv.find((a) => a.startsWith("--date="));
       const res = promote(version, { date: dateArg ? dateArg.slice("--date=".length) : undefined });
       process.stdout.write(

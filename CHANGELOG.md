@@ -5,20 +5,20 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 Entries for the next release live as **fragment files** under [`.changelog/unreleased/`](.changelog/unreleased/) —
-one file per change, so two pull requests never edit the same lines and never conflict here.
+one file per change, so pull requests with distinct fragment filenames do not share an edit to this section.
 
-Add `.changelog/unreleased/<category>-<slug>.md` containing your entry exactly as it should read
-under its `### Category` heading, leading `- ` included. Categories: `added`, `changed`,
-`deprecated`, `removed`, `fixed`, `security`.
+Add `.changelog/unreleased/<category>-<slug>.md` containing your entry as it should read under
+its `### Category` heading, leading `- ` included. Categories: `added`, `changed`, `deprecated`,
+`removed`, `fixed`, `security`.
 
 ```bash
 node scripts/changelog-fragments.mjs render   # preview the assembled section
 node scripts/changelog-fragments.mjs check    # what CI checks
 ```
 
-`node scripts/changelog-fragments.mjs promote <version>` assembles them into a `## [X.Y.Z]`
-section and deletes them as part of a version cut. **Do not add entries to this section by hand**
-— the release step replaces its body, so a hand-written entry here is lost.
+`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [X.Y.Z]` section
+below this one and deletes them as part of a version cut. **Do not add anything to this section by
+hand**: `check` and `promote` refuse while it holds anything but this note.
 
 ## [0.2.0] - 2026-05-23
 

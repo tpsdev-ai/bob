@@ -1,12 +1,21 @@
 // bob#236: changelog fragments. Ported from flair's model; these tests cover the
-// issue's acceptance: two PRs adding fragments never conflict; `check` fails on a
-// hand-written [Unreleased] entry and on a malformed fragment; `render` is the
-// migrated content reordered only by category and filename; `promote` writes a
-// dated section and deletes the fragments.
+// issue's acceptance: two PRs whose fragments have distinct filenames merge
+// cleanly in either order; `check` fails on anything but the managed note under
+// [Unreleased] and on a malformed fragment; `render` is the migrated content
+// reordered by category and filename, apart from three named repairs; `promote`
+// writes a dated section below [Unreleased] and deletes the fragments.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cf from "../scripts/changelog-fragments.mjs";
@@ -114,22 +123,62 @@ describe("changelog fragments — check (bob#236)", () => {
     expect(() => cf.check({ dir, changelogPath })).toThrow(/continuation indent 3/);
   });
 
-  // Each entry is opened once and judged by its descriptor, not by a separate
-  // stat of the path. A link to /dev/null resolves to a character device: the
-  // stat-then-read form read it as an empty file and blamed the content.
+  it("REFUSES a continuation line that is not indented (it would render outside the entry)", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-flush-left.md", "- **Valid.** Detail\n### Added\n");
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      /fixed-flush-left\.md:2: continuation line is not indented/,
+    );
+  });
+
+  it("REFUSES an empty bold lede", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-empty-lede.md", "- **** detail\n");
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/fixed-empty-lede\.md: empty bold lede/);
+  });
+
   it("passes on an empty fragment directory (the state right after `promote`)", () => {
     const { dir, changelogPath } = project();
     expect(cf.check({ dir, changelogPath })).toEqual({ fragments: 0, entries: 0 });
   });
 
-  it("REFUSES an entry that is not a regular file (a directory, a device)", () => {
+  it("REFUSES a missing fragment directory rather than reading it as empty", () => {
+    const { dir, changelogPath } = project();
+    rmSync(dir, { recursive: true });
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/unreleased\/: directory not found/);
+  });
+
+  // Each entry is opened once and judged by its descriptor, not by a separate
+  // stat of the path. The open does not block on a FIFO (O_NONBLOCK).
+  it("REFUSES an entry that is not a regular file (a directory, a FIFO)", () => {
     const { dir, changelogPath } = project();
     mkdirSync(join(dir, "fixed-a-directory.md"));
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unexpected directory/);
     rmSync(join(dir, "fixed-a-directory.md"), { recursive: true });
-    symlinkSync("/dev/null", join(dir, "fixed-a-device.md"));
+    const made = spawnSync("mkfifo", [join(dir, "fixed-a-fifo.md")], { encoding: "utf8" });
+    expect(made.status, made.stderr).toBe(0);
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/fixed-a-fifo\.md: not a regular file/);
+  });
+
+  it("REFUSES a symbolic link, even to a well-formed fragment outside the directory", () => {
+    const { dir, changelogPath } = project();
+    const outside = join(root, "elsewhere.md");
+    writeFileSync(outside, "- **A well-formed entry.** Detail.\n");
+    symlinkSync(outside, join(dir, "fixed-a-link.md"));
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/fixed-a-link\.md: a symbolic link/);
+  });
+
+  it("REFUSES text other than the managed note under [Unreleased], naming its line", () => {
+    const { dir, changelogPath } = project();
+    writeFileSync(
+      changelogPath,
+      `# Changelog\n\n## [Unreleased]\n\n${NOTE}\n\nA hand-written paragraph.\n\n## [0.0.1] - 2020-01-01\n`,
+    );
+    // Lines 1-4 are the title, a blank, the header and a blank; the note follows,
+    // then a blank, then the paragraph.
+    const line = 4 + NOTE.split("\n").length + 2;
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /fixed-a-device\.md: not a regular file/,
+      `holds text other than the managed note (line ${line}: A hand-written paragraph.)`,
     );
   });
 
@@ -164,10 +213,72 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(text).toContain("## [1.2.3] - 2022-01-02");
     expect(text).toContain("### Added\n\n- **an addition.**");
     expect(text).toContain("### Fixed\n\n- **a fix.**");
-    // The fragments are gone, and [Unreleased] carries the note again.
+    // The fragments are gone, and [Unreleased] carries the note again: the
+    // result passes `check`.
     expect(cf.readFragments(dir)).toEqual([]);
     expect(text).toContain("Entries for the next release live as **fragment files**");
+    expect(cf.check({ dir, changelogPath })).toEqual({ fragments: 0, entries: 0 });
   });
+
+  it("promote REFUSES text other than the managed note under [Unreleased], and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const before = `# Changelog\n\n## [Unreleased]\n\n${NOTE}\n\nA hand-written paragraph.\n\n## [0.0.1] - 2020-01-01\n`;
+    writeFileSync(changelogPath, before);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      /promote: '## \[Unreleased\]' holds text other than the managed note/,
+    );
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  it("promote REFUSES a --date that is not a real YYYY-MM-DD, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const before = readFileSync(changelogPath, "utf8");
+    for (const date of ["2022-1-2", "2022-02-30", "", "tomorrow"]) {
+      expect(() => cf.promote("1.2.3", { date, dir, changelogPath })).toThrow(/invalid --date/);
+    }
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  // Permission bits do not bind root, so these two cannot fail a write as root.
+  const asRoot = process.getuid?.() === 0;
+
+  it.skipIf(asRoot)(
+    "promote that cannot write CHANGELOG.md deletes no fragment and says how to recover",
+    () => {
+      const { dir, changelogPath } = project();
+      fragment(dir, "fixed-a.md", "- **a fix.** \n");
+      chmodSync(changelogPath, 0o444);
+      try {
+        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+          /could not write CHANGELOG\.md \(EACCES\); no fragment was deleted/,
+        );
+      } finally {
+        chmodSync(changelogPath, 0o644);
+      }
+      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    },
+  );
+
+  it.skipIf(asRoot)(
+    "promote that cannot delete a fragment names it and says how to recover",
+    () => {
+      const { dir, changelogPath } = project();
+      fragment(dir, "fixed-a.md", "- **a fix.** \n");
+      chmodSync(dir, 0o555);
+      try {
+        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+          /is written to CHANGELOG\.md, but 1 fragment\(s\) could not be deleted: fixed-a\.md \(EACCES\)/,
+        );
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+      expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2022-01-02");
+    },
+  );
 });
 
 describe("changelog fragments — the migration (bob#236)", () => {
@@ -181,8 +292,8 @@ describe("changelog fragments — the migration (bob#236)", () => {
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
   // The entries the migration had to repair to pass `check`. Every other entry
-  // is byte-for-byte the pre-migration text, so a new difference is a failure
-  // rather than an unnoticed extra repair.
+  // is the pre-migration text unchanged (whitespace at its end aside), so a new
+  // difference is a failure rather than an unnoticed extra repair.
   const REPAIRED = [
     // An over-long lede: reshaped.
     {
@@ -204,16 +315,15 @@ describe("changelog fragments — the migration (bob#236)", () => {
     },
   ];
 
-  it("render carries every pre-migration entry verbatim, except the named repairs, each once", () => {
+  it("render carries every pre-migration entry unchanged, except the named repairs, each once", () => {
     const rendered = ENTRIES(cf.assemble(migrated));
     expect(rendered.length).toBe(before.length);
     expect(new Set(rendered).size).toBe(rendered.length);
-    const notVerbatim = before.filter((e) => !rendered.includes(e));
-    // An unnamed difference maps to a string naming the entry: `undefined` would
-    // sort last and be ignored by toEqual, so the check could never fire.
-    const named = notVerbatim.map(
-      (e) =>
-        REPAIRED.find((r) => e.startsWith(r.was))?.fragment ?? `not verbatim: ${e.slice(0, 80)}`,
+    const differing = before.filter((e) => !rendered.includes(e));
+    // An unnamed difference maps to a string naming the entry, so a failure says
+    // which entry it is.
+    const named = differing.map(
+      (e) => REPAIRED.find((r) => e.startsWith(r.was))?.fragment ?? `differs: ${e.slice(0, 80)}`,
     );
     expect(named.sort()).toEqual(REPAIRED.map((r) => r.fragment).sort());
   });
@@ -256,53 +366,71 @@ describe("changelog fragments — the live directory (release-safe)", () => {
   });
 });
 
-// Acceptance: two PRs that each add a fragment merge in either order with no
-// conflict. Two real branches in a temp git repo, merged both ways.
-describe("changelog fragments — two concurrent PRs never conflict (bob#236)", () => {
+// Acceptance: two PRs whose fragments have DISTINCT filenames merge in either
+// order with no conflict. Two real branches in a temp git repo: B merged into A,
+// and separately A's original commit merged into B; both fragments must be
+// present after each merge. (Two PRs that pick the SAME filename still conflict,
+// on that file; the README says so.)
+describe("changelog fragments — two PRs with distinct fragment filenames (bob#236)", () => {
   function git(cwd: string, ...args: string[]): { code: number; out: string } {
     const r = spawnSync("git", args, { cwd, encoding: "utf8" });
     return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
   }
 
+  // Every setup step must succeed; a silently failed step would leave the merges
+  // below testing something else.
+  function ok(cwd: string, ...args: string[]): void {
+    const r = git(cwd, ...args);
+    expect(r.code, `git ${args.join(" ")}: ${r.out}`).toBe(0);
+  }
+
+  const A = join(".changelog", "unreleased", "fixed-from-a.md");
+  const B = join(".changelog", "unreleased", "added-from-b.md");
+
   function repo(): string {
     const d = join(root, "repo");
     mkdirSync(d, { recursive: true });
-    git(d, "init", "-q", "-b", "main");
-    git(d, "config", "user.email", "t@t.dev");
-    git(d, "config", "user.name", "t");
+    ok(d, "init", "-q", "-b", "main");
+    ok(d, "config", "user.email", "t@t.dev");
+    ok(d, "config", "user.name", "t");
+    ok(d, "config", "commit.gpgsign", "false");
     writeFileSync(join(d, "CHANGELOG.md"), `# Changelog\n\n## [Unreleased]\n\n${NOTE}\n`);
     mkdirSync(join(d, ".changelog", "unreleased"), { recursive: true });
     writeFileSync(join(d, ".changelog", "unreleased", "README.md"), "# fragments\n");
-    git(d, "add", "-A");
-    git(d, "commit", "-q", "-m", "base");
+    ok(d, "add", "-A");
+    ok(d, "commit", "-q", "-m", "base");
     return d;
   }
 
-  it("branch A adds a fragment, branch B adds a different one; merging either order conflicts neither", () => {
-    const d = repo();
-    git(d, "checkout", "-q", "-b", "a");
-    writeFileSync(join(d, ".changelog", "unreleased", "fixed-from-a.md"), "- **a.** \n");
-    git(d, "add", "-A");
-    git(d, "commit", "-q", "-m", "a");
-    git(d, "checkout", "-q", "main");
-    git(d, "checkout", "-q", "-b", "b");
-    writeFileSync(join(d, ".changelog", "unreleased", "added-from-b.md"), "- **b.** \n");
-    git(d, "add", "-A");
-    git(d, "commit", "-q", "-m", "b");
+  function bothFragments(d: string): void {
+    expect(readFileSync(join(d, A), "utf8")).toBe("- **a.** \n");
+    expect(readFileSync(join(d, B), "utf8")).toBe("- **b.** \n");
+  }
 
-    // Merge b into a (A first), then the reverse, both clean.
-    git(d, "checkout", "-q", "a");
+  it("B merged into A, and A's original commit merged into B: both clean, both fragments present", () => {
+    const d = repo();
+    ok(d, "checkout", "-q", "-b", "a", "main");
+    writeFileSync(join(d, A), "- **a.** \n");
+    ok(d, "add", "--", A);
+    ok(d, "commit", "-q", "-m", "a");
+    ok(d, "checkout", "-q", "-b", "b", "main");
+    writeFileSync(join(d, B), "- **b.** \n");
+    ok(d, "add", "--", B);
+    ok(d, "commit", "-q", "-m", "b");
+
+    // Order 1: B into A, on a branch of its own so `a` keeps its original commit.
+    ok(d, "checkout", "-q", "-b", "a-then-b", "a");
     const m1 = git(d, "merge", "--no-edit", "b");
     expect(m1.code, m1.out).toBe(0);
-    git(d, "checkout", "-q", "main");
-    git(d, "merge", "--no-edit", "a"); // now main has both
-    git(d, "checkout", "-q", "-b", "c", "main~1"); // the pre-merge state on a
-    const m2 = git(d, "merge", "--no-edit", "b");
-    expect(m2.code, m2.out).toBe(0);
+    bothFragments(d);
 
-    // Both fragments survive the merge.
-    git(d, "checkout", "-q", "a");
-    const files = readFileSync(join(d, ".changelog", "unreleased", "added-from-b.md"), "utf8");
-    expect(files).toContain("**b.**");
+    // Order 2: A's original commit into B.
+    ok(d, "checkout", "-q", "-b", "b-then-a", "b");
+    const parents = git(d, "rev-list", "--parents", "-n", "1", "a");
+    expect(parents.code, parents.out).toBe(0);
+    expect(parents.out.trim().split(" ")).toHaveLength(2); // `a` is still A's one-parent commit
+    const m2 = git(d, "merge", "--no-edit", "a");
+    expect(m2.code, m2.out).toBe(0);
+    bothFragments(d);
   });
 });
