@@ -451,7 +451,7 @@ type PinStage = "when it was pinned" | "immediately before the spawn";
 
 // The cwd must still be the directory that was checked: the same canonical path,
 // inside the checked canonical workspace, and (no-follow) the pinned device +
-// inode. Throws a RunRefusal naming what changed.
+// inode. Throws a RunRefusal naming the failed check or mismatch.
 function assertStillPinned(
   ops: DirPinOps,
   dir: string,
@@ -469,12 +469,12 @@ function assertStillPinned(
   }
   if (!isInsideCanonical(workspace, real)) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} now resolves outside the workspace ${workspace} (to ${real}), ${stage}: a component of its path was replaced after it was checked. Nothing was started.`,
+      `run refused: the working directory ${dir} now resolves outside the workspace ${workspace} (to ${real}), ${stage}; it resolved inside that workspace when it was checked. Nothing was started.`,
     );
   }
   if (real !== dir) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} now resolves to ${real}, ${stage}, not to the path that was checked: a component of its path was replaced or moved. Nothing was started; retry once the directory is stable.`,
+      `run refused: the working directory ${dir} now resolves to ${real}, ${stage}, not to the canonical path that was checked. Nothing was started; retry once the directory is stable.`,
     );
   }
   let st: DirStat;
@@ -487,7 +487,7 @@ function assertStillPinned(
   }
   if (!st.isDirectory() || st.dev !== pin.dev || st.ino !== pin.ino) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} was replaced after it was checked (it is no longer the pinned directory: device or inode changed, ${stage}). Nothing was started; retry once the directory is stable.`,
+      `run refused: the working directory ${dir} does not match its pin ${stage}: a no-follow stat of it is not a directory with the pinned device and inode. Nothing was started; retry once the directory is stable.`,
     );
   }
 }
@@ -508,7 +508,7 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
     const code = errCode(err);
     const remedy =
       code === "EACCES"
-        ? "run opens the directory for reading to pin it, so a directory without read permission is refused even though a command could start in it; make it readable (chmod u+r) or pass another directory"
+        ? "run opens the directory for reading to pin it, so a directory without read permission is refused even though a command could start in it; if this one lacks read permission, make it readable (chmod u+r) or pass another directory"
         : "check that it exists and is a real directory, not a symlink";
     throw new RunRefusal(
       `run refused: the working directory ${dir} could not be opened to pin its identity (${code}). Nothing was started; ${remedy}.`,
@@ -859,7 +859,7 @@ export class JobManager {
       workspace = this.dirPinOps.realpath(ctxCwd);
     } catch (err) {
       throw new RunRefusal(
-        `run refused: the workspace ${ctxCwd} could not be resolved through its symlinks (${errCode(err)}), so no cwd can be confined to it. Nothing was started; this is a fault in the session's workspace, not in the command.`,
+        `run refused: the workspace ${ctxCwd} could not be resolved through its symlinks (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
       );
     }
     let resolved: string;

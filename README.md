@@ -25,8 +25,9 @@ from available presence and event information, small help routed to the right
 owner, and Discord conversation. Hire one with
 `bob onboard <name> --role jarvis --provider <provider> --model <model> --context-window <tokens>`; the
 interview gives the class seed an individual persona. The role allows only
-`read`, `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch`
-and `discord_react`, with `allowResidentShell: false`. Onboarding stamps only
+`flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and
+`discord_react`, with `allowResidentShell: false`; it does not allow `read`
+(bob#230). Onboarding stamps only
 the Flair capability: configure `discord` with its token file and channel
 allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
 conversation there. The body and automatic decision loop come later. An admitted Discord turn binds the outbound Discord tools to that turn's channel; in a cron turn, and outside an admitted turn (a one-shot `bob run`), the channel allow-list is the only boundary. This binds only the outbound tools: the conversation context is still shared across channels and DMs, so channel isolation is not provided until per-channel history lands (tracked in bob#234).

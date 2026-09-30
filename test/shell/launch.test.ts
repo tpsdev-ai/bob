@@ -209,7 +209,7 @@ describe("runLaunch", () => {
   let root: string;
   let agentDir: string;
 
-  function makeAgent(role = "ea", allow = ["read"]): void {
+  function makeAgent(role = "reviewer", allow = ["read"]): void {
     agentDir = join(root, AGENT);
     mkdirSync(join(agentDir, "work"), { recursive: true });
     mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
@@ -296,7 +296,7 @@ describe("runLaunch", () => {
     });
     expect(code).toBe(0);
     expect(seen).toHaveLength(1);
-    // The ea role's ceiling, narrowed by bob.yaml.
+    // The reviewer role's ceiling, narrowed by bob.yaml.
     expect(seen[0].tools).toEqual(["read"]);
     expect(seen[0].config.cwd).toBe(join(agentDir, "work"));
   });
@@ -511,7 +511,7 @@ describe("the mail consumer", () => {
     // …and the agent's bob.yaml (which the policy is resolved from) is the one
     // this agent dir carries: the chain drives THIS agent.
     expect(readFileSync(join(root, "agents", AGENT, "bob.yaml"), "utf8")).toContain("allow:");
-    expect(loadRole("ea").tools.allow).toContain("read");
+    expect(loadRole("reviewer").tools.allow).toContain("read");
   });
 });
 

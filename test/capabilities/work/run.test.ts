@@ -17,6 +17,7 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -27,13 +28,14 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
 import {
   type DirPinOps,
   NODE_DIR_PIN_OPS,
   RunRefusal,
 } from "../../../src/capabilities/work/run.js";
-import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
+import { groupAlive, type LiveWork, WIRE_HOOK, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
 
 let live: LiveWork | undefined;
@@ -889,8 +891,8 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     const err = await refusalOf(
       live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
     );
-    expect(err.message).toContain("was replaced after it was checked");
-    expect(err.message).toContain("device or inode changed, immediately before the spawn");
+    expect(err.message).toContain("does not match its pin immediately before the spawn");
+    expect(err.message).toContain("not a directory with the pinned device and inode");
     await expectNothingStarted(m.file);
   }, 20_000);
 
@@ -1293,4 +1295,31 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     expect(opened.length).toBe(1);
     expect(closed).toEqual(opened);
   }, 20_000);
+});
+
+// #221: a setup that throws must not leave the scratch directory behind. The
+// work harness removes it in a catch when the session load throws, so this holds
+// even though a caller never receives a handle to clean up when setup fails.
+describe("workSession — a failed setup leaves no scratch directory", () => {
+  it("removes its scratch directory when setup throws", async () => {
+    // Force setup to throw: a wire hook that is ALREADY installed trips the
+    // one-at-a-time guard while the session loads (after the scratch dir is
+    // created, before a handle is returned).
+    const hooks = globalThis as unknown as Record<string, unknown>;
+    const tmp = mkdtempSync(join(tmpdir(), "bob-work-throws-"));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    hooks[WIRE_HOOK] = () => {};
+    try {
+      await expect(workSession({ script: async () => ({ text: "unused" }) })).rejects.toThrow(
+        /one at a time/,
+      );
+      expect(readdirSync(tmp), "the scratch directory is gone").toEqual([]);
+    } finally {
+      delete hooks[WIRE_HOOK];
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
