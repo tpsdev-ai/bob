@@ -185,6 +185,15 @@ export {
   stampedToolAllowlist,
 } from "./init.js";
 export {
+  type LoginDeps,
+  runLogin,
+  runLogout,
+  type StoredProviders,
+  SUBSCRIPTION_PROVIDERS,
+  storedCredentialProviders,
+  subscriptionCredentialCheck,
+} from "./login.js";
+export {
   createTpsMailConsumer,
   type DurableIo,
   durableWrite,

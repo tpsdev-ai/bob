@@ -60,8 +60,14 @@ import {
   readTools,
   type ToolsBlock,
 } from "./bob-yaml.js";
+import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
-import { declaredProviderModel, effectiveCapabilities, resolveAgentToolPolicy } from "./run.js";
+import {
+  declaredProviderModel,
+  effectiveCapabilities,
+  mapBobProviderToPi,
+  resolveAgentToolPolicy,
+} from "./run.js";
 import {
   auditToolNames,
   capabilityForTool,
@@ -251,11 +257,70 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 
   // bob#200: the tps-mail capability. When it is declared its own checks cover
   // the inbox, so the generic inbox check below runs only for an agent without it.
+  const bobYamlPath = join(agentDir, "bob.yaml");
   let yamlText: string | undefined;
+  let bobYamlReadError: string | undefined;
   try {
-    yamlText = readFileSync(join(agentDir, "bob.yaml"), "utf8");
-  } catch {
-    yamlText = undefined;
+    yamlText = readFileSync(bobYamlPath, "utf8");
+  } catch (err) {
+    bobYamlReadError =
+      (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
+  }
+
+  // bob#241: when bob.yaml names a provider in SUBSCRIPTION_PROVIDERS — the
+  // scope of this check (see login.ts) — the agent's own auth store must hold a
+  // credential for it that passes bob's local credential checks. Two different
+  // failures have two different remedies: no credential that passes bob's local
+  // credential checks is fixed with `bob login <agent> <provider>`; a store
+  // that cannot be read or fails bob's conservative validation (auth.json) is
+  // fixed by repairing that store — neither is a pass. A bob.yaml that cannot be
+  // read or whose provider block cannot be parsed is a FAIL too, fixed by restoring
+  // it. A provider outside that set produces no check at all.
+  if (bobYamlReadError !== undefined) {
+    // A bob.yaml doctor cannot read is a config error, not a pass: the
+    // subscription check cannot be evaluated, so FAIL with the remedy rather
+    // than silently skipping it.
+    checks.push({
+      name: "subscription auth",
+      status: "fail",
+      detail: `cannot read ${bobYamlPath} (${bobYamlReadError})`,
+      fix: `restore or make readable ${bobYamlPath}, then re-run 'bob doctor ${opts.name}'`,
+    });
+  } else if (yamlText !== undefined) {
+    let providerName: string | undefined;
+    let providerParseError: string | undefined;
+    try {
+      const provider = readBlock(yamlText, "provider") as Record<string, unknown> | undefined;
+      const raw = provider?.name;
+      providerName = typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+    } catch (err) {
+      providerParseError = err instanceof Error ? err.message : String(err);
+    }
+    if (providerParseError !== undefined) {
+      // A provider block doctor cannot parse is a config error, not a pass: the
+      // subscription check (and every provider-derived decision) cannot be
+      // evaluated, so FAIL with the remedy rather than silently skipping it.
+      checks.push({
+        name: "subscription auth",
+        status: "fail",
+        detail: `cannot read the provider block in bob.yaml — ${providerParseError}`,
+        fix: `fix the provider block in bob.yaml, then re-run 'bob doctor ${opts.name}'`,
+      });
+    } else if (providerName !== undefined) {
+      const piProvider = mapBobProviderToPi(providerName);
+      if (SUBSCRIPTION_PROVIDERS.has(piProvider)) {
+        const sub = subscriptionCredentialCheck({
+          name: opts.name,
+          provider: piProvider,
+          piAgentDir: join(agentDir, ".pi-agent"),
+        });
+        checks.push(
+          sub.status === "ok"
+            ? { name: "subscription auth", status: "ok", detail: sub.detail }
+            : { name: "subscription auth", status: "fail", detail: sub.detail, fix: sub.fix },
+        );
+      }
+    }
   }
   const mail = tpsMailChecks({
     name: opts.name,
