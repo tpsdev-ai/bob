@@ -10,9 +10,9 @@ import { type SpawnError, spawnNode } from "./cli-spawn.js";
 // inline code spans, fenced code blocks, and the Commands table — and fails if
 // the CLI rejects any of them. It also fails if a code span or code fence holds
 // `--interactive` as a token (split on whitespace and commas, backticks
-// stripped), bare or as `--interactive=<value>`: the CLI refuses the flag when it
-// is on, and the README offers no interactive mode (table cells are not scanned
-// for flags).
+// stripped), bare or as `--interactive=<value>`: `bob run` refuses the flag when
+// it is on, and the README offers no interactive `bob run` mode (table cells are
+// not scanned for flags).
 //
 // Two vacuous-pass modes are closed:
 //  - a plain-text Commands-table row (no backticks) is read as a table cell,

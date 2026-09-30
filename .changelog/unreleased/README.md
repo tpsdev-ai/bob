@@ -24,7 +24,8 @@ Create `<category>-<slug>.md` in this directory:
   PR number exists.
 
 The file contains the entry as it should appear under its heading, including
-the leading `- ` and a 2-space indent on every continuation line:
+the leading `- `, with every nonblank continuation line indented by an even
+number of spaces, at least 2:
 
 ```markdown
 - **The thing that changed, in bold.** What it means for someone running bob,
@@ -38,9 +39,10 @@ sentence break is a `.`, `!` or `?` followed by whitespace inside the lede:
 any character JavaScript's `\s` matches, including a space, a tab, a line
 break and the non-breaking space. `check` counts nothing else as one, so
 `First.Second.` passes. The lede is
-the entry's summary, the line a reader skims first. The GitHub release carries
-the whole `## [<version>]` section (`scripts/changelog-extract.mjs`), so detail
-is never cut; it belongs in the body, where it reads as detail. `check` fails
+the entry's summary, the line a reader skims first. The release workflow passes
+the whole `## [<version>]` section to the GitHub release, as
+`scripts/changelog-extract.mjs` extracts it (trimming only the whitespace around
+it), so detail is not shortened; it belongs in the body, where it reads as detail. `check` fails
 naming the fragment and this rule, and gives the word count when the lede is
 too long.
 
@@ -49,8 +51,8 @@ not valid UTF-8, instead of reading them with replacement characters; `check`
 and `promote` read `CHANGELOG.md` the same way. Reading then trims the
 whitespace at the end of the file and changes nothing else. Assembly joins the fragments as read — no reflow, no re-indent, no
 rewrapping — so tables and nested code blocks come through unchanged. The flip
-side is that a fragment which is not already a well-formed list item is a hard
-error rather than something the tooling quietly fixes up: silent normalisation
+side is that a fragment that breaks a rule `check` enforces (listed below) is a
+hard error rather than something the tooling quietly fixes up: silent normalisation
 is how content goes missing.
 
 The reader skips `README.md` and dotfiles (such as `.gitkeep`) without looking
@@ -86,7 +88,8 @@ keeps `## [Unreleased]` with its note, writes every fragment into a new
 `## [<version>] - <date>` section below it (in Keep a Changelog category order,
 and by filename within each category), then deletes the fragments.
 `<version>` is `MAJOR.MINOR.PATCH` with no leading zeros, optionally followed by
-a pre-release of dot-separated letters and digits (`1.0.0-rc.1`); build metadata
+a pre-release of dot-separated identifiers of letters and digits, a numeric one
+with no leading zero (`1.0.0-rc.1`); build metadata
 is not accepted, and neither is a version that already has a section in
 `CHANGELOG.md`. `--date` must be a real date written `YYYY-MM-DD`, given at most
 once; without it the date is today's (UTC). An invalid version or date is
@@ -95,10 +98,11 @@ category carries no meaning; stability does, and filename sort is stable across
 machines and filesystems.
 
 `promote` runs only in a git work tree. Before it writes anything, it refuses
-while `CHANGELOG.md` is not a regular file, or while it or any fragment is
-untracked (not in the index) or differs from the index, naming each, so that
-`git checkout -- CHANGELOG.md .changelog/unreleased` restores everything it
-changed. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
+while `CHANGELOG.md` is not a regular file or has more than one hard link, or
+while it or any fragment is untracked (not in the index) or differs from the
+index, naming each, so that `git checkout -- CHANGELOG.md .changelog/unreleased`
+restores everything it changed, unless another process changes those files
+while `promote` runs. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 delete a fragment after writing the section, it names each one left: those are
 already in the new section, so delete them, or restore both
 (`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.

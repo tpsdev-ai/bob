@@ -6,7 +6,7 @@
 // the top of CHANGELOG.md, so two PRs that each added an entry could make
 // overlapping edits there, and the second to merge could conflict. The cost is not the
 // resolution — it is that a merge/rebase to resolve DISMISSES the existing
-// approvals, so every conflict buys a full second review round for zero content
+// approvals, so a conflict can buy a full second review round for zero content
 // change. (bob's own [Unreleased] had also drifted into repeated
 // `### Fixed`/`### Changed` headers from earlier resolutions.)
 //
@@ -24,7 +24,8 @@
 //             before the PR number exists)
 //
 // FILE CONTENT: the entry as it should appear under its `### Category` heading,
-// INCLUDING the leading `- ` and a 2-space indent on every continuation line.
+// INCLUDING the leading `- `, with every nonblank continuation line indented by an
+// even number of spaces, at least 2.
 // Reading decodes the file as UTF-8 and refuses it by name when its bytes are not
 // valid UTF-8, instead of reading them with replacement characters; it then
 // trims the whitespace at the end of the file. Assembly joins the fragments as
@@ -79,7 +80,7 @@ const HEADING = {
 };
 
 // The body `## [Unreleased]` carries once entries live in fragments, and the
-// ONLY body `check` and `promote` accept there (blank lines around it aside).
+// ONLY body `check` and `promote` accept there (whitespace around it aside).
 // Kept as a constant so both agree on it and `promote` can restore it.
 export const UNRELEASED_NOTE = [
   "Entries for the next release live as **fragment files** under [`.changelog/unreleased/`](.changelog/unreleased/) —",
@@ -136,9 +137,9 @@ export function parseFragmentName(filename) {
   return { category, slug };
 }
 
-// The body must already be a well-formed top-level list item, because assembly
-// does not rewrite it. Anything else is an error the author fixes, not something
-// this script guesses at.
+// The body must already be a top-level list item that passes the checks below,
+// because assembly does not rewrite it. A body that fails them is an error the
+// author fixes, not something this script guesses at.
 export function validateFragmentBody(relPath, body) {
   if (body.trim().length === 0) {
     throw new FragmentError(
@@ -201,9 +202,9 @@ export function validateFragmentBody(relPath, body) {
 // ─── Lede (flair#1392; bob also refuses a MISSING or EMPTY lede, bob#236) ────
 //
 // The lede is the entry's summary, the line a reader skims first.
-// bob's GitHub release publishes the whole `## [<version>]` section
-// (release-publish.yml runs scripts/changelog-extract.mjs), so nothing is cut
-// from an entry; but a 105-word lede is not a summary, it IS the entry. Hence
+// bob's release workflow passes the whole `## [<version>]` section to the GitHub
+// release (release-publish.yml runs scripts/changelog-extract.mjs, which trims
+// only the whitespace around it), so no entry is shortened; but a 105-word lede is not a summary, it IS the entry. Hence
 // <= 25 words with no sentence break, the rule flair#1392 set. A sentence break
 // is a `.`, `!` or `?` followed by whitespace; nothing else is counted, so
 // `First.Second.` is one sentence. Historical CHANGELOG.md is
@@ -288,10 +289,14 @@ function decodeUtf8OrThrow(bytes, what) {
 // restores a tracked link, not the file it points at. Each access opens the
 // path with O_NOFOLLOW (a link fails with ELOOP) and judges the file by fstat on
 // that descriptor, which gives lstat's answer without a separate path check a
-// swap could race. The write reopens the path the same way and refuses unless it
-// is still the very file that was read (same device and inode), then truncates
-// and writes through that descriptor, so a link or another file swapped in
-// between the read and the write fails closed.
+// swap could race. A file with more than one hard link is refused too: the
+// truncating write would change every link, and git checkout restores only this
+// path. The write reopens the path the same way and refuses unless the file it
+// opened has the same device and inode as the file that was read, then truncates
+// and writes through that descriptor. So a symbolic link, or a file with another
+// device or inode, swapped in between the read and the write fails closed. The
+// read descriptor is closed before the write opens, so a replacement that the
+// filesystem gives the same inode number is not told apart.
 const CHANGELOG_READ_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 const CHANGELOG_WRITE_FLAGS = constants.O_WRONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 
@@ -308,7 +313,7 @@ function openRegularChangelog(changelogPath, flags, fstat = fstatBigint) {
     if (err?.code === "ELOOP") {
       throw new FragmentError(
         "CHANGELOG.md is a symbolic link; it must be a regular file, so that git checkout -- CHANGELOG.md " +
-          "restores what promote writes. Replace the link with the file itself.",
+          "can undo what promote writes. Replace the link with the file itself.",
       );
     }
     throw err;
@@ -317,8 +322,16 @@ function openRegularChangelog(changelogPath, flags, fstat = fstatBigint) {
   if (!st.isFile()) {
     closeSync(fd);
     throw new FragmentError(
-      "CHANGELOG.md is not a regular file; it must be one, so that git checkout -- CHANGELOG.md restores " +
+      "CHANGELOG.md is not a regular file; it must be one, so that git checkout -- CHANGELOG.md can undo " +
         "what promote writes.",
+    );
+  }
+  if (st.nlink > 1n) {
+    closeSync(fd);
+    throw new FragmentError(
+      `CHANGELOG.md has ${st.nlink} hard links; it must have one, so that git checkout -- CHANGELOG.md ` +
+        "can undo what promote writes (a write would change the other links too). Replace it with a copy " +
+        "(cp CHANGELOG.md CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md).",
     );
   }
   return { fd, st };
@@ -334,7 +347,10 @@ export function readChangelog(changelogPath, { fstat = fstatBigint } = {}) {
   }
 }
 
-/** Replace CHANGELOG.md's content, only if it is still the regular file `read` came from. */
+/**
+ * Replace CHANGELOG.md's content, only if the regular file opened for writing has
+ * the same device and inode as the file `read` came from.
+ */
 export function writeChangelog(changelogPath, text, read, { fstat = fstatBigint } = {}) {
   const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_WRITE_FLAGS, fstat);
   try {
@@ -460,8 +476,9 @@ export function countEntries(section) {
 // written that way (another case, a suffix, a missing `]`, trailing spaces or
 // tabs, up to three leading spaces) and the same text with no space after `##`.
 // Exactly one candidate may exist, and it must be the exact line: a candidate
-// before or after it is refused, so no entry can sit under an [Unreleased]
-// heading that `check` and `promote` do not read.
+// before or after it is refused, so no entry can sit under another such line
+// that `check` and `promote` do not read. A heading written another way, such as
+// a setext `[Unreleased]` underlined with `---`, is not a candidate.
 const UNRELEASED_HEADING = "## [Unreleased]";
 const UNRELEASED_LOOKALIKE = /^ {0,3}##[ \t]*\[[ \t]*unreleased/i;
 
@@ -504,7 +521,7 @@ export function locateUnreleased(lines) {
 
 // `promote` rewrites the `## [Unreleased]` body to UNRELEASED_NOTE, so anything
 // else there would be dropped at the version cut. Both `check` and `promote`
-// therefore refuse unless that body is the note (blank lines around it aside).
+// therefore refuse unless that body is the note (whitespace around it aside).
 // A list entry gets its own message, because its remedy is a fragment.
 export function strayUnreleasedEntries(body) {
   return body.split("\n").filter((l) => l.startsWith("- "));
@@ -591,7 +608,8 @@ export function promote(
   if (!isReleaseVersion(version)) {
     throw new FragmentError(
       `promote: invalid version '${version}'. Expected MAJOR.MINOR.PATCH with no leading zeros, optionally ` +
-        `followed by -<pre-release> of dot-separated letters and digits (e.g. 0.31.0 or 1.0.0-rc.1); build ` +
+        `followed by -<pre-release> of dot-separated identifiers of letters and digits, a numeric one with no ` +
+        `leading zero (e.g. 0.31.0 or 1.0.0-rc.1); build ` +
         `metadata (+...) is not accepted.`,
     );
   }

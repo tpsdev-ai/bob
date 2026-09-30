@@ -15,6 +15,7 @@ import {
   chmodSync,
   copyFileSync,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -254,9 +255,11 @@ describe("changelog fragments — check (bob#236)", () => {
     }
   });
 
-  // A second candidate hides the entry under it from the note check wherever it
-  // sits: before the exact heading its section is never read, and after it the
-  // candidate ends the section being read.
+  // A second candidate can hide the entry under it from the note check: before
+  // the exact heading its section is never read, and after it a candidate at
+  // column one ends the section being read (an indented one leaves the entry
+  // inside that section, where the note check would refuse it). Either way the
+  // duplicate is refused first.
   it("REFUSES a second [Unreleased] heading hiding an entry, before or after the exact one, in check and in promote", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
@@ -522,6 +525,23 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     }
   });
 
+  // A truncating write would change every hard link of CHANGELOG.md, and git
+  // checkout restores only this path, so a second link is refused.
+  it("REFUSES a CHANGELOG.md with another hard link, in check and in promote, and changes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const other = join(root, "other-link-to-CHANGELOG.md");
+    linkSync(changelogPath, other);
+    stageAll();
+    const before = readFileSync(other);
+    const msg = "CHANGELOG.md has 2 hard links";
+    expect(() => cf.check({ dir, changelogPath })).toThrow(msg);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
+    expect(readFileSync(other).equals(before)).toBe(true);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
   it("REFUSES a CHANGELOG.md that is not a regular file (a directory), in check and in promote", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
@@ -533,8 +553,9 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
-  // The write reopens CHANGELOG.md without following a link and only writes to
-  // the very file that was read, so a swap between the read and the write fails.
+  // The write reopens CHANGELOG.md without following a link and writes only if
+  // the file it opened has the same device and inode as the file that was read,
+  // so a link or a file with another device or inode swapped in fails.
   it("writeChangelog REFUSES a link swapped in after the read, and writes nothing through it", () => {
     const { changelogPath } = project();
     const read = cf.readChangelog(changelogPath);
@@ -574,6 +595,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       calls += 1;
       return {
         isFile: () => real.isFile(),
+        nlink: 1n,
         dev: 7n,
         ino: calls === 1 ? 2n ** 53n : 2n ** 53n + 1n,
       };
@@ -803,7 +825,7 @@ describe("changelog fragments — the migration (bob#236)", () => {
     },
   ];
 
-  it("render carries every pre-migration entry unchanged, except the named repairs, each once", () => {
+  it("render carries every pre-migration list entry unchanged (trailing whitespace aside), except the named repairs, each once", () => {
     const rendered = ENTRIES(cf.assemble(migrated));
     expect(rendered.length).toBe(before.length);
     expect(new Set(rendered).size).toBe(rendered.length);
