@@ -257,23 +257,27 @@ function isSymlink(file: string): boolean {
 // Resolve an ABSOLUTE Node executable for the unit, at install time.
 //
 // The unit must run bob under NODE — bin/bob's shebang and package.json's
-// `engines` say so — whatever runtime ran install-service. When the installer
-// is NOT node (e.g. a developer runs install-service under bun) we use the first
-// trusted `node` on the installer's PATH; with none, installation is REFUSED
-// (the throw names the remedy, and each executable `node` from an absolute PATH
-// entry that the trust screen rejected) rather than writing a unit that would
-// run bob under a non-Node runtime.
+// `engines` say so — whatever runtime ran install-service. The branch is chosen
+// by execPath's BASENAME: `node`, compared case-insensitively, with `.exe`
+// dropped on Windows. A "PATH `node`" below is an executable regular file named
+// `node` in an absolute PATH entry; nothing checks that it is actually Node.
 //
-// When the installer IS node we use its own interpreter, execPath, with one
+// When execPath's basename is NOT `node` (e.g. a developer runs install-service
+// under bun) we use the first trusted PATH `node`; with none, installation is
+// REFUSED (the throw names the remedy, and each executable `node` from an
+// absolute PATH entry that the trust screen rejected) rather than writing a
+// unit that would run bob under a non-Node runtime.
+//
+// When execPath's basename IS `node` we use execPath itself, with one
 // exception. On a Homebrew install execPath can be a versioned target
 // (observed: …/Cellar/node/<version>/bin/node), and writing that into the unit
-// breaks the service after `brew upgrade node` removes that directory. So when
-// a TRUSTED PATH `node` whose FINAL entry is a symlink has the same realpath as
-// execPath, we write that symlink path instead (e.g. /opt/homebrew/bin/node), even
-// when a direct match comes earlier on PATH. That path keeps working only while
-// whatever maintains the symlink keeps it pointing at a working Node. Without a
-// trusted matching symlink we fall back to execPath, which may itself be stable
-// or versioned.
+// breaks the service after `brew upgrade node` removes that directory. So the
+// first TRUSTED PATH `node`, in PATH order, whose FINAL entry is a symlink with
+// the same realpath as execPath is written instead (e.g. /opt/homebrew/bin/node),
+// even when a direct match comes earlier on PATH. That path keeps working only
+// while whatever maintains the symlink keeps it pointing at a working Node.
+// With no trusted matching symlink anywhere on PATH, or when execPath has no
+// realpath, we fall back to execPath, which may itself be stable or versioned.
 //
 // TRUST SCREEN: both branches consider only PATH candidates that pass it. A PATH
 // entry that is empty or not absolute (`bin`, `.`) is skipped. A candidate is
@@ -284,8 +288,8 @@ function isSymlink(file: string): boolean {
 // name writable by no one else (write by the host's administrators group
 // excepted); any other directory group- or other-writable only with the sticky
 // bit (or, besides its owner, writable only by that administrators group).
-// A candidate that fails is skipped, and the resolution falls back as it would
-// with no such candidate. The fallback in the node branch, execPath itself, is
+// A candidate that fails is skipped, and the resolution continues through PATH
+// as if it were absent. The fallback in the `node` branch, execPath itself, is
 // the running interpreter and is not screened.
 export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   const execPath = deps.execPath ?? process.execPath;
@@ -318,13 +322,14 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   }
 
   if (executableBasename(execPath).toLowerCase() === "node") {
-    // The installer IS node: prefer a trusted PATH `node` whose FINAL entry is a
-    // SYMLINK resolving to the SAME binary, so a versioned target is written as
-    // that symlink path. A direct (non-symlink) match does not help — a
-    // versioned Cellar binary on PATH is still versioned — so without a trusted
-    // matching symlink we fall back to the running interpreter's own path, which
-    // can be versioned. A PATH `node` symlinked to a DIFFERENT binary is not a
-    // match; the first trusted matching symlink in PATH order wins.
+    // execPath's basename is `node`: prefer a trusted PATH `node` whose FINAL
+    // entry is a SYMLINK resolving to the SAME file, so a versioned target is
+    // written as that symlink path. A direct (non-symlink) match does not help —
+    // a versioned Cellar binary on PATH is still versioned — so without a
+    // trusted matching symlink anywhere on PATH we fall back to the running
+    // interpreter's own path, which can be versioned. A PATH `node` symlinked to
+    // a DIFFERENT file is not a match; the first trusted matching symlink in
+    // PATH order wins.
     const execReal = realpathOrUndefined(execPath);
     if (execReal !== undefined) {
       for (const candidate of candidates) {
@@ -335,7 +340,7 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
     return execPath;
   }
 
-  // The installer is not node: use the first trusted Node found on PATH.
+  // execPath's basename is not `node`: use the first trusted PATH `node`.
   if (candidates.length > 0) return candidates[0];
   const skipped =
     untrusted.length > 0

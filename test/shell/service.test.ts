@@ -71,7 +71,8 @@ afterAll(() => {
 });
 
 // A fresh 0700 temp directory holding an executable stub named node: a TRUSTED
-// PATH entry, so a test that resolves an interpreter never sees the host's node.
+// PATH entry. A test that passes it as its only PATH entry resolves this stub,
+// never the host's node.
 function stubNodeDir(prefix: string): { dir: string; node: string } {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   fixtureDirs.push(dir);
@@ -370,9 +371,10 @@ describe("systemd backend", () => {
 });
 
 describe("the unit does not depend on the service manager's PATH (bob#218)", () => {
-  // No `interpreter` given: the renderer resolves one with the injected deps (a
-  // non-Node installer; a PATH holding one trusted node), never the host's.
-  it("launchd: the default interpreter is the resolved absolute Node path", () => {
+  // No `interpreter` given: the renderer resolves one with the injected deps (an
+  // installer whose execPath is not named node; a PATH holding one trusted stub
+  // node), never the host's.
+  it("launchd: the default interpreter is the resolved absolute path", () => {
     const { dir, node } = stubNodeDir("bob-render-default-");
     const deps = { ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir };
     const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME, ...deps });
@@ -381,7 +383,7 @@ describe("the unit does not depend on the service manager's PATH (bob#218)", () 
     expect(xml).toContain(`    <string>${node}</string>\n    <string>/usr/local/bin/bob</string>`);
   });
 
-  it("systemd: the default interpreter is the resolved absolute Node path", () => {
+  it("systemd: the default interpreter is the resolved absolute path", () => {
     const { dir, node } = stubNodeDir("bob-render-default-");
     const deps = { ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir };
     const unit = renderSystemdUnit({
@@ -553,7 +555,7 @@ describe("resolveNodeExecutable — a PATH symlink over a versioned target (bob#
 // running uid is the installer.
 describe("resolveNodeExecutable — a PATH node is a candidate only through a trusted, absolute entry (bob#233)", () => {
   const delimiter = process.platform === "win32" ? ";" : ":";
-  const BUN = "/opt/bun/bin/bun"; // a non-Node installer
+  const BUN = "/opt/bun/bin/bun"; // an installer whose execPath is not named node
   const NO_NODE = /no Node executable found/;
   const scratch: string[] = [];
   afterAll(() => {
@@ -599,7 +601,7 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
   }
 
   describe("directory trust (finding 1)", () => {
-    it("a 0777 directory whose node symlinks to the running interpreter, first on PATH, is not chosen: the fallback applies", () => {
+    it("a 0777 directory whose node symlinks to the running interpreter is not chosen: alone on PATH the fallback applies; a trusted matching symlink later on PATH wins", () => {
       const versioned = nodeFile(tempDir("bob-trust-versioned-"));
       const open = tempDir("bob-trust-0777-", 0o777);
       nodeLink(open, versioned);
@@ -726,18 +728,19 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
         return home;
       }
 
-      it("a PATH entry that is a directory symlink in a sticky, world-writable directory is refused; the fallback applies", () => {
+      it("a PATH entry that is a directory symlink in a sticky, world-writable directory is refused; as the only PATH entry, the fallback applies", () => {
         const versioned = nodeFile(tempDir("bob-sym-versioned-"));
         const target = trustedNodeHome(versioned);
         const sticky = tempDir("bob-sym-sticky-");
         makeSticky(sticky);
         const link = join(sticky, "bin");
         symlinkSync(target, link);
-        // A Node installer does not take the matching link: the fallback is execPath.
+        // An installer named node does not take the matching link; with no other
+        // PATH entry, it gets its own execPath.
         expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: link })).toBe(
           versioned,
         );
-        // A non-Node installer refuses, naming the skipped path.
+        // An installer not named node refuses, naming the rejected path.
         expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: link })).toThrow(
           `Skipped as untrusted: ${join(link, "node")}`,
         );
@@ -786,7 +789,7 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
       ).toBe(stable);
     });
 
-    it("a failed stat makes the candidate untrusted: it is skipped and the fallback applies", () => {
+    it("a failed stat makes the candidate untrusted: as the only PATH entry, it is skipped and the fallback applies", () => {
       const versioned = nodeFile(tempDir("bob-trust-statv-"));
       const dir = tempDir("bob-trust-statfail-");
       const stable = nodeLink(dir, versioned);
@@ -907,7 +910,7 @@ describe("resolveNodeExecutable — a PATH node is a candidate only through a tr
     });
   });
 
-  describe("the non-Node installer branch (finding 3)", () => {
+  describe("the branch for an installer not named node (finding 3)", () => {
     it("skips an untrusted first match for a trusted later one, and refuses when only untrusted or relative entries hold node", () => {
       const open = tempDir("bob-nn-0777-", 0o777);
       nodeFile(open);
@@ -1131,8 +1134,8 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
     expect(r.error).toBeDefined(); // ENOENT — node is not resolvable on this PATH
   });
 
-  // The installer is Node (the real-node fixture) with an EMPTY PATH, so the
-  // resolution returns that interpreter: the resolution reads neither the
+  // The installer is the real-node fixture (named node) with an EMPTY PATH, so
+  // the resolution returns that interpreter: the resolution reads neither the
   // host's PATH nor its trust (only the fixture lookup above reads the PATH).
   itWithRealNode(
     "launchd: the rendered command runs under the resolved Node and gets bob --help to exit 0",
@@ -1234,7 +1237,7 @@ describe("the printed install-service command is the unit's command (bob#218)", 
     // A stub systemctl so the install's daemon-reload succeeds without a bus.
     writeFileSync(join(binDir, "systemctl"), "#!/bin/sh\nexit 0\n");
     chmodSync(join(binDir, "systemctl"), 0o755);
-    // A stub node: the CLI runs under bun (a non-Node installer) and its PATH is
+    // A stub node: the CLI runs under bun (not named node) and its PATH is
     // ONLY binDir (0700, owned by this uid), so it resolves this trusted stub and
     // never the host's node.
     const stubNode = join(binDir, "node");
