@@ -14,10 +14,13 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -474,6 +477,85 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     );
     expect(readFileSync(changelogPath).equals(bad)).toBe(true);
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  // git checkout restores a tracked LINK, not the file it points at, so a
+  // CHANGELOG.md that is a symbolic link is refused before any read or write.
+  it("REFUSES a CHANGELOG.md that is a tracked symbolic link, in check and in promote, and changes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const external = mkdtempSync(join(tmpdir(), "bob-fragments-ext-"));
+    try {
+      const target = join(external, "CHANGELOG.md");
+      writeFileSync(target, readFileSync(changelogPath));
+      rmSync(changelogPath);
+      symlinkSync(target, changelogPath);
+      stageAll();
+      const commit = spawnSync(
+        "git",
+        [
+          "-c",
+          "user.name=t",
+          "-c",
+          "user.email=t@t.dev",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-q",
+          "-m",
+          "base",
+        ],
+        { cwd: root, encoding: "utf8" },
+      );
+      expect(commit.status, commit.stderr).toBe(0);
+      const targetBefore = readFileSync(target);
+      const msg = "CHANGELOG.md is a symbolic link";
+      expect(() => cf.check({ dir, changelogPath })).toThrow(msg);
+      expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
+      expect(readFileSync(target).equals(targetBefore)).toBe(true);
+      expect(lstatSync(changelogPath).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(changelogPath)).toBe(target);
+      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a CHANGELOG.md that is not a regular file (a directory), in check and in promote", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    rmSync(changelogPath);
+    mkdirSync(changelogPath);
+    const msg = "CHANGELOG.md is not a regular file";
+    expect(() => cf.check({ dir, changelogPath })).toThrow(msg);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  // The write reopens CHANGELOG.md without following a link and only writes to
+  // the very file that was read, so a swap between the read and the write fails.
+  it("writeChangelog REFUSES a link swapped in after the read, and writes nothing through it", () => {
+    const { changelogPath } = project();
+    const read = cf.readChangelog(changelogPath);
+    const moved = join(root, "moved-CHANGELOG.md");
+    renameSync(changelogPath, moved);
+    symlinkSync(moved, changelogPath);
+    const before = readFileSync(moved);
+    expect(() => cf.writeChangelog(changelogPath, "replaced\n", read)).toThrow(
+      "CHANGELOG.md is a symbolic link",
+    );
+    expect(readFileSync(moved).equals(before)).toBe(true);
+  });
+
+  it("writeChangelog REFUSES a different regular file swapped in after the read, and writes nothing", () => {
+    const { changelogPath } = project();
+    const read = cf.readChangelog(changelogPath);
+    renameSync(changelogPath, join(root, "moved-CHANGELOG.md"));
+    writeFileSync(changelogPath, "another file\n");
+    expect(() => cf.writeChangelog(changelogPath, "replaced\n", read)).toThrow(
+      "CHANGELOG.md was replaced after it was read",
+    );
+    expect(readFileSync(changelogPath, "utf8")).toBe("another file\n");
   });
 
   // Permission bits do not bind root, so these two cannot fail a write as root.

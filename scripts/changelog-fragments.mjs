@@ -50,6 +50,7 @@ import {
   closeSync,
   constants,
   fstatSync,
+  ftruncateSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -282,6 +283,68 @@ function decodeUtf8OrThrow(bytes, what) {
   }
 }
 
+// CHANGELOG.md is read and written only as a REGULAR file, never through a
+// symbolic link: promote's recovery is `git checkout -- CHANGELOG.md`, which
+// restores a tracked link, not the file it points at. Each access opens the
+// path with O_NOFOLLOW (a link fails with ELOOP) and judges the file by fstat on
+// that descriptor, which gives lstat's answer without a separate path check a
+// swap could race. The write reopens the path the same way and refuses unless it
+// is still the very file that was read (same device and inode), then truncates
+// and writes through that descriptor, so a link or another file swapped in
+// between the read and the write fails closed.
+const CHANGELOG_READ_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
+const CHANGELOG_WRITE_FLAGS = constants.O_WRONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
+
+function openRegularChangelog(changelogPath, flags) {
+  let fd;
+  try {
+    fd = openSync(changelogPath, flags);
+  } catch (err) {
+    if (err?.code === "ELOOP") {
+      throw new FragmentError(
+        "CHANGELOG.md is a symbolic link; it must be a regular file, so that git checkout -- CHANGELOG.md " +
+          "restores what promote writes. Replace the link with the file itself.",
+      );
+    }
+    throw err;
+  }
+  const st = fstatSync(fd);
+  if (!st.isFile()) {
+    closeSync(fd);
+    throw new FragmentError(
+      "CHANGELOG.md is not a regular file; it must be one, so that git checkout -- CHANGELOG.md restores " +
+        "what promote writes.",
+    );
+  }
+  return { fd, st };
+}
+
+/** CHANGELOG.md's text and the identity (device, inode) of the file read. */
+export function readChangelog(changelogPath) {
+  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_READ_FLAGS);
+  try {
+    return { text: decodeUtf8OrThrow(readFileSync(fd), "CHANGELOG.md"), dev: st.dev, ino: st.ino };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Replace CHANGELOG.md's content, only if it is still the regular file `read` came from. */
+export function writeChangelog(changelogPath, text, read) {
+  const { fd, st } = openRegularChangelog(changelogPath, CHANGELOG_WRITE_FLAGS);
+  try {
+    if (st.dev !== read.dev || st.ino !== read.ino) {
+      throw new FragmentError(
+        "CHANGELOG.md was replaced after it was read; nothing was written. Run promote again.",
+      );
+    }
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // Read every fragment in `dir`. Dotfiles are ignored (.DS_Store, .gitkeep);
 // README.md documents the convention and is not a fragment. EVERYTHING else is
 // parsed, and a file that will not parse throws — a fragment directory that
@@ -486,7 +549,7 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
   // header is an error, not "no stray entries ⇒ OK" — otherwise the PR-time
   // check is weaker than the release-time one and a mangled header sails through
   // CI green and detonates mid-release-cut (flair#953).
-  const changelogLines = decodeUtf8OrThrow(readFileSync(changelogPath), "CHANGELOG.md").split("\n");
+  const changelogLines = readChangelog(changelogPath).text.split("\n");
   const heading = findUnreleasedHeading(changelogLines);
   if (heading.problem !== undefined) {
     throw new FragmentError(
@@ -539,7 +602,8 @@ export function promote(
         `Add the entries for this release before running the release step.`,
     );
   }
-  const text = decodeUtf8OrThrow(readFileSync(changelogPath), "CHANGELOG.md");
+  const changelogRead = readChangelog(changelogPath);
+  const text = changelogRead.text;
   const lines = text.split("\n");
   const heading = findUnreleasedHeading(lines);
   if (heading.problem !== undefined) {
@@ -592,8 +656,11 @@ export function promote(
   // A failure part-way must say what state it left and how to recover: the
   // section is written first, and the fragments are deleted only after that.
   try {
-    writeFileSync(changelogPath, next.join("\n"));
+    writeChangelog(changelogPath, next.join("\n"), changelogRead);
   } catch (err) {
+    if (err instanceof FragmentError) {
+      throw new FragmentError(`promote: ${err.message} No fragment was deleted.`);
+    }
     throw new FragmentError(
       `promote: could not write CHANGELOG.md (${err?.code ?? err}); no fragment was deleted. Restore it ` +
         `(git checkout -- CHANGELOG.md) and run promote again.`,

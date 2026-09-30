@@ -95,8 +95,8 @@ category carries no meaning; stability does, and filename sort is stable across
 machines and filesystems.
 
 `promote` runs only in a git work tree. Before it writes anything, it refuses
-while `CHANGELOG.md` or any fragment is untracked (not in the index) or differs
-from the index, naming each, so that
+while `CHANGELOG.md` is not a regular file, or while it or any fragment is
+untracked (not in the index) or differs from the index, naming each, so that
 `git checkout -- CHANGELOG.md .changelog/unreleased` restores everything it
 changed. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 delete a fragment after writing the section, it names each one left: those are
