@@ -2,7 +2,7 @@
 // issue's acceptance: two PRs whose fragments have distinct filenames merge
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` is the migrated content
-// reordered by category and filename, apart from the eight repairs the migration
+// reordered by category and filename, apart from the nine repairs the migration
 // tests name; `promote`
 // writes a dated section below [Unreleased] and deletes the fragments.
 
@@ -184,10 +184,27 @@ describe("changelog fragments — check (bob#236)", () => {
     );
   });
 
+  it("REFUSES a suffixed or differently cased [Unreleased] heading, in check and in promote", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    for (const heading of ["## [Unreleased] - next", "## [unreleased]"]) {
+      const text = `# Changelog\n\n${heading}\n\n${NOTE}\n\n## [0.0.1] - 2020-01-01\n`;
+      writeFileSync(changelogPath, text);
+      expect(() => cf.check({ dir, changelogPath }), heading).toThrow(
+        /no '## \[Unreleased\]' heading/,
+      );
+      expect(
+        () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }),
+        heading,
+      ).toThrow(/no '## \[Unreleased\]' heading/);
+      expect(readFileSync(changelogPath, "utf8")).toBe(text);
+    }
+  });
+
   it("REFUSES when CHANGELOG.md has no [Unreleased] header (cannot skip the stray check)", () => {
     const { dir, changelogPath } = project();
     writeFileSync(changelogPath, `# Changelog\n\n## [0.0.1] - 2020-01-01\n`);
-    expect(() => cf.check({ dir, changelogPath })).toThrow(/no '## \[Unreleased\]' section/);
+    expect(() => cf.check({ dir, changelogPath })).toThrow(/no '## \[Unreleased\]' heading/);
   });
 });
 
@@ -334,37 +351,45 @@ describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
   // would go red on the release PR. `unreleased-main-a188b6fe.md` is main's
-  // [Unreleased] block at a188b6fe, the last main this change merged, before its
-  // entries moved into fragments; `migrated-bob-236/` is the fragment set made
-  // from it, every entry of that block included.
+  // [Unreleased] block at a188b6fe, the main commit whose entries were migrated,
+  // before they moved into fragments; `migrated-bob-236/` is the fragment set
+  // made from it, every entry of that block included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
   const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-a188b6fe.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The eight entries the migration changed: three to pass `check` (1-3; the
-  // second was later corrected as well), and five corrected because they no
-  // longer matched bob's code or the rendered order (4-8). Every other entry is
-  // main's text unchanged (whitespace at its end aside), so a new difference is a
-  // failure rather than an unnoticed extra repair.
+  // The nine entries the migration changed, each as EXACT edits of main's text
+  // (applied in order, each `from` found exactly once) plus every word that
+  // disappears from the entry (`dropped`). Three were changed to pass `check`
+  // (fixed-17, fixed-19, added-09; fixed-19 was also corrected), and six more were
+  // corrected because they no longer matched bob's code or the rendered order.
+  // Every other entry is main's text unchanged (whitespace at its end aside). A
+  // new difference, or a word that vanishes without being listed, fails: a
+  // repair cannot drop a fact unnoticed.
   type Repair = {
     fragment: string;
     was: string;
-    repair: "lede" | "indent" | "correction";
-    edits?: [string, string][];
+    why: string;
+    edits: [string, string][];
+    dropped: string[];
   };
   const REPAIRED: Repair[] = [
-    // An over-long lede: reshaped.
     {
       fragment: "fixed-17-bob-loads-the-raw-32-byte.md",
       was: "- **bob loads the raw 32-byte seed key",
-      repair: "lede",
+      why: "An over-long lede, reshaped; every fact kept.",
+      edits: [
+        [
+          "- **bob loads the raw 32-byte seed key Flair writes (and base64 of it), as well as base64 PKCS8 and PEM, and a malformed key fails with the file, its size and the accepted formats.**",
+          "- **bob loads every key shape Flair writes, and a malformed key fails naming the file, its size and the accepted formats.** It accepts the raw 32-byte seed key Flair writes (and base64 of it), as well as base64 PKCS8 and PEM.",
+        ],
+      ],
+      dropped: [],
     },
-    // A lede with no closing `**`: reshaped; and parsing `bob run --interactive`
-    // is not support for it: the command refuses the flag when it is on.
     {
       fragment: "fixed-19-a-boolean-flag-bob-onboard-s.md",
       was: "- **A boolean flag — ",
-      repair: "correction",
+      why: "A lede with no closing `**`, reshaped; and parsing `bob run --interactive` is not support for it.",
       edits: [
         [
           "- **A boolean flag — `bob onboard`'s",
@@ -383,30 +408,31 @@ describe("changelog fragments — the migration (bob#236)", () => {
           "keeps `testbot` as the name). Parsing is not support: `bob run` refuses `--interactive` when it is on, with exit code 2, because its interactive mode does not exist on the embedded-SDK path yet. (`test/shell/argv.test.ts`",
         ],
       ],
+      dropped: ["so"],
     },
-    // A continuation line indented 3 spaces: re-indented to 2, text unchanged.
     {
       fragment: "added-09-the-reachy-capability-jarvis-s3-memory.md",
       was: "- **The `reachy` capability",
-      repair: "indent",
+      why: "A continuation line indented 3 spaces, re-indented to 2.",
+      edits: [["\n   OrgEvent record id is", "\n  OrgEvent record id is"]],
+      dropped: [],
     },
-    // builder-local holds the `work` run tools, not `bash` (roles/builder-local/role.json).
     {
       fragment: "added-07-the-anchored-edit-capability-and-the.md",
       was: "- **The `anchored-edit` capability and the `builder-local` role",
-      repair: "correction",
+      why: "builder-local holds the `work` run tools, not `bash` (roles/builder-local/role.json).",
       edits: [
         [
           "plus `bash`, `grep`, `find`, `ls` and the flair tools,",
           "plus the `work` capability's `run`, `run_status` and `run_cancel` (it holds no `bash`), `grep`, `find`, `ls` and the flair tools,",
         ],
       ],
+      dropped: [],
     },
-    // The resident rule's exception: a role that opts in keeps its writers.
     {
       fragment: "fixed-04-a-resident-agent-keeps-a-tool.md",
       was: "- **A resident agent keeps a tool only when",
-      repair: "correction",
+      why: "The resident rule's exception: a role that opts in keeps its writers.",
       edits: [
         [
           "- **A resident agent keeps a tool only when a reviewed classification says it writes no file and runs no command (bob#213).**",
@@ -417,38 +443,58 @@ describe("changelog fragments — the migration (bob#236)", () => {
           "no longer keeps them. A role that sets `tools.allowResidentShell: true` keeps its writers for a resident agent (the agent's `bob.yaml` can turn that off, not on); builder-local, the one shipped role that lists the anchored-edit writers, opts in, and so does coder.",
         ],
       ],
+      dropped: ["when"],
     },
-    // render puts Changed before Fixed, so "above" pointed the wrong way.
     {
       fragment: "changed-09-onboarding-and-alignment-ran-under-a.md",
       was: "- **Onboarding and alignment ran under a FIXED setup policy",
-      repair: "correction",
+      why: 'render puts Changed before Fixed, so "above" pointed the wrong way.',
       edits: [["(Fixed, above)", "(under Fixed)"]],
+      dropped: ["above"],
     },
-    // "the contract above" meant the task contract, which renders under Added.
     {
       fragment: "changed-11-stated-limits-of-the-contract-above.md",
       was: "- **Stated limits of the contract above.**",
-      repair: "correction",
+      why: '"the contract above" meant the task contract, which renders under Added.',
       edits: [
         [
           "- **Stated limits of the contract above.**",
           "- **Stated limits of the system-prompt task contract (under Added).**",
         ],
       ],
+      dropped: ["above"],
     },
-    // `bash`/`write`/`edit` are the coder role's set; builder-local holds `run`
-    // and the anchored-edit writers.
     {
       fragment: "changed-06-role-json-is-the-ceiling-on.md",
       was: "- **`role.json` is the ceiling on the tool allowlist",
-      repair: "correction",
+      why: "`bash`/`write`/`edit` are the coder role's set; builder-local holds `run` and the anchored-edit writers.",
       edits: [
         [
           "the coder role sets it `true`, so a persistent builder keeps `bash`/`write`/`edit` while no `bob.yaml` can grant itself a shell its role does not allow.",
           "the `coder` role sets it `true`, so a persistent agent of the `coder` role keeps `bash`/`write`/`edit` (builder-local sets it too, and keeps `run` and the anchored-edit writers instead), while no `bob.yaml` can grant itself a shell its role does not allow.",
         ],
       ],
+      dropped: ["builder"],
+    },
+    {
+      fragment: "changed-10-readme-usage-section-matches-the-cli.md",
+      was: "- **README usage section matches the CLI.**",
+      why: "The README stopped advertising an interactive `bob run` mode; the CLI parses `--interactive` and refuses it only when it is on.",
+      edits: [
+        [
+          "The usage section no longer names commands or flags the CLI does not have: `bob serve`",
+          "The usage section no longer advertises what the CLI does not support: `bob serve`",
+        ],
+        [
+          "`--interactive` (the CLI rejects it),",
+          "an interactive `bob run` mode (`bob run` parses `--interactive` but refuses it when it is on),",
+        ],
+        [
+          "fails if the retired `--interactive` flag appears",
+          "fails if the unsupported `--interactive` flag appears",
+        ],
+      ],
+      dropped: ["flags", "have", "retired"],
     },
   ];
 
@@ -465,26 +511,24 @@ describe("changelog fragments — the migration (bob#236)", () => {
     expect(named.sort()).toEqual(REPAIRED.map((r) => r.fragment).sort());
   });
 
-  it("each repair changed only what it names", () => {
-    const spans = (s: string) => s.match(/`[^`]+`/g) ?? [];
+  it("each repair is exactly its listed edits, and every word it removes is listed", () => {
+    const words = (s: string) =>
+      new Set(s.toLowerCase().match(/[a-z0-9]+(?:['’-][a-z0-9]+)*/g) ?? []);
     for (const r of REPAIRED) {
-      const was = before.find((e) => e.startsWith(r.was));
+      const matches = before.filter((e) => e.startsWith(r.was));
+      expect(matches, r.fragment).toHaveLength(1);
+      const was = matches[0] ?? "";
       const now = migrated.find((f) => f.name === r.fragment)?.body;
-      if (was === undefined || now === undefined) throw new Error(`missing: ${r.fragment}`);
-      if (r.repair === "indent") {
-        expect(now.replace(/^ +/gm, "")).toBe(was.replace(/^ +/gm, ""));
-      } else if (r.repair === "correction") {
-        // Exactly the named edits, each applied once, and nothing else.
-        let text = was;
-        for (const [from, to] of r.edits ?? []) {
-          expect(text.split(from).length - 1, `${r.fragment}: ${from}`).toBe(1);
-          text = text.replace(from, to);
-        }
-        expect(now).toBe(text);
-      } else {
-        // The lede moved; every code span (command, flag, path, error) stayed.
-        for (const span of spans(was)) expect(spans(now)).toContain(span);
+      if (now === undefined) throw new Error(`no fixture copy: ${r.fragment}`);
+      let text = was;
+      for (const [from, to] of r.edits) {
+        expect(text.split(from).length - 1, `${r.fragment}: ${from}`).toBe(1);
+        text = text.replace(from, () => to);
       }
+      expect(now, r.fragment).toBe(text);
+      const kept = words(now);
+      const vanished = [...words(was)].filter((w) => !kept.has(w)).sort();
+      expect(vanished, r.fragment).toEqual([...r.dropped].sort());
     }
   });
 

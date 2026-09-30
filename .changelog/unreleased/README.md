@@ -61,12 +61,12 @@ node scripts/changelog-fragments.mjs check    # what CI runs
 
 CI runs `check` in its test job, for every pull request that targets `main`
 and every push to `main`, once the build job has succeeded. It fails on a
-malformed fragment (a bad name; a
-missing, empty or over-long bold lede; a body that is not a list item; a
-continuation line indented by an odd number of spaces or not at all; a fragment
-holding more than one entry), on a fragment entry that is not a regular file, on a
-missing fragment directory, and on anything but the managed note under
-`[Unreleased]`. Every command refuses an argument it does not take (exit
+malformed fragment (a bad name; a missing, empty or over-long bold lede; a body
+that is not a list item; a continuation line indented by an odd number of spaces
+or not at all; a fragment holding more than one entry), on a fragment entry that
+is not a regular file, on a missing fragment directory, on a `CHANGELOG.md`
+without the exact heading line `## [Unreleased]`, and on anything but the
+managed note under it. Every command refuses an argument it does not take (exit
 status 2).
 
 ## At release time

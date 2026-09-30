@@ -360,8 +360,11 @@ export function countEntries(section) {
 
 // ─── CHANGELOG.md surgery ─────────────────────────────────────────────────────
 
+// The heading is the exact line `## [Unreleased]` (trailing blanks aside): a
+// suffixed or differently cased heading is not taken for it, so `check` and
+// `promote` refuse rather than keep an altered heading.
 export function locateUnreleased(lines) {
-  const start = lines.findIndex((l) => /^##\s+\[Unreleased\]/i.test(l));
+  const start = lines.findIndex((l) => /^## \[Unreleased\][ \t]*$/.test(l));
   if (start === -1) return null;
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
@@ -428,8 +431,8 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
   const loc = locateUnreleased(readFileSync(changelogPath, "utf8").split("\n"));
   if (!loc) {
     throw new FragmentError(
-      `CHANGELOG.md has no '## [Unreleased]' section, so the stray-entry check could not run — and ` +
-        `'promote' will refuse for the same reason at release time. Restore the header.`,
+      `CHANGELOG.md has no '## [Unreleased]' heading (a line that is exactly that text), so the stray-entry ` +
+        `check could not run — and 'promote' will refuse for the same reason at release time. Restore the heading.`,
     );
   }
   const stray = strayUnreleasedEntries(loc.body);
@@ -479,7 +482,11 @@ export function promote(
   const text = readFileSync(changelogPath, "utf8");
   const lines = text.split("\n");
   const loc = locateUnreleased(lines);
-  if (!loc) throw new FragmentError(`promote: no '## [Unreleased]' section in ${changelogPath}.`);
+  if (!loc) {
+    throw new FragmentError(
+      `promote: no '## [Unreleased]' heading (a line that is exactly that text) in ${changelogPath}.`,
+    );
+  }
   // Matched the way scripts/changelog-extract.mjs finds a release's section, which
   // would publish only the first of two.
   const existing = lines.findIndex((l) => l.startsWith(`## [${version}]`));
