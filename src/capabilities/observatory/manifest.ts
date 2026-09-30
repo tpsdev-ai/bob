@@ -20,5 +20,7 @@ export const observatoryManifest: BobCapabilityManifest = {
   provides: {
     tools: ["observatory_report"],
     serves: false,
+    // Private: it reads the office's signal files and reports agents' status.
+    dataClass: "private",
   },
 };

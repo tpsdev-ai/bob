@@ -231,6 +231,11 @@ export function resolveEffectiveConfig(input: EffectiveConfigInputs): EffectiveC
     ...(block.allowResidentShell !== undefined
       ? { allowResidentShell: block.allowResidentShell }
       : {}),
+    // bob#244: carried through so a bob.yaml `allowResidentWeb: true` is refused
+    // as a widening, never ignored. The ceiling below grants no resident web:
+    // the host grant ratifies no such flag, so an adopted resident agent drops
+    // the egress tools (and no packaged position requests them).
+    ...(block.allowResidentWeb !== undefined ? { allowResidentWeb: block.allowResidentWeb } : {}),
   };
   const policy = resolveToolPolicy({
     yamlText,

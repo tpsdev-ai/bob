@@ -24,10 +24,14 @@ The `jarvis` role is the office's resident agent: memory with receipts, awarenes
 from available presence and event information, small help routed to the right
 owner, and Discord conversation. Hire one with
 `bob onboard <name> --role jarvis --provider <provider> --model <model> --context-window <tokens>`; the
-interview gives the class seed an individual persona. The role allows only
-`flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and
-`discord_react`, with `allowResidentShell: false`; it does not allow `read`
-(bob#230). Onboarding stamps only
+interview gives the class seed an individual persona. The role's six
+implemented tools are `flair_search`, `flair_write`, `flair_get`,
+`discord_reply`, `discord_fetch` and `discord_react`, with
+`allowResidentShell: false`; it does not allow `read`
+(bob#230). It also lists `web_fetch` and `web_search` with `allowResidentWeb: true`,
+but neither tool exists yet, and bob refuses a session that holds web together
+with Flair or Discord (see [Data classes](#data-classes-and-what-a-web-session-may-hold)),
+so a jarvis agent has no web access. Onboarding stamps only
 the Flair capability: configure `discord` with its token file and channel
 allowlist, then add the Discord tools to `bob.yaml`'s `tools.allow` to enable
 conversation there. The body and automatic decision loop come later. An admitted Discord turn binds the outbound Discord tools to that turn's channel; in a cron turn, and outside an admitted turn (a one-shot `bob run`), the channel allow-list is the only boundary. This binds only the outbound tools: the conversation context is still shared across channels and DMs, so channel isolation is not provided until per-channel history lands (tracked in bob#234).
@@ -80,7 +84,9 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 
 A `cron:` entry fires into the one live `bob run <name>` session, on that session's model: bob.yaml's, unless the session was started with `--model X` (`bob install-service <name> --model X` writes that flag into the service unit), in which case every turn, cron included, uses X. `--model X` on a `bob run <name> <prompt>` call is a one-shot override for that single task. No flag picks a model per `cron:` entry.
 
-**Service units run bob under Node.** `bob install-service <name>` writes `<node> <bob> run <name>`, resolving an absolute Node executable at install time — the installer's own interpreter when it is Node, otherwise the `node` found on its PATH — and REFUSES, naming the remedy, when no Node is found. A unit that is already installed keeps its old command until it is rewritten, so after upgrading bob, reinstall it: `bob down <name>`, `bob install-service <name>` (with the same flags as before, e.g. `--model`), then `bob up <name>`.
+**Service units invoke bob through a selected interpreter path named `node`.** `bob install-service <name>` writes `<node> <bob> run <name>`, resolving an absolute interpreter path at install time. The choice depends on the basename of the installer's own interpreter path (`execPath`), compared case-insensitively, with `.exe` dropped on Windows. When that basename is not `node` (e.g. bun), the interpreter is the first trusted `node` on the installer's PATH — an executable regular file named `node`, which is not checked to be Node — and the install REFUSES, naming the remedy, when there is none. When the basename is `node`, the interpreter is the installer's own `execPath`, with one exception: the first trusted PATH `node`, in PATH order, whose final entry is a SYMLINK resolving to the same file is written instead (for example `/opt/homebrew/bin/node`), even when a direct match (the versioned binary itself) comes earlier on PATH. With no such symlink anywhere on PATH, the unit gets that `execPath`, which can be a versioned target such as `…/Cellar/node/<version>/bin/node`. The unit runs whatever the written path points AT when it launches: a symlink is followed to its later target — including across a Node major upgrade — and the target is not re-checked at launch, so a symlink path keeps working only while whatever maintains it (on Homebrew, `brew`) keeps it pointing at a working Node. Re-run `bob install-service <name>` after changing Node installations: `bob down <name>`, `bob install-service <name>` (with the same flags as before, e.g. `--model`), then `bob up <name>`.
+
+**A `node` from PATH is used only through a trusted, absolute PATH entry.** The `execPath` of an installer whose basename is `node`, the default above, is the running interpreter and is not screened. A PATH entry that is empty or not absolute (`bin`, `.`) is skipped, so the unit never depends on the installer's working directory. A `node` found on PATH, a file or a symlink, is used only when the whole path to its file passes the trust rule, following EVERY symlink on the way (a symlinked PATH directory included). Every directory on the way must be owned by the installing user or by root. The directory holding each symlink met on the way, the directory holding each symlink target's final name, and the directory holding `node` itself must be writable by no one but their owner, apart from the macOS `admin` group below; any other directory on the way may be group- or other-writable only when it has the sticky bit, as `/tmp` does, or when, besides its owner, only that `admin` group can write it. So a symlink in an other-writable directory, even a sticky one, or in a directory writable by any group but that `admin` group, is never trusted, whatever it points to. On macOS the rule trusts the `admin` group: a directory writable by its owner and that group, and not other-writable, passes the write check (it must still be owned by the installing user or by root). That is a policy choice for Homebrew prefixes that are `admin`-writable (observed: `/opt/homebrew/bin` as `drwxrwxr-x <user> admin`). A symlink that lands in a directory writable by any other group is not trusted either: an installer named `node` then takes the next trusted matching symlink on PATH, or its own `execPath` if none remains, and any other installer (e.g. bun) takes the next trusted `node` on PATH or refuses, naming the rejected path. A directory whose owner or mode cannot be read is untrusted. A candidate that fails is skipped, not fatal: the resolution continues through PATH as if it were absent, so an installer named `node` takes the next trusted matching symlink and uses its own `execPath` only if none remains, and any other installer takes the next trusted `node` or refuses. The refusal names each executable `node` from an absolute PATH entry that the rule rejected.
 
 ## Positions
 
@@ -238,7 +244,24 @@ change one, the named test is what tells you.
 - **Doctor points at the right file.** A resident agent whose allowlist names a
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
-  narrow it. *(`test/shell/doctor.test.ts`)*
+  narrow it. For a web tool dropped while the resident web grant is absent,
+  doctor recommends `tools.allowResidentWeb` as the grant, and says the shell
+  grant (`allowResidentShell`) does not cover web; if the tool is also in
+  `tools.exclude`, the fix says to remove it from there as well. An exclusion
+  alone, with the grant in effect, does not trigger this warning. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
+- **A web session holds nothing private beyond its admitted prompt.** A session
+  that holds the `web` capability, or allows a web tool, is refused unless every
+  capability in it is public-class, it holds no pi built-in tool, it carries no
+  `soul.md` content, standing contract, unclassified startup context or restored
+  history, and the system prompt pi assembles for it is exactly bob's reviewed
+  web prompt (a web session has no agent workspace: pi's working directory is
+  `/`). Checked at `bob.yaml` load over the capability set, by the session
+  factory before it builds pi's runtime (so before any extension loads), and on
+  the composed session at creation, after the mode binds extensions and after
+  every reload; there is no override. The admitted prompt itself is not classified yet: which
+  prompts may reach a web tool is decided before a web tool is registered. See
+  [Data classes](#data-classes-and-what-a-web-session-may-hold).
+  *(`test/shell/data-class.test.ts`, `test/shell/web-composition-session.test.ts`)*
 - **builder-local runs commands only through `run`, and `run` always has a
   deadline.** The `work` capability's `run` / `run_status` / `run_cancel`
   replace pi's `bash` in `roles/builder-local/role.json`. An omitted timeout gets
@@ -561,6 +584,90 @@ stay textual, like a Discord snowflake.
 
 **Secrets never go in `bob.yaml`.** Capability schemas take a *path* — `keyFile`,
 `officeKeyFile`, `tokenFile` — and the value is read from that file at startup.
+
+### Data classes, and what a web session may hold
+
+Every capability's manifest states a data class, `provides.dataClass`: what the
+capability can bring into a session is `public` or `private`.
+
+| Class     | Capabilities                                                                              |
+| --------- | ----------------------------------------------------------------------------------------- |
+| `public`  | `fixture`, `presence` (imports no context), `web`                                         |
+| `private` | `flair`, `discord`, `anchored-edit`, `work`, `reachy`, `observatory`, `tps-mail`, planned `mail` |
+
+A manifest without a class counts as private; moving a capability to public is a
+reviewed change, and a test fails if a shipped capability states no class.
+
+Once its tools land, the `web` capability will send model-influenced data to
+hosts outside the office (a fetched URL, a search query); this release registers
+neither tool. So until bob can attribute every input of a session to its
+source, a session that holds `web` (or allows `web_fetch` or `web_search`) must
+hold nothing private beyond its admitted prompt. A session that holds web
+because it allows an egress tool, without the capability, counts too. bob
+refuses such a session when it would also hold:
+
+- a private-class capability, or an extension bob cannot attribute to a capability;
+- any pi built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
+  `powershell`: each reads or writes local data), or a tool bob cannot attribute;
+- `soul.md` content, or the persistent runtime's standing contract (its agent
+  block and cron duties);
+- a context file, skill, prompt template or custom system prompt, including one a
+  capability adds when the mode binds extensions or on a reload;
+- restored history, such as a resumed session whose history held a private
+  capability;
+- a system prompt other than bob's reviewed web prompt. pi's own template names
+  local paths: the install paths of its documentation and, in every template,
+  the working directory. So a web session gets bob's reviewed prompt instead,
+  and no agent workspace (pi's working directory is `/`), and the prompt pi
+  assembles is compared with the reviewed one, character for character.
+
+Each check reports, in one error, every problem that check can see. The check
+at `bob.yaml` load sees only the capability set, and runs after each capability
+block has passed its own schema (a block that fails is refused first, on its
+own). So a config that is wrong in more than one place can be refused at load
+for its capabilities and then, once those are fixed, in the session factory for
+its tools, startup context or history. The refusal says why the session is a web
+session and names the remedy: remove `web` from `capabilities:`, or remove the
+egress tool from `tools.allow` when that is what made it one.
+
+The one-shot task of `bob run <name> "<task>"` is the admitted prompt and is
+allowed; the system prompt carries a capped copy of it. bob's own post-compaction "what remains" note carries workspace data,
+so it is not sent into a web session. The rule is checked when `bob.yaml`'s
+capabilities are resolved, by the session factory before it builds pi's runtime,
+and on the composed session at creation, after the mode binds extensions and
+after every reload. There is no override. In practice web composes only with `fixture` and `presence`, in a
+session with an empty `soul.md`, and never beside Flair or Discord.
+
+### `web` — configuration only in this release
+
+`web` ships its manifest, catalog entry, extension and config block. It
+registers no tool and has no network code yet. The block is flat, and every
+field is optional:
+
+```yaml
+capabilities: [web]
+web:
+  allow_http: false
+  fetch_max_chars: 20000
+  fetch_per_turn: 10
+  text_per_turn: 100000
+```
+
+| Field             | Default  | Bounds         |
+| ----------------- | -------- | -------------- |
+| `allow_http`      | `false`  | boolean        |
+| `fetch_max_chars` | `20000`  | 1 to 100000    |
+| `fetch_per_turn`  | `10`     | 1 to 10        |
+| `text_per_turn`   | `100000` | 1 to 100000    |
+
+The block is validated when `bob.yaml` is loaded and again when the extension
+reads it from `BOB_CAP_WEB`; an unknown key, a wrong type or a value out of
+bounds is refused at both. `web_fetch` and `web_search` are classified `egress`:
+a resident agent's policy excludes them unless its role sets
+`tools.allowResidentWeb: true` (`jarvis` and `ea` do; `allowResidentShell` does
+not cover them). The grant removes only that resident egress exclusion: an
+explicit `tools.exclude` entry still wins. A mail turn never holds them. *(`test/capabilities/web/config.test.ts`,
+`test/shell/web-policy.test.ts`)*
 
 ### `tps-mail` — answering TPS mail
 

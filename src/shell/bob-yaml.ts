@@ -86,6 +86,7 @@ export function readCapabilities(yamlText: string): string[] {
 //     exclude:
 //       - bash
 //     allowResidentShell: false
+//     allowResidentWeb: false
 //
 // `readBlock` already handles the shape (a flat mapping of scalar / inline-list
 // / block-sequence-list values); this wrapper is the SCHEMA on top of it. A key
@@ -106,9 +107,14 @@ export interface ToolsBlock {
   // Opt a resident agent back into the shell + file-writing tools the resident
   // policy drops (see tool-allowlist.ts, RESIDENT_EXCLUDED_TOOLS).
   allowResidentShell?: boolean;
+  // bob#244: lift the resident egress exclusion for the web tools
+  // (tool-allowlist.ts, RESIDENT_EGRESS_TOOLS); an explicit `exclude` entry
+  // still wins. Like allowResidentShell, bob.yaml may only narrow the role's
+  // grant.
+  allowResidentWeb?: boolean;
 }
 
-const TOOLS_KEYS = ["allow", "exclude", "allowResidentShell"] as const;
+const TOOLS_KEYS = ["allow", "exclude", "allowResidentShell", "allowResidentWeb"] as const;
 
 export function readTools(yamlText: string): ToolsBlock | undefined {
   // The INLINE form (`tools: {allow: [read]}`) is refused, not ignored.
@@ -139,15 +145,15 @@ export function readTools(yamlText: string): ToolsBlock | undefined {
         `unknown key "${key}" — supported keys are ${TOOLS_KEYS.join(", ")}.`,
       );
     }
-    if (key === "allowResidentShell") {
+    if (key === "allowResidentShell" || key === "allowResidentWeb") {
       if (typeof value !== "boolean") {
         throw new BobYamlError(
           "tools",
           lineOfKey(yamlText, "tools", key),
-          `"allowResidentShell" must be true or false.`,
+          `"${key}" must be true or false.`,
         );
       }
-      out.allowResidentShell = value;
+      out[key] = value;
       continue;
     }
     const names = toToolNames(value);
@@ -159,7 +165,7 @@ export function readTools(yamlText: string): ToolsBlock | undefined {
       );
     }
     // Narrowed for the assignment below: the key is one of the two name lists
-    // (allowResidentShell was handled above).
+    // (the two boolean grants were handled above).
     if (key === "allow" || key === "exclude") out[key] = names;
   }
   return out;

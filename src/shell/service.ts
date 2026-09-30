@@ -26,9 +26,18 @@
 // real init system.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, mkdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
 
 // Strict class init.ts/run.ts use — agent names are filesystem paths AND get
 // embedded in the unit Label / file name / ExecStart, so this doubles as path,
@@ -54,6 +63,14 @@ function assertName(name: string): void {
 // `engines.node`; the install-time refusal below names it as the remedy.
 const NODE_ENGINES_FLOOR = ">=22.19.0";
 
+// Ownership and mode of a directory, symlinks followed: what the trust screen
+// reads. The default source is fs.statSync.
+export interface PathOwnership {
+  uid: number;
+  gid: number;
+  mode: number;
+}
+
 export interface NodeResolutionDeps {
   // The installing process's own interpreter. Defaults to process.execPath.
   execPath?: string;
@@ -62,6 +79,141 @@ export interface NodeResolutionDeps {
   // Whether a candidate path is a REGULAR EXECUTABLE file. Defaults to an fs
   // check (regular file + X_OK); injected in tests.
   isExecutable?: (file: string) => boolean;
+  // The installer's uid. The trust screen accepts directories owned by this uid
+  // or by root. Defaults to process.getuid().
+  getUid?: () => number;
+  // Ownership and mode of a directory (symlinks followed). Defaults to
+  // fs.statSync. A throw makes the candidate UNTRUSTED. Injected in tests.
+  statPath?: (path: string) => PathOwnership;
+  // The host's administrators group. A directory owned by the installer or by
+  // root, and writable by its owner and this group but by no one else, is
+  // accepted: a policy that TRUSTS this group.
+  // Defaults to 80 (`admin`) on macOS, for Homebrew prefixes that are
+  // admin-writable (observed: /opt/homebrew/bin as drwxrwxr-x <user> admin),
+  // and to null elsewhere (then group write passes only in a sticky ancestor).
+  // Injected in tests.
+  adminGid?: number | null;
+}
+
+// The group-write and other-write permission bits, the other-write bit alone,
+// and the sticky bit.
+const GROUP_OR_OTHER_WRITE = 0o022;
+const OTHER_WRITE = 0o002;
+const STICKY = 0o1000;
+// Symlink hops followed while screening one candidate (Linux's MAXSYMLINKS).
+const MAX_SYMLINK_HOPS = 40;
+// macOS's `admin` group.
+const DARWIN_ADMIN_GID = 80;
+
+interface TrustContext {
+  uid: number;
+  adminGid: number | null;
+  statPath: (path: string) => PathOwnership;
+}
+
+// Whether one directory on the way to a candidate interpreter is trusted. Every
+// directory must be owned by the installer or by root; a failed stat is
+// untrusted. A HOLDER, a directory whose entry the resolution depends on
+// directly (it holds a symlink met on the way, or the final name of the
+// candidate or of a symlink target), must be writable by no one but its owner,
+// except that write by the host's administrators group is accepted (a policy
+// that trusts that group) in any directory that is not other-writable. An
+// ANCESTOR, any other directory traversed, may also be group- or other-writable
+// when it has the sticky bit (as /tmp does), which stops others renaming
+// entries they do not own.
+function directoryTrusted(dir: string, role: "holder" | "ancestor", ctx: TrustContext): boolean {
+  let st: PathOwnership;
+  try {
+    st = ctx.statPath(dir);
+  } catch {
+    return false;
+  }
+  if (st.uid !== ctx.uid && st.uid !== 0) return false;
+  if ((st.mode & GROUP_OR_OTHER_WRITE) === 0) return true;
+  if ((st.mode & OTHER_WRITE) === 0 && ctx.adminGid !== null && st.gid === ctx.adminGid) {
+    return true;
+  }
+  return role === "ancestor" && (st.mode & STICKY) !== 0;
+}
+
+// One name for the walk to look up, and whether the directory it is looked up
+// in must pass the HOLDER rule: true for the final name of the candidate and
+// for the final name of every symlink target (the entry the link lands on).
+interface WalkStep {
+  name: string;
+  holder: boolean;
+}
+
+// A path's names, its final one marked HOLDER. Trailing "." names are dropped;
+// a path left with no name, or whose final name is "..", names no entry for a
+// directory to hold, so it yields undefined and the candidate is untrusted.
+function walkSteps(path: string): WalkStep[] | undefined {
+  const names = path
+    .slice(parse(path).root.length)
+    .split(sep)
+    .filter((n) => n.length > 0);
+  while (names.length > 0 && names[names.length - 1] === ".") names.pop();
+  if (names.length === 0 || names[names.length - 1] === "..") return undefined;
+  return names.map((name, i) => ({ name, holder: i === names.length - 1 }));
+}
+
+// Whether a candidate interpreter path is trusted: every directory traversed to
+// reach the file passes directoryTrusted. The walk resolves the path one name at
+// a time and follows each symlink hop. It applies the HOLDER rule to the
+// directory holding each symlink met on the way (intermediate directory links
+// included), to the directory holding each symlink target's final name, and to
+// the directory holding the candidate's own final name; every other directory
+// traversed gets the ANCESTOR rule. So a symlink in an other-writable
+// directory, sticky or not, or in one writable by any group but the trusted
+// administrators group, is never trusted, whatever it points to: its owner
+// could retarget it after the unit is written. A candidate the walk cannot
+// follow (a failed lstat or readlink, more than MAX_SYMLINK_HOPS hops, a
+// symlink target that names no entry, a non-directory on the way, or a final
+// entry that is not a regular file) is untrusted, and so is a relative path.
+function interpreterPathTrusted(file: string, ctx: TrustContext): boolean {
+  if (!isAbsolute(file)) return false;
+  let dir = parse(file).root;
+  if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+  let pending = walkSteps(file);
+  if (pending === undefined) return false;
+  let hops = 0;
+  while (pending.length > 0) {
+    const step = pending.shift() as WalkStep;
+    if (step.name === ".") continue;
+    if (step.name === "..") {
+      dir = dirname(dir);
+      continue;
+    }
+    const last = pending.length === 0;
+    if (step.holder && !directoryTrusted(dir, "holder", ctx)) return false;
+    const entry = join(dir, step.name);
+    let target: string | undefined;
+    try {
+      const st = lstatSync(entry);
+      if (st.isSymbolicLink()) target = readlinkSync(entry);
+      else if (last) return st.isFile();
+      else if (!st.isDirectory()) return false;
+    } catch {
+      return false;
+    }
+    if (target === undefined) {
+      dir = entry;
+      if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+      continue;
+    }
+    // A symlink met anywhere on the way must sit in a HOLDER-grade directory.
+    if (!directoryTrusted(dir, "holder", ctx)) return false;
+    hops += 1;
+    if (hops > MAX_SYMLINK_HOPS) return false;
+    const targetSteps = walkSteps(target);
+    if (targetSteps === undefined) return false;
+    if (isAbsolute(target)) {
+      dir = parse(target).root;
+      if (!directoryTrusted(dir, "ancestor", ctx)) return false;
+    }
+    pending = [...targetSteps, ...pending];
+  }
+  return false;
 }
 
 function defaultIsExecutable(file: string): boolean {
@@ -80,36 +232,130 @@ function executableBasename(file: string): string {
   return process.platform === "win32" ? base.replace(/\.exe$/i, "") : base;
 }
 
+// A path's realpath (symlinks followed), or undefined when it does not resolve.
+// Used only to decide whether a PATH entry names the SAME binary as execPath; a
+// path that does not resolve yields no match, and the caller falls back.
+function realpathOrUndefined(file: string): string | undefined {
+  try {
+    return realpathSync(file);
+  } catch {
+    return undefined;
+  }
+}
+
+// Whether a path's final component is a symlink. A Homebrew entry such as
+// /opt/homebrew/bin/node is a symlink to the versioned target; a versioned
+// Cellar entry (…/Cellar/node/<version>/bin/node) is a real file. Detected by
+// lstat, so a symlinked PARENT directory does not count as a symlink here.
+function isSymlink(file: string): boolean {
+  try {
+    return lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // Resolve an ABSOLUTE Node executable for the unit, at install time.
 //
 // The unit must run bob under NODE — bin/bob's shebang and package.json's
-// `engines` say so — whatever runtime ran install-service. When the installer
-// IS node that is its own process.execPath. Otherwise (e.g. a developer runs
-// install-service under bun) we look for `node` on the installer's PATH. If
-// neither yields a Node, installation is REFUSED (the throw names the remedy)
-// rather than writing a unit that would run bob under a non-Node runtime.
+// `engines` say so — whatever runtime ran install-service. The branch is chosen
+// by execPath's BASENAME: `node`, compared case-insensitively, with `.exe`
+// dropped on Windows. A "PATH `node`" below is an executable regular file named
+// `node` in an absolute PATH entry; nothing checks that it is actually Node.
+//
+// When execPath's basename is NOT `node` (e.g. a developer runs install-service
+// under bun) we use the first trusted PATH `node`; with none, installation is
+// REFUSED (the throw names the remedy, and each executable `node` from an
+// absolute PATH entry that the trust screen rejected) rather than writing a
+// unit that would run bob under a non-Node runtime.
+//
+// When execPath's basename IS `node` we use execPath itself, with one
+// exception. On a Homebrew install execPath can be a versioned target
+// (observed: …/Cellar/node/<version>/bin/node), and writing that into the unit
+// breaks the service after `brew upgrade node` removes that directory. So the
+// first TRUSTED PATH `node`, in PATH order, whose FINAL entry is a symlink with
+// the same realpath as execPath is written instead (e.g. /opt/homebrew/bin/node),
+// even when a direct match comes earlier on PATH. That path keeps working only
+// while whatever maintains the symlink keeps it pointing at a working Node.
+// With no trusted matching symlink anywhere on PATH, or when execPath has no
+// realpath, we fall back to execPath, which may itself be stable or versioned.
+//
+// TRUST SCREEN: both branches consider only PATH candidates that pass it. A PATH
+// entry that is empty or not absolute (`bin`, `.`) is skipped. A candidate is
+// kept only when interpreterPathTrusted accepts the whole path to its file,
+// following EVERY symlink on the way (a symlinked PATH directory included):
+// every directory owned by the installer or by root; the directory holding each
+// symlink met, each symlink target's final name and the candidate's own final
+// name writable by no one else (write by the host's administrators group
+// excepted); any other directory group- or other-writable only with the sticky
+// bit (or, besides its owner, writable only by that administrators group).
+// A candidate that fails is skipped, and the resolution continues through PATH
+// as if it were absent. The fallback in the `node` branch, execPath itself, is
+// the running interpreter and is not screened.
 export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   const execPath = deps.execPath ?? process.execPath;
-  if (executableBasename(execPath).toLowerCase() === "node") {
-    return execPath;
-  }
   const pathEnv = deps.pathEnv ?? process.env.PATH ?? "";
   const isExecutable = deps.isExecutable ?? defaultIsExecutable;
   const delimiter = process.platform === "win32" ? ";" : ":";
+  const trust: TrustContext = {
+    uid: (deps.getUid ?? (() => process.getuid?.() ?? 0))(),
+    adminGid:
+      deps.adminGid !== undefined
+        ? deps.adminGid
+        : process.platform === "darwin"
+          ? DARWIN_ADMIN_GID
+          : null,
+    statPath: deps.statPath ?? ((path) => statSync(path)),
+  };
+
+  // Every executable, trusted `node` on the installer's PATH, in PATH order.
+  // Only ABSOLUTE entries count, so the unit never depends on the installer's
+  // working directory; defaultIsExecutable requires a regular file (a directory
+  // named `node` is skipped), and the trust screen above applies.
+  const candidates: string[] = [];
+  const untrusted: string[] = [];
   for (const dir of pathEnv.split(delimiter)) {
-    if (!dir) continue;
-    // resolve() against the installer's working directory, so a RELATIVE PATH
-    // entry still yields an ABSOLUTE interpreter in the unit; defaultIsExecutable
-    // then requires a regular file (a directory named `node` is skipped).
-    const candidate = resolve(dir, "node");
-    if (isExecutable(candidate)) return candidate;
+    if (!dir || !isAbsolute(dir)) continue;
+    const candidate = join(dir, "node");
+    if (!isExecutable(candidate)) continue;
+    if (interpreterPathTrusted(candidate, trust)) candidates.push(candidate);
+    else untrusted.push(candidate);
   }
+
+  if (executableBasename(execPath).toLowerCase() === "node") {
+    // execPath's basename is `node`: prefer a trusted PATH `node` whose FINAL
+    // entry is a SYMLINK resolving to the SAME file, so a versioned target is
+    // written as that symlink path. A direct (non-symlink) match does not help —
+    // a versioned Cellar binary on PATH is still versioned — so without a
+    // trusted matching symlink anywhere on PATH we fall back to the running
+    // interpreter's own path, which can be versioned. A PATH `node` symlinked to
+    // a DIFFERENT file is not a match; the first trusted matching symlink in
+    // PATH order wins.
+    const execReal = realpathOrUndefined(execPath);
+    if (execReal !== undefined) {
+      for (const candidate of candidates) {
+        if (realpathOrUndefined(candidate) !== execReal) continue;
+        if (isSymlink(candidate)) return candidate;
+      }
+    }
+    return execPath;
+  }
+
+  // execPath's basename is not `node`: use the first trusted PATH `node`.
+  if (candidates.length > 0) return candidates[0];
+  const skipped =
+    untrusted.length > 0
+      ? ` Skipped as untrusted: ${untrusted.join(", ")} (to be trusted, every directory on the way must be owned by you or root; the directory holding node and every directory holding a symlink or the entry a symlink points to must not be writable by group or others, and any other directory may be only if it has the sticky bit; on macOS, write access for the admin group, but not for others, is allowed).`
+      : "";
   throw new Error(
-    `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.`,
+    `bob install-service: no Node executable found. The service unit must run bob under Node (engines: ${NODE_ENGINES_FLOOR}), not under whichever runtime ran install-service. Install Node ${NODE_ENGINES_FLOOR} and put it on PATH, then re-run.${skipped}`,
   );
 }
 
-export interface RenderServiceOptions {
+// The renderers take the resolution deps too: when `interpreter` is not given,
+// they resolve it with these (resolveNodeExecutable), so a caller or a test can
+// pin the resolution instead of reading the host's PATH and filesystem.
+export interface RenderServiceOptions extends NodeResolutionDeps {
   name: string;
   // Absolute path to the `bob` binary the unit runs. Both init systems use a
   // minimal PATH, so this MUST be absolute (the caller resolves it). Required.
@@ -122,6 +368,7 @@ export interface RenderServiceOptions {
   // the interpreter is started by ABSOLUTE path with the bob script as its
   // first argument and PATH is never consulted. installService resolves it once
   // and passes it in; this option is also the direct-renderer / test override.
+  // When it is absent, the resolution deps above (NodeResolutionDeps) apply.
   interpreter?: string;
   // Optional model override passed through to `bob run` (→ runPersistent).
   model?: string;
@@ -138,9 +385,10 @@ export type RenderPlistOptions = RenderServiceOptions;
 // "runs:" line read this ONE list, so the displayed command can never drift from
 // what the unit actually executes (e.g. the CLI dropping `--model`).
 export function serviceCommandArgs(
-  opts: Pick<RenderServiceOptions, "interpreter" | "bobBin" | "name" | "model">,
+  opts: Pick<RenderServiceOptions, "interpreter" | "bobBin" | "name" | "model"> &
+    NodeResolutionDeps,
 ): string[] {
-  const args = [opts.interpreter ?? resolveNodeExecutable(), opts.bobBin, "run", opts.name];
+  const args = [opts.interpreter ?? resolveNodeExecutable(opts), opts.bobBin, "run", opts.name];
   if (opts.model) args.push("--model", opts.model);
   return args;
 }
@@ -294,24 +542,23 @@ export type CommandRunner = (
 // Back-compat: the launchd-only runner shape used by existing callers/tests.
 export type LaunchctlRunner = (args: string[]) => Promise<{ code: number; stderr: string }>;
 
-export interface ServiceOpsDeps {
+// The Node resolution deps (NodeResolutionDeps) resolve the unit's interpreter:
+// injected in tests, defaulting to the current process's own interpreter, PATH
+// and uid.
+export interface ServiceOpsDeps extends NodeResolutionDeps {
   // Write the unit to disk (install-service). Injected in tests.
   writeFile?: (path: string, contents: string) => void;
   // Run launchctl (macOS). Injected in tests.
   runLaunchctl?: LaunchctlRunner;
   // Run systemctl (Linux). Injected in tests.
   runSystemctl?: LaunchctlRunner;
-  // Resolve the current uid for the launchd gui domain target. Injected in tests.
+  // Resolve the current uid for the launchd gui domain target. Injected in
+  // tests. It is also the installer uid the resolution's trust screen uses.
   getUid?: () => number;
   // Home dir override (tests).
   home?: string;
   // Force a backend (tests; CI runs on Linux). Defaults to the host platform.
   platform?: ServicePlatform;
-  // Node resolution for the unit's interpreter (see resolveNodeExecutable).
-  // Injected in tests; defaults to the current process's own interpreter + PATH.
-  execPath?: string;
-  pathEnv?: string;
-  isExecutable?: (file: string) => boolean;
 }
 
 export interface InstallServiceOptions extends RenderServiceOptions, ServiceOpsDeps {}

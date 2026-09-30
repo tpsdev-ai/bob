@@ -6,8 +6,11 @@
       "flair_get",
       "discord_reply",
       "discord_fetch",
-      "discord_react"
-    ]
+      "discord_react",
+      "web_fetch",
+      "web_search"
+    ],
+    "allowResidentWeb": true
   },
   "default_provider": "exe-dev-gateway",
   "default_model": "claude-opus-4-7"

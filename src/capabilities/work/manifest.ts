@@ -16,5 +16,7 @@ export const workManifest: BobCapabilityManifest = {
   provides: {
     tools: ["run", "run_status", "run_cancel"],
     serves: false,
+    // Private: a command's output can carry any workspace or host data.
+    dataClass: "private",
   },
 };

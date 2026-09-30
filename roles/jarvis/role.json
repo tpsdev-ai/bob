@@ -6,9 +6,12 @@
       "flair_get",
       "discord_reply",
       "discord_fetch",
-      "discord_react"
+      "discord_react",
+      "web_fetch",
+      "web_search"
     ],
-    "allowResidentShell": false
+    "allowResidentShell": false,
+    "allowResidentWeb": true
   },
   "default_provider": "ollama",
   "default_model": "qwen3:8b"
