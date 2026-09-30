@@ -11,9 +11,11 @@
 // active-tool audit (session.ts assertAllowedToolsActive), because nothing
 // registers it.
 //
-// `dataClass: public` — what web brings into a session is public web content.
-// The class is what lets web compose at all: a session that holds web may hold
-// only public-class capabilities (data-class.ts).
+// `dataClass: public` — what web WILL bring into a session once its tools land
+// (fetched pages in R1c, search results in R2) is public web content; in this
+// slice it brings nothing. The class is what lets web compose at all: a
+// session that holds web may hold only public-class capabilities
+// (data-class.ts).
 //
 // `piPackage` is a self-referencing specifier into this package's `exports`
 // map, resolved through Node's ESM resolver at session setup.

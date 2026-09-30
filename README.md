@@ -243,13 +243,17 @@ change one, the named test is what tells you.
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
   narrow it. A dropped web tool names `tools.allowResidentWeb`, never the shell
   grant. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
-- **A web session holds nothing private.** A session that holds the `web`
-  capability, or allows a web tool, is refused unless every capability in it is
-  public-class, it holds no pi built-in tool, and it carries no `soul.md`
-  content, standing contract, unclassified startup context or restored history.
+- **A web session holds nothing private beyond its admitted prompt.** A session
+  that holds the `web` capability, or allows a web tool, is refused unless every
+  capability in it is public-class, it holds no pi built-in tool, it carries no
+  `soul.md` content, standing contract, unclassified startup context or restored
+  history, and the system prompt pi assembles for it is exactly bob's reviewed
+  web prompt (a web session has no workspace: pi's working directory is `/`).
   Checked at `bob.yaml` load and by the session factory before anything is
   built, at creation, after the mode binds extensions and after every reload;
-  there is no override. See [Data classes](#data-classes-and-what-a-web-session-may-hold).
+  there is no override. The admitted prompt itself is not classified yet: which
+  prompts may reach a web tool is decided before a web tool is registered. See
+  [Data classes](#data-classes-and-what-a-web-session-may-hold).
   *(`test/shell/data-class.test.ts`, `test/shell/web-composition-session.test.ts`)*
 - **builder-local runs commands only through `run`, and `run` always has a
   deadline.** The `work` capability's `run` / `run_status` / `run_cancel`
@@ -581,10 +585,13 @@ capability can bring into a session is `public` or `private`.
 A manifest without a class counts as private; moving a capability to public is a
 reviewed change, and a test fails if a shipped capability states no class.
 
-The `web` capability sends model-influenced data to hosts outside the office,
-so until bob can attribute every input of a session to its source, a session
-that holds `web` (or allows `web_fetch` or `web_search`) must hold nothing
-private. bob refuses it, naming each problem, when it would also hold:
+Once its tools land, the `web` capability will send model-influenced data to
+hosts outside the office (a fetched URL, a search query); this release registers
+neither tool. So until bob can attribute every input of a session to its
+source, a session that holds `web` (or allows `web_fetch` or `web_search`) must
+hold nothing private beyond its admitted prompt. For a config whose capability
+blocks are otherwise valid, bob refuses such a session with one composition
+error that names every composition problem, when it would also hold:
 
 - a private-class capability, or an extension bob cannot attribute to a capability;
 - any pi built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
@@ -594,10 +601,15 @@ private. bob refuses it, naming each problem, when it would also hold:
 - a context file, skill, prompt template or custom system prompt, including one a
   capability adds when the mode binds extensions or on a reload;
 - restored history, such as a resumed session whose history held a private
-  capability.
+  capability;
+- a system prompt other than bob's reviewed web prompt. pi's own template names
+  local paths: the install paths of its documentation and, in every template,
+  the working directory. So a web session gets bob's reviewed prompt instead,
+  and no workspace (pi's working directory is `/`), and the prompt pi assembles
+  is compared with the reviewed one, character for character.
 
 The one-shot task of `bob run <name> "<task>"` is the admitted prompt and is
-allowed. bob's own post-compaction "what remains" note carries workspace data,
+allowed; the system prompt carries a capped copy of it. bob's own post-compaction "what remains" note carries workspace data,
 so it is not sent into a web session. The rule is checked when `bob.yaml`'s
 capabilities are resolved, and by the session factory before anything is built,
 at creation, after the mode binds extensions and after every reload. There is

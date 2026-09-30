@@ -6,9 +6,11 @@
 // the catalog validated bob.yaml with, and REGISTERS NO TOOL. There is no
 // network code here: the fetch core is slice R1b, `web_fetch` is R1c.
 //
-// A session that holds this capability is a WEB session, and bob refuses to
-// compose one with anything private (data-class.ts), at creation, after the
-// mode binds extensions and after every reload.
+// A session that holds this capability is a WEB session. bob refuses to
+// compose one with anything private beyond its admitted prompt (data-class.ts):
+// at YAML load, before the session is built, at creation, after the mode binds
+// extensions and after every reload. A web session sends bob's reviewed system
+// prompt in place of pi's template and has no workspace.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfigFromEnv } from "./config.js";

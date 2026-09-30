@@ -472,8 +472,9 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
   // The shell opt-in keeps the writers; only the web opt-in keeps egress. The
   // egress exclusion lists only the egress names this allowlist asks for: pi
   // applies excludeTools after the strict allowlist, so an unlisted name is
-  // inert either way, and every existing agent's resolved policy (and a bound
-  // agent's ratified baseline) stays exactly as it was.
+  // inert either way, and every existing agent's effective tool and exclusion
+  // lists (and a bound agent's ratified baseline) stay exactly as they were;
+  // the returned policy gains only the allowResidentWeb flag.
   const residentExclusions = resident
     ? [
         ...(allowResidentShell ? [] : RESIDENT_EXCLUDED_TOOLS),

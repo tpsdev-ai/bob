@@ -18,8 +18,11 @@ import {
   restoredHistoryEntries,
   STARTUP_CONTEXT_CLASS,
   sessionCompositionView,
+  WEB_SESSION_CWD,
+  WEB_SESSION_SYSTEM_PROMPT,
   WebCompositionError,
   webCompositionProblems,
+  webSessionSystemPrompt,
 } from "../../src/shell/data-class.js";
 import { PI_BUILTIN_TOOLS } from "../../src/shell/tool-allowlist.js";
 
@@ -106,6 +109,7 @@ describe("classification completeness", () => {
       soul: "private",
       "standing-contract": "private",
       "task-contract": "admitted-prompt",
+      "web-system-prompt": "public",
     });
     expect({ ...BOB_INJECTION_DATA_CLASS }).toEqual({ "compaction-note": "private" });
   });
@@ -233,7 +237,7 @@ describe("the web composition rule", () => {
     );
   });
 
-  it("the refusal names every problem, the public set and that there is no override", () => {
+  it("a composition refusal names every composition problem, the public set and that there is no override", () => {
     const err = (() => {
       try {
         throw new WebCompositionError(["one", "two"]);
@@ -361,6 +365,8 @@ describe("the session view (what pi composed)", () => {
     activeTools: [] as string[],
     capabilityBySource: { "/cap/web/index.js": "web" },
     soul: "",
+    // What pi assembles when every input is the reviewed one.
+    assembledSystemPrompt: webSessionSystemPrompt(),
     restoredHistory: 0,
   };
 
@@ -370,6 +376,7 @@ describe("the session view (what pi composed)", () => {
       soul: "I am a soul",
       contractBlock: "TASK: fetch",
       contractSource: "task-contract",
+      assembledSystemPrompt: webSessionSystemPrompt(["TASK: fetch"]),
       loader: loader({ getAppendSystemPrompt: () => ["I am a soul", "TASK: fetch", "stranger"] }),
     });
     expect(v.extensions).toEqual([
@@ -428,6 +435,69 @@ describe("the session view (what pi composed)", () => {
     ]);
     expect(webCompositionProblems(v)).toEqual([
       `pi's built-in tool "read" reads or writes local data`,
+    ]);
+  });
+});
+
+describe("the system prompt a web session sends", () => {
+  const loader = (systemPrompt: string | undefined, append: string[] = []) => ({
+    getAgentsFiles: () => ({ agentsFiles: [] }),
+    getSkills: () => ({ skills: [] }),
+    getPrompts: () => ({ prompts: [] }),
+    getSystemPrompt: () => systemPrompt,
+    getAppendSystemPrompt: () => append,
+  });
+  const web = {
+    extensions: [{ path: "/cap/web/index.js", tools: new Map() }],
+    activeTools: [] as string[],
+    capabilityBySource: { "/cap/web/index.js": "web" },
+    soul: "",
+    restoredHistory: 0,
+  };
+
+  it("is bob's reviewed prompt, the appended entries and pi's working-directory line naming /", () => {
+    expect(WEB_SESSION_CWD).toBe("/");
+    expect(webSessionSystemPrompt()).toBe(
+      `${WEB_SESSION_SYSTEM_PROMPT}\nCurrent working directory: /\n`,
+    );
+    expect(webSessionSystemPrompt(["TASK: a", "B"])).toBe(
+      `${WEB_SESSION_SYSTEM_PROMPT}\n\nTASK: a\n\nB\nCurrent working directory: /\n`,
+    );
+  });
+
+  it("classifies the loader's reviewed prompt, and accepts the assembled prompt that matches", () => {
+    const v = sessionCompositionView({
+      ...web,
+      contractBlock: "TASK: fetch",
+      contractSource: "task-contract",
+      assembledSystemPrompt: webSessionSystemPrompt(["TASK: fetch"]),
+      loader: loader(WEB_SESSION_SYSTEM_PROMPT, ["TASK: fetch"]),
+    });
+    expect(v.startup).toEqual([
+      { kind: "classified", source: "web-system-prompt" },
+      { kind: "classified", source: "task-contract" },
+    ]);
+    expect(webCompositionProblems(v)).toEqual([]);
+  });
+
+  it("refuses an assembled prompt that is not the reviewed one, naming where, without quoting it", () => {
+    const leaked = `${WEB_SESSION_SYSTEM_PROMPT}\nCurrent working directory: /home/someone/agents/x/work\n`;
+    const v = sessionCompositionView({
+      ...web,
+      assembledSystemPrompt: leaked,
+      loader: loader(WEB_SESSION_SYSTEM_PROMPT),
+    });
+    const problems = webCompositionProblems(v);
+    expect(problems).toEqual([
+      "unclassified startup context: the system prompt pi assembled is not the reviewed web prompt (it differs at line 4 of 5)",
+    ]);
+    expect(problems.join("\n")).not.toContain("/home/someone");
+  });
+
+  it("refuses when the assembled prompt cannot be read", () => {
+    const v = sessionCompositionView({ ...web, loader: loader(WEB_SESSION_SYSTEM_PROMPT) });
+    expect(webCompositionProblems(v)).toEqual([
+      "unclassified startup context: the system prompt pi assembled could not be read",
     ]);
   });
 });

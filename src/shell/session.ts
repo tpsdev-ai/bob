@@ -60,6 +60,8 @@ import {
   type StartupSource,
   sessionCompositionView,
   sessionWebSurface,
+  WEB_SESSION_CWD,
+  WEB_SESSION_SYSTEM_PROMPT,
 } from "./data-class.js";
 import { ADMIN_PASS_ENV } from "./flair-pair.js";
 import {
@@ -716,7 +718,7 @@ export function isolatedLoaderOptions(
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
   },
-  extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[] },
+  extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[]; webSession?: boolean },
 ): LoaderOptions {
   const contractBlock = config.contractBlock;
   // Inline extensions pi appends AFTER every path-loaded one: the setup tool
@@ -740,6 +742,12 @@ export function isolatedLoaderOptions(
     // An explicit (empty) prompt source disables SYSTEM.md discovery — the
     // global APPEND_SYSTEM.md too. The append source is exactly soul.md.
     systemPrompt: "",
+    // bob#244: a web session gets bob's reviewed prompt in place of pi's
+    // template, which names local paths (data-class.ts). As an override, never
+    // a source: pi reads a source that names an existing file as that file.
+    ...(extra?.webSession === true
+      ? { systemPromptOverride: () => WEB_SESSION_SYSTEM_PROMPT }
+      : {}),
     appendSystemPrompt: config.appendSystemPrompt.length > 0 ? [config.appendSystemPrompt] : [],
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
@@ -812,7 +820,8 @@ export function auditCreatedSession(
 // bob#244: the web composition rule on what pi ACTUALLY composed — the loaded
 // extensions, the active tools and their sources, the startup context the
 // resource loader holds (context files, skills, prompt templates, the system
-// prompt and every appended entry), and the session's history source. Runs with
+// prompt and every appended entry), the system prompt pi ASSEMBLED from all of
+// it (what the session sends), and the session's history source. Runs with
 // the tool audit: at creation, after the mode binds extensions and after every
 // reload, because a bind or a reload can add startup context (an extension's
 // `resources_discover` skills and prompt templates) that creation never saw. A
@@ -823,7 +832,7 @@ export function auditCreatedSession(
 // manager other than the one checked at creation is history bob cannot
 // attribute.
 export function auditWebSession(input: {
-  session: AuditSession & { sessionManager?: unknown };
+  session: AuditSession & { sessionManager?: unknown; systemPrompt?: unknown };
   loader: AuditExtensions & StartupSource;
   config: Pick<
     RunSessionConfig,
@@ -857,6 +866,9 @@ export function auditWebSession(input: {
       soul: input.config.appendSystemPrompt,
       ...(input.contractBlock !== undefined ? { contractBlock: input.contractBlock } : {}),
       ...(contractSource !== undefined ? { contractSource } : {}),
+      ...(typeof input.session.systemPrompt === "string"
+        ? { assembledSystemPrompt: input.session.systemPrompt }
+        : {}),
       restoredHistory: 0,
       historySourceChanged,
     }),
@@ -1114,8 +1126,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   let openrouterKey: string | undefined;
   return async ({ sessionManager }) => {
     // PIN the agent's own identity + directory. A resumed or imported session
-    // records its own cwd and agent dir; bob's agent is bob's agent.
-    const cwd = config.cwd;
+    // records its own cwd and agent dir; bob's agent is bob's agent. (A web
+    // session's directory is pinned too: to "/", below.)
     const agentDir = config.piAgentDir;
 
     // bob#230: the confined read, decided FIRST — before any environment change,
@@ -1137,12 +1149,17 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       tools: policy.tools,
       excludeTools: policy.excludeTools,
     });
-    if (holdsWeb(composing)) {
+    const webSession = holdsWeb(composing);
+    if (webSession) {
       assertWebComposition({
         ...composing,
         restoredHistory: restoredHistoryEntries(sessionManager),
       });
     }
+    // A web session has no workspace: pi's working directory is "/", because
+    // every prompt template pi has ends with that directory (data-class.ts).
+    // Every other session runs in the agent's own work directory.
+    const cwd = webSession ? WEB_SESSION_CWD : config.cwd;
 
     // bob#214: the model's declared window, for THIS session's provider/model,
     // or a refusal naming the remedy — before any key is read or any runtime
@@ -1219,6 +1236,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         {
           ...(guard !== undefined ? { guard } : {}),
           ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
+          ...(webSession ? { webSession: true } : {}),
         },
       ),
     });
@@ -1282,7 +1300,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // bob#244: the web composition rule on the composed session (a no-op for
       // a session that holds no web).
       auditWebSession({
-        session: result.session as unknown as AuditSession & { sessionManager?: unknown },
+        session: result.session as unknown as AuditSession & {
+          sessionManager?: unknown;
+          systemPrompt?: unknown;
+        },
         loader: services.resourceLoader as unknown as AuditExtensions & StartupSource,
         config,
         ...(contractBlock !== undefined ? { contractBlock } : {}),

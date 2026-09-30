@@ -20,10 +20,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { capabilityConfigEnv, resolveCapabilities } from "../../src/shell/capability-loader.js";
-import { WebCompositionError } from "../../src/shell/data-class.js";
+import { WebCompositionError, webSessionSystemPrompt } from "../../src/shell/data-class.js";
 import { initAgent } from "../../src/shell/init.js";
 import { type RunSessionConfig, resolveRunConfig } from "../../src/shell/run.js";
-import { createBobRuntimeFactory } from "../../src/shell/session.js";
+import {
+  auditWebSession,
+  contractBlockFor,
+  createBobRuntimeFactory,
+} from "../../src/shell/session.js";
 import type { ToolPolicy } from "../../src/shell/tool-allowlist.js";
 
 // The env the factory writes (capability configs, the runtime-mode signal) is
@@ -60,8 +64,8 @@ interface Agent {
 
 // A real agent on disk (bob.yaml, soul.md, .pi-agent) whose session config is
 // then pointed at the capabilities under test. Everything lives under `root`.
-function scaffold(): Agent {
-  const agentsRoot = join(root, "agents");
+function scaffold(parent = "agents"): Agent {
+  const agentsRoot = join(root, parent);
   const res = initAgent({
     name: "webbot",
     role: "ea",
@@ -138,6 +142,8 @@ async function build(
   });
   const session = result.session as unknown as {
     getActiveToolNames(): string[];
+    readonly systemPrompt: string;
+    readonly sessionManager: unknown;
     reload(options?: unknown): Promise<void>;
     bindExtensions(bindings: unknown): Promise<void>;
     dispose(): void;
@@ -150,6 +156,7 @@ async function build(
   };
   return {
     session,
+    cwd: result.services.cwd,
     loader: result.services.resourceLoader,
     logs,
     exits,
@@ -189,6 +196,98 @@ describe("the control: a public-only web session is composed", () => {
       await built.session.bindExtensions({});
       await built.session.reload();
       expect(built.exits).toEqual([]);
+    } finally {
+      built.session.dispose();
+    }
+  });
+});
+
+describe("the system prompt a web session sends names nothing local", () => {
+  // The agent lives under a directory whose name must never reach a web
+  // session's prompt.
+  const MARKER = "SENSITIVE-private-dir-7f3a";
+  const TASK = "fetch the page the operator named";
+
+  it("a real web session sends bob's reviewed prompt: no working directory, no pi install path", async () => {
+    const agent = scaffold(join(MARKER, "agents"));
+    expect(agent.cwd).toContain(MARKER);
+    const composed = compose(agent, {
+      capabilities: ["fixture", "web"],
+      tools: ["bob_fixture_noop"],
+      taskContract: TASK,
+    });
+    const built = await build(agent, composed);
+    try {
+      expect(built.cwd, "a web session has no workspace").toBe("/");
+      const block = contractBlockFor(composed.config) as string;
+      expect(built.session.systemPrompt).toBe(webSessionSystemPrompt([block]));
+      expect(built.session.systemPrompt).not.toContain(MARKER);
+      expect(built.session.systemPrompt).not.toContain(agent.cwd);
+      expect(built.session.systemPrompt).not.toContain("pi-coding-agent");
+      // The prompt still holds after a bind and a reload (pi rebuilds it).
+      await built.session.bindExtensions({});
+      await built.session.reload();
+      expect(built.session.systemPrompt).toBe(webSessionSystemPrompt([block]));
+      expect(built.exits).toEqual([]);
+    } finally {
+      built.session.dispose();
+    }
+  });
+
+  it("the control: the same agent WITHOUT web sends pi's template, which names both", async () => {
+    const agent = scaffold(join(MARKER, "agents"));
+    const built = await build(
+      agent,
+      compose(agent, {
+        capabilities: ["fixture"],
+        tools: ["bob_fixture_noop"],
+        taskContract: TASK,
+      }),
+    );
+    try {
+      expect(built.cwd).toBe(agent.cwd);
+      expect(built.session.systemPrompt).toContain(`Current working directory: ${agent.cwd}`);
+      expect(built.session.systemPrompt).toContain(MARKER);
+      expect(built.session.systemPrompt).toContain("pi-coding-agent");
+    } finally {
+      built.session.dispose();
+    }
+  });
+
+  it("the audit refuses a real session whose assembled prompt names local paths", async () => {
+    // pi's own template, with the sensitive working directory, read by the
+    // real audit as if the session held web: only the assembled prompt is wrong.
+    const agent = scaffold(join(MARKER, "agents"));
+    const composed = compose(agent, {
+      capabilities: ["fixture"],
+      tools: ["bob_fixture_noop"],
+      taskContract: TASK,
+    });
+    const built = await build(agent, composed);
+    try {
+      const asWeb = {
+        ...composed.config,
+        capabilityBySource: Object.fromEntries(
+          Object.keys(composed.config.capabilityBySource ?? {}).map((source) => [source, "web"]),
+        ),
+      };
+      const audit = () =>
+        auditWebSession({
+          session: built.session,
+          loader: built.loader,
+          config: asWeb,
+          contractBlock: contractBlockFor(composed.config) as string,
+          checkedSessionManager: built.session.sessionManager,
+        });
+      expect(audit).toThrow(WebCompositionError);
+      expect(audit).toThrow("the system prompt pi assembled is not the reviewed web prompt");
+      let message = "";
+      try {
+        audit();
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).not.toContain(MARKER);
     } finally {
       built.session.dispose();
     }
