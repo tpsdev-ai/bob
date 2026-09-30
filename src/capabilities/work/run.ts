@@ -464,7 +464,7 @@ function assertStillPinned(
     real = ops.realpath(dir);
   } catch (err) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): it was removed, or a component of its path was replaced, after it was checked. Nothing was started.`,
+      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): resolving it failed, so whether it is still the directory that was checked is unknown. Nothing was started.`,
     );
   }
   if (!isInsideCanonical(workspace, real)) {
@@ -492,10 +492,10 @@ function assertStillPinned(
   }
 }
 
-// Open and verify the pin. On a failure after the open, the descriptor is
-// closed before the refusal is thrown, and the refusal says how that close went:
-// "closed" only when the close returned, "unknown" when it failed (a failed close
-// may or may not have released the descriptor, and this code cannot tell).
+// Open and verify the pin. On a failure after the open, closing the descriptor is
+// ATTEMPTED before the refusal is thrown, and the refusal says how that close
+// went: "closed" only when the close returned, "unknown" when it failed (a failed
+// close may or may not have released the descriptor; this code cannot tell).
 function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
   let fd: number;
   try {
@@ -539,27 +539,46 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
   // Still refusing, whatever the close does: nothing is started either way. A
   // failed close is REPORTED, never suppressed, so the refusal never claims a
   // closure that did not happen.
-  try {
-    ops.close(fd);
-  } catch (err) {
-    throw new RunRefusal(
-      `${failure.message} Closing the descriptor that pinned it then failed (${errCode(err)}), so whether that descriptor is still open is unknown.`,
-    );
-  }
-  throw new RunRefusal(`${failure.message} The descriptor that pinned it was closed.`);
+  const closeFailed = closePin(ops, fd);
+  throw new RunRefusal(
+    `${failure.message} ${closeFailed ?? "The descriptor that pinned it was closed."}`,
+  );
 }
 
-// Release the pin. Called BEFORE the spawn, so a failed close refuses with
-// nothing started instead of failing after a child exists. A failed close may or
-// may not have released the descriptor: the refusal says that it is unknown.
-function releasePin(ops: DirPinOps, dir: string, pin: DirPin): void {
+// Close a pin's descriptor. Null when the close returned; otherwise the sentence a
+// refusal carries: the close failed, so whether the descriptor is still open is
+// unknown (a failed close may or may not have released it).
+function closePin(ops: DirPinOps, fd: number): string | null {
   try {
-    ops.close(pin.fd);
+    ops.close(fd);
+    return null;
   } catch (err) {
+    return `Closing the descriptor that pinned it then failed (${errCode(err)}), so whether that descriptor is still open is unknown.`;
+  }
+}
+
+// Release the pin, BEFORE the spawn, after the final re-check. `recheck` holds
+// that re-check's failure, if it failed. Throws when either failed, and reports
+// BOTH: a failed close is never dropped because the re-check already refused,
+// and a release that fails leaves the descriptor's state unknown, which the
+// refusal says. Nothing is started in any of these cases.
+function releasePin(
+  ops: DirPinOps,
+  dir: string,
+  pin: DirPin,
+  recheck: { err: unknown } | null,
+): void {
+  const closeFailed = closePin(ops, pin.fd);
+  if (recheck === null) {
+    if (closeFailed === null) return;
     throw new RunRefusal(
-      `run refused: closing the descriptor that pinned the working directory ${dir} failed (${errCode(err)}), so whether that descriptor is still open is unknown. Nothing was started: the pin is released before the spawn, so no command starts after a failed release; retry.`,
+      `run refused: the working directory ${dir} passed its final re-check. ${closeFailed} Nothing was started: a release that fails refuses before the spawn; retry.`,
     );
   }
+  if (closeFailed === null) throw recheck.err;
+  const first =
+    recheck.err instanceof Error ? recheck.err.message : `run refused: ${String(recheck.err)}.`;
+  throw new RunRefusal(`${first} ${closeFailed}`);
 }
 
 // An owner-only directory: a real directory (not a symlink), owned by this user,
@@ -668,7 +687,8 @@ export interface Excerpt {
   bytes: number;
   // Bytes of an unterminated final line withheld (only when `complete` is false).
   withheld: number;
-  // The capture could not be opened as a regular file (removed, or replaced).
+  // The capture could not be read as a regular file: the no-follow open failed,
+  // or what it opened is not a regular file.
   missing: boolean;
 }
 
@@ -981,25 +1001,21 @@ export class JobManager {
     // Node names a child's cwd by string, so this NARROWS the window in which they
     // can differ rather than closing it (see "the cwd pin" above, and the README):
     // pin the resolved directory and verify it, re-check it, release the pin, and
-    // only then spawn. Every pin step refuses with nothing started, and none runs
-    // after the spawn. The test seams are synchronous and called only when set.
+    // only then spawn. A failure in any pin step refuses with nothing started, and
+    // no pin step runs after the spawn. The test seams are synchronous and called
+    // only when set.
     let child: ChildProcess;
     try {
       this.beforePin?.(cwd);
       const pin = pinDirectory(this.dirPinOps, cwd, workspace);
-      let failure: unknown = null;
+      let recheck: { err: unknown } | null = null;
       try {
         this.beforeSpawn?.(cwd);
         assertStillPinned(this.dirPinOps, cwd, workspace, pin, "immediately before the spawn");
       } catch (err) {
-        failure = err;
+        recheck = { err };
       }
-      try {
-        releasePin(this.dirPinOps, cwd, pin);
-      } catch (err) {
-        failure ??= err;
-      }
-      if (failure !== null) throw failure;
+      releasePin(this.dirPinOps, cwd, pin, recheck);
       // Detached: the child leads its own session and process group
       // (pgid = its pid), as pi's bash tool starts Unix commands. stdin is
       // closed, as in pi's bash; the environment is bob's own (pi's bash also

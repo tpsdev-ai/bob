@@ -762,9 +762,11 @@ describe("run — refusals name actor, state and remedy", () => {
 });
 
 describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", () => {
-  // Every refusal here runs a command that writes a MARKER outside the workspace
-  // by absolute path: had the command started anywhere — registered as a job or
-  // not — the marker would exist. An empty job list alone would not prove that.
+  // Every cwd and pin refusal test here runs a command that writes a MARKER
+  // outside the workspace by absolute path: had the command started anywhere —
+  // registered as a job or not — the marker would exist. An empty job list alone
+  // would not prove that. (The live-job-limit test runs `sleep` instead and
+  // checks the registration and the limit's refusal.)
   function marker(): { file: string; command: string } {
     const dir = join((live as LiveWork).scratch, "marker");
     mkdirSync(dir);
@@ -941,6 +943,9 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
       live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
     );
     expect(err.message).toContain("could not be re-resolved immediately before the spawn (EIO)");
+    // An EIO establishes neither a removal nor a replacement: no cause is claimed.
+    expect(err.message).toContain("resolving it failed");
+    expect(err.message).not.toMatch(/removed|replaced/);
     await expectNothingStarted(m.file);
   }, 20_000);
 
@@ -1083,13 +1088,74 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     const err = await refusalOf(
       live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
     );
-    expect(err.message).toContain("closing the descriptor that pinned the working directory");
+    expect(err.message).toContain("passed its final re-check");
     expect(err.message).toContain(
-      "failed (EIO), so whether that descriptor is still open is unknown",
+      "Closing the descriptor that pinned it then failed (EIO), so whether that descriptor is still open is unknown",
     );
-    expect(err.message).not.toMatch(/\b(was|is) closed\b/i);
+    expect(err.message).not.toMatch(/\b(was|is) (closed|released)\b/i);
     expect(err.message).toContain("Nothing was started");
     await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("a FINAL re-check that fails, then a release close that throws BEFORE closing: run refuses and reports both", async () => {
+    const opened: number[] = [];
+    let closeAttempts = 0;
+    let outside = "";
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      open: (p, flags) => {
+        const fd = NODE_DIR_PIN_OPS.open(p, flags);
+        opened.push(fd);
+        return fd;
+      },
+      // Throws WITHOUT closing: the descriptor really is still open afterwards.
+      close: () => {
+        closeAttempts += 1;
+        throw failure("EINTR");
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        // The pin was verified; the FINAL re-check then fails: the pinned
+        // directory is moved outside the workspace and linked to.
+        beforeSpawn: () => {
+          const ws = (live as LiveWork).cwd;
+          renameSync(join(ws, "sub"), join(outside, "sub"));
+          symlinkSync(join(outside, "sub"), join(ws, "sub"), "dir");
+        },
+      },
+    });
+    outside = outsideDir();
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    try {
+      const err = await refusalOf(
+        live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+      );
+      // The re-check's failure ...
+      expect(err.message).toContain("now resolves outside the workspace");
+      expect(err.message).toContain("immediately before the spawn");
+      // ... AND the failed close, with the descriptor's state unknown.
+      expect(err.message).toContain("Closing the descriptor that pinned it then failed (EINTR)");
+      expect(err.message).toContain("whether that descriptor is still open is unknown");
+      expect(err.message).not.toMatch(/\b(was|is) (closed|released)\b/i);
+      expect(closeAttempts).toBe(1);
+      // The case is real: the descriptor the refusal does not vouch for IS open.
+      expect(opened.length).toBe(1);
+      expect(fstatSync(opened[0]).isDirectory()).toBe(true);
+      await expectNothingStarted(m.file);
+    } finally {
+      // The injected close never closed it; close it here so it does not leak.
+      for (const fd of opened) {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed
+        }
+      }
+    }
   }, 20_000);
 
   it("a cleanup close that throws BEFORE closing is reported: run refuses, starts nothing, and does not claim the descriptor closed", async () => {
