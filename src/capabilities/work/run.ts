@@ -420,10 +420,10 @@ const errCode = (err: unknown): string =>
 // after the open, a close that throws before or after it closes — and see the
 // refusal, what it says about the descriptor, and that nothing starts.
 // Production uses NODE_DIR_PIN_OPS.
-// Device and inode are bigints, compared at full 64-bit precision: as a number,
-// a device or inode above Number.MAX_SAFE_INTEGER loses its low bits, so two
-// different directories could compare equal (some network, overlay and snapshot
-// file systems report such values).
+// Device and inode are bigints, compared at full 64-bit precision: not every
+// integer above Number.MAX_SAFE_INTEGER is representable as a number, so two
+// distinct device or inode values can compare equal as numbers (some network,
+// overlay and snapshot file systems report such values).
 export interface DirStat {
   dev: bigint;
   ino: bigint;
