@@ -15,5 +15,7 @@ export const reachyManifest: BobCapabilityManifest = {
     // serves: true — in S1 the capability injects inbound turns (speech
     // addressed to jarvis). S3 registers the tools and consumes events.
     serves: true,
+    // Private: speech and camera frames from the room.
+    dataClass: "private",
   },
 };

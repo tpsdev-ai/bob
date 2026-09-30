@@ -125,6 +125,8 @@ export const CONFIG_FIELD_CLASSES: Readonly<
   fixture: { greeting: "not-a-credential" },
   "anchored-edit": {},
   work: {},
+  // bob#244: settings only (a boolean and three integers); no string field.
+  web: {},
 });
 
 // The credential fields of one block, derived from the inventory.

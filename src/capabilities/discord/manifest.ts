@@ -20,5 +20,7 @@ export const discordManifest: BobCapabilityManifest = {
   provides: {
     tools: ["discord_reply", "discord_react", "discord_fetch"],
     serves: true,
+    // Private: inbound turns and discord_fetch carry channel and DM messages.
+    dataClass: "private",
   },
 };
