@@ -3,7 +3,7 @@
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` carries the migrated list
 // entries reordered by category and filename, and apart from that order they
-// differ only by the ten repairs the migration tests name and the whitespace
+// differ only by the eleven repairs the migration tests name and the whitespace
 // trimmed at the end of each fragment (the block body's two HTML comment
 // markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
 // and do not render); `promote`
@@ -484,19 +484,19 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
-  // would go red on the release PR. `unreleased-main-17a3f7f0.md` is the body
-  // of main's [Unreleased] block (its heading excluded) at 17a3f7f0, the main
+  // would go red on the release PR. `unreleased-main-3a41dad7.md` is the body
+  // of main's [Unreleased] block (its heading excluded) at 3a41dad7, the main
   // commit whose entries were migrated, before they moved into fragments;
   // `migrated-bob-236/` is the fragment set made from it, every list entry of
   // that body included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
-  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-17a3f7f0.md"), "utf8"));
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-3a41dad7.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The ten entries the migration changed, each as EXACT edits of main's text
+  // The eleven entries the migration changed, each as EXACT edits of main's text
   // (applied in order, each `from` found exactly once) plus every word that
-  // disappears from the entry (`dropped`). Four were changed to pass `check`
-  // (fixed-17, fixed-19, added-09, fixed-bob225; fixed-19 was also corrected), and six more were
+  // disappears from the entry (`dropped`). Five were changed to pass `check`
+  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and six more were
   // corrected because they no longer matched bob's code or the rendered order.
   // Every other entry is main's text unchanged (whitespace at its end aside). A
   // new difference, or a word that vanishes without being listed, fails. That
@@ -561,6 +561,18 @@ describe("changelog fragments — the migration (bob#236)", () => {
         [
           "- **After a mid-run compaction checkpoint, over-threshold tool turns do not checkpoint again for the same threshold until a valid reading at or below the threshold re-arms the check, and `bob doctor` reports a missing `provider.context_window` (bob#225).**",
           "- **After a mid-run compaction checkpoint, the check does not checkpoint again for that threshold until it re-arms, and `bob doctor` reports a missing `provider.context_window` (bob#225).** Over-threshold tool turns do not checkpoint again for the same threshold until a valid reading at or below the threshold re-arms the check.",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "fixed-bob228-install-service-writes-a-stable-node-path.md",
+      was: "- **`bob install-service` run from an interpreter named `node` writes",
+      why: 'An over-long lede (33 words, two sentences by the check\'s count: "e.g. " is a break), reshaped; the text it moved opens the body, and no word is dropped.',
+      edits: [
+        [
+          "- **`bob install-service` run from an interpreter named `node` writes that interpreter's own path unless a trusted PATH symlink resolves to the same file, e.g. `/opt/homebrew/bin/node` instead of a versioned Homebrew Cellar path (bob#228).**",
+          "- **`bob install-service` run from an interpreter named `node` writes that interpreter's own path unless a trusted PATH symlink resolves to the same file (bob#228).** It writes, e.g., `/opt/homebrew/bin/node` instead of a versioned Homebrew Cellar path.",
         ],
       ],
       dropped: [],
