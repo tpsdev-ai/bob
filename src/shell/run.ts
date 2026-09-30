@@ -1842,8 +1842,8 @@ function resolveProviderAndModel(
   name: string,
 ): { provider: string; model: string } {
   const bobProvider = readProviderField(yamlText, "name");
-  const model = readProviderField(yamlText, "model");
-  if (!bobProvider || !model) {
+  const model = declaredProviderModel(yamlText);
+  if (!bobProvider || model === undefined) {
     throw new Error(`bob run ${name}: bob.yaml is missing provider.name and/or provider.model`);
   }
   const provider = mapBobProviderToPi(bobProvider);
@@ -1853,6 +1853,15 @@ function resolveProviderAndModel(
   // validation so both refuse identically.
   assertProviderRunnable(provider, `bob run ${name}`);
   return { provider, model };
+}
+
+// provider.model as the session resolver reads it: the scalar text under
+// `provider:`, surrounding quotes stripped; an empty value is not a model.
+// Exported so `bob doctor` decides whether a model is declared the same way a
+// session does (bob#225): `model: 123` is the model "123" to both.
+export function declaredProviderModel(yamlText: string): string | undefined {
+  const model = readProviderField(yamlText, "model");
+  return model ? model : undefined;
 }
 
 // Read a scalar `key: value` field from inside the top-level `provider:` block.
