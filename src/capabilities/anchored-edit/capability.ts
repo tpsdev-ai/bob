@@ -51,6 +51,12 @@ export interface WireOptions {
 const ANCHOR_DOC =
   "An anchor token is `L<n>#<h>`: line number n, and h = 8 lowercase hex of FNV-1a 32 over the line's UTF-8 bytes with its terminator and a trailing CR stripped. `L0` addresses the position before line 1. The token is stable and unseeded; a line number is never folded into h.";
 
+// The anchor-prefix guard, as each mutating tool describes it: what it matches
+// (a shape, not where the text came from), when its refusal is the one returned,
+// and what to do about it.
+const PREFIX_GUARD_DOC = (field: string): string =>
+  `If any line of ${field} begins with the read_lines anchor prefix shape (L<n>#<h> and a space, where <h> is 8 lowercase hex characters), the call is refused and nothing is written. When the call's earlier checks pass, that refusal names the first matching line; a call an earlier check refuses gets that refusal instead. If the text was copied from read_lines output, strip the prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
+
 function ok(text: string, details: Record<string, unknown>): ToolOutput {
   return { content: [{ type: "text", text }], details };
 }
@@ -134,6 +140,7 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
       `Replace the range from the 'from' anchor to the 'to' anchor INCLUSIVE with new_text, or delete it when new_text is empty. ` +
       `${ANCHOR_DOC} BOTH ends are anchors from read_lines; every call also needs the current F# (a fingerprint). A stale anchor or fingerprint is refused as stale, naming the expected and observed tokens and a re-read window. ` +
       `new_text is split into logical lines on LF or CRLF; a trailing separator's final empty segment is discarded, so "\\n" is one blank line. ` +
+      `${PREFIX_GUARD_DOC("new_text")} ` +
       `A line longer than 2000 characters cannot be edited. A call that would remove or replace more than half the file is refused by the rewrite tripwire.`,
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
@@ -171,6 +178,7 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
     description:
       `Insert text after an existing line anchor, or use L0 to insert before line 1 (valid for any existing file, including an empty one). ` +
       `${ANCHOR_DOC} Every call needs the current F#. text is split like edit_lines; empty text is refused. ` +
+      `${PREFIX_GUARD_DOC("text")} ` +
       `Pure insertions are NOT counted by the rewrite tripwire (they destroy no existing content).`,
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
@@ -195,7 +203,8 @@ export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
     name: "write_file",
     label: "Write File",
     description:
-      "Create a NEW file, exclusively. Takes no fingerprint. Refuses if any directory entry already exists at the path (including a dangling symlink); this tool never replaces an existing file.",
+      "Create a NEW file, exclusively. Takes no fingerprint. Refuses if any directory entry already exists at the path (including a dangling symlink); this tool never replaces an existing file. " +
+      PREFIX_GUARD_DOC("content"),
     parameters: Type.Object({
       path: Type.String({ minLength: 1 }),
       content: Type.String(),
