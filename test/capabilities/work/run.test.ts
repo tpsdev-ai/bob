@@ -876,6 +876,34 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     await expectNothingStarted(m.file);
   }, 20_000);
 
+  it("(c) refuses when an INTERMEDIATE component is replaced by a symlink to another directory INSIDE the workspace, after the pin", async () => {
+    live = await workSession({
+      script: program(),
+      wire: {
+        // Move the pinned directory's parent elsewhere INSIDE the workspace and
+        // link to it from the old name. The path still leads to the pinned
+        // directory (same device + inode) and still resolves inside the
+        // workspace, but to a different canonical path: only the canonical-path
+        // comparison can refuse it.
+        beforeSpawn: () => {
+          const ws = (live as LiveWork).cwd;
+          renameSync(join(ws, "a"), join(ws, "c"));
+          symlinkSync(join(ws, "c"), join(ws, "a"), "dir");
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "a", "b"), { recursive: true });
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "a/b" }, live.cwd),
+    );
+    expect(err.message).toContain(`now resolves to ${realpathSync(join(live.cwd, "c", "b"))}`);
+    expect(err.message).toContain(
+      "immediately before the spawn, not to the canonical path that was checked",
+    );
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
   it("refuses when the cwd is replaced by ANOTHER directory inside the workspace after the pin", async () => {
     live = await workSession({
       script: program(),

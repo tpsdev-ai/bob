@@ -253,7 +253,10 @@ change one, the named test is what tells you.
   symlinks, to a directory inside the workspace; it is re-checked against a
   pinned identity immediately before the spawn, which narrows, but does not
   close, the window before the command starts in which a replaced path
-  component could change where it starts. The command's `outcome` and the
+  component could change where it starts. The pin is taken after `cwd` is
+  resolved, so a replacement between resolution and the pin that keeps the same
+  canonical path inside the workspace becomes the pinned directory. The
+  command's `outcome` and the
   verified `cleanup_state` are reported separately, and only a clean exit 0 is
   success. `run` counts as a shell for the resident
   policy. It is a process-group backend running as the same user, not a sandbox.

@@ -22,10 +22,10 @@ command starts in the workspace. It must be an existing directory, and after
 symlinks are resolved it must be inside the workspace when it is checked;
 otherwise `run` refuses the call, naming the path it resolved, and starts
 nothing. A path that cannot be resolved is refused too: whether it is inside is
-then unknown. This confines where a command starts (up to the window described
+then unknown. This confines where a command starts (up to the windows described
 next), not what it can reach: the command itself can still change directory.
 
-**Where a command starts, and the window that remains (bob#224).** Checking
+**Where a command starts, and the windows that remain (bob#224).** Checking
 `cwd` and starting the command are separate steps, and Node names a child's
 working directory by a string that the child resolves again when it changes into
 it. So `run` cannot make the directory a command starts in *be* the one it
@@ -58,14 +58,16 @@ close may or may not have released it. When the final re-check failed as well,
 the refusal reports both failures. The refusal says the descriptor was closed
 only when the close returned.
 
-The re-check NARROWS the race; it does not close it. A window remains from the
-last re-check until the child has changed directory, because the child's
-`chdir` re-resolves the path by name. A component replaced in that window can
-change where the command starts or prevent startup; the re-check cannot detect
-a later replacement. Closing the window needs a directory-descriptor boundary
-(`fchdir`, or resolution beneath an open directory) that Node does not offer a
-child; a helper that changes into the pinned directory before running the
-command would be OS-specific, so bob does not ship one. See Limits.
+The re-check NARROWS the race; it does not close it. Among the windows that
+remain, one is before the pin: the pin is taken after `cwd` is resolved (step 1
+comes before step 2; see Limits). Another runs from the last re-check until the
+child has changed directory, because the child's `chdir` re-resolves the path
+by name. A component replaced in that window can change where the command
+starts or prevent startup; the re-check cannot detect a later replacement.
+Closing that window needs a directory-descriptor boundary (`fchdir`, or
+resolution beneath an open directory) that Node does not offer a child; a
+helper that changes into the pinned directory before running the command would
+be OS-specific, so bob does not ship one. See Limits.
 
 The pin opens the directory for reading: Node has no search-only open. A
 directory with search but not read permission is therefore refused, although a
@@ -268,6 +270,11 @@ named error.
   cannot be closed from here. A live supervisor with no pinned identity whose
   event loop stalls for more than 10 minutes reads as dead to another bob's
   sweep, which then deletes that run's captures.
+- **The pin is taken after `cwd` is resolved.** A replacement between the
+  resolution and the pin that keeps the same canonical path inside the workspace
+  becomes the pinned directory, and the re-checks, which compare against the
+  pin, do not detect it. Containment still holds: the re-check as the pin is
+  taken still requires that path to resolve inside the workspace.
 - **The `cwd` re-check narrows the race between the check and the start; it
   does not close it.** A path component replaced after the last re-check and
   before the child has changed directory is not detected (see "Where a command
