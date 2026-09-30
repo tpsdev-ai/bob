@@ -3,8 +3,8 @@
 // scripts/changelog-fragments.mjs (flair#835).
 //
 // PROBLEM. A PR's changelog entry went into the single `[Unreleased]` block at
-// the top of CHANGELOG.md, so two PRs that each added an entry edited the same
-// lines and the second to merge conflicted. The cost is not the
+// the top of CHANGELOG.md, so two PRs that each added an entry could make
+// overlapping edits there, and the second to merge could conflict. The cost is not the
 // resolution — it is that a merge/rebase to resolve DISMISSES the existing
 // approvals, so every conflict buys a full second review round for zero content
 // change. (bob's own [Unreleased] had also drifted into repeated
@@ -25,8 +25,10 @@
 //
 // FILE CONTENT: the entry as it should appear under its `### Category` heading,
 // INCLUDING the leading `- ` and a 2-space indent on every continuation line.
-// Reading trims the whitespace at the end of the file; assembly then joins the
-// fragments as read: no reflow, no re-indent, no re-wrapping. That is
+// Reading decodes the file as UTF-8 and refuses it by name when its bytes are not
+// valid UTF-8, instead of reading them with replacement characters; it then
+// trims the whitespace at the end of the file. Assembly joins the fragments as
+// read: no reflow, no re-indent, no re-wrapping. That is
 // deliberate. The failure this design exists to prevent is silent
 // content loss, and every normalisation step is somewhere content can be
 // silently altered. A fragment that does not already look like a list item is a
@@ -262,6 +264,24 @@ export function validateLede(relPath, body) {
   if (msg) throw new FragmentError(msg);
 }
 
+// Fatal UTF-8 decoding for every file this script reads (fragments and
+// CHANGELOG.md): bytes that are not valid UTF-8 are refused by the file's name,
+// not decoded with U+FFFD replacement characters that `check` would pass and
+// `promote` would write back. A leading byte-order mark is kept, as the plain
+// `utf8` read kept it.
+const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+function decodeUtf8OrThrow(bytes, what) {
+  try {
+    return UTF8_FATAL.decode(bytes);
+  } catch {
+    throw new FragmentError(
+      `${what}: not valid UTF-8, so it is refused rather than read with replacement characters; ` +
+        `nothing was written. Save it as UTF-8.`,
+    );
+  }
+}
+
 // Read every fragment in `dir`. Dotfiles are ignored (.DS_Store, .gitkeep);
 // README.md documents the convention and is not a fragment. EVERYTHING else is
 // parsed, and a file that will not parse throws — a fragment directory that
@@ -326,7 +346,7 @@ export function readFragments(dir = FRAGMENT_DIR) {
         );
       }
       ({ category, slug } = parseFragmentName(name));
-      body = readFileSync(fd, "utf8");
+      body = decodeUtf8OrThrow(readFileSync(fd), `${FRAGMENT_DIR_REL}/${name}`);
     } finally {
       closeSync(fd);
     }
@@ -466,7 +486,7 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
   // header is an error, not "no stray entries ⇒ OK" — otherwise the PR-time
   // check is weaker than the release-time one and a mangled header sails through
   // CI green and detonates mid-release-cut (flair#953).
-  const changelogLines = readFileSync(changelogPath, "utf8").split("\n");
+  const changelogLines = decodeUtf8OrThrow(readFileSync(changelogPath), "CHANGELOG.md").split("\n");
   const heading = findUnreleasedHeading(changelogLines);
   if (heading.problem !== undefined) {
     throw new FragmentError(
@@ -519,7 +539,7 @@ export function promote(
         `Add the entries for this release before running the release step.`,
     );
   }
-  const text = readFileSync(changelogPath, "utf8");
+  const text = decodeUtf8OrThrow(readFileSync(changelogPath), "CHANGELOG.md");
   const lines = text.split("\n");
   const heading = findUnreleasedHeading(lines);
   if (heading.problem !== undefined) {

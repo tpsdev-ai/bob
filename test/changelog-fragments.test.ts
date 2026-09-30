@@ -16,6 +16,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -124,6 +125,8 @@ describe("changelog fragments — check (bob#236)", () => {
     expect(cf.countLedeSentences("Version 1.2.3 and scripts/x.mjs ship.")).toBe(1);
     expect(cf.countLedeSentences("First. Second.")).toBe(2);
     expect(cf.countLedeSentences("First!\nSecond?")).toBe(2);
+    expect(cf.countLedeSentences("First.\tSecond.")).toBe(2);
+    expect(cf.countLedeSentences("First.\u00a0Second.")).toBe(2);
   });
 
   it("REFUSES a fragment with no bold lede", () => {
@@ -439,6 +442,38 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(tryPromote).toThrow("untracked (not in the index): CHANGELOG.md");
     expect(readFileSync(changelogPath, "utf8")).toBe(edited);
     expect(names()).toEqual(["fixed-a.md", "fixed-b.md", "fixed-new.md"]);
+  });
+
+  // Every file is decoded as fatal UTF-8: bytes that are not valid UTF-8 are
+  // refused by name, never read as U+FFFD and passed or written back.
+  it("REFUSES a fragment that is not valid UTF-8, naming it, in check and in promote, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    writeFileSync(
+      join(dir, "fixed-bad-utf8.md"),
+      Buffer.concat([Buffer.from("- **OK.** "), Buffer.from([0xff]), Buffer.from("\n")]),
+    );
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const msg = ".changelog/unreleased/fixed-bad-utf8.md: not valid UTF-8";
+    expect(() => cf.check({ dir, changelogPath })).toThrow(msg);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readdirSync(dir).sort()).toEqual(["fixed-a.md", "fixed-bad-utf8.md"]);
+  });
+
+  it("REFUSES a CHANGELOG.md that is not valid UTF-8, in check and in promote, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const bad = Buffer.concat([readFileSync(changelogPath), Buffer.from([0xff, 0x0a])]);
+    writeFileSync(changelogPath, bad);
+    stageAll();
+    expect(() => cf.check({ dir, changelogPath })).toThrow("CHANGELOG.md: not valid UTF-8");
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      "CHANGELOG.md: not valid UTF-8",
+    );
+    expect(readFileSync(changelogPath).equals(bad)).toBe(true);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
   // Permission bits do not bind root, so these two cannot fail a write as root.
@@ -802,7 +837,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
 });
 
 // Acceptance: two PRs whose fragments have DISTINCT filenames merge in either
-// order with no conflict. Two real branches in a temp git repo: B merged into A,
+// order with no changelog conflict. Two real branches in a temp git repo: B merged into A,
 // and separately A's original commit merged into B; both fragments must be
 // present after each merge. (Two PRs that add the SAME filename with different
 // contents can conflict on that file; the README says so.)

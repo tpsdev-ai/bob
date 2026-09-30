@@ -34,16 +34,20 @@ the leading `- ` and a 2-space indent on every continuation line:
 ```
 
 **The bold lede is required: non-empty, ≤ 25 words, with no sentence break.** A
-sentence break is a `.`, `!` or `?` followed by a space or line break inside the
-lede; `check` counts nothing else as one, so `First.Second.` passes. The lede is
+sentence break is a `.`, `!` or `?` followed by whitespace inside the lede:
+any character JavaScript's `\s` matches, including a space, a tab, a line
+break and the non-breaking space. `check` counts nothing else as one, so
+`First.Second.` passes. The lede is
 the entry's summary, the line a reader skims first. The GitHub release carries
 the whole `## [<version>]` section (`scripts/changelog-extract.mjs`), so detail
 is never cut; it belongs in the body, where it reads as detail. `check` fails
 naming the fragment and this rule, and gives the word count when the lede is
 too long.
 
-Reading a fragment trims the whitespace at the end of the file; nothing else is
-changed. Assembly joins the fragments as read — no reflow, no re-indent, no
+Reading a fragment decodes it as UTF-8 and refuses it, by name, if its bytes are
+not valid UTF-8, instead of reading them with replacement characters; `check`
+and `promote` read `CHANGELOG.md` the same way. Reading then trims the
+whitespace at the end of the file and changes nothing else. Assembly joins the fragments as read — no reflow, no re-indent, no
 rewrapping — so tables and nested code blocks come through unchanged. The flip
 side is that a fragment which is not already a well-formed list item is a hard
 error rather than something the tooling quietly fixes up: silent normalisation
