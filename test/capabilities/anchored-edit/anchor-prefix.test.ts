@@ -1,11 +1,12 @@
 // bob#223: a model that copies read_lines output into new text keeps the
 // `L<n>#<8 hex> ` prefixes. edit_lines / insert_after / write_file refuse text
 // in which any line starts with that rendered shape, naming the first offending
-// line. No tool parameter turns the guard off; only the operator's anchored-edit
-// config (`anchorPrefixPaths` in bob.yaml) exempts a named file.
+// line. No tool argument and no config turns the guard off, and there is no
+// escape hatch: #223 asked for one, but no channel the agent cannot write exists
+// for it yet, so such content is written outside these tools.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CONFIG_ENV_VAR,
@@ -19,7 +20,6 @@ import {
   Refusal,
   renderReadLines,
 } from "../../../src/capabilities/anchored-edit/core.js";
-import anchoredEditExtension from "../../../src/capabilities/anchored-edit/index.js";
 import { resolveCapabilities } from "../../../src/shell/capability-loader.js";
 import { type Harness, makeHarness, type RegisteredTool } from "./helpers.js";
 
@@ -177,8 +177,8 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
   });
 });
 
-describe("anchored-edit — no tool call can turn the prefix guard off (bob#223)", () => {
-  it("the mutating tools' schemas hold exactly their data parameters, and no description offers an override", () => {
+describe("anchored-edit — no argument and no config turns the prefix guard off (bob#223)", () => {
+  it("the mutating tools' schemas hold exactly their data parameters, and each description states the guard", () => {
     const expected: Record<string, string[]> = {
       edit_lines: ["path", "from", "to", "new_text", "fingerprint"],
       insert_after: ["path", "anchor", "text", "fingerprint"],
@@ -188,215 +188,95 @@ describe("anchored-edit — no tool call can turn the prefix guard off (bob#223)
       const tool = h.tools.get(name) as RegisteredTool;
       const schema = tool.parameters as { properties: Record<string, unknown> };
       expect(Object.keys(schema.properties)).toEqual(keys);
-      expect(tool.description).not.toContain("allow_anchor_prefixes");
-      expect(tool.description).toContain("No parameter turns this off");
+      expect(tool.description).toContain("the call is refused and nothing is written");
+      expect(tool.description).toContain("report BLOCKED and name the file");
+      expect(tool.description).not.toMatch(/allow_anchor_prefixes|operator|exempt|escape/i);
     }
   });
 
-  it("a call that passes allow_anchor_prefixes: true is still refused and writes NOTHING", async () => {
-    writeFileSync(join(h.root, "e.txt"), "one\ntwo\nthree\n");
-    const { body, fp } = await readBody("e.txt");
-    const before = readFileSync(join(h.root, "e.txt"));
-    const prefixed = body.join("\n");
-    const outs = [
-      await h.call("edit_lines", {
-        path: "e.txt",
-        from: h.anchor("e.txt", 1),
-        to: h.anchor("e.txt", 1),
-        new_text: prefixed,
-        fingerprint: fp,
-        allow_anchor_prefixes: true,
-      }),
-      await h.call("insert_after", {
-        path: "e.txt",
-        anchor: h.anchor("e.txt", 3),
-        text: prefixed,
-        fingerprint: fp,
-        allow_anchor_prefixes: true,
-      }),
-      await h.call("write_file", {
-        path: "e2.txt",
-        content: prefixed,
-        allow_anchor_prefixes: true,
-      }),
-    ];
-    for (const out of outs) {
-      expect(out.details.refused).toBe(true);
-      expect(out.text).toContain("line 1 of the new text starts with a read_lines anchor prefix");
-      expect(out.text).not.toContain("allow_anchor_prefixes");
-    }
-    expect(readFileSync(join(h.root, "e.txt"))).toEqual(before);
-    expect(existsSync(join(h.root, "e2.txt"))).toBe(false);
-  });
-});
+  // Arguments no tool declares: the dropped per-call flag, the dropped config
+  // key, and a few override-sounding names. None may change what a call does.
+  const EXTRAS: Record<string, unknown>[] = [
+    { allow_anchor_prefixes: true },
+    { allow_anchor_prefixes: "true" },
+    { anchorPrefixPaths: ["*"] },
+    { force: true, override: true, skip_guard: true },
+  ];
 
-describe("anchored-edit — the operator's anchorPrefixPaths exempts only the files it names (bob#223)", () => {
-  let op: Harness;
-  beforeEach(() => {
-    op = makeHarness({
-      config: {
-        anchorPrefixPaths: ["fixtures/anchor-shaped.txt", "fixtures/created.txt", "link.txt"],
-      },
-    });
-    mkdirSync(join(op.root, "fixtures"));
-  });
-  afterEach(() => {
-    op.cleanup();
-  });
-
-  async function opRead(file: string): Promise<{ body: string[]; fp: string }> {
-    const read = await op.call("read_lines", { path: file });
-    return {
-      body: bodyLines(read.text, Number(read.details.lineCount)),
-      fp: String(read.details.fingerprint).replace(/^F#/, ""),
+  it("an extra argument never changes the outcome: prefixed text stays refused and clean text stays written (each tool)", async () => {
+    const base = "one\ntwo\nthree\nfour\n";
+    writeFileSync(join(h.root, "src.txt"), base);
+    // Lines 1-2 of a real read: with their prefixes, and stripped.
+    const { body, fp } = await readBody("src.txt");
+    const texts = {
+      prefixed: body.slice(0, 2).join("\n"),
+      clean: body.slice(0, 2).map(strip).join("\n"),
     };
-  }
-
-  it("a listed file takes prefixed text from every tool; the bytes land as sent", async () => {
-    const file = "fixtures/anchor-shaped.txt";
-    writeFileSync(join(op.root, file), "one\ntwo\nthree\nfour\n");
-    const r1 = await opRead(file);
-    const line1 = r1.body[0];
-    expectSucceeded(
-      await op.call("edit_lines", {
-        path: file,
-        from: op.anchor(file, 1),
-        to: op.anchor(file, 1),
-        new_text: line1,
-        fingerprint: r1.fp,
-      }),
-    );
-    expect(readFileSync(join(op.root, file), "utf8")).toBe(`${line1}\ntwo\nthree\nfour\n`);
-
-    const r2 = await opRead(file);
-    expectSucceeded(
-      await op.call("insert_after", {
-        path: file,
-        anchor: op.anchor(file, 4),
-        text: r2.body[1],
-        fingerprint: r2.fp,
-      }),
-    );
-    expect(readFileSync(join(op.root, file), "utf8")).toBe(
-      `${line1}\ntwo\nthree\nfour\n${r2.body[1]}\n`,
-    );
-
-    expectSucceeded(await op.call("write_file", { path: "fixtures/created.txt", content: line1 }));
-    expect(readFileSync(join(op.root, "fixtures/created.txt"), "utf8")).toBe(line1);
-  });
-
-  it("every other file in the same session is still refused, including an entry that is a symlink", async () => {
-    writeFileSync(join(op.root, "plain.txt"), "one\ntwo\n");
-    // `link.txt` is listed, but it is a symlink: the edit resolves to plain.txt,
-    // which is not listed, so the guard stays on.
-    symlinkSync("plain.txt", join(op.root, "link.txt"));
-    const { body, fp } = await opRead("plain.txt");
-    const before = readFileSync(join(op.root, "plain.txt"));
-    for (const path of ["plain.txt", "link.txt"]) {
-      const out = await op.call("edit_lines", {
-        path,
-        from: op.anchor("plain.txt", 1),
-        to: op.anchor("plain.txt", 1),
-        new_text: body[0],
-        fingerprint: fp,
-      });
-      expect(out.details.refused).toBe(true);
-      expect(out.text).toContain("line 1 of the new text starts with a read_lines anchor prefix");
-    }
-    expect(readFileSync(join(op.root, "plain.txt"))).toEqual(before);
-    const out = await op.call("write_file", { path: "fixtures/other.txt", content: body[0] });
-    expect(out.details.refused).toBe(true);
-    expect(existsSync(join(op.root, "fixtures/other.txt"))).toBe(false);
-  });
-});
-
-describe("anchored-edit — anchorPrefixPaths is validated where bob.yaml is read (bob#223)", () => {
-  const yaml = (block: string[]): string =>
-    ["capabilities:", "  - anchored-edit", "", "anchored-edit:", ...block, ""].join("\n");
-  const resolve = (text: string) =>
-    resolveCapabilities({ yamlText: text, resolveSource: (name) => `/resolved/${name}` });
-
-  it("a bob.yaml list of workspace-relative paths resolves, and the extension loads it", () => {
-    const res = resolve(yaml(["  anchorPrefixPaths:", "    - fixtures/a.txt", "    - b.txt"]));
-    expect(res.capabilities[0].config).toEqual({ anchorPrefixPaths: ["fixtures/a.txt", "b.txt"] });
-    const env = { [CONFIG_ENV_VAR]: JSON.stringify(res.capabilities[0].config) };
-    expect(loadConfigFromEnv(env)).toEqual({ anchorPrefixPaths: ["fixtures/a.txt", "b.txt"] });
-  });
-
-  it("no block, or no var, means no exemption", () => {
-    expect(
-      resolve(["capabilities:", "  - anchored-edit", ""].join("\n")).capabilities[0].config,
-    ).toEqual({});
-    expect(loadConfigFromEnv({})).toEqual({});
-  });
-
-  it("refuses a path that is not workspace-relative normal form, and any other key", () => {
-    for (const bad of [
-      "/etc/hosts",
-      "../up.txt",
-      "a/../b.txt",
-      "./a.txt",
-      "a/./b.txt",
-      "a/",
-      "a//b",
-      "a\\b",
-      "..",
-    ]) {
-      expect(() => resolve(yaml(["  anchorPrefixPaths:", `    - "${bad}"`]))).toThrow(
-        /capability "anchored-edit" config is invalid \(at \/anchorPrefixPaths\/0\)/,
-      );
-      const env = { [CONFIG_ENV_VAR]: JSON.stringify({ anchorPrefixPaths: [bad] }) };
-      expect(() => loadConfigFromEnv(env)).toThrow(
-        /config is invalid \(at \/anchorPrefixPaths\/0\)/,
-      );
-    }
-    const env = { [CONFIG_ENV_VAR]: JSON.stringify({ allow_anchor_prefixes: true }) };
-    expect(() => loadConfigFromEnv(env)).toThrow(/config is invalid/);
-    const notList = { [CONFIG_ENV_VAR]: JSON.stringify({ anchorPrefixPaths: true }) };
-    expect(() => loadConfigFromEnv(notList)).toThrow(/config is invalid/);
-  });
-
-  it("the extension factory hands the loaded list to the tools", async () => {
-    const tools = new Map<string, RegisteredTool>();
-    const fakePi = {
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
+    // What each tool leaves behind without any extra argument.
+    const expectedBytes: Record<string, Record<"prefixed" | "clean", string | null>> = {
+      edit_lines: { prefixed: base, clean: "one\ntwo\ntwo\nthree\nfour\n" },
+      insert_after: { prefixed: base, clean: `${base}one\ntwo\n` },
+      write_file: { prefixed: null, clean: "one\ntwo" },
     };
-    const prior = process.env[CONFIG_ENV_VAR];
-    const origError = console.error;
-    process.env[CONFIG_ENV_VAR] = JSON.stringify({ anchorPrefixPaths: ["listed.txt"] });
-    console.error = () => {};
-    try {
-      anchoredEditExtension(fakePi as never);
-    } finally {
-      console.error = origError;
-      if (prior === undefined) delete process.env[CONFIG_ENV_VAR];
-      else process.env[CONFIG_ENV_VAR] = prior;
+    let n = 0;
+    for (const tool of ["edit_lines", "insert_after", "write_file"]) {
+      for (const kind of ["prefixed", "clean"] as const) {
+        const observed: Array<{ refused: boolean; text: string; bytes: string | null }> = [];
+        for (const extra of [{}, ...EXTRAS]) {
+          // A fresh target per call, with the same bytes as src.txt (so the same
+          // fingerprint and anchors).
+          n++;
+          const file = `t${n}.txt`;
+          let params: Record<string, unknown>;
+          if (tool === "write_file") {
+            params = { path: file, content: texts[kind] };
+          } else {
+            writeFileSync(join(h.root, file), base);
+            params =
+              tool === "edit_lines"
+                ? {
+                    path: file,
+                    from: h.anchor(file, 1),
+                    to: h.anchor(file, 1),
+                    new_text: texts[kind],
+                    fingerprint: fp,
+                  }
+                : { path: file, anchor: h.anchor(file, 4), text: texts[kind], fingerprint: fp };
+          }
+          const out = await h.call(tool, { ...params, ...extra });
+          const target = join(h.root, file);
+          observed.push({
+            refused: out.details.refused === true,
+            text: out.text.split(file).join("<path>"),
+            bytes: existsSync(target) ? readFileSync(target, "utf8") : null,
+          });
+        }
+        // Without extras the call does what the guard says ...
+        expect(observed[0].refused).toBe(kind === "prefixed");
+        expect(observed[0].bytes).toBe(expectedBytes[tool][kind]);
+        // ... and every extra argument leaves that outcome exactly as it was.
+        for (const o of observed.slice(1)) expect(o).toEqual(observed[0]);
+      }
     }
-    const write = tools.get("write_file") as RegisteredTool;
-    const ctx = { cwd: h.root };
-    const prefixed = "L1#0123abcd hello";
-    const listed = await write.execute(
-      "t",
-      { path: "listed.txt", content: prefixed },
-      undefined,
-      undefined,
-      ctx,
-    );
-    expect(listed.content[0].text.startsWith("REFUSED")).toBe(false);
-    expect(readFileSync(join(h.root, "listed.txt"), "utf8")).toBe(prefixed);
-    const other = await write.execute(
-      "t",
-      { path: "other.txt", content: prefixed },
-      undefined,
-      undefined,
-      ctx,
-    );
-    expect(other.content[0].text).toContain(
-      "line 1 of the new text starts with a read_lines anchor prefix",
-    );
-    expect(existsSync(join(h.root, "other.txt"))).toBe(false);
+  });
+
+  it("the anchored-edit config takes no knob: anchorPrefixPaths in bob.yaml is refused at load", () => {
+    const yaml = [
+      "capabilities:",
+      "  - anchored-edit",
+      "",
+      "anchored-edit:",
+      "  anchorPrefixPaths:",
+      "    - fixtures/a.txt",
+      "",
+    ].join("\n");
+    expect(() =>
+      resolveCapabilities({ yamlText: yaml, resolveSource: (name) => `/resolved/${name}` }),
+    ).toThrow(/capability "anchored-edit" config is invalid/);
+    for (const block of [{ anchorPrefixPaths: ["a.txt"] }, { allow_anchor_prefixes: true }]) {
+      const env = { [CONFIG_ENV_VAR]: JSON.stringify(block) };
+      expect(() => loadConfigFromEnv(env)).toThrow(/config is invalid/);
+    }
   });
 });
 

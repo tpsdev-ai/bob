@@ -13,7 +13,6 @@
 // it. See core.ts for the byte rules and README.md for the documented gaps.
 
 import { type TSchema, Type } from "typebox";
-import type { AnchoredEditConfig } from "./config.js";
 import {
   AnchoredEditSession,
   clampUtf8,
@@ -47,19 +46,15 @@ export interface WireOptions {
   log?: (msg: string) => void;
   // Writer seam — lets a test force a short write; defaults to node writeSync.
   writeChunk?: WriteChunk;
-  // The capability's validated config block (index.ts reads it from the
-  // loader's env var). Operator-owned: no tool parameter reaches it. Absent
-  // means the empty block.
-  config?: AnchoredEditConfig;
 }
 
 const ANCHOR_DOC =
   "An anchor token is `L<n>#<h>`: line number n, and h = 8 lowercase hex of FNV-1a 32 over the line's UTF-8 bytes with its terminator and a trailing CR stripped. `L0` addresses the position before line 1. The token is stable and unseeded; a line number is never folded into h.";
 
-// The anchor-prefix guard, as each mutating tool describes it. No parameter
-// turns it off: only the operator's anchored-edit config can exempt a file.
+// The anchor-prefix guard, as each mutating tool describes it: exactly what the
+// guard does, and what to do when the text is refused.
 const PREFIX_GUARD_DOC = (field: string): string =>
-  `If any line of ${field} still begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused, naming the first offending line: strip the copied prefixes. No parameter turns this off; if the file's real content genuinely begins lines with that shape, report BLOCKED naming the file.`;
+  `If any line of ${field} begins with a read_lines anchor prefix (L<n>#<8 hex> ), the call is refused and nothing is written; the refusal names the first such line. Strip the copied prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
 
 function ok(text: string, details: Record<string, unknown>): ToolOutput {
   return { content: [{ type: "text", text }], details };
@@ -75,9 +70,7 @@ function capped(text: string): string {
 export function wireAnchoredEdit(opts: WireOptions): AnchoredEditSession {
   const { pi } = opts;
   const log = opts.log ?? ((m: string) => console.error(m));
-  const session = new AnchoredEditSession(opts.writeChunk, {
-    anchorPrefixPaths: opts.config?.anchorPrefixPaths,
-  });
+  const session = new AnchoredEditSession(opts.writeChunk);
 
   // Run one tool body with the shared result shape: every result (success or
   // refusal) is capped, and a refusal records its signals in the structured

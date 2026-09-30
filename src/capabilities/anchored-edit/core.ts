@@ -195,15 +195,14 @@ export function anchorPrefix(lineNo: number, line: RawLine): string {
 // Refuse `text` when any line still carries a read_lines anchor prefix. A model
 // copied read_lines output straight into new text with the prefixes included,
 // and the tool is the one place that can catch it. Names the tool, the FIRST
-// offending line number and the remedy. Nothing in a tool call can turn this
-// off; only the operator's anchored-edit config can exempt a file (the session
-// decides that before calling here).
+// offending line number and the remedy. Every mutating tool calls it on every
+// non-empty new text; nothing in a call or in config turns it off.
 export function assertNoAnchorPrefix(text: string, tool: string, path: string): void {
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     if (ANCHOR_PREFIX_RE.test(lines[i])) {
       throw new Refusal(
-        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If this file's real content genuinely begins lines with that shape, report BLOCKED naming the file: only the operator can allow such lines.`,
+        `refusing ${tool} on "${path}": line ${i + 1} of the new text starts with a read_lines anchor prefix (L<n>#<8 hex> ). The text still carries the read_lines output's prefixes; strip them (the leading "L<n>#<h> ") before passing the text. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`,
       );
     }
   }
@@ -629,28 +628,9 @@ export class AnchoredEditSession {
   // A byte-accepting writer seam (a test forces short writes); the default is
   // node's writeSync, looped by writeAllBytes until every byte is accepted.
   private readonly writeChunk: WriteChunk;
-  // Workspace-relative files whose new text may begin lines with the read_lines
-  // anchor prefix. It comes from the operator's anchored-edit config
-  // (`anchorPrefixPaths`, validated by CONFIG_SCHEMA) when the capability loads;
-  // no tool parameter reaches it. Empty by default: the guard is on everywhere.
-  private readonly anchorPrefixPaths: ReadonlySet<string>;
 
-  constructor(
-    writeChunk: WriteChunk = defaultWriteChunk,
-    opts: { anchorPrefixPaths?: readonly string[] } = {},
-  ) {
+  constructor(writeChunk: WriteChunk = defaultWriteChunk) {
     this.writeChunk = writeChunk;
-    this.anchorPrefixPaths = new Set(opts.anchorPrefixPaths ?? []);
-  }
-
-  // Whether the operator exempted this target from the anchor-prefix guard. The
-  // target's RESOLVED path (symlinks followed) relative to the pinned root must
-  // equal a configured entry exactly, so the exemption belongs to the file the
-  // entry names. An entry that is itself a symlink, or passes through one,
-  // matches nothing, and the guard stays on.
-  private anchorPrefixAllowed(t: ResolvedTarget): boolean {
-    if (this.anchorPrefixPaths.size === 0) return false;
-    return this.anchorPrefixPaths.has(relative(t.root, t.canonical).split(sep).join("/"));
   }
 
   // Run `fn` under the per-path critical section. The canonical path is the key.
@@ -938,9 +918,7 @@ export class AnchoredEditSession {
         );
       }
       this.requireFingerprint(t.canonical, path, fingerprint, fromAnchor, raw, from, signals);
-      if (newText !== "" && !this.anchorPrefixAllowed(t)) {
-        assertNoAnchorPrefix(newText, "edit_lines", path);
-      }
+      if (newText !== "") assertNoAnchorPrefix(newText, "edit_lines", path);
       const newLines = newText === "" ? [] : parseNewText(newText, path);
       const spliced = applyEditLines(raw, from, to, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
@@ -983,7 +961,7 @@ export class AnchoredEditSession {
         Math.max(1, after),
         signals,
       );
-      if (!this.anchorPrefixAllowed(t)) assertNoAnchorPrefix(text, "insert_after", path);
+      assertNoAnchorPrefix(text, "insert_after", path);
       const newLines = parseNewText(text, path);
       const spliced = applyInsertAfter(raw, after, newLines, path);
       this.charge(spliced.removedBytes, t.canonical, path, raw.length);
@@ -1000,7 +978,7 @@ export class AnchoredEditSession {
     const t = this.resolveWithin(rootArg, path);
     // Content copied from read_lines keeps its `L<n>#<h> ` prefixes; refuse it
     // here, before anything is opened, so a refused creation leaves nothing.
-    if (!this.anchorPrefixAllowed(t)) assertNoAnchorPrefix(content, "write_file", path);
+    assertNoAnchorPrefix(content, "write_file", path);
     // Validate the creation content BEFORE opening, so a refused creation never
     // leaves an occupied empty file behind.
     if (content.includes("\u0000")) {

@@ -115,23 +115,14 @@ it. It also renders real `read_lines` output (lines 1, 9, 10 and 99999) and
 checks that the guard matches exactly each rendered prefix and nothing else in
 that output.
 
-No tool parameter turns the guard off. For a file whose real content genuinely
-begins lines with that shape, the **operator** lists it in the agent's
-`bob.yaml`:
-
-```yaml
-anchored-edit:
-  anchorPrefixPaths:
-    - fixtures/anchor-shaped.txt
-```
-
-Each entry is a workspace-relative path in normal form (no leading `/`, no `.`
-or `..` segment, no empty segment); the schema refuses anything else, and it is
-absent by default. An entry exempts only the file it names: the target's
-resolved path (symlinks followed) relative to the workspace root must equal it
-exactly, so an entry that is itself a symlink, or passes through one, exempts
-nothing. The list is read once when the capability loads. The refusal tells the
-model to report BLOCKED for such a file; it does not name the knob.
+The guard runs on every non-empty new text of every `edit_lines`,
+`insert_after` and `write_file` call. No tool argument and no configuration
+turns it off, and an argument a tool does not declare is ignored: it never
+changes the result. There is deliberately no escape hatch. A switch would need a
+channel the agent cannot write, and none exists yet (the shell is outside every
+guard; see the documented gaps). Content whose lines genuinely begin with that
+shape has to be written outside these tools, so the refusal tells the model to
+report BLOCKED and name the file.
 
 ## Signals
 
@@ -160,10 +151,8 @@ guard.
   only. A shell command can still rewrite a tracked file (including a write
   followed by a commit in one command). This is slice 2.
 - **No role-owned overrides.** Slice 1 ships the fixed page, line and tripwire
-  limits; no path from `bob.yaml` can raise them. `bob.yaml`'s one anchored-edit
-  knob, `anchorPrefixPaths`, only exempts named files from the anchor-prefix
-  guard. Role-owned limit overrides and a role-owned replace permission are
-  slice 2.
+  limits; no path from `bob.yaml` can raise them. Role-owned limit overrides and
+  a role-owned replace permission are slice 2.
 - **The tripwire guards byte removal, not semantics.** It refuses corrupting
   rewrites; it does not stop a semantic override such as an appended
   reassignment.
