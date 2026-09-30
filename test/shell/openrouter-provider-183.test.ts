@@ -3,8 +3,13 @@
 // memory, openai-completions, no per-model baseUrl) and REFUSES any on-disk
 // openrouter entry in models.json/auth.json. Every entry path goes through the
 // factory, so every entry path gets it. No network.
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
+
+// Every temp dir this file creates is tracked and removed in the file-scope
+// afterAll, so none is left behind (issue #221).
+const _orTmpDirs: string[] = [];
+
 import {
   chmodSync,
   existsSync,
@@ -126,7 +131,9 @@ describe("openrouter provider (bob#183 round 3)", () => {
   const prevKey = process.env.OPENROUTER_API_KEY;
   beforeEach(() => {
     agentsRoot = mkdtempSync(join(tmpdir(), "bob-or-agents-"));
+    _orTmpDirs.push(agentsRoot);
     flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or-keys-"));
+    _orTmpDirs.push(flairKeysDir);
   });
   afterEach(() => {
     for (const s of servers) s.close();
@@ -563,7 +570,9 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
   const prevKey = process.env.OPENROUTER_API_KEY;
   beforeEach(() => {
     agentsRoot = mkdtempSync(join(tmpdir(), "bob-or4-agents-"));
+    _orTmpDirs.push(agentsRoot);
     flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or4-keys-"));
+    _orTmpDirs.push(flairKeysDir);
   });
   afterEach(() => {
     if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY;
@@ -754,7 +763,9 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
   const KEY = "sk-or-round6-testkey";
   beforeEach(() => {
     agentsRoot = mkdtempSync(join(tmpdir(), "bob-or6-agents-"));
+    _orTmpDirs.push(agentsRoot);
     flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or6-keys-"));
+    _orTmpDirs.push(flairKeysDir);
   });
   afterEach(() => {
     if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY;
@@ -1010,7 +1021,9 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
   const KEY = "sk-or-round7-testkey";
   beforeEach(() => {
     agentsRoot = mkdtempSync(join(tmpdir(), "bob-or7-agents-"));
+    _orTmpDirs.push(agentsRoot);
     flairKeysDir = mkdtempSync(join(tmpdir(), "bob-or7-keys-"));
+    _orTmpDirs.push(flairKeysDir);
   });
   afterEach(() => {
     if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY;
@@ -1245,4 +1258,8 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
       stub.restore();
     }
   });
+});
+
+afterAll(() => {
+  for (const d of _orTmpDirs) rmSync(d, { recursive: true, force: true });
 });
