@@ -3,8 +3,9 @@
 One file per change. Pull requests whose fragments have distinct filenames no
 longer share an edit to the `[Unreleased]` section of `CHANGELOG.md`, so adding
 a changelog entry stops being a routine merge conflict, and a review round is
-no longer spent resolving one (bob#236). Two pull requests that pick the same
-filename still conflict, on that file, so make the slug specific.
+no longer spent resolving one (bob#236). Two pull requests that add the same
+filename with different contents can conflict on that file, so make the slug
+specific.
 
 ## Adding an entry
 
@@ -14,8 +15,8 @@ Create `<category>-<slug>.md` in this directory:
 .changelog/unreleased/fixed-doctor-reply-transport.md
 ```
 
-- **category** — the text before the first hyphen. One of `added`, `changed`,
-  `deprecated`, `removed`, `fixed`, `security` ([Keep a
+- **category** — the text before the first hyphen, in lowercase. One of
+  `added`, `changed`, `deprecated`, `removed`, `fixed`, `security` ([Keep a
   Changelog](https://keepachangelog.com/en/1.1.0/)). It determines which
   `### Heading` the entry lands under.
 - **slug** — everything after it. Make it descriptive; you own uniqueness. A
@@ -32,7 +33,9 @@ the leading `- ` and a 2-space indent on every continuation line:
   A second paragraph, indented two spaces so it stays inside the list item.
 ```
 
-**The bold lede is required: non-empty, ≤ 25 words and one sentence.** It is
+**The bold lede is required: non-empty, ≤ 25 words, with no sentence break.** A
+sentence break is a `.`, `!` or `?` followed by a space or line break inside the
+lede; `check` counts nothing else as one, so `First.Second.` passes. The lede is
 the entry's summary, the line a reader skims first. The GitHub release carries
 the whole `## [<version>]` section (`scripts/changelog-extract.mjs`), so detail
 is never cut; it belongs in the body, where it reads as detail. `check` fails
@@ -55,7 +58,7 @@ refused.
 
 ```bash
 node scripts/changelog-fragments.mjs render   # preview the assembled section
-node scripts/changelog-fragments.mjs list     # what is staged, by category
+node scripts/changelog-fragments.mjs list     # available fragments, by category
 node scripts/changelog-fragments.mjs check    # what CI runs
 ```
 

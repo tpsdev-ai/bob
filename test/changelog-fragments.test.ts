@@ -106,6 +106,26 @@ describe("changelog fragments — check (bob#236)", () => {
     expect(() => cf.check({ dir, changelogPath })).toThrow(/not a changelog category/);
   });
 
+  it("REFUSES a category prefix that is not lowercase", () => {
+    for (const name of ["Fixed-a-thing.md", "FIXED-a-thing.md"]) {
+      const { dir, changelogPath } = project();
+      fragment(dir, name, "- **A thing was fixed.** Detail.\n");
+      expect(() => cf.check({ dir, changelogPath }), name).toThrow(
+        `'${name.split("-")[0]}' is not a changelog category`,
+      );
+      rmSync(join(dir, name));
+    }
+  });
+
+  // A sentence break is `.`, `!` or `?` followed by whitespace; nothing else is
+  // counted (the README and the lede error say so).
+  it("counts a lede's sentences by a '.', '!' or '?' followed by whitespace, and nothing else", () => {
+    expect(cf.countLedeSentences("First.Second.")).toBe(1);
+    expect(cf.countLedeSentences("Version 1.2.3 and scripts/x.mjs ship.")).toBe(1);
+    expect(cf.countLedeSentences("First. Second.")).toBe(2);
+    expect(cf.countLedeSentences("First!\nSecond?")).toBe(2);
+  });
+
   it("REFUSES a fragment with no bold lede", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-no-lede.md", "- a fix with no bold run.\n");
@@ -772,8 +792,8 @@ describe("changelog fragments — the CLI (bob#236)", () => {
 // Acceptance: two PRs whose fragments have DISTINCT filenames merge in either
 // order with no conflict. Two real branches in a temp git repo: B merged into A,
 // and separately A's original commit merged into B; both fragments must be
-// present after each merge. (Two PRs that pick the SAME filename still conflict,
-// on that file; the README says so.)
+// present after each merge. (Two PRs that add the SAME filename with different
+// contents can conflict on that file; the README says so.)
 describe("changelog fragments — two PRs with distinct fragment filenames (bob#236)", () => {
   function git(cwd: string, ...args: string[]): { code: number; out: string } {
     const r = spawnSync("git", args, { cwd, encoding: "utf8" });

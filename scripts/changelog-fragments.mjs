@@ -12,12 +12,13 @@
 //
 // FIX. One file per change under `.changelog/unreleased/`. PRs whose fragments
 // have distinct filenames no longer share an edit to `[Unreleased]`; two PRs
-// that pick the same filename still conflict, on that file. `promote` writes the
+// that add the same filename with different contents can conflict on that file. `promote` writes the
 // fragments into a `## [X.Y.Z]` section below `[Unreleased]` and deletes them.
 //
 // FILE NAMING: `.changelog/unreleased/<category>-<slug>.md`
 //   category  one of added|changed|deprecated|removed|fixed|security
-//             (Keep a Changelog), taken from the text BEFORE the first hyphen
+//             (Keep a Changelog), in lowercase and matched exactly, taken
+//             from the text BEFORE the first hyphen
 //   slug      anything else; make it descriptive, uniqueness is on you (a PR
 //             number is a fine slug, but is not required — the branch is pushed
 //             before the PR number exists)
@@ -116,7 +117,7 @@ export function parseFragmentName(filename) {
   }
   const stem = filename.slice(0, -".md".length);
   const dash = stem.indexOf("-");
-  const category = (dash === -1 ? stem : stem.slice(0, dash)).toLowerCase();
+  const category = dash === -1 ? stem : stem.slice(0, dash);
   if (!CATEGORIES.includes(category)) {
     throw new FragmentError(
       `${FRAGMENT_DIR_REL}/${filename}: '${dash === -1 ? stem : stem.slice(0, dash)}' is not a changelog ` +
@@ -196,11 +197,13 @@ export function validateFragmentBody(relPath, body) {
 
 // ─── Lede (flair#1392; bob also refuses a MISSING or EMPTY lede, bob#236) ────
 //
-// The lede is the entry's one-sentence summary, the line a reader skims first.
+// The lede is the entry's summary, the line a reader skims first.
 // bob's GitHub release publishes the whole `## [<version>]` section
 // (release-publish.yml runs scripts/changelog-extract.mjs), so nothing is cut
 // from an entry; but a 105-word lede is not a summary, it IS the entry. Hence
-// <= 25 words, one sentence: the rule flair#1392 set. Historical CHANGELOG.md is
+// <= 25 words with no sentence break, the rule flair#1392 set. A sentence break
+// is a `.`, `!` or `?` followed by whitespace; nothing else is counted, so
+// `First.Second.` is one sentence. Historical CHANGELOG.md is
 // not rewritten; this rule is fragments only.
 
 export const LEDE_WORD_LIMIT = 25;
@@ -233,13 +236,13 @@ export function ledeViolation(relPath, body) {
   const lede = extractFragmentLede(body);
   if (lede == null) {
     return (
-      `${relPath}: no bold lede. Start the entry with '- **<one sentence>**' (<= ${LEDE_WORD_LIMIT} words): ` +
+      `${relPath}: no bold lede. Start the entry with '- **<summary>**' (<= ${LEDE_WORD_LIMIT} words, no sentence break): ` +
       `the lede is the entry's summary, the line a reader skims first.`
     );
   }
   if (lede.length === 0) {
     return (
-      `${relPath}: empty bold lede. Put the entry's one-sentence summary (<= ${LEDE_WORD_LIMIT} words) ` +
+      `${relPath}: empty bold lede. Put the entry's summary (<= ${LEDE_WORD_LIMIT} words, no sentence break) ` +
       `inside the leading '**...**'.`
     );
   }
@@ -248,8 +251,9 @@ export function ledeViolation(relPath, body) {
   if (words <= LEDE_WORD_LIMIT && sentences <= 1) return null;
   const extra = sentences > 1 ? ` in ${sentences} sentences` : "";
   return (
-    `${relPath}: bold lede is ${words} words${extra}; a lede is the entry's one-sentence summary, ` +
-    `so it must be <= ${LEDE_WORD_LIMIT} words and one sentence (flair#1392). Move detail below the bold run.`
+    `${relPath}: bold lede is ${words} words${extra}; a lede is the entry's summary, so it must be ` +
+    `<= ${LEDE_WORD_LIMIT} words with no sentence break (a '.', '!' or '?' followed by whitespace) (flair#1392). ` +
+    `Move detail below the bold run.`
   );
 }
 
