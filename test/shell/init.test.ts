@@ -113,7 +113,8 @@ describe("initAgent", () => {
     expect(yaml).toContain("role: ea");
     expect(yaml).toContain("name: exe-dev-gateway");
     expect(yaml).toContain("model: claude-opus-4-7");
-    expect(yaml).toContain("- read");
+    // bob#230: the ea role no longer allows read, so init stamps none.
+    expect(yaml).not.toContain("- read");
     // Memory tools come from the flair capability (not the dead mcp__flair__* names).
     expect(yaml).toContain("- flair_write");
     expect(yaml).toContain("- flair_search");
@@ -169,7 +170,7 @@ describe("initAgent", () => {
     // fresh ea agent never carries a name nothing can register (round 3).
     const res = initAgent({ ...baseOpts(), name: "bot-ea-check", role: "ea" });
     const names = toolsAllowFromYaml(readFileSync(join(res.agentDir, "bob.yaml"), "utf8"));
-    for (const tool of ["read", "flair_search", "flair_write", "flair_get"]) {
+    for (const tool of ["flair_search", "flair_write", "flair_get"]) {
       expect(names).toContain(tool);
     }
     expect(names).not.toContain("discord_reply");

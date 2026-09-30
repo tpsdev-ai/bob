@@ -7,7 +7,8 @@ describe("role-loader", () => {
     const t = loadRole("ea");
     expect(t.role).toBe("ea");
     expect(t.soul.length).toBeGreaterThan(0);
-    expect(t.tools.allow).toContain("read");
+    // bob#230: ea answers a chat surface, so it does not hold `read`.
+    expect(t.tools.allow).not.toContain("read");
     // The Discord tools come from the capability's REAL names (the mcp__
     // plugin_discord_discord__* spellings pi's registry never knew).
     expect(t.tools.allow).toContain("discord_reply");
@@ -50,7 +51,6 @@ describe("role-loader", () => {
     expect(t.role).toBe("jarvis");
     expect(t.soul.trim().length).toBeGreaterThan(0);
     expect(t.tools.allow).toEqual([
-      "read",
       "flair_search",
       "flair_write",
       "flair_get",
@@ -58,6 +58,9 @@ describe("role-loader", () => {
       "discord_fetch",
       "discord_react",
     ]);
+    // bob#230: jarvis answers chat, so it drops `read` (the seed role files are
+    // pinned so this cannot quietly come back).
+    expect(t.tools.allow).not.toContain("read");
     expect(resolveToolNames(t.tools.allow, "")).toEqual(t.tools.allow);
     // flair_write stores memories; none of the shell or file mutators belong here.
     for (const tool of [

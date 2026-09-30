@@ -49,6 +49,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { confinedReadCustomTools } from "./confined-read.js";
 import { ADMIN_PASS_ENV } from "./flair-pair.js";
 import {
   applyModelLimits,
@@ -1052,6 +1053,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const cwd = config.cwd;
     const agentDir = config.piAgentDir;
 
+    // bob#230: the confined read, decided FIRST — before any environment change,
+    // key read or runtime build — so a resident session whose credential list is
+    // unavailable is refused with nothing to undo. Resident = the policy's
+    // decision OR the config's resolved one (resident: true, or persistent); the
+    // fixed setup session (setupSoulPath) is exempt. Non-resident sessions get
+    // pi's own read.
+    const confinedRead = confinedReadCustomTools(policy, config);
+
     // bob#214: the model's declared window, for THIS session's provider/model,
     // or a refusal naming the remedy — before any key is read or any runtime
     // built. The compaction threshold becomes pi's own compaction reserve.
@@ -1161,6 +1170,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       model,
       tools: policy.tools,
       ...(policy.excludeTools.length > 0 ? { excludeTools: policy.excludeTools } : {}),
+      // bob#230: a resident session that allows `read` gets bob's CONFINED read
+      // as a custom tool named `read` — pi registers SDK custom tools after its
+      // built-ins and extension tools, so this is where no role can reach pi's
+      // unconfined read. Decided above, before any runtime was built.
+      ...(confinedRead.length > 0 ? { customTools: confinedRead } : {}),
       // bob#214: the role's (or bob.yaml's) thinking level. pi clamps it to what
       // the model declares and hands it to the provider in its own request shape.
       ...(config.thinking !== undefined ? { thinkingLevel: config.thinking } : {}),
