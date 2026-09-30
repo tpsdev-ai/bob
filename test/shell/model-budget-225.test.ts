@@ -143,7 +143,7 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
     expect(steers.length).toBe(1);
   });
 
-  it("a compaction that does NOT complete keeps checkpoints off until one succeeds (unchanged)", async () => {
+  it("a compaction that does NOT complete keeps checkpoints off (unchanged); a success ends that failed-compaction state while the latch may still suppress checkpoints", async () => {
     const { steers, stop, compactionEnd } = harness();
     expect(await stop(60_000)).toBe(true);
     expect(steers.length).toBe(1);

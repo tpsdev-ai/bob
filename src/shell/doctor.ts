@@ -155,7 +155,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   // bob#225 (item 4): the context window of bob.yaml's provider.model. A
   // session for that model refuses to start without one (bob does not guess a
   // window; a guess can disagree with the server), at session creation. Report
-  // it here first, with the exact line to add.
+  // it here during doctor, with the exact line to add.
   checks.push(contextWindowCheck(join(agentDir, "bob.yaml")));
 
   // Launcher — exists + executable
