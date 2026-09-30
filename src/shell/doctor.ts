@@ -251,14 +251,25 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   // never a pass. A provider outside that set produces no check at all.
   if (yamlText !== undefined) {
     let providerName: string | undefined;
+    let providerParseError: string | undefined;
     try {
       const provider = readBlock(yamlText, "provider") as Record<string, unknown> | undefined;
       const raw = provider?.name;
       providerName = typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
-    } catch {
-      providerName = undefined;
+    } catch (err) {
+      providerParseError = err instanceof Error ? err.message : String(err);
     }
-    if (providerName !== undefined) {
+    if (providerParseError !== undefined) {
+      // A provider block doctor cannot parse is a config error, not a pass: the
+      // subscription check (and every provider-derived decision) cannot be
+      // evaluated, so FAIL with the remedy rather than silently skipping it.
+      checks.push({
+        name: "subscription auth",
+        status: "fail",
+        detail: `cannot read the provider block in bob.yaml — ${providerParseError}`,
+        fix: `fix the provider block in bob.yaml, then re-run 'bob doctor ${opts.name}'`,
+      });
+    } else if (providerName !== undefined) {
       const piProvider = mapBobProviderToPi(providerName);
       if (SUBSCRIPTION_PROVIDERS.has(piProvider)) {
         const sub = subscriptionCredentialCheck({

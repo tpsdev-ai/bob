@@ -204,6 +204,74 @@ describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", 
     expect(cap.lines.join("\n")).toContain("is not valid JSON");
   });
 
+  it("fails when the operator cancels a sign-in for a provider that was already stored", async () => {
+    writeStubPi({ exitCode: 0 }); // cancel: the stub writes nothing
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    const cap = capture();
+    const code = await runLogin({
+      name: "alpha",
+      provider: "openai-codex",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("already present");
+  });
+
+  it("succeeds when pi rewrites a store that already held the provider", async () => {
+    // A re-sign-in that rewrites the credential leaves the store changed.
+    writeStubPi({
+      afterAuthJson:
+        '{"openai-codex":{"type":"oauth","access":"bbbb","refresh":"rrrr","expires":2}}\n',
+    });
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    const cap = capture();
+    const code = await runLogin({
+      name: "alpha",
+      provider: "openai-codex",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(0);
+    expect(cap.lines.join("\n")).toContain("credential stored for openai-codex");
+  });
+
+  it("fails when pi exits non-zero even though a credential was written", async () => {
+    writeStubPi({ afterAuthJson: oauthJson("openai-codex"), exitCode: 2 });
+    makeAgent("alpha", "openai-codex");
+    const cap = capture();
+    const code = await runLogin({
+      name: "alpha",
+      provider: "openai-codex",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("did not complete");
+  });
+
   it("refuses an unknown agent, naming the agents directory", async () => {
     makeAgent("alpha");
     await expect(
@@ -228,6 +296,21 @@ describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", 
     const bin = resolvePiBin();
     expect(bin).toContain("@earendil-works/pi-coding-agent");
     expect(bin).toMatch(/bundle[\\/]cli\.js$/);
+  });
+
+  it("refuses when the pinned pi executable cannot be found, naming where it looked (never falls back to a PATH `pi`)", () => {
+    const empty = mkdtempSync(join(tmpdir(), "bob-pi-search-"));
+    try {
+      expect(() => resolvePiBin(empty)).toThrow(/could not find the pinned pi executable/);
+      // The refusal names the path it looked for...
+      expect(() => resolvePiBin(empty)).toThrow(
+        /pi-coding-agent[\s\S]*dist[\s\S]*bundle[\s\S]*cli\.js/,
+      );
+      // ...and the locations it searched.
+      expect(() => resolvePiBin(empty)).toThrow(/location/);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
   });
 });
 
@@ -303,14 +386,14 @@ describe("bob#241 — bob logout", () => {
 });
 
 describe("bob#241 — doctor fails a subscription provider with no usable credential", () => {
-  it("fails with the `bob login` remedy when the credential is absent", () => {
+  it("fails with the `bob login` remedy when only a scaffold placeholder is stored", () => {
     makeAgent("subbot", "openai-codex"); // scaffold writes a placeholder api key
     const check = subscriptionCheck("subbot");
     expect(check?.status).toBe("fail");
     expect(check?.fix).toBe("bob login subbot openai-codex");
   });
 
-  it("passes when the store holds a credential pi accepts", () => {
+  it("passes when the store holds a usable credential", () => {
     const dir = makeAgent("subbot", "openai-codex");
     writeFileSync(
       join(dir, ".pi-agent", "auth.json"),
@@ -318,6 +401,43 @@ describe("bob#241 — doctor fails a subscription provider with no usable creden
       { mode: 0o600 },
     );
     expect(subscriptionCheck("subbot")?.status).toBe("ok");
+  });
+
+  it("fails when the entry is schema-valid but has no key (pi does not treat it as configured)", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(join(dir, ".pi-agent", "auth.json"), `{"openai-codex":{"type":"api_key"}}\n`, {
+      mode: 0o600,
+    });
+    const check = subscriptionCheck("subbot");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("not usable");
+    expect(check?.fix).toBe("bob login subbot openai-codex");
+  });
+
+  it("passes when the store holds a usable api key (a non-empty key)", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"api_key","key":"sk-live-abc"}}\n`,
+      { mode: 0o600 },
+    );
+    expect(subscriptionCheck("subbot")?.status).toBe("ok");
+  });
+
+  it("fails the subscription-auth check when the provider block cannot be parsed", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    const yamlPath = join(dir, "bob.yaml");
+    const original = readFileSync(yamlPath, "utf8");
+    // A provider block that names a subscription provider but is an unsupported
+    // nested mapping, so readBlock refuses it.
+    writeFileSync(
+      yamlPath,
+      `provider:\n  name: openai-codex\n  auth:\n    mode: oauth\n\n${original}`,
+    );
+    const check = subscriptionCheck("subbot");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("provider block");
+    expect(check?.fix).toContain("bob.yaml");
   });
 
   it("fails when the target entry is one pi would reject", () => {
