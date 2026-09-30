@@ -236,20 +236,33 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 
   // bob#200: the tps-mail capability. When it is declared its own checks cover
   // the inbox, so the generic inbox check below runs only for an agent without it.
+  const bobYamlPath = join(agentDir, "bob.yaml");
   let yamlText: string | undefined;
+  let bobYamlReadError: string | undefined;
   try {
-    yamlText = readFileSync(join(agentDir, "bob.yaml"), "utf8");
-  } catch {
-    yamlText = undefined;
+    yamlText = readFileSync(bobYamlPath, "utf8");
+  } catch (err) {
+    bobYamlReadError =
+      (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   }
 
-  // bob#241: when bob.yaml names one of SUBSCRIPTION_PROVIDERS — the providers
-  // bob authenticates by a subscription login (pi's `isSubscription` set minus
-  // anthropic, which bob authenticates by an API key) — the agent's own auth
-  // store must hold a credential pi accepts for it, or `bob login` is the
-  // remedy. A store pi would reject, or one that cannot be read, is a FAIL,
-  // never a pass. A provider outside that set produces no check at all.
-  if (yamlText !== undefined) {
+  // bob#241: when bob.yaml names a provider in SUBSCRIPTION_PROVIDERS — the
+  // scope of this check (see login.ts) — the agent's own auth store must hold a
+  // usable credential for it, or `bob login` is the remedy. A store that cannot
+  // be read or fails bob's conservative validation is a FAIL, never a pass; so is
+  // a bob.yaml that cannot be read or whose provider block cannot be parsed. A
+  // provider outside that set produces no check at all.
+  if (bobYamlReadError !== undefined) {
+    // A bob.yaml doctor cannot read is a config error, not a pass: the
+    // subscription check cannot be evaluated, so FAIL with the remedy rather
+    // than silently skipping it.
+    checks.push({
+      name: "subscription auth",
+      status: "fail",
+      detail: `cannot read ${bobYamlPath} (${bobYamlReadError})`,
+      fix: `restore or make readable ${bobYamlPath}, then re-run 'bob doctor ${opts.name}'`,
+    });
+  } else if (yamlText !== undefined) {
     let providerName: string | undefined;
     let providerParseError: string | undefined;
     try {

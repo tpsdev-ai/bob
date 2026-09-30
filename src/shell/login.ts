@@ -15,12 +15,14 @@
 // bob composes the agent's pi config directory for every session, so the
 // operator does not need to know it: this module reuses the SAME session
 // composer — `resolveRunConfig`, whose `config.piAgentDir` IS the agent's
-// `.pi-agent` directory — and never re-derives the path. bob never prints, logs
-// or copies the token; it reports only WHICH providers the store holds a
-// credential for.
+// `.pi-agent` directory — and never re-derives the path. bob READS the agent's
+// auth store locally to decide whether a sign-in happened (it parses auth.json);
+// it never prints, logs or copies a credential VALUE — it reports only WHICH
+// providers the store holds a usable credential for.
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,14 +32,14 @@ import { resolveRunConfig } from "./run.js";
 
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
-// The providers `bob login` is for and the set the doctor check covers: pi's
-// subscription OAuth providers minus anthropic. pi's provider bundles mark
-// anthropic, openai-codex, github-copilot, xai and kimi-coding with
-// `isSubscription: true` (dist/bundle/chunks/*.js); bob authenticates anthropic
-// with an API key instead (its scaffold writes one, and `bob doctor` treats an
-// absent anthropic credential as a legitimate skip), so the check does not
-// cover anthropic. pi also offers an API-key path for some of the rest, so a
-// stored API key counts.
+// The SCOPE of the `bob doctor` subscription check — a policy choice, not a
+// limit on `bob login`: login starts pi for any provider, and pi offers both a
+// subscription OAuth path and, for some providers, an API-key path. This set is
+// pi's subscription OAuth providers (pi's bundles mark anthropic, openai-codex,
+// github-copilot, xai and kimi-coding with `isSubscription: true`,
+// dist/bundle/chunks/*.js) minus anthropic, which bob's scaffold configures with
+// an API key. The doctor check therefore simply does not cover anthropic; a
+// provider outside this set produces no check at all.
 export const SUBSCRIPTION_PROVIDERS: ReadonlySet<string> = new Set([
   "openai-codex",
   "github-copilot",
@@ -74,7 +76,7 @@ const PASSED_ENV = [
 export interface LoginDeps {
   agentsRoot?: string;
   homeDir?: string;
-  // The pi executable. Defaults to the pinned one (resolvePiBin).
+  // The pi executable. Defaults to the package-path one (resolvePiBin).
   piBin?: string;
   // Test seams for the terminal check. Default: process.stdin / process.stdout.
   stdinIsTTY?: boolean;
@@ -86,21 +88,26 @@ export interface LoginDeps {
   err?: (line: string) => void;
 }
 
-// The provider names the agent's auth store holds a USABLE credential for, and
-// separately the names whose record is stored but unusable (a schema-valid
-// entry pi's resolver would not treat as configured). A store that is absent is
-// "none"; a store pi would reject, or one that cannot be read or parsed, is a
-// REASON, never "none" — a failed read must not read as "no credential".
+// The provider names the agent's auth store holds a USABLE credential for (by
+// bob's conservative rule), and separately the names whose record is stored but
+// unusable (an entry bob's rule reads, but not as a usable key). A store that is
+// absent is "none"; a store bob's validation refuses, or one that cannot be read
+// or parsed, is a REASON, never "none" — a failed read must not read as "no
+// credential".
 export type StoredProviders =
   | { ok: true; providers: string[]; unusable: string[] }
   | { ok: false; reason: string };
 
-// Does pi's credential reader accept this entry? Mirrors `ReadOnlyAuthStorage.load`
+// bob's conservative validation of one stored entry, mirroring pi's read-only
+// validator `ReadOnlyAuthStorage.load`
 // (node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js:180-202):
-// an entry is a credential iff it is an object whose `type` is "api_key" (with
+// an entry is acceptable iff it is an object whose `type` is "api_key" (with
 // `key` undefined or a string, and `env` undefined or a map of strings) or
 // "oauth" (with string `access`, string `refresh` and a finite number
-// `expires`). Anything else makes pi reject the WHOLE store.
+// `expires`). This is bob's OWN rule: it is stricter than pi's live runtime,
+// whose AuthStorage parser only JSON-parses the file (dist/core/auth-storage.js:294,
+// used by ModelRuntime — dist/core/model-runtime.js:74). bob refuses the WHOLE
+// store when any entry fails it, rather than trusting part of it.
 function piAcceptsCredential(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
   const e = entry as Record<string, unknown>;
@@ -137,20 +144,85 @@ function isPlaceholder(entry: unknown): boolean {
   return false;
 }
 
-// Does pi treat this entry as a CONFIGURED credential — not merely one its
-// loader accepts? `piAcceptsCredential` above mirrors pi's schema check, which
-// permits an `api_key` with `key` undefined; pi's provider auth resolver then
-// requires a truthy stored key before treating the entry as configured
-// (node_modules/@earendil-works/pi-coding-agent/dist/core/provider-composer.js:200,
-// `if (input.credential.key)`). So a schema-valid record can still be unusable.
-// This predicate requires pi's required fields with NON-EMPTY values:
-//  - api_key: `key` is a non-empty string;
+// Does the entry hold a credential bob treats as USABLE — one pi's reader would
+// resolve to a non-empty value? This is bob's conservative rule (see the
+// validator note above), not a claim about pi's live runtime:
+//  - api_key: `key` resolves (env references resolved, no command executed) to a
+//    non-empty string;
 //  - oauth:  `access` and `refresh` are non-empty strings, `expires` finite.
+//
+// pi resolves a stored api_key's `key` when it reads it (dist/core/auth-storage.js:369-376,
+// `AuthStorage.read`, which returns `{...credential, key: resolveConfigValue(credential.key, credential.env)}`),
+// and a reference to a missing or EMPTY environment variable resolves to no key
+// (dist/core/resolve-config-value.js:83, `resolveTemplate`). bob mirrors that
+// resolution WITHOUT executing a command reference: a `!cmd` key is treated as
+// unresolved rather than run to make doctor pass.
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+function resolveStoredKey(key: unknown, entryEnv: unknown): string | undefined {
+  if (typeof key !== "string") return undefined;
+  if (key.startsWith("!")) return undefined;
+  const env: Record<string, string> =
+    entryEnv && typeof entryEnv === "object" && !Array.isArray(entryEnv)
+      ? (entryEnv as Record<string, string>)
+      : {};
+  const lookup = (name: string): string | undefined => {
+    const value = env[name] !== undefined ? env[name] : process.env[name];
+    return value !== undefined && value !== "" ? value : undefined;
+  };
+  let out = "";
+  let i = 0;
+  while (i < key.length) {
+    const dollar = key.indexOf("$", i);
+    if (dollar < 0) {
+      out += key.slice(i);
+      break;
+    }
+    out += key.slice(i, dollar);
+    const next = key[dollar + 1];
+    if (next === "$" || next === "!") {
+      out += next;
+      i = dollar + 2;
+      continue;
+    }
+    if (next === "{") {
+      const end = key.indexOf("}", dollar + 2);
+      if (end < 0) {
+        out += "$";
+        i = dollar + 1;
+        continue;
+      }
+      const name = key.slice(dollar + 2, end);
+      if (ENV_NAME_RE.test(name)) {
+        const value = lookup(name);
+        if (value === undefined) return undefined;
+        out += value;
+      } else {
+        out += key.slice(dollar, end + 1);
+      }
+      i = end + 1;
+      continue;
+    }
+    const match = key.slice(dollar + 1).match(ENV_NAME_PREFIX_RE);
+    if (match) {
+      const value = lookup(match[0]);
+      if (value === undefined) return undefined;
+      out += value;
+      i = dollar + 1 + match[0].length;
+      continue;
+    }
+    out += "$";
+    i = dollar + 1;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 function piTreatsAsConfigured(entry: unknown): boolean {
   if (!piAcceptsCredential(entry)) return false;
   const e = entry as Record<string, unknown>;
   if (e.type === "api_key") {
-    return typeof e.key === "string" && e.key.length > 0;
+    return resolveStoredKey(e.key, e.env) !== undefined;
   }
   return (
     typeof e.access === "string" &&
@@ -162,9 +234,14 @@ function piTreatsAsConfigured(entry: unknown): boolean {
   );
 }
 
-export function storedCredentialProviders(piAgentDir: string): StoredProviders {
+type AuthStoreRead = { ok: true; entries: Record<string, unknown> } | { ok: false; reason: string };
+
+// Read and conservatively validate the agent's auth store. A failed read or
+// parse, or any entry bob's validation rule refuses, is a REASON — never "no
+// credential".
+function readAuthStore(piAgentDir: string): AuthStoreRead {
   const path = join(piAgentDir, PROVIDER_LOGIN_STORE);
-  if (!existsSync(path)) return { ok: true, providers: [], unusable: [] };
+  if (!existsSync(path)) return { ok: true, entries: {} };
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -183,31 +260,61 @@ export function storedCredentialProviders(piAgentDir: string): StoredProviders {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return { ok: false, reason: `${path} is not a provider map` };
   }
-  const providers: string[] = [];
-  const unusable: string[] = [];
-  for (const [provider, entry] of Object.entries(parsed as Record<string, unknown>)) {
-    // Validate the WHOLE store, as pi does: one entry pi rejects makes the store
-    // unreadable to pi, so no provider in it can be trusted.
+  const entries = parsed as Record<string, unknown>;
+  for (const [provider, entry] of Object.entries(entries)) {
+    // bob's conservative rule (above): one entry it refuses makes the whole store
+    // untrustworthy, so bob never reads a credential out of a partly-bad store.
     if (!piAcceptsCredential(entry)) {
       return {
         ok: false,
-        reason: `${path} holds a credential pi would reject for provider "${provider}"`,
+        reason: `${path}: the credential for provider "${provider}" fails bob's conservative store validation`,
       };
     }
-    // A record pi's loader accepts is not necessarily one pi treats as
-    // configured: a schema-valid `api_key` with no key, or a bob scaffold
-    // placeholder, is stored but unusable. Only a usable credential counts.
+  }
+  return { ok: true, entries };
+}
+
+export function storedCredentialProviders(piAgentDir: string): StoredProviders {
+  const store = readAuthStore(piAgentDir);
+  if (!store.ok) return { ok: false, reason: store.reason };
+  const providers: string[] = [];
+  const unusable: string[] = [];
+  for (const [provider, entry] of Object.entries(store.entries)) {
+    // An entry bob's validator accepts is not necessarily one pi would resolve
+    // to a usable key: a keyless `api_key`, an unresolved reference, or a bob
+    // scaffold placeholder is stored but unusable. Only a usable credential counts.
     if (piTreatsAsConfigured(entry) && !isPlaceholder(entry)) providers.push(provider);
     else unusable.push(provider);
   }
   return { ok: true, providers: providers.sort(), unusable: unusable.sort() };
 }
 
-// bob#241 — the doctor check. When bob.yaml names a subscription provider, the
-// agent's auth store must hold a credential pi would accept for it. `ok` when
-// the check is satisfied or does not apply; `fail` (with a fix line) when the
-// provider has no stored credential, or when the store is one pi would reject —
-// neither a store that cannot be read nor one pi rejects is a pass.
+// A per-provider fingerprint of the STORED entry — a hash of its fields as
+// stored, never printed — so a change to a DIFFERENT provider cannot masquerade
+// as a change to this one. `fingerprint` is null when the provider has no entry.
+export function storedCredentialFingerprint(
+  piAgentDir: string,
+  provider: string,
+):
+  | { ok: true; present: boolean; usable: boolean; fingerprint: string | null }
+  | { ok: false; reason: string } {
+  const store = readAuthStore(piAgentDir);
+  if (!store.ok) return { ok: false, reason: store.reason };
+  const entry = store.entries[provider];
+  if (entry === undefined) return { ok: true, present: false, usable: false, fingerprint: null };
+  return {
+    ok: true,
+    present: true,
+    usable: piTreatsAsConfigured(entry) && !isPlaceholder(entry),
+    fingerprint: createHash("sha256").update(JSON.stringify(entry)).digest("hex"),
+  };
+}
+
+// bob#241 — the doctor check. When bob.yaml names a provider IN THIS CHECK'S
+// SCOPE, the agent's store must hold a usable credential for it. `ok` when the
+// check is satisfied or the provider is out of scope; `fail` (with a fix line)
+// when the provider has no usable credential, or when the store cannot be read
+// or parsed, or fails bob's conservative validation — none of those is a pass.
 export function subscriptionCredentialCheck(input: {
   name: string;
   provider: string;
@@ -215,7 +322,7 @@ export function subscriptionCredentialCheck(input: {
 }): { status: "ok"; detail: string } | { status: "fail"; detail: string; fix: string } {
   const { name, provider, piAgentDir } = input;
   if (!SUBSCRIPTION_PROVIDERS.has(provider)) {
-    return { status: "ok", detail: `provider ${provider} is not a subscription provider` };
+    return { status: "ok", detail: `provider ${provider} is outside this check's scope` };
   }
   const stored = storedCredentialProviders(piAgentDir);
   if (!stored.ok) {
@@ -231,7 +338,7 @@ export function subscriptionCredentialCheck(input: {
   if (stored.unusable.includes(provider)) {
     return {
       status: "fail",
-      detail: `credential record for ${provider} is stored but not usable — pi does not treat it as configured (an empty or placeholder value); stored: ${stored.providers.join(", ") || "none"}`,
+      detail: `credential record for ${provider} is stored but not usable — bob does not resolve it to a usable key (an empty key, an unresolved reference, or a placeholder value); stored: ${stored.providers.join(", ") || "none"}`,
       fix: `bob login ${name} ${provider}`,
     };
   }
@@ -242,11 +349,12 @@ export function subscriptionCredentialCheck(input: {
   };
 }
 
-// The pi executable bob pins: pi's package.json `bin` is `dist/bundle/cli.js`.
-// Resolve it from bob's OWN module directory by walking up to the nearest
-// node_modules, so a stray `pi` on PATH is never used. When the pinned bin is
-// not found the search REFUSES, naming every location it looked in — bob never
-// falls back to an unpinned `pi` on PATH. (The optional start directory is a
+// The pi executable from bob's OWN tree: pi's package.json `bin` is
+// `dist/bundle/cli.js`. Resolve the PACKAGE-PATH executable by walking up from
+// bob's own module directory to the nearest node_modules — this checks that the
+// path exists, NOT the package's version — so a stray `pi` on PATH is never used.
+// When it is not found the search REFUSES, naming every location it looked in;
+// bob never falls back to a `pi` on PATH. (The optional start directory is a
 // test seam; production callers pass none.)
 export function resolvePiBin(startDir?: string): string {
   const rel = join(
@@ -268,7 +376,7 @@ export function resolvePiBin(startDir?: string): string {
     dir = parent;
   }
   throw new Error(
-    `bob: could not find the pinned pi executable (looked for ${rel} in ${searched.length} location(s): ${searched.join(", ")}). Run 'bun install' in the bob checkout so the pinned pi is present; bob never runs an unpinned 'pi' from PATH.`,
+    `bob: could not find the pi executable at the package path (looked for ${rel} in ${searched.length} location(s): ${searched.join(", ")}). Run 'bun install' in the bob checkout so the pi package is present; bob never runs a 'pi' from PATH.`,
   );
 }
 
@@ -339,19 +447,8 @@ function runPi(input: {
   });
 }
 
-// A NON-SECRET fingerprint of the store FILE — device/inode, size and mtime —
-// enough to tell a rewritten store from an untouched one without reading the
-// credential value. `null` when the file is absent. A stat that fails for any
-// other reason propagates (a failed read is never silently "unchanged").
-function storeFingerprint(piAgentDir: string): string | null {
-  const path = join(piAgentDir, PROVIDER_LOGIN_STORE);
-  if (!existsSync(path)) return null;
-  const s = statSync(path);
-  return `${s.dev}:${s.ino}:${s.size}:${Math.trunc(s.mtimeMs)}`;
-}
-
-// bob login <agent> [provider] — start pi for subscription-provider sign-in; the
-// operator performs the sign-in itself.
+// bob login <agent> [provider] — start pi for provider sign-in; the operator
+// performs the sign-in itself.
 export async function runLogin(
   opts: { name: string; provider?: string } & LoginDeps,
 ): Promise<number> {
@@ -372,20 +469,20 @@ export async function runLogin(
     `bob login ${opts.name}: starting pi in ${agentDir} — type ${command} at the prompt to sign in.`,
   );
   out(
-    `  pi stores the credential in ${join(piAgentDir, PROVIDER_LOGIN_STORE)}; bob never reads it.`,
+    `  pi stores the credential in ${join(piAgentDir, PROVIDER_LOGIN_STORE)}; bob reads that store to check the result and never prints credential values.`,
   );
 
-  // Record the target's state BEFORE launch: which providers the store held, and
-  // the store file's fingerprint. Success is an OBSERVED change — the target's
-  // credential newly present, or the store rewritten — never pi's zero exit
-  // alone. A store that cannot be read before the run is refused, because the
-  // change cannot be observed without it.
-  const before = storedCredentialProviders(piAgentDir);
+  // Record the TARGET provider's stored credential BEFORE launch (its presence,
+  // usability and a fingerprint of its stored fields). Success is an OBSERVED
+  // change to THIS provider — newly usable, or its stored value changed — never
+  // pi's zero exit alone, and never a change to some OTHER provider. A store that
+  // cannot be read before the run is refused: the change cannot be observed
+  // without it.
+  const before = storedCredentialFingerprint(piAgentDir, target);
   if (!before.ok) {
     err(`bob login ${opts.name}: ${before.reason}`);
     return 1;
   }
-  const beforeFingerprint = storeFingerprint(piAgentDir);
 
   const exit = await runPi({
     piBin: opts.piBin ?? resolvePiBin(),
@@ -400,25 +497,29 @@ export async function runLogin(
     return 1;
   }
 
-  // The post-condition: the store must now hold a credential for the target AND
-  // that credential must be new or the store must have changed. A zero exit with
-  // a pre-existing, unchanged credential (the operator cancelled) is a failure.
-  const after = storedCredentialProviders(piAgentDir);
+  // The post-condition, about the TARGET provider only: it must now hold a usable
+  // credential AND that credential must be new (not usable before) or changed
+  // (its stored value differs). A zero exit that leaves the target's credential
+  // pre-existing and unchanged — the operator cancelled, or signed in to another
+  // provider — is a failure.
+  const after = storedCredentialFingerprint(piAgentDir, target);
   if (!after.ok) {
     err(`bob login ${opts.name}: ${after.reason}`);
     return 1;
   }
-  if (!after.providers.includes(target)) {
-    err(
-      `bob login ${opts.name}: no credential was stored for ${target} (stored: ${after.providers.join(", ") || "none"}).`,
-    );
+  if (!after.usable) {
+    err(`bob login ${opts.name}: no usable credential is stored for ${target}.`);
     return 1;
   }
-  const added = !before.providers.includes(target);
-  const changed = storeFingerprint(piAgentDir) !== beforeFingerprint;
+  const added = !before.usable;
+  const changed =
+    before.present &&
+    after.present &&
+    before.fingerprint !== null &&
+    before.fingerprint !== after.fingerprint;
   if (!added && !changed) {
     err(
-      `bob login ${opts.name}: a credential for ${target} was already present and the store is unchanged — nothing was signed in (did you cancel the sign-in?).`,
+      `bob login ${opts.name}: the credential for ${target} was already present and unchanged — nothing was signed in for it (did you cancel, or sign in to another provider?).`,
     );
     return 1;
   }
@@ -426,8 +527,9 @@ export async function runLogin(
   return 0;
 }
 
-// bob logout <agent> — the matching removal. pi's `/logout` is an interactive
-// credential selector and takes no provider argument, so this command takes
+// bob logout <agent> — start pi so the operator can run `/logout`. This is NOT
+// bound to `bob login`'s target: pi's `/logout` is an interactive selector over
+// ANY stored credential, and takes no provider argument, so this command takes
 // none either.
 export async function runLogout(opts: { name: string } & LoginDeps): Promise<number> {
   const agentsRoot = opts.agentsRoot ?? join(opts.homeDir ?? homedir(), "agents");

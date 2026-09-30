@@ -90,11 +90,12 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check of the agent's setup — prints each check
-  login <name> [prov] Start pi in the agent's own config dir so you can sign it
-                      in to a subscription provider: type '/login [provider]' at
-                      the prompt. Run it in a terminal. Flags: --agents-root <dir>
-  logout <name>       The matching removal: start pi and type '/logout' (an
-                      interactive selector — takes no provider).
+  login <name> [prov] Start pi from the agent's own directory, with the agent's
+                      config dir set, so you can sign it in: type '/login
+                      [provider]' at the prompt. Run it in a terminal.
+                      Flags: --agents-root <dir>
+  logout <name>       Start pi and type '/logout' (an interactive selector over
+                      any stored credential — takes no provider).
                       Flags: --agents-root <dir>
   hire <name>         Hire a NEW agent from a packaged position.
                       Flags: --as <position> --context-window <tokens> (required)

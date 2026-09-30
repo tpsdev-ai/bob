@@ -73,8 +73,8 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
-| `bob login <name> [provider]` | Start pi in the agent's own config dir; type `/login [provider]` at the prompt to sign in. Run it in a terminal |
-| `bob logout <name>` | The matching removal: start pi and type `/logout` (an interactive selector — takes no provider) |
+| `bob login <name> [provider]` | Start pi from the agent's own directory (its config dir set); type `/login [provider]` at the prompt to sign in. Run it in a terminal |
+| `bob logout <name>` | Start pi and type `/logout` (an interactive selector over any stored credential — takes no provider) |
 | `bob hire <name> --as <position> --context-window <tokens>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository. Without `--context-window` it refuses before writing anything |
 | `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
 | `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
@@ -832,17 +832,18 @@ X Premium) and `kimi-coding`. (pi also offers an API key for some of them.) pi's
 interactive TUI command (`/login`); pi ships no `login` subcommand or flag, so `bob login` starts
 pi's TUI **in the agent's own directory**, with `PI_CODING_AGENT_DIR` set to the agent's
 `.pi-agent`, and you type the command at the prompt. bob composes that directory for every session
-and reuses the same path, so the token lands in the agent's own `.pi-agent/auth.json` and nowhere
-else:
+and reuses the same path, so pi writes the credential to the agent's own `.pi-agent/auth.json` —
+the store path bob composes for every session:
 
 ```bash
 bob login <agent> [provider]   # starts pi; type '/login [provider]' at the prompt
 ```
 
-Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. bob never
-prints, logs or copies the token; when pi exits it reports only whether the agent's store now holds
-a credential for the provider it targeted. `bob logout <agent>` is the matching removal (pi's
-`/logout` is an interactive selector, so it takes no provider).
+Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. bob reads the
+agent's store locally to decide the result (it parses auth.json) and never prints a credential VALUE;
+when pi exits, `bob login` reports success only when the provider it targeted now holds a usable
+credential that is new or changed. `bob logout <agent>` starts pi for `/logout` (an interactive
+selector over any stored credential, so it takes no provider).
 
 Then point the agent at the subscription model and restart it. The model must be one pi's catalog
 lists for that provider:
@@ -867,9 +868,10 @@ bob restart <agent>
 ```
 
 `bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while `openai-codex`,
-`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no credential pi
-accepts for it. (anthropic is a pi subscription provider too, but bob authenticates anthropic by an
-API key, so doctor does not require a login credential for it.)
+`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no usable credential
+for it (a keyless entry, an unresolved `$VAR` reference, or a placeholder does not count). This set is
+the check's scope, not a limit on `bob login`; anthropic is simply outside it, so doctor requires no
+login credential for anthropic.
 
 ## Model budget
 
