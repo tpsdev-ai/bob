@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatReport, runDoctor } from "../../src/shell/doctor.js";
 import { MailConsumer, tpsMailStatsPath } from "../../src/shell/mail-consumer.js";
+import { resolveRunConfig } from "../../src/shell/run.js";
+import { sessionModelLimits } from "../../src/shell/session.js";
 import {
   keyResolver,
   mailRecord,
@@ -48,6 +50,8 @@ function makeHealthyAgent(opts: { home: string; name: string }): {
       "",
       "provider:",
       "  name: anthropic",
+      "  model: claude-x",
+      "  context_window: 262144",
       "",
       "tools:",
       "  allow:",
@@ -677,6 +681,220 @@ describe("runDoctor", () => {
     const mail = report.checks.find((c) => c.name === "TPS mail inbox");
     expect(mail?.detail).toContain("new=1");
     expect(mail?.detail).toContain("cur=2");
+  });
+
+  // bob#225 (item 4): a session for bob.yaml's provider.model refuses to start
+  // without provider.context_window (bob does not guess a window; a guess can
+  // disagree with the server). Doctor reports it during doctor, with the exact line to add.
+  it("OK when bob.yaml declares provider.model and provider.context_window", () => {
+    makeHealthyAgent({ home, name: "testbot" });
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("ok");
+    expect(c?.detail).toContain("262144");
+    expect(c?.detail).toContain("claude-x");
+  });
+
+  it("FAIL when bob.yaml declares provider.model but no provider.context_window, naming the exact line to add", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: ea",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: claude-x",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toMatch(/provider\.context_window is not declared/);
+    expect(c?.detail).toContain("claude-x");
+    expect(c?.detail).toMatch(/refuses to start/);
+    // The remedy is the exact line to add, in this agent's bob.yaml.
+    expect(c?.fix).toBe(
+      `add "context_window: <tokens>" under "provider:" in ${join(agentDir, "bob.yaml")}`,
+    );
+    expect(report.summary.fail).toBeGreaterThanOrEqual(1);
+  });
+
+  it("SKIPs the window check when bob.yaml declares no provider.model to key it to", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      ["agent:", "  id: testbot", "  role: ea", "", "provider:", "  name: anthropic", ""].join(
+        "\n",
+      ),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("skip");
+  });
+
+  // provider.model is read the way the session resolver reads it (the scalar
+  // text), not as a parsed YAML type: `model: 123` is the model "123".
+  it("reads provider.model as the session resolver does: `model: 123` with no window FAILs, and a session refuses it", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  model: 123",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain("not declared for 123");
+    expect(c?.fix).toBe(
+      `add "context_window: <tokens>" under "provider:" in ${join(agentDir, "bob.yaml")}`,
+    );
+
+    // The resolver's outcome for the same file: model "123", and the session
+    // refuses it for the undeclared window.
+    const resolved = resolveRunConfig({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      hostRoot: join(home, ".bob", "host"),
+    });
+    expect(resolved.model).toBe("123");
+    expect(() => sessionModelLimits(resolved.config)).toThrow(/without a declared context window/);
+  });
+
+  it("SKIPs, not OK, a declared window when bob.yaml declares no provider.model (the resolver refuses the missing model first)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  context_window: 262144",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("skip");
+    expect(c?.detail).toBe("no provider.model declared");
+
+    expect(() =>
+      resolveRunConfig({
+        name: "testbot",
+        agentsRoot: join(home, "agents"),
+        hostRoot: join(home, ".bob", "host"),
+      }),
+    ).toThrow(/missing provider\.name and\/or provider\.model/);
+  });
+
+  it("FAILs, not SKIPs, when bob.yaml cannot be read, with a readable-file remedy", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    const yamlPath = join(agentDir, "bob.yaml");
+    chmodSync(yamlPath, 0o000);
+    try {
+      const report = runDoctor({
+        name: "testbot",
+        agentsRoot: join(home, "agents"),
+        flairKeysDir: join(home, ".flair", "keys"),
+        homeDir: home,
+      });
+      const c = report.checks.find((x) => x.name === "provider.context_window");
+      expect(c?.status).toBe("fail");
+      expect(c?.detail).toContain(`${yamlPath} unreadable`);
+      expect(c?.detail).toContain("the context window cannot be checked");
+      expect(c?.fix).toBe(
+        `make ${yamlPath} a regular file this user can read, then re-run bob doctor`,
+      );
+      // The bob.yaml file check stats the file and does not read it, so it
+      // alone would not report this.
+      expect(report.checks.find((x) => x.name === "bob.yaml")?.status).toBe("ok");
+      expect(report.summary.fail).toBeGreaterThanOrEqual(1);
+    } finally {
+      chmodSync(yamlPath, 0o600);
+    }
+  });
+
+  it("FAILs an unparseable provider: block before choosing a model or window outcome (no SKIP for the missing model)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  context_window: 262144",
+        "  context_windw: 1",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain('unknown key "context_windw"');
+    expect(c?.fix).toBe("fix the shape of the provider: block in bob.yaml");
   });
 });
 
