@@ -270,7 +270,8 @@ export function validateLede(relPath, body) {
 // be swapped in between, so the file that passed the check need not be the file
 // that was read (CodeQL js/file-system-race). O_NONBLOCK makes opening a FIFO
 // return at once, so it is refused below instead of blocking on a writer.
-// O_NOFOLLOW refuses a symbolic link: a fragment is a regular file in this
+// O_NOFOLLOW refuses a symbolic link: a fragment (any entry but README.md and a
+// dotfile, which the loop below skips without opening) is a regular file in this
 // directory, never a pointer to content elsewhere.
 const FRAGMENT_OPEN_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 
@@ -350,8 +351,9 @@ export function assemble(fragments) {
 }
 
 // Count of top-level entries in an assembled section. Used by `check` and
-// `promote` to report "N entries" against the fragment count — if those two ever
-// disagree, something was dropped.
+// `promote` to report "N entries" against the fragment count. If those two ever
+// disagree, either an entry was dropped (fewer) or a fragment carried an extra
+// top-level item (more); both are refused.
 export function countEntries(section) {
   return section.split("\n").filter((l) => l.startsWith("- ")).length;
 }

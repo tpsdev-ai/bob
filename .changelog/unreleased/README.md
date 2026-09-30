@@ -46,8 +46,10 @@ side is that a fragment which is not already a well-formed list item is a hard
 error rather than something the tooling quietly fixes up: silent normalisation
 is how content goes missing.
 
-A fragment is a regular file in this directory. A symbolic link, a directory or
-any other kind of entry is refused.
+The reader skips `README.md` and dotfiles (such as `.gitkeep`) without looking
+at them. Every other entry in this directory is read as a fragment and must be a
+regular file: a symbolic link, a directory or any other kind of entry is
+refused.
 
 ## Checking your work
 
@@ -62,7 +64,7 @@ and every push to `main`, once the build job has succeeded. It fails on a
 malformed fragment (a bad name; a
 missing, empty or over-long bold lede; a body that is not a list item; a
 continuation line indented by an odd number of spaces or not at all; a fragment
-holding more than one entry), on an entry that is not a regular file, on a
+holding more than one entry), on a fragment entry that is not a regular file, on a
 missing fragment directory, and on anything but the managed note under
 `[Unreleased]`. Every command refuses an argument it does not take (exit
 status 2).

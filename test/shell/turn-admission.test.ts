@@ -30,6 +30,10 @@ afterEach(async () => {
 // Only pi's model/session, Discord transport and Flair transport are fakes.
 async function harness() {
   const root = mkdtempSync(join(tmpdir(), "bob-admission-"));
+  // Register the directory's removal up front (afterEach drains `cleanups`),
+  // BEFORE the setup below, which can throw — otherwise a failed start leaked
+  // the directory, since the combined cleanup is only registered afterwards.
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, "pulse", "work"), { recursive: true });
   mkdirSync(join(root, "pulse", ".pi-agent"));
   writeFileSync(

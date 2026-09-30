@@ -2,7 +2,8 @@
 // issue's acceptance: two PRs whose fragments have distinct filenames merge
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` is the migrated content
-// reordered by category and filename, apart from three named repairs; `promote`
+// reordered by category and filename, apart from the eight repairs the migration
+// tests name; `promote`
 // writes a dated section below [Unreleased] and deletes the fragments.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -332,18 +333,19 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
-  // would go red on the release PR. `unreleased-pre-bob-236.md` is the
-  // [Unreleased] block before the migration; `migrated-bob-236/` is the fragment
-  // set the migration made from it.
+  // would go red on the release PR. `unreleased-main-a188b6fe.md` is main's
+  // [Unreleased] block at a188b6fe, the last main this change merged, before its
+  // entries moved into fragments; `migrated-bob-236/` is the fragment set made
+  // from it, every entry of that block included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
-  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-pre-bob-236.md"), "utf8"));
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-a188b6fe.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The entries the migration had to repair to pass `check` (1-3), and the ones
-  // corrected afterwards because they no longer matched bob's tool policy or the
-  // rendered order (4-7). Every other entry is the pre-migration text unchanged
-  // (whitespace at its end aside), so a new difference is a failure rather than
-  // an unnoticed extra repair.
+  // The eight entries the migration changed: three to pass `check` (1-3; the
+  // second was later corrected as well), and five corrected because they no
+  // longer matched bob's code or the rendered order (4-8). Every other entry is
+  // main's text unchanged (whitespace at its end aside), so a new difference is a
+  // failure rather than an unnoticed extra repair.
   type Repair = {
     fragment: string;
     was: string;
@@ -357,11 +359,30 @@ describe("changelog fragments — the migration (bob#236)", () => {
       was: "- **bob loads the raw 32-byte seed key",
       repair: "lede",
     },
-    // A lede with no closing `**`: reshaped.
+    // A lede with no closing `**`: reshaped; and parsing `bob run --interactive`
+    // is not support for it: the command refuses the flag when it is on.
     {
       fragment: "fixed-19-a-boolean-flag-bob-onboard-s.md",
       was: "- **A boolean flag — ",
-      repair: "lede",
+      repair: "correction",
+      edits: [
+        [
+          "- **A boolean flag — `bob onboard`'s",
+          "- **A boolean flag is validated while the command line is parsed, before any command runs.** `bob onboard`'s",
+        ],
+        [
+          "and `bob run`'s `--interactive` — is validated as the command line is parsed, before any command runs: it is on when written bare or as `=true`, off as `=false`, and every other spelling",
+          "and `bob run`'s `--interactive`, parse as on when written bare or as `=true` and off as `=false`, and every other spelling",
+        ],
+        [
+          "is a usage error with exit code 2, so a bad spelling never runs the real command and a boolean flag",
+          "is a usage error with exit code 2; a bad spelling never runs the real command, and a boolean flag",
+        ],
+        [
+          "keeps `testbot` as the name). (`test/shell/argv.test.ts`",
+          "keeps `testbot` as the name). Parsing is not support: `bob run` refuses `--interactive` when it is on, with exit code 2, because its interactive mode does not exist on the embedded-SDK path yet. (`test/shell/argv.test.ts`",
+        ],
+      ],
     },
     // A continuation line indented 3 spaces: re-indented to 2, text unchanged.
     {
@@ -413,6 +434,19 @@ describe("changelog fragments — the migration (bob#236)", () => {
         [
           "- **Stated limits of the contract above.**",
           "- **Stated limits of the system-prompt task contract (under Added).**",
+        ],
+      ],
+    },
+    // `bash`/`write`/`edit` are the coder role's set; builder-local holds `run`
+    // and the anchored-edit writers.
+    {
+      fragment: "changed-06-role-json-is-the-ceiling-on.md",
+      was: "- **`role.json` is the ceiling on the tool allowlist",
+      repair: "correction",
+      edits: [
+        [
+          "the coder role sets it `true`, so a persistent builder keeps `bash`/`write`/`edit` while no `bob.yaml` can grant itself a shell its role does not allow.",
+          "the `coder` role sets it `true`, so a persistent agent of the `coder` role keeps `bash`/`write`/`edit` (builder-local sets it too, and keeps `run` and the anchored-edit writers instead), while no `bob.yaml` can grant itself a shell its role does not allow.",
         ],
       ],
     },
