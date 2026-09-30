@@ -360,13 +360,17 @@ export function countEntries(section) {
 
 // ─── CHANGELOG.md surgery ─────────────────────────────────────────────────────
 
-// The heading is ONE line, equal to `## [Unreleased]` byte for byte. Any line
-// that looks like an [Unreleased] heading (another case, a suffix, trailing
-// blanks, extra spaces) counts toward that one: a look-alike is refused rather
-// than taken for it, and a second heading is refused, so nothing can sit under a
+// The heading is ONE line, equal to `## [Unreleased]` byte for byte. A CANDIDATE
+// is any line that, after at most three leading spaces, starts with `##`,
+// optional spaces or tabs, `[`, optional spaces or tabs, and `unreleased` in any
+// letter case, whatever follows. That covers every Markdown level-two heading
+// written that way (another case, a suffix, a missing `]`, trailing spaces or
+// tabs, up to three leading spaces) and the same text with no space after `##`.
+// Exactly one candidate may exist, and it must be the exact line: a candidate
+// before or after it is refused, so no entry can sit under an [Unreleased]
 // heading that `check` and `promote` do not read.
 const UNRELEASED_HEADING = "## [Unreleased]";
-const UNRELEASED_LOOKALIKE = /^##\s*\[\s*unreleased\s*\]/i;
+const UNRELEASED_LOOKALIKE = /^ {0,3}##[ \t]*\[[ \t]*unreleased/i;
 
 /** `{ index }` of the one exact heading, or `{ problem }` saying what is wrong. */
 export function findUnreleasedHeading(lines) {

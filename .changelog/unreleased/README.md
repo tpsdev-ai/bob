@@ -66,9 +66,11 @@ that is not a list item; a continuation line indented by an odd number of spaces
 or not at all; a fragment holding more than one entry), on a fragment entry that
 is not a regular file, on a missing fragment directory, and on a `CHANGELOG.md`
 whose `[Unreleased]` heading is missing, repeated, or anything but the line
-`## [Unreleased]` byte for byte (another case, a suffix, trailing spaces or
-tabs), or that holds anything but the managed note under it. Every command
-refuses an argument it does not take (exit status 2).
+`## [Unreleased]` byte for byte, or that holds anything but the managed note
+under it. Here a line counts as an `[Unreleased]` heading when, after at most
+three leading spaces, it starts with `##`, optional spaces or tabs, `[`,
+optional spaces or tabs, and `unreleased` in any letter case, whatever follows.
+Every command refuses an argument it does not take (exit status 2).
 
 ## At release time
 

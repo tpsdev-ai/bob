@@ -193,6 +193,10 @@ describe("changelog fragments — check (bob#236)", () => {
       "## [Unreleased] ",
       "## [Unreleased]\t",
       "##  [Unreleased]",
+      " ## [Unreleased]",
+      "   ## [Unreleased]",
+      "## [Unreleased",
+      "##[Unreleased]",
     ]) {
       const text = `# Changelog\n\n${heading}\n\n${NOTE}\n\n## [0.0.1] - 2020-01-01\n`;
       writeFileSync(changelogPath, text);
@@ -208,20 +212,38 @@ describe("changelog fragments — check (bob#236)", () => {
     }
   });
 
-  it("REFUSES a second [Unreleased] heading, which could hide an entry, in check and in promote", () => {
+  // A second candidate hides the entry under it from the note check wherever it
+  // sits: before the exact heading its section is never read, and after it the
+  // candidate ends the section being read.
+  it("REFUSES a second [Unreleased] heading hiding an entry, before or after the exact one, in check and in promote", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
-    for (const second of ["## [Unreleased]", "## [Unreleased] - more"]) {
-      const text = `# Changelog\n\n## [Unreleased]\n\n${NOTE}\n\n${second}\n\n- a hidden entry\n\n## [0.0.1] - 2020-01-01\n`;
-      writeFileSync(changelogPath, text);
-      const line = 4 + NOTE.split("\n").length + 2;
-      const msg = `2 [Unreleased] headings (lines 3, ${line})`;
-      expect(() => cf.check({ dir, changelogPath }), second).toThrow(msg);
-      expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }), second).toThrow(
-        msg,
-      );
-      expect(readFileSync(changelogPath, "utf8")).toBe(text);
-      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    const noteLines = NOTE.split("\n").length;
+    for (const second of [
+      "## [Unreleased]",
+      " ## [Unreleased]",
+      "   ## [unreleased]",
+      "## [Unreleased] - more",
+      "## [Unreleased",
+    ]) {
+      const hidden = `${second}\n\n- a hidden entry\n\n`;
+      const exact = `## [Unreleased]\n\n${NOTE}\n\n`;
+      for (const [where, body, lines] of [
+        ["before", hidden + exact, "3, 7"],
+        ["after", exact + hidden, `3, ${4 + noteLines + 2}`],
+      ] as const) {
+        const text = `# Changelog\n\n${body}## [0.0.1] - 2020-01-01\n`;
+        writeFileSync(changelogPath, text);
+        const label = `${JSON.stringify(second)} ${where}`;
+        const msg = `2 [Unreleased] headings (lines ${lines})`;
+        expect(() => cf.check({ dir, changelogPath }), label).toThrow(msg);
+        expect(
+          () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }),
+          label,
+        ).toThrow(msg);
+        expect(readFileSync(changelogPath, "utf8")).toBe(text);
+        expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+      }
     }
   });
 
@@ -388,8 +410,9 @@ describe("changelog fragments — the migration (bob#236)", () => {
   // (fixed-17, fixed-19, added-09; fixed-19 was also corrected), and six more were
   // corrected because they no longer matched bob's code or the rendered order.
   // Every other entry is main's text unchanged (whitespace at its end aside). A
-  // new difference, or a word that vanishes without being listed, fails: a
-  // repair cannot drop a fact unnoticed.
+  // new difference, or a word that vanishes without being listed, fails. That
+  // detects unlisted vanished words; it does not prove every fact is preserved (a
+  // rewrite that removes no word, such as swapping two names, would pass).
   type Repair = {
     fragment: string;
     was: string;
@@ -514,11 +537,11 @@ describe("changelog fragments — the migration (bob#236)", () => {
           "an interactive `bob run` mode (`bob run` parses `--interactive` but refuses it when it is on),",
         ],
         [
-          "fails if the retired `--interactive` flag appears",
-          "fails if the unsupported `--interactive` flag appears",
+          "and fails if the retired `--interactive` flag appears as a word in a code span or code fence;",
+          "and fails if a README code span or code fence spells `--interactive` as a word, since the interactive `bob run` mode is unsupported;",
         ],
       ],
-      dropped: ["flags", "have", "retired"],
+      dropped: ["appears", "flag", "flags", "have", "retired"],
     },
   ];
 
