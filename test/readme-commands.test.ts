@@ -8,8 +8,11 @@ import { type SpawnError, spawnNode } from "./cli-spawn.js";
 // The README's usage section must only name commands the CLI actually accepts.
 // The test reads the `bob <command>` names the README carries in three places —
 // inline code spans, fenced code blocks, and the Commands table — and fails if
-// the CLI rejects any of them. It also fails if the retired `--interactive` flag
-// appears as a word in a code span or code fence (table cells are not scanned for flags).
+// the CLI rejects any of them. It also fails if a code span or code fence holds
+// `--interactive` as a token (split on whitespace and commas, backticks
+// stripped), bare or as `--interactive=<value>`: the CLI refuses the flag when it
+// is on, and the README offers no interactive mode (table cells are not scanned
+// for flags).
 //
 // Two vacuous-pass modes are closed:
 //  - a plain-text Commands-table row (no backticks) is read as a table cell,
@@ -89,7 +92,10 @@ function retiredFlagsNamedIn(md: string): string[] {
       // A code span wraps its contents in backticks; the flag token may still
       // carry a leading ` from the span open or trailing ` from the span close.
       const token = raw.replace(/^`+/, "").replace(/`+$/, "");
-      if (RETIRED_FLAGS.includes(token)) found.add(token);
+      // The flag bare, or with a value (`--interactive=true`).
+      const eq = token.indexOf("=");
+      const name = eq === -1 ? token : token.slice(0, eq);
+      if (RETIRED_FLAGS.includes(name)) found.add(token);
     }
   }
   return [...found];
@@ -192,6 +198,19 @@ describe("README usage names only commands/flags the CLI accepts (#149)", () => 
       throw new Error(`README names flags the CLI rejects: ${flagged.join(", ")}`);
     }
     expect(flagged).toEqual([]);
+  });
+
+  it("finds --interactive in a code span or fence, bare or with a value, and not in prose", () => {
+    const md =
+      "Prose --interactive=true is not code.\n\n" +
+      "`bob run x --interactive=true`\n\n" +
+      "```\nbob run x --interactive\n```\n\n" +
+      "`--interactive=false`, `--interactive-mode`\n";
+    expect(retiredFlagsNamedIn(md).sort()).toEqual([
+      "--interactive",
+      "--interactive=false",
+      "--interactive=true",
+    ]);
   });
 
   it("reads plain-text Commands-table rows, and an empty table yields no names", () => {

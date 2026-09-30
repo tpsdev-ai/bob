@@ -42,6 +42,7 @@
 //                                                    real date (default: today, UTC)
 //   Every command refuses an argument it does not take, with exit status 2.
 
+import { spawnSync } from "node:child_process";
 import {
   closeSync,
   constants,
@@ -53,7 +54,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
@@ -559,6 +560,8 @@ export function promote(
     );
   }
 
+  gitRestorableOrThrow({ changelogPath, dir, names: fragments.map((f) => f.name) });
+
   const day = date ?? new Date().toISOString().slice(0, 10);
   const replacement = ["", UNRELEASED_NOTE, "", `## [${version}] - ${day}`, "", section, ""];
   const next = [...lines.slice(0, loc.start + 1), ...replacement, ...lines.slice(loc.end)];
@@ -588,6 +591,57 @@ export function promote(
     );
   }
   return { version, date: day, entries, removed: fragments.map((f) => f.name) };
+}
+
+// `promote` rewrites CHANGELOG.md and deletes the fragments, and its recovery from
+// a part-way failure is `git checkout -- CHANGELOG.md .changelog/unreleased`,
+// which restores files from the INDEX. So before it writes anything, promote
+// requires a git work tree and refuses while CHANGELOG.md or any fragment is
+// untracked (not in the index) or differs from the index, naming each: git could
+// not restore those as they are, and a deleted untracked fragment would be gone.
+function git(cwd, args) {
+  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000 });
+  return { ok: !r.error && r.status === 0, out: r.stdout ?? "" };
+}
+
+export function gitRestorableOrThrow({ changelogPath, dir, names }) {
+  const inside = git(dir, ["rev-parse", "--is-inside-work-tree"]);
+  if (!inside.ok || inside.out.trim() !== "true") {
+    throw new FragmentError(
+      `promote: ${FRAGMENT_DIR_REL}/ is not in a git work tree. promote runs in the repository, so that a ` +
+        `part-way failure can be undone with git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}; nothing was written.`,
+    );
+  }
+  const clDir = dirname(changelogPath);
+  const clName = basename(changelogPath);
+  const lists = [
+    git(dir, ["ls-files", "-z", "--", "."]),
+    git(dir, ["ls-files", "-m", "-z", "--", "."]),
+    git(clDir, ["ls-files", "-z", "--", clName]),
+    git(clDir, ["ls-files", "-m", "-z", "--", clName]),
+  ];
+  if (lists.some((l) => !l.ok)) {
+    throw new FragmentError(
+      `promote: git ls-files failed, so it cannot tell whether git could restore CHANGELOG.md and the ` +
+        `fragments; nothing was written.`,
+    );
+  }
+  const set = (l) => new Set(l.out.split("\0").filter(Boolean));
+  const [tracked, modified, clTracked, clModified] = lists.map(set);
+  const untracked = names.filter((n) => !tracked.has(n));
+  const changed = names.filter((n) => modified.has(n));
+  if (!clTracked.has(clName)) untracked.unshift("CHANGELOG.md");
+  if (clModified.has(clName)) changed.unshift("CHANGELOG.md");
+  if (untracked.length > 0 || changed.length > 0) {
+    const parts = [];
+    if (untracked.length > 0) parts.push(`untracked (not in the index): ${untracked.join(", ")}`);
+    if (changed.length > 0)
+      parts.push(`changed since staged (differs from the index): ${changed.join(", ")}`);
+    throw new FragmentError(
+      `promote: git could not restore these as they are, so nothing was written. ${parts.join("; ")}. ` +
+        `Stage them (git add) or remove them, then run promote again.`,
+    );
+  }
 }
 
 // The versions `promote` accepts: MAJOR.MINOR.PATCH, each 0 or a number with no

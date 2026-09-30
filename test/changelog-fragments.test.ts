@@ -1,9 +1,12 @@
 // bob#236: changelog fragments. Ported from flair's model; these tests cover the
 // issue's acceptance: two PRs whose fragments have distinct filenames merge
 // cleanly in either order; `check` fails on anything but the managed note under
-// [Unreleased] and on a malformed fragment; `render` is the migrated content
-// reordered by category and filename, apart from the nine repairs the migration
-// tests name; `promote`
+// [Unreleased] and on a malformed fragment; `render` carries the migrated list
+// entries reordered by category and filename, and apart from that order they
+// differ only by the nine repairs the migration tests name and the whitespace
+// trimmed at the end of each fragment (the block body's two HTML comment
+// markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
+// and do not render); `promote`
 // writes a dated section below [Unreleased] and deletes the fragments.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -62,6 +65,18 @@ function project(): { dir: string; changelogPath: string } {
   const dir = join(root, ".changelog", "unreleased");
   mkdirSync(dir, { recursive: true });
   return { dir, changelogPath };
+}
+
+// promote runs only in a git work tree, with CHANGELOG.md and every fragment
+// matching the index: make `root` one and stage everything in it.
+function stageAll(): void {
+  for (const args of [
+    ["init", "-q"],
+    ["add", "-A"],
+  ]) {
+    const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+  }
 }
 
 function fragment(dir: string, name: string, body: string): void {
@@ -270,6 +285,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
     fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
     const res = cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
     expect(res.version).toBe("1.2.3");
     expect(res.date).toBe("2022-01-02");
@@ -355,6 +371,56 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
+  it("promote REFUSES outside a git work tree, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const before = readFileSync(changelogPath, "utf8");
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      /is not in a git work tree/,
+    );
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  // git checkout restores from the index: a file that is not there, or differs
+  // from it, could not be restored as it was, so promote touches nothing.
+  it("promote REFUSES what git could not restore (untracked, or differing from the index), naming each, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "fixed-b.md", "- **b fix.** \n");
+    stageAll();
+    fragment(dir, "fixed-new.md", "- **a new fragment, never staged.** \n");
+    fragment(dir, "fixed-b.md", "- **b fix, edited after staging.** \n");
+    const before = readFileSync(changelogPath, "utf8");
+    const names = () =>
+      cf
+        .readFragments(dir)
+        .map((f) => f.name)
+        .sort();
+    const tryPromote = () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
+    expect(tryPromote).toThrow(
+      "untracked (not in the index): fixed-new.md; changed since staged (differs from the index): fixed-b.md",
+    );
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(names()).toEqual(["fixed-a.md", "fixed-b.md", "fixed-new.md"]);
+
+    // CHANGELOG.md edited after staging, then CHANGELOG.md not in the index.
+    stageAll();
+    const edited = `${before}\na local edit in an old section\n`;
+    writeFileSync(changelogPath, edited);
+    expect(tryPromote).toThrow("changed since staged (differs from the index): CHANGELOG.md");
+    expect(readFileSync(changelogPath, "utf8")).toBe(edited);
+    stageAll();
+    const rm = spawnSync("git", ["rm", "-q", "--cached", "CHANGELOG.md"], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    expect(rm.status, rm.stderr).toBe(0);
+    expect(tryPromote).toThrow("untracked (not in the index): CHANGELOG.md");
+    expect(readFileSync(changelogPath, "utf8")).toBe(edited);
+    expect(names()).toEqual(["fixed-a.md", "fixed-b.md", "fixed-new.md"]);
+  });
+
   // Permission bits do not bind root, so these two cannot fail a write as root.
   const asRoot = process.getuid?.() === 0;
 
@@ -363,6 +429,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     () => {
       const { dir, changelogPath } = project();
       fragment(dir, "fixed-a.md", "- **a fix.** \n");
+      stageAll();
       chmodSync(changelogPath, 0o444);
       try {
         expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
@@ -380,6 +447,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     () => {
       const { dir, changelogPath } = project();
       fragment(dir, "fixed-a.md", "- **a fix.** \n");
+      stageAll();
       chmodSync(dir, 0o555);
       try {
         expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
@@ -396,12 +464,13 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 describe("changelog fragments — the migration (bob#236)", () => {
   // Pinned to fixtures, never the live directory: `promote` empties
   // .changelog/unreleased/ at every release, so a migration test that read it
-  // would go red on the release PR. `unreleased-main-a188b6fe.md` is main's
-  // [Unreleased] block at a188b6fe, the main commit whose entries were migrated,
-  // before they moved into fragments; `migrated-bob-236/` is the fragment set
-  // made from it, every entry of that block included.
+  // would go red on the release PR. `unreleased-main-1b30709e.md` is the body
+  // of main's [Unreleased] block (its heading excluded) at 1b30709e, the main
+  // commit whose entries were migrated, before they moved into fragments;
+  // `migrated-bob-236/` is the fragment set made from it, every list entry of
+  // that body included.
   const FIXTURES = join(import.meta.dir, "fixtures", "changelog");
-  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-a188b6fe.md"), "utf8"));
+  const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-1b30709e.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
   // The nine entries the migration changed, each as EXACT edits of main's text
@@ -538,10 +607,10 @@ describe("changelog fragments — the migration (bob#236)", () => {
         ],
         [
           "and fails if the retired `--interactive` flag appears as a word in a code span or code fence;",
-          "and fails if a README code span or code fence spells `--interactive` as a word, since the interactive `bob run` mode is unsupported;",
+          "and fails if a README code span or code fence holds `--interactive`, bare or as `--interactive=<value>`, as a token split on whitespace and commas, since the interactive `bob run` mode is unsupported;",
         ],
       ],
-      dropped: ["appears", "flag", "flags", "have", "retired"],
+      dropped: ["appears", "flag", "flags", "have", "retired", "word"],
     },
   ];
 
@@ -662,6 +731,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     }
     expect(readFileSync(changelogPath, "utf8")).toBe(before);
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    stageAll();
     const ok = run("promote", "1.2.3", "--date=2026-01-01");
     expect(ok.code, ok.out).toBe(0);
     expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2026-01-01");
