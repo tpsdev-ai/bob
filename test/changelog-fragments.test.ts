@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -243,6 +244,53 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
+  it("promote REFUSES a version outside MAJOR.MINOR.PATCH[-pre-release] or with a leading zero, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const before = readFileSync(changelogPath, "utf8");
+    for (const v of [
+      "01.2.3",
+      "1.02.3",
+      "1.2.03",
+      "1.2.3-rc.01",
+      "1.2.3+build",
+      "1.2.3-",
+      "1.2.3-rc..1",
+      "v1.2.3",
+    ]) {
+      expect(() => cf.promote(v, { date: "2022-01-02", dir, changelogPath }), v).toThrow(
+        /invalid version/,
+      );
+    }
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
+  it("the version format accepts plain and pre-release versions", () => {
+    for (const v of [
+      "0.0.0",
+      "0.31.0",
+      "10.20.30",
+      "1.0.0-rc.1",
+      "1.2.3-alpha",
+      "1.2.3-0",
+      "1.2.3-x.7.z.92",
+    ]) {
+      expect(cf.isReleaseVersion(v), v).toBe(true);
+    }
+  });
+
+  it("promote REFUSES a version that already has a section, and writes nothing", () => {
+    const { dir, changelogPath } = project(); // carries '## [0.0.1] - 2020-01-01'
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const before = readFileSync(changelogPath, "utf8");
+    expect(() => cf.promote("0.0.1", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      /already has a '## \[0\.0\.1\]' section \(line \d+\)/,
+    );
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
+
   // Permission bits do not bind root, so these two cannot fail a write as root.
   const asRoot = process.getuid?.() === 0;
 
@@ -291,10 +339,18 @@ describe("changelog fragments — the migration (bob#236)", () => {
   const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-pre-bob-236.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The entries the migration had to repair to pass `check`. Every other entry
-  // is the pre-migration text unchanged (whitespace at its end aside), so a new
-  // difference is a failure rather than an unnoticed extra repair.
-  const REPAIRED = [
+  // The entries the migration had to repair to pass `check` (1-3), and the ones
+  // corrected afterwards because they no longer matched bob's tool policy or the
+  // rendered order (4-7). Every other entry is the pre-migration text unchanged
+  // (whitespace at its end aside), so a new difference is a failure rather than
+  // an unnoticed extra repair.
+  type Repair = {
+    fragment: string;
+    was: string;
+    repair: "lede" | "indent" | "correction";
+    edits?: [string, string][];
+  };
+  const REPAIRED: Repair[] = [
     // An over-long lede: reshaped.
     {
       fragment: "fixed-17-bob-loads-the-raw-32-byte.md",
@@ -312,6 +368,53 @@ describe("changelog fragments — the migration (bob#236)", () => {
       fragment: "added-09-the-reachy-capability-jarvis-s3-memory.md",
       was: "- **The `reachy` capability",
       repair: "indent",
+    },
+    // builder-local holds the `work` run tools, not `bash` (roles/builder-local/role.json).
+    {
+      fragment: "added-07-the-anchored-edit-capability-and-the.md",
+      was: "- **The `anchored-edit` capability and the `builder-local` role",
+      repair: "correction",
+      edits: [
+        [
+          "plus `bash`, `grep`, `find`, `ls` and the flair tools,",
+          "plus the `work` capability's `run`, `run_status` and `run_cancel` (it holds no `bash`), `grep`, `find`, `ls` and the flair tools,",
+        ],
+      ],
+    },
+    // The resident rule's exception: a role that opts in keeps its writers.
+    {
+      fragment: "fixed-04-a-resident-agent-keeps-a-tool.md",
+      was: "- **A resident agent keeps a tool only when",
+      repair: "correction",
+      edits: [
+        [
+          "- **A resident agent keeps a tool only when a reviewed classification says it writes no file and runs no command (bob#213).**",
+          "- **Unless its role opts in, a resident agent keeps only the tools a reviewed classification says write no file and run no command (bob#213).**",
+        ],
+        [
+          "no longer keeps them; builder-local, the one shipped role that lists them, opts in.",
+          "no longer keeps them. A role that sets `tools.allowResidentShell: true` keeps its writers for a resident agent (the agent's `bob.yaml` can turn that off, not on); builder-local, the one shipped role that lists the anchored-edit writers, opts in, and so does coder.",
+        ],
+      ],
+    },
+    // render puts Changed before Fixed, so "above" pointed the wrong way.
+    {
+      fragment: "changed-09-onboarding-and-alignment-ran-under-a.md",
+      was: "- **Onboarding and alignment ran under a FIXED setup policy",
+      repair: "correction",
+      edits: [["(Fixed, above)", "(under Fixed)"]],
+    },
+    // "the contract above" meant the task contract, which renders under Added.
+    {
+      fragment: "changed-11-stated-limits-of-the-contract-above.md",
+      was: "- **Stated limits of the contract above.**",
+      repair: "correction",
+      edits: [
+        [
+          "- **Stated limits of the contract above.**",
+          "- **Stated limits of the system-prompt task contract (under Added).**",
+        ],
+      ],
     },
   ];
 
@@ -336,6 +439,14 @@ describe("changelog fragments — the migration (bob#236)", () => {
       if (was === undefined || now === undefined) throw new Error(`missing: ${r.fragment}`);
       if (r.repair === "indent") {
         expect(now.replace(/^ +/gm, "")).toBe(was.replace(/^ +/gm, ""));
+      } else if (r.repair === "correction") {
+        // Exactly the named edits, each applied once, and nothing else.
+        let text = was;
+        for (const [from, to] of r.edits ?? []) {
+          expect(text.split(from).length - 1, `${r.fragment}: ${from}`).toBe(1);
+          text = text.replace(from, to);
+        }
+        expect(now).toBe(text);
       } else {
         // The lede moved; every code span (command, flag, path, error) stayed.
         for (const span of spans(was)) expect(spans(now)).toContain(span);
@@ -363,6 +474,91 @@ describe("changelog fragments — the live directory (release-safe)", () => {
     // live in fragments; converting those again would print them twice.
     const rendered = ENTRIES(cf.assemble(cf.readFragments()));
     expect(new Set(rendered).size).toBe(rendered.length);
+  });
+
+  // A migrated fragment corrected in place must be corrected in its fixture copy
+  // too, where the repair is named; after a release none is left to compare.
+  it("each live fragment the migration made matches its fixture copy", () => {
+    const fixture = new Map(
+      cf
+        .readFragments(join(import.meta.dir, "fixtures", "changelog", "migrated-bob-236"))
+        .map((f) => [f.name, f.body]),
+    );
+    for (const f of cf.readFragments()) {
+      const copy = fixture.get(f.name);
+      if (copy !== undefined) expect(f.body, f.name).toBe(copy);
+    }
+  });
+});
+
+describe("changelog fragments — the CLI (bob#236)", () => {
+  // The script copied into a temp project: its ROOT is the copy's grandparent,
+  // so every command, promote included, acts on the temp project only.
+  const SCRIPT = join(import.meta.dir, "..", "scripts", "changelog-fragments.mjs");
+
+  function cli(): {
+    run: (...args: string[]) => { code: number; out: string };
+    dir: string;
+    changelogPath: string;
+  } {
+    const { dir, changelogPath } = project();
+    mkdirSync(join(root, "scripts"));
+    const copy = join(root, "scripts", "changelog-fragments.mjs");
+    copyFileSync(SCRIPT, copy);
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const run = (...args: string[]) => {
+      const r = spawnSync("node", [copy, ...args], { encoding: "utf8" });
+      return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+    };
+    return { run, dir, changelogPath };
+  }
+
+  for (const cmd of ["render", "list", "check"]) {
+    it(`${cmd} exits 0, and 2 with an argument it does not take`, () => {
+      const { run } = cli();
+      const good = run(cmd);
+      expect(good.code, good.out).toBe(0);
+      const bad = run(cmd, "--bogus");
+      expect(bad.code, bad.out).toBe(2);
+      expect(bad.out).toContain(`${cmd}: unexpected argument(s): --bogus`);
+    });
+  }
+
+  it("promote exits 2 on an argument it does not take or a repeated --date, and writes nothing", () => {
+    const { run, dir, changelogPath } = cli();
+    const before = readFileSync(changelogPath, "utf8");
+    for (const args of [
+      ["1.2.3", "--bogus"],
+      ["1.2.3", "--date", "2026-01-01"],
+      ["1.2.3", "--date=2026-01-01", "--date=2026-01-02"],
+    ]) {
+      const r = run("promote", ...args);
+      expect(r.code, `${args.join(" ")}: ${r.out}`).toBe(2);
+    }
+    expect(readFileSync(changelogPath, "utf8")).toBe(before);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    const ok = run("promote", "1.2.3", "--date=2026-01-01");
+    expect(ok.code, ok.out).toBe(0);
+    expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2026-01-01");
+  });
+
+  // The script's entry-point test compares real paths: run through a symlink, it
+  // must still run (here: refuse a malformed fragment), not exit 0 doing nothing.
+  it("runs through a symlinked path (a malformed fragment still fails check)", () => {
+    const { dir } = cli();
+    fragment(dir, "fixed-not-a-list.md", "just some prose\n");
+    symlinkSync(root, join(root, "link"));
+    const viaLink = join(root, "link", "scripts", "changelog-fragments.mjs");
+    const r = spawnSync("node", [viaLink, "check"], { encoding: "utf8" });
+    expect(r.status, `${r.stdout}${r.stderr}`).toBe(1);
+    expect(r.stderr).toContain("fixed-not-a-list.md: fragment must start with '- '");
+  });
+
+  it("an unknown command exits 2", () => {
+    const { run } = cli();
+    const r = run("publish");
+    expect(r.code, r.out).toBe(2);
+    expect(r.out).toContain("unknown command 'publish'");
   });
 });
 

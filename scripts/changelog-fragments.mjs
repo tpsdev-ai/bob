@@ -2,9 +2,9 @@
 // Changelog fragment files (bob#236), ported from flair's
 // scripts/changelog-fragments.mjs (flair#835).
 //
-// PROBLEM. Every PR was required to add its entry to the single `[Unreleased]`
-// block at the top of CHANGELOG.md, so two PRs that each added an entry edited
-// the same lines and the second to merge conflicted. The cost is not the
+// PROBLEM. A PR's changelog entry went into the single `[Unreleased]` block at
+// the top of CHANGELOG.md, so two PRs that each added an entry edited the same
+// lines and the second to merge conflicted. The cost is not the
 // resolution — it is that a merge/rebase to resolve DISMISSES the existing
 // approvals, so every conflict buys a full second review round for zero content
 // change. (bob's own [Unreleased] had also drifted into repeated
@@ -40,6 +40,7 @@
 //                                                    CHANGELOG.md and delete the
 //                                                    fragments; --date must be a
 //                                                    real date (default: today, UTC)
+//   Every command refuses an argument it does not take, with exit status 2.
 
 import {
   closeSync,
@@ -48,6 +49,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -453,8 +455,12 @@ export function promote(
   version,
   { date, changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {},
 ) {
-  if (!/^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$/.test(version ?? "")) {
-    throw new FragmentError(`promote: invalid version '${version}'. Expected semver, e.g. 0.31.0.`);
+  if (!isReleaseVersion(version)) {
+    throw new FragmentError(
+      `promote: invalid version '${version}'. Expected MAJOR.MINOR.PATCH with no leading zeros, optionally ` +
+        `followed by -<pre-release> of dot-separated letters and digits (e.g. 0.31.0 or 1.0.0-rc.1); build ` +
+        `metadata (+...) is not accepted.`,
+    );
   }
   if (date !== undefined && !isCalendarDate(date)) {
     throw new FragmentError(
@@ -472,6 +478,15 @@ export function promote(
   const lines = text.split("\n");
   const loc = locateUnreleased(lines);
   if (!loc) throw new FragmentError(`promote: no '## [Unreleased]' section in ${changelogPath}.`);
+  // Matched the way scripts/changelog-extract.mjs finds a release's section, which
+  // would publish only the first of two.
+  const existing = lines.findIndex((l) => l.startsWith(`## [${version}]`));
+  if (existing !== -1) {
+    throw new FragmentError(
+      `promote: CHANGELOG.md already has a '## [${version}]' section (line ${existing + 1}); a version is cut ` +
+        `once. Promote under the next version, or remove that section first.`,
+    );
+  }
 
   const stray = strayUnreleasedEntries(loc.body);
   if (stray.length > 0) {
@@ -530,6 +545,22 @@ export function promote(
   return { version, date: day, entries, removed: fragments.map((f) => f.name) };
 }
 
+// The versions `promote` accepts: MAJOR.MINOR.PATCH, each 0 or a number with no
+// leading zero, optionally followed by a pre-release: `-` and dot-separated
+// identifiers of letters and digits, a numeric identifier again with no leading
+// zero (1.0.0-rc.1). Narrower than SemVer (no build metadata, no hyphen inside a
+// pre-release) and a subset of what the release workflow and
+// scripts/changelog-extract.mjs accept, so a promoted version can be released.
+const VERSION_NUMBER = "(?:0|[1-9][0-9]*)";
+const PRE_RELEASE_ID = "(?:0|[1-9][0-9]*|[0-9]*[A-Za-z][0-9A-Za-z]*)";
+const RELEASE_VERSION = new RegExp(
+  `^${VERSION_NUMBER}\\.${VERSION_NUMBER}\\.${VERSION_NUMBER}(?:-${PRE_RELEASE_ID}(?:\\.${PRE_RELEASE_ID})*)?$`,
+);
+
+export function isReleaseVersion(v) {
+  return typeof v === "string" && RELEASE_VERSION.test(v);
+}
+
 // `YYYY-MM-DD` naming a day that exists (no 2026-02-30).
 export function isCalendarDate(s) {
   if (typeof s !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s)) return false;
@@ -540,11 +571,32 @@ export function isCalendarDate(s) {
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
-const isMain =
-  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (isMain) {
-  const cmd = process.argv[2] ?? "render";
+// Compared by REAL path: the module's own URL is resolved through symlinks while
+// argv[1] is not, so comparing them as given made the CLI a silent no-op (exit 0,
+// `check` included) whenever the script was run through a symlinked path.
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
   try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (isEntryPoint()) {
+  const USAGE = "render | list | check | promote <version> [--date=YYYY-MM-DD]";
+  // A usage error exits 2 and does nothing; an argument a command does not take
+  // is refused rather than ignored, for every command.
+  const usageError = (msg) => {
+    process.stderr.write(
+      `changelog-fragments: ${msg}\nUsage: node scripts/changelog-fragments.mjs ${USAGE}\n`,
+    );
+    process.exit(2);
+  };
+  const [cmd = "render", ...rest] = process.argv.slice(2);
+  try {
+    if ((cmd === "render" || cmd === "list" || cmd === "check") && rest.length > 0) {
+      usageError(`${cmd}: unexpected argument(s): ${rest.join(" ")}`);
+    }
     if (cmd === "render") {
       const section = assemble(readFragments());
       if (section.length > 0) process.stdout.write(`${section}\n`);
@@ -564,23 +616,18 @@ if (isMain) {
         `✓ ${res.fragments} fragment(s), ${res.entries} entr(ies), [Unreleased] holds only the managed note.\n`,
       );
     } else if (cmd === "promote") {
-      const version = process.argv[3];
-      const unknown = process.argv.slice(4).filter((a) => !a.startsWith("--date="));
-      if (unknown.length > 0) {
-        throw new FragmentError(
-          `promote: unexpected argument(s): ${unknown.join(" ")}. Usage: promote <version> [--date=YYYY-MM-DD].`,
-        );
-      }
-      const dateArg = process.argv.find((a) => a.startsWith("--date="));
-      const res = promote(version, { date: dateArg ? dateArg.slice("--date=".length) : undefined });
+      const [version, ...opts] = rest;
+      const unknown = opts.filter((a) => !a.startsWith("--date="));
+      if (unknown.length > 0) usageError(`promote: unexpected argument(s): ${unknown.join(" ")}`);
+      const dates = opts.filter((a) => a.startsWith("--date="));
+      if (dates.length > 1) usageError(`promote: --date given ${dates.length} times; give it once`);
+      const date = dates.length === 1 ? dates[0].slice("--date=".length) : undefined;
+      const res = promote(version, { date });
       process.stdout.write(
         `✓ promoted ${res.entries} entr(ies) into '## [${res.version}] - ${res.date}'; removed ${res.removed.length} fragment(s).\n`,
       );
     } else {
-      process.stderr.write(
-        `changelog-fragments: unknown command '${cmd}'. Try: render | list | check | promote <version>\n`,
-      );
-      process.exit(2);
+      usageError(`unknown command '${cmd}'`);
     }
   } catch (err) {
     process.stderr.write(`changelog-fragments: ${err?.message ?? err}\n`);

@@ -1,6 +1,7 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented in this file. Until a release, its entries live as
+fragment files under [`.changelog/unreleased/`](.changelog/unreleased/).
 
 ## [Unreleased]
 

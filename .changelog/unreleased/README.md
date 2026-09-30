@@ -57,21 +57,28 @@ node scripts/changelog-fragments.mjs list     # what is staged, by category
 node scripts/changelog-fragments.mjs check    # what CI runs
 ```
 
-CI runs `check` on every PR. It fails on a malformed fragment (a bad name; a
+CI runs `check` in its test job, for every pull request that targets `main`
+and every push to `main`, once the build job has succeeded. It fails on a
+malformed fragment (a bad name; a
 missing, empty or over-long bold lede; a body that is not a list item; a
 continuation line indented by an odd number of spaces or not at all; a fragment
 holding more than one entry), on an entry that is not a regular file, on a
 missing fragment directory, and on anything but the managed note under
-`[Unreleased]`.
+`[Unreleased]`. Every command refuses an argument it does not take (exit
+status 2).
 
 ## At release time
 
 `node scripts/changelog-fragments.mjs promote <version> [--date=YYYY-MM-DD]`
 keeps `## [Unreleased]` with its note, writes every fragment into a new
 `## [<version>] - <date>` section below it (in Keep a Changelog category order,
-and by filename within each category), then deletes the fragments. `--date`
-must be a real date written `YYYY-MM-DD`; without it the date is today's (UTC).
-An invalid date is refused before anything is written. Entry order within a
+and by filename within each category), then deletes the fragments.
+`<version>` is `MAJOR.MINOR.PATCH` with no leading zeros, optionally followed by
+a pre-release of dot-separated letters and digits (`1.0.0-rc.1`); build metadata
+is not accepted, and neither is a version that already has a section in
+`CHANGELOG.md`. `--date` must be a real date written `YYYY-MM-DD`, given at most
+once; without it the date is today's (UTC). An invalid version or date is
+refused before anything is written. Entry order within a
 category carries no meaning; stability does, and filename sort is stable across
 machines and filesystems.
 
