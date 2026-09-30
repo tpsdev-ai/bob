@@ -1,6 +1,7 @@
-// bob#248: the override repository's Git calls start no background process, so
-// initOverrideRepo — and hire, whose last step it is — returns only when no Git
-// process it started is still working in the agent directory.
+// bob#248: the Git calls that initialize the override repository (run only when
+// it has no `.git` yet) start no automatic maintenance or gc, so initOverrideRepo
+// — and hire, whose last step it is — does not return while automatic
+// housekeeping started by those calls is still working in the agent directory.
 //
 // `git commit` starts `git maintenance run --auto` after its own work, and that
 // run can detach and keep working inside the new repository after the commit
@@ -8,9 +9,10 @@
 // cleanup, hire's own rollback) raced it; under Bun, rmSync could return
 // without an error and leave the tree behind.
 //
-// Git's own trace (GIT_TRACE2_EVENT, which every git process bob runs inherits)
-// records each process's argv and each child process it starts, so this checks
-// what ran, not how long it took.
+// Git's own trace (GIT_TRACE2_EVENT, which the initializer's Git subprocesses
+// inherit from bob's environment) records each process's argv, each child
+// process it starts and its exit code, so this checks what ran, not how long it
+// took.
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -20,16 +22,20 @@ import { DEFAULT_POSITIONS_ROOT, hireAgent, initOverrideRepo } from "../../src/s
 
 interface TraceEvent {
   event: string;
+  sid?: string;
   argv?: string[];
+  code?: number;
 }
 
-function readTrace(path: string): TraceEvent[] {
+function traceLines(path: string): string[] {
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8")
     .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as TraceEvent);
+    .filter((line) => line.trim() !== "");
 }
+
+const parseTrace = (lines: string[]): TraceEvent[] =>
+  lines.map((line) => JSON.parse(line) as TraceEvent);
 
 // Every argv Git traced, from a process start or a child it started.
 function tracedCommands(events: TraceEvent[]): string[][] {
@@ -38,21 +44,35 @@ function tracedCommands(events: TraceEvent[]): string[][] {
     .map((e) => e.argv ?? []);
 }
 
-function expectNoBackgroundHousekeeping(tracePath: string): void {
-  const commands = tracedCommands(readTrace(tracePath));
-  // Known-present: the trace saw bob's own Git calls, so an empty or unread
-  // trace cannot pass.
-  for (const sub of ["init", "add", "commit"]) {
-    expect(commands.some((argv) => argv.includes(sub))).toBe(true);
+// What is wrong with a trace of the initializer's Git calls; empty when nothing is.
+// Known-present: each of bob's `init`, `add` and `commit` must have a `start`
+// record AND an `exit` record with code 0 from the same process (paired by the
+// Trace2 session id), so an empty trace, or one cut before a call finished,
+// cannot pass. Known-absent: no traced process started maintenance or gc.
+function traceProblems(events: TraceEvent[]): string[] {
+  const problems: string[] = [];
+  const exitCode = new Map<string, number>();
+  for (const e of events) {
+    if (e.event === "exit" && e.sid !== undefined && e.code !== undefined) {
+      exitCode.set(e.sid, e.code);
+    }
   }
-  // Known-absent: no Git process started maintenance or gc.
-  const housekeeping = commands.filter((argv) =>
-    argv.some((arg) => arg === "maintenance" || arg === "gc"),
-  );
-  expect(housekeeping).toEqual([]);
+  for (const sub of ["init", "add", "commit"]) {
+    const starts = events.filter((e) => e.event === "start" && (e.argv ?? []).includes(sub));
+    if (starts.length === 0) problems.push(`no start record for git ${sub}`);
+    else if (!starts.some((e) => e.sid !== undefined && exitCode.get(e.sid) === 0)) {
+      problems.push(`git ${sub} has no exit record with code 0`);
+    }
+  }
+  for (const argv of tracedCommands(events)) {
+    if (argv.some((arg) => arg === "maintenance" || arg === "gc")) {
+      problems.push(`housekeeping started: ${argv.join(" ")}`);
+    }
+  }
+  return problems;
 }
 
-describe("the override repository starts no background Git process (bob#248)", () => {
+describe("the override repository's initializing Git calls start no automatic maintenance or gc (bob#248)", () => {
   const scratch: string[] = [];
   const savedTrace = process.env.GIT_TRACE2_EVENT;
 
@@ -76,7 +96,7 @@ describe("the override repository starts no background Git process (bob#248)", (
     process.env.GIT_TRACE2_EVENT = tracePath;
     initOverrideRepo(agentDir);
     expect(existsSync(join(agentDir, "overrides", ".git"))).toBe(true);
-    expectNoBackgroundHousekeeping(tracePath);
+    expect(traceProblems(parseTrace(traceLines(tracePath)))).toEqual([]);
   });
 
   it("hire", async () => {
@@ -98,6 +118,25 @@ describe("the override repository starts no background Git process (bob#248)", (
       interview: async () => 0,
     });
     expect(existsSync(join(hired.agentDir, "overrides", ".git"))).toBe(true);
-    expectNoBackgroundHousekeeping(tracePath);
+    expect(traceProblems(parseTrace(traceLines(tracePath)))).toEqual([]);
+  });
+
+  // The check cannot pass a truncated trace: the real trace of initOverrideRepo,
+  // cut right after the `commit` process's start record, fails it.
+  it("a trace cut right after the commit's start record fails the check", () => {
+    const base = scratchDir();
+    const agentDir = join(base, "agent");
+    mkdirSync(agentDir);
+    const tracePath = join(base, "git-trace.json");
+    process.env.GIT_TRACE2_EVENT = tracePath;
+    initOverrideRepo(agentDir);
+    const lines = traceLines(tracePath);
+    expect(traceProblems(parseTrace(lines))).toEqual([]);
+    const commitStart = parseTrace(lines).findIndex(
+      (e) => e.event === "start" && (e.argv ?? []).includes("commit"),
+    );
+    expect(commitStart).toBeGreaterThanOrEqual(0);
+    const cut = parseTrace(lines.slice(0, commitStart + 1));
+    expect(traceProblems(cut)).toEqual(["git commit has no exit record with code 0"]);
   });
 });

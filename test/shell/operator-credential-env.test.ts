@@ -57,8 +57,8 @@ function probingRunner(seen: Probe[]): SessionRunner {
               childEnv: spawnSync("/usr/bin/env", { encoding: "utf8", env: process.env }).stdout,
             });
           } finally {
-            // Tear the session down before returning, as pi's interactive mode
-            // does when it quits, so nothing of it outlives the test.
+            // Await the runtime's disposal before returning, as pi's interactive
+            // mode does when it quits.
             await runtime.dispose();
           }
         },
