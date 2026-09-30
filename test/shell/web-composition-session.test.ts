@@ -202,13 +202,13 @@ describe("the control: a web session with only public-class inputs is composed",
   });
 });
 
-describe("the system prompt a web session sends names nothing local", () => {
+describe("the system prompt a web session sends names no agent workspace or pi install path, and its working directory is /", () => {
   // The agent lives under a directory whose name must never reach a web
   // session's prompt.
   const MARKER = "SENSITIVE-private-dir-7f3a";
   const TASK = "fetch the page the operator named";
 
-  it("a real web session sends bob's reviewed prompt: no working directory, no pi install path", async () => {
+  it("a real web session sends bob's reviewed prompt: no agent workspace or pi install path, working directory /", async () => {
     const agent = scaffold(join(MARKER, "agents"));
     expect(agent.cwd).toContain(MARKER);
     const composed = compose(agent, {
@@ -378,6 +378,29 @@ describe("refused at CREATION, before any extension loads", () => {
     await expect(
       build(agent, compose(agent, { capabilities: ["fixture", "web"] }), unreadable),
     ).rejects.toThrow("the session's history cannot be read, so bob cannot show it holds none");
+  });
+
+  it("a history accessor that throws is one more problem in the same refusal, with the web remedy", async () => {
+    const agent = scaffold();
+    const throwing = {
+      getEntries: () => {
+        throw new Error("the history store is gone");
+      },
+    } as unknown as ReturnType<typeof SessionManager.inMemory>;
+    const refusal = await build(
+      agent,
+      compose(agent, { capabilities: ["fixture", "web"], soul: "a private persona" }),
+      throwing,
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(refusal).toBeInstanceOf(WebCompositionError);
+    expect((refusal as WebCompositionError).problems).toEqual([
+      'startup context "soul" is private',
+      "the session's history cannot be read, so bob cannot show it holds none",
+    ]);
+    expect((refusal as Error).message).toContain("remove web from capabilities: in bob.yaml");
   });
 
   it("web + a private-data built-in (read) is refused", async () => {

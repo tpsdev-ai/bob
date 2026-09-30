@@ -11,9 +11,11 @@
 // active-tool audit (session.ts assertAllowedToolsActive), because nothing
 // registers it.
 //
-// `dataClass: public` — what web WILL bring into a session once its tools land
-// (fetched pages in R1c, search results in R2) is public web content; in this
-// slice it brings nothing. The class is what lets web compose at all: a
+// `dataClass: public` — in this slice the capability registers no tool and
+// imports no fetched content. web_fetch and web_search each need their own
+// classification review when they land: fetched pages and search results are
+// not public merely because they came from the web. The class is what lets web
+// compose at all: a
 // session that holds web may hold only public-class capabilities
 // (data-class.ts).
 //

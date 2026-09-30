@@ -148,7 +148,8 @@ export const STARTUP_CONTEXT_CLASS: Readonly<Record<StartupContextSource, Startu
 // template ends with the session's working directory. So a web session gets
 // bob's reviewed prompt in place of pi's template (the loader's
 // systemPromptOverride) and no agent workspace: pi's working directory is "/", so
-// the line pi always appends names nothing local. The audit then compares the
+// the line pi always appends ("Current working directory: /") names no agent
+// workspace or pi install path. The audit then compares the
 // prompt pi actually assembled with webSessionSystemPrompt, character for
 // character: a later pi that assembles it differently is refused, not trusted.
 export const WEB_SESSION_CWD = "/";
@@ -460,12 +461,18 @@ export function configHoldsWeb(
 }
 
 // How many history entries a session manager already holds, or undefined when
-// they cannot be read. A web session may restore none, so the caller reports
-// an unreadable history as a problem (historyUnreadable), never as empty.
+// they cannot be read: no accessor, an accessor that throws, or one that does
+// not return a list. A web session may restore none, so the caller reports an
+// unreadable history as a problem (historyUnreadable), never as empty.
 export function restoredHistoryEntries(sessionManager: unknown): number | undefined {
-  const sm = sessionManager as { getEntries?: () => unknown[] } | undefined;
-  if (typeof sm?.getEntries !== "function") return undefined;
-  return sm.getEntries().length;
+  try {
+    const sm = sessionManager as { getEntries?: () => unknown } | undefined;
+    if (typeof sm?.getEntries !== "function") return undefined;
+    const entries = sm.getEntries();
+    return Array.isArray(entries) ? entries.length : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // What the session view needs from pi's resource loader. Every getter is

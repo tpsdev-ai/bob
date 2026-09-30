@@ -593,6 +593,16 @@ describe("history and bob's own note", () => {
     // Unreadable is not empty: it comes back as unknown, and the rule refuses it.
     expect(restoredHistoryEntries({})).toBeUndefined();
     expect(restoredHistoryEntries(undefined)).toBeUndefined();
+    // An accessor that throws, or returns something that is not a list, is
+    // unreadable too.
+    expect(
+      restoredHistoryEntries({
+        getEntries: () => {
+          throw new Error("the history store is gone");
+        },
+      }),
+    ).toBeUndefined();
+    expect(restoredHistoryEntries({ getEntries: () => "not a list" })).toBeUndefined();
     const WEB = { kind: "capability" as const, name: "web", source: "/cap/web" };
     expect(
       webCompositionProblems({
