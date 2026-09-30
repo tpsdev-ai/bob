@@ -3,7 +3,7 @@
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` carries the migrated list
 // entries reordered by category and filename, and apart from that order they
-// differ only by the eleven repairs the migration tests name and the whitespace
+// differ only by the twenty-three repairs the migration tests name and the whitespace
 // trimmed at the end of each fragment (the block body's two HTML comment
 // markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
 // and do not render); `promote`
@@ -609,7 +609,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
   });
 
   // An index flag hides an edit from `git ls-files -m`, so promote also compares
-  // each file it would change or delete with its index blob, as git hashes it.
+  // the raw bytes of each file it would change or delete with its index blob.
   for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
     it(`promote REFUSES an edit hidden by ${flag}, in a fragment and in CHANGELOG.md, and changes nothing`, () => {
       const { dir, changelogPath } = project();
@@ -643,6 +643,37 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
     });
   }
+
+  // A filtered hash can miss a raw edit: with core.autocrlf=input, a CRLF rewrite
+  // of an LF fragment hashes like the original, and the CRLF body still passes
+  // validation. promote also compares raw bytes, so it refuses the rewrite.
+  it("promote REFUSES a hidden CRLF rewrite that a filtered hash would miss (core.autocrlf=input), and changes nothing", () => {
+    const { dir, changelogPath } = project();
+    const lf = "- **a fix.** Detail.\n";
+    fragment(dir, "fixed-a.md", lf);
+    stageAll();
+    const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    const rel = ".changelog/unreleased/fixed-a.md";
+    expect(gitIn("config", "core.autocrlf", "input").status).toBe(0);
+    expect(gitIn("update-index", "--assume-unchanged", rel).status).toBe(0);
+    const crlf = Buffer.from(lf.replace(/\n/g, "\r\n"));
+    writeFileSync(join(dir, "fixed-a.md"), crlf);
+    // The premise: ls-files -m sees nothing, the filtered hash equals the index
+    // blob, and only the raw hash differs.
+    expect(gitIn("ls-files", "-m").stdout).toBe("");
+    const blob = gitIn("ls-files", "-s", "--", rel).stdout.split(" ")[1];
+    expect(gitIn("hash-object", "--", rel).stdout.trim()).toBe(blob);
+    expect(gitIn("hash-object", "--no-filters", "--", rel).stdout.trim()).not.toBe(blob);
+    const changelogBefore = readFileSync(changelogPath);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      "changed since staged (differs from the index): fixed-a.md",
+    );
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      "promote also compares raw bytes with the index",
+    );
+    expect(readFileSync(changelogPath).equals(changelogBefore)).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md")).equals(crlf)).toBe(true);
+  });
 
   // Permission bits do not bind root, so these two cannot fail a write as root.
   const asRoot = process.getuid?.() === 0;
@@ -696,11 +727,13 @@ describe("changelog fragments — the migration (bob#236)", () => {
   const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-fff78d6a.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The eleven entries the migration changed, each as EXACT edits of main's text
+  // The twenty-three entries the migration changed, each as EXACT edits of main's text
   // (applied in order, each `from` found exactly once) plus every word that
   // disappears from the entry (`dropped`). Five were changed to pass `check`
-  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and six more were
-  // corrected because they no longer matched bob's code or the rendered order.
+  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and eighteen more were
+  // corrected because they no longer matched bob's code or the rendered order,
+  // most of them because code merged after they were written changed what they
+  // describe.
   // Every other entry is main's text unchanged (whitespace at its end aside). A
   // new difference, or a word that vanishes without being listed, fails. That
   // detects unlisted vanished words; it does not prove every fact is preserved (a
@@ -795,7 +828,7 @@ describe("changelog fragments — the migration (bob#236)", () => {
     {
       fragment: "fixed-04-a-resident-agent-keeps-a-tool.md",
       was: "- **A resident agent keeps a tool only when",
-      why: "The resident rule's exception: a role that opts in keeps its writers.",
+      why: "The resident rule's exception: a role that opts in keeps its writers. Then #247 added a fourth class, egress, with its own resident web grant.",
       edits: [
         [
           "- **A resident agent keeps a tool only when a reviewed classification says it writes no file and runs no command (bob#213).**",
@@ -804,6 +837,10 @@ describe("changelog fragments — the migration (bob#236)", () => {
         [
           "no longer keeps them; builder-local, the one shipped role that lists them, opts in.",
           "no longer keeps them. A role that sets `tools.allowResidentShell: true` keeps its writers for a resident agent (the agent's `bob.yaml` can turn that off, not on); builder-local, the one shipped role that lists the anchored-edit writers, opts in, and so does coder.",
+        ],
+        [
+          "`writer` (writes a file the model names, or runs a command) or `effect` (a memory write, a Discord post or reaction, a status report, a robot action, cancelling a job this run started).",
+          "`writer` (writes a file the model names, or runs a command), `effect` (a memory write, a Discord post or reaction, a status report, a robot action, cancelling a job this run started) or `egress` (a web tool that sends model-influenced data outside the office; a resident agent drops it unless its role sets `tools.allowResidentWeb`, which the shell opt-in does not cover).",
         ],
       ],
       dropped: ["when"],
@@ -818,26 +855,38 @@ describe("changelog fragments — the migration (bob#236)", () => {
     {
       fragment: "changed-11-stated-limits-of-the-contract-above.md",
       was: "- **Stated limits of the contract above.**",
-      why: '"the contract above" meant the task contract, which renders under Added.',
+      why: '"the contract above" meant the task contract, which renders under Added. Then scoped to the run\'s own agent requests (#243).',
       edits: [
         [
           "- **Stated limits of the contract above.**",
           "- **Stated limits of the system-prompt task contract (under Added).**",
         ],
+        [
+          "AND in every agent request's system prompt, so it costs tokens per request",
+          "AND in the system prompt of every agent request the run makes, so it costs tokens per request",
+        ],
       ],
-      dropped: ["above"],
+      dropped: ["above", "request's"],
     },
     {
       fragment: "changed-06-role-json-is-the-ceiling-on.md",
       was: "- **`role.json` is the ceiling on the tool allowlist",
-      why: "`bash`/`write`/`edit` are the coder role's set; builder-local holds `run` and the anchored-edit writers.",
+      why: "`bash`/`write`/`edit` are the coder role's set; builder-local holds `run` and the anchored-edit writers. Then scoped to agent runtime sessions (#243), and the web tools' own resident opt-in, allowResidentWeb (#247), is named.",
       edits: [
         [
           "the coder role sets it `true`, so a persistent builder keeps `bash`/`write`/`edit` while no `bob.yaml` can grant itself a shell its role does not allow.",
           "the `coder` role sets it `true`, so a persistent agent of the `coder` role keeps `bash`/`write`/`edit` (builder-local sets it too, and keeps `run` and the anchored-edit writers instead), while no `bob.yaml` can grant itself a shell its role does not allow.",
         ],
+        [
+          "and it is read at session creation.**",
+          "and it is read when each agent runtime session is created.**",
+        ],
+        [
+          "The resident opt-in lives in the role schema as `tools.allowResidentShell` —",
+          "The resident shell opt-in lives in the role schema as `tools.allowResidentShell` (the web tools have their own, `tools.allowResidentWeb`; see the data-classes entry under Added) —",
+        ],
       ],
-      dropped: ["builder"],
+      dropped: ["at", "builder", "creation"],
     },
     {
       fragment: "changed-10-readme-usage-section-matches-the-cli.md",
@@ -858,6 +907,179 @@ describe("changelog fragments — the migration (bob#236)", () => {
         ],
       ],
       dropped: ["appears", "flag", "flags", "have", "retired", "word"],
+    },
+    {
+      fragment: "changed-04-one-session-factory-bob-never-spawns.md",
+      was: "- **ONE session factory — bob never spawns pi and ne",
+      why: "bob login/logout (bob#241, #243) start pi's TUI outside the factory; the claims are scoped to agent runtime sessions and the exception is stated here once.",
+      edits: [
+        [
+          "- **ONE session factory — bob never spawns pi and never builds a pi command line.**",
+          "- **ONE session factory builds every agent runtime session, and bob never spawns pi or builds a pi command line for one.**",
+        ],
+        [
+          "Every session — `bob run`, the persistent runtime,",
+          "Every agent runtime session — `bob run`, the persistent runtime,",
+        ],
+        [
+          "so no caller-controlled argument reaches the session. (`test/shell/launch.test.ts`",
+          "so no caller-controlled argument reaches the session. `bob login` and `bob logout` (bob#241, under Added) are the exception: they start pi's own TUI as a separate process, with no arguments and an allowlisted environment, outside the factory and outside these controls, for the operator to sign in or out. (`test/shell/launch.test.ts`",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "changed-05-a-session-s-resources-are-built.md",
+      was: "- **A session's resources are built by bob, isolated",
+      why: "Scoped to agent runtime sessions: bob login/logout (#243) run pi's own TUI, which is not built by bob.",
+      edits: [
+        [
+          "- **A session's resources are built by bob, isolated.**",
+          "- **An agent runtime session's resources are built by bob, isolated.**",
+        ],
+        ["no longer load for bob agents.**", "no longer load in a bob agent's runtime sessions.**"],
+      ],
+      dropped: ["agents", "for"],
+    },
+    {
+      fragment: "changed-07-the-tool-audit-runs-at-creation.md",
+      was: "- **The tool audit runs at creation, after the mode",
+      why: "Scoped to agent runtime sessions: bob login/logout (#243) start pi outside the factory and its audit.",
+      edits: [
+        [
+          "- **The tool audit runs at creation,",
+          "- **The tool audit runs on every agent runtime session at creation,",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "added-01-an-explicit-model-budget-context-window.md",
+      was: "- **An explicit model budget: context window, compac",
+      why: "Scoped to agent runtime sessions (#243), and the mid-run checkpoint is once per threshold until the check re-arms (bob#225, #239).",
+      edits: [
+        [
+          "(required: every session refuses to start without a window",
+          "(required: every agent runtime session refuses to start without a window",
+        ],
+        [
+          "so pi's own compaction runs mid-run and the run continues.",
+          "so pi's own compaction runs mid-run and the run continues (once per threshold until the check re-arms: bob#225, under Fixed).",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "added-04-positions-packaged-role-compatible-agent-presets.md",
+      was: "- **Positions — packaged, role-compatible agent pres",
+      why: "Scoped to agent runtime session entry paths: bob login/logout (#243) do not go through the resolver.",
+      edits: [
+        [
+          "routes through EVERY session entry path —",
+          "routes through EVERY agent runtime session entry path —",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "added-06-the-jarvis-role-the-office-s.md",
+      was: "- **The `jarvis` role — the office's resident agent.",
+      why: "The jarvis ceiling gained web_fetch and web_search with allowResidentWeb (#247), and the reachy body capability shipped in this release though the role does not allow its tools.",
+      edits: [
+        [
+          "Its exact tool ceiling is `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and `discord_react`, with `allowResidentShell: false` and no shell or file-writing tools.",
+          "Its exact tool ceiling is `flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch`, `discord_react`, `web_fetch` and `web_search`, with `allowResidentShell: false`, `allowResidentWeb: true` and no shell or file-writing tools; the web tools are classified `egress`, and the composition rule refuses web beside Flair or Discord (see the data-classes entry).",
+        ],
+        [
+          "Discord still requires operator configuration; the body and automatic decision loop come later.",
+          "Discord still requires operator configuration; the role does not yet allow the `reachy` body tools (that capability ships in this release, against a stub sidecar), and the automatic decision loop comes later.",
+        ],
+      ],
+      dropped: ["come"],
+    },
+    {
+      fragment: "added-08-an-openrouter-provider-bob-owns.md",
+      was: "- **An `openrouter` provider bob OWNS.",
+      why: "Scoped to agent runtime entry paths: bob login/logout (#243) do not go through the factory.",
+      edits: [
+        [
+          "and every entry path (`bob run`, the persistent runtime, `bob onboard`, `bob align`) goes through that factory",
+          "and every agent runtime entry path (`bob run`, the persistent runtime, `bob onboard`, `bob align`) goes through that factory",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "added-10-the-task-or-a-persistent-agent.md",
+      was: "- **The task — or a persistent agent's standing cont",
+      why: "Scoped to agent runtime sessions: bob login/logout (#243) run pi without the contract or the guard.",
+      edits: [
+        [
+          "rides the SYSTEM PROMPT, and every agent request is checked for it.**",
+          "rides the SYSTEM PROMPT, and each runtime session's agent requests are checked for it.**",
+        ],
+        [
+          "**What the guard proves is that every agent request carries the contract block**",
+          "**What the guard proves is that every agent request of the session carries the contract block**",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "added-12-after-a-compaction-bob-sends-one.md",
+      was: '- **After a compaction bob sends ONE best-effort "wh',
+      why: "A web session (#247) gets no post-compaction note.",
+      edits: [
+        [
+          '- **After a compaction bob sends ONE best-effort "what remains" note**,',
+          '- **After a compaction bob sends ONE best-effort "what remains" note, except into a web session**,',
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "fixed-30-every-launch-path-enforces-the-tool.md",
+      was: "- **Every launch path enforces the tool policy.",
+      why: "Scoped to agent runtime launch paths: bob login/logout (#243) start pi without the allowlist.",
+      edits: [
+        [
+          "- **Every launch path enforces the tool policy.**",
+          "- **Every agent runtime launch path enforces the tool policy.**",
+        ],
+        [
+          "No path starts an agent session without the resolved allowlist.",
+          "No path starts an agent runtime session without the resolved allowlist.",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "fixed-31-a-missing-or-unparseable-tool-policy.md",
+      was: "- **A missing or unparseable tool policy is a load e",
+      why: "The factory-delivery clause is scoped to agent runtime sessions (#243).",
+      edits: [
+        [
+          "the resolved allowlist and denylist reach the session as the factory's `tools`/`excludeTools`.",
+          "the resolved allowlist and denylist reach each agent runtime session as the factory's `tools`/`excludeTools`.",
+        ],
+      ],
+      dropped: [],
+    },
+    {
+      fragment: "fixed-32-an-allowlisted-tool-the-session-does.md",
+      was: "- **An allowlisted tool the session does not actuall",
+      why: "The factory-delivery clauses are scoped to agent runtime sessions (#243).",
+      edits: [
+        [
+          "— fails the session, naming the tool",
+          "— fails the agent runtime session, naming the tool",
+        ],
+        [
+          "`bob doctor` reports the same condition before any session runs,",
+          "`bob doctor` reports the same condition before any agent runtime session runs,",
+        ],
+      ],
+      dropped: [],
     },
   ];
 

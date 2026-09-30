@@ -718,12 +718,13 @@ function git(cwd, args) {
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "" };
 }
 
-// The paths (relative to `cwd`) whose working-tree content, as `git hash-object`
-// hashes it, differs from their index blob; null when git cannot answer.
+// The paths (relative to `cwd`) whose RAW working-tree bytes (`git hash-object
+// --no-filters`) hash to something other than their index blob; null when git
+// cannot answer.
 function differsFromIndex(cwd, paths) {
   if (paths.length === 0) return [];
   const staged = git(cwd, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", ...paths]);
-  const hashed = git(cwd, ["hash-object", "--", ...paths]);
+  const hashed = git(cwd, ["hash-object", "--no-filters", "--", ...paths]);
   if (!staged.ok || !hashed.ok) return null;
   const index = new Map();
   for (const record of staged.out.split("\0").filter(Boolean)) {
@@ -765,9 +766,12 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   if (clModified.has(clName)) changed.unshift("CHANGELOG.md");
   // `ls-files -m` trusts the index flags: a file marked assume-unchanged or
   // skip-worktree reports no change even when it was edited. So every tracked
-  // file promote will change or delete is also compared with its index blob as
-  // git hashes it (`ls-files -s` against `hash-object`, which applies the path's
-  // clean filters, as `git add` would), whatever its flags say.
+  // file promote will change or delete is also compared with its index blob on
+  // its RAW bytes (`ls-files -s` against `hash-object --no-filters`), whatever its
+  // flags say. A filtered hash would miss an edit a filter normalizes away (with
+  // core.autocrlf=input, a CRLF rewrite of an LF file hashes like the original),
+  // so a file whose bytes a filter changes counts as changed: conservative, and
+  // the refusal says so.
   const fragmentsDiffer = differsFromIndex(
     dir,
     names.filter((n) => tracked.has(n)),
@@ -787,9 +791,16 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
     if (untracked.length > 0) parts.push(`untracked (not in the index): ${untracked.join(", ")}`);
     if (changed.length > 0)
       parts.push(`changed since staged (differs from the index): ${changed.join(", ")}`);
+    const rawNote =
+      changed.length > 0
+        ? " A file can count as changed with no edit: promote also compares raw bytes with the index, so " +
+          "a file that a line-ending conversion or a clean filter (core.autocrlf, a .gitattributes filter) " +
+          "changes on its way into git differs; for such a file, run promote in a checkout where git " +
+          "stores these files byte for byte."
+        : "";
     throw new FragmentError(
       `promote: git could not restore these as they are, so nothing was written. ${parts.join("; ")}. ` +
-        `Stage them (git add) or remove them, then run promote again.`,
+        `Stage them (git add) or remove them, then run promote again.${rawNote}`,
     );
   }
 }

@@ -100,7 +100,8 @@ machines and filesystems.
 `promote` runs only in a git work tree. Before it writes anything, it refuses
 while `CHANGELOG.md` is not a regular file or has more than one hard link, or
 while it or any fragment is untracked (not in the index) or differs from the
-index, naming each, so that `git checkout -- CHANGELOG.md .changelog/unreleased`
+index byte for byte (so a file that `core.autocrlf` or a clean filter changes on
+its way into git counts as differing), naming each, so that `git checkout -- CHANGELOG.md .changelog/unreleased`
 restores everything it changed, unless another process changes those files
 while `promote` runs. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 delete a fragment after writing the section, it names each one left: those are
