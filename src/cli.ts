@@ -38,6 +38,8 @@ import {
   runAlign,
   runDoctor,
   runLaunch,
+  runLogin,
+  runLogout,
   runMailTurnLaunch,
   runOnboard,
   runPersistent,
@@ -88,6 +90,11 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check of the agent's setup — prints each check
+  login <name> [prov] Sign the agent in to a subscription provider (pi's
+                      interactive /login) with the token kept in the agent's own
+                      store. Run it in a terminal. Flags: --agents-root <dir>
+  logout <name> [prov] The matching removal (pi's interactive /logout).
+                      Flags: --agents-root <dir>
   hire <name>         Hire a NEW agent from a packaged position.
                       Flags: --as <position> --context-window <tokens> (required)
                              --provider <p> --model <m> --no-flair
@@ -640,6 +647,44 @@ async function main(): Promise<number> {
           return 2;
         }
         return doctor(args.positional[0]);
+      case "login": {
+        const name = args.positional[0];
+        if (!name) {
+          console.error("bob login: missing <agent>");
+          return 2;
+        }
+        const provider = args.positional[1];
+        const agentsRoot = stringFlag(args.flags, "agents-root");
+        try {
+          return await runLogin({
+            name,
+            ...(provider !== undefined ? { provider } : {}),
+            ...(agentsRoot !== undefined ? { agentsRoot } : {}),
+          });
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          return 1;
+        }
+      }
+      case "logout": {
+        const name = args.positional[0];
+        if (!name) {
+          console.error("bob logout: missing <agent>");
+          return 2;
+        }
+        const provider = args.positional[1];
+        const agentsRoot = stringFlag(args.flags, "agents-root");
+        try {
+          return await runLogout({
+            name,
+            ...(provider !== undefined ? { provider } : {}),
+            ...(agentsRoot !== undefined ? { agentsRoot } : {}),
+          });
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          return 1;
+        }
+      }
       case "hire": {
         if (args.flags.flair !== undefined) {
           console.error("bob hire: --flair is not supported in slice 1");

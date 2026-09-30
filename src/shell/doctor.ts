@@ -51,8 +51,9 @@ import {
   readTools,
   type ToolsBlock,
 } from "./bob-yaml.js";
+import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
-import { effectiveCapabilities, resolveAgentToolPolicy } from "./run.js";
+import { effectiveCapabilities, mapBobProviderToPi, resolveAgentToolPolicy } from "./run.js";
 import {
   auditToolNames,
   capabilityForTool,
@@ -240,6 +241,36 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     yamlText = readFileSync(join(agentDir, "bob.yaml"), "utf8");
   } catch {
     yamlText = undefined;
+  }
+
+  // bob#241: when bob.yaml names a subscription provider, the agent's own auth
+  // store must hold a credential for it, or `bob login` is the remedy. A store
+  // that cannot be read is a FAIL, never a pass. Only a subscription provider
+  // produces a check at all.
+  if (yamlText !== undefined) {
+    let providerName: string | undefined;
+    try {
+      const provider = readBlock(yamlText, "provider") as Record<string, unknown> | undefined;
+      const raw = provider?.name;
+      providerName = typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+    } catch {
+      providerName = undefined;
+    }
+    if (providerName !== undefined) {
+      const piProvider = mapBobProviderToPi(providerName);
+      if (SUBSCRIPTION_PROVIDERS.has(piProvider)) {
+        const sub = subscriptionCredentialCheck({
+          name: opts.name,
+          provider: piProvider,
+          piAgentDir: join(agentDir, ".pi-agent"),
+        });
+        checks.push(
+          sub.status === "ok"
+            ? { name: "subscription auth", status: "ok", detail: sub.detail }
+            : { name: "subscription auth", status: "fail", detail: sub.detail, fix: sub.fix },
+        );
+      }
+    }
   }
   const mail = tpsMailChecks({
     name: opts.name,
