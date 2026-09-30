@@ -63,11 +63,14 @@ export const PI_BUILTIN_TOOLS = [
 //              a status report, a robot action, or cancelling a job this run
 //              started. A resident agent keeps these (the jarvis role holds
 //              flair_write and discord_reply without the shell opt-in).
-//   egress     sends model-influenced data to a host outside the office (bob#244,
-//              web spec v3): the classes above describe LOCAL effects, and an
-//              egress tool's defining property is outbound. A resident agent
-//              drops these unless its role opts in with `allowResidentWeb`; the
-//              shell opt-in (`allowResidentShell`) does not cover them.
+//   egress     this policy's category for the web tools (bob#244, web spec v3),
+//              which send model-influenced data to a host outside the office.
+//              Other effects can be outbound too (discord_reply posts a
+//              message; the planned mail_send sends a mail): egress sets the
+//              web tools apart so they get their own resident grant. A resident
+//              agent drops these unless its role opts in with
+//              `allowResidentWeb`; the shell opt-in (`allowResidentShell`) does
+//              not cover them.
 export type ToolEffect = "read-only" | "writer" | "effect" | "egress";
 
 // The writer rows come first, in the order RESIDENT_EXCLUDED_TOOLS lists them.
@@ -89,9 +92,10 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze(
   reachy_frame: "effect", // reachy: asks the robot for a camera frame
   run_cancel: "effect", // work: stops a job this run started
   mail_send: "effect", // mail (planned): sends a mail
-  // Both web tools carry model-influenced data to arbitrary hosts: a fetched
-  // URL's host, path and query, and a search query the model writes. Neither is
-  // registered yet (web registers no tool in slice R1a).
+  // Both web tools carry model-influenced data out of the office: web_fetch to
+  // the host of a URL the model chose (its host, path and query), web_search to
+  // the search provider (the query the model writes). Neither is registered yet
+  // (web registers no tool in slice R1a).
   web_fetch: "egress", // web: fetches a URL
   web_search: "egress", // web (planned for R2): sends a search query to the provider
   read: "read-only", // pi

@@ -74,7 +74,7 @@ describe("the resident rule for egress tools", () => {
     expect(residentDroppedTools(p)).toEqual(["bash"]);
   });
 
-  it("the role's allowResidentWeb keeps them", () => {
+  it("with the role's allowResidentWeb, the resident policy does not exclude them (activating either is still refused, because neither is registered)", () => {
     const p = policy(allowYaml(["flair_search", ...WEB_TOOLS]), { resident: true, role: webRole });
     expect(p.allowResidentWeb).toBe(true);
     for (const name of WEB_TOOLS) expect(p.excludeTools).not.toContain(name);
@@ -114,7 +114,7 @@ describe("the resident rule for egress tools", () => {
     ).toThrow(/tools\.allowResidentWeb is true, but the role does not grant it/);
   });
 
-  it("a non-resident session keeps them (residency is what drops them)", () => {
+  it("a non-resident policy does not exclude them (residency is what drops them; activating either is still refused, because neither is registered)", () => {
     const p = policy(allowYaml(WEB_TOOLS), { resident: false });
     expect(p.excludeTools).toEqual([]);
   });
@@ -154,7 +154,7 @@ describe("jarvis/ea role support", () => {
     }
   });
 
-  it("a resident jarvis agent that allows the web tools keeps them (the role's grant reaches the policy)", () => {
+  it("a resident jarvis policy that allows the web tools does not exclude them (the role's grant reaches the policy; activating either is still refused, because neither is registered)", () => {
     const yaml = [
       "agent:",
       "  id: jarvisbot",

@@ -24,9 +24,10 @@ The `jarvis` role is the office's resident agent: memory with receipts, awarenes
 from available presence and event information, small help routed to the right
 owner, and Discord conversation. Hire one with
 `bob onboard <name> --role jarvis --provider <provider> --model <model> --context-window <tokens>`; the
-interview gives the class seed an individual persona. The role allows only
-`flair_search`, `flair_write`, `flair_get`, `discord_reply`, `discord_fetch` and
-`discord_react`, with `allowResidentShell: false`; it does not allow `read`
+interview gives the class seed an individual persona. The role's six
+implemented tools are `flair_search`, `flair_write`, `flair_get`,
+`discord_reply`, `discord_fetch` and `discord_react`, with
+`allowResidentShell: false`; it does not allow `read`
 (bob#230). It also lists `web_fetch` and `web_search` with `allowResidentWeb: true`,
 but neither tool exists yet, and bob refuses a session that holds web together
 with Flair or Discord (see [Data classes](#data-classes-and-what-a-web-session-may-hold)),
