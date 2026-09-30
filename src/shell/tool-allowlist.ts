@@ -143,9 +143,9 @@ export function residentExclusions(
 }
 
 // The egress rows: what a resident agent drops unless its role opts in with
-// `allowResidentWeb` (bob#244). Separate from the shell opt-in on purpose: a
-// role that may run a shell unattended has not thereby been allowed to send
-// data out of the office.
+// `allowResidentWeb` (bob#244). Separate from the shell opt-in on purpose:
+// the shell grant does not grant `web_fetch` or `web_search`; shell commands
+// may themselves make outbound requests.
 export function residentEgressTools(
   effects: Readonly<Record<string, ToolEffect>> = TOOL_EFFECTS,
 ): string[] {
