@@ -13,15 +13,18 @@ import { afterEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
   lstatSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
-import { groupAlive, type LiveWork, waitFor, workSession } from "./helpers.js";
+import { groupAlive, type LiveWork, WIRE_HOOK, waitFor, workSession } from "./helpers.js";
 import { call, callWith, effect, lastOf, pause, pollUntilFinished, program } from "./program.js";
 
 let live: LiveWork | undefined;
@@ -747,4 +750,31 @@ describe("run — refusals name actor, state and remedy", () => {
     expect(r.text).toContain("run refused: this run already has 1 running job (run-1)");
     expect(r.text).toContain("run_cancel");
   }, 20_000);
+});
+
+// #221: a setup that throws must not leave the scratch directory behind. The
+// work harness removes it in a catch when the session load throws, so this holds
+// even though a caller never receives a handle to clean up when setup fails.
+describe("workSession — a failed setup leaves no scratch directory", () => {
+  it("removes its scratch directory when setup throws", async () => {
+    // Force setup to throw: a wire hook that is ALREADY installed trips the
+    // one-at-a-time guard while the session loads (after the scratch dir is
+    // created, before a handle is returned).
+    const hooks = globalThis as unknown as Record<string, unknown>;
+    const tmp = mkdtempSync(join(tmpdir(), "bob-work-throws-"));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    hooks[WIRE_HOOK] = () => {};
+    try {
+      await expect(workSession({ script: async () => ({ text: "unused" }) })).rejects.toThrow(
+        /one at a time/,
+      );
+      expect(readdirSync(tmp), "the scratch directory is gone").toEqual([]);
+    } finally {
+      delete hooks[WIRE_HOOK];
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

@@ -69,6 +69,60 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
     ]);
   });
 
+  it("a RESIDENT session's `read` is the CONFINED one (custom tool overrides pi's) (bob#230)", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "bob-toolpolicy-out-"));
+    writeFileSync(join(outside, "secret.txt"), "outside contents");
+    writeFileSync(join(cwd, "inside.txt"), "inside contents");
+    const cred = join(cwd, "auth.json");
+    writeFileSync(cred, "{}");
+    const build = async (persistent: boolean) =>
+      (await createPiRunSession(
+        baseConfig({ tools: ["read"], excludeTools: [], persistent, credentialPaths: [cred] }),
+      )) as unknown as {
+        _toolRegistry: Map<string, { execute(...a: unknown[]): Promise<unknown> }>;
+        dispose(): void;
+      };
+    const resident = await build(true);
+    try {
+      const read = resident._toolRegistry.get("read");
+      if (!read) throw new Error("the resident `read` tool is not registered");
+      const text = (r: unknown) =>
+        (r as { content: Array<{ text?: string }> }).content.map((c) => c.text ?? "").join("");
+      // The workspace file reads.
+      expect(text(await read.execute("c", { path: "inside.txt" }, undefined, undefined))).toContain(
+        "inside contents",
+      );
+      // Outside the workspace is refused — the ACTIVE tool is the confined one.
+      await expect(
+        read.execute("c", { path: join(outside, "secret.txt") }, undefined, undefined),
+      ).rejects.toThrow(/does not resolve to a file inside the agent's workspace/);
+      // A credential file inside the workspace is refused.
+      await expect(read.execute("c", { path: "auth.json" }, undefined, undefined)).rejects.toThrow(
+        /credential file/,
+      );
+    } finally {
+      resident.dispose();
+    }
+    // A NON-resident session keeps pi's own read (the custom tool is not added).
+    const ephemeral = await build(false);
+    try {
+      const read = ephemeral._toolRegistry.get("read");
+      if (!read) throw new Error("the ephemeral `read` tool is not registered");
+      const r = (await read.execute(
+        "c",
+        { path: join(outside, "secret.txt") },
+        undefined,
+        undefined,
+      )) as {
+        content: Array<{ text?: string }>;
+      };
+      expect(r.content.map((c) => c.text ?? "").join("")).toContain("outside contents");
+    } finally {
+      ephemeral.dispose();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it("REFUSES a config with no allowlist at all (the type and the runtime)", async () => {
     // Round 3: `tools` is REQUIRED. A session built without it would come up on
     // pi's defaults (read, bash, edit, write) — the absence of a policy is the
@@ -111,13 +165,12 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
           "",
           "tools:",
           "  allow:",
-          "    - read",
           "    - discord_reply",
           "",
         ].join("\n"),
       );
       const { config } = resolveRunConfig({ name: "assistant", agentsRoot });
-      expect(config.tools).toEqual(["read", "discord_reply"]);
+      expect(config.tools).toEqual(["discord_reply"]);
       await expect(createPiRunSession(config)).rejects.toThrow(/discord_reply/);
     } finally {
       rmSync(agentsRoot, { recursive: true, force: true });
