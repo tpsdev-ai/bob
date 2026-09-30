@@ -52,6 +52,9 @@ const INVALID_USAGE: ReadonlyArray<[string, Usage]> = [
 
 function harness() {
   const steers: string[] = [];
+  // The compaction reserve pi's settings report, changeable mid-test (a live
+  // threshold change: threshold = window - reserve).
+  let reserveTokens = RESERVE;
   const logs: string[] = [];
   const listeners = new Set<(event: never) => void>();
   const session = {
@@ -59,7 +62,7 @@ function harness() {
     settingsManager: {
       getCompactionSettings: () => ({
         enabled: true,
-        reserveTokens: RESERVE,
+        reserveTokens,
         keepRecentTokens: 20_000,
       }),
     },
@@ -88,6 +91,9 @@ function harness() {
     stop: async (tokens: number) => await turn(usage(tokens)),
     // A turn that ended in tool calls, whose last response carried usage `u`.
     turn,
+    setReserve: (tokens: number) => {
+      reserveTokens = tokens;
+    },
     // A SYNTHETIC compaction_end: success (true) or failure (false). pi's own
     // success path always supplies `estimatedTokensAfter`; a success built here
     // WITHOUT one exercises the missing-estimate handling, not current pi.
@@ -132,7 +138,9 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
     await stop(60_001);
     await stop(62_000);
     await stop(70_000);
-    expect(logs.filter((m) => /not checkpointing again until/.test(m)).length).toBe(1);
+    expect(
+      logs.filter((m) => /not checkpointing again for this threshold until/.test(m)).length,
+    ).toBe(1);
   });
 
   it("does not checkpoint at the threshold, only over it (pi's shouldCompact is a strict comparison)", async () => {
@@ -187,7 +195,9 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
     expect(await stop(60_000)).toBe(false);
     expect(await stop(70_000)).toBe(false);
     expect(steers.length).toBe(1);
-    expect(logs.filter((m) => /not checkpointing again until/.test(m)).length).toBe(1);
+    expect(
+      logs.filter((m) => /not checkpointing again for this threshold until/.test(m)).length,
+    ).toBe(1);
   });
 
   it("a successful compaction whose estimate is not a valid token count keeps the check suppressed", async () => {
@@ -198,6 +208,35 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
       expect(await stop(60_000), `estimate ${String(estimate)}`).toBe(false);
       expect(steers.length).toBe(1);
     }
+  });
+
+  it("a checkpoint at a changed threshold starts a new cycle: its later suppression is logged too", async () => {
+    const { steers, logs, stop, compactionEnd, setReserve } = harness();
+    const suppressionLogs = () =>
+      logs.filter((m) => /not checkpointing again for this threshold until/.test(m));
+
+    // Cycle 1, threshold 50_000: a checkpoint, a compaction estimated above the
+    // threshold, then repeated over-threshold turns: one suppression log.
+    expect(await stop(60_000)).toBe(true);
+    compactionEnd(true, THRESHOLD + 1);
+    expect(await stop(60_000)).toBe(false);
+    expect(await stop(61_000)).toBe(false);
+    expect(suppressionLogs().length).toBe(1);
+
+    // The threshold changes live (reserve 40_000: threshold 60_000). A tool turn
+    // over the NEW threshold checkpoints without the old one re-arming.
+    setReserve(40_000);
+    expect(await stop(70_000)).toBe(true);
+    expect(steers.length).toBe(2);
+
+    // Cycle 2: a compaction estimated above the new threshold, then repeated
+    // over-threshold turns: this cycle's suppression is logged as well.
+    compactionEnd(true, 60_001);
+    expect(await stop(70_000)).toBe(false);
+    expect(await stop(71_000)).toBe(false);
+    expect(steers.length).toBe(2);
+    expect(suppressionLogs().length).toBe(2);
+    expect(suppressionLogs()[1]).toContain("(60000 of 100000)");
   });
 
   for (const [label, invalid] of INVALID_USAGE) {

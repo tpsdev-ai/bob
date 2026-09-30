@@ -364,7 +364,7 @@ export function installMidRunCompaction(
         if (!suppressLogged) {
           suppressLogged = true;
           log(
-            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint and a compaction; not checkpointing again until a tool turn's valid usage or a compaction's valid estimate is at or below it (pi still checks when the run ends)`,
+            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint and a compaction; not checkpointing again for this threshold until a tool turn's valid usage or a compaction's valid estimate is at or below it (pi still checks when the run ends)`,
           );
         }
         return false;
@@ -373,6 +373,8 @@ export function installMidRunCompaction(
       // the run after pi's compaction. A steer that cannot be queued means no stop.
       await session.steer(checkpointText({ contextTokens, thresholdTokens, contextWindow }));
       checkpointedThreshold = thresholdTokens;
+      // A new checkpoint starts a new cycle: its own later suppression is logged.
+      suppressLogged = false;
       state = "stopped";
       log(
         `bob: context ${contextTokens} tokens is over the compaction threshold (${thresholdTokens} of ${contextWindow}); compacting between model calls`,

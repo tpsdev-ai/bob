@@ -685,7 +685,7 @@ describe("runDoctor", () => {
 
   // bob#225 (item 4): a session for bob.yaml's provider.model refuses to start
   // without provider.context_window (bob does not guess a window; a guess can
-  // disagree with the server). Doctor reports it first, with the exact line to add.
+  // disagree with the server). Doctor reports it during doctor, with the exact line to add.
   it("OK when bob.yaml declares provider.model and provider.context_window", () => {
     makeHealthyAgent({ home, name: "testbot" });
     const report = runDoctor({
