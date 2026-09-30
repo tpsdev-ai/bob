@@ -360,12 +360,41 @@ export function countEntries(section) {
 
 // ─── CHANGELOG.md surgery ─────────────────────────────────────────────────────
 
-// The heading is the exact line `## [Unreleased]` (trailing blanks aside): a
-// suffixed or differently cased heading is not taken for it, so `check` and
-// `promote` refuse rather than keep an altered heading.
+// The heading is ONE line, equal to `## [Unreleased]` byte for byte. Any line
+// that looks like an [Unreleased] heading (another case, a suffix, trailing
+// blanks, extra spaces) counts toward that one: a look-alike is refused rather
+// than taken for it, and a second heading is refused, so nothing can sit under a
+// heading that `check` and `promote` do not read.
+const UNRELEASED_HEADING = "## [Unreleased]";
+const UNRELEASED_LOOKALIKE = /^##\s*\[\s*unreleased\s*\]/i;
+
+/** `{ index }` of the one exact heading, or `{ problem }` saying what is wrong. */
+export function findUnreleasedHeading(lines) {
+  const found = [];
+  lines.forEach((l, i) => {
+    if (UNRELEASED_LOOKALIKE.test(l)) found.push(i);
+  });
+  if (found.length === 0) return { problem: `no '${UNRELEASED_HEADING}' heading` };
+  if (found.length > 1) {
+    return {
+      problem:
+        `${found.length} [Unreleased] headings (lines ${found.map((i) => i + 1).join(", ")}); ` +
+        `keep exactly one, the line '${UNRELEASED_HEADING}'`,
+    };
+  }
+  const index = found[0];
+  if (lines[index] !== UNRELEASED_HEADING) {
+    return {
+      problem: `line ${index + 1} is ${JSON.stringify(lines[index])}, not exactly '${UNRELEASED_HEADING}'`,
+    };
+  }
+  return { index };
+}
+
 export function locateUnreleased(lines) {
-  const start = lines.findIndex((l) => /^## \[Unreleased\][ \t]*$/.test(l));
-  if (start === -1) return null;
+  const heading = findUnreleasedHeading(lines);
+  if (heading.problem !== undefined) return null;
+  const start = heading.index;
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
     if (/^##\s+\[/.test(lines[i])) {
@@ -428,13 +457,15 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
   // header is an error, not "no stray entries ⇒ OK" — otherwise the PR-time
   // check is weaker than the release-time one and a mangled header sails through
   // CI green and detonates mid-release-cut (flair#953).
-  const loc = locateUnreleased(readFileSync(changelogPath, "utf8").split("\n"));
-  if (!loc) {
+  const changelogLines = readFileSync(changelogPath, "utf8").split("\n");
+  const heading = findUnreleasedHeading(changelogLines);
+  if (heading.problem !== undefined) {
     throw new FragmentError(
-      `CHANGELOG.md has no '## [Unreleased]' heading (a line that is exactly that text), so the stray-entry ` +
-        `check could not run — and 'promote' will refuse for the same reason at release time. Restore the heading.`,
+      `CHANGELOG.md: ${heading.problem}, so the stray-entry check could not run — and 'promote' will ` +
+        `refuse for the same reason at release time. Make it the one line '## [Unreleased]'.`,
     );
   }
+  const loc = locateUnreleased(changelogLines);
   const stray = strayUnreleasedEntries(loc.body);
   if (stray.length > 0) {
     throw new FragmentError(
@@ -481,12 +512,13 @@ export function promote(
   }
   const text = readFileSync(changelogPath, "utf8");
   const lines = text.split("\n");
-  const loc = locateUnreleased(lines);
-  if (!loc) {
+  const heading = findUnreleasedHeading(lines);
+  if (heading.problem !== undefined) {
     throw new FragmentError(
-      `promote: no '## [Unreleased]' heading (a line that is exactly that text) in ${changelogPath}.`,
+      `promote: CHANGELOG.md: ${heading.problem}. Make it the one line '## [Unreleased]'.`,
     );
   }
+  const loc = locateUnreleased(lines);
   // Matched the way scripts/changelog-extract.mjs finds a release's section, which
   // would publish only the first of two.
   const existing = lines.findIndex((l) => l.startsWith(`## [${version}]`));

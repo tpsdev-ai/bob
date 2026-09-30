@@ -184,20 +184,44 @@ describe("changelog fragments — check (bob#236)", () => {
     );
   });
 
-  it("REFUSES a suffixed or differently cased [Unreleased] heading, in check and in promote", () => {
+  it("REFUSES an [Unreleased] heading that is not exactly '## [Unreleased]', in check and in promote", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
-    for (const heading of ["## [Unreleased] - next", "## [unreleased]"]) {
+    for (const heading of [
+      "## [Unreleased] - next",
+      "## [unreleased]",
+      "## [Unreleased] ",
+      "## [Unreleased]\t",
+      "##  [Unreleased]",
+    ]) {
       const text = `# Changelog\n\n${heading}\n\n${NOTE}\n\n## [0.0.1] - 2020-01-01\n`;
       writeFileSync(changelogPath, text);
-      expect(() => cf.check({ dir, changelogPath }), heading).toThrow(
-        /no '## \[Unreleased\]' heading/,
+      const shown = JSON.stringify(heading);
+      expect(() => cf.check({ dir, changelogPath }), shown).toThrow(
+        `line 3 is ${shown}, not exactly '## [Unreleased]'`,
       );
-      expect(
-        () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }),
-        heading,
-      ).toThrow(/no '## \[Unreleased\]' heading/);
+      expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }), shown).toThrow(
+        `line 3 is ${shown}, not exactly '## [Unreleased]'`,
+      );
       expect(readFileSync(changelogPath, "utf8")).toBe(text);
+      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    }
+  });
+
+  it("REFUSES a second [Unreleased] heading, which could hide an entry, in check and in promote", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    for (const second of ["## [Unreleased]", "## [Unreleased] - more"]) {
+      const text = `# Changelog\n\n## [Unreleased]\n\n${NOTE}\n\n${second}\n\n- a hidden entry\n\n## [0.0.1] - 2020-01-01\n`;
+      writeFileSync(changelogPath, text);
+      const line = 4 + NOTE.split("\n").length + 2;
+      const msg = `2 [Unreleased] headings (lines 3, ${line})`;
+      expect(() => cf.check({ dir, changelogPath }), second).toThrow(msg);
+      expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath }), second).toThrow(
+        msg,
+      );
+      expect(readFileSync(changelogPath, "utf8")).toBe(text);
+      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
     }
   });
 
