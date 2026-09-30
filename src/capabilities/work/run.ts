@@ -420,9 +420,13 @@ const errCode = (err: unknown): string =>
 // after the open, a close that throws before or after it closes — and see the
 // refusal, what it says about the descriptor, and that nothing starts.
 // Production uses NODE_DIR_PIN_OPS.
+// Device and inode are bigints, compared at full 64-bit precision: as a number,
+// a device or inode above Number.MAX_SAFE_INTEGER loses its low bits, so two
+// different directories could compare equal (some network, overlay and snapshot
+// file systems report such values).
 export interface DirStat {
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
   isDirectory(): boolean;
 }
 export interface DirPinOps {
@@ -435,16 +439,16 @@ export interface DirPinOps {
 }
 export const NODE_DIR_PIN_OPS: DirPinOps = Object.freeze({
   realpath: (p: string) => realpathSync(p),
-  lstat: (p: string) => lstatSync(p),
+  lstat: (p: string) => lstatSync(p, { bigint: true }),
   open: (p: string, flags: number) => openSync(p, flags),
-  fstat: (fd: number) => fstatSync(fd),
+  fstat: (fd: number) => fstatSync(fd, { bigint: true }),
   close: (fd: number) => closeSync(fd),
 });
 
 interface DirPin {
   fd: number;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 type PinStage = "when it was pinned" | "immediately before the spawn";

@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
 import {
   type DirPinOps,
+  type DirStat,
   NODE_DIR_PIN_OPS,
   RunRefusal,
 } from "../../../src/capabilities/work/run.js";
@@ -894,6 +895,57 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     expect(err.message).toContain("does not match its pin immediately before the spawn");
     expect(err.message).toContain("not a directory with the pinned device and inode");
     await expectNothingStarted(m.file);
+  }, 20_000);
+
+  // 64-bit identities: two values that are EQUAL as numbers (2^60 and 2^60 + 1
+  // round to the same double) but DIFFERENT as bigints.
+  const BIG_PINNED = 2n ** 60n;
+  const BIG_OTHER = 2n ** 60n + 1n;
+  // A stat seam that reports `value` as the directory's `field`, keeping the
+  // real value of the other field.
+  const withField = (real: DirStat, field: "dev" | "ino", value: bigint): DirStat => ({
+    dev: field === "dev" ? value : real.dev,
+    ino: field === "ino" ? value : real.ino,
+    isDirectory: () => real.isDirectory(),
+  });
+
+  for (const field of ["dev", "ino"] as const) {
+    it(`refuses a pin whose ${field} differs only beyond Number precision (${field} is compared as a 64-bit value)`, async () => {
+      // The premise: as numbers these values are equal; as bigints they are not.
+      expect(Number(BIG_PINNED)).toBe(Number(BIG_OTHER));
+      expect(BIG_PINNED === BIG_OTHER).toBe(false);
+      const dirPinOps: DirPinOps = {
+        ...NODE_DIR_PIN_OPS,
+        fstat: (fd) => withField(NODE_DIR_PIN_OPS.fstat(fd), field, BIG_PINNED),
+        lstat: (p) => withField(NODE_DIR_PIN_OPS.lstat(p), field, BIG_OTHER),
+      };
+      live = await workSession({ script: program(), wire: { dirPinOps } });
+      const m = marker();
+      mkdirSync(join(live.cwd, "sub"));
+      const err = await refusalOf(
+        live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+      );
+      expect(err.message).toContain("does not match its pin when it was pinned");
+      expect(err.message).toContain("not a directory with the pinned device and inode");
+      await expectNothingStarted(m.file);
+    }, 20_000);
+  }
+
+  it("a pin whose 64-bit inode matches exactly still runs (the positive control)", async () => {
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      fstat: (fd) => withField(NODE_DIR_PIN_OPS.fstat(fd), "ino", BIG_PINNED),
+      lstat: (p) => withField(NODE_DIR_PIN_OPS.lstat(p), "ino", BIG_PINNED),
+    };
+    live = await workSession({ script: program(), wire: { dirPinOps } });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const job = await live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd);
+    await job.done;
+    expect(job.outcome).toBe("exited");
+    expect(job.exitCode).toBe(0);
+    expect(existsSync(m.file)).toBe(true);
+    await live.work.manager.endRun();
   }, 20_000);
 
   it("refuses when an intermediate component is swapped BEFORE the pin opens (the pin is verified as it is taken)", async () => {
