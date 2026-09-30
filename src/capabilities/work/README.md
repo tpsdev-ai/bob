@@ -60,12 +60,12 @@ only when the close returned.
 
 The re-check NARROWS the race; it does not close it. A window remains from the
 last re-check until the child has changed directory, because the child's
-`chdir` re-resolves the path by name: a component replaced inside that window
-changes where the command starts, and `run` cannot see it. Closing the window
-needs a directory-descriptor boundary (`fchdir`, or resolution beneath an open
-directory) that Node does not offer a child; a helper that changes into the
-pinned directory before running the command would be OS-specific, so bob does
-not ship one. See Limits.
+`chdir` re-resolves the path by name. A component replaced in that window can
+change where the command starts or prevent startup; the re-check cannot detect
+a later replacement. Closing the window needs a directory-descriptor boundary
+(`fchdir`, or resolution beneath an open directory) that Node does not offer a
+child; a helper that changes into the pinned directory before running the
+command would be OS-specific, so bob does not ship one. See Limits.
 
 The pin opens the directory for reading: Node has no search-only open. A
 directory with search but not read permission is therefore refused, although a
