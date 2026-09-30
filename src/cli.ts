@@ -90,10 +90,11 @@ Commands:
   down <name>         Stop + unload the agent's service unit
   restart <name>      Graceful restart (SIGTERM → clean session dispose → relaunch)
   doctor <name>       Health check of the agent's setup — prints each check
-  login <name> [prov] Sign the agent in to a subscription provider (pi's
-                      interactive /login) with the token kept in the agent's own
-                      store. Run it in a terminal. Flags: --agents-root <dir>
-  logout <name> [prov] The matching removal (pi's interactive /logout).
+  login <name> [prov] Start pi in the agent's own config dir so you can sign it
+                      in to a subscription provider: type '/login [provider]' at
+                      the prompt. Run it in a terminal. Flags: --agents-root <dir>
+  logout <name>       The matching removal: start pi and type '/logout' (an
+                      interactive selector — takes no provider).
                       Flags: --agents-root <dir>
   hire <name>         Hire a NEW agent from a packaged position.
                       Flags: --as <position> --context-window <tokens> (required)
@@ -653,6 +654,10 @@ async function main(): Promise<number> {
           console.error("bob login: missing <agent>");
           return 2;
         }
+        if (args.positional.length > 2) {
+          console.error("bob login: too many arguments (usage: bob login <agent> [provider])");
+          return 2;
+        }
         const provider = args.positional[1];
         const agentsRoot = stringFlag(args.flags, "agents-root");
         try {
@@ -672,12 +677,18 @@ async function main(): Promise<number> {
           console.error("bob logout: missing <agent>");
           return 2;
         }
-        const provider = args.positional[1];
+        // pi's /logout is an interactive credential selector and takes no
+        // provider, so neither does this command: an extra argument is refused.
+        if (args.positional.length > 1) {
+          console.error(
+            "bob logout: takes no provider — pi's /logout is an interactive selector (usage: bob logout <agent>)",
+          );
+          return 2;
+        }
         const agentsRoot = stringFlag(args.flags, "agents-root");
         try {
           return await runLogout({
             name,
-            ...(provider !== undefined ? { provider } : {}),
             ...(agentsRoot !== undefined ? { agentsRoot } : {}),
           });
         } catch (err) {

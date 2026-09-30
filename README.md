@@ -73,8 +73,8 @@ The divergence read remains signed with the agent's key. Only local onboarding a
 | `bob install-service <name>` | Write the agent's service unit — launchd on macOS, a systemd user unit on Linux                |
 | `bob up <name>` / `bob down <name>` / `bob restart <name>` | Load+start, stop+unload, and gracefully restart the agent's service unit                    |
 | `bob doctor <name>`        | Health check (agent layout, tool allowlist, identity keys, pi-agent config, mail inbox, the `tps-mail` capability)                                          |
-| `bob login <name> [provider]` | Sign the agent in to a subscription provider through pi's interactive `/login`, keeping the token in the agent's own store. Run it in a terminal |
-| `bob logout <name> [provider]` | The matching removal (pi's interactive `/logout`) |
+| `bob login <name> [provider]` | Start pi in the agent's own config dir; type `/login [provider]` at the prompt to sign in. Run it in a terminal |
+| `bob logout <name>` | The matching removal: start pi and type `/logout` (an interactive selector — takes no provider) |
 | `bob hire <name> --as <position> --context-window <tokens>` | Hire a NEW agent from a packaged position: scaffold it, ratify the host grant, store the diff baseline and initialize the override repository. Without `--context-window` it refuses before writing anything |
 | `bob position adopt <name> --as <position>` | Bind an EXISTING agent to a position without changing its config or soul |
 | `bob position diff <name>` | Show the host-ratified baseline against the current effective configuration |
@@ -826,26 +826,39 @@ path's persisted files (`(c)`).
 
 ### Moving an agent to a subscription model
 
-A subscription provider (ChatGPT Plus/Pro through pi's `openai-codex`, and the others pi logs
-into) is authenticated by an interactive login, not an API key. Sign the agent in **without
-knowing pi's config directory** — bob composes `PI_CODING_AGENT_DIR` for every session and reuses
-that one path, so the token lands in the agent's own `.pi-agent/auth.json` and nowhere else:
+Some providers pi authenticates by a subscription OAuth login — pi's `isSubscription` providers:
+`anthropic` (Claude Pro/Max), `openai-codex` (ChatGPT Plus/Pro), `github-copilot`, `xai` (SuperGrok /
+X Premium) and `kimi-coding`. (pi also offers an API key for some of them.) pi's login is an
+interactive TUI command (`/login`); pi ships no `login` subcommand or flag, so `bob login` starts
+pi's TUI **in the agent's own directory**, with `PI_CODING_AGENT_DIR` set to the agent's
+`.pi-agent`, and you type the command at the prompt. bob composes that directory for every session
+and reuses the same path, so the token lands in the agent's own `.pi-agent/auth.json` and nowhere
+else:
 
 ```bash
-bob login <agent> [provider]   # pi's interactive /login; run it in a terminal
+bob login <agent> [provider]   # starts pi; type '/login [provider]' at the prompt
 ```
 
-Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. With no
-provider it shows pi's own provider menu. bob never prints, logs or copies the token; afterwards it
-reports only which providers the store holds a credential for. `bob logout <agent> [provider]` is
-the matching removal.
+Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. bob never
+prints, logs or copies the token; when pi exits it reports only whether the agent's store now holds
+a credential for the provider it targeted. `bob logout <agent>` is the matching removal (pi's
+`/logout` is an interactive selector, so it takes no provider).
 
-Then point the agent at the subscription model and restart it:
+Then point the agent at the subscription model and restart it. The model must be one pi's catalog
+lists for that provider:
+
+| provider | a model pi lists |
+| --- | --- |
+| `openai-codex` | `gpt-5.4` |
+| `xai` | `grok-4.3` |
+| `kimi-coding` | `k3` |
+| `github-copilot` | `claude-sonnet-4` |
+| `anthropic` | `claude-sonnet-4-6` |
 
 ```yaml
 provider:
-  name: openai-codex          # or xai, kimi-coding, …
-  model: gpt-5
+  name: openai-codex
+  model: gpt-5.4
   context_window: <tokens>    # REQUIRED (see Model budget)
 ```
 
@@ -853,8 +866,8 @@ provider:
 bob restart <agent>
 ```
 
-`bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while a subscription
-provider is declared and the agent's store holds no credential for it.
+`bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while one of those
+providers is declared and the agent's store holds no credential pi accepts for it.
 
 ## Model budget
 

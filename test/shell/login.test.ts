@@ -1,9 +1,17 @@
 // bob#241 — bob login / bob logout, and the doctor check that rides on them.
 //
-// The login/logout child is pi's interactive flow. A STUB pi (a script on PATH
-// in the test's temp dir) stands in for it: it records its environment to a
-// file, so the test can assert PI_CODING_AGENT_DIR is the agent's OWN directory
-// and that nothing else was reachable. The stub never sees a credential.
+// HOW PI'S LOGIN REALLY RUNS is a TUI slash command, not a process argument: pi
+// hands its CLI startup arguments to `session.prompt`
+// (pi dist/modes/interactive/interactive-mode.js:859), and `/login` and
+// `/logout` run only on editor submits (…interactive-mode.js:2454). So bob runs
+// pi's TUI attached to the terminal, in the agent's directory, with
+// PI_CODING_AGENT_DIR set, and tells the operator to type the command.
+//
+// The tests use a STUB pi (a script) that stands in for pi's TUI: it records its
+// environment, argv and cwd, and (as a real /login or /logout would) writes or
+// removes a credential in the agent's own store. That models the REAL
+// invocation — pi is spawned with NO arguments — so a test that passed only a
+// slash argument would fail here.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -11,31 +19,42 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/shell/doctor.js";
 import { initAgent } from "../../src/shell/init.js";
-import { runLogin, runLogout } from "../../src/shell/login.js";
+import { resolvePiBin, runLogin, runLogout } from "../../src/shell/login.js";
+import { type SpawnError, spawnNode } from "../cli-spawn.js";
+
+const CLI = join(import.meta.dir, "..", "..", "dist", "cli.js");
 
 let root: string;
 let agentsRoot: string;
 let binDir: string;
 let envFile: string;
 let argvFile: string;
+let cwdFile: string;
 let savedPath: string | undefined;
 
-// A stub `pi` on PATH. It records the environment it was given (and its argv)
-// and exits with the requested code. bob's allowlist decides what it can see.
-function writeStubPi(exitCode = 0): void {
+function oauthJson(provider: string): string {
+  return `{"${provider}":{"type":"oauth","access":"a","refresh":"r","expires":123}}\n`;
+}
+
+// A stub `pi`: records env, argv and cwd; optionally writes an auth store (as a
+// real /login would); exits with the requested code.
+function writeStubPi(opts: { afterAuthJson?: string; exitCode?: number } = {}): void {
+  const lines = [
+    "#!/bin/sh",
+    `env > '${envFile}'`,
+    `printf '%s\\n' "$@" > '${argvFile}'`,
+    `pwd > '${cwdFile}'`,
+  ];
+  if (opts.afterAuthJson !== undefined) {
+    lines.push(`printf '%s' '${opts.afterAuthJson}' > "$PI_CODING_AGENT_DIR/auth.json"`);
+  }
+  lines.push(`exit ${opts.exitCode ?? 0}`, "");
   const path = join(binDir, "pi");
-  writeFileSync(
-    path,
-    [
-      "#!/bin/sh",
-      `env > '${envFile}'`,
-      `printf '%s\\n' "$@" > '${argvFile}'`,
-      `exit ${exitCode}`,
-      "",
-    ].join("\n"),
-  );
+  writeFileSync(path, lines.join("\n"));
   chmodSync(path, 0o755);
 }
+
+const stubPi = () => join(binDir, "pi");
 
 function envValue(name: string): string | undefined {
   const line = readFileSync(envFile, "utf8")
@@ -57,6 +76,11 @@ function makeAgent(name: string, provider = "anthropic"): string {
   return res.agentDir;
 }
 
+function capture() {
+  const lines: string[] = [];
+  return { lines, out: (l: string) => lines.push(l), err: (l: string) => lines.push(l) };
+}
+
 function subscriptionCheck(name: string) {
   const report = runDoctor({
     name,
@@ -74,9 +98,9 @@ beforeEach(() => {
   mkdirSync(binDir, { recursive: true });
   envFile = join(root, "child-env.txt");
   argvFile = join(root, "child-argv.txt");
+  cwdFile = join(root, "child-cwd.txt");
   savedPath = process.env.PATH;
   process.env.PATH = `${binDir}:${savedPath ?? ""}`;
-  writeStubPi(0);
 });
 
 afterEach(() => {
@@ -84,103 +108,242 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-describe("bob#241 — bob login runs pi's interactive flow with the agent's own config dir", () => {
-  it("spawns pi with PI_CODING_AGENT_DIR set to the agent's own .pi-agent, and leaves another agent's store untouched", async () => {
-    const alphaDir = makeAgent("alpha");
+describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", () => {
+  it("spawns pi with NO arguments, in the agent's directory, PI_CODING_AGENT_DIR set; another agent's store is untouched", async () => {
+    writeStubPi({ afterAuthJson: oauthJson("openai-codex") });
+    const alphaDir = makeAgent("alpha", "openai-codex");
     const betaDir = makeAgent("beta");
-    // A second agent's store, with known bytes. bob must not touch it.
     const betaAuth = join(betaDir, ".pi-agent", "auth.json");
-    writeFileSync(betaAuth, '{"beta-provider":{"type":"api_key","key":"beta-key"}}\n', {
-      mode: 0o600,
-    });
+    writeFileSync(
+      betaAuth,
+      '{"beta-provider":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n',
+      { mode: 0o600 },
+    );
     const betaBefore = readFileSync(betaAuth);
-    // A sentinel env var the child must NOT inherit (the env is an allowlist).
     process.env.BOB_LOGIN_SENTINEL = "must-not-leak";
+    const cap = capture();
 
     const code = await runLogin({
       name: "alpha",
+      provider: "openai-codex",
       agentsRoot,
+      piBin: stubPi(),
       stdinIsTTY: true,
       stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
     });
     delete process.env.BOB_LOGIN_SENTINEL;
 
     expect(code).toBe(0);
-    // The child ran pi's interactive `/login` and saw the agent's OWN dir.
+    // The UI was entered: pi was spawned, in the agent's own dir, with the agent's own store.
     expect(envValue("PI_CODING_AGENT_DIR")).toBe(join(alphaDir, ".pi-agent"));
-    expect(readFileSync(argvFile, "utf8").trim()).toBe("/login");
-    // The environment is an allowlist: an ambient variable did not reach pi.
+    expect(readFileSync(cwdFile, "utf8").trim()).toBe(alphaDir);
+    // NOT a slash argument — pi would send that to the model.
+    expect(readFileSync(argvFile, "utf8").trim()).toBe("");
+    // The environment is an allowlist.
     expect(envValue("BOB_LOGIN_SENTINEL")).toBeUndefined();
+    // bob told the operator what to type.
+    expect(cap.lines.join("\n")).toContain("type /login openai-codex");
     // No other agent's store was touched — byte for byte.
     expect(readFileSync(betaAuth)).toEqual(betaBefore);
   });
 
-  it("passes the named provider to pi's /login", async () => {
-    makeAgent("alpha");
-    await runLogin({
+  it("targets bob.yaml's provider when none is named", async () => {
+    writeStubPi({ afterAuthJson: oauthJson("openai-codex") });
+    makeAgent("alpha", "openai-codex");
+    const cap = capture();
+    const code = await runLogin({
+      name: "alpha",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(0);
+    expect(readFileSync(argvFile, "utf8").trim()).toBe("");
+    expect(cap.lines.join("\n")).toContain("type /login ");
+    expect(cap.lines.join("\n")).toContain("credential stored for openai-codex");
+  });
+
+  it("fails when pi exits 0 but stored nothing (a cancelled login)", async () => {
+    writeStubPi({ exitCode: 0 }); // no credential written
+    makeAgent("alpha", "openai-codex");
+    const cap = capture();
+    const code = await runLogin({
       name: "alpha",
       provider: "openai-codex",
       agentsRoot,
+      piBin: stubPi(),
       stdinIsTTY: true,
       stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
     });
-    expect(readFileSync(argvFile, "utf8").trim()).toBe("/login openai-codex");
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("no credential was stored for openai-codex");
   });
 
-  it("refuses an unknown agent, naming the agents directory it looked in", async () => {
+  it("fails when the store is unreadable after the run", async () => {
+    writeStubPi({ afterAuthJson: "not json at all\n" });
+    makeAgent("alpha", "openai-codex");
+    const cap = capture();
+    const code = await runLogin({
+      name: "alpha",
+      provider: "openai-codex",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("is not valid JSON");
+  });
+
+  it("refuses an unknown agent, naming the agents directory", async () => {
     makeAgent("alpha");
     await expect(
-      runLogin({ name: "ghost", agentsRoot, stdinIsTTY: true, stdoutIsTTY: true }),
+      runLogin({ name: "ghost", agentsRoot, piBin: stubPi(), stdinIsTTY: true, stdoutIsTTY: true }),
     ).rejects.toThrow(`no agent "ghost" under ${agentsRoot}`);
   });
 
-  it("refuses a non-interactive terminal, saying to run it in a terminal", async () => {
+  it("refuses a non-interactive terminal", async () => {
     makeAgent("alpha");
     await expect(
-      runLogin({ name: "alpha", agentsRoot, stdinIsTTY: false, stdoutIsTTY: true }),
-    ).rejects.toThrow(/interactive.*run it in a terminal/s);
-    await expect(
-      runLogin({ name: "alpha", agentsRoot, stdinIsTTY: true, stdoutIsTTY: false }),
+      runLogin({
+        name: "alpha",
+        agentsRoot,
+        piBin: stubPi(),
+        stdinIsTTY: false,
+        stdoutIsTTY: true,
+      }),
     ).rejects.toThrow(/interactive.*run it in a terminal/s);
   });
 
-  it("bob logout runs pi's /logout in the same agent's own config dir", async () => {
-    const alphaDir = makeAgent("alpha");
-    const code = await runLogout({
-      name: "alpha",
-      agentsRoot,
-      stdinIsTTY: true,
-      stdoutIsTTY: true,
-    });
-    expect(code).toBe(0);
-    expect(envValue("PI_CODING_AGENT_DIR")).toBe(join(alphaDir, ".pi-agent"));
-    expect(readFileSync(argvFile, "utf8").trim()).toBe("/logout");
+  it("resolves the project's PINNED pi executable by default", () => {
+    const bin = resolvePiBin();
+    expect(bin).toContain("@earendil-works/pi-coding-agent");
+    expect(bin).toMatch(/bundle[\\/]cli\.js$/);
   });
 });
 
-describe("bob#241 — doctor fails a subscription provider with no stored credential", () => {
+describe("bob#241 — bob logout", () => {
+  it("spawns pi with no argument and succeeds when a credential was removed", async () => {
+    writeStubPi({ afterAuthJson: oauthJson("anthropic") }); // openai-codex removed
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    const cap = capture();
+    const code = await runLogout({
+      name: "alpha",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(0);
+    expect(readFileSync(argvFile, "utf8").trim()).toBe("");
+    expect(cap.lines.join("\n")).toContain("removed openai-codex");
+  });
+
+  it("fails when the store is unchanged (a cancelled logout)", async () => {
+    writeStubPi({ exitCode: 0 }); // no change
+    const dir = makeAgent("alpha", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    const cap = capture();
+    const code = await runLogout({
+      name: "alpha",
+      agentsRoot,
+      piBin: stubPi(),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(code).toBe(1);
+    expect(cap.lines.join("\n")).toContain("no credential was removed");
+  });
+
+  it("the CLI refuses a provider argument to logout", () => {
+    try {
+      spawnNode([CLI, "logout", "alpha", "openai-codex"], { env: { ...process.env, HOME: root } });
+      throw new Error("logout with a provider unexpectedly succeeded");
+    } catch (err) {
+      const e = err as SpawnError;
+      expect(e.code).toBe(2);
+      expect(e.stdout).toContain("takes no provider");
+    }
+  });
+
+  it("the CLI refuses extra positionals to login", () => {
+    try {
+      spawnNode([CLI, "login", "alpha", "openai-codex", "extra"], {
+        env: { ...process.env, HOME: root },
+      });
+      throw new Error("login with extra args unexpectedly succeeded");
+    } catch (err) {
+      const e = err as SpawnError;
+      expect(e.code).toBe(2);
+      expect(e.stdout).toContain("too many arguments");
+    }
+  });
+});
+
+describe("bob#241 — doctor fails a subscription provider with no usable credential", () => {
   it("fails with the `bob login` remedy when the credential is absent", () => {
-    makeAgent("subbot", "openai-codex");
-    // The scaffold writes a placeholder api key — not a credential.
+    makeAgent("subbot", "openai-codex"); // scaffold writes a placeholder api key
     const check = subscriptionCheck("subbot");
     expect(check?.status).toBe("fail");
     expect(check?.fix).toBe("bob login subbot openai-codex");
   });
 
-  it("passes when the store holds a real credential for the provider", () => {
-    const agentDir = makeAgent("subbot", "openai-codex");
-    const auth = join(agentDir, ".pi-agent", "auth.json");
+  it("passes when the store holds a credential pi accepts", () => {
+    const dir = makeAgent("subbot", "openai-codex");
     writeFileSync(
-      auth,
-      `${JSON.stringify({ "openai-codex": { type: "oauth", access: "a", refresh: "r", expires: 1 } })}\n`,
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1}}\n`,
+      { mode: 0o600 },
+    );
+    expect(subscriptionCheck("subbot")?.status).toBe("ok");
+  });
+
+  it("fails when the target entry is one pi would reject", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(join(dir, ".pi-agent", "auth.json"), `{"openai-codex":{"token":"x"}}\n`, {
+      mode: 0o600,
+    });
+    const check = subscriptionCheck("subbot");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("pi would reject");
+  });
+
+  it("fails when an UNRELATED entry is one pi would reject (pi rejects the whole store)", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(
+      join(dir, ".pi-agent", "auth.json"),
+      `{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1},"other":{"token":"x"}}\n`,
       { mode: 0o600 },
     );
     const check = subscriptionCheck("subbot");
-    expect(check?.status).toBe("ok");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("pi would reject");
   });
 
   it("does not add a check for a provider that is not a subscription provider", () => {
-    makeAgent("apibot", "anthropic");
+    makeAgent("apibot", "openai");
     expect(subscriptionCheck("apibot")).toBeUndefined();
   });
 });
