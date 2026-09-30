@@ -847,9 +847,9 @@ bob login <agent> [provider]   # starts pi; type '/login [provider]' at the prom
 
 Run it in a terminal: it refuses a non-interactive stdin/stdout, naming the remedy. bob reads the
 agent's store locally to decide the result (it parses auth.json) and never prints a credential VALUE;
-when pi exits, `bob login` reports success only when the provider it targeted now holds a usable
-credential that is new or changed. `bob logout <agent>` starts pi for `/logout` (an interactive
-selector over any stored credential, so it takes no provider).
+when pi exits, `bob login` reports success only when the provider it targeted now holds a credential
+that passes bob's local credential checks and is new or changed. `bob logout <agent>` starts pi for
+`/logout` (an interactive selector over any stored credential, so it takes no provider).
 
 Then point the agent at the subscription model and restart it. The model must be one pi's catalog
 lists for that provider:

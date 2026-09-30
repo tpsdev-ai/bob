@@ -517,7 +517,9 @@ export async function runLogin(
     return 1;
   }
   if (!after.usable) {
-    err(`bob login ${opts.name}: no usable credential is stored for ${target}.`);
+    err(
+      `bob login ${opts.name}: no credential that passes bob's local credential checks is stored for ${target}.`,
+    );
     return 1;
   }
   const added = !before.usable;

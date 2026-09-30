@@ -185,7 +185,9 @@ describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", 
       err: cap.err,
     });
     expect(code).toBe(1);
-    expect(cap.lines.join("\n")).toContain("no usable credential is stored for openai-codex");
+    expect(cap.lines.join("\n")).toContain(
+      "no credential that passes bob's local credential checks is stored for openai-codex",
+    );
   });
 
   it("fails when the store is not valid JSON after the run", async () => {
