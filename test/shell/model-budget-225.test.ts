@@ -8,12 +8,14 @@
 // (and pi would compact again after each one).
 //
 // The rule tested here: after a checkpoint, the check does not checkpoint again
-// for the same threshold until it sees the context at or below it: a tool turn
-// whose reported usage is at or below the threshold, or a successful compaction
-// whose `estimatedTokensAfter` is at or below it. A successful compaction with
-// no usable estimate, or an estimate above the threshold, keeps the check
-// suppressed. These tests drive the hook directly with a fake session and fake
-// compaction_end events; they do not run pi's compaction.
+// for the same threshold until it re-arms, and only a VALID reading (a finite
+// token count above zero) at or below the threshold re-arms it: a tool turn's
+// usage, or a successful compaction's `estimatedTokensAfter`. A tool turn with
+// invalid usage (all-zero, non-finite, negative) neither re-arms nor
+// checkpoints. A successful compaction with no valid estimate, or an estimate
+// above the threshold, keeps the check suppressed. These tests drive the hook
+// directly with a fake session and SYNTHETIC compaction_end events; they do not
+// run pi's compaction.
 
 import { describe, expect, it } from "bun:test";
 import {
@@ -30,9 +32,23 @@ function usage(tokens: number): NonNullable<StopAfterTurnContext["message"]["usa
   return { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: tokens };
 }
 
-function over(tokens: number): StopAfterTurnContext {
-  return { message: { stopReason: "toolUse", usage: usage(tokens) }, toolResults: [{}] };
+type Usage = NonNullable<StopAfterTurnContext["message"]["usage"]>;
+
+function toolTurn(u: Usage): StopAfterTurnContext {
+  return { message: { stopReason: "toolUse", usage: u }, toolResults: [{}] };
 }
+
+// Usage pi's compaction code treats as carrying no valid data (all-zero), and
+// usage whose context size is not a finite count above zero.
+const INVALID_USAGE: ReadonlyArray<[string, Usage]> = [
+  ["all-zero", usage(0)],
+  ["NaN", { input: Number.NaN, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.NaN }],
+  [
+    "Infinity",
+    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.POSITIVE_INFINITY },
+  ],
+  ["negative", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: -5 }],
+];
 
 function harness() {
   const steers: string[] = [];
@@ -59,19 +75,22 @@ function harness() {
     },
   } satisfies MidRunCompactionSession;
   installMidRunCompaction(session, { log: (m) => logs.push(m) });
+  const turn = async (u: Usage) => {
+    const hook = session.agent.shouldStopAfterTurn;
+    if (hook === undefined) throw new Error("installMidRunCompaction installed no hook");
+    return await hook(toolTurn(u), undefined);
+  };
   return {
     session,
     steers,
     logs,
     // A turn that ended in tool calls, whose last response carried `tokens`.
-    stop: async (tokens: number) => {
-      const hook = session.agent.shouldStopAfterTurn;
-      if (hook === undefined) throw new Error("installMidRunCompaction installed no hook");
-      return await hook(over(tokens), undefined);
-    },
-    // pi finished a compaction this checkpoint asked for (true) or not (false).
-    // A successful result carries `estimatedTokensAfter` (pi's estimate of the
-    // compacted context) when one is passed, and no estimate otherwise.
+    stop: async (tokens: number) => await turn(usage(tokens)),
+    // A turn that ended in tool calls, whose last response carried usage `u`.
+    turn,
+    // A SYNTHETIC compaction_end: success (true) or failure (false). pi's own
+    // success path always supplies `estimatedTokensAfter`; a success built here
+    // WITHOUT one exercises the missing-estimate handling, not current pi.
     compactionEnd: (ok: boolean, estimatedTokensAfter?: unknown) => {
       const result = estimatedTokensAfter === undefined ? {} : { estimatedTokensAfter };
       for (const l of listeners)
@@ -81,15 +100,16 @@ function harness() {
 }
 
 describe("bob#225 item 2 — repeated checkpoints after a successful compaction are bounded", () => {
-  it("after a checkpoint and a successful compaction with no estimate, over-threshold tool turns do not checkpoint again until one is at or below the threshold", async () => {
+  it("after a checkpoint and a synthetic successful compaction with no estimate, over-threshold tool turns do not checkpoint again until one is at or below the threshold", async () => {
     const { steers, stop, compactionEnd } = harness();
 
     // Over the threshold → one checkpoint (queued so pi continues after its compaction).
     expect(await stop(60_000)).toBe(true);
     expect(steers.length).toBe(1);
 
-    // pi compacts, successfully, and reports no estimate of the result; the
-    // following tool turns are still over the threshold.
+    // A synthetic successful compaction_end with no estimate (pi's success path
+    // supplies one; this covers a result without it); the following tool turns
+    // are still over the threshold.
     compactionEnd(true);
 
     // Each of these over-threshold tool turns: NO further checkpoint.
@@ -133,7 +153,8 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
     expect(await stop(40_000)).toBe(false);
     expect(await stop(60_000)).toBe(false);
     expect(steers.length).toBe(1);
-    // A compaction that DOES succeed clears it.
+    // A synthetic successful compaction (no estimate) ends the suppressed
+    // state; the checkpoint already fired for this threshold still holds.
     compactionEnd(true);
     expect(await stop(60_000)).toBe(false); // already checkpointed for this threshold; no estimate
     expect(await stop(40_000)).toBe(false); // a tool turn at or below → re-arm
@@ -169,7 +190,7 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
     expect(logs.filter((m) => /not checkpointing again until/.test(m)).length).toBe(1);
   });
 
-  it("a successful compaction whose estimate is not a usable number keeps the check suppressed", async () => {
+  it("a successful compaction whose estimate is not a valid token count keeps the check suppressed", async () => {
     for (const estimate of [Number.NaN, Number.POSITIVE_INFINITY, -1, "40000", null]) {
       const { steers, stop, compactionEnd } = harness();
       expect(await stop(60_000)).toBe(true);
@@ -178,4 +199,31 @@ describe("bob#225 item 2 — repeated checkpoints after a successful compaction 
       expect(steers.length).toBe(1);
     }
   });
+
+  for (const [label, invalid] of INVALID_USAGE) {
+    it(`invalid (${label}) tool-turn usage after a compaction estimated above the threshold does not re-arm the check`, async () => {
+      const { steers, stop, turn, compactionEnd } = harness();
+      expect(await stop(60_000)).toBe(true);
+      compactionEnd(true, THRESHOLD + 1);
+
+      // Invalid usage between the compaction and the next over-threshold turn.
+      expect(await turn(invalid)).toBe(false);
+      expect(await stop(60_000)).toBe(false);
+      expect(steers.length).toBe(1);
+
+      // Control: VALID usage at or below the threshold does re-arm it.
+      expect(await stop(40_000)).toBe(false);
+      expect(await stop(60_000)).toBe(true);
+      expect(steers.length).toBe(2);
+    });
+
+    it(`invalid (${label}) tool-turn usage never checkpoints, even when the check is armed`, async () => {
+      const { steers, stop, turn } = harness();
+      expect(await turn(invalid)).toBe(false);
+      expect(steers.length).toBe(0);
+      // The check is still armed: a valid over-threshold turn checkpoints.
+      expect(await stop(60_000)).toBe(true);
+      expect(steers.length).toBe(1);
+    });
+  }
 });

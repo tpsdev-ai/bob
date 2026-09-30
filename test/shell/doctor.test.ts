@@ -864,6 +864,38 @@ describe("runDoctor", () => {
       chmodSync(yamlPath, 0o600);
     }
   });
+
+  it("FAILs an unparseable provider: block before choosing a model or window outcome (no SKIP for the missing model)", () => {
+    const { agentDir } = makeHealthyAgent({ home, name: "testbot" });
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      [
+        "agent:",
+        "  id: testbot",
+        "  role: reviewer",
+        "",
+        "provider:",
+        "  name: anthropic",
+        "  context_window: 262144",
+        "  context_windw: 1",
+        "",
+        "tools:",
+        "  allow:",
+        "    - read",
+        "",
+      ].join("\n"),
+    );
+    const report = runDoctor({
+      name: "testbot",
+      agentsRoot: join(home, "agents"),
+      flairKeysDir: join(home, ".flair", "keys"),
+      homeDir: home,
+    });
+    const c = report.checks.find((x) => x.name === "provider.context_window");
+    expect(c?.status).toBe("fail");
+    expect(c?.detail).toContain('unknown key "context_windw"');
+    expect(c?.fix).toBe("fix the shape of the provider: block in bob.yaml");
+  });
 });
 
 describe("formatReport", () => {

@@ -218,14 +218,33 @@ export interface StopAfterTurnContext {
 }
 
 /**
+ * bob#225: the ONE rule for a token count that may count as evidence of the
+ * context's size, for re-arming the checkpoint or for a checkpoint itself: a
+ * finite number greater than zero. Anything else is "no evidence". The lower
+ * bound is pi's own: its compaction code skips an assistant message whose
+ * usage's `calculateContextTokens` is not above zero ("all-zero usage", in its
+ * words) as having no valid usage data. The finite requirement is bob's.
+ */
+function validTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** A turn's context size from its usage (pi's `calculateContextTokens`), when
+ *  that usage is valid under `validTokenCount`; undefined otherwise. */
+function validUsageTokens(usage: StopAfterTurnContext["message"]["usage"]): number | undefined {
+  if (usage === undefined || usage === null) return undefined;
+  return validTokenCount(calculateContextTokens(usage as never));
+}
+
+/**
  * Check the compaction threshold BETWEEN model calls. After every turn that
  * ended in tool calls (the loop would otherwise make another model call), the
  * last response's context size — pi's own `calculateContextTokens` on its
- * usage — is compared with pi's own `shouldCompact` under the session's live
- * compaction settings. Over the threshold, bob queues a steer (the checkpoint)
- * and ends the low-level loop; pi's post-run handler then runs its threshold
- * compaction on that same message and, because a message is queued, continues
- * the run with it.
+ * usage, when that is valid (`validTokenCount`) — is compared with pi's own
+ * `shouldCompact` under the session's live compaction settings. Over the
+ * threshold, bob queues a steer (the checkpoint) and ends the low-level loop;
+ * pi's post-run handler then runs its threshold compaction on that same
+ * message and, because a message is queued, continues the run with it.
  *
  * Fails SAFE, i.e. toward pi's unchanged behaviour: if the steer cannot be
  * queued, or the hook itself throws, the loop is NOT stopped. If pi did not
@@ -234,13 +253,15 @@ export interface StopAfterTurnContext {
  * not retried on every turn.
  *
  * After a checkpoint, the check does not checkpoint again for the same
- * threshold until it sees the context at or below that threshold. A compaction
- * can succeed yet leave the context over the threshold; without this rule, each
- * following tool turn whose usage is still over the threshold would queue
- * another checkpoint, and pi would compact again after each one. Two things
- * re-arm the check: a tool turn evaluated here whose reported usage is at or
- * below the threshold, and a successful compaction whose `estimatedTokensAfter`
- * is at or below the current threshold. A compaction result with no usable
+ * threshold until it re-arms. A compaction can succeed yet leave the context
+ * over the threshold; without this rule, each following tool turn whose usage is
+ * still over the threshold would queue another checkpoint, and pi would compact
+ * again after each one. Two readings re-arm the check, and each must be valid
+ * under `validTokenCount` (a finite number above zero): a tool turn evaluated
+ * here whose usage is valid and at or below the threshold, and a successful
+ * compaction whose `estimatedTokensAfter` is valid and at or below the current
+ * threshold. A tool turn with invalid usage (all-zero, non-finite or negative)
+ * neither re-arms the check nor checkpoints. A compaction result with no valid
  * estimate, or an estimate above the threshold, leaves the check suppressed.
  *
  * Limits: pi's estimate counts the session's messages, not the system prompt or
@@ -258,23 +279,25 @@ export function installMidRunCompaction(
   // idle: may checkpoint; stopped: a checkpoint is waiting for pi's compaction;
   // suppressed: pi did not compact after the last checkpoint.
   let state: "idle" | "stopped" | "suppressed" = "idle";
-  // The threshold the last checkpoint fired for, until the check sees the
-  // context at or below it (see the note above). While it is set, a tool turn
-  // over that same threshold does not checkpoint again.
+  // The threshold the last checkpoint fired for, until the check re-arms (see
+  // the note above). While it is set, a tool turn over that same threshold does
+  // not checkpoint again.
   let checkpointedThreshold: number | null = null;
   let suppressLogged = false;
   // Whether a successful compaction's result puts the context at or below the
   // CURRENT threshold, by pi's own post-compaction estimate
-  // (`estimatedTokensAfter`). An estimate above the threshold, a missing or
-  // non-numeric one, or a threshold that cannot be computed is "not known to be
+  // (`estimatedTokensAfter`). An estimate above the threshold, one that is not
+  // valid under `validTokenCount` (missing, non-numeric, non-finite, zero or
+  // negative), or a threshold that cannot be computed is "not known to be at or
   // below": the suppression stays.
   const compactedAtOrBelowThreshold = (result: unknown): boolean => {
     try {
-      const after =
+      const after = validTokenCount(
         result !== null && typeof result === "object"
           ? (result as { estimatedTokensAfter?: unknown }).estimatedTokensAfter
-          : undefined;
-      if (typeof after !== "number" || !Number.isFinite(after) || after < 0) return false;
+          : undefined,
+      );
+      if (after === undefined) return false;
       const contextWindow = session.model?.contextWindow ?? 0;
       if (contextWindow <= 0) return false;
       const { reserveTokens } = session.settingsManager.getCompactionSettings();
@@ -288,8 +311,8 @@ export function installMidRunCompaction(
     if (event.result !== undefined) {
       state = "idle";
       if (compactedAtOrBelowThreshold(event.result)) {
-        // pi's estimate of the compacted context is at or below the threshold:
-        // the compaction itself brought the context under it, so re-arm.
+        // pi's estimate of the compacted context is valid and at or below the
+        // threshold, so re-arm.
         checkpointedThreshold = null;
         suppressLogged = false;
       }
@@ -321,11 +344,14 @@ export function installMidRunCompaction(
       const contextWindow = session.model?.contextWindow ?? 0;
       const usage = context.message.usage;
       if (!settings.enabled || contextWindow <= 0 || usage === undefined) return false;
-      const contextTokens = calculateContextTokens(usage as never);
+      const contextTokens = validUsageTokens(usage);
+      // Invalid usage (all-zero, non-finite, negative) is no evidence of the
+      // context's size either way: it neither re-arms nor checkpoints.
+      if (contextTokens === undefined) return false;
       const thresholdTokens = contextWindow - settings.reserveTokens;
-      if (contextTokens <= 0 || !shouldCompact(contextTokens, contextWindow, settings)) {
-        // At or below the threshold: re-arm, so a later tool turn over it may
-        // checkpoint again.
+      if (!shouldCompact(contextTokens, contextWindow, settings)) {
+        // Valid usage at or below the threshold: re-arm, so a later tool turn
+        // over it may checkpoint again.
         checkpointedThreshold = null;
         suppressLogged = false;
         return false;
@@ -333,12 +359,12 @@ export function installMidRunCompaction(
       if (checkpointedThreshold === thresholdTokens) {
         // A checkpoint already fired for this threshold. Reaching here means a
         // compaction succeeded since (a failed or declined one returns above),
-        // but neither its estimate nor a later tool turn's usage has been at or
-        // below the threshold. Do not checkpoint again yet.
+        // but neither a valid estimate nor a later tool turn's valid usage has
+        // been at or below the threshold. Do not checkpoint again yet.
         if (!suppressLogged) {
           suppressLogged = true;
           log(
-            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint and a compaction; not checkpointing again until a tool turn's usage or a compaction's estimate is at or below it (pi still checks when the run ends)`,
+            `bob: the context is still over the compaction threshold (${thresholdTokens} of ${contextWindow}) after a checkpoint and a compaction; not checkpointing again until a tool turn's valid usage or a compaction's valid estimate is at or below it (pi still checks when the run ends)`,
           );
         }
         return false;

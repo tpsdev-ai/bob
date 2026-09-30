@@ -12,11 +12,13 @@
 //   - Ed25519 keypair (private 0600, public exists)
 //   - .pi-agent/auth.json + models.json (PR-16a wrote these when
 //     provider was exe-dev-gateway)
-//   - provider.context_window (bob#225): FAILS when bob.yaml declares
-//     provider.model without provider.context_window (a session for that model
-//     refuses to start without it), naming the exact line to add; FAILS when
-//     bob.yaml cannot be read or its provider: block cannot be parsed; SKIPS
-//     when bob.yaml declares no provider.model
+//   - provider.context_window (bob#225): FAILS when bob.yaml cannot be read
+//     or its provider: block cannot be parsed, before any model or window
+//     outcome is chosen. For a readable bob.yaml whose provider: block parses:
+//     FAILS when it declares provider.model without provider.context_window (a
+//     session for that model refuses to start without it), naming the exact
+//     line to add; SKIPS when it declares no provider.model; OK when it
+//     declares both
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 //   - tps-mail (bob#200): FAILS when channels.tps_mail is declared with no
@@ -306,7 +308,10 @@ const INBOUND_CHAT_CAPABILITIES: ReadonlySet<string> = new Set(["discord", "tps-
 // through the reader the resolver uses (readProviderLimits), and provider.model
 // through the resolver's own interpretation (declaredProviderModel), so doctor
 // and a session agree on what is declared. Only provider.model is checked: a
-// `--model` override's provider.models entry is not.
+// `--model` override's provider.models entry is not. Order: an unreadable
+// bob.yaml or an unparseable provider: block FAILS first; only a readable file
+// whose provider: block parses reaches the model (SKIP when none) and then the
+// window (FAIL when none, else OK).
 function contextWindowCheck(yamlPath: string): DoctorCheck {
   const name = "provider.context_window";
   let yamlText: string;
