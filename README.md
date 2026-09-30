@@ -851,8 +851,9 @@ when pi exits, `bob login` reports success only when the provider it targeted no
 that passes bob's local credential checks and is new or changed. `bob logout <agent>` starts pi for
 `/logout` (an interactive selector over any stored credential, so it takes no provider).
 
-Then point the agent at the subscription model and restart it. The model must be one pi's catalog
-lists for that provider:
+Then point the agent at the subscription model and restart it. Choose a model from pi's **built-in**
+catalog for that provider — pi also merges custom model IDs you add under a provider alongside its
+built-in ones (see pi's `docs/models.md`); the table lists a built-in choice for each:
 
 | provider | a model pi lists |
 | --- | --- |
@@ -874,8 +875,9 @@ bob restart <agent>
 ```
 
 `bob doctor <agent>` fails with the `bob login <agent> <provider>` remedy while `openai-codex`,
-`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no usable credential
-for it (a keyless entry, an unresolved `$VAR` reference, or a placeholder does not count). A store
+`github-copilot`, `xai` or `kimi-coding` is declared and the agent's store holds no credential
+for it that passes bob's local credential checks (a keyless entry, an unresolved `$VAR` reference,
+or a placeholder does not count). A store
 that cannot be read or fails bob's conservative validation is a different failure: its remedy is to
 repair `auth.json`. This set is the check's scope, not a limit on `bob login`; anthropic is simply
 outside it, so doctor requires no login credential for anthropic.

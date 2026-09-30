@@ -268,8 +268,9 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 
   // bob#241: when bob.yaml names a provider in SUBSCRIPTION_PROVIDERS — the
   // scope of this check (see login.ts) — the agent's own auth store must hold a
-  // usable credential for it. Two different failures have two different remedies:
-  // no usable credential is fixed with `bob login <agent> <provider>`; a store
+  // credential for it that passes bob's local credential checks. Two different
+  // failures have two different remedies: no credential that passes bob's local
+  // credential checks is fixed with `bob login <agent> <provider>`; a store
   // that cannot be read or fails bob's conservative validation (auth.json) is
   // fixed by repairing that store — neither is a pass. A bob.yaml that cannot be
   // read or whose provider block cannot be parsed is a FAIL too, fixed by restoring

@@ -15,7 +15,15 @@
 // passed a slash argument would fail here.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/shell/doctor.js";
@@ -502,7 +510,7 @@ describe("bob#241 — the doctor subscription-auth check", () => {
     });
     const check = subscriptionCheck("subbot");
     expect(check?.status).toBe("fail");
-    expect(check?.detail).toContain("not usable");
+    expect(check?.detail).toContain("does not pass bob's local credential checks");
     expect(check?.fix).toBe("bob login subbot openai-codex");
   });
 
@@ -526,7 +534,7 @@ describe("bob#241 — the doctor subscription-auth check", () => {
     );
     const check = subscriptionCheck("subbot");
     expect(check?.status).toBe("fail");
-    expect(check?.detail).toContain("not usable");
+    expect(check?.detail).toContain("does not pass bob's local credential checks");
   });
 
   it("passes when an api_key references a SET non-empty environment variable", () => {
@@ -628,5 +636,73 @@ describe("bob#241 — the doctor subscription-auth check", () => {
     // check's scope: bob's scaffold configures anthropic with an API key.
     makeAgent("antbot", "anthropic");
     expect(subscriptionCheck("antbot")).toBeUndefined();
+  });
+});
+
+describe("bob#241 — the store read (absence vs. a failed read) and BOM handling", () => {
+  it("treats an unreadable (EACCES) store as a failure, not as an absent store (doctor)", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    const piAgent = join(dir, ".pi-agent");
+    writeFileSync(join(piAgent, "auth.json"), oauthJson("openai-codex"), { mode: 0o600 });
+    // Strip the directory's search bit: readFileSync throws EACCES and — the
+    // discriminating point — existsSync also returns false, so a code path that
+    // gates on existsSync would treat this store as ABSENT.
+    chmodSync(piAgent, 0o000);
+    try {
+      const check = subscriptionCheck("subbot");
+      expect(check?.status).toBe("fail");
+      // The store EXISTS but cannot be read: the failure names the read error,
+      // it does not read as "no credential stored".
+      expect(check?.detail).toContain("cannot read");
+      expect(check?.detail).not.toContain("no credential stored");
+    } finally {
+      chmodSync(piAgent, 0o755);
+    }
+  });
+
+  it("still treats a MISSING store as empty — the absent control", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    rmSync(join(dir, ".pi-agent", "auth.json"), { force: true });
+    const check = subscriptionCheck("subbot");
+    expect(check?.status).toBe("fail");
+    expect(check?.detail).toContain("no credential stored");
+    expect(check?.detail).not.toContain("cannot read");
+  });
+
+  it("refuses login BEFORE launching pi when the store cannot be read", async () => {
+    writeStubPi({ afterAuthJson: oauthJson("openai-codex") });
+    const dir = makeAgent("alpha", "openai-codex");
+    const piAgent = join(dir, ".pi-agent");
+    writeFileSync(join(piAgent, "auth.json"), oauthJson("openai-codex"), { mode: 0o600 });
+    chmodSync(piAgent, 0o000);
+    const cap = capture();
+    try {
+      const code = await runLogin({
+        name: "alpha",
+        provider: "openai-codex",
+        agentsRoot,
+        piBin: stubPi(),
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+        out: cap.out,
+        err: cap.err,
+      });
+      expect(code).toBe(1);
+    } finally {
+      chmodSync(piAgent, 0o755);
+    }
+    expect(cap.lines.join("\n")).toContain("cannot read");
+    // The stub pi records its argv/cwd as soon as it runs: their absence proves
+    // bob refused before it spawned the child.
+    expect(existsSync(argvFile)).toBe(false);
+    expect(existsSync(cwdFile)).toBe(false);
+  });
+
+  it("parses a BOM-prefixed auth.json (pi strips the BOM before JSON.parse)", () => {
+    const dir = makeAgent("subbot", "openai-codex");
+    writeFileSync(join(dir, ".pi-agent", "auth.json"), `\uFEFF${oauthJson("openai-codex")}`, {
+      mode: 0o600,
+    });
+    expect(subscriptionCheck("subbot")?.status).toBe("ok");
   });
 });

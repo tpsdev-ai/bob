@@ -18,7 +18,7 @@
 // `.pi-agent` directory — and never re-derives the path. bob READS the agent's
 // auth store locally to decide whether a sign-in happened (it parses auth.json);
 // it does not print credential fields — it reports only WHICH providers the
-// store holds a usable credential for.
+// store holds a credential for that passes bob's local credential checks.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -88,9 +88,10 @@ export interface LoginDeps {
   err?: (line: string) => void;
 }
 
-// The provider names the agent's auth store holds a USABLE credential for (by
-// bob's conservative rule), and separately the names whose record is stored but
-// unusable (an entry bob's rule reads, but not as a usable key). A store that is
+// The provider names the agent's auth store holds a credential for that passes
+// bob's local credential checks (by bob's conservative rule), and separately the
+// names whose record is stored but unusable (an entry bob's rule reads, but not
+// as a resolved key). A store that is
 // absent is "none"; a store bob's validation refuses, or one that cannot be read
 // or parsed, is a REASON, never "none" — a failed read must not read as "no
 // credential".
@@ -98,16 +99,18 @@ export type StoredProviders =
   | { ok: true; providers: string[]; unusable: string[] }
   | { ok: false; reason: string };
 
-// bob's conservative validation of one stored entry, mirroring pi's read-only
-// validator `ReadOnlyAuthStorage.load`
+// bob's conservative validation of one stored entry, matching the ENTRY-SHAPE
+// check pi's read-only validator `ReadOnlyAuthStorage.load` performs
 // (node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js:180-202):
 // an entry is acceptable iff it is an object whose `type` is "api_key" (with
 // `key` undefined or a string, and `env` undefined or a map of strings) or
 // "oauth" (with string `access`, string `refresh` and a finite number
-// `expires`). This is bob's OWN rule: it is stricter than pi's live runtime,
-// whose AuthStorage parser only JSON-parses the file (dist/core/auth-storage.js:294,
-// used by ModelRuntime — dist/core/model-runtime.js:74). bob refuses the WHOLE
-// store when any entry fails it, rather than trusting part of it.
+// `expires`). bob reads the store the way pi does — `JSON.parse` of the text
+// after stripping a leading BOM (dist/core/auth-storage.js parseStorageData:294,
+// used by ModelRuntime — dist/core/model-runtime.js:74) — and then applies this
+// entry-shape check, which the live parser does NOT do (it only JSON-parses).
+// bob refuses the WHOLE store when any entry fails the shape check, rather than
+// trusting part of it.
 function piAcceptsCredential(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
   const e = entry as Record<string, unknown>;
@@ -245,16 +248,25 @@ function piTreatsAsConfigured(entry: unknown): boolean {
 
 type AuthStoreRead = { ok: true; entries: Record<string, unknown> } | { ok: false; reason: string };
 
-// Read and conservatively validate the agent's auth store. A failed read or
-// parse, or any entry bob's validation rule refuses, is a REASON — never "no
-// credential".
+// Strip a leading UTF-8 BOM before parsing, exactly as pi does
+// (`JSON.parse(stripBom(content))` in dist/core/auth-storage.js), so a
+// BOM-prefixed auth.json parses here too.
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+// Read and conservatively validate the agent's auth store. Absence is decided by
+// the READ itself, not by a separate existence probe: only ENOENT (no file) is
+// "none" — every other read error (EACCES, EISDIR, …) is a REASON, never "no
+// credential", so an unreadable store cannot be mistaken for an absent one. A
+// failed parse, or any entry bob's validation rule refuses, is a REASON too.
 function readAuthStore(piAgentDir: string): AuthStoreRead {
   const path = join(piAgentDir, PROVIDER_LOGIN_STORE);
-  if (!existsSync(path)) return { ok: true, entries: {} };
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, entries: {} };
     return {
       ok: false,
       reason: `cannot read ${path} (${(err as NodeJS.ErrnoException).code ?? String(err)})`,
@@ -262,7 +274,7 @@ function readAuthStore(piAgentDir: string): AuthStoreRead {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripBom(raw));
   } catch {
     return { ok: false, reason: `${path} is not valid JSON` };
   }
@@ -290,8 +302,9 @@ export function storedCredentialProviders(piAgentDir: string): StoredProviders {
   const unusable: string[] = [];
   for (const [provider, entry] of Object.entries(store.entries)) {
     // An entry bob's validator accepts is not necessarily one pi would resolve
-    // to a usable key: a keyless `api_key`, an unresolved reference, or a bob
-    // scaffold placeholder is stored but unusable. Only a usable credential counts.
+    // to a key: a keyless `api_key`, an unresolved reference, or a bob
+    // scaffold placeholder is stored but does not pass bob's local credential
+    // checks. Only a credential that passes them counts.
     if (piTreatsAsConfigured(entry) && !isPlaceholder(entry)) providers.push(provider);
     else unusable.push(provider);
   }
@@ -320,9 +333,10 @@ export function storedCredentialFingerprint(
 }
 
 // bob#241 — the doctor check. When bob.yaml names a provider IN THIS CHECK'S
-// SCOPE, the agent's store must hold a usable credential for it. `ok` when the
-// check is satisfied or the provider is out of scope; `fail` (with a fix line)
-// when the provider has no usable credential, or when the store cannot be read
+// SCOPE, the agent's store must hold a credential for it that passes bob's local
+// credential checks. `ok` when the check is satisfied or the provider is out of
+// scope; `fail` (with a fix line) when the provider has no such credential, or
+// when the store cannot be read
 // or parsed, or fails bob's conservative validation — none of those is a pass.
 export function subscriptionCredentialCheck(input: {
   name: string;
@@ -347,7 +361,7 @@ export function subscriptionCredentialCheck(input: {
   if (stored.unusable.includes(provider)) {
     return {
       status: "fail",
-      detail: `credential record for ${provider} is stored but not usable — bob does not resolve it to a usable key (an empty key, an unresolved reference, or a placeholder value); stored: ${stored.providers.join(", ") || "none"}`,
+      detail: `credential record for ${provider} is stored but does not pass bob's local credential checks (an empty key, an unresolved reference, or a placeholder value); stored: ${stored.providers.join(", ") || "none"}`,
       fix: `bob login ${name} ${provider}`,
     };
   }
@@ -482,8 +496,9 @@ export async function runLogin(
   );
 
   // Record the TARGET provider's stored credential BEFORE launch (its presence,
-  // usability and a fingerprint of its stored fields). Success is an OBSERVED
-  // change to THIS provider — newly usable, or its stored value changed — never
+  // usability under bob's local checks and a fingerprint of its stored fields).
+  // Success is an OBSERVED change to THIS provider — it now passes bob's local
+  // credential checks where it did not, or its stored value changed — never
   // pi's zero exit alone, and never a change to some OTHER provider. A store that
   // cannot be read before the run is refused: the change cannot be observed
   // without it.
@@ -506,8 +521,9 @@ export async function runLogin(
     return 1;
   }
 
-  // The post-condition, about the TARGET provider only: it must now hold a usable
-  // credential AND that credential must be new (not usable before) or changed
+  // The post-condition, about the TARGET provider only: its credential must now
+  // pass bob's local credential checks AND that credential must be new (it did
+  // not pass before) or changed
   // (its stored value differs). A zero exit that leaves the target's credential
   // pre-existing and unchanged — the operator cancelled, or signed in to another
   // provider — is a failure.
