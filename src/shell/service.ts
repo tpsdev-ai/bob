@@ -311,7 +311,10 @@ export function resolveNodeExecutable(deps: NodeResolutionDeps = {}): string {
   );
 }
 
-export interface RenderServiceOptions {
+// The renderers take the resolution deps too: when `interpreter` is not given,
+// they resolve it with these (resolveNodeExecutable), so a caller or a test can
+// pin the resolution instead of reading the host's PATH and filesystem.
+export interface RenderServiceOptions extends NodeResolutionDeps {
   name: string;
   // Absolute path to the `bob` binary the unit runs. Both init systems use a
   // minimal PATH, so this MUST be absolute (the caller resolves it). Required.
@@ -324,6 +327,7 @@ export interface RenderServiceOptions {
   // the interpreter is started by ABSOLUTE path with the bob script as its
   // first argument and PATH is never consulted. installService resolves it once
   // and passes it in; this option is also the direct-renderer / test override.
+  // When it is absent, the resolution deps above (NodeResolutionDeps) apply.
   interpreter?: string;
   // Optional model override passed through to `bob run` (→ runPersistent).
   model?: string;
@@ -340,9 +344,10 @@ export type RenderPlistOptions = RenderServiceOptions;
 // "runs:" line read this ONE list, so the displayed command can never drift from
 // what the unit actually executes (e.g. the CLI dropping `--model`).
 export function serviceCommandArgs(
-  opts: Pick<RenderServiceOptions, "interpreter" | "bobBin" | "name" | "model">,
+  opts: Pick<RenderServiceOptions, "interpreter" | "bobBin" | "name" | "model"> &
+    NodeResolutionDeps,
 ): string[] {
-  const args = [opts.interpreter ?? resolveNodeExecutable(), opts.bobBin, "run", opts.name];
+  const args = [opts.interpreter ?? resolveNodeExecutable(opts), opts.bobBin, "run", opts.name];
   if (opts.model) args.push("--model", opts.model);
   return args;
 }
@@ -496,27 +501,23 @@ export type CommandRunner = (
 // Back-compat: the launchd-only runner shape used by existing callers/tests.
 export type LaunchctlRunner = (args: string[]) => Promise<{ code: number; stderr: string }>;
 
-export interface ServiceOpsDeps {
+// The Node resolution deps (NodeResolutionDeps) resolve the unit's interpreter:
+// injected in tests, defaulting to the current process's own interpreter, PATH
+// and uid.
+export interface ServiceOpsDeps extends NodeResolutionDeps {
   // Write the unit to disk (install-service). Injected in tests.
   writeFile?: (path: string, contents: string) => void;
   // Run launchctl (macOS). Injected in tests.
   runLaunchctl?: LaunchctlRunner;
   // Run systemctl (Linux). Injected in tests.
   runSystemctl?: LaunchctlRunner;
-  // Resolve the current uid for the launchd gui domain target. Injected in tests.
+  // Resolve the current uid for the launchd gui domain target. Injected in
+  // tests. It is also the installer uid the resolution's trust screen uses.
   getUid?: () => number;
   // Home dir override (tests).
   home?: string;
   // Force a backend (tests; CI runs on Linux). Defaults to the host platform.
   platform?: ServicePlatform;
-  // Node resolution for the unit's interpreter (see resolveNodeExecutable).
-  // Injected in tests; defaults to the current process's own interpreter + PATH.
-  // getUid above is also the installer uid the resolution's trust screen uses.
-  execPath?: string;
-  pathEnv?: string;
-  isExecutable?: (file: string) => boolean;
-  statPath?: (path: string) => PathOwnership;
-  adminGid?: number | null;
 }
 
 export interface InstallServiceOptions extends RenderServiceOptions, ServiceOpsDeps {}

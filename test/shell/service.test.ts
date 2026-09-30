@@ -52,6 +52,61 @@ function captureRunner(): { runner: LaunchctlRunner; calls: string[][] } {
   return { runner, calls };
 }
 
+// The installer uid every test that resolves an interpreter injects: the
+// running uid, which owns the temp directories the tests create. TRUST also
+// turns the administrators-group exception off, so no result depends on the
+// host's identity or group database; tests about those rules override it.
+const ME = process.getuid?.() ?? 0;
+const TRUST = { getUid: () => ME, adminGid: null };
+
+// Temp directories the file-level fixtures create, removed after the file.
+const fixtureDirs: string[] = [];
+afterAll(() => {
+  for (const dir of fixtureDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+// A fresh 0700 temp directory holding an executable stub named node: a TRUSTED
+// PATH entry, so a test that resolves an interpreter never sees the host's node.
+function stubNodeDir(prefix: string): { dir: string; node: string } {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  fixtureDirs.push(dir);
+  chmodSync(dir, 0o700);
+  const node = join(dir, "node");
+  writeFileSync(node, "#!/bin/sh\n");
+  chmodSync(node, 0o755);
+  return { dir, node };
+}
+
+// A REAL Node binary, for the acceptance tests that EXECUTE the rendered unit's
+// command (`bob --help`). It is a fixture to run, not the resolution under test,
+// so it is found without the trust screen: BOB_TEST_NODE when set, else the
+// first executable `node` on this process's PATH. With neither, those tests are
+// skipped, except under CI, where they run and fail naming this remedy.
+function findRealNode(): string | undefined {
+  const fromEnv = process.env.BOB_TEST_NODE;
+  if (fromEnv) return fromEnv;
+  for (const dir of (process.env.PATH ?? "").split(":")) {
+    if (!dir.startsWith("/")) continue;
+    const candidate = join(dir, "node");
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // not here
+    }
+  }
+  return undefined;
+}
+const REAL_NODE = findRealNode();
+function realNode(): string {
+  if (REAL_NODE === undefined) {
+    throw new Error(
+      "no Node binary to run the unit's command: set BOB_TEST_NODE or put node on PATH",
+    );
+  }
+  return REAL_NODE;
+}
+const itWithRealNode = it.skipIf(REAL_NODE === undefined && !process.env.CI);
+
 describe("renderPlist", () => {
   it("references the PERSISTENT entrypoint (bob run <name>)", () => {
     const xml = renderPlist({
@@ -70,13 +125,23 @@ describe("renderPlist", () => {
   });
 
   it("sets KeepAlive + RunAtLoad (the agent self-runs)", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const xml = renderPlist({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
     expect(xml).toContain("<key>KeepAlive</key>\n  <true/>");
     expect(xml).toContain("<key>RunAtLoad</key>\n  <true/>");
   });
 
   it("uses a stable, unique Label per agent", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const xml = renderPlist({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
     expect(serviceLabel("pulse")).toBe("ai.tpsdev.bob.pulse");
     expect(xml).toContain("<string>ai.tpsdev.bob.pulse</string>");
   });
@@ -86,6 +151,7 @@ describe("renderPlist", () => {
       name: "pulse",
       bobBin: "/usr/local/bin/bob",
       model: "claude-fast",
+      interpreter: INTERPRETER,
       home: HOME,
     });
     expect(xml).toContain("<string>--model</string>");
@@ -93,7 +159,12 @@ describe("renderPlist", () => {
   });
 
   it("NEVER embeds a token or any secret (security)", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const xml = renderPlist({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
     // No env-var block at all, and nothing token-shaped.
     expect(xml).not.toContain("EnvironmentVariables");
     expect(xml).not.toContain("TOKEN");
@@ -102,7 +173,12 @@ describe("renderPlist", () => {
   });
 
   it("points logs + WorkingDirectory at the agent's home", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
+    const xml = renderPlist({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
     expect(xml).toContain(`<string>${HOME}/agents/pulse/work</string>`);
     expect(xml).toContain(`<string>${HOME}/agents/pulse/service.out.log</string>`);
     expect(xml).toContain(`<string>${HOME}/agents/pulse/service.err.log</string>`);
@@ -113,6 +189,7 @@ describe("renderPlist", () => {
       name: "pulse",
       bobBin: "/opt/bob & co/bob",
       model: 'a"<b>',
+      interpreter: INTERPRETER,
       home: HOME,
     });
     expect(xml).toContain("/opt/bob &amp; co/bob");
@@ -121,10 +198,12 @@ describe("renderPlist", () => {
   });
 
   it("rejects an invalid agent name (path/XML injection defense)", () => {
-    expect(() => renderPlist({ name: "../evil", bobBin: "/bin/bob" })).toThrow(
-      /invalid agent name/,
-    );
-    expect(() => renderPlist({ name: "a b", bobBin: "/bin/bob" })).toThrow(/invalid agent name/);
+    expect(() =>
+      renderPlist({ name: "../evil", bobBin: "/bin/bob", interpreter: INTERPRETER }),
+    ).toThrow(/invalid agent name/);
+    expect(() =>
+      renderPlist({ name: "a b", bobBin: "/bin/bob", interpreter: INTERPRETER }),
+    ).toThrow(/invalid agent name/);
   });
 });
 
@@ -140,6 +219,7 @@ describe("installService (launchd)", () => {
     const res = await installService({
       name: "pulse",
       bobBin: "/usr/local/bin/bob",
+      interpreter: INTERPRETER,
       home: HOME,
       platform: "launchd",
       writeFile: (path, contents) => written.push({ path, contents }),
@@ -218,9 +298,9 @@ describe("systemd backend", () => {
     expect(unit).toContain(
       `ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse --model claude-fast`,
     );
-    expect(() => renderSystemdUnit({ name: "../evil", bobBin: "/bin/bob" })).toThrow(
-      /invalid agent name/,
-    );
+    expect(() =>
+      renderSystemdUnit({ name: "../evil", bobBin: "/bin/bob", interpreter: INTERPRETER }),
+    ).toThrow(/invalid agent name/);
   });
 
   it("systemdUnitPath + servicePath resolve the user-unit location", () => {
@@ -281,26 +361,34 @@ describe("systemd backend", () => {
 });
 
 describe("the unit does not depend on the service manager's PATH (bob#218)", () => {
-  it("launchd: the default interpreter is an absolute Node path", () => {
-    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
-    const interpreter = resolveNodeExecutable();
-    expect(basename(interpreter)).toBe("node");
-    expect(xml).toContain(
-      `    <string>${interpreter}</string>\n    <string>/usr/local/bin/bob</string>`,
-    );
+  // No `interpreter` given: the renderer resolves one with the injected deps (a
+  // non-Node installer; a PATH holding one trusted node), never the host's.
+  it("launchd: the default interpreter is the resolved absolute Node path", () => {
+    const { dir, node } = stubNodeDir("bob-render-default-");
+    const deps = { ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir };
+    const xml = renderPlist({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME, ...deps });
+    expect(resolveNodeExecutable(deps)).toBe(node);
+    expect(node.startsWith("/")).toBe(true);
+    expect(xml).toContain(`    <string>${node}</string>\n    <string>/usr/local/bin/bob</string>`);
   });
 
-  it("systemd: the default interpreter is an absolute Node path", () => {
-    const unit = renderSystemdUnit({ name: "pulse", bobBin: "/usr/local/bin/bob", home: HOME });
-    const interpreter = resolveNodeExecutable();
-    expect(basename(interpreter)).toBe("node");
-    expect(unit).toContain(`ExecStart=${interpreter} /usr/local/bin/bob run pulse`);
+  it("systemd: the default interpreter is the resolved absolute Node path", () => {
+    const { dir, node } = stubNodeDir("bob-render-default-");
+    const deps = { ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir };
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      home: HOME,
+      ...deps,
+    });
+    expect(resolveNodeExecutable(deps)).toBe(node);
+    expect(unit).toContain(`ExecStart=${node} /usr/local/bin/bob run pulse`);
   });
 });
 
 describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () => {
   it("returns the installer's own interpreter when it IS node", () => {
-    expect(resolveNodeExecutable({ execPath: "/usr/local/bin/node", pathEnv: "" })).toBe(
+    expect(resolveNodeExecutable({ ...TRUST, execPath: "/usr/local/bin/node", pathEnv: "" })).toBe(
       "/usr/local/bin/node",
     );
   });
@@ -310,7 +398,7 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
     writeFileSync(join(dir, "node"), "#!/bin/sh\n");
     chmodSync(join(dir, "node"), 0o755);
     try {
-      expect(resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
+      expect(resolveNodeExecutable({ ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
         join(dir, "node"),
       );
     } finally {
@@ -326,12 +414,12 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
       const rel = relative(process.cwd(), dir); // a RELATIVE PATH entry
       expect(rel.startsWith("/")).toBe(false); // premise: it IS relative
       // premise: the same directory, named absolutely, IS chosen
-      expect(resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
+      expect(resolveNodeExecutable({ ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: dir })).toBe(
         join(dir, "node"),
       );
-      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: rel })).toThrow(
-        /no Node executable found/,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: rel }),
+      ).toThrow(/no Node executable found/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -346,6 +434,7 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
     try {
       const delimiter = process.platform === "win32" ? ";" : ":";
       const resolved = resolveNodeExecutable({
+        ...TRUST,
         execPath: "/opt/bun/bin/bun",
         pathEnv: `${dirOnly}${delimiter}${fileDir}`,
       });
@@ -360,12 +449,12 @@ describe("resolveNodeExecutable — the unit runs bob under node (bob#218)", () 
   it("refuses with the engines floor and the PATH remedy when no node is found", () => {
     const empty = mkdtempSync(join(tmpdir(), "bob-no-node-"));
     try {
-      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: empty })).toThrow(
-        /22\.19\.0/,
-      );
-      expect(() => resolveNodeExecutable({ execPath: "/opt/bun/bin/bun", pathEnv: empty })).toThrow(
-        /on PATH/,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: empty }),
+      ).toThrow(/22\.19\.0/);
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: "/opt/bun/bin/bun", pathEnv: empty }),
+      ).toThrow(/on PATH/);
     } finally {
       rmSync(empty, { recursive: true, force: true });
     }
@@ -389,7 +478,11 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
     const stable = join(stableDir, "node");
     symlinkSync(versioned.file, stable); // /opt/homebrew/bin/node -> .../Cellar/node/<v>/bin/node
     try {
-      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: stableDir });
+      const resolved = resolveNodeExecutable({
+        ...TRUST,
+        execPath: versioned.file,
+        pathEnv: stableDir,
+      });
       expect(resolved).toBe(stable);
       expect(resolved).not.toBe(versioned.file);
     } finally {
@@ -402,7 +495,11 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
     const versioned = versionedNode();
     const emptyDir = mkdtempSync(join(tmpdir(), "bob-node-empty-"));
     try {
-      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: emptyDir });
+      const resolved = resolveNodeExecutable({
+        ...TRUST,
+        execPath: versioned.file,
+        pathEnv: emptyDir,
+      });
       expect(resolved).toBe(versioned.file);
     } finally {
       rmSync(versioned.dir, { recursive: true, force: true });
@@ -420,7 +517,11 @@ describe("resolveNodeExecutable — a stable path over a versioned target (bob#2
     const elsewhere = join(stableDir, "node");
     symlinkSync(other, elsewhere); // points at a DIFFERENT binary
     try {
-      const resolved = resolveNodeExecutable({ execPath: versioned.file, pathEnv: stableDir });
+      const resolved = resolveNodeExecutable({
+        ...TRUST,
+        execPath: versioned.file,
+        pathEnv: stableDir,
+      });
       // The non-matching symlink is not chosen; the fallback is execPath.
       expect(resolved).not.toBe(elsewhere);
       expect(resolved).toBe(versioned.file);
@@ -446,11 +547,11 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
     for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
   });
 
-  // A fresh temp directory (0700, owned by the running uid), chmod'ed to `mode`.
-  function tempDir(prefix: string, mode?: number): string {
+  // A fresh temp directory owned by the running uid, set to `mode` (default 0700).
+  function tempDir(prefix: string, mode = 0o700): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
     scratch.push(dir);
-    if (mode !== undefined) chmodSync(dir, mode);
+    chmodSync(dir, mode);
     return dir;
   }
   // Nested directories under `parent`, each 0755 whatever the umask.
@@ -466,7 +567,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
   // Make `dir` 1777 (world-writable + sticky, like /tmp). bun's fs.chmodSync
   // drops the sticky bit, so this runs chmod(1) and asserts the bit is set.
   function makeSticky(dir: string): void {
-    const r = spawnSync("chmod", ["1777", dir], { encoding: "utf8", timeout: 10_000 });
+    const r = spawnSync("/bin/chmod", ["1777", dir], { encoding: "utf8", timeout: 10_000 });
     expect(r.status).toBe(0);
     expect(statSync(dir).mode & 0o7777).toBe(0o1777);
   }
@@ -489,33 +590,46 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const versioned = nodeFile(tempDir("bob-trust-versioned-"));
       const open = tempDir("bob-trust-0777-", 0o777);
       nodeLink(open, versioned);
-      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: open })).toBe(versioned);
+      expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: open })).toBe(
+        versioned,
+      );
       // A trusted matching symlink LATER on PATH is still chosen: the untrusted
       // entry is skipped, not fatal.
       const closed = tempDir("bob-trust-0700-");
       const stable = nodeLink(closed, versioned);
       expect(
-        resolveNodeExecutable({ execPath: versioned, pathEnv: `${open}${delimiter}${closed}` }),
+        resolveNodeExecutable({
+          ...TRUST,
+          execPath: versioned,
+          pathEnv: `${open}${delimiter}${closed}`,
+        }),
       ).toBe(stable);
     });
 
     it("a group-writable directory is not chosen when its group is not the administrators group", () => {
       const dir = tempDir("bob-trust-0775-", 0o775);
       nodeFile(dir);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: null })).toThrow(
-        NO_NODE,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, adminGid: null }),
+      ).toThrow(NO_NODE);
     });
 
     it("group write by the administrators group is accepted (stock Homebrew); other-write never is", () => {
       const dir = tempDir("bob-trust-admin-", 0o775);
       const node = nodeFile(dir);
       const gid = statSync(dir).gid;
-      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: gid })).toBe(node);
+      expect(resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, adminGid: gid })).toBe(
+        node,
+      );
       const open = tempDir("bob-trust-admin-0777-", 0o777);
       nodeFile(open);
       expect(() =>
-        resolveNodeExecutable({ execPath: BUN, pathEnv: open, adminGid: statSync(open).gid }),
+        resolveNodeExecutable({
+          ...TRUST,
+          execPath: BUN,
+          pathEnv: open,
+          adminGid: statSync(open).gid,
+        }),
       ).toThrow(NO_NODE);
     });
 
@@ -523,9 +637,9 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const dir = tempDir("bob-trust-sticky-holder-");
       makeSticky(dir);
       nodeFile(dir);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, adminGid: null })).toThrow(
-        NO_NODE,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, adminGid: null }),
+      ).toThrow(NO_NODE);
     });
 
     it.skipIf(process.getuid?.() === 0)(
@@ -533,11 +647,12 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       () => {
         const dir = tempDir("bob-trust-owner-");
         const node = nodeFile(dir);
-        const me = process.getuid?.() ?? 0;
         // premise: the installer that owns it does choose it
-        expect(resolveNodeExecutable({ execPath: BUN, pathEnv: dir, getUid: () => me })).toBe(node);
+        expect(
+          resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, getUid: () => ME }),
+        ).toBe(node);
         expect(() =>
-          resolveNodeExecutable({ execPath: BUN, pathEnv: dir, getUid: () => me + 1 }),
+          resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, getUid: () => ME + 1 }),
         ).toThrow(NO_NODE);
       },
     );
@@ -547,11 +662,13 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const bin = subdirs(outer, "bin");
       chmodSync(bin, 0o700);
       const node = nodeFile(bin);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: bin, adminGid: null })).toThrow(
-        NO_NODE,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: bin, adminGid: null }),
+      ).toThrow(NO_NODE);
       makeSticky(outer); // now like /tmp
-      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: bin, adminGid: null })).toBe(node);
+      expect(resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: bin, adminGid: null })).toBe(
+        node,
+      );
     });
 
     it("a symlink is judged by where it leads: a node link or a PATH directory link into a 0777 directory is not chosen", () => {
@@ -560,18 +677,22 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       // A trusted directory whose node symlinks INTO the untrusted one.
       const holder = tempDir("bob-trust-linkholder-");
       nodeLink(holder, target);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: holder })).toThrow(NO_NODE);
+      expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: holder })).toThrow(
+        NO_NODE,
+      );
       // A PATH entry that is itself a symlink to the untrusted directory.
       const parent = tempDir("bob-trust-dirlink-");
       const linked = join(parent, "bin");
       symlinkSync(open, linked);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: linked })).toThrow(NO_NODE);
+      expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: linked })).toThrow(
+        NO_NODE,
+      );
       // premise: a PATH directory link into a TRUSTED directory is chosen.
       const good = tempDir("bob-trust-gooddir-");
       nodeFile(good);
       const goodLink = join(parent, "good");
       symlinkSync(good, goodLink);
-      expect(resolveNodeExecutable({ execPath: BUN, pathEnv: goodLink })).toBe(
+      expect(resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: goodLink })).toBe(
         join(goodLink, "node"),
       );
     });
@@ -581,9 +702,9 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const versioned = nodeFile(subdirs(prefix, "Cellar", "node", "1.0.0", "bin"));
       const stable = join(subdirs(prefix, "bin"), "node");
       symlinkSync("../Cellar/node/1.0.0/bin/node", stable);
-      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: join(prefix, "bin") })).toBe(
-        stable,
-      );
+      expect(
+        resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: join(prefix, "bin") }),
+      ).toBe(stable);
     });
 
     it("a failed stat makes the candidate untrusted: it is skipped and the fallback applies", () => {
@@ -600,14 +721,14 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
         return statSync(path);
       };
       // premise: without the failure the link is chosen
-      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: dir })).toBe(stable);
-      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: dir, statPath })).toBe(
+      expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: dir })).toBe(stable);
+      expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: dir, statPath })).toBe(
         versioned,
       );
       expect(fired).toBeGreaterThan(0); // the injected failure really fired
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: dir, statPath })).toThrow(
-        NO_NODE,
-      );
+      expect(() =>
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, statPath }),
+      ).toThrow(NO_NODE);
     });
 
     it("a symlink cycle is untrusted (the walk is bounded)", () => {
@@ -615,7 +736,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       symlinkSync(join(dir, "loop"), join(dir, "node"));
       symlinkSync(join(dir, "node"), join(dir, "loop"));
       expect(() =>
-        resolveNodeExecutable({ execPath: BUN, pathEnv: dir, isExecutable: () => true }),
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: dir, isExecutable: () => true }),
       ).toThrow(NO_NODE);
     });
   });
@@ -630,26 +751,80 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const abs = tempDir("bob-rel-abs-");
       const absNode = nodeFile(abs);
       // premise: the same directory named ABSOLUTELY is chosen
-      expect(resolveNodeExecutable({ execPath: versioned, pathEnv: bin })).toBe(join(bin, "node"));
+      expect(resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: bin })).toBe(
+        join(bin, "node"),
+      );
       const previous = process.cwd();
       process.chdir(cwd);
       try {
         const relativeOnly = `bin${delimiter}.`;
-        expect(resolveNodeExecutable({ execPath: versioned, pathEnv: relativeOnly })).toBe(
-          versioned,
-        );
-        expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: relativeOnly })).toThrow(
-          NO_NODE,
-        );
         expect(
-          resolveNodeExecutable({ execPath: BUN, pathEnv: `${relativeOnly}${delimiter}${abs}` }),
+          resolveNodeExecutable({ ...TRUST, execPath: versioned, pathEnv: relativeOnly }),
+        ).toBe(versioned);
+        expect(() =>
+          resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: relativeOnly }),
+        ).toThrow(NO_NODE);
+        expect(
+          resolveNodeExecutable({
+            ...TRUST,
+            execPath: BUN,
+            pathEnv: `${relativeOnly}${delimiter}${abs}`,
+          }),
         ).toBe(absNode);
         expect(
-          resolveNodeExecutable({ execPath: BUN, pathEnv: `${delimiter}${delimiter}${abs}` }),
+          resolveNodeExecutable({
+            ...TRUST,
+            execPath: BUN,
+            pathEnv: `${delimiter}${delimiter}${abs}`,
+          }),
         ).toBe(absNode);
       } finally {
         process.chdir(previous);
       }
+    });
+  });
+
+  // The hosted CI runner's layout: the only node on PATH sits in a
+  // world-writable directory (as /usr/local/bin is there). The trust rule
+  // refuses it, and the refusal must say what it skipped and why.
+  describe("a PATH whose only node sits under a world-writable directory (the hosted runner)", () => {
+    it("is refused with the actionable message by the resolver, both renderers and installService", async () => {
+      const binary = nodeFile(tempDir("bob-ci-binary-")); // the binary itself, trusted
+      const open = tempDir("bob-ci-usr-local-bin-", 0o777); // like the runner's /usr/local/bin
+      const link = nodeLink(open, binary); // a node symlink ...
+      const openToo = tempDir("bob-ci-other-bin-", 0o777);
+      const file = nodeFile(openToo); // ... and a node file, both world-writable
+      const deps = { ...TRUST, execPath: BUN, pathEnv: `${open}${delimiter}${openToo}` };
+      // premise: the same link in a 0700 directory IS chosen
+      const closed = tempDir("bob-ci-trusted-");
+      const trustedLink = nodeLink(closed, binary);
+      expect(resolveNodeExecutable({ ...deps, pathEnv: closed })).toBe(trustedLink);
+
+      let message = "";
+      try {
+        resolveNodeExecutable(deps);
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toContain("bob install-service: no Node executable found");
+      expect(message).toContain(">=22.19.0");
+      expect(message).toContain("put it on PATH");
+      expect(message).toContain(`Skipped as untrusted: ${link}, ${file}`);
+      expect(message).toContain("owned by you or root and not writable by others");
+
+      const opts = { name: "pulse", bobBin: BOB_BIN, home: HOME, ...deps };
+      expect(() => renderPlist(opts)).toThrow(message);
+      expect(() => renderSystemdUnit(opts)).toThrow(message);
+      const written: Array<{ path: string; contents: string }> = [];
+      await expect(
+        installService({
+          ...opts,
+          platform: "systemd",
+          writeFile: (path, contents) => written.push({ path, contents }),
+          runSystemctl: async () => ({ code: 0, stderr: "" }),
+        }),
+      ).rejects.toThrow(message);
+      expect(written).toHaveLength(0);
     });
   });
 
@@ -660,24 +835,32 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
       const trusted = tempDir("bob-nn-trusted-");
       const good = nodeFile(trusted);
       expect(
-        resolveNodeExecutable({ execPath: BUN, pathEnv: `${open}${delimiter}${trusted}` }),
+        resolveNodeExecutable({
+          ...TRUST,
+          execPath: BUN,
+          pathEnv: `${open}${delimiter}${trusted}`,
+        }),
       ).toBe(good);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: open })).toThrow(NO_NODE);
+      expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: open })).toThrow(
+        NO_NODE,
+      );
       // The refusal names what it skipped and why, so the remedy is actionable.
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: open })).toThrow(
+      expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: open })).toThrow(
         `Skipped as untrusted: ${join(open, "node")}`,
       );
       // With nothing skipped, the refusal does not claim anything was.
       let bare = "";
       try {
-        resolveNodeExecutable({ execPath: BUN, pathEnv: "" });
+        resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: "" });
       } catch (e) {
         bare = (e as Error).message;
       }
       expect(bare).toMatch(NO_NODE);
       expect(bare).not.toContain("Skipped as untrusted");
       const rel = relative(process.cwd(), trusted);
-      expect(() => resolveNodeExecutable({ execPath: BUN, pathEnv: rel })).toThrow(NO_NODE);
+      expect(() => resolveNodeExecutable({ ...TRUST, execPath: BUN, pathEnv: rel })).toThrow(
+        NO_NODE,
+      );
     });
 
     it("installService refuses and writes NOTHING when PATH holds only an untrusted node", async () => {
@@ -689,6 +872,7 @@ describe("resolveNodeExecutable — only trusted, absolute PATH entries supply n
         bobBin: BOB_BIN,
         home: HOME,
         platform: "systemd",
+        ...TRUST,
         execPath: BUN,
         pathEnv: open,
         writeFile: (path, contents) => written.push({ path, contents }),
@@ -719,6 +903,7 @@ describe("installService prefers a stable PATH symlink over a direct match (bob#
         bobBin: BOB_BIN,
         home: HOME,
         platform: "launchd",
+        ...TRUST,
         execPath: versioned,
         pathEnv,
         writeFile: (path, contents) => launchdWritten.push({ path, contents }),
@@ -733,6 +918,7 @@ describe("installService prefers a stable PATH symlink over a direct match (bob#
         bobBin: BOB_BIN,
         home: HOME,
         platform: "systemd",
+        ...TRUST,
         execPath: versioned,
         pathEnv,
         writeFile: (path, contents) => systemdWritten.push({ path, contents }),
@@ -750,17 +936,21 @@ describe("installService prefers a stable PATH symlink over a direct match (bob#
 
 describe("installService resolves the interpreter at install time (bob#218)", () => {
   it("a bun-launched install writes the Node path, not bun", async () => {
+    const { dir, node } = stubNodeDir("bob-install-bun-");
     const written: Array<{ path: string; contents: string }> = [];
     const res = await installService({
       name: "pulse",
       bobBin: BOB_BIN,
       home: HOME,
       platform: "systemd",
+      ...TRUST,
+      execPath: process.execPath,
+      pathEnv: dir,
       writeFile: (path, contents) => written.push({ path, contents }),
       runSystemctl: async () => ({ code: 0, stderr: "" }),
     });
     // process.execPath is the test runner (bun); the unit must still be node.
-    expect(basename(res.interpreter)).toBe("node");
+    expect(res.interpreter).toBe(node);
     expect(basename(res.interpreter)).not.toBe(basename(process.execPath));
     expect(written[0].contents).toContain(`ExecStart=${res.interpreter} ${BOB_BIN} run pulse`);
   });
@@ -777,6 +967,7 @@ describe("installService resolves the interpreter at install time (bob#218)", ()
         bobBin: BOB_BIN,
         home: HOME,
         platform: "systemd",
+        ...TRUST,
         execPath: "/opt/bun/bin/bun",
         pathEnv: binDir,
         writeFile: (path, contents) => written.push({ path, contents }),
@@ -800,6 +991,7 @@ describe("installService resolves the interpreter at install time (bob#218)", ()
         bobBin: BOB_BIN,
         home: HOME,
         platform: "systemd",
+        ...TRUST,
         execPath: "/opt/bun/bin/bun",
         pathEnv: empty,
         writeFile: (path, contents) => written.push({ path, contents }),
@@ -847,6 +1039,7 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
     const r = spawnSync(command[0], [...command.slice(1), "--help"], {
       env: { HOME, PATH: minimalPath },
       encoding: "utf8",
+      timeout: 20_000,
     });
     return { code: r.status, out: r.stdout ?? "" };
   }
@@ -859,23 +1052,49 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
     expect(r.error).toBeDefined(); // ENOENT — node is not resolvable on this PATH
   });
 
-  it("launchd: the rendered command runs under the resolved Node and gets bob --help to exit 0", () => {
-    const plist = renderPlist({ name: "pulse", bobBin: BOB_BIN, home: HOME });
-    const head = interpreterAndBob(programArguments(plist));
-    expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
-    const res = helpUnderMinimalPath(head);
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("Usage: bob");
-  });
+  // The installer is Node (the real-node fixture) with an EMPTY PATH, so the
+  // resolution is its own interpreter; nothing reads the host's PATH or trust.
+  itWithRealNode(
+    "launchd: the rendered command runs under the resolved Node and gets bob --help to exit 0",
+    () => {
+      const plist = renderPlist({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        ...TRUST,
+        execPath: realNode(),
+        pathEnv: "",
+      });
+      const head = interpreterAndBob(programArguments(plist));
+      expect(head[0]).toBe(realNode());
+      expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
+      const res = helpUnderMinimalPath(head);
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Usage: bob");
+    },
+    30_000,
+  );
 
-  it("systemd: the rendered command runs under the resolved Node and gets bob --help to exit 0", () => {
-    const unit = renderSystemdUnit({ name: "pulse", bobBin: BOB_BIN, home: HOME });
-    const head = interpreterAndBob(execStart(unit));
-    expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
-    const res = helpUnderMinimalPath(head);
-    expect(res.code).toBe(0);
-    expect(res.out).toContain("Usage: bob");
-  });
+  itWithRealNode(
+    "systemd: the rendered command runs under the resolved Node and gets bob --help to exit 0",
+    () => {
+      const unit = renderSystemdUnit({
+        name: "pulse",
+        bobBin: BOB_BIN,
+        home: HOME,
+        ...TRUST,
+        execPath: realNode(),
+        pathEnv: "",
+      });
+      const head = interpreterAndBob(execStart(unit));
+      expect(head[0]).toBe(realNode());
+      expect(basename(head[0])).toBe("node"); // NODE, not the test runner (bun)
+      const res = helpUnderMinimalPath(head);
+      expect(res.code).toBe(0);
+      expect(res.out).toContain("Usage: bob");
+    },
+    30_000,
+  );
 });
 
 // The unit writes its command as `ExecStart=` (systemd) or an array of
@@ -935,10 +1154,16 @@ describe("the printed install-service command is the unit's command (bob#218)", 
     // A stub systemctl so the install's daemon-reload succeeds without a bus.
     writeFileSync(join(binDir, "systemctl"), "#!/bin/sh\nexit 0\n");
     chmodSync(join(binDir, "systemctl"), 0o755);
+    // A stub node: the CLI runs under bun (a non-Node installer) and its PATH is
+    // ONLY binDir (0700, owned by this uid), so it resolves this trusted stub and
+    // never the host's node.
+    const stubNode = join(binDir, "node");
+    writeFileSync(stubNode, "#!/bin/sh\n");
+    chmodSync(stubNode, 0o755);
     try {
       const out = spawnNode(
         [CLI, "install-service", "pulse", "--bob-bin", BOB_BIN, "--model", "claude-fast"],
-        { env: { ...process.env, HOME: home, PATH: `${binDir}:${process.env.PATH ?? ""}` } },
+        { env: { ...process.env, HOME: home, PATH: binDir } },
       );
       const printed = out
         .split("\n")
@@ -946,6 +1171,7 @@ describe("the printed install-service command is the unit's command (bob#218)", 
         ?.split("runs:")[1]
         ?.trim();
       expect(printed).toContain("--model claude-fast");
+      expect(printed?.split(" ")[0]).toBe(stubNode);
       // The unit the CLI just wrote carries the same command verbatim.
       const unitText = readFileSync(servicePath("pulse", { home }), "utf8");
       expect(printed).toBe(unitCommand(unitText));
