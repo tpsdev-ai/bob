@@ -56,6 +56,35 @@ jobs:
         run: sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar
       - run: bun run test
 
+  # The whole-suite leak check (#221) runs in ITS OWN job: it spawns a second,
+  # complete suite with a fresh TMPDIR, which would slow the unit job down. The
+  # unit suite keeps the leak test OPT-IN (it skips unless BOB_LEAK_CHECK=1), so
+  # `bun run test` above stays fast. Same install/build/sidecar-user setup as
+  # Unit Tests because the child runs the whole suite.
+  leak-check:
+    name: Suite Temp-Dir Leak Check
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      # Provision the unprivileged user the jarvis key-read proof runs as (the
+      # runner is disposable; that is where useradd belongs).
+      - name: provision jarvis-sidecar (reachy key-read proof)
+        run: sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar
+      # BOB_LEAK_CHECK enables the check in THIS process; BOB_LEAK_CHECK_CHILD=0
+      # marks it as the parent (the check's own child sets BOB_LEAK_CHECK_CHILD=1,
+      # which makes the child skip this file so it cannot recurse).
+      - name: Whole-suite temporary-directory leak check
+        run: BOB_LEAK_CHECK=1 BOB_LEAK_CHECK_CHILD=0 bun test test/leak-check.test.ts
+
   pack:
     name: Published Artifact
     needs: build

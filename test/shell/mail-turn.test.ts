@@ -156,7 +156,7 @@ describe("(a9) a mail turn holds no `read` — a REAL pi session", () => {
 describe("(a9) a mail turn holds no Discord tool — a REAL pi session with the discord capability", () => {
   const DISCORD_TOOLS = ["discord_fetch", "discord_react", "discord_reply"];
 
-  // An EA whose role allows read and the three Discord tools, with the discord
+  // An EA whose role allows the three Discord tools, with the discord
   // capability really declared and loaded (run mode: outbound REST only, no
   // gateway, no network — the token file holds a placeholder).
   beforeEach(() => {
@@ -179,7 +179,6 @@ describe("(a9) a mail turn holds no Discord tool — a REAL pi session with the 
         "",
         "tools:",
         "  allow:",
-        "    - read",
         "    - discord_reply",
         "    - discord_react",
         "    - discord_fetch",
@@ -227,7 +226,7 @@ describe("(a9) a mail turn holds no Discord tool — a REAL pi session with the 
   }
 
   it("the same agent's ordinary run holds all three Discord tools (the control)", async () => {
-    expect(await realTools({ mailTurn: false })).toEqual([...DISCORD_TOOLS, "read"]);
+    expect(await realTools({ mailTurn: false })).toEqual([...DISCORD_TOOLS]);
   });
 
   it("its mail turn holds none of discord_reply, discord_react, discord_fetch", async () => {
