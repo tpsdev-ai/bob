@@ -101,22 +101,26 @@ is that some legitimate edits to small files are refused.
 A local model once copied `read_lines` output into `new_text` with its
 `L<n>#<h> ` prefixes intact (bob#223). `edit_lines`, `insert_after` and
 `write_file` refuse text in which any line starts with that rendered shape —
-`L`, digits, `#`, 8 hex characters, then a space — and write nothing. The guard
+`L`, digits, `#`, 8 lowercase hex characters, then a space — and write nothing. The guard
 matches the shape only: it cannot tell a copied prefix from genuine content
 that begins the same way, and it refuses both. When the call's earlier checks
-pass (the rewrite budget, the anchors and the fingerprint for `edit_lines` and
-`insert_after`; the path for all three), the refusal names the tool, the first
-matching line number and the remedy: strip the prefixes if the text was copied,
-or report BLOCKED and name the file if its real content needs such a line. A
-call that an earlier check refuses, such as one with a stale anchor or
-fingerprint, gets that refusal instead, and writes nothing either.
+pass (for `edit_lines` and `insert_after`: the check that the file's rewrite
+budget has not already tripped, then the anchors and the fingerprint; for all
+three: the path), the refusal names the tool, the first matching line number
+and the remedy: strip the prefixes if the text was copied, or report BLOCKED and
+name the file if its real content needs such a line. A call that an earlier
+check refuses, such as one with a stale anchor or fingerprint or one on a file
+whose budget already tripped, gets that refusal instead, and writes nothing
+either. A new call's own charge against the rewrite budget runs after the
+guard, so an `edit_lines` call that would newly exceed the limit and has a
+matching line gets the prefix refusal.
 
 Rendering has one definition: `ANCHOR_FORMAT` in `core.ts` holds the lead, the
 separators, the hash radix and the hash width, and `anchorToken` /
 `anchorPrefix` render from those parts only. The matcher is a literal regex
 pinned to it by a contract test: the guard's `ANCHOR_PREFIX_RE` (like the anchor
-parser's `ANCHOR_TOKEN_RE`) is written as a literal, because CI refuses a regex
-built at runtime. The contract test checks each literal's source against
+parser's `ANCHOR_TOKEN_RE`) is written as a literal, not built from those parts
+at runtime. The contract test checks each literal's source against
 `ANCHOR_FORMAT`'s parts, so a part changed without the literals following fails
 it. It also renders real `read_lines` output (lines 1, 9, 10 and 99999) and
 checks both literals against it: the guard's matcher matches exactly each

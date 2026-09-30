@@ -55,7 +55,7 @@ const ANCHOR_DOC =
 // (a shape, not where the text came from), when its refusal is the one returned,
 // and what to do about it.
 const PREFIX_GUARD_DOC = (field: string): string =>
-  `If any line of ${field} begins with the read_lines anchor prefix shape (L<n>#<8 hex> ), the call is refused and nothing is written. When the call's earlier checks pass, that refusal names the first matching line; a call an earlier check refuses gets that refusal instead. If the text was copied from read_lines output, strip the prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
+  `If any line of ${field} begins with the read_lines anchor prefix shape (L<n>#<h> and a space, where <h> is 8 lowercase hex characters), the call is refused and nothing is written. When the call's earlier checks pass, that refusal names the first matching line; a call an earlier check refuses gets that refusal instead. If the text was copied from read_lines output, strip the prefixes and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`;
 
 function ok(text: string, details: Record<string, unknown>): ToolOutput {
   return { content: [{ type: "text", text }], details };

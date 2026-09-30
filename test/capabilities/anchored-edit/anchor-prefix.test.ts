@@ -1,5 +1,5 @@
 // bob#223: a model copied read_lines output into new text with its
-// `L<n>#<8 hex> ` prefixes intact. edit_lines / insert_after / write_file refuse
+// `L<n>#<h> ` prefixes intact (<h>: 8 lowercase hex characters). edit_lines / insert_after / write_file refuse
 // text in which any line matches that shape (copied or not); when the call's
 // earlier checks pass, the refusal names the first matching line. No tool argument and no config turns the guard off, and there is no
 // escape hatch: #223 asked for one, but no channel the agent cannot write exists
@@ -216,6 +216,53 @@ describe("anchored-edit — read_lines prefixes in new text are refused (bob#223
     }
     expect(readFileSync(join(h.root, "s.txt"))).toEqual(before);
   });
+
+  it("the rewrite budget: a newly over-limit edit with a matching line gets the prefix refusal; an already-tripped file answers budget_stop first", async () => {
+    // 24 bytes, so a 12-byte rewrite limit.
+    writeFileSync(join(h.root, "b.txt"), "one\ntwo\nthree\nfour\nfive\n");
+    const { body, fp } = await readBody("b.txt");
+    const before = readFileSync(join(h.root, "b.txt"));
+    const whole = { path: "b.txt", from: h.anchor("b.txt", 1), to: h.anchor("b.txt", 5) };
+    // Replacing all 24 bytes would newly exceed the limit, but the new charge
+    // runs after the guard: the matching line is refused first, and nothing is
+    // charged.
+    const over = await h.call("edit_lines", {
+      ...whole,
+      new_text: body.join("\n"),
+      fingerprint: fp,
+    });
+    expect(over.details.refused).toBe(true);
+    expect(over.text).toContain(
+      "line 1 of the new text matches the read_lines anchor prefix shape",
+    );
+    expect(over.details.signals).not.toContain("budget_stop");
+    expect(readFileSync(join(h.root, "b.txt"))).toEqual(before);
+    // The same over-limit edit with clean text trips the budget.
+    const trip = await h.call("edit_lines", { ...whole, new_text: "clean", fingerprint: fp });
+    expect(trip.details.signals).toContain("budget_stop");
+    // Now the already-tripped check answers first, before the prefix guard.
+    const tripped = [
+      await h.call("edit_lines", {
+        path: "b.txt",
+        from: h.anchor("b.txt", 1),
+        to: h.anchor("b.txt", 1),
+        new_text: body[0],
+        fingerprint: fp,
+      }),
+      await h.call("insert_after", {
+        path: "b.txt",
+        anchor: h.anchor("b.txt", 5),
+        text: body[0],
+        fingerprint: fp,
+      }),
+    ];
+    for (const out of tripped) {
+      expect(out.details.refused).toBe(true);
+      expect(out.details.signals).toContain("budget_stop");
+      expect(out.text).not.toContain("anchor prefix shape");
+    }
+    expect(readFileSync(join(h.root, "b.txt"))).toEqual(before);
+  });
 });
 
 describe("anchored-edit — no argument and no config turns the prefix guard off (bob#223)", () => {
@@ -331,8 +378,8 @@ describe("anchored-edit — no argument and no config turns the prefix guard off
   });
 });
 
-// Rendering has one definition (ANCHOR_FORMAT). The matchers are literal regexes
-// (CI refuses a RegExp built at runtime), pinned to that definition here: their
+// Rendering has one definition (ANCHOR_FORMAT). The matchers are literal regexes,
+// not built from ANCHOR_FORMAT at runtime, pinned to that definition here: their
 // source must spell ANCHOR_FORMAT's parts, the guard must match exactly the
 // prefixes read_lines renders, and the anchor parser must read each rendered
 // token back.

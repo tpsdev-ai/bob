@@ -147,9 +147,9 @@ export function fnv1a32(bytes: Buffer): number {
 // `L<n>#<h> ` in front of each line, and anchorHashOf, anchorToken and
 // anchorPrefix build the token and the prefix from these parts only.
 //
-// The MATCHERS are literal regexes written to match that format: CI refuses a
-// RegExp built at runtime (Semgrep detect-non-literal-regexp), so they cannot be
-// derived from these parts. They are pinned to the format by the contract test in
+// The MATCHERS are literal regexes written to match that format; they are not
+// built from these parts at runtime. They are pinned to the format by the
+// contract test in
 // test/capabilities/anchored-edit/anchor-prefix.test.ts, which checks each
 // literal's source against these parts and the guard against real read_lines
 // output. Change a part here and that test fails until the literals follow.
@@ -188,26 +188,30 @@ export function anchorToken(lineNo: number, line: RawLine): string {
 }
 
 // The prefix in front of a line's text in read_lines output (and in a stale
-// refusal's re-read window), separator included: `L<n>#<8 hex> `.
+// refusal's re-read window), separator included: `L<n>#<h> `, where <h> is 8
+// lowercase hex characters.
 export function anchorPrefix(lineNo: number, line: RawLine): string {
   return `${anchorToken(lineNo, line)}${ANCHOR_FORMAT.prefixSep}`;
 }
 
 // Refuse `text` when any line matches the read_lines anchor prefix shape
-// (ANCHOR_PREFIX_RE). bob#223: a model copied read_lines output into new text
+// (ANCHOR_PREFIX_RE: `L`, a line number, `#`, 8 lowercase hex characters, then a
+// space, at the start of the line). bob#223: a model copied read_lines output into new text
 // with the prefixes included. The guard sees only the shape, so it cannot tell
 // a copied prefix from genuine content that begins the same way, and it
 // refuses both. Names the tool, the FIRST matching line number and the remedy.
-// edit_lines and insert_after call it only after their budget, anchor and
-// fingerprint checks pass, and write_file after its path resolves; a call that
-// an earlier check refuses gets that refusal instead. Nothing in a call or in
-// config turns it off.
+// edit_lines and insert_after call it only after the already-tripped budget
+// check, the anchor checks and the fingerprint check pass, and write_file after
+// its path resolves; a call that an earlier check refuses gets that refusal
+// instead. A new call's own charge against the rewrite budget runs AFTER this
+// guard, so an edit that would newly exceed the limit and has a matching line
+// gets the prefix refusal. Nothing in a call or in config turns it off.
 export function assertNoAnchorPrefix(text: string, tool: string, path: string): void {
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     if (ANCHOR_PREFIX_RE.test(lines[i])) {
       throw new Refusal(
-        `refusing ${tool} on "${path}": line ${i + 1} of the new text matches the read_lines anchor prefix shape (L<n>#<8 hex> at the start of the line). If the text was copied from read_lines output, strip the leading "L<n>#<h> " from its lines and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`,
+        `refusing ${tool} on "${path}": line ${i + 1} of the new text matches the read_lines anchor prefix shape (L<n>#<h> and a space at the start of the line, where <h> is 8 lowercase hex characters). If the text was copied from read_lines output, strip the leading "L<n>#<h> " from its lines and call again. If the file's real content needs a line that begins with that shape, report BLOCKED and name the file.`,
       );
     }
   }
