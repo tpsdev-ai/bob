@@ -12,7 +12,7 @@
 // request pi builds from it, carry bob.yaml's window and cap, not the registry's.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -50,15 +50,28 @@ let piAgentDir: string;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "bob-225-refresh-"));
   agentsRoot = join(root, "agents");
+  // The fixture bob.yaml IS the source of the asserted pair and its limits: it
+  // declares the stub provider/model AND both the context window and the output
+  // cap, so the test asserts against the limits bob resolves FROM THIS FILE.
   const res = initAgent({
     name: "budgetbot",
     role: "ea",
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-    contextWindow: 200_000,
+    provider: STUB_PROVIDER,
+    model: STUB_MODEL,
+    contextWindow: CONFIG_WINDOW,
     agentsRoot,
     skipFlair: true,
   });
+  // `bob init` writes provider.context_window; the output cap is added under
+  // `provider:` here so the fixture declares BOTH limits.
+  const yamlPath = join(res.agentDir, "bob.yaml");
+  writeFileSync(
+    yamlPath,
+    readFileSync(yamlPath, "utf8").replace(
+      /^ {2}context_window: \d+$/m,
+      `  context_window: ${CONFIG_WINDOW}\n  max_output_tokens: ${CONFIG_MAX_OUTPUT}`,
+    ),
+  );
   cwd = join(res.agentDir, "work");
   piAgentDir = join(res.agentDir, ".pi-agent");
 });
@@ -176,20 +189,15 @@ async function liveSession(input: {
   runtime: ModelRuntime;
   extensionSources?: string[];
 }): Promise<LiveSession> {
+  // The provider/model pair AND its limits come from the fixture bob.yaml via
+  // resolveRunConfig; the test injects no session config of its own beyond the
+  // extension source it drives.
   const base = resolveRunConfig({ name: "budgetbot", agentsRoot }).config;
   const factory = createBobRuntimeFactory({
     config: {
       ...base,
       capabilityBySource: {},
       extensionSources: input.extensionSources ?? [],
-      provider: STUB_PROVIDER,
-      model: STUB_MODEL,
-      modelLimits: {
-        provider: STUB_PROVIDER,
-        model: STUB_MODEL,
-        contextWindow: CONFIG_WINDOW,
-        maxOutputTokens: CONFIG_MAX_OUTPUT,
-      },
     } as RunSessionConfig,
     policy: { tools: ["read"], excludeTools: [], resident: false, allowResidentShell: false },
     deps: { log: () => {}, exit: () => {} },
@@ -213,7 +221,7 @@ describe("bob#225 — pi's model refresh resolves bob's declared window, end to 
     });
     try {
       // Precondition (the creation path): the session's model already carries
-      // bob.yaml's numbers, not the registry's.
+      // the window and cap the fixture bob.yaml declares, not the registry's.
       const before = session.model;
       expect(before?.contextWindow).toBe(CONFIG_WINDOW);
       expect(before?.maxTokens).toBe(CONFIG_MAX_OUTPUT);
@@ -224,9 +232,10 @@ describe("bob#225 — pi's model refresh resolves bob's declared window, end to 
       // returned (a fresh object), so identity changes.
       await session.prompt("hello", { expandPromptTemplates: false });
       expect(session.model).not.toBe(before);
-      // And what the refresh resolved is bob's pair, not the registry's.
-      expect(session.model?.contextWindow).toBe(CONFIG_WINDOW);
-      expect(session.model?.maxTokens).toBe(CONFIG_MAX_OUTPUT);
+      const afterFirstRefresh = session.model;
+      // And what the refresh resolved is bob.yaml's pair, not the registry's.
+      expect(afterFirstRefresh?.contextWindow).toBe(CONFIG_WINDOW);
+      expect(afterFirstRefresh?.maxTokens).toBe(CONFIG_MAX_OUTPUT);
       // The request pi built from the refreshed model carries the window and cap.
       expect(stub.requests.length).toBe(1);
       expect(stub.requests[0]?.model.contextWindow).toBe(CONFIG_WINDOW);
@@ -235,10 +244,16 @@ describe("bob#225 — pi's model refresh resolves bob's declared window, end to 
       // The registry's own lookup still resolves through the wrapper too.
       expect(runtime.getModel(STUB_PROVIDER, STUB_MODEL)?.contextWindow).toBe(CONFIG_WINDOW);
 
-      // A second run refreshes again (the same registration), after an explicit
-      // runtime refresh — the numbers still hold end to end.
-      await runtime.refresh({ allowNetwork: false });
+      // A second run refreshes AGAIN (the same registration), after an explicit
+      // runtime refresh. The explicit refresh must not abort or error...
+      const refreshed = await runtime.refresh({ allowNetwork: false });
+      expect(refreshed.aborted).toBe(false);
+      expect(refreshed.errors.size).toBe(0);
       await session.prompt("again", { expandPromptTemplates: false });
+      // ...and the second prompt must have REPLACED the model again — a fresh
+      // object, not the one the first refresh produced — still carrying the
+      // declared window and cap end to end.
+      expect(session.model).not.toBe(afterFirstRefresh);
       expect(session.model?.contextWindow).toBe(CONFIG_WINDOW);
       expect(session.model?.maxTokens).toBe(CONFIG_MAX_OUTPUT);
       expect(stub.requests.length).toBe(2);
