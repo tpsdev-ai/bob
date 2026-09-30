@@ -364,12 +364,13 @@ export function initOverrideRepo(agentDir: string): string {
 }
 
 // bob#248: the Git calls that initialize this repository (run only when it has
-// no `.git` yet) start no automatic housekeeping. After `git commit`, Git
-// starts `git maintenance run --auto` (older Git: `git gc --auto`), which can
+// no `.git` yet) start no automatic maintenance or gc. Before these flags, the
+// observed `git commit` (Git 2.50.1 and 2.55.0) started
+// `git maintenance run --auto` (older Git ran `git gc --auto` there), which can
 // detach and keep working inside the repository after `git commit` has
-// returned, so whoever removes or copies the agent directory next races it.
-// For these calls, `maintenance.auto=false` turns the maintenance run off and
-// `gc.auto=0` the automatic gc; this small bookkeeping repository needs neither.
+// returned; a caller that removed the agent directory next raced it. For these
+// calls, `maintenance.auto=false` turns the maintenance run off and `gc.auto=0`
+// the automatic gc; this small bookkeeping repository needs neither.
 const NO_AUTO_HOUSEKEEPING = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
 
 function git(args: string[], cwd: string): void {

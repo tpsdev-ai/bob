@@ -101,9 +101,10 @@ describe("FLAIR_ADMIN_PASS never reaches an agent session", () => {
       else process.env[key] = value;
     }
     rmSync(base, { recursive: true, force: true });
-    // bob#248: under Bun, rmSync can return without an error and leave the
-    // tree when something changes inside it during the removal. Check, so a
-    // leftover fails this test by name instead of leaking silently.
+    // bob#248: before the override repository's Git calls stopped starting
+    // automatic maintenance, rmSync under Bun sometimes returned without an
+    // error and left this tree. Check, so a leftover fails this test by name
+    // instead of leaking silently.
     if (existsSync(base)) {
       throw new Error(
         `cleanup left ${base} behind: ${readdirSync(base, { recursive: true }).slice(0, 20).join(", ")}`,

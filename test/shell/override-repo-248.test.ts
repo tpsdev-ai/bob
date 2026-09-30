@@ -1,18 +1,20 @@
 // bob#248: the Git calls that initialize the override repository (run only when
 // it has no `.git` yet) start no automatic maintenance or gc, so initOverrideRepo
 // — and hire, whose last step it is — does not return while automatic
-// housekeeping started by those calls is still working in the agent directory.
+// maintenance or gc started by those calls is still working in the agent
+// directory.
 //
-// `git commit` starts `git maintenance run --auto` after its own work, and that
-// run can detach and keep working inside the new repository after the commit
-// has returned. A caller that removed the agent directory next (a test's
-// cleanup, hire's own rollback) raced it; under Bun, rmSync could return
-// without an error and leave the tree behind.
+// Before bob passed `maintenance.auto=false` and `gc.auto=0`, the observed
+// `git commit` started `git maintenance run --auto` after its own work, and
+// that run can detach and keep working inside the new repository after the
+// commit has returned. A test's cleanup that removed the agent directory next
+// raced it; under Bun, its rmSync returned without an error and left the tree
+// behind in some of the observed runs.
 //
 // Git's own trace (GIT_TRACE2_EVENT, which the initializer's Git subprocesses
-// inherit from bob's environment) records each process's argv, each child
-// process it starts and its exit code, so this checks what ran, not how long it
-// took.
+// inherit from bob's environment) records each Git process's command line and
+// how it exited, and the command line of each child command it runs, so this
+// checks what ran, not how long it took.
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -44,7 +46,8 @@ function tracedCommands(events: TraceEvent[]): string[][] {
     .map((e) => e.argv ?? []);
 }
 
-// What is wrong with a trace of the initializer's Git calls; empty when nothing is.
+// The problems this check finds in a trace of the initializer's Git calls;
+// empty when it finds none.
 // Known-present: each of bob's `init`, `add` and `commit` must have a `start`
 // record AND an `exit` record with code 0 from the same process (paired by the
 // Trace2 session id), so an empty trace, or one cut before a call finished,
@@ -121,8 +124,9 @@ describe("the override repository's initializing Git calls start no automatic ma
     expect(traceProblems(parseTrace(traceLines(tracePath)))).toEqual([]);
   });
 
-  // The check cannot pass a truncated trace: the real trace of initOverrideRepo,
-  // cut right after the `commit` process's start record, fails it.
+  // The check rejects a trace cut before the commit's successful exit. This
+  // test cuts the real trace of initOverrideRepo right after the `commit`
+  // process's start record.
   it("a trace cut right after the commit's start record fails the check", () => {
     const base = scratchDir();
     const agentDir = join(base, "agent");
