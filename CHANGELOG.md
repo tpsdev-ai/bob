@@ -17,7 +17,7 @@ node scripts/changelog-fragments.mjs render   # preview the assembled section
 node scripts/changelog-fragments.mjs check    # what CI checks
 ```
 
-`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [X.Y.Z]` section
+`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [<version>]` section
 below this one and deletes them as part of a version cut. **Do not add anything to this section by
 hand**: `check` and `promote` refuse while it holds anything but this note.
 

@@ -13,7 +13,7 @@
 // FIX. One file per change under `.changelog/unreleased/`. PRs whose fragments
 // have distinct filenames no longer share an edit to `[Unreleased]`; two PRs
 // that add the same filename with different contents can conflict on that file. `promote` writes the
-// fragments into a `## [X.Y.Z]` section below `[Unreleased]` and deletes them.
+// fragments into a `## [<version>]` section below `[Unreleased]` and deletes them.
 //
 // FILE NAMING: `.changelog/unreleased/<category>-<slug>.md`
 //   category  one of added|changed|deprecated|removed|fixed|security
@@ -24,8 +24,8 @@
 //             before the PR number exists)
 //
 // FILE CONTENT: the entry as it should appear under its `### Category` heading,
-// INCLUDING the leading `- `, with every nonblank continuation line indented by an
-// even number of spaces, at least 2.
+// INCLUDING the leading `- `. Every continuation line is indented with spaces
+// only, an even number of them, and every nonblank one by at least 2.
 // Reading decodes the file as UTF-8 and refuses it by name when its bytes are not
 // valid UTF-8, instead of reading them with replacement characters; it then
 // trims the whitespace at the end of the file. Assembly joins the fragments as
@@ -95,7 +95,7 @@ export const UNRELEASED_NOTE = [
   "node scripts/changelog-fragments.mjs check    # what CI checks",
   "```",
   "",
-  "`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [X.Y.Z]` section",
+  "`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [<version>]` section",
   "below this one and deletes them as part of a version cut. **Do not add anything to this section by",
   "hand**: `check` and `promote` refuse while it holds anything but this note.",
 ].join("\n");
@@ -718,6 +718,23 @@ function git(cwd, args) {
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "" };
 }
 
+// The paths (relative to `cwd`) whose working-tree content, as `git hash-object`
+// hashes it, differs from their index blob; null when git cannot answer.
+function differsFromIndex(cwd, paths) {
+  if (paths.length === 0) return [];
+  const staged = git(cwd, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", ...paths]);
+  const hashed = git(cwd, ["hash-object", "--", ...paths]);
+  if (!staged.ok || !hashed.ok) return null;
+  const index = new Map();
+  for (const record of staged.out.split("\0").filter(Boolean)) {
+    const tab = record.indexOf("\t");
+    index.set(record.slice(tab + 1), record.slice(0, tab).split(" ")[1]);
+  }
+  const work = hashed.out.split("\n").filter(Boolean);
+  if (work.length !== paths.length) return null;
+  return paths.filter((p, i) => index.get(p) !== work[i]);
+}
+
 export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   const inside = git(dir, ["rev-parse", "--is-inside-work-tree"]);
   if (!inside.ok || inside.out.trim() !== "true") {
@@ -746,6 +763,25 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   const changed = names.filter((n) => modified.has(n));
   if (!clTracked.has(clName)) untracked.unshift("CHANGELOG.md");
   if (clModified.has(clName)) changed.unshift("CHANGELOG.md");
+  // `ls-files -m` trusts the index flags: a file marked assume-unchanged or
+  // skip-worktree reports no change even when it was edited. So every tracked
+  // file promote will change or delete is also compared with its index blob as
+  // git hashes it (`ls-files -s` against `hash-object`, which applies the path's
+  // clean filters, as `git add` would), whatever its flags say.
+  const fragmentsDiffer = differsFromIndex(
+    dir,
+    names.filter((n) => tracked.has(n)),
+  );
+  const changelogDiffers = clTracked.has(clName) ? differsFromIndex(clDir, [clName]) : [];
+  if (fragmentsDiffer === null || changelogDiffers === null) {
+    throw new FragmentError(
+      `promote: git ls-files -s or git hash-object failed or gave an unexpected answer, so it cannot tell whether git could restore ` +
+        `CHANGELOG.md and the fragments; nothing was written.`,
+    );
+  }
+  for (const n of fragmentsDiffer) if (!changed.includes(n)) changed.push(n);
+  if (changelogDiffers.length > 0 && !changed.includes("CHANGELOG.md"))
+    changed.unshift("CHANGELOG.md");
   if (untracked.length > 0 || changed.length > 0) {
     const parts = [];
     if (untracked.length > 0) parts.push(`untracked (not in the index): ${untracked.join(", ")}`);

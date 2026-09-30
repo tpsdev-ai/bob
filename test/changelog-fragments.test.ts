@@ -608,6 +608,42 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
   });
 
+  // An index flag hides an edit from `git ls-files -m`, so promote also compares
+  // each file it would change or delete with its index blob, as git hashes it.
+  for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+    it(`promote REFUSES an edit hidden by ${flag}, in a fragment and in CHANGELOG.md, and changes nothing`, () => {
+      const { dir, changelogPath } = project();
+      const original = "- **a fix.** \n";
+      fragment(dir, "fixed-a.md", original);
+      stageAll();
+      const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      const tryPromote = () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
+
+      // A hidden edit to a fragment.
+      expect(gitIn("update-index", flag, ".changelog/unreleased/fixed-a.md").status).toBe(0);
+      fragment(dir, "fixed-a.md", "- **a fix, edited behind the index flag.** \n");
+      expect(gitIn("ls-files", "-m").stdout).toBe(""); // the flag hides it from ls-files -m
+      const changelogBefore = readFileSync(changelogPath);
+      const edited = readFileSync(join(dir, "fixed-a.md"));
+      expect(tryPromote).toThrow("changed since staged (differs from the index): fixed-a.md");
+      expect(readFileSync(changelogPath).equals(changelogBefore)).toBe(true);
+      expect(readFileSync(join(dir, "fixed-a.md")).equals(edited)).toBe(true);
+
+      // A hidden edit to CHANGELOG.md, with the fragment back to its staged bytes.
+      fragment(dir, "fixed-a.md", original);
+      expect(gitIn("update-index", flag, "CHANGELOG.md").status).toBe(0);
+      const changelogEdited = Buffer.concat([
+        changelogBefore,
+        Buffer.from("\na local edit in an old section\n"),
+      ]);
+      writeFileSync(changelogPath, changelogEdited);
+      expect(gitIn("ls-files", "-m").stdout).toBe("");
+      expect(tryPromote).toThrow("changed since staged (differs from the index): CHANGELOG.md");
+      expect(readFileSync(changelogPath).equals(changelogEdited)).toBe(true);
+      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+    });
+  }
+
   // Permission bits do not bind root, so these two cannot fail a write as root.
   const asRoot = process.getuid?.() === 0;
 

@@ -24,8 +24,8 @@ Create `<category>-<slug>.md` in this directory:
   PR number exists.
 
 The file contains the entry as it should appear under its heading, including
-the leading `- `, with every nonblank continuation line indented by an even
-number of spaces, at least 2:
+the leading `- `. Every continuation line is indented with spaces only, an even
+number of them, and every nonblank one by at least 2:
 
 ```markdown
 - **The thing that changed, in bold.** What it means for someone running bob,
