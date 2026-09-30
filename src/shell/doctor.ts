@@ -455,8 +455,8 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   }
 
   // bob#244: the egress (web) tools have their own grant. The shell grant does
-  // not cover them, so this warning names allowResidentWeb, never
-  // allowResidentShell.
+  // not cover them, so this warning recommends allowResidentWeb as the grant
+  // and names allowResidentShell only to say that it does not cover web.
   const droppedWeb = residentDroppedWebTools(servicePolicy);
   if (droppedWeb.length > 0) {
     const role = readAgentRole(yamlText) ?? "<role>";

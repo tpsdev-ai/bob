@@ -520,7 +520,8 @@ export function residentDroppedTools(policy: ToolPolicy): string[] {
 }
 
 // bob#244: the egress (web) tools a resident agent's allowlist asked for that
-// the resident policy drops because the role does not grant allowResidentWeb.
+// the effective resident policy drops: allowResidentWeb is not in effect,
+// because the role does not grant it or bob.yaml narrows it away.
 export function residentDroppedWebTools(policy: ToolPolicy): string[] {
   if (!policy.resident || policy.allowResidentWeb === true) return [];
   const excluded = new Set(policy.excludeTools);

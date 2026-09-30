@@ -7,9 +7,10 @@
 // R1c) and `web_search` (R2). Slice R1a REGISTERS NEITHER: the names are
 // declared now so their TOOL_EFFECTS rows (egress), the jarvis/ea role
 // ceilings and the mail-turn exclusion can be reviewed and pinned before any
-// web tool exists. A session whose allowlist names one is refused by the
-// active-tool audit (session.ts assertAllowedToolsActive), because nothing
-// registers it.
+// web tool exists. A session whose EFFECTIVE allowlist names one (in
+// tools.allow and not excluded) is refused by the active-tool audit
+// (session.ts assertAllowedToolsActive), because nothing registers it; an
+// excluded name is ignored.
 //
 // `dataClass: public` — in this slice the capability registers no tool and
 // imports no fetched content. web_fetch and web_search each need their own

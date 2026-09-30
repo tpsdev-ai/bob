@@ -241,8 +241,9 @@ change one, the named test is what tells you.
 - **Doctor points at the right file.** A resident agent whose allowlist names a
   tool the resident policy drops is a WARN whose fix names
   `roles/<role>/role.json` — the grant lives in the role; `bob.yaml` may only
-  narrow it. A dropped web tool names `tools.allowResidentWeb`, never the shell
-  grant. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
+  narrow it. For a dropped web tool, doctor recommends `tools.allowResidentWeb`
+  as the grant, and says the shell grant (`allowResidentShell`) does not cover
+  web. *(`test/shell/doctor.test.ts`, `test/shell/web-policy.test.ts`)*
 - **A web session holds nothing private beyond its admitted prompt.** A session
   that holds the `web` capability, or allows a web tool, is refused unless every
   capability in it is public-class, it holds no pi built-in tool, it carries no
