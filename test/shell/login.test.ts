@@ -131,7 +131,7 @@ describe("bob#241 — bob login runs pi's interactive flow with the agent's own 
     makeAgent("alpha");
     await expect(
       runLogin({ name: "ghost", agentsRoot, stdinIsTTY: true, stdoutIsTTY: true }),
-    ).rejects.toThrow(new RegExp(`no agent "ghost" under ${agentsRoot}`));
+    ).rejects.toThrow(`no agent "ghost" under ${agentsRoot}`);
   });
 
   it("refuses a non-interactive terminal, saying to run it in a terminal", async () => {
