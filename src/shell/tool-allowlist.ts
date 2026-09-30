@@ -512,10 +512,12 @@ function roleToolNames(ceiling: RoleToolCeiling): string[] {
   return resolved;
 }
 
-// The tools a resident agent's own allowlist asked for that the resident policy
-// drops — doctor's warning, so the drop is never silent either. These are the
-// names the SHELL grant (allowResidentShell) would keep; the egress names,
-// whose grant is allowResidentWeb, are residentDroppedWebTools'.
+// The tools a resident agent's own allowlist asked for that the effective
+// exclusion list drops while the SHELL grant (allowResidentShell) is absent:
+// its non-egress names — doctor's warning, so the drop is never silent either.
+// That list includes explicit tools.exclude entries, which stay excluded after
+// the shell grant is given. The egress names, whose grant is allowResidentWeb,
+// are residentDroppedWebTools'.
 export function residentDroppedTools(policy: ToolPolicy): string[] {
   if (!policy.resident || policy.allowResidentShell) return [];
   const allowed = new Set(policy.tools);

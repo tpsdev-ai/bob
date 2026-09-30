@@ -234,6 +234,33 @@ describe("doctor names the web grant, not the shell grant", () => {
     expect(check?.fix).not.toContain("set tools.allowResidentShell: true");
   });
 
+  it("an explicitly excluded dropped web tool: the remedy adds removing it from tools.exclude; without the exclusion it does not", () => {
+    const yaml = (extra: string) =>
+      [
+        "agent:",
+        "  id: webbot",
+        "  role: jarvis",
+        "resident: true",
+        "capabilities:",
+        "  - web",
+        allowYaml(["web_fetch"], `  allowResidentWeb: false\n${extra}`),
+      ].join("\n");
+    const grant =
+      "grant it in roles/jarvis/role.json (tools.allowResidentWeb: true) AND remove tools.allowResidentWeb: false from bob.yaml — the grant lives in the role, bob.yaml may only narrow it, and the explicit false in bob.yaml denies it; tools.allowResidentShell does not cover web";
+    // Known present: web_fetch is also in tools.exclude, so the grant alone
+    // would leave it excluded.
+    const excluded = doctorTools(yaml("  exclude:\n    - web_fetch\n"));
+    expect(excluded?.status).toBe("warn");
+    expect(excluded?.fix).toBe(
+      `${grant}; web_fetch is also in tools.exclude, which the grant does not undo, so remove it from tools.exclude in bob.yaml as well — or drop web_fetch from tools.allow`,
+    );
+    // Known absent: not excluded, so the remedy is the existing one.
+    const notExcluded = doctorTools(yaml(""));
+    expect(notExcluded?.status).toBe("warn");
+    expect(notExcluded?.fix).toBe(`${grant} — or drop web_fetch from tools.allow`);
+    expect(notExcluded?.fix).not.toContain("tools.exclude");
+  });
+
   it("no web warning when the role's grant holds", () => {
     const check = doctorTools(
       [

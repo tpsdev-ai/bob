@@ -530,11 +530,20 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
   if (droppedWeb.length > 0) {
     const role = readAgentRole(yamlText) ?? "<role>";
     const denial = block.allowResidentWeb === false;
+    // A dropped web tool that bob.yaml ALSO excludes explicitly stays excluded
+    // after the grant: the remedy says to remove it from tools.exclude too.
+    const declaredExclusions = new Set((block.exclude ?? []).map((name) => name.trim()));
+    const explicit = droppedWeb.filter((tool) => declaredExclusions.has(tool));
+    const grant = denial
+      ? `grant it in roles/${role}/role.json (tools.allowResidentWeb: true) AND remove tools.allowResidentWeb: false from bob.yaml — the grant lives in the role, bob.yaml may only narrow it, and the explicit false in bob.yaml denies it; tools.allowResidentShell does not cover web`
+      : `set tools.allowResidentWeb: true in roles/${role}/role.json — the grant lives in the role, bob.yaml may only narrow it, and tools.allowResidentShell does not cover web`;
+    const alsoExcluded =
+      explicit.length > 0
+        ? `; ${explicit.join(", ")} ${explicit.length === 1 ? "is" : "are"} also in tools.exclude, which the grant does not undo, so remove ${explicit.length === 1 ? "it" : "them"} from tools.exclude in bob.yaml as well`
+        : "";
     warnings.push({
       detail: `${residency} drops ${droppedWeb.join(", ")}, which the role allows (web tools need their own resident grant)`,
-      fix: denial
-        ? `grant it in roles/${role}/role.json (tools.allowResidentWeb: true) AND remove tools.allowResidentWeb: false from bob.yaml — the grant lives in the role, bob.yaml may only narrow it, and the explicit false in bob.yaml denies it; tools.allowResidentShell does not cover web — or drop ${droppedWeb.join(", ")} from tools.allow`
-        : `set tools.allowResidentWeb: true in roles/${role}/role.json — the grant lives in the role, bob.yaml may only narrow it, and tools.allowResidentShell does not cover web — or drop ${droppedWeb.join(", ")} from tools.allow`,
+      fix: `${grant}${alsoExcluded} — or drop ${droppedWeb.join(", ")} from tools.allow`,
     });
   }
 
