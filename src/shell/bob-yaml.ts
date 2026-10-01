@@ -16,6 +16,7 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
+import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
 import {
   ModelBudgetError,
   parseSessionBudget,
@@ -328,6 +329,113 @@ export function readSessionBudget(yamlText: string): SessionBudget {
       err.message.replace(/^bob\.yaml "session:" block: /, ""),
     );
   }
+}
+
+// The one-shot run bounds, per agent (bob.yaml `run:`):
+//
+//   run:
+//     wall_clock_seconds: 1800
+//     no_progress_seconds: 600
+//     turn_timeout_seconds: 300
+//
+// Absent keys fall back to run-bounds.ts's defaults. An unknown key, a
+// non-integer, or a value outside the accepted range throws, so a misspelled or
+// absurd bound is not read as "no bound". A second `run:` line or a repeated
+// key under `run:` throws too: the shared block reader keeps the last value of
+// a repeated key, which would hide an invalid earlier one from these checks.
+//
+// A seconds key is capped so its milliseconds fit the runtime timer range
+// (setTimeout clamps a larger delay to 1 ms).
+const MAX_SECONDS = Math.floor(MAX_TIMER_MS / 1000);
+const RUN_KEYS = ["wall_clock_seconds", "no_progress_seconds", "turn_timeout_seconds"] as const;
+
+function wholeSeconds(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
+  if (value < 1 || value > MAX_SECONDS) return undefined;
+  return value;
+}
+
+// Refuse a second top-level `run:` line (block or inline form) and a direct
+// sub-key of `run:` set twice, naming the key and both lines. Scans with the
+// same column-0 key rule as readBlock; a direct sub-key is a `name:` line at the
+// indent of the block's first content line.
+function refuseDuplicateRunKeys(yamlText: string): void {
+  const lines = yamlText.split(/\r?\n/);
+  let runLine: number | undefined;
+  let inRun = false;
+  let baseIndent: number | undefined;
+  const seen = new Map<string, number>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) {
+      inRun = /^run\s*:/.test(line);
+      if (inRun) {
+        if (runLine !== undefined) {
+          throw new BobYamlError(
+            "run",
+            i + 1,
+            `a second "run:" (the first is on line ${runLine}) — write one "run:" block.`,
+          );
+        }
+        runLine = i + 1;
+      }
+      continue;
+    }
+    if (!inRun) continue;
+    const t = line.trim();
+    if (t === "" || t.startsWith("#")) continue;
+    const indent = line.length - line.replace(/^ +/, "").length;
+    if (baseIndent === undefined) baseIndent = indent;
+    if (indent !== baseIndent) continue;
+    const m = t.match(/^([A-Za-z0-9_-]+)\s*:/);
+    if (!m) continue;
+    const first = seen.get(m[1]);
+    if (first !== undefined) {
+      throw new BobYamlError(
+        "run",
+        i + 1,
+        `"${m[1]}" is set again (first on line ${first}) — set it once.`,
+      );
+    }
+    seen.set(m[1], i + 1);
+  }
+}
+
+export function readRunLimits(yamlText: string): RunLimitsBlock {
+  refuseDuplicateRunKeys(yamlText);
+  const inline = /^run[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "run",
+      lineOf(yamlText, /^run[ \t]*:/m),
+      `the inline form is not supported — write "run:" on its own line, then wall_clock_seconds:/no_progress_seconds:/turn_timeout_seconds: indented under it.`,
+    );
+  }
+  const raw = readBlock(yamlText, "run");
+  if (raw === undefined) return {};
+  const out: RunLimitsBlock = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(RUN_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "run",
+        lineOfKey(yamlText, "run", key),
+        `unknown key "${key}" — supported keys are ${RUN_KEYS.join(", ")}.`,
+      );
+    }
+    const n = wholeSeconds(value);
+    if (n === undefined) {
+      throw new BobYamlError(
+        "run",
+        lineOfKey(yamlText, "run", key),
+        `"${key}" must be a whole number of seconds between 1 and ${MAX_SECONDS}.`,
+      );
+    }
+    if (key === "wall_clock_seconds") out.wallClockSeconds = n;
+    else if (key === "no_progress_seconds") out.noProgressSeconds = n;
+    else out.turnTimeoutSeconds = n;
+  }
+  return out;
 }
 
 // The role this agent was hired into (bob.yaml `agent.role`). The role is the

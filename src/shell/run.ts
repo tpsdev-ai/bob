@@ -56,6 +56,7 @@ import {
   readCron,
   readProviderLimits,
   readResident,
+  readRunLimits,
   readSessionBudget,
   readTools,
 } from "./bob-yaml.js";
@@ -70,6 +71,7 @@ import {
   DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
   readWorktreeStatus,
+  readWorktreeStatusResult,
   type SilenceReason,
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
@@ -84,6 +86,18 @@ import { resolveAdoptedConfig } from "./position-runtime.js";
 import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
+import {
+  boundMessage,
+  createRunBounds,
+  RunAbortedError,
+  type RunBounds,
+  type RunLimitsBlock,
+  type RunTimer,
+  raceTimeout,
+  resolveRunLimits,
+  type TerminationReason,
+  TIMED_OUT,
+} from "./run-bounds.js";
 import {
   createBobRuntimeFactory,
   OPENROUTER_KEY_CONSUMED_MESSAGE,
@@ -488,6 +502,19 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
+  // Stop an in-flight turn. pi's AgentSession exposes `abort()`, which resolves
+  // once the agent is idle; bob calls it when a bound ends a one-shot run after
+  // the session factory has returned.
+  // Optional so a fake session in tests need not provide it; without it, bob
+  // cannot confirm the session stopped.
+  abort?(): Promise<void>;
+  // Queue a message for the agent. pi's AgentSession `steer()` only queues; it
+  // never starts a turn. pi delivers the queue at the start of its next agent
+  // run, after each assistant turn, and in the continuation it runs after an
+  // auto-compaction. A one-shot run sends its compaction note this way.
+  // Optional so a fake session in tests need not provide it; without it, the
+  // note is not sent.
+  steer?(text: string): Promise<void>;
   dispose(): void;
 }
 
@@ -653,6 +680,8 @@ export interface RunOptions {
   // Defaults to a fresh Date() per call. Lets a test pin the start millisecond so
   // two runs started in the same millisecond still get distinct files and locks.
   now?: () => Date;
+  // Deterministic bound timer for tests; production uses native timers.
+  timer?: RunTimer;
   // #145: the ONE completion contract this run is judged by. When the caller
   // (or bob.yaml) declares an expected final-assistant-message shape, a run only
   // settles exit 0 when the captured final text matches it. Omitted → the
@@ -672,6 +701,12 @@ export interface RunOptions {
   // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
   // role or capability, is dropped.
   mailTurn?: boolean;
+  // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
+  // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
+  // Tests pass small values.
+  wallClockMs?: number;
+  noProgressMs?: number;
+  turnTimeoutMs?: number;
 }
 
 export interface RunResult {
@@ -695,6 +730,10 @@ export interface RunResult {
   // no final message that did NOT fail simply had nothing to say. (A mail turn
   // retries a failure and sends no reply for silence.)
   failed?: true;
+  // bob#135: set when a bound ended the run (the wall clock, the no-progress
+  // watchdog, or a turn timeout) rather than the session. The exit code is
+  // non-zero.
+  aborted?: TerminationReason;
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -744,7 +783,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { agentDir, provider, model, config, flairBootstrapTarget } = resolveRunConfig({
+  const resolved = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
@@ -753,23 +792,73 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
 
+  // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
+  // per-invocation flags. The wall clock and the watchdog start HERE, once the
+  // configuration is resolved and before the Flair bootstrap and the session
+  // start. A run-level bound (wall clock, no-progress watchdog) or the turn
+  // timeout ends the run with a non-zero exit; `stop()` in the `finally` clears
+  // the run-level timers, and a fired bound cancels a pending turn deadline, so
+  // a completed run leaves the event loop free.
+  const limits = resolveRunLimits(resolved.runLimits, {
+    ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
+    ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
+    ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
+  });
+  const bounds = createRunBounds(limits, opts.timer);
+  try {
+    return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);
+  } finally {
+    bounds.stop();
+  }
+}
+
+// The run itself, under the bounds created by runAgent. Split out so the timer
+// lifecycle lives in one `finally` in runAgent, wrapping every await below.
+async function runBoundedSession(
+  opts: RunOptions,
+  prompt: string,
+  taskContract: string,
+  resolved: ResolvedRunConfig,
+  bounds: RunBounds,
+): Promise<RunResult> {
+  const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
+  const limits = bounds.limits;
+
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
   // (the mail turn reaches runAgent through `bob launch`). The persistent
   // runtime calls the same helper in persistent.ts; the interactive launch path
   // below covers the TUI. Setup sessions (onboard/align) are not runtime turns
-  // and do not load it.
-  await attachFlairBootstrap(flairBootstrapTarget, config);
+  // and do not load it. Guarded like the factory below: when a run-level bound
+  // fires first, the run returns without waiting for the bootstrap (the guard
+  // does not cancel it).
+  try {
+    await bounds.guard(attachFlairBootstrap(flairBootstrapTarget, config));
+  } catch (err) {
+    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    throw err;
+  }
 
   const factory = opts.sessionFactory ?? createPiRunSession;
   // #145: the task is the session's CONTRACT, carried in its system prompt
   // through the factory. (It is ALSO the first user message below, so a provider
   // that shows only messages still sees it; see the README's stated limits.)
-  const session = await factory({
-    ...config,
-    taskContract,
-    ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
-  });
+  // The factory is guarded too: when a run-level bound fires before a session
+  // finishes standing up (pi's resource/extension load), the run returns
+  // without waiting for it. The guard does not cancel the factory.
+  let session: RunSession;
+  try {
+    session = await bounds.guard(
+      factory({
+        ...config,
+        taskContract,
+        ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
+      }),
+    );
+  } catch (err) {
+    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    throw err;
+  }
 
   // Tee every session event to a per-run JSONL log so a mid-run death (a provider
   // cap, an OOM, a crash) is post-mortem-able instead of leaving no trace. Logging
@@ -904,6 +993,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const unsubscribeRunLog = session.subscribe((event) => {
+    // Progress belongs to the session, regardless of whether its best-effort
+    // log was opened, an append succeeds, or streamed deltas pass the log cap.
+    bounds.noteProgress();
     // Post-mortem trail: record EVERY event (tool calls, results, errors,
     // retries), not just text — that's what makes a death diagnosable. The
     // FINAL-MESSAGE capture is NOT here: it lives on the compaction observer
@@ -931,6 +1023,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   let exitCode = 0;
   let reason: SilenceReason | undefined;
   let failed = false;
+  let aborted: TerminationReason | undefined;
 
   // #145: after every non-aborted compaction the observer sends ONE best-effort
   // "what remains" note (a steer: the last thing the agent said, git status,
@@ -942,8 +1035,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     // bob#244: the note carries workspace data (git status), so a web session
     // refuses it; the observer logs the refusal and the run carries on.
+    // bob#135: through the run's one sender, so no note is sent once a bound
+    // has fired, and queued with steer(), so the note never starts a turn.
     inject: gatedNoteInjection(config, "compaction-note", (text) =>
-      session.prompt(text, { streamingBehavior: "steer" }),
+      sendToSession(session, bounds, text, "steer"),
     ),
     log: (m) => process.stderr.write(`${m}\n`),
   });
@@ -983,6 +1078,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       if (budgetLeft() <= 0) return;
       const spent = await repromptWhileReasoningOnly({
         session,
+        // Every re-prompt goes through the SAME bounded sender as the first
+        // prompt, so a stalled continuation is ended by the turn bound too.
+        send: (text) => boundedPrompt(session, text, bounds),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
         maxReprompts: budgetLeft(),
@@ -996,9 +1094,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
-    // expansion — see session.ts promptSession).
-    await promptSession(session, opts.prompt);
-    await drainReasoningOnly();
+    // expansion — see session.ts promptSession). Turn-bounded when configured (bob#135).
+    await boundedPrompt(session, prompt, bounds);
+    await bounds.guard(drainReasoningOnly());
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -1022,9 +1120,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         observer.startTurn(); // the retry is its own turn: its final message counts
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
-        await promptSession(session, CONTINUE_TURN);
-        await drainReasoningOnly(); // same budget: the total stays within the bound
+        await boundedPrompt(session, CONTINUE_TURN, bounds);
+        await bounds.guard(drainReasoningOnly()); // same budget: the total stays within the bound
       } catch (err) {
+        // A bound that fired during the continue turn ends the run; it must not
+        // be swallowed here and leave a silent exit 0.
+        if (err instanceof RunAbortedError) throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
@@ -1067,28 +1168,34 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
                 : " (the session settled without a final message)") +
           "\n",
       );
-      const status = readWorktreeStatus(config.cwd);
-      if (status.length > 0) {
-        process.stderr.write(`bob run ${opts.name}: uncommitted paths in ${config.cwd}:\n`);
-        for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
-      } else {
-        process.stderr.write(
-          `bob run ${opts.name}: no dirty paths in ${config.cwd} (nothing to commit there)\n`,
-        );
-      }
+      reportWorktreeStatus(opts.name, config.cwd, true);
     }
   } catch (err) {
     exitCode = 1;
     failed = true;
-    // Surface the error instead of swallowing it: an underscore-ignored catch
-    // made a cap-hit look like a silent clean exit. Label a provider
-    // rate-limit/cap so a budget stall is distinguishable from a crash.
-    const msg = err instanceof Error ? err.message : String(err);
-    const isCap =
-      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
-    process.stderr.write(
-      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
-    );
+    if (err instanceof RunAbortedError) {
+      // bob#135 — a bound ended the run: name it and how to raise it, and record
+      // the outcome in the log. Then signal the session's abort and wait for it,
+      // at most the grace, BEFORE reading the workspace; if the abort did not
+      // resolve, the report says the workspace may still be changing. The wait
+      // is bounded: pi's abort() waits for idle, so a turn that never becomes
+      // idle must not keep the run (and the CLI's process.exit) pending.
+      aborted = err.reason;
+      writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
+      process.stderr.write(boundMessage(opts.name, err.reason, limits));
+      const idle = await abortBounded(session, ABORT_GRACE_MS);
+      reportWorktreeStatus(opts.name, config.cwd, idle);
+    } else {
+      // Surface the error instead of swallowing it: an underscore-ignored catch
+      // made a cap-hit look like a silent clean exit. Label a provider
+      // rate-limit/cap so a budget stall is distinguishable from a crash.
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCap =
+        /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+      process.stderr.write(
+        `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+      );
+    }
   } finally {
     // Stop recording first: the done line below is this log's last record, and the
     // run is over whatever the turn did.
@@ -1126,8 +1233,130 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model,
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(aborted !== undefined ? { aborted } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
+}
+
+// The result for a run a bound ended during the Flair bootstrap or before the
+// session factory returned: bob has no returned session handle, so it signals
+// no abort and reads no workspace status, and there is no run log to record it
+// in. A session the factory returns after this is never used, aborted or
+// disposed; in the `bob` CLI, `process.exit` ends it.
+function abortedRunResult(
+  opts: RunOptions,
+  resolved: ResolvedRunConfig,
+  bounds: RunBounds,
+  reason: TerminationReason,
+): RunResult {
+  process.stderr.write(boundMessage(opts.name, reason, bounds.limits));
+  return {
+    exitCode: 1,
+    agentDir: resolved.agentDir,
+    provider: resolved.provider,
+    model: resolved.model,
+    ...(opts.captureStdout ? { stdout: "" } : {}),
+    aborted: reason,
+    failed: true,
+  };
+}
+
+// bob#135 — the ONE place a one-shot run sends to its session. The task, the
+// continue turn and the reasoning re-prompts go through it as turns (through
+// promptSession, so template expansion stays off; boundedPrompt times each one).
+// The compaction note goes through it as a steer: queued with `steer()`, which
+// never starts a turn. pi delivers it only if an agent run continues or starts
+// after it is queued; otherwise it is not delivered. Once
+// any bound has fired it sends nothing and throws that bound's RunAbortedError.
+// It throws synchronously, before a prompt promise exists, so a caller that
+// races the send is never left holding an unhandled rejection.
+function sendToSession(
+  session: RunSession,
+  bounds: RunBounds,
+  text: string,
+  as: "turn" | "steer",
+): Promise<void> {
+  const fired = bounds.reason();
+  if (fired !== undefined) throw new RunAbortedError(fired);
+  if (as === "turn") return promptSession(session, text);
+  if (session.steer === undefined) {
+    throw new Error("the session has no steer(), so the note is not sent");
+  }
+  return session.steer(text);
+}
+
+// One prompt turn under the run's abort (bounds.guard), and an optional turn
+// timeout. A configured timeout that expires ends the run as `turn_timeout`;
+// there is no retry. The caller's abort path then signals
+// the session's abort. pi's PromptOptions carries no AbortSignal and `prompt()`
+// is a whole turn (model requests plus tool work), so a turn is the smallest
+// unit bob can bound.
+async function boundedPrompt(session: RunSession, text: string, bounds: RunBounds): Promise<void> {
+  const turnTimeoutMs = bounds.limits.turnTimeoutMs;
+  if (turnTimeoutMs === undefined) {
+    await bounds.guard(sendToSession(session, bounds, text, "turn"));
+    return;
+  }
+  const outcome = await bounds.guard(
+    raceTimeout(
+      sendToSession(session, bounds, text, "turn"),
+      turnTimeoutMs,
+      bounds.signal,
+      bounds.timer,
+    ),
+  );
+  if (outcome !== TIMED_OUT) return;
+  // The first bound to fire is the one reported.
+  bounds.fire("turn_timeout");
+  throw new RunAbortedError(bounds.reason() ?? "turn_timeout");
+}
+
+// How long an abort may block the run. pi's abort() signals cancellation and
+// then WAITS for the agent to become idle; a turn that never becomes idle must
+// not keep the run pending, so every abort is signalled and then given at most
+// this long to settle before the run returns on its own.
+const ABORT_GRACE_MS = 1_000;
+
+/** Signal the session's abort and give it at most `graceMs` to settle. Returns
+ *  true only when abort() resolved within the grace (pi's abort() resolves once
+ *  the agent is idle). A missing abort(), one that rejects, and one still
+ *  pending when the grace ends all return false. Never blocks past the grace. */
+async function abortBounded(session: RunSession, graceMs: number): Promise<boolean> {
+  if (!session.abort) return false;
+  const settled = await raceTimeout(
+    Promise.resolve()
+      .then(() => session.abort?.())
+      .then(
+        () => true,
+        () => false,
+      ),
+    graceMs,
+  );
+  return settled === true;
+}
+
+/** Print the agent cwd's worktree status: the paths a run may have left dirty,
+ *  or that the status could not be read — never "clean" for a git that failed
+ *  or timed out. `idle` false means the session did not confirm it stopped:
+ *  the report says the workspace may still be changing, and a clean read is
+ *  not reported as final. */
+function reportWorktreeStatus(name: string, cwd: string, idle: boolean): void {
+  const status = readWorktreeStatusResult(cwd);
+  if (!idle) {
+    process.stderr.write(
+      `bob run ${name}: the session did not confirm it stopped, so the workspace may still be changing\n`,
+    );
+  }
+  if (!status.ok) {
+    process.stderr.write(`bob run ${name}: workspace status unavailable in ${cwd}\n`);
+  } else if (status.status.length > 0) {
+    process.stderr.write(`bob run ${name}: uncommitted paths in ${cwd}:\n`);
+    for (const line of status.status.split("\n")) process.stderr.write(`  ${line}\n`);
+  } else if (idle) {
+    process.stderr.write(`bob run ${name}: no dirty paths in ${cwd} (nothing to commit there)\n`);
+  } else {
+    process.stderr.write(`bob run ${name}: no uncommitted paths in ${cwd} when read\n`);
+  }
 }
 
 // Resolve everything a pi session needs for an agent from disk: provider/model
@@ -1182,6 +1411,10 @@ export interface ResolvedRunConfig {
   // bob#254 — where to call Flair at session start, when the agent configures
   // the flair capability. Absent: no bootstrap is loaded.
   flairBootstrapTarget?: FlairBootstrapTarget;
+  // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
+  // validated for every caller. A one-shot `bob run` overlays its per-invocation
+  // flags on these to arm the run.
+  runLimits: RunLimitsBlock;
 }
 
 // The tool policy for an agent's bob.yaml. ONE entry point for every launch
@@ -1811,6 +2044,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     agent,
     policy: toolPolicy,
     capabilities,
+    runLimits: readRunLimits(yamlText),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }
