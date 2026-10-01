@@ -279,6 +279,44 @@ describe("lifecycle (launchd) — up / down / restart invoke the right launchctl
     );
   });
 });
+// Parse systemd ExecStart= value back into an argv array: split on double-
+// quoted tokens (with \ escaping) and unquoted spaces.
+function execStart(unit: string): string[] {
+  const line = unit.split("\n").find((l) => l.startsWith("ExecStart="));
+  if (!line) throw new Error("no ExecStart in the systemd unit");
+  const raw = line.slice("ExecStart=".length);
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    if (raw[i] === " ") {
+      i++;
+      continue;
+    }
+    if (raw[i] === '"') {
+      i++;
+      let token = "";
+      while (i < raw.length && raw[i] !== '"') {
+        if (raw[i] === "\\" && i + 1 < raw.length) {
+          token += raw[i + 1];
+          i += 2;
+        } else {
+          token += raw[i];
+          i++;
+        }
+      }
+      i++;
+      tokens.push(token);
+    } else {
+      let token = "";
+      while (i < raw.length && raw[i] !== " ") {
+        token += raw[i];
+        i++;
+      }
+      tokens.push(token);
+    }
+  }
+  return tokens;
+}
 
 describe("systemd backend", () => {
   it("renderSystemdUnit runs the persistent entrypoint + Restart=always, no secret", () => {
@@ -371,26 +409,21 @@ describe("systemd backend", () => {
     expect(["launchd", "systemd"]).toContain(detectPlatform());
   });
 
-  it("Render with spaces in both interpreter and bob paths (bob#222)", () => {
+  it("ExecStart quoting: fixtures with space, backslash, and double-quote (bob#222)", () => {
     const unit = renderSystemdUnit({
       name: "pulse",
-      bobBin: "/usr/local/bin/bob",
-      interpreter: "/opt/node/bin/node",
+      bobBin: '/opt/bo"b \\path/bin/bob',
+      interpreter: '/usr/local/it "ner/bin/node',
       home: HOME,
     });
-    expect(unit).toContain(`ExecStart="/opt/node/bin/node" "/usr/local/bin/bob" "run" "pulse"`);
-  });
-
-  it("ExecStart with quoted path gets backslash-escaped (bob#222)", () => {
-    const unit = renderSystemdUnit({
-      name: "pulse",
-      bobBin: "/usr/local/bin/bob",
-      interpreter: '/opt/node with "quote"/bin/node',
-      home: HOME,
-    });
-    expect(unit).toContain(
-      `ExecStart="/opt/node with \\"quote\\"/bin/node" "/usr/local/bin/bob" "run" "pulse"`,
-    );
+    // The systemd renderer must quote every argument; execStart() decodes back
+    // to the original argv array, including spaces, backslashes, and quotes
+    // embedded in path names.
+    const argv = execStart(unit);
+    expect(argv[0]).toBe('/usr/local/it "ner/bin/node');
+    expect(argv[1]).toBe('/opt/bo"b \\path/bin/bob');
+    expect(argv[2]).toBe("run");
+    expect(argv[3]).toBe("pulse");
   });
 });
 
@@ -1153,43 +1186,6 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
     const array = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
     if (!array) throw new Error("no ProgramArguments array in the plist");
     return [...array[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]);
-  }
-
-  function execStart(unit: string): string[] {
-    const line = unit.split("\n").find((l) => l.startsWith("ExecStart="));
-    if (!line) throw new Error("no ExecStart in the systemd unit");
-    const raw = line.slice("ExecStart=".length);
-    const tokens: string[] = [];
-    let i = 0;
-    while (i < raw.length) {
-      if (raw[i] === " ") {
-        i++;
-        continue;
-      }
-      if (raw[i] === '"') {
-        i++;
-        let token = "";
-        while (i < raw.length && raw[i] !== '"') {
-          if (raw[i] === "\\" && i + 1 < raw.length) {
-            token += raw[i + 1];
-            i += 2;
-          } else {
-            token += raw[i];
-            i++;
-          }
-        }
-        i++;
-        tokens.push(token);
-      } else {
-        let token = "";
-        while (i < raw.length && raw[i] !== " ") {
-          token += raw[i];
-          i++;
-        }
-        tokens.push(token);
-      }
-    }
-    return tokens;
   }
 
   function helpUnderMinimalPath(command: string[]): { code: number | null; out: string } {

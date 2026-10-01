@@ -495,7 +495,8 @@ export function renderSystemdUnit(opts: RenderServiceOptions): string {
   const logDir = join(home, "agents", opts.name);
 
   const exec = serviceCommandArgs(opts).map((a) => {
-    // systemd.syntax: each argument must be in double-quotes; backslash-escape \ and " inside the value
+    // systemd syntax: wrap each argument in double-quotes (an allowed form);
+    // backslash-escape embedded \\ and \" inside the value
     return `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   });
 
