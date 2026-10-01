@@ -21,6 +21,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -146,8 +147,10 @@ describe("bob#241 — bob login runs pi's TUI with the agent's own config dir", 
 
     expect(code).toBe(0);
     // bob spawned pi (the child ran), in the agent's own dir, with the agent's own store.
-    expect(envValue("PI_CODING_AGENT_DIR")).toBe(join(alphaDir, ".pi-agent"));
-    expect(readFileSync(cwdFile, "utf8").trim()).toBe(alphaDir);
+    expect(realpathSync(envValue("PI_CODING_AGENT_DIR") ?? "")).toBe(
+      realpathSync(join(alphaDir, ".pi-agent")),
+    );
+    expect(readFileSync(cwdFile, "utf8").trim()).toBe(realpathSync(alphaDir));
     // NOT a slash argument — pi would send that to the model.
     expect(readFileSync(argvFile, "utf8").trim()).toBe("");
     // A var off the allowlist is omitted; an allowlisted one (PATH) is kept.
