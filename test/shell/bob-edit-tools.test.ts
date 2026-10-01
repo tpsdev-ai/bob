@@ -1,7 +1,9 @@
 // bob-edit-tools.test.ts — bob#143 items 1 and 2. The two pi-facing tools,
 // exercised against real files in a temp cwd:
-//   * the tolerant `edit` lands a whitespace-run mismatch, refuses an ambiguous
-//     normalised match, and keeps pi's exact-match behaviour otherwise;
+//   * the tolerant `edit` lands a whitespace-run mismatch, applies an oldText
+//     at one exact position unchanged, and refuses an oldText that occurs at
+//     more than one position (overlapping occurrences included), exactly or
+//     after normalisation;
 //   * `replace_lines` replaces/deletes an inclusive line range, refuses an
 //     inverted or out-of-range one, keeps the line numbers decisive when a line
 //     repeats, validates before any write, and is confined to the session cwd
@@ -75,11 +77,38 @@ describe("createTolerantEditToolDefinition", () => {
     const tool = createTolerantEditToolDefinition(cwd);
     await expect(
       run(tool, { path: "f.md", edits: [{ oldText: "x y", newText: "X Y" }] }),
-    ).rejects.toThrow(/^oldText matches 2 places exactly in f\.md\./);
+    ).rejects.toThrow(/^oldText matches 2 places exactly in f\.md \(overlapping/);
     expect(readFileSync(join(cwd, "f.md"), "utf8")).toBe("x y\nx y\nx   y\n");
   });
 
-  it("refuses a normalised match that is not unique, naming the count", async () => {
+  it("refuses an exact oldText at two overlapping positions, leaving the file byte-identical", async () => {
+    writeFileSync(join(cwd, "f.md"), "aaa\n");
+    const before = readFileSync(join(cwd, "f.md"));
+    const tool = createTolerantEditToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.md", edits: [{ oldText: "aa", newText: "X" }] }),
+    ).rejects.toThrow(/^oldText matches 2 places exactly in f\.md \(overlapping/);
+    expect(readFileSync(join(cwd, "f.md")).equals(before)).toBe(true);
+  });
+
+  it("refuses a normalised oldText at two overlapping positions, leaving the file byte-identical", async () => {
+    writeFileSync(join(cwd, "f.md"), "a  a   a\n");
+    const before = readFileSync(join(cwd, "f.md"));
+    const tool = createTolerantEditToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.md", edits: [{ oldText: "a a", newText: "X" }] }),
+    ).rejects.toThrow(/^Found 2 occurrences of the text in f\.md after normalising/);
+    expect(readFileSync(join(cwd, "f.md")).equals(before)).toBe(true);
+  });
+
+  it("still applies an oldText at exactly one position", async () => {
+    writeFileSync(join(cwd, "f.md"), "aab\n");
+    const tool = createTolerantEditToolDefinition(cwd);
+    await run(tool, { path: "f.md", edits: [{ oldText: "ab", newText: "X" }] });
+    expect(readFileSync(join(cwd, "f.md"), "utf8")).toBe("aX\n");
+  });
+
+  it("refuses a normalised oldText at two positions, naming the count", async () => {
     writeFileSync(join(cwd, "f.md"), "- x   y\n- x  y\n");
     const tool = createTolerantEditToolDefinition(cwd);
     await expect(
@@ -141,7 +170,7 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     expect(resultText(rb)).toContain("Matched 1 edit(s)");
   });
 
-  it("another file's read cannot make an ambiguous normalised edit apply", async () => {
+  it("another file's read cannot make a normalised oldText at two positions apply", async () => {
     // b.md holds "x y" twice under normalisation, so its edit must be refused;
     // a.md holds it once, and its span "x  y" also occurs exactly once in b.md.
     writeFileSync(join(cwd, "a.md"), "x  y\n");

@@ -3,10 +3,13 @@
 // TWO custom tools bob registers, each from its own allowance:
 //
 //   * `edit`        — pi's edit tool, wrapped so a model whose oldText differs
-//                     only in runs of spaces/tabs still lands. The wrapper calls
-//                     pi's edit FIRST; on an exact/fuzzy match failure it
-//                     resolves each oldText through edit-tolerance.ts (exact,
-//                     then a unique whitespace-run-normalised match) and hands
+//                     only in runs of spaces/tabs still lands. When pi has read
+//                     the file and before it matches, an oldText that occurs
+//                     exactly at more than one position (overlapping
+//                     occurrences included) is refused. On pi's exact/fuzzy
+//                     match failure the wrapper resolves each oldText through
+//                     edit-tolerance.ts (exact, then whitespace-run-normalised,
+//                     each accepted only at exactly one position) and hands
 //                     pi's own tool the exact file substrings, so pi keeps its
 //                     path resolution, write queue and diff. A successful
 //                     normalised retry's result says how many edits needed the
@@ -32,7 +35,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { checkWriteTarget } from "./confined-read.js";
-import { type EditRequest, locateTolerantEdits } from "./edit-tolerance.js";
+import {
+  EditMatchError,
+  type EditRequest,
+  locateTolerantEdits,
+  refuseRepeatedExactOldText,
+} from "./edit-tolerance.js";
 
 // pi's edit failure messages that mean "the oldText did not match": NOT the
 // access failure ("Could not edit file"), which must propagate untouched.
@@ -52,6 +60,8 @@ type PiEditExecute = (
 interface CapturingOps {
   operations: EditOperations;
   content: () => string;
+  // The input of the pi call about to run; its edits are checked when pi reads.
+  check: (input: unknown) => void;
 }
 
 type ReadSource = (absolutePath: string) => Promise<Buffer>;
@@ -61,19 +71,28 @@ type ReadSource = (absolutePath: string) => Promise<Buffer>;
 // execution: pi runs a response's tool calls in parallel by default, so a
 // capture shared across calls could hold another file's content when the
 // fallback reads it.
+//
+// The read is also where an oldText at more than one exact position is refused:
+// it runs inside pi's edit after pi has read the file and before it matches, so
+// pi's own count, which skips overlapping occurrences, never decides.
 function capturingOperations(read: ReadSource): CapturingOps {
   let captured = "";
+  let pending: EditInput | undefined;
   return {
     operations: {
       access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
       readFile: async (absolutePath) => {
         const buffer = await read(absolutePath);
         captured = buffer.toString("utf-8");
+        refuseRepeatedExactOldText(captured, pending?.edits, String(pending?.path ?? ""));
         return buffer;
       },
       writeFile: (absolutePath, text) => writeFile(absolutePath, text, "utf-8"),
     },
     content: () => captured,
+    check: (input) => {
+      pending = input as EditInput | undefined;
+    },
   };
 }
 
@@ -111,8 +130,10 @@ export function createTolerantEditToolDefinition(
       const runBase = createEditToolDefinition(cwd, { operations: capturing.operations })
         .execute as unknown as PiEditExecute;
       try {
+        capturing.check(input);
         return await runBase(callId, input, signal, onUpdate, ctx);
       } catch (err) {
+        if (err instanceof EditMatchError) throw err;
         const message = err instanceof Error ? err.message : String(err);
         if (!MATCH_ERROR.test(message)) throw err;
         const typed = input as EditInput;
@@ -126,7 +147,9 @@ export function createTolerantEditToolDefinition(
         const corrected = [...located]
           .sort((a, b) => a.editIndex - b.editIndex)
           .map((edit) => ({ oldText: edit.oldText, newText: edit.newText }));
-        const result = await runBase(callId, { ...typed, edits: corrected }, signal, onUpdate, ctx);
+        const retry = { ...typed, edits: corrected };
+        capturing.check(retry);
+        const result = await runBase(callId, retry, signal, onUpdate, ctx);
         return noteNormalisation(result, normalizedCount);
       }
     },

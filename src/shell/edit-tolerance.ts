@@ -8,12 +8,13 @@
 //
 // This module answers one question for the edit wrapper: given the file's
 // content and the model's edits, what EXACT substring of the file does each
-// oldText mean? A unique exact match wins, and two-plus exact matches fail,
-// naming that count. When there is no exact match, the content and the oldText
-// are canonicalised (runs of spaces/tabs → one space, trailing whitespace
-// dropped) and the edit is accepted only when that canonical form occurs
-// EXACTLY ONCE. Zero or two-plus canonical matches fail, naming the count, so
-// an ambiguous edit is never guessed.
+// oldText mean? Positions are counted with overlapping occurrences included. An
+// oldText that occurs exactly at one position wins; one that occurs exactly at
+// more than one position fails, naming that count. With no exact occurrence,
+// the content and the oldText are canonicalised (runs of spaces/tabs → one
+// space, trailing whitespace dropped), and the edit is accepted only when the
+// canonical oldText occurs at exactly one position; otherwise it fails, naming
+// the count.
 //
 // The returned edits carry the file's exact substring as `oldText`, so the
 // wrapper can hand them to pi's own edit tool and reuse its path resolution,
@@ -36,9 +37,10 @@ export interface LocatedEdit extends EditRequest {
 }
 
 /**
- * A match that failed. `count` is the count the message names: exact
- * occurrences for an exact duplicate, canonical occurrences when there is no
- * exact match, and 0 for an empty oldText or overlapping edits.
+ * A match that failed. `count` is the count the message names: the number of
+ * positions the oldText occurs at (overlapping occurrences included), exactly
+ * for an exact duplicate and after normalisation when there is no exact match;
+ * 0 for an empty oldText or overlapping edits.
  */
 export class EditMatchError extends Error {
   readonly count: number;
@@ -96,7 +98,7 @@ export function canonicalizeWhitespaceRuns(text: string): Canonical {
   return { canon: canon.join(""), start, end };
 }
 
-/** Non-overlapping exact occurrences of `needle` in `haystack`. */
+/** The number of positions `needle` occurs at in `haystack`, overlapping occurrences included. */
 export function countExactOccurrences(haystack: string, needle: string): number {
   if (needle.length === 0) return 0;
   let count = 0;
@@ -105,12 +107,15 @@ export function countExactOccurrences(haystack: string, needle: string): number 
     const at = haystack.indexOf(needle, i);
     if (at === -1) break;
     count++;
-    i = at + needle.length;
+    i = at + 1;
   }
   return count;
 }
 
-/** Non-overlapping canonical occurrences: count and (when exactly one) its index. */
+/**
+ * The number of positions the canonical oldText occurs at in the canonical
+ * content, overlapping occurrences included, and the first of them.
+ */
 export function canonicalOccurrence(
   canonical: Canonical,
   oldText: string,
@@ -125,7 +130,7 @@ export function canonicalOccurrence(
     if (at === -1) break;
     count++;
     if (first === -1) first = at;
-    i = at + needle.length;
+    i = at + 1;
   }
   return { count, index: first };
 }
@@ -135,16 +140,16 @@ function describe(path: string, index: number, total: number): string {
 }
 
 function notFoundMessage(path: string, index: number, total: number): string {
-  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must match, or match uniquely under that normalisation.`;
+  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must occur at one position, exactly or under that normalisation.`;
 }
 
 function exactDuplicateMessage(path: string, index: number, total: number, count: number): string {
   const subject = total === 1 ? "oldText" : `edits[${index}].oldText`;
-  return `${subject} matches ${count} places exactly in ${path}. The text must be unique. Please provide more context to make it unique.`;
+  return `${subject} matches ${count} places exactly in ${path} (overlapping occurrences included). It must match at one place only; add surrounding context.`;
 }
 
 function duplicateMessage(path: string, index: number, total: number, count: number): string {
-  return `Found ${count} occurrences of ${describe(path, index, total)} after normalising runs of spaces/tabs and ignoring trailing whitespace. The text must be unique. Please provide more context to make it unique.`;
+  return `Found ${count} occurrences of ${describe(path, index, total)} after normalising runs of spaces/tabs and ignoring trailing whitespace (overlapping occurrences included). It must match at one place only; add surrounding context.`;
 }
 
 function emptyMessage(path: string, index: number, total: number): string {
@@ -155,8 +160,9 @@ function emptyMessage(path: string, index: number, total: number): string {
 
 /**
  * Resolve every edit's oldText to an exact file substring. Throws
- * {@link EditMatchError} on a blank oldText, an ambiguous match (2+), or no
- * match at all — mirroring pi's failure semantics, with the count named.
+ * {@link EditMatchError}, naming the count, on a blank oldText, an oldText that
+ * occurs at more than one position (overlapping occurrences included), or no
+ * match at all.
  */
 export function locateTolerantEdits(
   content: string,
@@ -224,4 +230,28 @@ export function locateTolerantEdits(
   }
 
   return { edits: located, normalizedCount };
+}
+
+/**
+ * pi's edit matches against the file with a leading BOM removed and CRLF/CR
+ * turned into LF, and its own count skips overlapping occurrences. The wrapper
+ * calls this on the content pi has just read, before pi matches: an oldText
+ * that occurs exactly at more than one position of that text (overlapping
+ * occurrences included) is refused here, naming the count.
+ */
+export function refuseRepeatedExactOldText(content: string, edits: unknown, path: string): void {
+  if (!Array.isArray(edits)) return;
+  const text = toLF(content.startsWith("\uFEFF") ? content.slice(1) : content);
+  for (let index = 0; index < edits.length; index++) {
+    const oldText = (edits[index] as { oldText?: unknown } | undefined)?.oldText;
+    if (typeof oldText !== "string") continue;
+    const count = countExactOccurrences(text, toLF(oldText));
+    if (count > 1) {
+      throw new EditMatchError(exactDuplicateMessage(path, index, edits.length, count), count);
+    }
+  }
+}
+
+function toLF(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }

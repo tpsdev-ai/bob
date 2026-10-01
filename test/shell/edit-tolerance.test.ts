@@ -1,14 +1,18 @@
 // edit-tolerance.test.ts — bob#143 item 1. The pure matcher behind the tolerant
-// `edit`: exact match first, then a whitespace-run-normalised match accepted
-// only when it is unique. Two-plus exact matches fail with the exact count; zero
-// and two-plus normalised matches fail with the normalised count.
+// `edit`: exact match first, then a whitespace-run-normalised match. An oldText
+// is accepted only at one position; one that occurs at more than one position
+// (overlapping occurrences included) fails with that count, exact or normalised.
 import { describe, expect, it } from "bun:test";
-import { EditMatchError, locateTolerantEdits } from "../../src/shell/edit-tolerance.js";
+import {
+  EditMatchError,
+  locateTolerantEdits,
+  refuseRepeatedExactOldText,
+} from "../../src/shell/edit-tolerance.js";
 
 const align = (n: number): string => " ".repeat(n);
 
 describe("locateTolerantEdits — exact first", () => {
-  it("keeps an exact, unique match as-is", () => {
+  it("keeps an oldText at one exact position as-is", () => {
     const content = "alpha\nbeta\ngamma\n";
     const { edits, normalizedCount } = locateTolerantEdits(
       content,
@@ -82,7 +86,7 @@ describe("locateTolerantEdits — refusals", () => {
     }
   });
 
-  it("fails when the normalised match is not unique, naming the count", () => {
+  it("fails when the normalised oldText occurs at two positions, naming the count", () => {
     // Two lines collapse to the same canonical form.
     const content = `x${align(2)}y\nx${align(5)}y\n`;
     try {
@@ -115,7 +119,7 @@ describe("locateTolerantEdits — refusals", () => {
       expect(err).toBeInstanceOf(EditMatchError);
       expect((err as EditMatchError).count).toBe(2);
       expect((err as Error).message).toBe(
-        "oldText matches 2 places exactly in f.ts. The text must be unique. Please provide more context to make it unique.",
+        "oldText matches 2 places exactly in f.ts (overlapping occurrences included). It must match at one place only; add surrounding context.",
       );
     }
     // With several edits, the message names the edit.
@@ -128,7 +132,41 @@ describe("locateTolerantEdits — refusals", () => {
         ],
         "f.ts",
       ),
-    ).toThrow(/^edits\[1\]\.oldText matches 2 places exactly in f\.ts\./);
+    ).toThrow(/^edits\[1\]\.oldText matches 2 places exactly in f\.ts \(overlapping/);
+  });
+
+  it("refuses a normalised oldText at two overlapping positions", () => {
+    // Canonically "a a a": "a a" occurs at positions 0 and 2, which overlap.
+    try {
+      locateTolerantEdits("a  a   a", [{ oldText: "a a", newText: "X" }], "f.ts");
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect(err).toBeInstanceOf(EditMatchError);
+      expect((err as EditMatchError).count).toBe(2);
+      expect((err as Error).message).toMatch(
+        /^Found 2 occurrences of the text in f\.ts after normalising/,
+      );
+    }
+  });
+
+  it("refuses an exact oldText at two overlapping positions", () => {
+    try {
+      locateTolerantEdits("aaa", [{ oldText: "aa", newText: "X" }], "f.ts");
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect(err).toBeInstanceOf(EditMatchError);
+      expect((err as EditMatchError).count).toBe(2);
+      expect((err as Error).message).toMatch(
+        /^oldText matches 2 places exactly in f\.ts \(overlapping/,
+      );
+    }
+  });
+
+  it("still accepts an oldText at exactly one position, exact or normalised", () => {
+    const exact = locateTolerantEdits("aab", [{ oldText: "ab", newText: "X" }], "f.ts");
+    expect(exact.edits[0]).toMatchObject({ kind: "exact", index: 1, length: 2 });
+    const normalised = locateTolerantEdits("a  b a", [{ oldText: "a b", newText: "X" }], "f.ts");
+    expect(normalised.edits[0]).toMatchObject({ kind: "whitespace", oldText: "a  b", index: 0 });
   });
 
   it("fails on an empty oldText", () => {
@@ -149,5 +187,40 @@ describe("locateTolerantEdits — refusals", () => {
         "f.ts",
       ),
     ).toThrow(/overlap/);
+  });
+});
+
+describe("refuseRepeatedExactOldText — the check before pi matches", () => {
+  it("refuses an oldText at more than one exact position, overlaps included", () => {
+    expect(() =>
+      refuseRepeatedExactOldText("aaa", [{ oldText: "aa", newText: "x" }], "f.ts"),
+    ).toThrow(/^oldText matches 2 places exactly in f\.ts \(overlapping/);
+    expect(() =>
+      refuseRepeatedExactOldText(
+        "abab",
+        [
+          { oldText: "a", newText: "x" },
+          { oldText: "b", newText: "y" },
+        ],
+        "f.ts",
+      ),
+    ).toThrow(/^edits\[0\]\.oldText matches 2 places exactly in f\.ts \(overlapping/);
+  });
+
+  it("matches in pi's text: a leading BOM dropped, CRLF and CR read as LF", () => {
+    expect(() =>
+      refuseRepeatedExactOldText("\uFEFFx\r\nx\r", [{ oldText: "x\n", newText: "y" }], "f.ts"),
+    ).toThrow(/matches 2 places exactly/);
+  });
+
+  it("passes an oldText at one position, at none, or not a string", () => {
+    expect(() =>
+      refuseRepeatedExactOldText(
+        "aab",
+        [{ oldText: "ab", newText: "x" }, { oldText: "zz", newText: "y" }, { oldText: 3 }],
+        "f.ts",
+      ),
+    ).not.toThrow();
+    expect(() => refuseRepeatedExactOldText("aab", undefined, "f.ts")).not.toThrow();
   });
 });
