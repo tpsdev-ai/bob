@@ -406,6 +406,31 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
   }
 }
 
+// pi's `api` for an OpenAI-compatible endpoint (the shape ollama.com/v1 speaks),
+// and the declared limits for its model. A provider block WITHOUT `api` is one pi
+// cannot resolve at all (bob#132: "Unknown provider"); the model entry needs
+// `reasoning`/`input` and a window/output cap. bob applies the agent's real
+// window and output cap at session creation (bob#214), so the defaults here are
+// the shape pi needs when the scaffold carries no window, not a server-enforced
+// value. Mirrors buildOpenrouterProvider in session.ts.
+const PI_OPENAI_COMPLETIONS_API = "openai-completions";
+const PI_MODEL_DEFAULT_CONTEXT_WINDOW = 128_000;
+const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
+
+/** The full model entry for an OpenAI-compatible provider (cost is zero: bob's
+ *  transport, not pi, owns the endpoint and the price). */
+function piOpenAiCompletionsModel(opts: InitOptions): Record<string, unknown> {
+  return {
+    id: opts.model,
+    name: opts.model,
+    reasoning: false,
+    input: ["text"],
+    contextWindow: opts.contextWindow ?? PI_MODEL_DEFAULT_CONTEXT_WINDOW,
+    maxTokens: PI_MODEL_DEFAULT_MAX_TOKENS,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
 function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const piDir = join(agentDir, ".pi-agent");
   // mkdirSync above already created it; defensive recreate in case caller
@@ -417,6 +442,10 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
   // is NEVER written here (bob#183) — so its auth.json carries no key entry.
   const isEnvKeyProvider = opts.provider === "openrouter";
+  // The OpenAI-compatible providers get the full provider schema (api, compat and
+  // a complete model entry), so pi can resolve `ollama-cloud/<model>` from the
+  // scaffolded files with no hand-editing (bob#132).
+  const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
   const baseUrl = knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
 
@@ -432,7 +461,17 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
     : {
         [piProvider]: {
           ...(baseUrl ? { baseUrl } : {}),
-          models: [{ id: opts.model, name: opts.model }],
+          ...(isOpenAiCompatible
+            ? {
+                api: PI_OPENAI_COMPLETIONS_API,
+                compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+              }
+            : {}),
+          models: [
+            isOpenAiCompatible
+              ? piOpenAiCompletionsModel(opts)
+              : { id: opts.model, name: opts.model },
+          ],
         },
       };
   writeFileSync(modelsPath, `${JSON.stringify({ providers }, null, 2)}\n`);
