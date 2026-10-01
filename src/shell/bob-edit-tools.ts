@@ -5,8 +5,9 @@
 //   * `edit`        — pi's edit tool, wrapped so a model whose oldText differs
 //                     only in runs of spaces/tabs still lands. When pi has read
 //                     the file and before it matches, an oldText that occurs
-//                     exactly at more than one position (overlapping
-//                     occurrences included) is refused. On pi's exact/fuzzy
+//                     exactly at more than one position, or nowhere exactly
+//                     and at multiple normalised positions (overlaps included),
+//                     is refused. On pi's exact/fuzzy
 //                     match failure the wrapper resolves each oldText through
 //                     edit-tolerance.ts: the exact pass first, and only for an
 //                     oldText that occurs nowhere exactly the whitespace-run-
@@ -41,11 +42,11 @@ import {
   EditMatchError,
   type EditRequest,
   locateTolerantEdits,
-  refuseRepeatedExactOldText,
+  refuseAmbiguousOldTextBeforePiMatch,
 } from "./edit-tolerance.js";
 
-// pi's edit failure messages that mean "the oldText did not match": NOT the
-// access failure ("Could not edit file"), which must propagate untouched.
+// pi's not-found or duplicate-match errors. Access failures ("Could not edit
+// file") must propagate untouched.
 const MATCH_ERROR =
   /^(Could not find (?:the exact text|edits\[\d+\])|Found \d+ occurrences of (?:the text|edits\[\d+\]))/;
 
@@ -74,9 +75,9 @@ type ReadSource = (absolutePath: string) => Promise<Buffer>;
 // capture shared across calls could hold another file's content when the
 // fallback reads it.
 //
-// The read is also where an oldText at more than one exact position is refused:
-// it runs inside pi's edit after pi has read the file and before it matches, so
-// pi's own count, which skips overlapping occurrences, never decides.
+// The read rejects ambiguous exact matches, or ambiguous normalised matches
+// when there is no exact match. It runs before pi matches, so pi's own count,
+// which skips overlapping occurrences, never decides these cases.
 function capturingOperations(read: ReadSource): CapturingOps {
   let captured = "";
   let pending: EditInput | undefined;
@@ -86,7 +87,7 @@ function capturingOperations(read: ReadSource): CapturingOps {
       readFile: async (absolutePath) => {
         const buffer = await read(absolutePath);
         captured = buffer.toString("utf-8");
-        refuseRepeatedExactOldText(captured, pending?.edits, String(pending?.path ?? ""));
+        refuseAmbiguousOldTextBeforePiMatch(captured, pending?.edits, String(pending?.path ?? ""));
         return buffer;
       },
       writeFile: (absolutePath, text) => writeFile(absolutePath, text, "utf-8"),

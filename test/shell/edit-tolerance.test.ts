@@ -1,6 +1,7 @@
 // edit-tolerance.test.ts — bob#143 item 1. The pure matcher behind the tolerant
 // `edit`. The exact pass runs first: an oldText at one exact position is
-// applied, and one at more than one exact position fails with that count. Only
+// selected by the matcher (pi may still refuse it), and one at more than one
+// exact position fails with that count. Only
 // when it occurs nowhere exactly does the whitespace-run-normalised pass run,
 // accepting only one normalised position. Counts include overlapping
 // occurrences.
@@ -8,7 +9,7 @@ import { describe, expect, it } from "bun:test";
 import {
   EditMatchError,
   locateTolerantEdits,
-  refuseRepeatedExactOldText,
+  refuseAmbiguousOldTextBeforePiMatch,
 } from "../../src/shell/edit-tolerance.js";
 
 const align = (n: number): string => " ".repeat(n);
@@ -171,7 +172,7 @@ describe("locateTolerantEdits — refusals", () => {
     expect(normalised.edits[0]).toMatchObject({ kind: "whitespace", oldText: "a  b", index: 0 });
   });
 
-  it("exact-first rule: one exact position is applied though normalising would find two", () => {
+  it("exact-first rule: one exact position is selected though normalising would find two", () => {
     // "a a" occurs exactly once (line 1) and twice after normalising (lines 1
     // and 2). The exact pass runs first and wins; the normalised pass never runs.
     const content = "a a\na  a\n";
@@ -207,13 +208,13 @@ describe("locateTolerantEdits — refusals", () => {
   });
 });
 
-describe("refuseRepeatedExactOldText — the check before pi matches", () => {
+describe("refuseAmbiguousOldTextBeforePiMatch — the check before pi matches", () => {
   it("refuses an oldText at more than one exact position, overlaps included", () => {
     expect(() =>
-      refuseRepeatedExactOldText("aaa", [{ oldText: "aa", newText: "x" }], "f.ts"),
+      refuseAmbiguousOldTextBeforePiMatch("aaa", [{ oldText: "aa", newText: "x" }], "f.ts"),
     ).toThrow(/^oldText matches 2 places exactly in f\.ts \(overlapping/);
     expect(() =>
-      refuseRepeatedExactOldText(
+      refuseAmbiguousOldTextBeforePiMatch(
         "abab",
         [
           { oldText: "a", newText: "x" },
@@ -226,18 +227,22 @@ describe("refuseRepeatedExactOldText — the check before pi matches", () => {
 
   it("matches in pi's text: a leading BOM dropped, CRLF and CR read as LF", () => {
     expect(() =>
-      refuseRepeatedExactOldText("\uFEFFx\r\nx\r", [{ oldText: "x\n", newText: "y" }], "f.ts"),
+      refuseAmbiguousOldTextBeforePiMatch(
+        "\uFEFFx\r\nx\r",
+        [{ oldText: "x\n", newText: "y" }],
+        "f.ts",
+      ),
     ).toThrow(/matches 2 places exactly/);
   });
 
   it("passes an oldText at one position, at none, or not a string", () => {
     expect(() =>
-      refuseRepeatedExactOldText(
+      refuseAmbiguousOldTextBeforePiMatch(
         "aab",
         [{ oldText: "ab", newText: "x" }, { oldText: "zz", newText: "y" }, { oldText: 3 }],
         "f.ts",
       ),
     ).not.toThrow();
-    expect(() => refuseRepeatedExactOldText("aab", undefined, "f.ts")).not.toThrow();
+    expect(() => refuseAmbiguousOldTextBeforePiMatch("aab", undefined, "f.ts")).not.toThrow();
   });
 });

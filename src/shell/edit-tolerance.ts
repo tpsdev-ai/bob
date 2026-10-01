@@ -9,9 +9,10 @@
 // This module answers one question for the edit wrapper: given the file's
 // content and the model's edits, what EXACT substring of the file does each
 // oldText mean? Positions are counted with overlapping occurrences included.
-// The exact pass runs first: an oldText at one exact position is applied, and
-// one at more than one exact position fails, naming that count. Only when it
-// occurs nowhere exactly does the whitespace-run-normalised pass run (runs of
+// The exact pass runs first: an oldText at one exact position is selected by
+// the matcher (pi may still refuse it), and one at more than one exact position
+// fails, naming that count. Only when it occurs nowhere exactly does the
+// whitespace-run-normalised pass run (runs of
 // spaces/tabs → one space, trailing whitespace dropped): it accepts only one
 // normalised position and otherwise fails, naming the count.
 //
@@ -36,10 +37,10 @@ export interface LocatedEdit extends EditRequest {
 }
 
 /**
- * A match that failed. `count` is the count the message names: the number of
- * positions the oldText occurs at (overlapping occurrences included), exactly
- * for an exact duplicate and after normalisation when there is no exact match;
- * 0 for an empty oldText or overlapping edits.
+ * A match that failed. For duplicate and not-found errors, `count` is the
+ * number of positions the oldText occurs at (overlaps included): exact for an
+ * exact duplicate, normalised when there is no exact match. Empty oldText and
+ * overlapping edits also carry 0, although their messages do not name a count.
  */
 export class EditMatchError extends Error {
   readonly count: number;
@@ -159,10 +160,9 @@ function emptyMessage(path: string, index: number, total: number): string {
 
 /**
  * Resolve every edit's oldText to an exact file substring, exact pass first.
- * Throws {@link EditMatchError}, naming the count, on a blank oldText, an
- * oldText at more than one exact position, an oldText at no exact position and
- * more than one normalised position, or no match at all (overlapping
- * occurrences included in every count).
+ * Throws {@link EditMatchError} on an empty oldText, duplicate exact or
+ * normalised positions, no match, or overlapping edits. Duplicate and
+ * not-found errors name their position count (overlaps included).
  */
 export function locateTolerantEdits(
   content: string,
@@ -235,19 +235,36 @@ export function locateTolerantEdits(
 /**
  * pi's edit matches against the file with a leading BOM removed and CRLF/CR
  * turned into LF, and its own count skips overlapping occurrences. The wrapper
- * calls this on the content pi has just read, before pi matches: an oldText
- * that occurs exactly at more than one position of that text (overlapping
- * occurrences included) is refused here, naming the count.
+ * calls this on the content pi has just read, before pi matches. More than one
+ * exact position is refused first. With no exact position, more than one
+ * whitespace-run-normalised position is refused before pi's fuzzy pass can
+ * choose one. Both counts include overlapping occurrences.
  */
-export function refuseRepeatedExactOldText(content: string, edits: unknown, path: string): void {
+export function refuseAmbiguousOldTextBeforePiMatch(
+  content: string,
+  edits: unknown,
+  path: string,
+): void {
   if (!Array.isArray(edits)) return;
   const text = toLF(content.startsWith("\uFEFF") ? content.slice(1) : content);
+  let canonical: Canonical | undefined;
   for (let index = 0; index < edits.length; index++) {
     const oldText = (edits[index] as { oldText?: unknown } | undefined)?.oldText;
     if (typeof oldText !== "string") continue;
-    const count = countExactOccurrences(text, toLF(oldText));
+    const normalizedOldText = toLF(oldText);
+    const count = countExactOccurrences(text, normalizedOldText);
     if (count > 1) {
       throw new EditMatchError(exactDuplicateMessage(path, index, edits.length, count), count);
+    }
+    if (count === 0) {
+      canonical ??= canonicalizeWhitespaceRuns(text);
+      const normalisedCount = canonicalOccurrence(canonical, normalizedOldText).count;
+      if (normalisedCount > 1) {
+        throw new EditMatchError(
+          duplicateMessage(path, index, edits.length, normalisedCount),
+          normalisedCount,
+        );
+      }
     }
   }
 }

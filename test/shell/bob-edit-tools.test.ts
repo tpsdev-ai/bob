@@ -1,9 +1,9 @@
 // bob-edit-tools.test.ts — bob#143 items 1 and 2. The two pi-facing tools,
 // exercised against real files in a temp cwd:
-//   * the tolerant `edit` lands a whitespace-run mismatch, applies an oldText
-//     at one exact position unchanged, refuses one at more than one exact
-//     position, and, for an oldText at no exact position, refuses more than one
-//     normalised position (overlapping occurrences included in both counts);
+//   * the tolerant `edit` lands a whitespace-run mismatch, selects an oldText
+//     at one exact position for pi (which may still refuse it), refuses one at
+//     more than one exact position, and, for an oldText at no exact position,
+//     refuses more than one normalised position (overlaps included in both counts);
 //   * `replace_lines` replaces/deletes an inclusive line range, refuses an
 //     inverted or out-of-range one, keeps the line numbers decisive when a line
 //     repeats, validates before any write, and is confined to the session cwd
@@ -99,6 +99,36 @@ describe("createTolerantEditToolDefinition", () => {
       run(tool, { path: "f.md", edits: [{ oldText: "a a", newText: "X" }] }),
     ).rejects.toThrow(/^Found 2 occurrences of the text in f\.md after normalising/);
     expect(readFileSync(join(cwd, "f.md")).equals(before)).toBe(true);
+  });
+
+  it("refuses overlapping normalised positions before pi's fuzzy pass, leaving aaa byte-identical", async () => {
+    const file = join(cwd, "f.md");
+    const before = Buffer.from("aaa");
+    writeFileSync(file, before);
+    const tool = createTolerantEditToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.md", edits: [{ oldText: "aa ", newText: "X" }] }),
+    ).rejects.toThrow(/^Found 2 occurrences of the text in f\.md after normalising/);
+    expect(readFileSync(file).equals(before)).toBe(true);
+  });
+
+  it("lets pi refuse a unique exact position when its Unicode match is ambiguous", async () => {
+    const file = join(cwd, "f.md");
+    const before = Buffer.from("1\n①\n");
+    writeFileSync(file, before);
+    const tool = createTolerantEditToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.md", edits: [{ oldText: "1", newText: "X" }] }),
+    ).rejects.toThrow(/Found 2 occurrences/);
+    expect(readFileSync(file).equals(before)).toBe(true);
+  });
+
+  it("keeps the exact-first rule when normalising would find two positions", async () => {
+    const file = join(cwd, "f.md");
+    writeFileSync(file, "a a\na  a\n");
+    const tool = createTolerantEditToolDefinition(cwd);
+    await run(tool, { path: "f.md", edits: [{ oldText: "a a", newText: "X" }] });
+    expect(readFileSync(file, "utf8")).toBe("X\na  a\n");
   });
 
   it("still applies an oldText at exactly one position", async () => {
