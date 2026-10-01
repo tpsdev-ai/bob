@@ -9,7 +9,16 @@
 // and do not render); `promote`
 // writes a dated section below [Unreleased] and deletes the fragments.
 
-import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  setDefaultTimeout,
+} from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -55,14 +64,33 @@ function ENTRIES(s: string): string[] {
 
 let root: string;
 const CHILD_TIMEOUT_MS = 10_000;
-// Every case gets enough time for its bounded child calls on a loaded CI host.
 setDefaultTimeout(30_000);
 
-// A commit or merge can start detached Git maintenance and return before it
-// finishes writing under cwd. Keep the test's Git work trees quiescent so
-// afterEach can remove them without racing that child.
+const gitEnv: Record<string, string> = {
+  GIT_CONFIG_COUNT: "3",
+  GIT_CONFIG_KEY_0: "maintenance.auto",
+  GIT_CONFIG_VALUE_0: "false",
+  GIT_CONFIG_KEY_1: "gc.auto",
+  GIT_CONFIG_VALUE_1: "0",
+  GIT_CONFIG_KEY_2: "core.hooksPath",
+  GIT_CONFIG_VALUE_2: "/dev/null",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_TEMPLATE_DIR: "/dev/null",
+};
+const priorGitEnv = new Map(Object.keys(gitEnv).map((key) => [key, process.env[key]]));
+beforeAll(() => {
+  for (const [key, value] of Object.entries(gitEnv)) process.env[key] = value;
+});
+afterAll(() => {
+  for (const [key, value] of priorGitEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 function gitSync(cwd: string, args: string[]) {
-  return spawnSync("git", ["-c", "maintenance.auto=false", "-c", "gc.auto=0", ...args], {
+  return spawnSync("git", args, {
     cwd,
     encoding: "utf8",
     timeout: CHILD_TIMEOUT_MS,
@@ -1363,6 +1391,55 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     const ok = run("promote", "1.2.3", "--date=2026-01-01");
     expect(ok.code, ok.out).toBe(0);
     expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2026-01-01");
+  });
+
+  it("the script's Git children inherit the test's maintenance settings", () => {
+    cli();
+    stageAll();
+    expect(gitSync(root, ["config", "maintenance.auto", "true"]).status).toBe(0);
+    expect(gitSync(root, ["config", "gc.auto", "100"]).status).toBe(0);
+
+    const bin = join(root, "bin");
+    const trace = join(root, "git-child-config.log");
+    mkdirSync(bin);
+    const shim = join(bin, "git");
+    writeFileSync(
+      shim,
+      `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+const env = { ...process.env, PATH: process.env.BOB_TEST_GIT_PATH };
+for (const key of ["maintenance.auto", "gc.auto"]) {
+  const result = spawnSync("git", ["-C", process.env.BOB_TEST_REPO, "config", "--get", key], {
+    encoding: "utf8", env, timeout: ${CHILD_TIMEOUT_MS},
+  });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+  appendFileSync(process.env.BOB_TEST_GIT_TRACE, result.stdout);
+}
+const result = spawnSync("git", process.argv.slice(2), {
+  stdio: "inherit", env, timeout: ${CHILD_TIMEOUT_MS},
+});
+process.exit(result.status ?? 1);
+`,
+    );
+    chmodSync(shim, 0o755);
+    const run = spawnSync(
+      "node",
+      [join(root, "scripts", "changelog-fragments.mjs"), "promote", "1.2.3", "--date=2026-01-01"],
+      {
+        encoding: "utf8",
+        timeout: CHILD_TIMEOUT_MS,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          BOB_TEST_GIT_PATH: process.env.PATH ?? "",
+          BOB_TEST_GIT_TRACE: trace,
+          BOB_TEST_REPO: root,
+        },
+      },
+    );
+    expect(run.status, `${run.error ?? ""}${run.stderr ?? ""}`).toBe(0);
+    expect(readFileSync(trace, "utf8")).toMatch(/^(false\n0\n)+$/);
   });
 
   // The script's entry-point test compares real paths: run through a symlink, it

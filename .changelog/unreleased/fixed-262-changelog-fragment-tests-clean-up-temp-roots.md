@@ -1,1 +1,0 @@
-- **Changelog fragment tests clean up temporary Git repositories reliably.** Git calls disable detached maintenance, child processes have timeouts, and cleanup verifies removal. (Closes #262)
