@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { readCapabilities } from "../../src/shell/bob-yaml.js";
 import { initAgent, stampedToolAllowlist } from "../../src/shell/init.js";
 import { loadRole } from "../../src/shell/role-loader.js";
@@ -483,6 +484,22 @@ describe("initAgent", () => {
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
       expect(models.providers["ollama-cloud"].models[0].id).toBe("deepseek-v4-pro");
       expect(models.providers["ollama-cloud"].baseUrl).toBe("https://ollama.com/v1");
+      // bob#132: `api` and `compat` on the provider block.
+      expect(models.providers["ollama-cloud"].api).toBe("openai-completions");
+      expect(models.providers["ollama-cloud"].compat).toEqual({
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+      });
+      expect(models.providers["ollama-cloud"].models[0].reasoning).toBe(false);
+      expect(models.providers["ollama-cloud"].models[0].input).toEqual(["text"]);
+      expect(models.providers["ollama-cloud"].models[0].contextWindow).toBe(262_144);
+      expect(models.providers["ollama-cloud"].models[0].maxTokens).toBeGreaterThan(0);
+      expect(models.providers["ollama-cloud"].models[0].cost).toEqual({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      });
 
       const auth = JSON.parse(readFileSync(authPath, "utf8"));
       expect(auth["ollama-cloud"].type).toBe("api_key");
@@ -590,4 +607,64 @@ describe("initAgent — the context window (bob#214)", () => {
       /positive whole number/,
     );
   });
+});
+
+// bob#132 — a fresh onboard's .pi-agent files must RESOLVE in pi. This drives
+// pi's real ModelRuntime over the generated models.json/auth.json with NO
+// network (ModelRuntime.create refreshes from the network only when allowModelNetwork is true), so it fails
+// on a scaffold pi cannot resolve.
+describe("initAgent — the generated provider resolves in pi (bob#132)", () => {
+  let tmpRoot: string;
+  let keysRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "bob-init-132-"));
+    keysRoot = mkdtempSync(join(tmpdir(), "bob-keys-132-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(keysRoot, { recursive: true, force: true });
+  });
+
+  it("resolves ollama-cloud/<model> from a fresh onboard's files, with no network", async () => {
+    const res = initAgent({
+      name: "testbot",
+      role: "ea",
+      provider: "ollama-cloud",
+      model: "deepseek-v4-pro",
+      contextWindow: 262_144,
+      agentsRoot: tmpRoot,
+      flairKeysDir: keysRoot,
+    });
+    const piDir = join(res.agentDir, ".pi-agent");
+    const runtime = await ModelRuntime.create({
+      authPath: join(piDir, "auth.json"),
+      modelsPath: join(piDir, "models.json"),
+    });
+
+    const model = runtime.getModel("ollama-cloud", "deepseek-v4-pro") as
+      | {
+          api?: string;
+          contextWindow?: number;
+          maxTokens?: number;
+          reasoning?: boolean;
+          input?: readonly string[];
+          compat?: { supportsDeveloperRole?: boolean; supportsReasoningEffort?: boolean };
+        }
+      | undefined;
+    expect(model, "ollama-cloud/deepseek-v4-pro resolves").toBeDefined();
+    expect(model?.api).toBe("openai-completions");
+    expect(model?.contextWindow).toBe(262_144);
+    expect(model?.maxTokens).toBeGreaterThan(0);
+    expect(model?.reasoning).toBe(false);
+    expect(model?.input).toEqual(["text"]);
+    expect(model?.compat?.supportsDeveloperRole).toBe(false);
+    expect(model?.compat?.supportsReasoningEffort).toBe(false);
+
+    // The key stays in auth.json and pi's auth storage resolves it for the
+    // custom provider.
+    const auth = await runtime.getAuth("ollama-cloud");
+    expect(auth?.auth?.apiKey).toBe("REPLACE_WITH_YOUR_API_KEY");
+  }, 10_000);
 });

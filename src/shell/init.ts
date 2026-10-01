@@ -406,6 +406,27 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
   }
 }
 
+// The OpenAI-compatible provider shape for ollama.com/v1 (bob#132): pi drops a
+// custom provider block that has no `api`. bob also writes the model's fields;
+// bob.yaml can override the limits at session creation (bob#214).
+const PI_OPENAI_COMPLETIONS_API = "openai-completions";
+const PI_MODEL_DEFAULT_CONTEXT_WINDOW = 128_000;
+const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
+
+/** The full model entry for an OpenAI-compatible provider (cost is zero: bob
+ *  does not track this provider's pricing, so pi reports $0 for it). */
+function piOpenAiCompletionsModel(opts: InitOptions): Record<string, unknown> {
+  return {
+    id: opts.model,
+    name: opts.model,
+    reasoning: false,
+    input: ["text"],
+    contextWindow: opts.contextWindow ?? PI_MODEL_DEFAULT_CONTEXT_WINDOW,
+    maxTokens: PI_MODEL_DEFAULT_MAX_TOKENS,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
 function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const piDir = join(agentDir, ".pi-agent");
   // mkdirSync above already created it; defensive recreate in case caller
@@ -417,6 +438,9 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
   // is NEVER written here (bob#183) — so its auth.json carries no key entry.
   const isEnvKeyProvider = opts.provider === "openrouter";
+  // OpenAI-compatible providers also get `api`, `compat` and an explicit model
+  // entry (bob#132).
+  const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
   const baseUrl = knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
 
@@ -432,7 +456,17 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
     : {
         [piProvider]: {
           ...(baseUrl ? { baseUrl } : {}),
-          models: [{ id: opts.model, name: opts.model }],
+          ...(isOpenAiCompatible
+            ? {
+                api: PI_OPENAI_COMPLETIONS_API,
+                compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+              }
+            : {}),
+          models: [
+            isOpenAiCompatible
+              ? piOpenAiCompletionsModel(opts)
+              : { id: opts.model, name: opts.model },
+          ],
         },
       };
   writeFileSync(modelsPath, `${JSON.stringify({ providers }, null, 2)}\n`);
