@@ -78,10 +78,9 @@ const gitEnv: Record<string, string> = {
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TEMPLATE_DIR: "/dev/null",
 };
-// Bun starts a child spawned WITHOUT an `env` option with the environment the
-// test process started with, not with process.env as changed since. So setting
-// process.env here reaches a child only when the spawn passes `env:
-// process.env`: every spawn in this file does, and so does the script's git().
+// Under Bun 1.3.10, a child spawned without an `env` option does not see these
+// process.env changes, so the Git helper below and the Node launches of the
+// script pass `env: process.env`.
 const priorGitEnv = new Map(Object.keys(gitEnv).map((key) => [key, process.env[key]]));
 beforeAll(() => {
   for (const [key, value] of Object.entries(gitEnv)) process.env[key] = value;
@@ -1400,7 +1399,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
   });
 
   it("the script's Git children inherit the test's maintenance settings", () => {
-    const { dir, changelogPath } = cli();
+    const { run, dir, changelogPath } = cli();
     stageAll();
     expect(gitSync(root, ["config", "maintenance.auto", "true"]).status).toBe(0);
     expect(gitSync(root, ["config", "gc.auto", "100"]).status).toBe(0);
@@ -1432,17 +1431,22 @@ process.exit(result.status ?? 1);
 `,
     );
     chmodSync(shim, 0o755);
+    const inProcessTrace = join(root, "in-process-git-child-config.log");
     const shimEnv: Record<string, string> = {
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       BOB_TEST_GIT_PATH: process.env.PATH ?? "",
-      BOB_TEST_GIT_TRACE: join(root, "in-process-git-child-config.log"),
+      BOB_TEST_GIT_TRACE: inProcessTrace,
       BOB_TEST_REPO: root,
     };
-    // The script imported into this process: Bun starts its Git children.
     const priorShimEnv = new Map(Object.keys(shimEnv).map((key) => [key, process.env[key]]));
     Object.assign(process.env, shimEnv);
+    let promoted: { code: number; out: string };
     try {
+      // The script imported into this process: Bun starts its Git children.
       cf.gitRestorableOrThrow({ changelogPath, dir, names: ["fixed-a.md"] });
+      // The script launched by cli().run: Node starts its Git children.
+      process.env.BOB_TEST_GIT_TRACE = trace;
+      promoted = run("promote", "1.2.3", "--date=2026-01-01");
     } finally {
       for (const [key, value] of priorShimEnv) {
         if (value === undefined) delete process.env[key];
@@ -1450,28 +1454,15 @@ process.exit(result.status ?? 1);
       }
     }
     expect(
-      existsSync(shimEnv.BOB_TEST_GIT_TRACE),
+      existsSync(inProcessTrace),
       "the in-process script's Git children were started without process.env (PATH did not reach them)",
     ).toBe(true);
-    expect(readFileSync(shimEnv.BOB_TEST_GIT_TRACE, "utf8")).toMatch(/^(false\n0\n)+$/);
-
-    // The script run by node: Node starts its Git children.
-    const run = spawnSync(
-      "node",
-      [join(root, "scripts", "changelog-fragments.mjs"), "promote", "1.2.3", "--date=2026-01-01"],
-      {
-        encoding: "utf8",
-        timeout: CHILD_TIMEOUT_MS,
-        env: {
-          ...process.env,
-          PATH: `${bin}:${process.env.PATH ?? ""}`,
-          BOB_TEST_GIT_PATH: process.env.PATH ?? "",
-          BOB_TEST_GIT_TRACE: trace,
-          BOB_TEST_REPO: root,
-        },
-      },
-    );
-    expect(run.status, `${run.error ?? ""}${run.stderr ?? ""}`).toBe(0);
+    expect(readFileSync(inProcessTrace, "utf8")).toMatch(/^(false\n0\n)+$/);
+    expect(promoted.code, promoted.out).toBe(0);
+    expect(
+      existsSync(trace),
+      "cli().run's Git children were started without process.env (PATH did not reach them)",
+    ).toBe(true);
     expect(readFileSync(trace, "utf8")).toMatch(/^(false\n0\n)+$/);
   });
 
