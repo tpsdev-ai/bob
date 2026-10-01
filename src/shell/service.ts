@@ -495,14 +495,15 @@ export function renderSystemdUnit(opts: RenderServiceOptions): string {
   const logDir = join(home, "agents", opts.name);
 
   // Refuse line breaks in any ExecStart argument before quoting it.
-  for (const arg of serviceCommandArgs(opts)) {
+  const args = serviceCommandArgs(opts);
+  for (const arg of args) {
     if (arg.includes("\n") || arg.includes("\r") || arg.includes("\0")) {
       throw new Error(
         `refusing ExecStart argument with line breaks: ${JSON.stringify(arg)} (use a path without line breaks)`,
       );
     }
   }
-  const exec = serviceCommandArgs(opts).map((a) => {
+  const exec = args.map((a) => {
     // systemd syntax: double-quote every argument; backslash-escape \ and "
     // inside; replace % with %% and $ with $$ so systemd passes them
     // through literally (systemd.service: %% is %, $$ is $).
