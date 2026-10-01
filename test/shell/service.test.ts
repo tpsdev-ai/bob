@@ -425,13 +425,17 @@ describe("systemd backend", () => {
     expect(argv[3]).toBe("pulse");
   });
   it("ExecStart escapes %h and env vars through literally (bob#222)", () => {
-    const bobPath = `/opt/${HOME} with %h/work`;
+    const bobPath = "/opt/$HOME with %h/work";
     const unit = renderSystemdUnit({
       name: "pulse",
       bobBin: bobPath,
       interpreter: INTERPRETER,
       home: HOME,
     });
+    // The raw unit must contain doubled % and $ (the systemd escaping).
+    expect(unit).toContain("%%h");
+    expect(unit).toContain("$$HOME");
+    // Decode through systemd quoting + the escaping to prove round-trip.
     const argv = execStart(unit);
     expect(argv[1]).toBe(bobPath);
   });
