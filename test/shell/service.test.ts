@@ -288,7 +288,7 @@ describe("systemd backend", () => {
       interpreter: INTERPRETER,
       home: HOME,
     });
-    expect(unit).toContain(`ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse`);
+    expect(unit).toContain(`ExecStart="${INTERPRETER}" "/usr/local/bin/bob" "run" "pulse"`);
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain(`WorkingDirectory=${HOME}/agents/pulse/work`);
@@ -306,7 +306,7 @@ describe("systemd backend", () => {
       home: HOME,
     });
     expect(unit).toContain(
-      `ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse --model claude-fast`,
+      `ExecStart="${INTERPRETER}" "/usr/local/bin/bob" "run" "pulse" "--model" "claude-fast"`,
     );
     expect(() =>
       renderSystemdUnit({ name: "../evil", bobBin: "/bin/bob", interpreter: INTERPRETER }),
@@ -335,7 +335,9 @@ describe("systemd backend", () => {
     });
     expect(res.path).toBe(`${HOME}/.config/systemd/user/bob-pulse.service`);
     expect(written[0].path).toBe(res.path);
-    expect(written[0].contents).toContain(`ExecStart=${INTERPRETER} /usr/local/bin/bob run pulse`);
+    expect(written[0].contents).toContain(
+      `ExecStart="${INTERPRETER}" "/usr/local/bin/bob" "run" "pulse"`,
+    );
     expect(calls).toEqual([["--user", "daemon-reload"]]);
   });
 
@@ -368,6 +370,28 @@ describe("systemd backend", () => {
     // No override → host platform (just assert it returns a valid backend).
     expect(["launchd", "systemd"]).toContain(detectPlatform());
   });
+
+  it("Render with spaces in both interpreter and bob paths (bob#222)", () => {
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: "/opt/node/bin/node",
+      home: HOME,
+    });
+    expect(unit).toContain(`ExecStart="/opt/node/bin/node" "/usr/local/bin/bob" "run" "pulse"`);
+  });
+
+  it("ExecStart with quoted path gets backslash-escaped (bob#222)", () => {
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: "/usr/local/bin/bob",
+      interpreter: '/opt/node with "quote"/bin/node',
+      home: HOME,
+    });
+    expect(unit).toContain(
+      `ExecStart="/opt/node with \\"quote\\"/bin/node" "/usr/local/bin/bob" "run" "pulse"`,
+    );
+  });
 });
 
 describe("the unit does not depend on the service manager's PATH (bob#218)", () => {
@@ -393,7 +417,7 @@ describe("the unit does not depend on the service manager's PATH (bob#218)", () 
       ...deps,
     });
     expect(resolveNodeExecutable(deps)).toBe(node);
-    expect(unit).toContain(`ExecStart=${node} /usr/local/bin/bob run pulse`);
+    expect(unit).toContain(`ExecStart="${node}" "/usr/local/bin/bob" "run" "pulse"`);
   });
 });
 
@@ -1026,7 +1050,9 @@ describe("installService prefers a trusted PATH symlink over a direct match (bob
         runSystemctl: async () => ({ code: 0, stderr: "" }),
       });
       expect(systemd.interpreter).toBe(stable);
-      expect(systemdWritten[0].contents).toContain(`ExecStart=${stable} ${BOB_BIN} run pulse`);
+      expect(systemdWritten[0].contents).toContain(
+        `ExecStart="${stable}" "${BOB_BIN}" "run" "pulse"`,
+      );
       expect(systemdWritten[0].contents).not.toContain(versioned);
     } finally {
       rmSync(versionedDir, { recursive: true, force: true });
@@ -1053,7 +1079,9 @@ describe("installService resolves the interpreter at install time (bob#218)", ()
     // process.execPath is the test runner (bun); the unit must still be node.
     expect(res.interpreter).toBe(node);
     expect(basename(res.interpreter)).not.toBe(basename(process.execPath));
-    expect(written[0].contents).toContain(`ExecStart=${res.interpreter} ${BOB_BIN} run pulse`);
+    expect(written[0].contents).toContain(
+      `ExecStart="${res.interpreter}" "${BOB_BIN}" "run" "pulse"`,
+    );
   });
 
   it("a non-node installer resolves node from its PATH", async () => {
@@ -1076,7 +1104,7 @@ describe("installService resolves the interpreter at install time (bob#218)", ()
       });
       expect(res.interpreter).toBe(nodePath);
       expect(written).toHaveLength(1);
-      expect(written[0].contents).toContain(`ExecStart=${nodePath} ${BOB_BIN} run pulse`);
+      expect(written[0].contents).toContain(`ExecStart="${nodePath}" "${BOB_BIN}" "run" "pulse"`);
       expect(written[0].contents).not.toContain("/opt/bun/bin/bun");
     } finally {
       rmSync(binDir, { recursive: true, force: true });
@@ -1130,10 +1158,38 @@ describe("the rendered unit runs under a minimal PATH with no interpreter on it 
   function execStart(unit: string): string[] {
     const line = unit.split("\n").find((l) => l.startsWith("ExecStart="));
     if (!line) throw new Error("no ExecStart in the systemd unit");
-    return line
-      .slice("ExecStart=".length)
-      .split(" ")
-      .filter((t) => t.length > 0);
+    const raw = line.slice("ExecStart=".length);
+    const tokens: string[] = [];
+    let i = 0;
+    while (i < raw.length) {
+      if (raw[i] === " ") {
+        i++;
+        continue;
+      }
+      if (raw[i] === '"') {
+        i++;
+        let token = "";
+        while (i < raw.length && raw[i] !== '"') {
+          if (raw[i] === "\\" && i + 1 < raw.length) {
+            token += raw[i + 1];
+            i += 2;
+          } else {
+            token += raw[i];
+            i++;
+          }
+        }
+        i++;
+        tokens.push(token);
+      } else {
+        let token = "";
+        while (i < raw.length && raw[i] !== " ") {
+          token += raw[i];
+          i++;
+        }
+        tokens.push(token);
+      }
+    }
+    return tokens;
   }
 
   function helpUnderMinimalPath(command: string[]): { code: number | null; out: string } {
@@ -1207,9 +1263,40 @@ function unitCommand(unitText: string): string {
     return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]).join(" ");
   }
   const line = unitText.split("\n").find((l) => l.startsWith("ExecStart="));
-  return (line ?? "").slice("ExecStart=".length);
+  const raw = (line ?? "").slice("ExecStart=".length);
+  // Strip systemd double-quote wrapping and return space-joined args.
+  const tokens: string[] = [];
+  let idx = 0;
+  while (idx < raw.length) {
+    if (raw[idx] === " ") {
+      idx++;
+      continue;
+    }
+    if (raw[idx] === '"') {
+      idx++;
+      let t = "";
+      while (idx < raw.length && raw[idx] !== '"') {
+        if (raw[idx] === "\\" && idx + 1 < raw.length) {
+          t += raw[idx + 1];
+          idx += 2;
+        } else {
+          t += raw[idx];
+          idx++;
+        }
+      }
+      idx++;
+      tokens.push(t);
+    } else {
+      let t = "";
+      while (idx < raw.length && raw[idx] !== " ") {
+        t += raw[idx];
+        idx++;
+      }
+      tokens.push(t);
+    }
+  }
+  return tokens.join(" ");
 }
-
 describe("the printed install-service command is the unit's command (bob#218)", () => {
   it("renderers and installService build it from ONE argument list", async () => {
     const argv = serviceCommandArgs({
@@ -1233,7 +1320,10 @@ describe("the printed install-service command is the unit's command (bob#218)", 
       model: "claude-fast",
       home: HOME,
     });
-    expect(unit).toContain(`ExecStart=${argv.join(" ")}`);
+    const q = (a: string) => `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    expect(unit).toContain(
+      `ExecStart=${q(argv[0])} ${q(argv[1])} ${q(argv[2])} ${q(argv[3])} ${q(argv[4])} ${q(argv[5])}`,
+    );
 
     const written: Array<{ path: string; contents: string }> = [];
     const res = await installService({
@@ -1247,7 +1337,9 @@ describe("the printed install-service command is the unit's command (bob#218)", 
       runSystemctl: async () => ({ code: 0, stderr: "" }),
     });
     expect(res.argv).toEqual(argv);
-    expect(written[0].contents).toContain(`ExecStart=${argv.join(" ")}`);
+    expect(written[0].contents).toContain(
+      `ExecStart=${q(argv[0])} ${q(argv[1])} ${q(argv[2])} ${q(argv[3])} ${q(argv[4])} ${q(argv[5])}`,
+    );
   });
 
   it("the CLI prints exactly the command the unit runs, including --model", () => {

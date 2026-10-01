@@ -452,7 +452,7 @@ async function installServiceCmd(
   const model = stringFlag(flags, "model");
   const { path: written, argv } = await installService({ name, bobBin, model });
   console.log(`[bob install-service] wrote ${written}`);
-  console.log(`  runs:    ${argv.join(" ")}`);
+  console.log(`  runs:      ${argv.join(" ")}`);
   console.log(`  next:    bob up ${name}   (load + start)`);
   if (bobBin === "bob") {
     console.error(

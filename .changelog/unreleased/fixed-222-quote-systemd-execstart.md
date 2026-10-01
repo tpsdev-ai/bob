@@ -1,0 +1,1 @@
+- **The systemd `ExecStart` line now quotes every argument as `systemd.syntax` requires, with backslash-escaped `\` and `"` inside values (bob#222).** Arguments whose paths contain spaces or quotes (for example `/opt/node with "quote"/bin/node`) are wrapped in double-quotes; any embedded `\` or `"` is prefixed with `\`.

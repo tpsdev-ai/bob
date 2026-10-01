@@ -18,8 +18,7 @@ afterEach(() => {
 
 describe("anchored-edit — smoke session through the tool registry", () => {
   it("reads, edits two lines, inserts after the last line, and creates a file", async () => {
-    const source =
-      Array.from({ length: 10 }, (_, i) => `const v${i + 1} = ${i + 1};`).join("\n") + "\n";
+    const source = `${Array.from({ length: 10 }, (_, i) => `const v${i + 1} = ${i + 1};`).join("\n")}\n`;
     writeFileSync(join(h.root, "app.js"), source);
     const results: string[] = [];
 
