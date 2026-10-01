@@ -37,7 +37,7 @@ export const CONTINUE_TURN =
   "the outcome (including any commit/push the task asked for).";
 
 /** The continuation sent when a run's turn ends with reasoning only — no text
- *  and no tool call (flair#256). A reasoning-only turn is not a final answer:
+ *  and no tool call (bob#256). A reasoning-only turn is not a final answer:
  *  local reasoning models emit it regularly, so bob sends this and keeps the
  *  run going, bounded (DEFAULT_MAX_REASONING_REPROMPTS). */
 export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give your final report.";
@@ -191,10 +191,12 @@ function textFromContent(content: unknown): string {
 }
 
 /**
- * One assistant message's ending, classified (flair#256). `text` is its text
+ * One assistant message's ending, classified (bob#256). `text` is its text
  * blocks, `reasoning` its thinking blocks, `hasToolCall` whether it called a
- * tool. `reasoningOnly` is the shape the issue names — NO tool call and NO
- * non-empty text — which pi would otherwise take as the agent being finished.
+ * tool. `reasoningOnly` is the shape the issue names — NO tool call, NO
+ * non-empty text, and ACTUAL thinking content — which pi would otherwise take
+ * as the agent being finished. An empty or whitespace-only message has no
+ * thinking content, so it is NOT reasoning-only (it is silence).
  */
 export interface AssistantEnding {
   text: string;
@@ -222,7 +224,14 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
       else if (b.type === "toolCall") hasToolCall = true;
     }
   }
-  return { text, reasoning, hasToolCall, reasoningOnly: !hasToolCall && text.trim().length === 0 };
+  return {
+    text,
+    reasoning,
+    hasToolCall,
+    // ACTUAL thinking content is required: an empty or whitespace-only message is
+    // silence, not reasoning-only (bob#256).
+    reasoningOnly: !hasToolCall && text.trim().length === 0 && reasoning.trim().length > 0,
+  };
 }
 
 /** Tracks the LAST assistant message that ended (an `AssistantEnding`), from the
@@ -292,7 +301,7 @@ export interface CompactionObserver {
    *  "send no reply" for a mail turn (bob#200). */
   lastEndFailed(): boolean;
   /** The classification of the LAST assistant message that ended since the
-   *  boundary (flair#256), or undefined when none has or the last one failed. */
+   *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
 }
 

@@ -10,20 +10,33 @@
 // never by the model's output: after that many consecutive reasoning-only
 // endings the run stops and reports the honest outcome. A model that answers
 // with reasoning only forever therefore cannot hold the run — the loop's exit
-// does not depend on a turn ever producing text.
-//
-// The caller sends the first prompt (through promptSession) and then calls
-// repromptWhileReasoningOnly, which only continues it.
+// does not depend on a turn ever producing text. The caller sends the first
+// prompt (through promptSession) and then calls repromptWhileReasoningOnly,
+// which only continues it; run.ts carries ONE budget across its whole run.
 
 import {
   type AssistantEnding,
-  capText,
   DEFAULT_MAX_REASONING_REPROMPTS,
-  DEFAULT_REASONING_EXCERPT_CHARS,
   REASONING_CONTINUE_TURN,
 } from "./compaction-contract.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
+
+/**
+ * Thrown by a turn ADMISSION when an admitted turn keeps ending reasoning-only
+ * past the bound. Callers (the cron scheduler, the Discord inbound listener)
+ * treat it as a failed turn rather than a successful one.
+ */
+export class ReasoningOnlyExhaustedError extends Error {
+  readonly reprompts: number;
+  constructor(reprompts: number) {
+    super(
+      `the turn ended without a final report: its last turns carried reasoning only (no text, no tool call) after ${reprompts} re-prompt(s)`,
+    );
+    this.name = "ReasoningOnlyExhaustedError";
+    this.reprompts = reprompts;
+  }
+}
 
 export interface ReasoningRetryResult {
   /** How many reasoning-only endings were re-prompted (0..maxReprompts). */
@@ -31,9 +44,6 @@ export interface ReasoningRetryResult {
   /** True when the LAST turn still ended reasoning-only (the run ended without a
    *  final report). */
   endedReasoningOnly: boolean;
-  /** A bounded excerpt of the last reasoning, for the honest outcome. "" when
-   *  there was none. */
-  reasoningExcerpt: string;
 }
 
 export interface ReasoningRetryOptions {
@@ -41,15 +51,27 @@ export interface ReasoningRetryOptions {
   /** The last assistant ending observed so far (undefined when the transport
    *  ends no message, in which case there is nothing to re-prompt). */
   readEnding: () => AssistantEnding | undefined;
-  /** Max consecutive reasoning-only endings to re-prompt. Defaults to
-   *  DEFAULT_MAX_REASONING_REPROMPTS. Clamped to >= 0. */
+  /** Max consecutive reasoning-only endings to re-prompt. Must be a finite
+   *  positive number; capped at DEFAULT_MAX_REASONING_REPROMPTS so no caller can
+   *  make the loop unbounded. Defaults to that constant. */
   maxReprompts?: number;
-  excerptChars?: number;
   /** Called before each re-prompt's own turn, so the caller can open a fresh
    *  turn boundary (the observer's startTurn). */
   beginTurn?: () => void;
   /** Test/log seam: called once per re-prompt with the 1-based count and max. */
   onReprompt?: (n: number, max: number) => void;
+}
+
+/**
+ * Resolve the re-prompt budget: a finite positive number, capped at the constant
+ * ceiling. Rejects a non-finite or non-positive value rather than looping.
+ */
+export function resolveMaxReprompts(value?: number): number {
+  const raw = value ?? DEFAULT_MAX_REASONING_REPROMPTS;
+  if (!Number.isFinite(raw) || raw <= 0) {
+    throw new Error(`invalid maxReprompts: ${raw} (must be a finite positive number)`);
+  }
+  return Math.min(Math.floor(raw), DEFAULT_MAX_REASONING_REPROMPTS);
 }
 
 /**
@@ -63,8 +85,7 @@ export interface ReasoningRetryOptions {
 export async function repromptWhileReasoningOnly(
   opts: ReasoningRetryOptions,
 ): Promise<ReasoningRetryResult> {
-  const max = Math.max(0, Math.floor(opts.maxReprompts ?? DEFAULT_MAX_REASONING_REPROMPTS));
-  const excerptChars = opts.excerptChars ?? DEFAULT_REASONING_EXCERPT_CHARS;
+  const max = resolveMaxReprompts(opts.maxReprompts);
   let reprompts = 0;
   let ending = opts.readEnding();
   while (reprompts < max && ending?.reasoningOnly === true) {
@@ -74,9 +95,5 @@ export async function repromptWhileReasoningOnly(
     await promptSession(opts.session, REASONING_CONTINUE_TURN);
     ending = opts.readEnding();
   }
-  return {
-    reprompts,
-    endedReasoningOnly: ending?.reasoningOnly === true,
-    reasoningExcerpt: capText((ending?.reasoning ?? "").trim(), excerptChars),
-  };
+  return { reprompts, endedReasoningOnly: ending?.reasoningOnly === true };
 }
