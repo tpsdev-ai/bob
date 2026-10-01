@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   bobEditCustomTools,
   createReplaceLinesToolDefinition,
@@ -87,6 +87,81 @@ describe("createTolerantEditToolDefinition", () => {
     ).rejects.toThrow(/Found 2 occurrences/);
     // Nothing written.
     expect(readFileSync(join(cwd, "f.md"), "utf8")).toBe("- x   y\n- x  y\n");
+  });
+});
+
+// Holds the FIRST read of each file until the test releases it, so the test
+// decides the order in which two concurrent executions' reads land. The read
+// itself is synchronous, so only the release order decides that order.
+function gatedFirstReads(expected: number) {
+  const releases = new Map<string, () => void>();
+  let allHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    allHeld = resolve;
+  });
+  const read = async (absolutePath: string): Promise<Buffer> => {
+    const buffer = readFileSync(absolutePath);
+    if (!releases.has(absolutePath)) {
+      const gate = new Promise<void>((resolve) => releases.set(absolutePath, resolve));
+      if (releases.size === expected) allHeld();
+      await gate;
+    }
+    return buffer;
+  };
+  const release = (name: string): void => {
+    for (const [path, resolve] of releases) if (basename(path) === name) resolve();
+  };
+  return { read, held, release };
+}
+
+describe("createTolerantEditToolDefinition — concurrent calls (pi runs a response's tool calls in parallel by default)", () => {
+  let cwd: string;
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "bob-edit-"));
+  });
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("two normalised edits of different files each apply to their own file", async () => {
+    writeFileSync(join(cwd, "a.md"), "- a     b\n");
+    writeFileSync(join(cwd, "b.md"), "- c     d\n");
+    const reads = gatedFirstReads(2);
+    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const first = run(tool, { path: "a.md", edits: [{ oldText: "- a b", newText: "- A B" }] });
+    const second = run(tool, { path: "b.md", edits: [{ oldText: "- c d", newText: "- C D" }] });
+    await reads.held;
+    // a.md's read lands, then b.md's, both before a.md's fallback runs.
+    reads.release("a.md");
+    reads.release("b.md");
+    const [ra, rb] = await Promise.all([first, second]);
+    expect(readFileSync(join(cwd, "a.md"), "utf8")).toBe("- A B\n");
+    expect(readFileSync(join(cwd, "b.md"), "utf8")).toBe("- C D\n");
+    expect(resultText(ra)).toContain("Matched 1 edit(s)");
+    expect(resultText(rb)).toContain("Matched 1 edit(s)");
+  });
+
+  it("another file's read cannot make an ambiguous normalised edit apply", async () => {
+    // b.md holds "x y" twice under normalisation, so its edit must be refused;
+    // a.md holds it once, and its span "x  y" also occurs exactly once in b.md.
+    writeFileSync(join(cwd, "a.md"), "x  y\n");
+    writeFileSync(join(cwd, "b.md"), "x  y\nx   y\n");
+    const reads = gatedFirstReads(2);
+    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const onB = run(tool, { path: "b.md", edits: [{ oldText: "x y", newText: "Z" }] });
+    const onA = run(tool, { path: "a.md", edits: [{ oldText: "x y", newText: "W" }] });
+    const refusedB = onB.then(
+      () => "applied",
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+    await reads.held;
+    // b.md's read lands, then a.md's, both before b.md's fallback runs.
+    reads.release("b.md");
+    reads.release("a.md");
+    expect(await refusedB).toMatch(/^Found 2 occurrences of the text in b\.md after normalising/);
+    await onA;
+    expect(readFileSync(join(cwd, "b.md"), "utf8")).toBe("x  y\nx   y\n");
+    expect(readFileSync(join(cwd, "a.md"), "utf8")).toBe("W\n");
   });
 });
 

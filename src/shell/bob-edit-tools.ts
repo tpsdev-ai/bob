@@ -54,15 +54,20 @@ interface CapturingOps {
   content: () => string;
 }
 
+type ReadSource = (absolutePath: string) => Promise<Buffer>;
+
 // pi's default local operations, with the file's content captured so the caller
-// can match against exactly what pi resolved and read.
-function capturingOperations(): CapturingOps {
+// can match against exactly what pi resolved and read. One capture per edit
+// execution: pi runs a response's tool calls in parallel by default, so a
+// capture shared across calls could hold another file's content when the
+// fallback reads it.
+function capturingOperations(read: ReadSource): CapturingOps {
   let captured = "";
   return {
     operations: {
       access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
       readFile: async (absolutePath) => {
-        const buffer = await readFile(absolutePath);
+        const buffer = await read(absolutePath);
         captured = buffer.toString("utf-8");
         return buffer;
       },
@@ -86,10 +91,12 @@ function noteNormalisation(result: unknown, count: number): unknown {
 }
 
 // pi's edit tool, with the whitespace-run-tolerant retry in front of its failure.
-export function createTolerantEditToolDefinition(cwd: string): ToolDefinition {
-  const capturing = capturingOperations();
-  const base = createEditToolDefinition(cwd, { operations: capturing.operations });
-  const runBase = base.execute as unknown as PiEditExecute;
+// `read` is a test seam for the file read pi's edit makes (default: fs readFile).
+export function createTolerantEditToolDefinition(
+  cwd: string,
+  read: ReadSource = (absolutePath) => readFile(absolutePath),
+): ToolDefinition {
+  const base = createEditToolDefinition(cwd);
   return {
     ...base,
     async execute(
@@ -99,6 +106,10 @@ export function createTolerantEditToolDefinition(cwd: string): ToolDefinition {
       onUpdate?: unknown,
       ctx?: unknown,
     ) {
+      // This execution's own capture and its own pi edit over it.
+      const capturing = capturingOperations(read);
+      const runBase = createEditToolDefinition(cwd, { operations: capturing.operations })
+        .execute as unknown as PiEditExecute;
       try {
         return await runBase(callId, input, signal, onUpdate, ctx);
       } catch (err) {
