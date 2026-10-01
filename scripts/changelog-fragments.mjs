@@ -396,12 +396,8 @@ function assertFragmentDirectories(dir) {
     try {
       st = lstatSync(path);
     } catch (err) {
-      if (err?.code === "ENOENT") {
-        throw new FragmentError(
-          `${rel}/: directory not found. It holds the changelog fragments and their README.md; ` +
-            `restore it (git checkout -- ${FRAGMENT_DIR_REL}). An empty directory is fine.`,
-        );
-      }
+      // A missing directory is left to readFragments, which names .changelog/unreleased/.
+      if (err?.code === "ENOENT") return;
       throw err;
     }
     if (st.isSymbolicLink()) {

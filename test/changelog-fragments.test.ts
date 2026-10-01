@@ -28,7 +28,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import * as cf from "../scripts/changelog-fragments.mjs";
 
 const NOTE = cf.UNRELEASED_NOTE;
@@ -191,6 +191,14 @@ describe("changelog fragments — check (bob#236)", () => {
     const { dir, changelogPath } = project();
     rmSync(dir, { recursive: true });
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unreleased\/: directory not found/);
+  });
+
+  it("REFUSES a missing .changelog parent with the fragment-directory message", () => {
+    const { dir, changelogPath } = project();
+    rmSync(dirname(dir), { recursive: true });
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      /\.changelog\/unreleased\/: directory not found/,
+    );
   });
 
   it("REFUSES a non-.md extension, naming the file", () => {
