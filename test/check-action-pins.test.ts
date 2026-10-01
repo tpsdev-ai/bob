@@ -47,6 +47,13 @@ test("a correct full-tag pin passes", async () => {
   expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
 });
 
+test("sub-path action refs with several segments are checked", async () => {
+  const root = fixture(`- uses: github/codeql-action/upload/sarif@${WRONG} # v2.2.0`);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain("github/codeql-action/upload/sarif@");
+});
+
 test("quoted action refs are checked", async () => {
   const root = fixture(`- uses: "oven-sh/setup-bun@${WRONG}" # v2.2.0`);
   const result = await checkActionPins({ root, resolver: resolver() });

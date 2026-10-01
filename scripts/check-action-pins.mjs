@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
 const FULL_TAG = /^v\d+\.\d+\.\d+$/;
 const USES =
-  /^\s*(?:-\s*)?uses:\s*(["']?)([\w.-]+)\/([\w.-]+)((?:\/[^\s@#"']+)*)@([a-f\d]{40})\1(?=\s|#|$)(.*)$/i;
+  /^\s*(?:-\s*)?uses:\s*(["']?)([\w.-]+)\/([\w.-]+)((?:\/[^\s@#"'/]+)*)@([a-f\d]{40})\1(?=\s|#|$)(.*)$/i;
 const MAX_ENTRIES = 10_000;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_TAG_PAGES = 100;
