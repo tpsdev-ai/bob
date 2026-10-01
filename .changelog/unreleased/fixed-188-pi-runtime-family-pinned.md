@@ -1,0 +1,1 @@
+- **The whole @earendil-works (pi) family is pinned in package.json overrides and a unit test fails when bun.lock moves one (Closes #188).** A family member resolved at another version, or with no override, fails it. A lockfile regeneration that moves the pi runtime now fails CI instead of depending on review, and a deliberate upgrade changes the overrides, which the test reads.
