@@ -1,12 +1,15 @@
-// run-termination.test.ts — bob#135. A one-shot `bob run` must always
-// terminate. These exercise the three bounds against the injectable session
-// seam: a stalled provider is ended by the wall clock and by the per-call
-// timeout, a run-log stall trips the no-progress watchdog, and a provider that
-// answers (once, or in a stream of events) is left unchanged.
+// run-termination.test.ts — bob#135. A one-shot `bob run` must end when a bound
+// fires. These exercise the three bounds against the injectable session seam (a
+// `RunSession`, not a provider): a stalled session is ended by the wall clock
+// and by the turn timeout, a run-log stall trips the no-progress watchdog, and a
+// session that answers (once, or in a stream of events) is left unchanged. A
+// session whose `abort()` never settles is ended regardless, and a subprocess
+// proves the process itself exits with the run's code then.
 //
-// Every case passes a SHORT configured bound and its own bun timeout, so a
+// The bound cases pass a SHORT configured bound and their own bun timeout, so a
 // missing or broken bound fails the case rather than hanging the suite.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +34,13 @@ const messageEnd = (text: string, stopReason = "stop"): unknown => ({
   },
 });
 
+// An assistant message that ended with thinking only (no text, no tool call):
+// the shape the reasoning re-prompt loop reacts to (bob#256).
+const thinkingEnd = (thinking: string): unknown => ({
+  type: "message_end",
+  message: { role: "assistant", content: [{ type: "thinking", thinking }], stopReason: "stop" },
+});
+
 interface Fake {
   session: RunSession;
   promptCalls: string[];
@@ -38,9 +48,12 @@ interface Fake {
 }
 
 // A controllable RunSession. `runPrompt` decides what `prompt()` does on each
-// call: emit events, resolve, or stall forever.
+// call: emit events, resolve, or stall forever. `runAbort` (default: settle at
+// once) decides what `abort()` does — pass a never-settling promise to model
+// pi's abort() waiting for a turn that never becomes idle.
 function fakeSession(
   runPrompt: (emit: Emitter, text: string, call: number) => Promise<void>,
+  runAbort?: () => Promise<void>,
 ): Fake {
   const listeners: Array<(event: unknown) => void> = [];
   const promptCalls: string[] = [];
@@ -62,6 +75,7 @@ function fakeSession(
     },
     async abort() {
       aborts += 1;
+      if (runAbort) await runAbort();
     },
     dispose() {
       // no-op
@@ -117,15 +131,15 @@ describe("runAgent termination bounds (bob#135)", () => {
       sessionFactory: factoryReturning(fake.session),
       wallClockMs: 60,
       noProgressMs: 60_000,
-      callTimeoutMs: 60_000,
-      callRetries: 0,
+      turnTimeoutMs: 60_000,
+      turnRetries: 0,
     });
     expect(res.exitCode).toBe(1);
     expect(res.aborted).toBe("wall_clock");
     expect(Date.now() - started).toBeLessThan(5_000);
   }, 15_000);
 
-  it("ends a stalled provider call at the per-call timeout after its retry", async () => {
+  it("ends a stalled turn at the turn timeout after its retry", async () => {
     const fake = fakeSession(() => new Promise<void>(() => {}));
     const res = await runAgent({
       name: "testbot",
@@ -134,11 +148,11 @@ describe("runAgent termination bounds (bob#135)", () => {
       sessionFactory: factoryReturning(fake.session),
       wallClockMs: 60_000,
       noProgressMs: 60_000,
-      callTimeoutMs: 50,
-      callRetries: 1,
+      turnTimeoutMs: 50,
+      turnRetries: 1,
     });
     expect(res.exitCode).toBe(1);
-    expect(res.aborted).toBe("call_timeout");
+    expect(res.aborted).toBe("turn_timeout");
     // one attempt + one retry
     expect(fake.promptCalls.length).toBe(2);
     // the stuck turn was aborted on the session before the retry and on give-up
@@ -159,8 +173,8 @@ describe("runAgent termination bounds (bob#135)", () => {
       sessionFactory: factoryReturning(fake.session),
       wallClockMs: 60_000,
       noProgressMs: 60,
-      callTimeoutMs: 60_000,
-      callRetries: 0,
+      turnTimeoutMs: 60_000,
+      turnRetries: 0,
     });
     expect(res.exitCode).toBe(1);
     expect(res.aborted).toBe("no_progress");
@@ -181,14 +195,101 @@ describe("runAgent termination bounds (bob#135)", () => {
       sessionFactory: factoryReturning(fake.session),
       wallClockMs: 60_000,
       noProgressMs: 150,
-      callTimeoutMs: 60_000,
-      callRetries: 0,
+      turnTimeoutMs: 60_000,
+      turnRetries: 0,
     });
     expect(res.exitCode).toBe(0);
     expect(res.aborted).toBeUndefined();
   }, 15_000);
 
-  it("leaves a normally-answering provider unchanged", async () => {
+  it("ends a reasoning-only turn whose continuation stalls at the turn timeout", async () => {
+    // The first prompt answers with a thinking-only ending; the continuation
+    // (the re-prompt) never answers. The continuation is routed through the
+    // SAME bounded sender, so the turn timeout ends the run — without it, the
+    // continuation would hang forever.
+    const fake = fakeSession(async (emit, _text, call) => {
+      if (call === 1) {
+        emit(thinkingEnd("thinking..."));
+        return;
+      }
+      return new Promise<void>(() => {});
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 50,
+      turnRetries: 0,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("turn_timeout");
+    expect(fake.promptCalls.length).toBe(2); // the prompt + one continuation
+  }, 15_000);
+
+  it("returns once a bound fires even though abort() never settles", async () => {
+    // abort() never settles: pi's abort() waits for idle, so this is the shape
+    // that used to keep the run pending after the wall clock fired.
+    const fake = fakeSession(
+      () => new Promise<void>(() => {}),
+      () => new Promise<void>(() => {}),
+    );
+    const started = Date.now();
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 60_000,
+      turnRetries: 0,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("wall_clock");
+    // The bound (60ms) plus the abort grace (1s), not "forever".
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 15_000);
+
+  it("a subprocess exits with the run's code when abort() never settles", () => {
+    // The real CLI cannot be handed a hanging abort from outside, so this child
+    // mirrors cli.ts's `main().then((code) => process.exit(code))` around the
+    // same runAgent call, with a session whose abort() never settles.
+    const script = join(agentsRoot, "hang-abort-child.ts");
+    writeFileSync(
+      script,
+      [
+        `import { runAgent } from ${JSON.stringify(join(import.meta.dir, "../../src/shell/run.ts"))};`,
+        "const session = {",
+        "  subscribe: () => () => {},",
+        "  prompt: () => new Promise(() => {}),",
+        "  abort: () => new Promise(() => {}),",
+        "  dispose: () => {},",
+        "};",
+        "const res = await runAgent({",
+        '  name: "testbot",',
+        '  prompt: "hi",',
+        `  agentsRoot: ${JSON.stringify(agentsRoot)},`,
+        "  sessionFactory: async () => session,",
+        "  wallClockMs: 60,",
+        "  noProgressMs: 60000,",
+        "  turnTimeoutMs: 60000,",
+        "  turnRetries: 0,",
+        "});",
+        'process.stderr.write("CHILD_RUN_CODE=" + res.exitCode + "\\n");',
+        "process.exit(res.exitCode);",
+      ].join("\n"),
+    );
+    const started = Date.now();
+    const out = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 8_000 });
+    expect(out.status).toBe(1);
+    expect(out.stderr).toContain("CHILD_RUN_CODE=1");
+    expect(Date.now() - started).toBeLessThan(6_000);
+  }, 20_000);
+
+  it("leaves a normally-answering session unchanged", async () => {
     const fake = fakeSession(async (emit) => {
       emit(textDelta("ok"));
       emit(messageEnd("ok"));

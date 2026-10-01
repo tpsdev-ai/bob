@@ -500,8 +500,8 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
-  // Stop an in-flight turn. pi's AgentSession exposes `abort()`; bob's per-call
-  // timeout calls it to unstick a provider call. Optional so a fake session in
+  // Stop an in-flight turn. pi's AgentSession exposes `abort()`; bob's turn
+  // timeout calls it to unstick a prompt turn. Optional so a fake session in
   // tests need not provide it.
   abort?(): Promise<void>;
   dispose(): void;
@@ -693,8 +693,8 @@ export interface RunOptions {
   // Tests pass small values.
   wallClockMs?: number;
   noProgressMs?: number;
-  callTimeoutMs?: number;
-  callRetries?: number;
+  turnTimeoutMs?: number;
+  turnRetries?: number;
 }
 
 export interface RunResult {
@@ -719,7 +719,7 @@ export interface RunResult {
   // retries a failure and sends no reply for silence.)
   failed?: true;
   // bob#135: set when a run-level bound ended the run — the wall clock, the
-  // no-progress watchdog, or the per-call timeout after its retries — rather
+  // no-progress watchdog, or the turn timeout after its retries — rather
   // than the session. The exit code is non-zero.
   aborted?: TerminationReason;
 }
@@ -782,13 +782,13 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. A run-level bound (wall clock, no-progress watchdog)
-  // or the per-call timeout ends the run with a non-zero exit; `stop()` in the
+  // or the turn timeout ends the run with a non-zero exit; `stop()` in the
   // `finally` clears every timer so a completed run leaves the event loop free.
   const limits = resolveRunLimits(resolved.runLimits, {
     ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
-    ...(opts.callTimeoutMs !== undefined ? { callTimeoutMs: opts.callTimeoutMs } : {}),
-    ...(opts.callRetries !== undefined ? { callRetries: opts.callRetries } : {}),
+    ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
+    ...(opts.turnRetries !== undefined ? { turnRetries: opts.turnRetries } : {}),
   });
   const bounds = createRunBounds(limits);
   try {
@@ -815,8 +815,14 @@ async function runBoundedSession(
   // (the mail turn reaches runAgent through `bob launch`). The persistent
   // runtime calls the same helper in persistent.ts; the interactive launch path
   // below covers the TUI. Setup sessions (onboard/align) are not runtime turns
-  // and do not load it.
-  await attachFlairBootstrap(flairBootstrapTarget, config);
+  // and do not load it. Guarded like the factory below: a bootstrap that never
+  // answers is ended by a run-level bound, not left to wedge the run.
+  try {
+    await bounds.guard(attachFlairBootstrap(flairBootstrapTarget, config));
+  } catch (err) {
+    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    throw err;
+  }
 
   const factory = opts.sessionFactory ?? createPiRunSession;
   // #145: the task is the session's CONTRACT, carried in its system prompt
@@ -1056,6 +1062,9 @@ async function runBoundedSession(
       if (budgetLeft() <= 0) return;
       const spent = await repromptWhileReasoningOnly({
         session,
+        // Every re-prompt goes through the SAME bounded sender as the first
+        // prompt, so a stalled continuation is ended by the turn bound too.
+        send: (text) => boundedPrompt(session, text, bounds, opts.name),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
         maxReprompts: budgetLeft(),
@@ -1143,26 +1152,21 @@ async function runBoundedSession(
                 : " (the session settled without a final message)") +
           "\n",
       );
-      const status = readWorktreeStatus(config.cwd);
-      if (status.length > 0) {
-        process.stderr.write(`bob run ${opts.name}: uncommitted paths in ${config.cwd}:\n`);
-        for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
-      } else {
-        process.stderr.write(
-          `bob run ${opts.name}: no dirty paths in ${config.cwd} (nothing to commit there)\n`,
-        );
-      }
+      reportWorktreeStatus(opts.name, config.cwd);
     }
   } catch (err) {
     exitCode = 1;
     failed = true;
     if (err instanceof RunAbortedError) {
       // bob#135 — a run-level bound ended the run: name it and how to raise it,
-      // record the outcome in the log, and stop the stuck call.
+      // record the outcome in the log, and signal the stuck turn. The abort is
+      // bounded: pi's abort() waits for idle, so a turn that never becomes idle
+      // must not keep the run (and the CLI's process.exit) pending.
       aborted = err.reason;
       writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
       process.stderr.write(boundMessage(opts.name, err.reason, limits));
-      if (session.abort) await session.abort().catch(() => {});
+      reportWorktreeStatus(opts.name, config.cwd);
+      await abortBounded(session, ABORT_GRACE_MS);
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch
       // made a cap-hit look like a silent clean exit. Label a provider
@@ -1236,12 +1240,13 @@ function abortedRunResult(
   };
 }
 
-// One provider call under two bounds: the per-call timeout and the run's own
-// abort (bounds.guard). A call that does not answer within `callTimeoutMs` is
-// aborted on the session and retried up to `callRetries` times; after the last
-// retry the run ends as a per-call timeout. pi's PromptOptions carries no
-// AbortSignal, so bob bounds the call itself and calls the session's abort() to
-// stop the stuck turn — this is the nearest layer bob owns.
+// One prompt turn under two bounds: the turn timeout and the run's own
+// abort (bounds.guard). A turn that does not finish within `turnTimeoutMs` is
+// signalled to abort and retried up to `turnRetries` times; after the last
+// retry the run ends as a turn timeout. pi's PromptOptions carries no
+// AbortSignal and `prompt()` is a whole turn — model requests plus tool work —
+// so a turn is the smallest unit bob can bound: bob races the turn and signals
+// the session's abort, at its own layer.
 async function boundedPrompt(
   session: RunSession,
   text: string,
@@ -1251,18 +1256,47 @@ async function boundedPrompt(
   const limits = bounds.limits;
   for (let attempt = 0; ; attempt++) {
     const outcome = await bounds.guard(
-      raceTimeout(promptSession(session, text), limits.callTimeoutMs),
+      raceTimeout(promptSession(session, text), limits.turnTimeoutMs),
     );
     if (outcome !== TIMED_OUT) return;
-    // The provider did not answer. Stop the stuck turn before retrying.
-    if (session.abort) await session.abort().catch(() => {});
-    if (attempt >= limits.callRetries) {
-      bounds.fire("call_timeout");
-      throw new RunAbortedError("call_timeout");
+    // The turn did not finish. Signal the stuck turn to stop before retrying.
+    await abortBounded(session, ABORT_GRACE_MS);
+    if (attempt >= limits.turnRetries) {
+      bounds.fire("turn_timeout");
+      throw new RunAbortedError("turn_timeout");
     }
     process.stderr.write(
-      `bob run ${name}: no provider answer within ${limits.callTimeoutMs % 1000 === 0 ? `${limits.callTimeoutMs / 1000}s` : `${limits.callTimeoutMs}ms`} — retrying (${attempt + 1}/${limits.callRetries})\n`,
+      `bob run ${name}: no prompt turn finished within ${limits.turnTimeoutMs % 1000 === 0 ? `${limits.turnTimeoutMs / 1000}s` : `${limits.turnTimeoutMs}ms`} — retrying (${attempt + 1}/${limits.turnRetries})\n`,
     );
+  }
+}
+
+// How long an abort may block the run. pi's abort() signals cancellation and
+// then WAITS for the agent to become idle; a turn that never becomes idle must
+// not keep the run pending, so every abort is signalled and then given at most
+// this long to settle before the run returns on its own.
+const ABORT_GRACE_MS = 1_000;
+
+/** Signal the session's abort and give it at most `graceMs` to settle. Never
+ *  rejects and never blocks past the grace — the run ends either way. */
+async function abortBounded(session: RunSession, graceMs: number): Promise<void> {
+  if (!session.abort) return;
+  await raceTimeout(
+    Promise.resolve()
+      .then(() => session.abort?.())
+      .catch(() => {}),
+    graceMs,
+  );
+}
+
+/** Print the agent cwd's worktree status: the paths a run may have left dirty. */
+function reportWorktreeStatus(name: string, cwd: string): void {
+  const status = readWorktreeStatus(cwd);
+  if (status.length > 0) {
+    process.stderr.write(`bob run ${name}: uncommitted paths in ${cwd}:\n`);
+    for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
+  } else {
+    process.stderr.write(`bob run ${name}: no dirty paths in ${cwd} (nothing to commit there)\n`);
   }
 }
 

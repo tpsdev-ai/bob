@@ -16,7 +16,7 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
-import type { RunLimitsBlock } from "./run-bounds.js";
+import { MAX_TIMER_MS, MAX_TURN_RETRIES, type RunLimitsBlock } from "./run-bounds.js";
 import {
   ModelBudgetError,
   parseSessionBudget,
@@ -336,21 +336,27 @@ export function readSessionBudget(yamlText: string): SessionBudget {
 //   run:
 //     wall_clock_seconds: 1800
 //     no_progress_seconds: 600
-//     call_timeout_seconds: 300
-//     call_retries: 1
+//     turn_timeout_seconds: 300
+//     turn_retries: 1
 //
-// Absent keys fall back to run-bounds.ts's defaults. Unknown keys and
-// non-positive values throw, so a misspelled bound is not read as "no bound".
+// Absent keys fall back to run-bounds.ts's defaults. An unknown key, a
+// non-integer, or a value outside the accepted range throws, so a misspelled or
+// absurd bound is not read as "no bound".
+//
+// A seconds key is capped so its milliseconds fit the runtime timer range
+// (setTimeout clamps a larger delay to 1 ms).
+const MAX_SECONDS = Math.floor(MAX_TIMER_MS / 1000);
 const RUN_KEYS = [
   "wall_clock_seconds",
   "no_progress_seconds",
-  "call_timeout_seconds",
-  "call_retries",
+  "turn_timeout_seconds",
+  "turn_retries",
 ] as const;
 
-function wholeNumber(value: unknown, allowZero: boolean): number | undefined {
-  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+function wholeNumber(value: unknown, allowZero: boolean, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
   if (allowZero ? value < 0 : value < 1) return undefined;
+  if (value > max) return undefined;
   return value;
 }
 
@@ -361,7 +367,7 @@ export function readRunLimits(yamlText: string): RunLimitsBlock {
     throw new BobYamlError(
       "run",
       lineOf(yamlText, /^run[ \t]*:/m),
-      `the inline form is not supported — write "run:" on its own line, then wall_clock_seconds:/no_progress_seconds:/call_timeout_seconds:/call_retries: indented under it.`,
+      `the inline form is not supported — write "run:" on its own line, then wall_clock_seconds:/no_progress_seconds:/turn_timeout_seconds:/turn_retries: indented under it.`,
     );
   }
   const raw = readBlock(yamlText, "run");
@@ -375,20 +381,24 @@ export function readRunLimits(yamlText: string): RunLimitsBlock {
         `unknown key "${key}" — supported keys are ${RUN_KEYS.join(", ")}.`,
       );
     }
-    const n = wholeNumber(value, key === "call_retries");
+    const n = wholeNumber(
+      value,
+      key === "turn_retries",
+      key === "turn_retries" ? MAX_TURN_RETRIES : MAX_SECONDS,
+    );
     if (n === undefined) {
       throw new BobYamlError(
         "run",
         lineOfKey(yamlText, "run", key),
-        key === "call_retries"
-          ? `"${key}" must be a whole number of retries (0 or more).`
-          : `"${key}" must be a positive whole number of seconds.`,
+        key === "turn_retries"
+          ? `"${key}" must be a whole number of retries between 0 and ${MAX_TURN_RETRIES}.`
+          : `"${key}" must be a whole number of seconds between 1 and ${MAX_SECONDS}.`,
       );
     }
     if (key === "wall_clock_seconds") out.wallClockSeconds = n;
     else if (key === "no_progress_seconds") out.noProgressSeconds = n;
-    else if (key === "call_timeout_seconds") out.callTimeoutSeconds = n;
-    else out.callRetries = n;
+    else if (key === "turn_timeout_seconds") out.turnTimeoutSeconds = n;
+    else out.turnRetries = n;
   }
   return out;
 }

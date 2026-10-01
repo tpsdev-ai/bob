@@ -84,13 +84,14 @@ Commands:
                       that stays up, loading bob.yaml capabilities (discord
                       gateway, cron). This is what the service unit runs.
   run <name> <prompt> Run ONE short-lived task (claude -p style) — minimal +
-                      ephemeral, no gateway. Prints the response, exits. It
-                      always terminates: a wall clock (--timeout <seconds>,
+                      ephemeral, no gateway. Prints the response, exits. A bound
+                      ends a stalled run with a non-zero exit instead of
+                      hanging: a wall clock (--timeout <seconds>,
                       run.wall_clock_seconds), a no-progress watchdog
                       (--no-progress-timeout <seconds>, run.no_progress_seconds),
-                      and a per-call timeout with retries (--call-timeout
-                      <seconds> / --call-retries <n>, run.call_timeout_seconds
-                      / run.call_retries).
+                      and a turn timeout with retries (--turn-timeout
+                      <seconds> / --turn-retries <n>, run.turn_timeout_seconds
+                      / run.turn_retries).
                       Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
@@ -438,12 +439,12 @@ async function run(
   // text (runAgent is otherwise silent), so we print the response.
   //
   // bob#135 — the one-shot bounds. Each flag overrides the agent's bob.yaml
-  // `run:` key, which overrides run-bounds.ts's default. A bad value is a
-  // UsageError (exit 2) before the run starts.
+  // `run:` key, which overrides run-bounds.ts's default. A bare, empty or
+  // out-of-range value is a UsageError (exit 2) before the run starts.
   const wallClockMs = secondsFlagToMs(flags, "timeout");
   const noProgressMs = secondsFlagToMs(flags, "no-progress-timeout");
-  const callTimeoutMs = secondsFlagToMs(flags, "call-timeout");
-  const callRetries = countFlag(flags, "call-retries");
+  const turnTimeoutMs = secondsFlagToMs(flags, "turn-timeout");
+  const turnRetries = countFlag(flags, "turn-retries");
   const result = await runAgent({
     name,
     prompt,
@@ -451,8 +452,8 @@ async function run(
     captureStdout: true,
     ...(wallClockMs !== undefined ? { wallClockMs } : {}),
     ...(noProgressMs !== undefined ? { noProgressMs } : {}),
-    ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
-    ...(callRetries !== undefined ? { callRetries } : {}),
+    ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
+    ...(turnRetries !== undefined ? { turnRetries } : {}),
   });
   if (result.stdout && result.stdout.trim().length > 0) {
     console.log(result.stdout);

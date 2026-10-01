@@ -42,6 +42,8 @@ export function stringFlag(
 // real (`--no-flair=true` likewise registered). A declared boolean now reaches
 // the consumers as a boolean, validated here. No looser coercion anywhere: the
 // whitelist keeps every boolean consumer's "on" identical.
+import { MAX_TIMER_MS, MAX_TURN_RETRIES } from "./run-bounds.js";
+
 export class UsageError extends Error {}
 
 export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
@@ -69,33 +71,64 @@ export function boolFlag(flags: Readonly<Record<string, string | boolean>>, name
   return boolValue(name, value);
 }
 
-// A positive whole number of SECONDS, in milliseconds. A bare/absent flag means
-// "not given"; a bad value (zero, negative, non-integer) is a UsageError naming
-// the flag rather than a timer armed with a nonsense deadline.
+// A positive whole number of SECONDS, in milliseconds — within the runtime
+// timer range (a larger delay is clamped to 1 ms by setTimeout). An ABSENT flag
+// means "not given"; a bare (`--timeout`) or empty (`--timeout=`) flag, and any
+// value that is not a positive whole number of seconds in range, is a
+// UsageError naming the flag rather than a timer armed with a nonsense deadline.
 export function secondsFlagToMs(
   flags: Readonly<Record<string, string | boolean>>,
   name: string,
 ): number | undefined {
-  const raw = stringFlag(flags, name);
+  const raw = valueFlag(flags, name);
   if (raw === undefined) return undefined;
   if (!/^\d+$/.test(raw) || Number(raw) < 1) {
     throw new UsageError(`--${name} must be a positive whole number of seconds (got '${raw}')`);
   }
-  return Number(raw) * 1000;
+  const ms = Number(raw) * 1000;
+  if (!Number.isSafeInteger(ms) || ms > MAX_TIMER_MS) {
+    throw new UsageError(
+      `--${name} must be at most ${Math.floor(MAX_TIMER_MS / 1000)} seconds (got '${raw}')`,
+    );
+  }
+  return ms;
 }
 
-// A non-negative whole-number flag (a count). Bare/absent means "not given";
-// anything else is a UsageError naming the flag.
+// A non-negative whole-number flag (a count), capped at the value's own maximum.
+// Absent means "not given"; a bare or empty flag, a value that is not a whole
+// number, or one past the cap, is a UsageError naming the flag.
 export function countFlag(
   flags: Readonly<Record<string, string | boolean>>,
   name: string,
+  max = MAX_TURN_RETRIES,
 ): number | undefined {
-  const raw = stringFlag(flags, name);
+  const raw = valueFlag(flags, name);
   if (raw === undefined) return undefined;
   if (!/^\d+$/.test(raw)) {
     throw new UsageError(`--${name} must be a whole number (got '${raw}')`);
   }
-  return Number(raw);
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n > max) {
+    throw new UsageError(`--${name} must be a whole number between 0 and ${max} (got '${raw}')`);
+  }
+  return n;
+}
+
+// The raw string of a value flag, or undefined when the flag is ABSENT. A bare
+// flag (`true`) or the empty `--key=` form is a supplied-but-valueless flag: a
+// UsageError, never silently "not given".
+function valueFlag(
+  flags: Readonly<Record<string, string | boolean>>,
+  name: string,
+): string | undefined {
+  if (!(name in flags) || flags[name] === undefined) return undefined;
+  const value = flags[name];
+  if (typeof value !== "string" || value === "") {
+    throw new UsageError(
+      `--${name} needs a value; ${value === true ? "it was given with none" : "it was given empty"}`,
+    );
+  }
+  return value;
 }
 
 // `parseArgs` produces the shape `cli.ts` consumes: the subcommand, the

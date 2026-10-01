@@ -8,11 +8,12 @@
 //
 // The re-prompting is BOUNDED by a constant (DEFAULT_MAX_REASONING_REPROMPTS),
 // never by the model's output. A one-shot run (run.ts) carries ONE budget across
-// its whole run, the compaction retry included; each admitted runtime turn
-// (turn-admission.ts) gets a fresh budget, and exhaustion rejects that turn while
-// the runtime continues. The loop's exit never depends on a turn producing text.
-// The caller sends the first prompt (through promptSession) and then calls
-// repromptWhileReasoningOnly, which only continues it.
+// its whole run, the compaction retry included, and sends every re-prompt through
+// its bounded sender; each admitted runtime turn (turn-admission.ts) gets a fresh
+// budget, and exhaustion rejects that turn while the runtime continues. The
+// loop's exit never depends on a turn producing text. The caller sends the first
+// prompt (through promptSession) and then calls repromptWhileReasoningOnly, which
+// only continues it.
 
 import {
   type AssistantEnding,
@@ -57,6 +58,10 @@ export interface ReasoningRetryOptions {
   /** Called before each re-prompt's own turn, so the caller can open a fresh
    *  turn boundary (the observer's startTurn). */
   beginTurn?: () => void;
+  /** How to send one continuation turn. Defaults to `promptSession(session,
+   *  text)`. A one-shot caller passes its BOUNDED sender, so a stalled
+   *  continuation is bounded exactly like the first prompt. */
+  send?: (text: string) => Promise<void>;
   /** Test/log seam: called once per re-prompt with the 1-based count and max. */
   onReprompt?: (n: number, max: number) => void;
 }
@@ -85,13 +90,14 @@ export async function repromptWhileReasoningOnly(
   opts: ReasoningRetryOptions,
 ): Promise<ReasoningRetryResult> {
   const max = resolveMaxReprompts(opts.maxReprompts);
+  const send = opts.send ?? ((text: string) => promptSession(opts.session, text));
   let reprompts = 0;
   let ending = opts.readEnding();
   while (reprompts < max && ending?.reasoningOnly === true) {
     reprompts += 1;
     opts.onReprompt?.(reprompts, max);
     opts.beginTurn?.();
-    await promptSession(opts.session, REASONING_CONTINUE_TURN);
+    await send(REASONING_CONTINUE_TURN);
     ending = opts.readEnding();
   }
   return { reprompts, endedReasoningOnly: ending?.reasoningOnly === true };

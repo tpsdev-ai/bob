@@ -149,41 +149,56 @@ describe("boolFlag", () => {
   });
 });
 
-// bob#135 — the numeric flags behind `bob run`'s bounds. A bad value is refused
-// by name before any run starts, never armed as a nonsense deadline.
+// bob#135 — the numeric flags behind `bob run`'s bounds. A bare, empty or
+// out-of-range value is refused by name before any run starts, never armed as a
+// nonsense deadline.
 describe("secondsFlagToMs", () => {
   it("reads a whole number of seconds as milliseconds", () => {
     expect(secondsFlagToMs({ timeout: "90" }, "timeout")).toBe(90_000);
+    expect(secondsFlagToMs({ timeout: "2147483" }, "timeout")).toBe(2_147_483_000);
   });
 
-  it("treats absent, bare and empty flags as not given", () => {
+  it("treats an absent flag as not given, but a bare or empty flag as a UsageError", () => {
     expect(secondsFlagToMs({}, "timeout")).toBeUndefined();
-    expect(secondsFlagToMs({ timeout: true }, "timeout")).toBeUndefined();
-    expect(secondsFlagToMs({ timeout: "" }, "timeout")).toBeUndefined();
+    expect(() => secondsFlagToMs({ timeout: true }, "timeout")).toThrow(UsageError);
+    expect(() => secondsFlagToMs({ timeout: "" }, "timeout")).toThrow(UsageError);
   });
 
-  it("refuses zero, negative and non-integer values by flag name", () => {
+  it("refuses zero, negative, non-integer, past-the-timer-range and unsafe values", () => {
     for (const bad of ["0", "-1", "1.5", "abc"]) {
       expect(() => secondsFlagToMs({ timeout: bad }, "timeout")).toThrow(/--timeout/);
     }
+    // 2147484 s → 2147484000 ms; setTimeout clamps that to 1 ms.
+    expect(() => secondsFlagToMs({ timeout: "2147484" }, "timeout")).toThrow(
+      /at most 2147483 seconds/,
+    );
+    // Past Number.MAX_SAFE_INTEGER, so the converted ms is not a safe integer.
+    expect(() => secondsFlagToMs({ timeout: "9007199254740993" }, "timeout")).toThrow(
+      /at most 2147483 seconds/,
+    );
   });
 });
 
 describe("countFlag", () => {
-  it("reads a non-negative whole number", () => {
-    expect(countFlag({ "call-retries": "0" }, "call-retries")).toBe(0);
-    expect(countFlag({ "call-retries": "3" }, "call-retries")).toBe(3);
+  it("reads a non-negative whole number up to the cap", () => {
+    expect(countFlag({ "turn-retries": "0" }, "turn-retries")).toBe(0);
+    expect(countFlag({ "turn-retries": "3" }, "turn-retries")).toBe(3);
+    expect(countFlag({ "turn-retries": "100" }, "turn-retries")).toBe(100);
   });
 
-  it("treats absent, bare and empty flags as not given", () => {
-    expect(countFlag({}, "call-retries")).toBeUndefined();
-    expect(countFlag({ "call-retries": true }, "call-retries")).toBeUndefined();
-    expect(countFlag({ "call-retries": "" }, "call-retries")).toBeUndefined();
+  it("treats an absent flag as not given, but a bare or empty flag as a UsageError", () => {
+    expect(countFlag({}, "turn-retries")).toBeUndefined();
+    expect(() => countFlag({ "turn-retries": true }, "turn-retries")).toThrow(UsageError);
+    expect(() => countFlag({ "turn-retries": "" }, "turn-retries")).toThrow(UsageError);
   });
 
-  it("refuses a non-integer or negative value by flag name", () => {
+  it("refuses a negative, fractional, non-numeric, unsafe or past-the-cap value", () => {
     for (const bad of ["-1", "1.5", "abc"]) {
-      expect(() => countFlag({ "call-retries": bad }, "call-retries")).toThrow(/--call-retries/);
+      expect(() => countFlag({ "turn-retries": bad }, "turn-retries")).toThrow(/--turn-retries/);
     }
+    expect(() => countFlag({ "turn-retries": "101" }, "turn-retries")).toThrow(/between 0 and 100/);
+    expect(() => countFlag({ "turn-retries": "9007199254740993" }, "turn-retries")).toThrow(
+      /between 0 and 100/,
+    );
   });
 });

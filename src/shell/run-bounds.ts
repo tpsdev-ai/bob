@@ -1,4 +1,4 @@
-// run-bounds.ts — the bounds that make a one-shot `bob run` always terminate.
+// run-bounds.ts — the bounds that end a one-shot `bob run` that stalls.
 //
 // bob#135: a one-shot run has hung at startup and mid-run, with no timeout on
 // the inference call and nothing watching the run log, so the process sat until
@@ -9,50 +9,59 @@
 //   * no_progress — no run-log event for N milliseconds. A stuck inference call
 //                   emits nothing, so the log stops growing; this is the
 //                   heartbeat the issue asks for, without external polling.
-//   * call_timeout — ONE provider call's deadline, with a bounded retry, so a
-//                   single stuck call cannot wedge the whole run.
+//   * turn_timeout — ONE prompt turn's deadline, with a bounded retry, so a
+//                   single stuck turn cannot wedge the whole run.
 //
 // The wall-clock and the watchdog are RUN-LEVEL: either one, when it fires,
 // sets the run's reason and aborts the signal, and {@link RunBounds.guard}
-// turns that into a {@link RunAbortedError} at the next await. The per-call
-// bound is applied at the prompt call site (run.ts) with {@link raceTimeout}.
+// turns that into a {@link RunAbortedError} at the next guarded await. The turn
+// bound is applied at every one-shot prompt (run.ts's `boundedPrompt`), which
+// races the prompt turn against {@link raceTimeout} and signals the session's
+// abort — pi's `prompt()` is a whole turn (model requests plus tool work) and
+// offers no per-request signal, so a turn is the smallest unit bob can bound.
 //
 // Every timer is cleared by {@link RunBounds.stop}, which the run calls in a
 // `finally`, so a completed run leaves no timer holding the event loop open.
-export type TerminationReason = "wall_clock" | "no_progress" | "call_timeout";
+export type TerminationReason = "wall_clock" | "no_progress" | "turn_timeout";
 
 export interface RunLimits {
   /** Whole-run wall-clock deadline, in milliseconds. */
   wallClockMs: number;
   /** No run-log event for this long ends the run, in milliseconds. */
   noProgressMs: number;
-  /** One provider call's deadline, in milliseconds. */
-  callTimeoutMs: number;
-  /** Retries after a per-call timeout (0 = one attempt, no retry). */
-  callRetries: number;
+  /** One prompt turn's deadline, in milliseconds. */
+  turnTimeoutMs: number;
+  /** Retries after a turn timeout (0 = one attempt, no retry). */
+  turnRetries: number;
 }
 
 export const DEFAULT_RUN_LIMITS: RunLimits = Object.freeze({
   wallClockMs: 30 * 60_000,
   noProgressMs: 10 * 60_000,
-  callTimeoutMs: 5 * 60_000,
-  callRetries: 1,
+  turnTimeoutMs: 5 * 60_000,
+  turnRetries: 1,
 });
+
+/** Node's maximum timer delay: `setTimeout` clamps a larger delay to 1 ms. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/** The largest accepted turn-retry count — a bound on the retries, not a knob to spin. */
+export const MAX_TURN_RETRIES = 100;
 
 /** The `run:` block of bob.yaml, in SECONDS (the operator-facing unit). */
 export interface RunLimitsBlock {
   wallClockSeconds?: number;
   noProgressSeconds?: number;
-  callTimeoutSeconds?: number;
-  callRetries?: number;
+  turnTimeoutSeconds?: number;
+  turnRetries?: number;
 }
 
 /** Per-invocation overrides (the `bob run` flags), already in milliseconds. */
 export interface RunLimitsOverrides {
   wallClockMs?: number;
   noProgressMs?: number;
-  callTimeoutMs?: number;
-  callRetries?: number;
+  turnTimeoutMs?: number;
+  turnRetries?: number;
 }
 
 /**
@@ -68,14 +77,14 @@ export function resolveRunLimits(block: RunLimitsBlock, overrides?: RunLimitsOve
     ...(block.noProgressSeconds !== undefined
       ? { noProgressMs: block.noProgressSeconds * 1000 }
       : {}),
-    ...(block.callTimeoutSeconds !== undefined
-      ? { callTimeoutMs: block.callTimeoutSeconds * 1000 }
+    ...(block.turnTimeoutSeconds !== undefined
+      ? { turnTimeoutMs: block.turnTimeoutSeconds * 1000 }
       : {}),
-    ...(block.callRetries !== undefined ? { callRetries: block.callRetries } : {}),
+    ...(block.turnRetries !== undefined ? { turnRetries: block.turnRetries } : {}),
     ...(o.wallClockMs !== undefined ? { wallClockMs: o.wallClockMs } : {}),
     ...(o.noProgressMs !== undefined ? { noProgressMs: o.noProgressMs } : {}),
-    ...(o.callTimeoutMs !== undefined ? { callTimeoutMs: o.callTimeoutMs } : {}),
-    ...(o.callRetries !== undefined ? { callRetries: o.callRetries } : {}),
+    ...(o.turnTimeoutMs !== undefined ? { turnTimeoutMs: o.turnTimeoutMs } : {}),
+    ...(o.turnRetries !== undefined ? { turnRetries: o.turnRetries } : {}),
   };
 }
 
@@ -109,13 +118,28 @@ function assertPositive(name: string, value: number): void {
   }
 }
 
+function assertWithinTimerRange(name: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value > MAX_TIMER_MS) {
+    throw new Error(
+      `run bounds: ${name} must be a whole number of ms at most ${MAX_TIMER_MS} (got ${value})`,
+    );
+  }
+}
+
 export function createRunBounds(limits: RunLimits): RunBounds {
   assertPositive("wall_clock", limits.wallClockMs);
   assertPositive("no_progress", limits.noProgressMs);
-  assertPositive("call_timeout", limits.callTimeoutMs);
-  if (!Number.isInteger(limits.callRetries) || limits.callRetries < 0) {
+  assertPositive("turn_timeout", limits.turnTimeoutMs);
+  assertWithinTimerRange("wall_clock", limits.wallClockMs);
+  assertWithinTimerRange("no_progress", limits.noProgressMs);
+  assertWithinTimerRange("turn_timeout", limits.turnTimeoutMs);
+  if (
+    !Number.isSafeInteger(limits.turnRetries) ||
+    limits.turnRetries < 0 ||
+    limits.turnRetries > MAX_TURN_RETRIES
+  ) {
     throw new Error(
-      `run bounds: call_retries must be a non-negative integer (got ${limits.callRetries})`,
+      `run bounds: turn_retries must be a whole number between 0 and ${MAX_TURN_RETRIES} (got ${limits.turnRetries})`,
     );
   }
 
@@ -193,7 +217,7 @@ export function boundMessage(name: string, reason: TerminationReason, limits: Ru
       return `bob run ${name}: WALL-CLOCK TIMEOUT — the run exceeded its ${secs(limits.wallClockMs)} wall clock and was ended (exit 1). Raise it with --timeout <seconds> or run.wall_clock_seconds in bob.yaml.\n`;
     case "no_progress":
       return `bob run ${name}: NO-PROGRESS WATCHDOG — the run log saw no new event for ${secs(limits.noProgressMs)}, so the run was ended (exit 1). Raise it with --no-progress-timeout <seconds> or run.no_progress_seconds in bob.yaml.\n`;
-    case "call_timeout":
-      return `bob run ${name}: PER-CALL TIMEOUT — the provider did not answer within ${secs(limits.callTimeoutMs)} after ${limits.callRetries} retr${limits.callRetries === 1 ? "y" : "ies"}, so the run was ended (exit 1). Raise it with --call-timeout <seconds> or run.call_timeout_seconds in bob.yaml.\n`;
+    case "turn_timeout":
+      return `bob run ${name}: TURN TIMEOUT — the prompt turn did not finish within ${secs(limits.turnTimeoutMs)} after ${limits.turnRetries} retr${limits.turnRetries === 1 ? "y" : "ies"}, so the run was ended (exit 1). Raise it with --turn-timeout <seconds> or run.turn_timeout_seconds in bob.yaml.\n`;
   }
 }
