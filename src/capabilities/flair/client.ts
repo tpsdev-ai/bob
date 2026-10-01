@@ -38,6 +38,49 @@ export interface FlairMemory {
   [k: string]: unknown;
 }
 
+// bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is the
+// rendered block bob appends to a session's system prompt (soul + the "Active
+// Skills" manifest + predicted context); `tokenEstimate` is Flair's own size
+// figure, optional here because the caller only needs the text.
+export interface FlairBootstrap {
+  context: string;
+  tokenEstimate?: number;
+}
+
+export interface FlairBootstrapOptions {
+  // Hard cap on Flair's CONTENT SELECTION (POST /BootstrapMemories maxTokens).
+  maxTokens?: number;
+  channel?: string;
+  surface?: string;
+  // Whether Flair includes the soul. Left at Flair's default (true): with
+  // `false` Flair also drops the skill-assignment scan that builds the "Active
+  // Skills" section (resources/MemoryBootstrap.ts), so the manifest this
+  // feature exists to load would vanish.
+  includeSoul?: boolean;
+}
+
+// Why a bootstrap call produced no context. Code-owned, so a session's failure
+// line can name the cause without ever echoing server text (which can carry a
+// reflected credential).
+export type FlairBootstrapFailure = "unreachable" | "http_error" | "invalid_response";
+
+export class FlairBootstrapError extends Error {
+  readonly failure: FlairBootstrapFailure;
+  readonly status?: number;
+  constructor(failure: FlairBootstrapFailure, status?: number) {
+    super(
+      failure === "unreachable"
+        ? "flair bootstrap: the request did not complete"
+        : failure === "http_error"
+          ? `flair bootstrap: HTTP ${status ?? "error"}`
+          : "flair bootstrap: the response carried no context",
+    );
+    this.name = "FlairBootstrapError";
+    this.failure = failure;
+    if (status !== undefined) this.status = status;
+  }
+}
+
 export interface FlairSoulEntry {
   id: string;
   agentId?: string;
@@ -70,6 +113,7 @@ export interface FlairClient {
     },
   ): Promise<{ id: string }>;
   get(id: string): Promise<FlairMemory | null>;
+  bootstrap(opts?: FlairBootstrapOptions): Promise<FlairBootstrap>;
 }
 
 // Minimal fetch shape we depend on (so tests pass a fake without DOM lib types).
@@ -272,6 +316,47 @@ export class FlairHttpClient implements FlairClient {
       | FlairMemory
       | undefined;
     return r ?? null;
+  }
+
+  // ── Session bootstrap (POST /BootstrapMemories) ───────────────────────────
+  //
+  // Signed as this agent, like every other call. A non-2xx, an unreadable body
+  // or a body with no `context` string is an ERROR (a typed FlairBootstrapError),
+  // never an empty context: a caller that appended "" would read a failed load
+  // as "Flair had nothing", which is the one thing bootstrap must never look
+  // like.
+  async bootstrap(opts: FlairBootstrapOptions = {}): Promise<FlairBootstrap> {
+    const body: Record<string, unknown> = { agentId: this.agentId };
+    if (opts.maxTokens !== undefined) body.maxTokens = opts.maxTokens;
+    if (opts.channel !== undefined) body.channel = opts.channel;
+    if (opts.surface !== undefined) body.surface = opts.surface;
+    if (opts.includeSoul !== undefined) body.includeSoul = opts.includeSoul;
+    let r: unknown;
+    try {
+      r = await this.signedFetch("POST", "/BootstrapMemories", body);
+    } catch (err) {
+      // signedFetch's message names the status and a slice of the server body;
+      // that body can carry a reflected credential, so the status is parsed out
+      // and the message is dropped, never re-thrown.
+      const message = err instanceof Error ? err.message : "";
+      const m = /^flair POST \/BootstrapMemories -> (\d{3})/.exec(message);
+      throw m
+        ? new FlairBootstrapError("http_error", Number(m[1]))
+        : new FlairBootstrapError("unreachable");
+    }
+    if (
+      r === null ||
+      typeof r !== "object" ||
+      Array.isArray(r) ||
+      typeof (r as { context?: unknown }).context !== "string"
+    ) {
+      throw new FlairBootstrapError("invalid_response");
+    }
+    const rec = r as { context: string; tokenEstimate?: unknown };
+    return {
+      context: rec.context,
+      ...(typeof rec.tokenEstimate === "number" ? { tokenEstimate: rec.tokenEstimate } : {}),
+    };
   }
 
   // ── Presence heartbeats (POST /Presence) ──────────────────────────────────

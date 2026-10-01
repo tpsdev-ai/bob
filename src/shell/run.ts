@@ -73,6 +73,11 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
+import {
+  type FlairBootstrapTarget,
+  loadFlairBootstrapContext,
+  flairBootstrapTarget as resolveFlairBootstrapTarget,
+} from "./flair-bootstrap.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import { createRequestUsageTracker } from "./request-usage.js";
@@ -495,6 +500,11 @@ export interface RunSessionConfig {
   model: string;
   // Appended system prompt (soul.md contents). Empty string when no soul.
   appendSystemPrompt: string;
+  // bob#254 — the Flair bootstrap block, when the agent configures the flair
+  // capability and Flair answered. Appended to the system prompt AFTER
+  // soul.md, as its own entry (session.ts isolatedLoaderOptions). Absent when
+  // there is no bootstrap, on any failure path, or in a web session.
+  flairBootstrap?: string;
   // The agent's working dir (~/agents/<name>/work) — pi's cwd.
   cwd: string;
   // The agent's pi config dir (~/agents/<name>/.pi-agent) — holds
@@ -684,6 +694,24 @@ export interface RunResult {
   failed?: true;
 }
 
+// bob#254 — load the Flair bootstrap for this session and attach the rendered
+// block to the config. A failure never stops the session: the block becomes the
+// one-line "could not load" note instead (flair-bootstrap.ts). No target (the
+// agent does not configure the flair capability) → nothing to do.
+export async function attachFlairBootstrap(
+  target: FlairBootstrapTarget | undefined,
+  config: RunSessionConfig,
+  log?: (message: string) => void,
+): Promise<void> {
+  if (target === undefined) return;
+  const text = await loadFlairBootstrapContext({
+    target,
+    gate: config,
+    ...(log !== undefined ? { log } : {}),
+  });
+  if (text.length > 0) config.flairBootstrap = text;
+}
+
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -713,7 +741,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { agentDir, provider, model, config } = resolveRunConfig({
+  const { agentDir, provider, model, config, flairBootstrapTarget } = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
@@ -721,6 +749,14 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+
+  // bob#254 — the agent runtime sessions that build a system prompt load the
+  // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
+  // (the mail turn reaches runAgent through `bob launch`). The persistent
+  // runtime calls the same helper in persistent.ts; the interactive launch path
+  // below covers the TUI. Setup sessions (onboard/align) are not runtime turns
+  // and do not load it.
+  await attachFlairBootstrap(flairBootstrapTarget, config);
 
   const factory = opts.sessionFactory ?? createPiRunSession;
   // #145: the task is the session's CONTRACT, carried in its system prompt
@@ -1092,6 +1128,9 @@ export interface ResolvedRunConfig {
   // the persistent runtime can start the ones it runs itself (tps-mail's inbox
   // consumer) from the SAME validated config the session loads.
   capabilities: ResolvedCapability[];
+  // bob#254 — where to call Flair at session start, when the agent configures
+  // the flair capability. Absent: no bootstrap is loaded.
+  flairBootstrapTarget?: FlairBootstrapTarget;
 }
 
 // The tool policy for an agent's bob.yaml. ONE entry point for every launch
@@ -1242,13 +1281,16 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     return result.exitCode;
   }
 
-  const { config, policy } = resolveRunConfig({
+  const { config, policy, flairBootstrapTarget } = resolveRunConfig({
     name: opts.name,
     agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
     model: opts.model,
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+  // bob#254 — the interactive path builds a real system prompt too, so it loads
+  // the bootstrap before the session is opened.
+  await attachFlairBootstrap(flairBootstrapTarget, config);
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
   return interactive({ config, policy, deps: opts.deps });
 }
@@ -1677,6 +1719,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     workspaceRoot: join(agentDir, "work"),
   });
 
+  // bob#254 — the Flair coordinates the session bootstrap calls at start, when
+  // the agent configures the flair capability. Resolved here (sync) from the
+  // SAME validated capability config the session loads; the async call happens
+  // in each runtime entry path (runAgent, runLaunch, startPersistent).
+  const flairBootstrapTarget = resolveFlairBootstrapTarget(capabilities);
+
   const config: RunSessionConfig = {
     provider,
     model,
@@ -1712,6 +1760,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     agent,
     policy: toolPolicy,
     capabilities,
+    ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }
 

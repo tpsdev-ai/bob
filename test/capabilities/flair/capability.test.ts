@@ -59,6 +59,9 @@ class FakeClient implements FlairClient {
     this.getCalls.push(id);
     return id === "pulse-123" ? { id, content: "hello" } : null;
   }
+  async bootstrap() {
+    return { context: "fake context" };
+  }
 }
 
 describe("loadConfigFromEnv", () => {

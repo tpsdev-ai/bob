@@ -35,6 +35,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 export { type PiLike, type WireOptions, wireFlairCapability } from "./capability.js";
 export {
   type Durability,
+  type FlairBootstrap,
+  FlairBootstrapError,
+  type FlairBootstrapFailure,
+  type FlairBootstrapOptions,
   type FlairClient,
   FlairHttpClient,
   type FlairMemory,

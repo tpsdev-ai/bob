@@ -108,6 +108,7 @@ describe("classification completeness", () => {
     });
     expect({ ...STARTUP_CONTEXT_CLASS }).toEqual({
       soul: "private",
+      "flair-bootstrap": "private",
       "standing-contract": "private",
       "task-contract": "admitted-prompt",
       "web-system-prompt": "public",
@@ -224,6 +225,30 @@ describe("the web composition rule", () => {
         view({ extensions: [WEB], startup: [{ kind: "classified", source: "task-contract" }] }),
       ),
     ).toEqual([]);
+  });
+
+  it("classifies the Flair bootstrap as private startup context, like soul.md", () => {
+    // No web: classified, no problem.
+    expect(
+      webCompositionProblems(
+        configCompositionView({
+          extensionSources: [],
+          tools: [],
+          flairBootstrap: "## Context from Flair\n- skill-x",
+        }),
+      ),
+    ).toEqual([]);
+    // A web session that would hold it: refused, named as the private row.
+    expect(
+      webCompositionProblems(
+        configCompositionView({
+          extensionSources: ["/cap/web"],
+          capabilityBySource: { "/cap/web": "web" },
+          tools: [],
+          flairBootstrap: "## Context from Flair\n- skill-x",
+        }),
+      ),
+    ).toEqual([`startup context "flair-bootstrap" is private`]);
   });
 
   it("refuses restored history, and a history source that changed after creation", () => {
