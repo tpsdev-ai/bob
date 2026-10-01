@@ -406,14 +406,9 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
   }
 }
 
-// pi's `api` for an OpenAI-compatible endpoint (the shape ollama.com/v1 speaks),
-// and the declared limits for its model. A provider block WITHOUT `api` is one pi
-// cannot resolve at all (bob#132: "Unknown provider"). pi fills in the model's
-// reasoning/input/window/output cap when they are absent; bob writes them so the
-// scaffold states the values the agent runs with. bob replaces the window with
-// provider.context_window at session creation (bob#214); the 16 384 output cap
-// is what pi sends on every request unless bob.yaml sets
-// provider.max_output_tokens. The model fields mirror buildOpenrouterProvider.
+// The OpenAI-compatible provider shape for ollama.com/v1 (bob#132): pi drops a
+// custom provider block that has no `api`. bob also writes the model's fields;
+// bob.yaml can override the limits at session creation (bob#214).
 const PI_OPENAI_COMPLETIONS_API = "openai-completions";
 const PI_MODEL_DEFAULT_CONTEXT_WINDOW = 128_000;
 const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
@@ -443,9 +438,8 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
   // is NEVER written here (bob#183) — so its auth.json carries no key entry.
   const isEnvKeyProvider = opts.provider === "openrouter";
-  // The OpenAI-compatible providers get the full provider schema (api, compat and
-  // a complete model entry), so pi can resolve `ollama-cloud/<model>` from the
-  // scaffolded files with no hand-editing (bob#132).
+  // OpenAI-compatible providers also get `api`, `compat` and an explicit model
+  // entry (bob#132).
   const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
   const baseUrl = knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";

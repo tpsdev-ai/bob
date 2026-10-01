@@ -484,7 +484,7 @@ describe("initAgent", () => {
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
       expect(models.providers["ollama-cloud"].models[0].id).toBe("deepseek-v4-pro");
       expect(models.providers["ollama-cloud"].baseUrl).toBe("https://ollama.com/v1");
-      // bob#132: the full OpenAI-compatible provider schema, so pi resolves it.
+      // bob#132: `api` and `compat` on the provider block.
       expect(models.providers["ollama-cloud"].api).toBe("openai-completions");
       expect(models.providers["ollama-cloud"].compat).toEqual({
         supportsDeveloperRole: false,
