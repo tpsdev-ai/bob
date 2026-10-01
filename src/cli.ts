@@ -43,6 +43,7 @@ import {
   runMailTurnLaunch,
   runOnboard,
   runPersistent,
+  secondsFlagToMs,
   servicePath,
   stringFlag,
   syncFlairSoul,
@@ -82,7 +83,14 @@ Commands:
                       that stays up, loading bob.yaml capabilities (discord
                       gateway, cron). This is what the service unit runs.
   run <name> <prompt> Run ONE short-lived task (claude -p style) — minimal +
-                      ephemeral, no gateway. Prints the response, exits.
+                      ephemeral, no gateway. Prints the response, exits. A bound
+                      ends a stalled run with a non-zero exit instead of
+                      hanging: a wall clock (--timeout <seconds>,
+                      run.wall_clock_seconds), a no-progress watchdog
+                      (--no-progress-timeout <seconds>, run.no_progress_seconds),
+                      and an optional turn timeout (--turn-timeout <seconds>,
+                      run.turn_timeout_seconds). Defaults: 30 min wall clock,
+                      10 min without session events; no turn timeout.
                       Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
@@ -428,7 +436,23 @@ async function run(
   // ONE-SHOT TASK (claude -p style) — minimal + ephemeral (no gateway; see
   // BOB_PERSISTENT in run.ts). captureStdout collects the assistant's final
   // text (runAgent is otherwise silent), so we print the response.
-  const result = await runAgent({ name, prompt, model, captureStdout: true });
+  //
+  // bob#135 — the one-shot bounds. Each flag overrides the agent's bob.yaml
+  // `run:` key, which overrides run-bounds.ts's default. A bare, empty or
+  // out-of-range value is a UsageError (exit 2), on every occurrence of a
+  // repeated flag, before the run starts.
+  const wallClockMs = secondsFlagToMs(flags, "timeout");
+  const noProgressMs = secondsFlagToMs(flags, "no-progress-timeout");
+  const turnTimeoutMs = secondsFlagToMs(flags, "turn-timeout");
+  const result = await runAgent({
+    name,
+    prompt,
+    model,
+    captureStdout: true,
+    ...(wallClockMs !== undefined ? { wallClockMs } : {}),
+    ...(noProgressMs !== undefined ? { noProgressMs } : {}),
+    ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
+  });
   if (result.stdout && result.stdout.trim().length > 0) {
     console.log(result.stdout);
   }

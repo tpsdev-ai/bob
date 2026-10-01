@@ -122,9 +122,11 @@ describe("runAgent loop breaker", () => {
       agentsRoot,
       sessionFactory: factoryReturning(fake.session),
       toolLoopLimit: 3,
+      turnTimeoutMs: 50,
     });
     expect(res.exitCode).toBe(1);
     expect(res.loopBreaker).toEqual({ toolName: "edit", count: 3 });
+    expect(res.aborted).toBeUndefined();
     expect(res.failed).toBe(true);
     expect(fake.aborts()).toBeGreaterThanOrEqual(1);
   }, 15_000);

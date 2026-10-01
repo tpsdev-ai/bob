@@ -804,12 +804,15 @@ describe("runAgent — the completion contract (#145)", () => {
         listeners.push(listener);
         return () => {};
       },
+      // The best-effort note is queued with steer(): it is not a turn the test
+      // scripts.
+      async steer() {},
       async prompt(text: string, options?: unknown) {
-        // A STEER (the best-effort note) is not a turn the test scripts: only a
-        // real prompt runs the scripted events. Without this, the note's own
-        // steer would emit another compaction and loop. (bob's own prompt entry
-        // point passes `expandPromptTemplates: false`, which is still a real
-        // prompt — the tell is the streaming behaviour.)
+        // A STEER is not a turn the test scripts: only a real prompt runs the
+        // scripted events. Without this, a steering prompt would emit another
+        // compaction and loop. (bob's own prompt entry point passes
+        // `expandPromptTemplates: false`, which is still a real prompt — the tell
+        // is the streaming behaviour.)
         const streaming = (options as { streamingBehavior?: string } | undefined)
           ?.streamingBehavior;
         if (streaming !== undefined) return;
@@ -968,19 +971,25 @@ describe("runAgent — the completion contract (#145)", () => {
     expect(res.reason).toBe("final_shape_mismatch");
   });
 
-  it('sends the best-effort "what remains" note after a compaction, as a STEER', async () => {
-    const steers: Array<{ text: string; options?: unknown }> = [];
+  it('sends the best-effort "what remains" note after a compaction, queued with steer()', async () => {
+    // bob#135: the note is queued with steer(), never sent as a steering
+    // prompt(), which would start a turn of its own on an idle session.
+    const steers: string[] = [];
+    const steeringPrompts: string[] = [];
     const listeners: Array<(event: unknown) => void> = [];
     const session = {
       subscribe(listener: (event: unknown) => void) {
         listeners.push(listener);
         return () => {};
       },
+      async steer(text: string) {
+        steers.push(text);
+      },
       async prompt(text: string, options?: unknown) {
         const streaming = (options as { streamingBehavior?: string } | undefined)
           ?.streamingBehavior;
         if (streaming !== undefined) {
-          steers.push({ text, options });
+          steeringPrompts.push(text);
           return;
         }
         for (const listener of listeners) {
@@ -999,7 +1008,7 @@ describe("runAgent — the completion contract (#145)", () => {
     });
     expect(res.exitCode).toBe(0);
     expect(steers).toHaveLength(1);
-    expect(steers[0].text).toContain("WHAT REMAINS");
-    expect((steers[0].options as { streamingBehavior?: string }).streamingBehavior).toBe("steer");
+    expect(steers[0]).toContain("WHAT REMAINS");
+    expect(steeringPrompts).toEqual([]);
   });
 });

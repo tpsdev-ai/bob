@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>tpsdev-ai/flair//.github/renovate-preset"],
-  "description": "bob-specific exceptions to the shared tpsdev-ai preset. bob's bunfig.toml refuses versions younger than 7 days at install time (except @types/node and typescript), so advisory fixes wait the same 7 days here; an urgent fresh fix is a deliberate PR that adds the package to bunfig's minimumReleaseAgeExcludes. Lockfile maintenance is off: a lockfile refresh could move the pi runtime's transitive packages. Other update PRs regenerate bun.lock too, so review every generated lockfile diff for pi transitive changes.",
+  "description": "bob-specific exceptions to the shared tpsdev-ai preset. bob's bunfig.toml refuses versions younger than 7 days at install time (except @types/node and typescript, bunfig's install gate only — the preset's 7-day cooldown holds those two as well), so advisory fixes wait the same 7 days here; an urgent fresh fix is a deliberate PR that carries the version bump itself as well as adding the package to bunfig's minimumReleaseAgeExcludes — the exclude alone does not make Renovate propose the fix sooner, because vulnerabilityAlerts.minimumReleaseAge below still holds it. Lockfile maintenance is off. CI fails when any @earendil-works/* entry in bun.lock resolves to a version other than its exact override, or has no override; the pi rule below names the pins.",
   "vulnerabilityAlerts": {
     "minimumReleaseAge": "7 days"
   },
@@ -10,7 +10,7 @@
   },
   "packageRules": [
     {
-      "description": "bob pins the pi runtime at exactly 0.84.3 on purpose: bob builds on its ModelRuntime seam, and a pi upgrade is a deliberate, spec'd PR with its own review, never a Renovate bump. The rule matches the whole @earendil-works family, so Renovate proposes no update for any of them; their transitive resolutions (pi-agent-core, pi-client, pi-protocol, pi-telemetry, pi-tui) can still move when another update regenerates bun.lock.",
+      "description": "bob pins the pi runtime at exactly 0.84.3 on purpose: bob builds on its ModelRuntime seam, and a pi upgrade is a deliberate, spec'd PR with its own review, never a Renovate bump. The rule matches @earendil-works/**, so Renovate proposes no update for those packages. package.json overrides pin pi-agent-core, pi-ai, pi-client, pi-coding-agent, pi-protocol, pi-telemetry and pi-tui to exact versions, and test/pi-family-pin.test.ts enforces them: CI fails when any @earendil-works/* entry in bun.lock resolves to a version other than its exact override, or has no override. A coordinated override + lock upgrade passes.",
       "matchPackageNames": ["@earendil-works/**"],
       "enabled": false
     },

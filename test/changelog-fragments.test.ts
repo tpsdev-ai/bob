@@ -38,7 +38,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import * as cf from "../scripts/changelog-fragments.mjs";
 
 const NOTE = cf.UNRELEASED_NOTE;
@@ -240,6 +240,14 @@ describe("changelog fragments — check (bob#236)", () => {
     const { dir, changelogPath } = project();
     rmSync(dir, { recursive: true });
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unreleased\/: directory not found/);
+  });
+
+  it("REFUSES a missing .changelog parent with the fragment-directory message", () => {
+    const { dir, changelogPath } = project();
+    rmSync(dirname(dir), { recursive: true });
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      /\.changelog\/unreleased\/: directory not found/,
+    );
   });
 
   it("REFUSES a non-.md extension, naming the file", () => {
@@ -1366,6 +1374,37 @@ describe("changelog fragments — the CLI (bob#236)", () => {
       return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     };
     return { run, dir, changelogPath };
+  }
+
+  for (const location of [".changelog", ".changelog/unreleased"] as const) {
+    for (const command of ["check", "promote"] as const) {
+      it(`${command} refuses a symbolic link at ${location} without changing files`, () => {
+        const { run, changelogPath } = cli();
+        const link = join(root, location);
+        const target = join(root, "linked-store");
+        renameSync(link, target);
+        symlinkSync(target, link);
+        const targetFragments = location === ".changelog" ? join(target, "unreleased") : target;
+        writeFileSync(join(targetFragments, "README.md"), "# fragments\n");
+        stageAll();
+
+        const changelogBefore = readFileSync(changelogPath);
+        const namesBefore = readdirSync(targetFragments).sort();
+        const filesBefore = namesBefore.map((name) => readFileSync(join(targetFragments, name)));
+        const result = command === "check" ? run(command) : run(command, "1.2.3");
+
+        expect(result.code, result.out).toBe(1);
+        expect(result.out).toContain(`${location}/ is a symbolic link`);
+        expect(result.out).toContain("Replace the link with the directory itself");
+        expect(readFileSync(changelogPath)).toEqual(changelogBefore);
+        expect(lstatSync(link).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(link)).toBe(target);
+        expect(readdirSync(targetFragments).sort()).toEqual(namesBefore);
+        expect(namesBefore.map((name) => readFileSync(join(targetFragments, name)))).toEqual(
+          filesBefore,
+        );
+      }, 15_000);
+    }
   }
 
   for (const cmd of ["render", "list", "check"]) {

@@ -184,7 +184,7 @@ export class DiscordJsClient implements DiscordClient {
       // Give the REST manager a request path that never builds a Headers from an
       // h2-tagged response (see makeDiscordRestRequest). Without this, the
       // capability cannot make ANY REST call under Node.
-      rest: { makeRequest: makeDiscordRestRequest as RESTOptions["makeRequest"] },
+      rest: { makeRequest: makeDiscordRestRequest as unknown as RESTOptions["makeRequest"] },
     });
     // Enable the REST manager WITHOUT logging in — outbound works in a one-shot
     // run with no gateway connection. (login() also sets the token; doing it

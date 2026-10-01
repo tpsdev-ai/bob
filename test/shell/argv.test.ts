@@ -11,6 +11,7 @@ import {
   BOOLEAN_FLAGS,
   boolFlag,
   parseArgs,
+  secondsFlagToMs,
   stringFlag,
   UsageError,
 } from "../../src/shell/argv.js";
@@ -127,6 +128,27 @@ describe("parseArgs", () => {
   it("a repeated flag keeps the LAST value (the object key is overwritten)", () => {
     expect(parseArgs(["run", "--model", "a", "--model", "b"]).flags.model).toBe("b");
   });
+
+  it("validates EVERY occurrence of a repeated bound flag (a bad earlier one cannot be hidden)", () => {
+    // bob#135 r3: `--timeout= --timeout=10` used to parse to the valid 10s.
+    expect(() => parseArgs(["run", "ember", "task", "--timeout=", "--timeout=10"])).toThrow(
+      UsageError,
+    );
+    expect(() => parseArgs(["run", "ember", "task", "--timeout=", "--timeout=10"])).toThrow(
+      "--timeout needs a value",
+    );
+    // the bare occurrence is validated too, wherever it sits
+    expect(() => parseArgs(["run", "ember", "task", "--timeout", "--timeout=10"])).toThrow(
+      "--timeout needs a value",
+    );
+    expect(() =>
+      parseArgs(["run", "ember", "task", "--no-progress-timeout=0", "--no-progress-timeout=10"]),
+    ).toThrow("--no-progress-timeout must be a positive whole number of seconds");
+    // valid repeats still take the last value, as for every flag
+    expect(parseArgs(["run", "ember", "task", "--timeout=10", "--timeout=20"]).flags.timeout).toBe(
+      "20",
+    );
+  });
 });
 
 // `boolFlag` is the second guard: the same whitelist for a flag map built by
@@ -144,5 +166,35 @@ describe("boolFlag", () => {
     for (const bad of ["yes", "1", "TRUE", ""]) {
       expect(() => boolFlag({ "dry-run": bad }, "dry-run")).toThrow(UsageError);
     }
+  });
+});
+
+// bob#135 — the numeric flags behind `bob run`'s bounds. A bare, empty or
+// out-of-range value is refused by name before any run starts — on every
+// occurrence of a repeated flag — never armed as a nonsense deadline.
+describe("secondsFlagToMs", () => {
+  it("reads a whole number of seconds as milliseconds", () => {
+    expect(secondsFlagToMs({ timeout: "90" }, "timeout")).toBe(90_000);
+    expect(secondsFlagToMs({ timeout: "2147483" }, "timeout")).toBe(2_147_483_000);
+  });
+
+  it("treats an absent flag as not given, but a bare or empty flag as a UsageError", () => {
+    expect(secondsFlagToMs({}, "timeout")).toBeUndefined();
+    expect(() => secondsFlagToMs({ timeout: true }, "timeout")).toThrow(UsageError);
+    expect(() => secondsFlagToMs({ timeout: "" }, "timeout")).toThrow(UsageError);
+  });
+
+  it("refuses zero, negative, non-integer, past-the-timer-range and unsafe values", () => {
+    for (const bad of ["0", "-1", "1.5", "abc"]) {
+      expect(() => secondsFlagToMs({ timeout: bad }, "timeout")).toThrow(/--timeout/);
+    }
+    // 2147484 s → 2147484000 ms; setTimeout clamps that to 1 ms.
+    expect(() => secondsFlagToMs({ timeout: "2147484" }, "timeout")).toThrow(
+      /at most 2147483 seconds/,
+    );
+    // Past Number.MAX_SAFE_INTEGER, so the converted ms is not a safe integer.
+    expect(() => secondsFlagToMs({ timeout: "9007199254740993" }, "timeout")).toThrow(
+      /at most 2147483 seconds/,
+    );
   });
 });

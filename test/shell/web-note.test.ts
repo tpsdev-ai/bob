@@ -48,7 +48,8 @@ function writeAgent(capabilities: string[]): void {
   );
 }
 
-// A session whose one turn compacts and then ends; any steer is recorded.
+// A session whose one turn compacts and then ends; any steer is recorded (a
+// one-shot run queues the note with steer()).
 function compactingSession(steers: string[]): RunSession {
   const listeners: Array<(event: unknown) => void> = [];
   return {
@@ -72,6 +73,9 @@ function compactingSession(steers: string[]): RunSession {
           },
         });
       }
+    },
+    async steer(text: string) {
+      steers.push(text);
     },
     dispose() {},
   } as unknown as RunSession;

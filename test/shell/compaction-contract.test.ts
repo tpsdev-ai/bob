@@ -5,6 +5,9 @@
 // from, and the note that accompanies a compaction without ever being
 // load-bearing.
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildRemainingNote,
   buildStandingContract,
@@ -13,6 +16,7 @@ import {
   DEFAULT_REMAINING_NOTE_CAP_CHARS,
   evaluateCompletion,
   readWorktreeStatus,
+  readWorktreeStatusResult,
   renderWorktreeNote,
 } from "../../src/shell/compaction-contract.js";
 
@@ -307,4 +311,25 @@ describe("the note's building blocks", () => {
   it('readWorktreeStatus is best-effort: a non-repo directory yields ""', () => {
     expect(readWorktreeStatus("/definitely/not/a/repo/at/all")).toBe("");
   });
+
+  it("readWorktreeStatusResult marks a directory that is not a repository as not ok", () => {
+    expect(readWorktreeStatusResult("/definitely/not/a/repo/at/all").ok).toBe(false);
+  });
+
+  it("readWorktreeStatusResult bounds a git that hangs and reports it as not ok", () => {
+    // The seam stands in for a git that never answers: a plain PATH shim is not
+    // honoured by this runtime's `spawnSync`.
+    const dir = mkdtempSync(join(tmpdir(), "bob-hang-git-"));
+    const fake = join(dir, "git");
+    writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    try {
+      const started = Date.now();
+      const r = readWorktreeStatusResult(process.cwd(), { git: fake, timeoutMs: 100 });
+      expect(r.ok).toBe(false);
+      expect(r.status).toBe("");
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 8_000);
 });

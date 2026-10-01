@@ -1,0 +1,1 @@
+- **Changelog check and promote refuse symbolic-link fragment directories (Closes #267).**
