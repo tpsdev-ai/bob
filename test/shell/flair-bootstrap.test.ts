@@ -257,21 +257,69 @@ describe("loadFlairBootstrapContext (unit, via seams)", () => {
     expect(fetched).toBe(false);
     expect(logs.join("\n")).toContain("holds web");
   });
+
+  it("bounds the appended block locally: an over-budget context becomes the failure note", async () => {
+    const big = `## Active Skills\n${Array.from({ length: 40 }, (_, i) => `- skill-${i} (source: org)`).join("\n")}`;
+    const logs: string[] = [];
+    const text = await loadFlairBootstrapContext({
+      // 5 estimated tokens ≈ 20 characters, well under this block.
+      target: { ...target, maxTokens: 5 },
+      gate,
+      log: (m) => logs.push(m),
+      seams: {
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ context: big }),
+        }),
+        readFile: () => Buffer.from(pem()),
+      },
+    });
+    expect(text).toContain("could not be loaded");
+    expect(text).toContain("exceeded the flair.bootstrap_tokens budget");
+    expect(text).not.toContain("skill-0");
+    expect(logs.join("\n")).toContain("exceeded");
+  });
+
+  it("a Flair that never answers becomes the failure note (timeout)", async () => {
+    const text = await loadFlairBootstrapContext({
+      target,
+      gate,
+      timeoutMs: 20,
+      seams: {
+        fetchImpl: () => new Promise<never>(() => {}),
+        readFile: () => Buffer.from(pem()),
+      },
+    });
+    expect(text).toContain("could not be loaded");
+    expect(text).toContain("did not answer in time");
+  });
 });
 
 describe("flairBootstrapTarget", () => {
   it("defaults the budget and reads flair.bootstrap_tokens", () => {
     const base = { name: "flair", config: { url: "u", agentId: "a", keyFile: "k" } };
-    expect(flairBootstrapTarget([base])?.maxTokens).toBe(DEFAULT_FLAIR_BOOTSTRAP_TOKENS);
+    expect(flairBootstrapTarget([base], "a")?.maxTokens).toBe(DEFAULT_FLAIR_BOOTSTRAP_TOKENS);
     expect(
-      flairBootstrapTarget([
-        { name: "flair", config: { url: "u", agentId: "a", keyFile: "k", bootstrap_tokens: 1234 } },
-      ])?.maxTokens,
+      flairBootstrapTarget(
+        [
+          {
+            name: "flair",
+            config: { url: "u", agentId: "a", keyFile: "k", bootstrap_tokens: 1234 },
+          },
+        ],
+        "a",
+      )?.maxTokens,
     ).toBe(1234);
   });
 
   it("is undefined when the agent does not configure flair", () => {
-    expect(flairBootstrapTarget([{ name: "discord", config: {} }])).toBeUndefined();
+    expect(flairBootstrapTarget([{ name: "discord", config: {} }], "a")).toBeUndefined();
+  });
+
+  it("refuses a flair.agentId that is not the launched agent", () => {
+    const caps = [{ name: "flair", config: { url: "u", agentId: "someone-else", keyFile: "k" } }];
+    expect(() => flairBootstrapTarget(caps, "testbot")).toThrow(/flair\.agentId is "someone-else"/);
   });
 });
 

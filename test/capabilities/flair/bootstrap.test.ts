@@ -2,9 +2,11 @@
 //
 // The client is exercised through its fetch/readFile seams (a real keypair so
 // the signing path runs). The point of these tests is the ERROR stance: a
-// non-2xx, an unreadable body or a body with no `context` is a typed
-// FlairBootstrapError, never an empty context, and the server body is never
-// put in the error (it can carry a reflected credential).
+// non-2xx, a response that never arrives (timeout), one over the size bound, or
+// a body whose `context` is missing or not a string is a typed
+// FlairBootstrapError, and the server body is never put in the error (it can
+// carry a reflected credential). A blank `context` is a successful empty
+// response.
 import { describe, expect, it } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { FlairBootstrapError, FlairHttpClient } from "../../../src/capabilities/flair/client.js";
@@ -18,6 +20,7 @@ type Captured = { url: string; method: string; headers: Record<string, string>; 
 
 function clientWith(
   reply: (captured: Captured) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>,
+  extra: Partial<ConstructorParameters<typeof FlairHttpClient>[0]> = {},
 ): { client: FlairHttpClient; captured: Captured[] } {
   const captured: Captured[] = [];
   const client = new FlairHttpClient({
@@ -32,6 +35,7 @@ function clientWith(
     now: () => 1_700_000_000_000,
     uuid: () => "nonce",
     readFile: () => Buffer.from(PEM),
+    ...extra,
   });
   return { client, captured };
 }
@@ -130,5 +134,36 @@ describe("FlairHttpClient.bootstrap", () => {
     }
     expect(err).toBeInstanceOf(FlairBootstrapError);
     expect((err as FlairBootstrapError).failure).toBe("invalid_response");
+  });
+
+  it("a blank context is a successful empty response", async () => {
+    const { client } = clientWith(ok(JSON.stringify({ context: "" })));
+    expect(await client.bootstrap({})).toEqual({ context: "" });
+  });
+
+  it("a response that never arrives is a timeout", async () => {
+    const { client } = clientWith(() => new Promise<never>(() => {}), { bootstrapTimeoutMs: 20 });
+    let err: unknown;
+    try {
+      await client.bootstrap({});
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(FlairBootstrapError);
+    expect((err as FlairBootstrapError).failure).toBe("timeout");
+  });
+
+  it("a response over the size bound is refused", async () => {
+    const { client } = clientWith(ok(JSON.stringify({ context: "x".repeat(500) })), {
+      bootstrapMaxResponseBytes: 50,
+    });
+    let err: unknown;
+    try {
+      await client.bootstrap({});
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(FlairBootstrapError);
+    expect((err as FlairBootstrapError).failure).toBe("too_large");
   });
 });

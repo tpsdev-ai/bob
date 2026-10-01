@@ -23,6 +23,11 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { normalizeEd25519PrivateKey } from "../../lib/ed25519-key.js";
 
+// Thrown (as a plain Error) by signedFetch when a response exceeds the size
+// bound a caller passed; bootstrap maps it to a typed FlairBootstrapError so no
+// other call path sees a bootstrap-specific type.
+const RESPONSE_TOO_LARGE_MARKER = "flair response exceeded the size bound";
+
 export interface FlairSearchHit {
   id: string;
   content: string;
@@ -39,16 +44,25 @@ export interface FlairMemory {
 }
 
 // bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is the
-// rendered block bob appends to a session's system prompt (soul + the "Active
-// Skills" manifest + predicted context); `tokenEstimate` is Flair's own size
-// figure, optional here because the caller only needs the text.
+// rendered block bob appends to a session's system prompt; its sections (an
+// Identity section, "## Active Skills", predicted context) MAY appear, and a
+// long Active Skills section can exceed Flair's own selection budget, so the
+// CALLER bounds the block itself. `tokenEstimate` is Flair's own size figure,
+// optional because the caller does not rely on it.
 export interface FlairBootstrap {
   context: string;
   tokenEstimate?: number;
 }
 
+// Default bounds on one bootstrap request: a host that accepts the request and
+// never finishes cannot hold session start past the timeout, and an oversized
+// body is refused rather than parsed and appended.
+export const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 10_000;
+export const DEFAULT_BOOTSTRAP_MAX_RESPONSE_BYTES = 1_000_000;
+
 export interface FlairBootstrapOptions {
-  // Hard cap on Flair's CONTENT SELECTION (POST /BootstrapMemories maxTokens).
+  // Flair's own cap on its CONTENT SELECTION (POST /BootstrapMemories
+  // maxTokens). It does NOT bound the rendered context; the caller does.
   maxTokens?: number;
   channel?: string;
   surface?: string;
@@ -57,12 +71,21 @@ export interface FlairBootstrapOptions {
   // Skills" section (resources/MemoryBootstrap.ts), so the manifest this
   // feature exists to load would vanish.
   includeSoul?: boolean;
+  // Per-call overrides of the client's bounds (tests). Omitted → the client's
+  // configured values, defaulting to the constants above.
+  timeoutMs?: number;
+  maxResponseBytes?: number;
 }
 
 // Why a bootstrap call produced no context. Code-owned, so a session's failure
 // line can name the cause without ever echoing server text (which can carry a
 // reflected credential).
-export type FlairBootstrapFailure = "unreachable" | "http_error" | "invalid_response";
+export type FlairBootstrapFailure =
+  | "unreachable"
+  | "timeout"
+  | "http_error"
+  | "too_large"
+  | "invalid_response";
 
 export class FlairBootstrapError extends Error {
   readonly failure: FlairBootstrapFailure;
@@ -71,9 +94,13 @@ export class FlairBootstrapError extends Error {
     super(
       failure === "unreachable"
         ? "flair bootstrap: the request did not complete"
-        : failure === "http_error"
-          ? `flair bootstrap: HTTP ${status ?? "error"}`
-          : "flair bootstrap: the response carried no context",
+        : failure === "timeout"
+          ? "flair bootstrap: the request timed out"
+          : failure === "http_error"
+            ? `flair bootstrap: HTTP ${status ?? "error"}`
+            : failure === "too_large"
+              ? "flair bootstrap: the response exceeded the size bound"
+              : "flair bootstrap: the response carried no context",
     );
     this.name = "FlairBootstrapError";
     this.failure = failure;
@@ -117,9 +144,11 @@ export interface FlairClient {
 }
 
 // Minimal fetch shape we depend on (so tests pass a fake without DOM lib types).
+// `signal` is passed for the bootstrap timeout; a fake that ignores it is fine
+// because the timeout is also race-enforced by the caller.
 type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 export interface FlairHttpClientOptions {
@@ -137,6 +166,9 @@ export interface FlairHttpClientOptions {
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
   readFile?: (path: string) => Buffer;
+  // Bounds on one bootstrap call (bob#254). Defaults: the constants above.
+  bootstrapTimeoutMs?: number;
+  bootstrapMaxResponseBytes?: number;
 }
 
 // ─── Signing primitives (exported for reuse by the shell) ───────────────────
@@ -190,6 +222,8 @@ export class FlairHttpClient implements FlairClient {
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => Buffer;
+  private readonly bootstrapTimeoutMs: number;
+  private readonly bootstrapMaxResponseBytes: number;
   // Parsed once; reused across requests.
   private keyObject?: KeyObject;
 
@@ -210,6 +244,9 @@ export class FlairHttpClient implements FlairClient {
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
+    this.bootstrapTimeoutMs = opts.bootstrapTimeoutMs ?? DEFAULT_BOOTSTRAP_TIMEOUT_MS;
+    this.bootstrapMaxResponseBytes =
+      opts.bootstrapMaxResponseBytes ?? DEFAULT_BOOTSTRAP_MAX_RESPONSE_BYTES;
   }
 
   // Parse the on-disk private key into a node KeyObject. See
@@ -231,6 +268,9 @@ export class FlairHttpClient implements FlairClient {
     // answer to a read, not a failure, and string-matching a thrown message
     // for "404" is the fragile alternative.
     nullOnStatus?: readonly number[],
+    // bootstrap-only extras: the abort signal for the timeout, and the response
+    // size bound. Both are optional so every other call is unchanged.
+    extra?: { signal?: AbortSignal; maxResponseBytes?: number },
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       Authorization: tpsEd25519AuthHeader({
@@ -247,8 +287,14 @@ export class FlairHttpClient implements FlairClient {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...(extra?.signal !== undefined ? { signal: extra.signal } : {}),
     });
     const text = await res.text();
+    if (extra?.maxResponseBytes !== undefined && text.length > extra.maxResponseBytes) {
+      // The bound is enforced on the body AFTER it is read (the fetch seam
+      // returns text); it bounds what is kept and parsed, not what arrives.
+      throw new Error(RESPONSE_TOO_LARGE_MARKER);
+    }
     if (!res.ok) {
       if (nullOnStatus?.includes(res.status)) return null;
       // Never include request body or auth header — only status + a short,
@@ -320,29 +366,53 @@ export class FlairHttpClient implements FlairClient {
 
   // ── Session bootstrap (POST /BootstrapMemories) ───────────────────────────
   //
-  // Signed as this agent, like every other call. A non-2xx, an unreadable body
-  // or a body with no `context` string is an ERROR (a typed FlairBootstrapError),
-  // never an empty context: a caller that appended "" would read a failed load
-  // as "Flair had nothing", which is the one thing bootstrap must never look
-  // like.
+  // Signed as this agent, like every other call. A non-2xx, a response that
+  // never arrives (timeout), one over the size bound, or a body whose `context`
+  // is missing or not a string is an ERROR (a typed FlairBootstrapError). A
+  // `context` that is present but BLANK is a successful empty response; the
+  // caller decides what to do with it (it appends nothing).
   async bootstrap(opts: FlairBootstrapOptions = {}): Promise<FlairBootstrap> {
     const body: Record<string, unknown> = { agentId: this.agentId };
     if (opts.maxTokens !== undefined) body.maxTokens = opts.maxTokens;
     if (opts.channel !== undefined) body.channel = opts.channel;
     if (opts.surface !== undefined) body.surface = opts.surface;
     if (opts.includeSoul !== undefined) body.includeSoul = opts.includeSoul;
+    const timeoutMs = opts.timeoutMs ?? this.bootstrapTimeoutMs;
+    const maxResponseBytes = opts.maxResponseBytes ?? this.bootstrapMaxResponseBytes;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Race-enforced as well as aborted: a fetch seam that ignores `signal`
+    // (tests) still cannot hold the caller, and the real fetch is released by
+    // the abort.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new FlairBootstrapError("timeout"));
+      }, timeoutMs);
+    });
     let r: unknown;
     try {
-      r = await this.signedFetch("POST", "/BootstrapMemories", body);
+      const pending = this.signedFetch("POST", "/BootstrapMemories", body, undefined, {
+        signal: controller.signal,
+        maxResponseBytes,
+      });
+      pending.catch(() => {}); // the race below owns the rejection
+      r = await Promise.race([pending, timedOut]);
     } catch (err) {
+      if (err instanceof FlairBootstrapError) throw err; // timeout
       // signedFetch's message names the status and a slice of the server body;
       // that body can carry a reflected credential, so the status is parsed out
       // and the message is dropped, never re-thrown.
       const message = err instanceof Error ? err.message : "";
+      if (message.startsWith(RESPONSE_TOO_LARGE_MARKER)) {
+        throw new FlairBootstrapError("too_large");
+      }
       const m = /^flair POST \/BootstrapMemories -> (\d{3})/.exec(message);
       throw m
         ? new FlairBootstrapError("http_error", Number(m[1]))
         : new FlairBootstrapError("unreachable");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
     if (
       r === null ||

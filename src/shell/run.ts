@@ -500,10 +500,11 @@ export interface RunSessionConfig {
   model: string;
   // Appended system prompt (soul.md contents). Empty string when no soul.
   appendSystemPrompt: string;
-  // bob#254 — the Flair bootstrap block, when the agent configures the flair
-  // capability and Flair answered. Appended to the system prompt AFTER
-  // soul.md, as its own entry (session.ts isolatedLoaderOptions). Absent when
-  // there is no bootstrap, on any failure path, or in a web session.
+  // bob#254 — the Flair bootstrap block, when the agent's resolved capabilities
+  // include the flair capability. Appended to the system prompt AFTER soul.md,
+  // as its own entry (session.ts isolatedLoaderOptions). Holds EITHER the
+  // block or the one-line "could not be loaded" note; absent when the agent
+  // does not configure flair, or the session holds web.
   flairBootstrap?: string;
   // The agent's working dir (~/agents/<name>/work) — pi's cwd.
   cwd: string;
@@ -1723,7 +1724,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // the agent configures the flair capability. Resolved here (sync) from the
   // SAME validated capability config the session loads; the async call happens
   // in each runtime entry path (runAgent, runLaunch, startPersistent).
-  const flairBootstrapTarget = resolveFlairBootstrapTarget(capabilities);
+  const flairBootstrapTarget = resolveFlairBootstrapTarget(capabilities, opts.name);
 
   const config: RunSessionConfig = {
     provider,
