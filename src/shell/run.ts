@@ -502,7 +502,8 @@ export interface RunSession {
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
   // Stop an in-flight turn. pi's AgentSession exposes `abort()`, which resolves
-  // once the agent is idle; bob calls it when a bound ends a one-shot run.
+  // once the agent is idle; bob calls it when a bound ends a one-shot run whose
+  // session has started.
   // Optional so a fake session in tests need not provide it; without it, bob
   // cannot confirm the session stopped.
   abort?(): Promise<void>;
@@ -782,10 +783,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   });
 
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
-  // per-invocation flags. A run-level bound (wall clock, no-progress watchdog)
-  // or the turn timeout ends the run with a non-zero exit; `stop()` in the
-  // `finally` clears the run-level timers, and a fired bound cancels a pending
-  // turn deadline, so a completed run leaves the event loop free.
+  // per-invocation flags. The wall clock and the watchdog start HERE, once the
+  // configuration is resolved and before the Flair bootstrap and the session
+  // start. A run-level bound (wall clock, no-progress watchdog) or the turn
+  // timeout ends the run with a non-zero exit; `stop()` in the `finally` clears
+  // the run-level timers, and a fired bound cancels a pending turn deadline, so
+  // a completed run leaves the event loop free.
   const limits = resolveRunLimits(resolved.runLimits, {
     ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
@@ -1022,8 +1025,10 @@ async function runBoundedSession(
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     // bob#244: the note carries workspace data (git status), so a web session
     // refuses it; the observer logs the refusal and the run carries on.
+    // bob#135: through the run's one sender, so no note is sent once a bound
+    // has fired.
     inject: gatedNoteInjection(config, "compaction-note", (text) =>
-      session.prompt(text, { streamingBehavior: "steer" }),
+      sendToSession(session, bounds, text, "steer"),
     ),
     log: (m) => process.stderr.write(`${m}\n`),
   });
@@ -1223,8 +1228,9 @@ async function runBoundedSession(
   };
 }
 
-// The result for a run a bound ended before/while the session came up (the
-// guarded factory), when there is no run log to record it in.
+// The result for a run a bound ended during the Flair bootstrap or the session
+// start (the guarded factory): there is no session to abort, no run log to
+// record it in, and no workspace status read.
 function abortedRunResult(
   opts: RunOptions,
   resolved: ResolvedRunConfig,
@@ -1243,6 +1249,25 @@ function abortedRunResult(
   };
 }
 
+// bob#135 — the ONE place a one-shot run calls `session.prompt`: the task, the
+// continue turn and the reasoning re-prompts go through it as turns (through
+// promptSession, so template expansion stays off), and the compaction note as a
+// steer. Once any bound has fired it sends nothing and throws that bound's
+// RunAbortedError. It throws synchronously, before a prompt promise exists, so a
+// caller that races the send is never left holding an unhandled rejection.
+function sendToSession(
+  session: RunSession,
+  bounds: RunBounds,
+  text: string,
+  as: "turn" | "steer",
+): Promise<void> {
+  const fired = bounds.reason();
+  if (fired !== undefined) throw new RunAbortedError(fired);
+  return as === "turn"
+    ? promptSession(session, text)
+    : session.prompt(text, { streamingBehavior: "steer" });
+}
+
 // One prompt turn under two bounds: the turn timeout and the run's own abort
 // (bounds.guard). A turn that does not finish within `turnTimeoutMs` ends the
 // run as `turn_timeout`; there is no retry. The caller's abort path then signals
@@ -1250,12 +1275,12 @@ function abortedRunResult(
 // is a whole turn (model requests plus tool work), so a turn is the smallest
 // unit bob can bound.
 async function boundedPrompt(session: RunSession, text: string, bounds: RunBounds): Promise<void> {
-  // A fired bound starts no further prompt. Checked here because guard()
-  // receives the prompt already started, so it cannot refuse it.
-  const fired = bounds.reason();
-  if (fired !== undefined) throw new RunAbortedError(fired);
   const outcome = await bounds.guard(
-    raceTimeout(promptSession(session, text), bounds.limits.turnTimeoutMs, bounds.signal),
+    raceTimeout(
+      sendToSession(session, bounds, text, "turn"),
+      bounds.limits.turnTimeoutMs,
+      bounds.signal,
+    ),
   );
   if (outcome !== TIMED_OUT) return;
   // The first bound to fire is the one reported.

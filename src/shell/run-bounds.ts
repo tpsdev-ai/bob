@@ -5,7 +5,9 @@
 // someone killed it. Three independent bounds now apply, each configurable
 // (`bob run` flags, bob.yaml `run:` keys) with a sane default:
 //
-//   * wall_clock  — the whole run's deadline.
+//   * wall_clock  — the run's deadline, counted from createRunBounds. run.ts
+//                   calls it once the agent's configuration is resolved,
+//                   before the Flair bootstrap and the session start.
 //   * no_progress — no run-log event for N milliseconds. A stuck inference call
 //                   emits nothing, so the log stops growing; this is the
 //                   heartbeat the issue asks for, without external polling.
@@ -15,9 +17,10 @@
 // The wall-clock and the watchdog are RUN-LEVEL: either one, when it fires,
 // sets the run's reason and aborts the signal, and {@link RunBounds.guard}
 // turns that into a {@link RunAbortedError} at the next guarded await. The turn
-// bound is applied at every one-shot prompt (run.ts's `boundedPrompt`), which
-// races the prompt turn against {@link raceTimeout} and, when the deadline wins,
-// fires `turn_timeout` to end the run. pi's `prompt()` is a whole turn (model
+// bound is applied to each one-shot prompt turn (the task, the continue turn and
+// the reasoning re-prompts; run.ts's `boundedPrompt`), which races the turn
+// against {@link raceTimeout} and, when the deadline wins, fires `turn_timeout`
+// to end the run. pi's `prompt()` is a whole turn (model
 // requests plus tool work) and offers no per-request signal, so a turn is the
 // smallest unit bob can bound.
 //
@@ -28,7 +31,7 @@
 export type TerminationReason = "wall_clock" | "no_progress" | "turn_timeout";
 
 export interface RunLimits {
-  /** Whole-run wall-clock deadline, in milliseconds. */
+  /** The run's wall-clock deadline, in milliseconds, counted from createRunBounds. */
   wallClockMs: number;
   /** No run-log event for this long ends the run, in milliseconds. */
   noProgressMs: number;

@@ -67,6 +67,45 @@ describe("readRunLimits — the bob.yaml run: block", () => {
   it("refuses the inline form", () => {
     expect(() => readRunLimits("run: {wall_clock_seconds: 60}")).toThrow(/inline form/);
   });
+
+  // The shared block reader keeps the LAST value of a repeated key, so a repeat
+  // would hide an invalid earlier value. Every repeat is refused by key and line.
+  const refusal = (yaml: string): BobYamlError => {
+    try {
+      readRunLimits(yaml);
+    } catch (err) {
+      if (err instanceof BobYamlError) return err;
+      throw err;
+    }
+    throw new Error("readRunLimits accepted a repeated run: key");
+  };
+
+  it("refuses an invalid value followed by a valid duplicate of the same key", () => {
+    const err = refusal("run:\n  wall_clock_seconds: 0\n  wall_clock_seconds: 60\n");
+    expect(err.line).toBe(3);
+    expect(err.message).toContain('"wall_clock_seconds" is set again (first on line 2)');
+  });
+
+  it("refuses a second inline run: after a valid block", () => {
+    const err = refusal("run:\n  wall_clock_seconds: 60\nrun: {wall_clock_seconds: 0}\n");
+    expect(err.line).toBe(3);
+    expect(err.message).toContain('a second "run:" (the first is on line 1)');
+  });
+
+  it("refuses a second run: block, even with another block between them", () => {
+    const yaml = [
+      "run:",
+      "  turn_timeout_seconds: 0",
+      "provider:",
+      "  name: anthropic",
+      "run:",
+      "  turn_timeout_seconds: 300",
+      "",
+    ].join("\n");
+    const err = refusal(yaml);
+    expect(err.line).toBe(5);
+    expect(err.message).toContain('a second "run:" (the first is on line 1)');
+  });
 });
 
 describe("resolveRunLimits — defaults, bob.yaml, then flags", () => {

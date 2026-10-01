@@ -56,10 +56,11 @@ interface Fake {
 // call: emit events, resolve, or stall forever. `runAbort` (default: settle at
 // once) decides what `abort()` does — pass a never-settling promise to model
 // pi's abort() waiting for a turn that never becomes idle, or `null` for a
-// session with no abort() at all.
+// session with no abort() at all. `runAbort` gets the emitter, so an abort can
+// deliver session events while the run waits for it.
 function fakeSession(
   runPrompt: (emit: Emitter, text: string, call: number) => Promise<void>,
-  runAbort?: (() => Promise<void>) | null,
+  runAbort?: ((emit: Emitter) => Promise<void>) | null,
 ): Fake {
   const listeners: Array<(event: unknown) => void> = [];
   const promptCalls: string[] = [];
@@ -86,7 +87,7 @@ function fakeSession(
   if (runAbort !== null) {
     session.abort = async () => {
       aborts += 1;
-      if (runAbort) await runAbort();
+      if (runAbort) await runAbort(emit);
     };
   }
   return { session, promptCalls, abortCount: () => aborts };
@@ -407,6 +408,44 @@ describe("runAgent termination bounds (bob#135)", () => {
     expect(res.exitCode).toBe(1);
     expect(res.aborted).toBe("turn_timeout");
     expect(fake.abortCount()).toBe(1);
+  }, 15_000);
+
+  it("a compaction that ends after the turn timeout fired sends no note: no further session.prompt", async () => {
+    // Known-present: a compaction during the live turn sends the "what remains"
+    // note as a steer (prompt call 2). Known-absent: the turn then times out, and
+    // a compaction that ends while the abort is pending sends nothing more.
+    const compactionEnd = { type: "compaction_end", reason: "threshold" };
+    const fake = fakeSession(
+      (emit, _text, call) => {
+        if (call === 1) {
+          emit(compactionEnd);
+          return new Promise<void>(() => {});
+        }
+        return Promise.resolve(); // the steer note is queued, not a turn
+      },
+      async (emit) => {
+        emit(compactionEnd);
+      },
+    );
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const err = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "hi",
+        agentsRoot,
+        sessionFactory: factoryReturning(fake.session),
+        wallClockMs: 60_000,
+        noProgressMs: 60_000,
+        turnTimeoutMs: 40,
+      });
+    });
+    expect(fake.promptCalls.length).toBe(2);
+    expect(fake.promptCalls[0]).toBe("hi");
+    expect(fake.promptCalls[1]).toContain("[BOB WHAT REMAINS");
+    expect(res?.exitCode).toBe(1);
+    expect(res?.aborted).toBe("turn_timeout");
+    expect(fake.abortCount()).toBe(1);
+    expect(err).toContain("the run was ended by its turn_timeout bound");
   }, 15_000);
 
   it("reads the workspace status after the abort, so a write made before abort() resolves is reported", async () => {
