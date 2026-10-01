@@ -457,26 +457,32 @@ describe("systemd backend", () => {
     }
   });
 
-  it("installService with NUL in interpreter path writes nothing and never reloads (bob#222)", async () => {
-    const written: Array<{ path: string; contents: string }> = [];
-    const ctlCalls: string[][] = [];
-    const runner = async (args: string[]) => {
-      ctlCalls.push(args);
-      return { code: 0, stderr: "" };
-    };
-    await expect(
-      installService({
-        name: "pulse",
-        bobBin: BOB_BIN,
-        interpreter: "/usr/local/bin/node\nbad",
-        home: HOME,
-        platform: "systemd",
-        writeFile: (path, contents) => written.push({ path, contents }),
-        runSystemctl: runner,
-      }),
-    ).rejects.toThrow(/NUL/);
-    expect(written).toHaveLength(0);
-    expect(ctlCalls).toHaveLength(0);
+  it("installService refuses CR, LF and NUL in the interpreter path: writes nothing, never reloads (bob#222)", async () => {
+    for (const bad of [
+      "/usr/local/bin/node\nbad",
+      "/usr/local/bin/node\rbad",
+      "/usr/local/bin/node\0bad",
+    ]) {
+      const written: Array<{ path: string; contents: string }> = [];
+      const ctlCalls: string[][] = [];
+      const runner = async (args: string[]) => {
+        ctlCalls.push(args);
+        return { code: 0, stderr: "" };
+      };
+      await expect(
+        installService({
+          name: "pulse",
+          bobBin: BOB_BIN,
+          interpreter: bad,
+          home: HOME,
+          platform: "systemd",
+          writeFile: (path, contents) => written.push({ path, contents }),
+          runSystemctl: runner,
+        }),
+      ).rejects.toThrow(/refusing ExecStart argument with line breaks or NUL/);
+      expect(written).toHaveLength(0);
+      expect(ctlCalls).toHaveLength(0);
+    }
   });
 });
 
