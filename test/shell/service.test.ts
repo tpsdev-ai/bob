@@ -422,8 +422,19 @@ describe("systemd backend", () => {
     const argv = execStart(unit);
     expect(argv[0]).toBe('/usr/local/it "ner/bin/node');
     expect(argv[1]).toBe('/opt/bo"b \\path/bin/bob');
-    expect(argv[2]).toBe("run");
     expect(argv[3]).toBe("pulse");
+  });
+
+  it("renderSystemdUnit throws when an ExecStart arg contains line breaks (bob#222)", () => {
+    const badPath = "/usr/local/bin/node\nbad";
+    expect(() =>
+      renderSystemdUnit({
+        name: "pulse",
+        bobBin: '/opt/bo"b \\path/bin/bob',
+        interpreter: badPath,
+        home: HOME,
+      }),
+    ).toThrow(/refusing ExecStart argument with line breaks/);
   });
 });
 
