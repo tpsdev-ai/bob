@@ -52,6 +52,7 @@ import {
   constants,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -373,6 +374,8 @@ export function writeChangelog(changelogPath, text, read, { fstat = fstatBigint 
 //
 // A MISSING directory is refused, not read as "no fragments": `check` would
 // otherwise pass a tree whose fragments were deleted along with the directory.
+// Check both directory entries with lstat before reading their contents, so a
+// link at either level is refused before check or promote reaches the fragments.
 //
 // Each entry is opened ONCE and every question about it is answered from that
 // descriptor. Checking the path (stat) and then reading the path lets the entry
@@ -384,7 +387,33 @@ export function writeChangelog(changelogPath, text, read, { fstat = fstatBigint 
 // directory, never a pointer to content elsewhere.
 const FRAGMENT_OPEN_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
 
+function assertFragmentDirectories(dir) {
+  for (const [path, rel] of [
+    [dirname(dir), ".changelog"],
+    [dir, FRAGMENT_DIR_REL],
+  ]) {
+    let st;
+    try {
+      st = lstatSync(path);
+    } catch (err) {
+      // A missing directory is left to readFragments, which names .changelog/unreleased/.
+      if (err?.code === "ENOENT") return;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new FragmentError(
+        `${rel}/ is a symbolic link; it must be a real directory. Replace the link with the ` +
+          `directory itself and put the fragment files in ${FRAGMENT_DIR_REL}/.`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new FragmentError(`${rel}/ is not a directory. Restore ${FRAGMENT_DIR_REL}/.`);
+    }
+  }
+}
+
 export function readFragments(dir = FRAGMENT_DIR) {
+  assertFragmentDirectories(dir);
   let names;
   try {
     names = readdirSync(dir);
