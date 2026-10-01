@@ -9,11 +9,21 @@
 // and do not render); `promote`
 // writes a dated section below [Unreleased] and deletes the fragments.
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  setDefaultTimeout,
+} from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   fstatSync,
   linkSync,
   lstatSync,
@@ -53,11 +63,50 @@ function ENTRIES(s: string): string[] {
 }
 
 let root: string;
+const CHILD_TIMEOUT_MS = 10_000;
+setDefaultTimeout(30_000);
+
+const gitEnv: Record<string, string> = {
+  GIT_CONFIG_COUNT: "3",
+  GIT_CONFIG_KEY_0: "maintenance.auto",
+  GIT_CONFIG_VALUE_0: "false",
+  GIT_CONFIG_KEY_1: "gc.auto",
+  GIT_CONFIG_VALUE_1: "0",
+  GIT_CONFIG_KEY_2: "core.hooksPath",
+  GIT_CONFIG_VALUE_2: "/dev/null",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_TEMPLATE_DIR: "/dev/null",
+};
+// Under Bun 1.3.10, a child spawned without an `env` option does not see these
+// process.env changes, so the Git helper below and the Node launches of the
+// script pass `env: process.env`.
+const priorGitEnv = new Map(Object.keys(gitEnv).map((key) => [key, process.env[key]]));
+beforeAll(() => {
+  for (const [key, value] of Object.entries(gitEnv)) process.env[key] = value;
+});
+afterAll(() => {
+  for (const [key, value] of priorGitEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+function gitSync(cwd: string, args: string[]) {
+  return spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: CHILD_TIMEOUT_MS,
+    env: process.env,
+  });
+}
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "bob-fragments-"));
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  expect(existsSync(root), `temporary project survived cleanup: ${root}`).toBe(false);
 });
 
 // A minimal project: a CHANGELOG whose [Unreleased] body is the note (no stray
@@ -80,8 +129,8 @@ function stageAll(): void {
     ["init", "-q"],
     ["add", "-A"],
   ]) {
-    const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
-    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+    const r = gitSync(root, args);
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.error ?? r.stderr}`);
   }
 }
 
@@ -285,7 +334,10 @@ describe("changelog fragments — check (bob#236)", () => {
     mkdirSync(join(dir, "fixed-a-directory.md"));
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unexpected directory/);
     rmSync(join(dir, "fixed-a-directory.md"), { recursive: true });
-    const made = spawnSync("mkfifo", [join(dir, "fixed-a-fifo.md")], { encoding: "utf8" });
+    const made = spawnSync("mkfifo", [join(dir, "fixed-a-fifo.md")], {
+      encoding: "utf8",
+      timeout: CHILD_TIMEOUT_MS,
+    });
     expect(made.status, made.stderr).toBe(0);
     expect(() => cf.check({ dir, changelogPath })).toThrow(/fixed-a-fifo\.md: not a regular file/);
   });
@@ -526,10 +578,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(tryPromote).toThrow("changed since staged (differs from the index): CHANGELOG.md");
     expect(readFileSync(changelogPath, "utf8")).toBe(edited);
     stageAll();
-    const rm = spawnSync("git", ["rm", "-q", "--cached", "CHANGELOG.md"], {
-      cwd: root,
-      encoding: "utf8",
-    });
+    const rm = gitSync(root, ["rm", "-q", "--cached", "CHANGELOG.md"]);
     expect(rm.status, rm.stderr).toBe(0);
     expect(tryPromote).toThrow("untracked (not in the index): CHANGELOG.md");
     expect(readFileSync(changelogPath, "utf8")).toBe(edited);
@@ -637,22 +686,18 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       rmSync(changelogPath);
       symlinkSync(target, changelogPath);
       stageAll();
-      const commit = spawnSync(
-        "git",
-        [
-          "-c",
-          "user.name=t",
-          "-c",
-          "user.email=t@t.dev",
-          "-c",
-          "commit.gpgsign=false",
-          "commit",
-          "-q",
-          "-m",
-          "base",
-        ],
-        { cwd: root, encoding: "utf8" },
-      );
+      const commit = gitSync(root, [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t.dev",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "base",
+      ]);
       expect(commit.status, commit.stderr).toBe(0);
       const targetBefore = readFileSync(target);
       const msg = "CHANGELOG.md is a symbolic link";
@@ -664,6 +709,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
     } finally {
       rmSync(external, { recursive: true, force: true });
+      expect(existsSync(external), `external target survived cleanup: ${external}`).toBe(false);
     }
   });
 
@@ -758,7 +804,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       const original = "- **a fix.** \n";
       fragment(dir, "fixed-a.md", original);
       stageAll();
-      const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      const gitIn = (...args: string[]) => gitSync(root, args);
       const tryPromote = () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
 
       // A hidden edit to a fragment.
@@ -794,7 +840,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     const lf = "- **a fix.** Detail.\n";
     fragment(dir, "fixed-a.md", lf);
     stageAll();
-    const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    const gitIn = (...args: string[]) => gitSync(root, args);
     const rel = ".changelog/unreleased/fixed-a.md";
     expect(gitIn("config", "core.autocrlf", "input").status).toBe(0);
     expect(gitIn("update-index", "--assume-unchanged", rel).status).toBe(0);
@@ -1312,7 +1358,11 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     copyFileSync(SCRIPT, copy);
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
     const run = (...args: string[]) => {
-      const r = spawnSync("node", [copy, ...args], { encoding: "utf8" });
+      const r = spawnSync("node", [copy, ...args], {
+        encoding: "utf8",
+        timeout: CHILD_TIMEOUT_MS,
+        env: process.env,
+      });
       return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     };
     return { run, dir, changelogPath };
@@ -1348,6 +1398,74 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2026-01-01");
   });
 
+  it("the script's Git children inherit the test's maintenance settings", () => {
+    const { run, dir, changelogPath } = cli();
+    stageAll();
+    expect(gitSync(root, ["config", "maintenance.auto", "true"]).status).toBe(0);
+    expect(gitSync(root, ["config", "gc.auto", "100"]).status).toBe(0);
+    // The test's own Git children (gitSync stages and commits) see them too.
+    expect(gitSync(root, ["config", "--get", "maintenance.auto"]).stdout).toBe("false\n");
+    expect(gitSync(root, ["config", "--get", "gc.auto"]).stdout).toBe("0\n");
+
+    const bin = join(root, "bin");
+    const trace = join(root, "git-child-config.log");
+    mkdirSync(bin);
+    const shim = join(bin, "git");
+    writeFileSync(
+      shim,
+      `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+const env = { ...process.env, PATH: process.env.BOB_TEST_GIT_PATH };
+for (const key of ["maintenance.auto", "gc.auto"]) {
+  const result = spawnSync("git", ["-C", process.env.BOB_TEST_REPO, "config", "--get", key], {
+    encoding: "utf8", env, timeout: ${CHILD_TIMEOUT_MS},
+  });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+  appendFileSync(process.env.BOB_TEST_GIT_TRACE, result.stdout);
+}
+const result = spawnSync("git", process.argv.slice(2), {
+  stdio: "inherit", env, timeout: ${CHILD_TIMEOUT_MS},
+});
+process.exit(result.status ?? 1);
+`,
+    );
+    chmodSync(shim, 0o755);
+    const inProcessTrace = join(root, "in-process-git-child-config.log");
+    const shimEnv: Record<string, string> = {
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      BOB_TEST_GIT_PATH: process.env.PATH ?? "",
+      BOB_TEST_GIT_TRACE: inProcessTrace,
+      BOB_TEST_REPO: root,
+    };
+    const priorShimEnv = new Map(Object.keys(shimEnv).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, shimEnv);
+    let promoted: { code: number; out: string };
+    try {
+      // The script imported into this process: Bun starts its Git children.
+      cf.gitRestorableOrThrow({ changelogPath, dir, names: ["fixed-a.md"] });
+      // The script launched by cli().run: Node starts its Git children.
+      process.env.BOB_TEST_GIT_TRACE = trace;
+      promoted = run("promote", "1.2.3", "--date=2026-01-01");
+    } finally {
+      for (const [key, value] of priorShimEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    expect(
+      existsSync(inProcessTrace),
+      "the in-process script's Git children were started without process.env (PATH did not reach them)",
+    ).toBe(true);
+    expect(readFileSync(inProcessTrace, "utf8")).toMatch(/^(false\n0\n)+$/);
+    expect(promoted.code, promoted.out).toBe(0);
+    expect(
+      existsSync(trace),
+      "cli().run's Git children were started without process.env (PATH did not reach them)",
+    ).toBe(true);
+    expect(readFileSync(trace, "utf8")).toMatch(/^(false\n0\n)+$/);
+  });
+
   // The script's entry-point test compares real paths: run through a symlink, it
   // must still run (here: refuse a malformed fragment), not exit 0 doing nothing.
   it("runs through a symlinked path (a malformed fragment still fails check)", () => {
@@ -1355,7 +1473,11 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     fragment(dir, "fixed-not-a-list.md", "just some prose\n");
     symlinkSync(root, join(root, "link"));
     const viaLink = join(root, "link", "scripts", "changelog-fragments.mjs");
-    const r = spawnSync("node", [viaLink, "check"], { encoding: "utf8" });
+    const r = spawnSync("node", [viaLink, "check"], {
+      encoding: "utf8",
+      timeout: CHILD_TIMEOUT_MS,
+      env: process.env,
+    });
     expect(r.status, `${r.stdout}${r.stderr}`).toBe(1);
     expect(r.stderr).toContain("fixed-not-a-list.md: fragment must start with '- '");
   });
@@ -1375,8 +1497,8 @@ describe("changelog fragments — the CLI (bob#236)", () => {
 // contents can conflict on that file; the README says so.)
 describe("changelog fragments — two PRs with distinct fragment filenames (bob#236)", () => {
   function git(cwd: string, ...args: string[]): { code: number; out: string } {
-    const r = spawnSync("git", args, { cwd, encoding: "utf8" });
-    return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+    const r = gitSync(cwd, args);
+    return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}${r.error ?? ""}` };
   }
 
   // Every setup step must succeed; a silently failed step would leave the merges
