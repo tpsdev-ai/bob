@@ -60,7 +60,7 @@ export interface RunPersistentOptions {
   // Override the agents root dir (tests). Defaults to ~/agents.
   agentsRoot?: string;
   // Inject the session factory (tests). Defaults to the real SDK factory with a
-  // DURABLE SessionManager (persisted on disk under the agent's cwd).
+  // DURABLE SessionManager (persisted under the agent's .pi-agent/sessions).
   sessionFactory?: RunSessionFactory;
   // Scheduler seam: tests release a real fire callback during shutdown.
   cronSchedulerFactory?: typeof startCronScheduler;
@@ -323,7 +323,9 @@ export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
 // docs), not as a top-level method, so we adapt it here. Best-effort — if the
 // shape ever changes, shutdown still proceeds to dispose().
 const defaultPersistentFactory: RunSessionFactory = async (config: RunSessionConfig) => {
-  const session = await createPiRunSession(config, (cwd) => SessionManager.create(cwd));
+  const session = await createPiRunSession(config, (cwd) =>
+    SessionManager.create(cwd, join(config.piAgentDir, "sessions")),
+  );
   if (typeof session.waitForIdle !== "function") {
     const agent = (session as unknown as { agent?: { waitForIdle?: () => Promise<void> } }).agent;
     if (agent && typeof agent.waitForIdle === "function") {
