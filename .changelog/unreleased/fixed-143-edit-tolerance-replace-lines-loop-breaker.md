@@ -1,0 +1,3 @@
+- **Edit now tolerates whitespace-run mismatches, adds a `replace_lines` tool, and breaks a repeating tool-call loop (bob#143).**
+
+  The tolerant match retries an `oldText` that does not match exactly with runs of spaces/tabs collapsed and trailing whitespace ignored, and applies only when that normalised match is unique; the result says how many edits needed it. `replace_lines(path, startLine, endLine, newText)` rewrites an inclusive 1-based line range and rides with `edit` in the `coder`, `writer` and `custom` roles and the `builder` position. When the same tool call (identical name and arguments) repeats `run.tool_loop_limit` times in a row (default 4), the run ends with a message naming the repeated call.

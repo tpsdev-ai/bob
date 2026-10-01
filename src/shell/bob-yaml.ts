@@ -330,6 +330,48 @@ export function readSessionBudget(yamlText: string): SessionBudget {
   }
 }
 
+// bob#143 item 3: the loop breaker's limit, per agent (bob.yaml `run:`):
+//
+//   run:
+//     tool_loop_limit: 4
+//
+// Absent → the caller's default (DEFAULT_TOOL_LOOP_LIMIT). An unknown key or a
+// non-positive value throws, so a typo is not read as "no limit".
+const RUN_KEYS = ["tool_loop_limit"] as const;
+
+export function readToolLoopLimit(yamlText: string): number | undefined {
+  const inline = /^run[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "run",
+      lineOf(yamlText, /^run[ \t]*:/m),
+      `the inline form is not supported — write "run:" on its own line, then tool_loop_limit: indented under it.`,
+    );
+  }
+  const raw = readBlock(yamlText, "run");
+  if (raw === undefined) return undefined;
+  for (const key of Object.keys(raw)) {
+    if (!(RUN_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "run",
+        lineOfKey(yamlText, "run", key),
+        `unknown key "${key}" — supported keys are ${RUN_KEYS.join(", ")}.`,
+      );
+    }
+  }
+  const value = raw.tool_loop_limit;
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new BobYamlError(
+      "run",
+      lineOfKey(yamlText, "run", "tool_loop_limit"),
+      `"tool_loop_limit" must be a positive whole number.`,
+    );
+  }
+  return value;
+}
+
 // The role this agent was hired into (bob.yaml `agent.role`). The role is the
 // CEILING on the tool allowlist (tool-allowlist.ts): roles/<role>/role.json
 // ships with bob, while bob.yaml is agent-writable, so bob.yaml may narrow the

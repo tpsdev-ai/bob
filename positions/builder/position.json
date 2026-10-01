@@ -2,7 +2,7 @@
   "name": "builder",
   "version": "0.1.0",
   "role": "coder",
-  "tools": ["read", "bash", "write", "edit", "grep", "find"],
+  "tools": ["read", "bash", "write", "edit", "replace_lines", "grep", "find"],
   "capabilities": { "permitted": ["flair"], "default": [] },
   "files": [{ "path": "soul.md", "kind": "soul" }]
 }

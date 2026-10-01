@@ -57,6 +57,7 @@ import {
   readProviderLimits,
   readResident,
   readSessionBudget,
+  readToolLoopLimit,
   readTools,
 } from "./bob-yaml.js";
 import {
@@ -94,6 +95,7 @@ import {
 } from "./session.js";
 import type { ModelLimits, ThinkingSetting } from "./session-budget.js";
 import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
+import { DEFAULT_TOOL_LOOP_LIMIT, ToolLoopDetector } from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError } from "./turn-origin.js";
 
@@ -488,6 +490,9 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
+  // Stop an in-flight turn (pi's AgentSession.abort). The loop breaker calls it
+  // to end a stuck turn. Optional so a fake session in tests need not provide it.
+  abort?(): Promise<void>;
   dispose(): void;
 }
 
@@ -672,6 +677,9 @@ export interface RunOptions {
   // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
   // role or capability, is dropped.
   mailTurn?: boolean;
+  // bob#143 item 3: the loop breaker's limit — how many consecutive identical
+  // tool calls end the turn. Overrides bob.yaml's `run.tool_loop_limit`.
+  toolLoopLimit?: number;
 }
 
 export interface RunResult {
@@ -695,6 +703,9 @@ export interface RunResult {
   // no final message that did NOT fail simply had nothing to say. (A mail turn
   // retries a failure and sends no reply for silence.)
   failed?: true;
+  // bob#143 item 3: set when the loop breaker ended the run — the same tool call
+  // repeated `toolLoopLimit` times in a row. The exit code is non-zero.
+  loopBreaker?: { toolName: string; count: number };
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -713,6 +724,35 @@ export async function attachFlairBootstrap(
     ...(log !== undefined ? { log } : {}),
   });
   if (text.length > 0) config.flairBootstrap = text;
+}
+
+// bob#143 item 3 — the loop breaker error. Thrown into the awaited turn when the
+// same tool call has repeated `limit` times in a row, so the run ends instead of
+// looping. `call` names the repeated call for the message.
+class ToolLoopError extends Error {
+  readonly toolName: string;
+  readonly count: number;
+  constructor(toolName: string, count: number) {
+    super(`the tool call ${toolName} repeated ${count} times in a row`);
+    this.name = "ToolLoopError";
+    this.toolName = toolName;
+    this.count = count;
+  }
+}
+
+function summarizeArgs(args: unknown): string {
+  if (args === undefined) return "(no arguments)";
+  try {
+    const json = JSON.stringify(args);
+    if (json === undefined) return String(args);
+    return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+  } catch {
+    return String(args);
+  }
+}
+
+function loopBreakMessage(name: string, toolName: string, args: unknown, count: number): string {
+  return `bob run ${name}: LOOP BREAKER — the same tool call repeated ${count} times in a row: ${toolName} ${summarizeArgs(args)}; ending the turn. Use a different mechanism (for example replace_lines for a line-based edit), or stop and report BLOCKED.\n`;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -744,7 +784,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { agentDir, provider, model, config, flairBootstrapTarget } = resolveRunConfig({
+  const resolved = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
@@ -752,6 +792,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+  const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
+  // bob#143 item 3: how many consecutive identical tool calls end the turn.
+  const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -903,6 +946,34 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     );
   }
 
+  // bob#143 item 3 — the loop breaker. A run of identical tool calls is watched
+  // as the events arrive; when it reaches the limit the breaker prints the
+  // message and aborts `loopController`, which rejects the awaited turn.
+  const loopDetector = new ToolLoopDetector(toolLoopLimit);
+  const loopController = new AbortController();
+  let loopBreaker: { toolName: string; count: number } | undefined;
+  const raceLoop = <T>(work: Promise<T>): Promise<T> => {
+    if (loopBreaker !== undefined) {
+      return Promise.reject(new ToolLoopError(loopBreaker.toolName, loopBreaker.count));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(new ToolLoopError(loopBreaker?.toolName ?? "", loopBreaker?.count ?? 0));
+      };
+      loopController.signal.addEventListener("abort", onAbort, { once: true });
+      work.then(
+        (value) => {
+          loopController.signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (err) => {
+          loopController.signal.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+      );
+    });
+  };
+
   const unsubscribeRunLog = session.subscribe((event) => {
     // Post-mortem trail: record EVERY event (tool calls, results, errors,
     // retries), not just text — that's what makes a death diagnosable. The
@@ -916,6 +987,24 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       },
       isDeltaEvent(event.type),
     );
+    // bob#143 item 3: count consecutive identical tool calls as they start.
+    if (event.type === "tool_execution_start") {
+      const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
+      const args = (event as unknown as { args?: unknown }).args;
+      const observation = loopDetector.observe(toolName, args);
+      if (observation.fire && loopBreaker === undefined) {
+        loopBreaker = { toolName, count: observation.count };
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: { reason: "tool_loop", toolName, count: observation.count },
+          },
+          false,
+        );
+        process.stderr.write(loopBreakMessage(opts.name, toolName, args, observation.count));
+        loopController.abort();
+      }
+    }
   });
 
   // bob#214: one flat usage record per model request (prompt, cached-prompt,
@@ -996,9 +1085,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
-    // expansion — see session.ts promptSession).
-    await promptSession(session, opts.prompt);
-    await drainReasoningOnly();
+    // expansion — see session.ts promptSession). Raced against the loop breaker.
+    await raceLoop(promptSession(session, opts.prompt));
+    await raceLoop(drainReasoningOnly());
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -1022,9 +1111,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         observer.startTurn(); // the retry is its own turn: its final message counts
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
-        await promptSession(session, CONTINUE_TURN);
-        await drainReasoningOnly(); // same budget: the total stays within the bound
+        await raceLoop(promptSession(session, CONTINUE_TURN));
+        await raceLoop(drainReasoningOnly()); // same budget: the total stays within the bound
       } catch (err) {
+        // A loop break during the retry ends the run; it must not be swallowed
+        // here and leave a silent exit 0.
+        if (err instanceof ToolLoopError) throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
@@ -1080,15 +1172,21 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   } catch (err) {
     exitCode = 1;
     failed = true;
-    // Surface the error instead of swallowing it: an underscore-ignored catch
-    // made a cap-hit look like a silent clean exit. Label a provider
-    // rate-limit/cap so a budget stall is distinguishable from a crash.
-    const msg = err instanceof Error ? err.message : String(err);
-    const isCap =
-      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
-    process.stderr.write(
-      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
-    );
+    if (err instanceof ToolLoopError) {
+      // bob#143 item 3 — the loop breaker ended the turn; the message was written
+      // when it fired. Stop the stuck turn so nothing keeps running.
+      if (session.abort) await session.abort().catch(() => {});
+    } else {
+      // Surface the error instead of swallowing it: an underscore-ignored catch
+      // made a cap-hit look like a silent clean exit. Label a provider
+      // rate-limit/cap so a budget stall is distinguishable from a crash.
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCap =
+        /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+      process.stderr.write(
+        `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+      );
+    }
   } finally {
     // Stop recording first: the done line below is this log's last record, and the
     // run is over whatever the turn did.
@@ -1126,6 +1224,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model,
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(loopBreaker !== undefined ? { loopBreaker } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
 }
@@ -1182,6 +1281,9 @@ export interface ResolvedRunConfig {
   // bob#254 — where to call Flair at session start, when the agent configures
   // the flair capability. Absent: no bootstrap is loaded.
   flairBootstrapTarget?: FlairBootstrapTarget;
+  // bob#143 item 3 — bob.yaml `run.tool_loop_limit`, or the default. One-shot
+  // runs and the persistent runtime both observe it.
+  toolLoopLimit: number;
 }
 
 // The tool policy for an agent's bob.yaml. ONE entry point for every launch
@@ -1811,6 +1913,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     agent,
     policy: toolPolicy,
     capabilities,
+    toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }

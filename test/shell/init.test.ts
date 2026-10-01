@@ -33,6 +33,7 @@ const REAL_TOOL_NAMES = new Set([
   "read",
   "bash",
   "edit",
+  "replace_lines",
   "write",
   "grep",
   "find",

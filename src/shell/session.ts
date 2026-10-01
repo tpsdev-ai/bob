@@ -51,6 +51,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { bobEditCustomTools } from "./bob-edit-tools.js";
 import { confinedReadCustomTools } from "./confined-read.js";
 import {
   assertWebComposition,
@@ -1154,6 +1155,12 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // pi's own read.
     const confinedRead = confinedReadCustomTools(policy, config);
 
+    // bob#143: the tolerant `edit` (shadows pi's built-in) and `replace_lines`,
+    // for a session that effectively allows `edit`. Registered as SDK custom
+    // tools so they shadow the built-ins by name; a name the policy does not
+    // allow is filtered out by pi, so this only ever adds edit's companions.
+    const bobEdit = bobEditCustomTools(policy, config.cwd);
+
     // bob#244: the web composition rule on what this session is ABOUT to
     // compose (data-class.ts), decided with the confined read — before bob sets
     // the capability environment, reads a key or builds pi's model runtime and
@@ -1296,7 +1303,12 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // as a custom tool named `read` — pi registers SDK custom tools after its
       // built-ins and extension tools, so this is where no role can reach pi's
       // unconfined read. Decided above, before any runtime was built.
-      ...(confinedRead.length > 0 ? { customTools: confinedRead } : {}),
+      // bob#143: bob's tolerant edit + replace_lines.
+      ...(bobEdit.length > 0
+        ? { customTools: [...confinedRead, ...bobEdit] }
+        : confinedRead.length > 0
+          ? { customTools: confinedRead }
+          : {}),
       // bob#214: the role's (or bob.yaml's) thinking level. pi clamps it to what
       // the model declares and hands it to the provider in its own request shape.
       ...(config.thinking !== undefined ? { thinkingLevel: config.thinking } : {}),

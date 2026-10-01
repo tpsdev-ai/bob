@@ -700,6 +700,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       "bash",
       "write",
       "edit",
+      "replace_lines",
       "powershell",
       "run",
       "write_file",
