@@ -1,0 +1,1 @@
+- **CI verifies each SHA-pinned action's full release tag comment against GitHub's peeled commit** (Closes #102)
