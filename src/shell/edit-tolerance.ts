@@ -8,11 +8,12 @@
 //
 // This module answers one question for the edit wrapper: given the file's
 // content and the model's edits, what EXACT substring of the file does each
-// oldText mean? Exact match wins; when it finds nothing, the content and the
-// oldText are canonicalised (runs of spaces/tabs → one space, trailing
-// whitespace dropped) and the edit is accepted only when that canonical form
-// occurs EXACTLY ONCE. Zero or two-plus canonical matches fail, naming the
-// count, so an ambiguous edit is never guessed.
+// oldText mean? A unique exact match wins, and two-plus exact matches fail,
+// naming that count. When there is no exact match, the content and the oldText
+// are canonicalised (runs of spaces/tabs → one space, trailing whitespace
+// dropped) and the edit is accepted only when that canonical form occurs
+// EXACTLY ONCE. Zero or two-plus canonical matches fail, naming the count, so
+// an ambiguous edit is never guessed.
 //
 // The returned edits carry the file's exact substring as `oldText`, so the
 // wrapper can hand them to pi's own edit tool and reuse its path resolution,
@@ -34,7 +35,11 @@ export interface LocatedEdit extends EditRequest {
   kind: "exact" | "whitespace";
 }
 
-/** A match that failed. `count` is the number of canonical occurrences seen. */
+/**
+ * A match that failed. `count` is the count the message names: exact
+ * occurrences for an exact duplicate, canonical occurrences when there is no
+ * exact match, and 0 for an empty oldText or overlapping edits.
+ */
 export class EditMatchError extends Error {
   readonly count: number;
   constructor(message: string, count: number) {
@@ -133,6 +138,11 @@ function notFoundMessage(path: string, index: number, total: number): string {
   return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must match, or match uniquely under that normalisation.`;
 }
 
+function exactDuplicateMessage(path: string, index: number, total: number, count: number): string {
+  const subject = total === 1 ? "oldText" : `edits[${index}].oldText`;
+  return `${subject} matches ${count} places exactly in ${path}. The text must be unique. Please provide more context to make it unique.`;
+}
+
 function duplicateMessage(path: string, index: number, total: number, count: number): string {
   return `Found ${count} occurrences of ${describe(path, index, total)} after normalising runs of spaces/tabs and ignoring trailing whitespace. The text must be unique. Please provide more context to make it unique.`;
 }
@@ -176,7 +186,10 @@ export function locateTolerantEdits(
       continue;
     }
     if (exactCount > 1) {
-      throw new EditMatchError(duplicateMessage(path, index, edits.length, exactCount), exactCount);
+      throw new EditMatchError(
+        exactDuplicateMessage(path, index, edits.length, exactCount),
+        exactCount,
+      );
     }
     const { count, index: at } = canonicalOccurrence(canonical, oldText);
     if (count !== 1) {

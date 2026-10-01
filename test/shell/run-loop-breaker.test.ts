@@ -1,20 +1,25 @@
 // run-loop-breaker.test.ts — bob#143 item 3. Through runAgent with a fake
 // session that emits tool_execution_start events: a run of identical calls ends
 // the run non-zero, one short of the limit does not, a different call resets
-// the run, and an abort that fails or is missing is reported.
+// the run, and an abort that fails, is missing or does not settle is reported.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
 import { runAgent } from "../../src/shell/run.js";
+import { LOOP_ABORT_GRACE_MS } from "../../src/shell/tool-loop.js";
 
 interface Call {
   toolName: string;
   args: unknown;
 }
 
-function makeSession(opts: { calls: Call[]; resolve: boolean; abort?: "rejects" | "missing" }): {
+function makeSession(opts: {
+  calls: Call[];
+  resolve: boolean;
+  abort?: "rejects" | "missing" | "pending";
+}): {
   session: RunSession;
   aborts: () => number;
 } {
@@ -57,6 +62,7 @@ function makeSession(opts: { calls: Call[]; resolve: boolean; abort?: "rejects" 
     async abort() {
       aborts += 1;
       if (opts.abort === "rejects") throw new Error("abort failed");
+      if (opts.abort === "pending") await new Promise<void>(() => {});
     },
     dispose() {
       // no-op
@@ -152,6 +158,40 @@ describe("runAgent loop breaker", () => {
           : "bob run testbot: could not stop the repeated turn — the session has no abort()",
       );
     }
+  }, 15_000);
+
+  it("ends the run non-zero when the abort never settles, within the bound", async () => {
+    const fake = makeSession({
+      calls: [editCall, editCall, editCall],
+      resolve: false,
+      abort: "pending",
+    });
+    const stderr: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    const started = Date.now();
+    let res: Awaited<ReturnType<typeof runAgent>>;
+    try {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "hi",
+        agentsRoot,
+        sessionFactory: factoryReturning(fake.session),
+        toolLoopLimit: 3,
+      });
+    } finally {
+      process.stderr.write = write;
+    }
+    expect(Date.now() - started).toBeLessThan(LOOP_ABORT_GRACE_MS + 5_000);
+    expect(res.exitCode).toBe(1);
+    expect(res.loopBreaker).toEqual({ toolName: "edit", count: 3 });
+    expect(fake.aborts()).toBe(1);
+    expect(stderr.join("")).toContain(
+      `bob run testbot: the stop request did not settle within ${LOOP_ABORT_GRACE_MS}ms; ending the run anyway`,
+    );
   }, 15_000);
 
   it("does not fire one short of the limit", async () => {

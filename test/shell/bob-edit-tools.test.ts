@@ -70,6 +70,15 @@ describe("createTolerantEditToolDefinition", () => {
     expect(resultText(result)).toContain("normalising runs of spaces/tabs");
   });
 
+  it("refuses an exact duplicate with its exact count", async () => {
+    writeFileSync(join(cwd, "f.md"), "x y\nx y\nx   y\n");
+    const tool = createTolerantEditToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.md", edits: [{ oldText: "x y", newText: "X Y" }] }),
+    ).rejects.toThrow(/^oldText matches 2 places exactly in f\.md\./);
+    expect(readFileSync(join(cwd, "f.md"), "utf8")).toBe("x y\nx y\nx   y\n");
+  });
+
   it("refuses a normalised match that is not unique, naming the count", async () => {
     writeFileSync(join(cwd, "f.md"), "- x   y\n- x  y\n");
     const tool = createTolerantEditToolDefinition(cwd);

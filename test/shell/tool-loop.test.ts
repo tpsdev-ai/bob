@@ -1,7 +1,7 @@
 // tool-loop.test.ts — bob#143 item 3. The pure detector behind the loop breaker:
 // consecutive identical calls only, reset by any different call, firing at the
-// limit and not before; and the call key, which keeps every own argument key
-// (`__proto__` included), ignores object-key order and keeps array order.
+// limit and not before; and the call key for arguments parsed from JSON, which
+// ignores object-key order, keeps array order and counts a `__proto__` key.
 import { describe, expect, it } from "bun:test";
 import {
   DEFAULT_TOOL_LOOP_LIMIT,
@@ -103,24 +103,6 @@ describe("toolCallKey", () => {
     expect(toolCallKey("edit", swapped)).not.toBe(toolCallKey("edit", original));
     expect(toolCallKey("edit", { o: { a: { b: 1 } } })).not.toBe(
       toolCallKey("edit", { o: { a: { b: 2 } } }),
-    );
-  });
-
-  it("gives every value a defined string, keeping values JSON cannot encode apart", () => {
-    expect(toolCallKey("t", { a: undefined })).not.toBe(toolCallKey("t", {}));
-    expect(toolCallKey("t", { a: undefined })).not.toBe(toolCallKey("t", { a: null }));
-    expect(toolCallKey("t", Symbol("s"))).toBe("t\u0000Symbol(s)");
-    expect(toolCallKey("t", 0)).not.toBe(toolCallKey("t", -0));
-    expect(toolCallKey("t", Number.NaN)).not.toBe(toolCallKey("t", null));
-    expect(toolCallKey("t", { a: "<circular>" })).not.toBe(
-      toolCallKey(
-        "t",
-        (() => {
-          const cyclic: Record<string, unknown> = {};
-          cyclic.a = cyclic;
-          return cyclic;
-        })(),
-      ),
     );
   });
 });

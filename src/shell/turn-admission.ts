@@ -6,6 +6,7 @@ import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
 import {
   DEFAULT_TOOL_LOOP_LIMIT,
+  LOOP_ABORT_GRACE_MS,
   loopBreakMessage,
   ToolLoopDetector,
   ToolLoopError,
@@ -40,8 +41,8 @@ export function createTurnAdmission(
     toolLoopLimit?: number;
     name?: string;
     // How long admitTurn waits for a loop-broken prompt to settle before it
-    // rejects anyway (test seam; default below). The binding is kept until the
-    // prompt settles either way.
+    // rejects anyway (test seam; default LOOP_ABORT_GRACE_MS). The binding is
+    // kept until the prompt settles either way.
     loopAbortGraceMs?: number;
   } = {},
 ) {
@@ -206,10 +207,6 @@ export function createTurnAdmission(
   };
   return admission;
 }
-
-// How long admitTurn waits for a loop-broken prompt to settle before it rejects
-// anyway and reports the prompt still running.
-const LOOP_ABORT_GRACE_MS = 1_000;
 
 // Ask the session to stop a loop-broken prompt. A missing or rejected abort()
 // is logged; nothing waits on it.

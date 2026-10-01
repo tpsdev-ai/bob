@@ -13,62 +13,33 @@
 /** Default number of consecutive identical calls that trips the loop breaker. */
 export const DEFAULT_TOOL_LOOP_LIMIT = 4;
 
-/** A stable key for a call: the tool name and its arguments, independent of object-key order. */
+/**
+ * After a loop break, how long the runtime waits for what it asked to stop: the
+ * loop-broken prompt (persistent admission) or the stop request (one-shot run).
+ */
+export const LOOP_ABORT_GRACE_MS = 1_000;
+
+/**
+ * A stable key for a call: the tool name and its arguments, which pi delivers
+ * as parsed JSON. Object-key order is ignored; array order is not.
+ */
 export function toolCallKey(toolName: string, args: unknown): string {
-  return `${toolName}\u0000${stableStringify(args)}`;
+  return `${toolName}\u0000${canonical(args)}`;
 }
 
-// A canonical string for a value, written directly rather than by rebuilding
-// objects: every own enumerable key is kept, `__proto__` included (a plain `{}`
-// copy would drop it). Object keys are sorted, so two calls whose argument
-// objects were built in a different key order are still the SAME call; array
-// order is kept. A value JSON has no form for (undefined, a non-finite number, a
-// bigint, a symbol, a function) gets its own unquoted token, and a cycle is
-// written as <circular>. If reading the value throws (a getter, a revoked
-// proxy), the key is String(value). For a JSON value, which is what pi
-// delivers, distinct content gives a distinct string.
-function stableStringify(value: unknown): string {
-  try {
-    return canonical(value, new Set());
-  } catch {
-    return String(value);
-  }
-}
-
-function canonical(value: unknown, ancestors: Set<object>): string {
-  if (value === null) return "null";
-  switch (typeof value) {
-    case "string":
-      return JSON.stringify(value);
-    case "number":
-      if (Object.is(value, -0)) return "-0";
-      return Number.isFinite(value) ? JSON.stringify(value) : String(value);
-    case "boolean":
-      return String(value);
-    case "undefined":
-      return "undefined";
-    case "bigint":
-      return `${value}n`;
-    case "symbol":
-      return value.toString();
-    case "function":
-      return "function";
-  }
-  const obj = value as object;
-  if (ancestors.has(obj)) return "<circular>";
-  ancestors.add(obj);
-  try {
-    if (Array.isArray(obj)) {
-      return `[${obj.map((item) => canonical(item, ancestors)).join(",")}]`;
-    }
-    const record = obj as Record<string, unknown>;
+// The canonical form of a parsed JSON value: JSON with object keys sorted. It is
+// written directly rather than by copying objects, because a plain `{}` copy
+// drops an own `__proto__` key, which JSON.parse produces.
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
     const entries = Object.keys(record)
       .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical(record[key], ancestors)}`);
+      .map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`);
     return `{${entries.join(",")}}`;
-  } finally {
-    ancestors.delete(obj);
   }
+  return String(JSON.stringify(value));
 }
 
 export interface LoopObservation {

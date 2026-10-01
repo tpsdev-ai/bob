@@ -97,6 +97,7 @@ import type { ModelLimits, ThinkingSetting } from "./session-budget.js";
 import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
 import {
   DEFAULT_TOOL_LOOP_LIMIT,
+  LOOP_ABORT_GRACE_MS,
   loopBreakMessage,
   ToolLoopDetector,
   ToolLoopError,
@@ -1153,14 +1154,28 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     failed = true;
     if (err instanceof ToolLoopError) {
       // bob#143 item 3 — the loop breaker failed the run; the message was written
-      // when it fired. Ask the session to stop the turn; a session without
-      // abort(), or an abort that fails, is reported.
+      // when it fired. Ask the session to stop the turn, waiting at most
+      // LOOP_ABORT_GRACE_MS: the run returns either way. A session without
+      // abort(), an abort that fails, and one still pending are reported.
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         if (!session.abort) throw new Error("the session has no abort()");
-        await session.abort();
+        const settled = await Promise.race([
+          session.abort().then(() => true),
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), LOOP_ABORT_GRACE_MS);
+          }),
+        ]);
+        if (!settled) {
+          process.stderr.write(
+            `bob run ${opts.name}: the stop request did not settle within ${LOOP_ABORT_GRACE_MS}ms; ending the run anyway\n`,
+          );
+        }
       } catch (abortErr) {
         const m = abortErr instanceof Error ? abortErr.message : String(abortErr);
         process.stderr.write(`bob run ${opts.name}: could not stop the repeated turn — ${m}\n`);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch

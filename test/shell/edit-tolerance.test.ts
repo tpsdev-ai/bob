@@ -1,7 +1,7 @@
 // edit-tolerance.test.ts — bob#143 item 1. The pure matcher behind the tolerant
 // `edit`: exact match first, then a whitespace-run-normalised match accepted
-// only when it is unique. Zero and two-plus normalised matches fail, naming the
-// count.
+// only when it is unique. Two-plus exact matches fail with the exact count; zero
+// and two-plus normalised matches fail with the normalised count.
 import { describe, expect, it } from "bun:test";
 import { EditMatchError, locateTolerantEdits } from "../../src/shell/edit-tolerance.js";
 
@@ -103,6 +103,32 @@ describe("locateTolerantEdits — refusals", () => {
     } catch (err) {
       expect((err as EditMatchError).count).toBe(2);
     }
+  });
+
+  it("reports an exact duplicate's EXACT count, not the normalised one", () => {
+    // Two exact matches, plus a third that matches only after normalising.
+    const content = "x y\nx y\nx   y\n";
+    try {
+      locateTolerantEdits(content, [{ oldText: "x y", newText: "X Y" }], "f.ts");
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect(err).toBeInstanceOf(EditMatchError);
+      expect((err as EditMatchError).count).toBe(2);
+      expect((err as Error).message).toBe(
+        "oldText matches 2 places exactly in f.ts. The text must be unique. Please provide more context to make it unique.",
+      );
+    }
+    // With several edits, the message names the edit.
+    expect(() =>
+      locateTolerantEdits(
+        content,
+        [
+          { oldText: "x   y", newText: "X Y" },
+          { oldText: "x y", newText: "X Y" },
+        ],
+        "f.ts",
+      ),
+    ).toThrow(/^edits\[1\]\.oldText matches 2 places exactly in f\.ts\./);
   });
 
   it("fails on an empty oldText", () => {

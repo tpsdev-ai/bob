@@ -647,6 +647,7 @@ export function readBlock(yamlText: string, key: string): Record<string, unknown
       throw new BobYamlError(key, lineNo, `expected "name: value". ${SUPPORTED_SHAPES}`);
     }
     const subKey = m[1];
+    refuseReservedKey(key, lineNo, subKey);
     const rest = m[2].trim();
     if (rest.startsWith("[")) {
       // Inline-flow list.
@@ -684,6 +685,15 @@ interface OpenList {
   current?: Record<string, unknown>;
 }
 
+// `__proto__` cannot be stored as a key of the plain objects readBlock builds:
+// the assignment would set the prototype or be ignored, so the key would vanish
+// before a reader's unknown-key check sees it. Refuse it instead.
+function refuseReservedKey(key: string, lineNo: number, name: string): void {
+  if (name === "__proto__") {
+    throw new BobYamlError(key, lineNo, `"__proto__" is a reserved key and is not supported.`);
+  }
+}
+
 // Match `name: value` STRICTLY: the colon must be followed by whitespace or end
 // of line. That's YAML's own rule, and it's load-bearing here — the loose form
 // would read `- http://example` as the key `http` with value `//example`,
@@ -705,6 +715,7 @@ function setMappingValue(
   name: string,
   rest: string,
 ): void {
+  refuseReservedKey(key, lineNo, name);
   if (rest === "") {
     throw new BobYamlError(
       key,
