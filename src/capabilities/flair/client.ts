@@ -23,6 +23,64 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { normalizeEd25519PrivateKey } from "../../lib/ed25519-key.js";
 
+// Thrown (as a plain Error) by signedFetch when a response exceeds the size
+// bound a caller passed; bootstrap maps it to a typed FlairBootstrapError so no
+// other call path sees a bootstrap-specific type.
+const RESPONSE_TOO_LARGE_MARKER = "flair response exceeded the size bound";
+
+/** UTF-8 byte length of `text` — the unit the response bound counts. */
+function utf8ByteLength(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+/**
+ * Read a response body as text, refusing it once its UTF-8 BYTES exceed
+ * `maxBytes`. With a byte stream (`res.body`, which a real fetch response
+ * carries) each chunk's bytes are checked BEFORE it is retained: once the total
+ * passes the bound the stream is cancelled, and the earlier chunks — not the
+ * whole body — are what was held. A fake without a stream falls back to
+ * `text()`, whose complete body is received before its byte length is checked.
+ * Throws RESPONSE_TOO_LARGE_MARKER past the bound.
+ */
+async function readBodyTextBounded(
+  res: { text(): Promise<string>; body?: ResponseBody | null },
+  maxBytes: number,
+): Promise<string> {
+  // `res` is the injected fetch result; a real fetch Response carries `body`, a
+  // test fake may not. Read it if present.
+  const body = res.body;
+  if (body === undefined || body === null) {
+    const text = await res.text();
+    if (utf8ByteLength(text) > maxBytes) throw new Error(RESPONSE_TOO_LARGE_MARKER);
+    return text;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw new Error(RESPONSE_TOO_LARGE_MARKER);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
 export interface FlairSearchHit {
   id: string;
   content: string;
@@ -36,6 +94,73 @@ export interface FlairMemory {
   createdAt?: string;
   durability?: string;
   [k: string]: unknown;
+}
+
+// bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is
+// candidate content: Flair's rendered block, which bob may append under its own
+// heading, or omit — a blank or web-session response yields nothing to append,
+// and an over-budget one is replaced by a failure note. Its sections (an
+// Identity section, "## Active Skills", predicted context) MAY appear, and a
+// long Active Skills section can exceed Flair's own selection budget, so the
+// CALLER bounds what it appends. `tokenEstimate` measures the whole response
+// Flair serialized, optional because the caller does not rely on it.
+export interface FlairBootstrap {
+  context: string;
+  tokenEstimate?: number;
+}
+
+// Default bounds on one bootstrap request: a host that accepts the request and
+// never finishes cannot hold session start past the timeout, and an oversized
+// body is refused rather than parsed and appended.
+export const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 10_000;
+export const DEFAULT_BOOTSTRAP_MAX_RESPONSE_BYTES = 1_000_000;
+
+export interface FlairBootstrapOptions {
+  // Flair's own cap on its CONTENT SELECTION (POST /BootstrapMemories
+  // maxTokens). It does NOT bound the rendered context; the caller does.
+  maxTokens?: number;
+  channel?: string;
+  surface?: string;
+  // Whether Flair includes the soul. Left at Flair's default (true): with
+  // `false` Flair also drops the skill-assignment scan that builds the "Active
+  // Skills" section (resources/MemoryBootstrap.ts), so the manifest this
+  // feature exists to load would vanish.
+  includeSoul?: boolean;
+  // Per-call overrides of the client's bounds (tests). Omitted → the client's
+  // configured values, defaulting to the constants above.
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+}
+
+// Why a bootstrap call produced no context. Code-owned, so a session's failure
+// line can name the cause without ever echoing server text (which can carry a
+// reflected credential).
+export type FlairBootstrapFailure =
+  | "unreachable"
+  | "timeout"
+  | "http_error"
+  | "too_large"
+  | "invalid_response";
+
+export class FlairBootstrapError extends Error {
+  readonly failure: FlairBootstrapFailure;
+  readonly status?: number;
+  constructor(failure: FlairBootstrapFailure, status?: number) {
+    super(
+      failure === "unreachable"
+        ? "flair bootstrap: the request did not complete"
+        : failure === "timeout"
+          ? "flair bootstrap: the request timed out"
+          : failure === "http_error"
+            ? `flair bootstrap: HTTP ${status ?? "error"}`
+            : failure === "too_large"
+              ? "flair bootstrap: the response exceeded the size bound"
+              : "flair bootstrap: the response carried no context",
+    );
+    this.name = "FlairBootstrapError";
+    this.failure = failure;
+    if (status !== undefined) this.status = status;
+  }
 }
 
 export interface FlairSoulEntry {
@@ -70,12 +195,30 @@ export interface FlairClient {
     },
   ): Promise<{ id: string }>;
   get(id: string): Promise<FlairMemory | null>;
+  bootstrap(opts?: FlairBootstrapOptions): Promise<FlairBootstrap>;
+}
+
+// The slice of a streaming body the bounded reader needs (structural, so no DOM
+// lib type is required): a real fetch response carries one. Kept OFF FetchLike so
+// the fetch seam every caller injects stays the minimal { ok, status, text() }
+// shape; signedFetch reads the stream off the response object directly.
+interface ResponseBodyReader {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  cancel(reason?: unknown): Promise<void>;
+  releaseLock?(): void;
+}
+interface ResponseBody {
+  getReader(): ResponseBodyReader;
 }
 
 // Minimal fetch shape we depend on (so tests pass a fake without DOM lib types).
+// `signal` is passed for the bootstrap timeout; a fake that ignores it is fine
+// because the timeout is also race-enforced by the caller. The size bound is
+// counted off the response's byte stream when it has one (a real fetch
+// response), else off the decoded text's UTF-8 byte length.
 type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 export interface FlairHttpClientOptions {
@@ -93,6 +236,9 @@ export interface FlairHttpClientOptions {
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
   readFile?: (path: string) => Buffer;
+  // Bounds on one bootstrap call (bob#254). Defaults: the constants above.
+  bootstrapTimeoutMs?: number;
+  bootstrapMaxResponseBytes?: number;
 }
 
 // ─── Signing primitives (exported for reuse by the shell) ───────────────────
@@ -146,6 +292,8 @@ export class FlairHttpClient implements FlairClient {
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => Buffer;
+  private readonly bootstrapTimeoutMs: number;
+  private readonly bootstrapMaxResponseBytes: number;
   // Parsed once; reused across requests.
   private keyObject?: KeyObject;
 
@@ -166,6 +314,9 @@ export class FlairHttpClient implements FlairClient {
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
+    this.bootstrapTimeoutMs = opts.bootstrapTimeoutMs ?? DEFAULT_BOOTSTRAP_TIMEOUT_MS;
+    this.bootstrapMaxResponseBytes =
+      opts.bootstrapMaxResponseBytes ?? DEFAULT_BOOTSTRAP_MAX_RESPONSE_BYTES;
   }
 
   // Parse the on-disk private key into a node KeyObject. See
@@ -187,6 +338,9 @@ export class FlairHttpClient implements FlairClient {
     // answer to a read, not a failure, and string-matching a thrown message
     // for "404" is the fragile alternative.
     nullOnStatus?: readonly number[],
+    // bootstrap-only extras: the abort signal for the timeout, and the response
+    // size bound. Both are optional so every other call is unchanged.
+    extra?: { signal?: AbortSignal; maxResponseBytes?: number },
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       Authorization: tpsEd25519AuthHeader({
@@ -203,8 +357,15 @@ export class FlairHttpClient implements FlairClient {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...(extra?.signal !== undefined ? { signal: extra.signal } : {}),
     });
-    const text = await res.text();
+    // A bootstrap response is bounded by BYTES while it is read: a real fetch
+    // response streams, and the read stops and cancels at the bound. Every
+    // other call reads the whole body.
+    const text =
+      extra?.maxResponseBytes !== undefined
+        ? await readBodyTextBounded(res, extra.maxResponseBytes)
+        : await res.text();
     if (!res.ok) {
       if (nullOnStatus?.includes(res.status)) return null;
       // Never include request body or auth header — only status + a short,
@@ -272,6 +433,71 @@ export class FlairHttpClient implements FlairClient {
       | FlairMemory
       | undefined;
     return r ?? null;
+  }
+
+  // ── Session bootstrap (POST /BootstrapMemories) ───────────────────────────
+  //
+  // Signed as this agent, like every other call. A non-2xx, a response that
+  // never arrives (timeout), one over the size bound, or a body whose `context`
+  // is missing or not a string is an ERROR (a typed FlairBootstrapError). A
+  // `context` that is present but BLANK is a successful empty response; the
+  // caller decides what to do with it (it appends nothing).
+  async bootstrap(opts: FlairBootstrapOptions = {}): Promise<FlairBootstrap> {
+    const body: Record<string, unknown> = { agentId: this.agentId };
+    if (opts.maxTokens !== undefined) body.maxTokens = opts.maxTokens;
+    if (opts.channel !== undefined) body.channel = opts.channel;
+    if (opts.surface !== undefined) body.surface = opts.surface;
+    if (opts.includeSoul !== undefined) body.includeSoul = opts.includeSoul;
+    const timeoutMs = opts.timeoutMs ?? this.bootstrapTimeoutMs;
+    const maxResponseBytes = opts.maxResponseBytes ?? this.bootstrapMaxResponseBytes;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Race-enforced as well as aborted: a fetch seam that ignores `signal`
+    // (tests) still cannot hold the caller, and the real fetch is released by
+    // the abort.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new FlairBootstrapError("timeout"));
+      }, timeoutMs);
+    });
+    let r: unknown;
+    try {
+      const pending = this.signedFetch("POST", "/BootstrapMemories", body, undefined, {
+        signal: controller.signal,
+        maxResponseBytes,
+      });
+      pending.catch(() => {}); // the race below owns the rejection
+      r = await Promise.race([pending, timedOut]);
+    } catch (err) {
+      if (err instanceof FlairBootstrapError) throw err; // timeout
+      // signedFetch's message names the status and a slice of the server body;
+      // that body can carry a reflected credential, so the status is parsed out
+      // and the message is dropped, never re-thrown.
+      const message = err instanceof Error ? err.message : "";
+      if (message.startsWith(RESPONSE_TOO_LARGE_MARKER)) {
+        throw new FlairBootstrapError("too_large");
+      }
+      const m = /^flair POST \/BootstrapMemories -> (\d{3})/.exec(message);
+      throw m
+        ? new FlairBootstrapError("http_error", Number(m[1]))
+        : new FlairBootstrapError("unreachable");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (
+      r === null ||
+      typeof r !== "object" ||
+      Array.isArray(r) ||
+      typeof (r as { context?: unknown }).context !== "string"
+    ) {
+      throw new FlairBootstrapError("invalid_response");
+    }
+    const rec = r as { context: string; tokenEstimate?: unknown };
+    return {
+      context: rec.context,
+      ...(typeof rec.tokenEstimate === "number" ? { tokenEstimate: rec.tokenEstimate } : {}),
+    };
   }
 
   // ── Presence heartbeats (POST /Presence) ──────────────────────────────────

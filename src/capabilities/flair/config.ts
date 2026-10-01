@@ -48,6 +48,19 @@ export const CONFIG_SCHEMA = Type.Object(
       description:
         "Path to the agent's Ed25519 private key (raw 32-byte seed, base64 of that seed, base64 PKCS8 DER, or PEM PKCS8). Never inlined.",
     }),
+    // bob#254 — the size budget for the session-start bootstrap block the SHELL
+    // appends to the system prompt, in ESTIMATED tokens (~4 chars each). It is
+    // passed to Flair as maxTokens and enforced by the shell on the block it
+    // appends, because Flair's own selection budget does not cover the skill
+    // lines it adds. The capability validates the value here; the extension
+    // ignores it at runtime. Absent → the shell's default (2000).
+    bootstrap_tokens: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        description:
+          "Size budget, in estimated tokens, for the Flair bootstrap block the shell appends at session start (default 2000).",
+      }),
+    ),
   },
   { additionalProperties: false },
 );

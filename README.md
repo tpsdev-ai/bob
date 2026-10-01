@@ -48,6 +48,8 @@ Registering an Agent record writes to Flair's admin-only `Agent` table, so onboa
 
 The persona is mirrored **one way: `soul.md` → Flair**, at the points where bob is already authoring one (`bob onboard`, `bob align`). Flair is the source of truth for *consumers* — it's what `bootstrap` returns, what travels to another machine running that identity, and what federates. `soul.md` is the source of truth for *authoring* — the hiring interview and your editor both write it, and the launcher reads it locally so a Flair outage can never boot a persona-less agent. Launch itself never syncs, in either direction.
 
+On runtime launch, for an agent whose resolved capabilities include `flair`, bob loads Flair's bootstrap context (`POST /BootstrapMemories`) and appends it to the system prompt after `soul.md`, under the heading `## Context from Flair (loaded at session start)`. Flair chooses what the context contains — its own soul entries (which need not match the local `soul.md`), the agent's assigned skills, predicted context. Bob bounds the appended block, heading included, by `flair.bootstrap_tokens` (default 2000, estimated at about 4 characters per token); on a request, response, timeout or budget failure the session still starts with one line saying the context could not be loaded (an identity mismatch instead refuses launch). A web session appends no bootstrap.
+
 If the two diverge (you edited `soul.md` after onboarding, or something else wrote the soul), the local file wins — loudly and losslessly: bob saves Flair's copy to `soul.flair.bak.md` next to `soul.md` and warns, naming both. Nothing is resolved silently.
 
 The divergence read remains signed with the agent's key. Only local onboarding and alignment use the operator password file for the Soul PUT. The `flair_*` runtime tools and self-improvement proposals receive no operator credential and cannot write a Soul entry. The operator password is read at call time, removed from the process environment and never passed to an agent session. It is not isolated from same-user file access, which is tracked separately: agent tools run as the same OS user as bob.
@@ -611,8 +613,8 @@ refuses such a session when it would also hold:
 - a private-class capability, or an extension bob cannot attribute to a capability;
 - any pi built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`,
   `powershell`: each reads or writes local data), or a tool bob cannot attribute;
-- `soul.md` content, or the persistent runtime's standing contract (its agent
-  block and cron duties);
+- `soul.md` content or the Flair bootstrap context, or the persistent runtime's
+  standing contract (its agent block and cron duties);
 - a context file, skill, prompt template or custom system prompt, including one a
   capability adds when the mode binds extensions or on a reload;
 - restored history, such as a resumed session whose history held a private

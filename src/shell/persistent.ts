@@ -42,6 +42,7 @@ import {
   type MailConsumerOptions,
 } from "./mail-consumer.js";
 import {
+  attachFlairBootstrap,
   createPiRunSession,
   type RunSession,
   type RunSessionConfig,
@@ -125,16 +126,17 @@ function neverResolves(): Promise<void> {
 export async function startPersistent(opts: RunPersistentOptions): Promise<PersistentHandle> {
   const log = opts.log ?? ((m: string) => console.error(m));
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { provider, model, config, cron, agent, capabilities, agentDir } = resolveRunConfig({
-    name: opts.name,
-    agentsRoot: root,
-    model: opts.model,
-    // The persistent runtime is resident by definition: this process stays up
-    // behind the agent's service unit with nobody at the keyboard, which is
-    // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
-    // `resident: true` says the same thing for the one-shot path.
-    persistent: true,
-  });
+  const { provider, model, config, cron, agent, capabilities, agentDir, flairBootstrapTarget } =
+    resolveRunConfig({
+      name: opts.name,
+      agentsRoot: root,
+      model: opts.model,
+      // The persistent runtime is resident by definition: this process stays up
+      // behind the agent's service unit with nobody at the keyboard, which is
+      // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
+      // `resident: true` says the same thing for the one-shot path.
+      persistent: true,
+    });
 
   // Mark this as the persistent runtime so "serving" capabilities (discord's
   // inbound gateway) open their connection — createPiRunSession surfaces it as
@@ -153,6 +155,11 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     role: agent.role,
     duties: cron,
   });
+  // bob#254 — the warm session builds a system prompt like every other entry
+  // path, so it loads the Flair bootstrap too. It serves cron and Discord
+  // inbound, so those turns carry the same context. A failure attaches the
+  // one-line "could not load" note rather than stopping the runtime.
+  await attachFlairBootstrap(flairBootstrapTarget, config, log);
   // bob#200: the tps-mail inbox consumer. It answers each accepted mail with
   // ONE turn in a FRESH session through the agent's launcher, so mail never
   // enters this warm session. Started BEFORE the warm session so a second

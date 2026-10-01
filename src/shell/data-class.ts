@@ -121,6 +121,7 @@ export const BOB_EXTENSION_DATA_CLASS: Readonly<Record<string, DataClass>> = Obj
 // R1c, R3), not this one.
 export type StartupContextSource =
   | "soul"
+  | "flair-bootstrap"
   | "standing-contract"
   | "task-contract"
   | "web-system-prompt";
@@ -131,6 +132,12 @@ export const STARTUP_CONTEXT_CLASS: Readonly<Record<StartupContextSource, Startu
     // soul.md, appended to the system prompt: an operator-written persona the
     // hiring interview refines. Nothing attributes what it holds.
     soul: "private",
+    // bob#254 — the Flair bootstrap context appended after soul.md. Flair holds
+    // the agent's memories, skills and predictions, so nothing here attributes
+    // what it carries either; the same row as soul.md is why a web session takes
+    // neither (the shell drops the bootstrap for a web session,
+    // flair-bootstrap.ts).
+    "flair-bootstrap": "private",
     // The persistent runtime's standing contract: bob.yaml's agent name and
     // role, and every cron duty's prompt.
     "standing-contract": "private",
@@ -409,6 +416,9 @@ export interface ConfigViewInput {
   tools: readonly string[];
   excludeTools?: readonly string[];
   appendSystemPrompt?: string;
+  // bob#254 — the Flair bootstrap block, appended after soul.md. Classified the
+  // same way soul.md is (a web session takes neither).
+  flairBootstrap?: string;
   taskContract?: string;
   standingContract?: string;
   restoredHistory?: number;
@@ -423,6 +433,8 @@ export function configCompositionView(input: ConfigViewInput): CompositionView {
   // isolatedLoaderOptions), so the same test decides whether it is present.
   if ((input.appendSystemPrompt ?? "").length > 0)
     startup.push({ kind: "classified", source: "soul" });
+  if ((input.flairBootstrap ?? "").length > 0)
+    startup.push({ kind: "classified", source: "flair-bootstrap" });
   if (input.standingContract !== undefined) {
     startup.push({ kind: "classified", source: "standing-contract" });
   }
@@ -495,6 +507,8 @@ export interface SessionViewInput {
   loader: StartupSource;
   // What bob appended, so each appended entry can be matched to its row.
   soul: string;
+  // bob#254 — the Flair bootstrap block appended after soul.md, when present.
+  flairBootstrap?: string;
   contractBlock?: string;
   contractSource?: "task-contract" | "standing-contract";
   // The system prompt pi assembled and will send (AgentSession.systemPrompt);
@@ -584,6 +598,12 @@ export function sessionCompositionView(input: SessionViewInput): CompositionView
     for (const entry of loader.getAppendSystemPrompt()) {
       if (input.soul.length > 0 && entry === input.soul) {
         startup.push({ kind: "classified", source: "soul" });
+      } else if (
+        input.flairBootstrap !== undefined &&
+        input.flairBootstrap.length > 0 &&
+        entry === input.flairBootstrap
+      ) {
+        startup.push({ kind: "classified", source: "flair-bootstrap" });
       } else if (
         input.contractBlock !== undefined &&
         input.contractSource !== undefined &&

@@ -714,13 +714,19 @@ export function installSessionBudget(
 // list order, so the guard sees the payload last — after every declared
 // capability has had its turn.
 export function isolatedLoaderOptions(
-  config: Pick<RunSessionConfig, "appendSystemPrompt" | "extensionSources" | "piAgentDir"> & {
+  config: Pick<
+    RunSessionConfig,
+    "appendSystemPrompt" | "flairBootstrap" | "extensionSources" | "piAgentDir"
+  > & {
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
   },
   extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[]; webSession?: boolean },
 ): LoaderOptions {
   const contractBlock = config.contractBlock;
+  // The appended system prompt: soul.md first, then the Flair bootstrap
+  // (bob#254) — its own entry, so a loader-level audit can match each to its
+  // data-class row. Both are omitted when empty.
   // Inline extensions pi appends AFTER every path-loaded one: the setup tool
   // first, then bob's contract guard (which must run its request handler LAST).
   const inlineFactories = [
@@ -748,7 +754,10 @@ export function isolatedLoaderOptions(
     ...(extra?.webSession === true
       ? { systemPromptOverride: () => WEB_SESSION_SYSTEM_PROMPT }
       : {}),
-    appendSystemPrompt: config.appendSystemPrompt.length > 0 ? [config.appendSystemPrompt] : [],
+    appendSystemPrompt: [
+      ...(config.appendSystemPrompt.length > 0 ? [config.appendSystemPrompt] : []),
+      ...((config.flairBootstrap ?? "").length > 0 ? [config.flairBootstrap as string] : []),
+    ],
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
       : {}),
@@ -836,7 +845,11 @@ export function auditWebSession(input: {
   loader: AuditExtensions & StartupSource;
   config: Pick<
     RunSessionConfig,
-    "capabilityBySource" | "appendSystemPrompt" | "taskContract" | "standingContract"
+    | "capabilityBySource"
+    | "appendSystemPrompt"
+    | "flairBootstrap"
+    | "taskContract"
+    | "standingContract"
   >;
   contractBlock?: string;
   // The session manager whose history the factory counted before building.
@@ -864,6 +877,9 @@ export function auditWebSession(input: {
       capabilityBySource: input.config.capabilityBySource,
       loader: input.loader,
       soul: input.config.appendSystemPrompt,
+      ...(input.config.flairBootstrap !== undefined
+        ? { flairBootstrap: input.config.flairBootstrap }
+        : {}),
       ...(input.contractBlock !== undefined ? { contractBlock: input.contractBlock } : {}),
       ...(contractSource !== undefined ? { contractSource } : {}),
       ...(typeof input.session.systemPrompt === "string"
