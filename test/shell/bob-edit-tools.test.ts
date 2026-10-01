@@ -5,8 +5,9 @@
 //   * `replace_lines` replaces/deletes an inclusive line range, refuses an
 //     inverted or out-of-range one, keeps the line numbers decisive when a line
 //     repeats, validates before any write, and is confined to the session cwd
-//     (relative paths resolve against it; an absolute path, `..` escape or
-//     escaping symlink that leaves it is refused).
+//     (relative paths resolve against it; a path that resolves outside it,
+//     whether absolute, through `..` or through a symlink, is refused; an
+//     absolute path inside it is accepted).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,

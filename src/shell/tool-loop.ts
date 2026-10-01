@@ -13,7 +13,7 @@
 /** Default number of consecutive identical calls that ends a turn. */
 export const DEFAULT_TOOL_LOOP_LIMIT = 4;
 
-/** A stable key for a call: the tool name and its arguments, order-independent. */
+/** A stable key for a call: the tool name and its arguments, independent of object-key order. */
 export function toolCallKey(toolName: string, args: unknown): string {
   return `${toolName}\u0000${stableStringify(args)}`;
 }

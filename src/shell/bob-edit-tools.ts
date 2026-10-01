@@ -1,6 +1,6 @@
 // bob-edit-tools.ts — bob#143 items 1 and 2, the pi-facing tools.
 //
-// TWO custom tools bob registers on a session that allows `edit`:
+// TWO custom tools bob registers, each from its own allowance:
 //
 //   * `edit`        — pi's edit tool, wrapped so a model whose oldText differs
 //                     only in runs of spaces/tabs still lands. The wrapper calls
@@ -8,8 +8,9 @@
 //                     resolves each oldText through edit-tolerance.ts (exact,
 //                     then a unique whitespace-run-normalised match) and hands
 //                     pi's own tool the exact file substrings, so pi keeps its
-//                     path resolution, write queue and diff. The result says how
-//                     many edits needed the normalisation.
+//                     path resolution, write queue and diff. A successful
+//                     normalised retry's result says how many edits needed the
+//                     normalisation.
 //   * `replace_lines` — replace an inclusive 1-based line range without
 //                     reproducing the old lines. It reads the file, validates
 //                     the range against that content, then writes the range back
@@ -168,8 +169,9 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
         newText: string;
       };
       // Confine the write to the run's workspace root: a relative path resolves
-      // against it, while an absolute path, a `..` escape or an escaping symlink
-      // that leaves the root is refused before any read or write.
+      // against it, and a path that resolves outside it (absolute, through `..`
+      // or through a symlink) is refused before any read or write. An absolute
+      // path inside the root is accepted.
       const requested = isAbsolute(path) ? path : resolve(cwd, path);
       const target = checkWriteTarget(requested, cwd);
       // Read the file's real content, then validate the range against it — no

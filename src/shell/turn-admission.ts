@@ -15,8 +15,9 @@ import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
   admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]>;
-  // The origin of the turn currently admitted, from admission until that
-  // prompt settles — never cleared mid-prompt by an agent_end.
+  // The origin of the admitted turn whose prompt the caller runs inside, from
+  // admission until that prompt settles — never cleared mid-prompt by an
+  // agent_end, a loop break, or a later admission. Elsewhere: run.
   readOrigin(): TurnOrigin;
 }
 
@@ -30,15 +31,17 @@ export interface TurnAdmission {
 //
 // bob#143 item 3: every admitted turn runs the same loop breaker as a one-shot
 // `bob run`. The detector counts consecutive identical tool calls within the
-// turn; at the configured limit the turn is signalled to stop and the admission
-// fails with `ToolLoopError`.
+// turn; at the configured limit the session is asked to stop and the admission
+// fails with `ToolLoopError`. The turn's origin binding lasts until its prompt
+// settles, which can be after the admission fails.
 export function createTurnAdmission(
   opts: {
     log?: (m: string) => void;
     toolLoopLimit?: number;
     name?: string;
     // How long admitTurn waits for a loop-broken prompt to settle before it
-    // stops holding the turn's origin binding (test seam; default below).
+    // rejects anyway (test seam; default below). The binding is kept until the
+    // prompt settles either way.
     loopAbortGraceMs?: number;
   } = {},
 ) {
@@ -51,9 +54,6 @@ export function createTurnAdmission(
     messages: unknown[];
     detector: ToolLoopDetector;
     abort?: (err: Error) => void;
-    // Set when the detector fires: the session's abort(), so admitTurn can wait
-    // for the aborted prompt to settle before it releases the origin binding.
-    stopping?: Promise<void>;
   };
   const context = new AsyncLocalStorage<Turn>();
   const endings = createAssistantEndingTracker();
@@ -80,16 +80,9 @@ export function createTurnAdmission(
               turn.abort = undefined;
               log(loopBreakMessage(agentName, toolName, args, observation.count));
               abort(new ToolLoopError(toolName, observation.count));
-              // Signal the session to stop, and RECORD the promise: admitTurn
-              // holds the turn's origin binding until it settles, so an
-              // in-flight tool the abort has not reached yet still sees the
-              // turn's origin rather than `run`. Never rejects.
-              turn.stopping = Promise.resolve()
-                .then(() => session?.abort?.())
-                .then(
-                  () => undefined,
-                  () => undefined,
-                );
+              // Ask the session to stop. The binding does not depend on the
+              // answer: admitTurn releases it only when the prompt settles.
+              requestStop(session, log);
             }
           }
         }
@@ -102,8 +95,8 @@ export function createTurnAdmission(
         // until the admitted prompt settles, which readOrigin() relies on: the
         // discord tools bind a turn's outbound reach to readOrigin(), and a
         // cleared origin mid-turn would restore their allowlist reach. The
-        // origin is cleared once, in admitTurn's own finally, after
-        // session.prompt() has resolved or rejected.
+        // origin is cleared once, after the admitted prompt has resolved or
+        // rejected (see admitTurn's finally).
         turn.messages = event.messages;
       });
       ready();
@@ -135,53 +128,58 @@ export function createTurnAdmission(
         });
         turn.abort = (err) => abortTurn(err);
         active = turn;
+        // The prompt itself, tracked apart from the race and from the abort:
+        // only its settlement releases the turn's origin binding.
+        let prompt: Promise<void> = Promise.resolve();
         try {
           // No await between installing the context and invoking the prompt.
-          await context.run(turn, async () => {
+          prompt = context.run(turn, () => {
             endings.reset();
-            // Race the turn against the loop breaker: when the detector fires,
-            // `loopAbort` rejects and the turn fails, the same way a one-shot
-            // `bob run` ends on a repeated call.
-            await Promise.race([
-              (async () => {
-                await promptSession(target, text);
-                // bob#256: continue through reasoning-only turns, bounded. Exhaustion
-                // is a FAILED turn — thrown so the callers (the cron scheduler, the
-                // Discord inbound listener) handle it as a failure rather than a
-                // successful fire/reply.
-                const reasoning = await repromptWhileReasoningOnly({
-                  session: target,
-                  readEnding: () => endings.current(),
-                  beginTurn: () => endings.reset(),
-                  onReprompt: (n, max) =>
-                    log(
-                      `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
-                    ),
-                });
-                if (reasoning.endedReasoningOnly) {
-                  throw new ReasoningOnlyExhaustedError(reasoning.reprompts);
-                }
-              })(),
-              loopAbort,
-            ]);
+            return (async () => {
+              await promptSession(target, text);
+              // bob#256: continue through reasoning-only turns, bounded. Exhaustion
+              // is a FAILED turn — thrown so the callers (the cron scheduler, the
+              // Discord inbound listener) handle it as a failure rather than a
+              // successful fire/reply.
+              const reasoning = await repromptWhileReasoningOnly({
+                session: target,
+                readEnding: () => endings.current(),
+                beginTurn: () => endings.reset(),
+                onReprompt: (n, max) =>
+                  log(
+                    `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
+                  ),
+              });
+              if (reasoning.endedReasoningOnly) {
+                throw new ReasoningOnlyExhaustedError(reasoning.reprompts);
+              }
+            })();
           });
+          // Race the turn against the loop breaker: when the detector fires,
+          // `loopAbort` rejects and the turn fails, the same way a one-shot
+          // `bob run` ends on a repeated call.
+          await Promise.race([prompt, loopAbort]);
           return turn.messages;
         } finally {
-          // bob#143: the origin binding outlives the aborted prompt. The
-          // detector rejects `loopAbort` the moment it fires, which ends THIS
-          // admission, but pi's prompt is still running — its parallel tool
-          // path can execute a call prepared before the abort. Hold the binding
-          // until the abort settles, bounded so a prompt that never settles
-          // cannot pin the admission either; if it does not settle in the
-          // bound, keep the binding and report it.
-          const settled = turn.stopping ? await settledWithin(turn.stopping, graceMs) : true;
-          if (settled) {
+          // bob#143: the origin binding is released only when the PROMPT
+          // settles. A loop break rejects `loopAbort` the moment the detector
+          // fires, while pi's prompt may still be running: its parallel tool
+          // path can execute a call prepared before the abort, and the
+          // session's abort() may be missing or fail. admitTurn waits for the
+          // prompt at most `graceMs`; past that it keeps the binding, reports
+          // it, and releases it when the prompt settles. The binding belongs to
+          // the turn (readOrigin), so a queued admission cannot replace it.
+          const release = (): void => {
             turn.origin = { kind: "run" };
-            active = undefined;
+            if (active === turn) active = undefined;
+          };
+          if (await settledWithin(prompt, graceMs)) {
+            release();
           } else {
             log(
-              `[bob] loop breaker: the aborted turn did not settle within ${graceMs}ms; keeping its origin binding`,
+              `[bob] loop breaker: the aborted turn did not settle within ${graceMs}ms; keeping its origin binding until it settles`,
             );
+            prompt.then(release, release);
           }
         }
       };
@@ -191,8 +189,11 @@ export function createTurnAdmission(
       return result;
     },
     readOrigin(): TurnOrigin {
+      // Keyed on the caller's own turn, not on `active`: a loop-broken prompt
+      // that outlives its admission keeps its origin after the next admission
+      // starts. A settled turn's origin was reset to run.
       const turn = context.getStore();
-      return turn && turn === active ? { ...turn.origin } : { kind: "run" };
+      return turn ? { ...turn.origin } : { kind: "run" };
     },
     close(): void {
       closed = true;
@@ -206,9 +207,25 @@ export function createTurnAdmission(
   return admission;
 }
 
-// How long admitTurn holds a loop-broken turn's origin binding while it waits
-// for the aborted prompt to settle.
+// How long admitTurn waits for a loop-broken prompt to settle before it rejects
+// anyway and reports the prompt still running.
 const LOOP_ABORT_GRACE_MS = 1_000;
+
+// Ask the session to stop a loop-broken prompt. A missing or rejected abort()
+// is logged; nothing waits on it.
+function requestStop(session: RunSession | undefined, log: (m: string) => void): void {
+  Promise.resolve()
+    .then(() => {
+      if (typeof session?.abort !== "function") throw new Error("the session has no abort()");
+      return session.abort();
+    })
+    .catch((err: unknown) => {
+      const m = err instanceof Error ? err.message : String(err);
+      log(
+        `[bob] loop breaker: could not signal the session to stop (${m}); the turn keeps its origin binding until its prompt settles`,
+      );
+    });
+}
 
 // Wait at most `ms` for `p`; true when it settled (either way), false when the
 // bound elapsed first. The timer is cleared either way, so a settled turn

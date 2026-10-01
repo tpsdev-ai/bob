@@ -60,8 +60,9 @@ describe("ToolLoopDetector", () => {
 });
 
 describe("toolCallKey", () => {
-  it("is order-independent for object arguments", () => {
+  it("is independent of object-key order, not of array order", () => {
     expect(toolCallKey("edit", { a: 1, b: 2 })).toBe(toolCallKey("edit", { b: 2, a: 1 }));
+    expect(toolCallKey("edit", { a: [1, 2] })).not.toBe(toolCallKey("edit", { a: [2, 1] }));
     expect(toolCallKey("edit", { a: 1 })).not.toBe(toolCallKey("edit", { a: 2 }));
     expect(toolCallKey("edit", { a: 1 })).not.toBe(toolCallKey("read", { a: 1 }));
   });

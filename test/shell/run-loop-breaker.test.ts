@@ -1,7 +1,7 @@
 // run-loop-breaker.test.ts — bob#143 item 3. Through runAgent with a fake
 // session that emits tool_execution_start events: a run of identical calls ends
-// the run non-zero, one short of the limit does not, and a different call resets
-// the run.
+// the run non-zero, one short of the limit does not, a different call resets
+// the run, and an abort that fails or is missing is reported.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,7 +14,7 @@ interface Call {
   args: unknown;
 }
 
-function makeSession(opts: { calls: Call[]; resolve: boolean }): {
+function makeSession(opts: { calls: Call[]; resolve: boolean; abort?: "rejects" | "missing" }): {
   session: RunSession;
   aborts: () => number;
 } {
@@ -56,11 +56,13 @@ function makeSession(opts: { calls: Call[]; resolve: boolean }): {
     },
     async abort() {
       aborts += 1;
+      if (opts.abort === "rejects") throw new Error("abort failed");
     },
     dispose() {
       // no-op
     },
   };
+  if (opts.abort === "missing") delete session.abort;
   return { session, aborts: () => aborts };
 }
 
@@ -119,6 +121,37 @@ describe("runAgent loop breaker", () => {
     expect(res.loopBreaker).toEqual({ toolName: "edit", count: 3 });
     expect(res.failed).toBe(true);
     expect(fake.aborts()).toBeGreaterThanOrEqual(1);
+  }, 15_000);
+
+  it("reports an abort that fails or is missing, and still ends the run non-zero", async () => {
+    for (const abort of ["rejects", "missing"] as const) {
+      const fake = makeSession({ calls: [editCall, editCall, editCall], resolve: false, abort });
+      const stderr: string[] = [];
+      const write = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        stderr.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      let res: Awaited<ReturnType<typeof runAgent>>;
+      try {
+        res = await runAgent({
+          name: "testbot",
+          prompt: "hi",
+          agentsRoot,
+          sessionFactory: factoryReturning(fake.session),
+          toolLoopLimit: 3,
+        });
+      } finally {
+        process.stderr.write = write;
+      }
+      expect(res.exitCode).toBe(1);
+      expect(res.loopBreaker).toEqual({ toolName: "edit", count: 3 });
+      expect(stderr.join("")).toContain(
+        abort === "rejects"
+          ? "bob run testbot: could not stop the repeated turn — abort failed"
+          : "bob run testbot: could not stop the repeated turn — the session has no abort()",
+      );
+    }
   }, 15_000);
 
   it("does not fire one short of the limit", async () => {

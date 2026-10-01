@@ -1152,8 +1152,15 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     failed = true;
     if (err instanceof ToolLoopError) {
       // bob#143 item 3 — the loop breaker ended the turn; the message was written
-      // when it fired. Stop the stuck turn so nothing keeps running.
-      if (session.abort) await session.abort().catch(() => {});
+      // when it fired. Ask the session to stop the turn; a session without
+      // abort(), or an abort that fails, is reported.
+      try {
+        if (!session.abort) throw new Error("the session has no abort()");
+        await session.abort();
+      } catch (abortErr) {
+        const m = abortErr instanceof Error ? abortErr.message : String(abortErr);
+        process.stderr.write(`bob run ${opts.name}: could not stop the repeated turn — ${m}\n`);
+      }
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch
       // made a cap-hit look like a silent clean exit. Label a provider
