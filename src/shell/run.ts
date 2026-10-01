@@ -1263,7 +1263,8 @@ function abortedRunResult(
 // continue turn and the reasoning re-prompts go through it as turns (through
 // promptSession, so template expansion stays off; boundedPrompt times each one).
 // The compaction note goes through it as a steer: queued with `steer()`, which
-// never starts a turn, so pi delivers it inside a turn bob sent and timed. Once
+// never starts a turn. pi delivers it only if an agent run continues or starts
+// after it is queued; otherwise it is not delivered. Once
 // any bound has fired it sends nothing and throws that bound's RunAbortedError.
 // It throws synchronously, before a prompt promise exists, so a caller that
 // races the send is never left holding an unhandled rejection.

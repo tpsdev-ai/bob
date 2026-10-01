@@ -476,7 +476,7 @@ describe("runAgent termination bounds (bob#135)", () => {
     expect(err).toContain("the run was ended by its turn_timeout bound");
   }, 15_000);
 
-  it("a compaction during a live turn still delivers the note, queued into that turn", async () => {
+  it("a compaction during a live turn queues the note with steer() and starts no other prompt", async () => {
     const fake = fakeSession(async (emit) => {
       emit({ type: "compaction_end", reason: "threshold" });
       emit(messageEnd("done"));
