@@ -970,8 +970,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     let outcome = judge();
     if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
       // Budget exhausted on a reasoning-only ending: report the honest failure
-      // BEFORE the compaction retry. The retry recovers a SILENT settlement (a
-      // compaction erased the plan); it is not a fourth reasoning turn, and a
+      // BEFORE the compaction retry. The retry recovers a SILENT settlement after
+      // compaction; it is not a fourth reasoning turn, and a
       // text reply to it must never turn the run green.
       outcome = { ok: false, reason: "reasoning_only" };
     } else if (!outcome.ok && outcome.reason === "settled_after_compaction") {

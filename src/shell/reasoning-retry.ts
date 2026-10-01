@@ -7,13 +7,12 @@
 // run.
 //
 // The re-prompting is BOUNDED by a constant (DEFAULT_MAX_REASONING_REPROMPTS),
-// never by the model's output: after that many re-prompts (one budget for the
-// whole run) a still-reasoning-only ending ends the run with the honest outcome.
-// A model that answers
-// with reasoning only forever therefore cannot hold the run — the loop's exit
-// does not depend on a turn ever producing text. The caller sends the first
-// prompt (through promptSession) and then calls repromptWhileReasoningOnly,
-// which only continues it; run.ts carries ONE budget across its whole run.
+// never by the model's output. A one-shot run (run.ts) carries ONE budget across
+// its whole run, the compaction retry included; each admitted runtime turn
+// (turn-admission.ts) gets a fresh budget, and exhaustion rejects that turn while
+// the runtime continues. The loop's exit never depends on a turn producing text.
+// The caller sends the first prompt (through promptSession) and then calls
+// repromptWhileReasoningOnly, which only continues it.
 
 import {
   type AssistantEnding,

@@ -42,10 +42,10 @@ export const CONTINUE_TURN =
  *  run going, bounded (DEFAULT_MAX_REASONING_REPROMPTS). */
 export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give your final report.";
 
-/** The most reasoning-only re-prompts in a run before it ends with the honest
- *  outcome. A CONSTANT, not a function of the model's output, so a model that
- *  answers with reasoning only can never hold the run: after this many
- *  re-prompts a still-reasoning-only ending ends the run and reports it. */
+/** The most reasoning-only re-prompts per budget: one budget per one-shot run
+ *  (the compaction retry included) and a fresh one per admitted runtime turn.
+ *  A CONSTANT, not a function of the model's output: after this many re-prompts
+ *  a still-reasoning-only ending fails the run, or rejects that admitted turn. */
 export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
 
 /** How many recent tool calls the generated worktree note lists. */
@@ -226,8 +226,8 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
     text,
     reasoning,
     hasToolCall,
-    // ACTUAL thinking content is required: an empty or whitespace-only message is
-    // silence, not reasoning-only (bob#256).
+    // ACTUAL thinking content is required: empty or whitespace-only text with no
+    // substantive thinking and no tool call is silence, not reasoning-only (bob#256).
     reasoningOnly: !hasToolCall && text.trim().length === 0 && reasoning.trim().length > 0,
   };
 }
