@@ -202,7 +202,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /\.changelog\/unreleased\/fixed\.txt: not a \.md file\. Changelog fragments must be named/,
+      `.changelog/unreleased/fixed.txt: not a .md file. Changelog fragments must be named <category>-<slug>.md (categories: added, changed, deprecated, removed, fixed, security).`,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -221,7 +221,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /\.changelog\/unreleased\/fixed\.md: missing the '-<slug>' part/,
+      `.changelog/unreleased/fixed.md: missing the '-<slug>' part. Name it fixed-<something-descriptive>.md.`,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -240,7 +240,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /.changelog\/unreleased\/fixed-empty\.md: fragment is empty\. Write the changelog entry/,
+      `.changelog/unreleased/fixed-empty.md: fragment is empty. Write the changelog entry into it, or delete the file.`,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -259,7 +259,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /.changelog\/unreleased\/fixed-tab\.md:2: continuation indent 0; tabs are not allowed/,
+      `.changelog/unreleased/fixed-tab.md:2: continuation indent 0; tabs are not allowed; indent continuation lines by an even number of spaces: 2 for the entry, 4 or more for nested content.`,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -558,7 +558,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-      /promote: no fragments in \.changelog\/unreleased/,
+      `promote: no fragments in .changelog/unreleased/ — refusing to cut v1.2.3 with an empty changelog section. Add the entries for this release before running the release step.`,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(
@@ -577,7 +577,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
     stageAll();
-    // Break the git index by replacing it with a directory: ls-files fails for any user
+    // Replace the default index path (.git/index) with a directory so ls-files fails regardless of file permissions.
     const index = join(root, ".git", "index");
     const save = `${index}.save`;
     renameSync(index, save);
@@ -587,7 +587,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       const beforeFNames = readdirSync(dir).sort();
       const beforeFRags = readdirSync(dir).map((n) => readFileSync(join(dir, n)));
       expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-        /git ls-files failed.*nothing was written.*repair.*ls-files succeeds.*retry promote/,
+        `promote: git ls-files failed, so nothing was written; repair the Git index or its environment until ls-files succeeds, then retry promote.`,
       );
       expect(readFileSync(changelogPath)).toEqual(beforeBytes);
       expect(readdirSync(dir).sort()).toEqual(beforeFNames);
