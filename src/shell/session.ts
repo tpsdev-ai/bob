@@ -1518,7 +1518,7 @@ export async function runInteractiveSession(input: InteractiveRunInput): Promise
     {
       cwd: config.cwd,
       agentDir: config.piAgentDir,
-      sessionManager: SessionManager.create(config.cwd),
+      sessionManager: SessionManager.create(config.cwd, join(config.piAgentDir, "sessions")),
     },
   );
   const mode = input.modeFactory

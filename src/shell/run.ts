@@ -1837,8 +1837,8 @@ export {
 //
 // `sessionManagerFactory` lets a caller supply the SessionManager — the
 // ephemeral `run` path defaults to in-memory (nothing to persist); the
-// persistent runtime passes `SessionManager.create(cwd)` so the warm session is
-// durable on disk (the working window; Flair remains the long-term store).
+// persistent runtime passes a durable manager rooted in piAgentDir/sessions
+// (the working window; Flair remains the long-term store).
 export async function createPiRunSession(
   config: RunSessionConfig,
   sessionManagerFactory?: (cwd: string) => SessionManagerLike,

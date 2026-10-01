@@ -1,0 +1,1 @@
+- **Pi transcripts use each agent's .pi-agent/sessions directory for durable sessions and interactive resume (Closes #251)**.
