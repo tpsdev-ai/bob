@@ -36,6 +36,22 @@ export const CONTINUE_TURN =
   "restate what remains in one line, finish the task, and end with a final message describing " +
   "the outcome (including any commit/push the task asked for).";
 
+/** The continuation sent when a run's turn ends with reasoning only — no text
+ *  and no tool call (flair#256). A reasoning-only turn is not a final answer:
+ *  local reasoning models emit it regularly, so bob sends this and keeps the
+ *  run going, bounded (DEFAULT_MAX_REASONING_REPROMPTS). */
+export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give your final report.";
+
+/** The most consecutive reasoning-only endings re-prompted before a run ends
+ *  with the honest outcome. A CONSTANT, not a function of the model's output,
+ *  so a model that answers with reasoning only can never hold the run: after
+ *  this many re-prompts the run stops and reports it. */
+export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
+
+/** Cap on the reasoning excerpt carried in the honest outcome (never the whole
+ *  reasoning, which can be long). */
+export const DEFAULT_REASONING_EXCERPT_CHARS = 400;
+
 /** How many recent tool calls the generated worktree note lists. */
 export const DEFAULT_RECENT_TOOL_CALLS = 5;
 
@@ -53,7 +69,10 @@ export type SilenceReason =
   | "no_final_message"
   // A final message EXISTS but does not match the declared expected shape — it
   // is not silence, so it gets its own reason.
-  | "final_shape_mismatch";
+  | "final_shape_mismatch"
+  // The run ended with a reasoning-only turn (no text, no tool call), re-prompted
+  // up to the bound and still reasoning-only — "ended without a final report".
+  | "reasoning_only";
 
 /** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
  *  less yields "" — never the untruncated text. */
@@ -171,6 +190,68 @@ function textFromContent(content: unknown): string {
   return out;
 }
 
+/**
+ * One assistant message's ending, classified (flair#256). `text` is its text
+ * blocks, `reasoning` its thinking blocks, `hasToolCall` whether it called a
+ * tool. `reasoningOnly` is the shape the issue names — NO tool call and NO
+ * non-empty text — which pi would otherwise take as the agent being finished.
+ */
+export interface AssistantEnding {
+  text: string;
+  reasoning: string;
+  hasToolCall: boolean;
+  reasoningOnly: boolean;
+}
+
+export function classifyAssistantEnding(content: unknown): AssistantEnding {
+  let text = "";
+  let reasoning = "";
+  let hasToolCall = false;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (typeof block === "string") {
+        text += block;
+        continue;
+      }
+      const b = block as { type?: string; text?: string; thinking?: string };
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "text" && typeof b.text === "string") text += b.text;
+      else if (b.type === "thinking" && typeof b.thinking === "string") reasoning += b.thinking;
+      else if (b.type === "toolCall") hasToolCall = true;
+    }
+  }
+  return { text, reasoning, hasToolCall, reasoningOnly: !hasToolCall && text.trim().length === 0 };
+}
+
+/** Tracks the LAST assistant message that ended (an `AssistantEnding`), from the
+ *  session event stream. `reset()` at each turn boundary so a prior turn's
+ *  ending is never read. A failure-ended message clears it: a failure is not a
+ *  reasoning-only ending. */
+export interface AssistantEndingTracker {
+  observe(event: unknown): void;
+  reset(): void;
+  current(): AssistantEnding | undefined;
+}
+
+export function createAssistantEndingTracker(): AssistantEndingTracker {
+  let current: AssistantEnding | undefined;
+  return {
+    reset(): void {
+      current = undefined;
+    },
+    current: () => current,
+    observe(event: unknown): void {
+      const e = (event ?? {}) as SessionEventLike;
+      if (e.type !== "message_end" || e.message?.role !== "assistant") return;
+      current = isFailureStopReason(e.message.stopReason)
+        ? undefined
+        : classifyAssistantEnding(e.message.content);
+    },
+  };
+}
+
 export interface CompactionObserverOptions {
   /** `git status --short` for the agent's worktree; "" outside a repo. */
   worktreeStatus?: () => string;
@@ -210,6 +291,9 @@ export interface CompactionObserver {
    *  `finalText()` — which is the difference between "retry this mail" and
    *  "send no reply" for a mail turn (bob#200). */
   lastEndFailed(): boolean;
+  /** The classification of the LAST assistant message that ended since the
+   *  boundary (flair#256), or undefined when none has or the last one failed. */
+  lastEnding(): AssistantEnding | undefined;
 }
 
 /**
@@ -235,11 +319,13 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let finalMessage = "";
   let sawAssistantEnd = false;
   let lastEndFailed = false;
+  let lastEnding: AssistantEnding | undefined;
 
   const clearCapture = (): void => {
     finalMessage = "";
     sawAssistantEnd = false;
     lastEndFailed = false;
+    lastEnding = undefined;
     deltaBuffer = "";
   };
 
@@ -259,6 +345,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     finalText: () => finalMessage,
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
+    lastEnding: () => lastEnding,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -310,6 +397,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             finalMessage = failed ? "" : ended;
             sawAssistantEnd = true;
             lastEndFailed = failed;
+            lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
           }
           deltaBuffer = "";
           return;

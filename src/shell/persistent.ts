@@ -186,7 +186,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
   // the launcher, so the consumer above neither holds nor submits to it.
-  const admission = createTurnAdmission();
+  const admission = createTurnAdmission({ log });
   config.turnAdmission = admission;
   let session: RunSession;
   try {

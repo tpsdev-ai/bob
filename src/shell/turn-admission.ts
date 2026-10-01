@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createEventBus, type EventBus } from "@earendil-works/pi-coding-agent";
+import { createAssistantEndingTracker } from "./compaction-contract.js";
+import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
 import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
@@ -15,9 +17,15 @@ export interface TurnAdmission {
 // One runtime owns one FIFO. Async context binds the origin to the actual
 // prompt call, including its preflight awaits. A bare prompt outside this call
 // reads run, even while an admitted prompt is paused before before_agent_start.
-export function createTurnAdmission() {
+//
+// Every admitted turn is also re-prompted while its last turn ends with
+// reasoning only (flair#256), bounded, so a cron/Discord turn cannot end the
+// agent mid-task either.
+export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
+  const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
   type Turn = { origin: TurnOrigin; messages: unknown[] };
   const context = new AsyncLocalStorage<Turn>();
+  const endings = createAssistantEndingTracker();
   let active: Turn | undefined;
   let session: RunSession | undefined;
   let closed = false;
@@ -30,6 +38,7 @@ export function createTurnAdmission() {
     bind(value: RunSession): void {
       session = value;
       value.subscribe((event) => {
+        endings.observe(event);
         if (event.type !== "agent_end") return;
         const turn = context.getStore();
         if (turn !== active || !turn) return;
@@ -65,7 +74,25 @@ export function createTurnAdmission() {
         active = turn;
         try {
           // No await between installing the context and invoking the prompt.
-          await context.run(turn, () => promptSession(target, text));
+          await context.run(turn, async () => {
+            endings.reset();
+            await promptSession(target, text);
+            // flair#256: continue through reasoning-only turns, bounded.
+            const reasoning = await repromptWhileReasoningOnly({
+              session: target,
+              readEnding: () => endings.current(),
+              beginTurn: () => endings.reset(),
+              onReprompt: (n, max) =>
+                log(
+                  `[bob] turn ended with reasoning only (no text, no tool call) — re-prompting (${n}/${max})`,
+                ),
+            });
+            if (reasoning.endedReasoningOnly) {
+              log(
+                `[bob] the turn ended without a final report: its last turn carried reasoning only, no text and no tool call, after ${reasoning.reprompts} re-prompt(s)`,
+              );
+            }
+          });
           return turn.messages;
         } finally {
           turn.origin = { kind: "run" };

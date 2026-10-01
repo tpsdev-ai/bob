@@ -75,6 +75,7 @@ import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
+import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
 import {
@@ -939,6 +940,19 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // bob's own runner: the text IS the prompt (no command/template/skill
     // expansion — see session.ts promptSession).
     await promptSession(session, opts.prompt);
+    // flair#256: a turn that ends with reasoning only (no text, no tool call) is
+    // not a final answer. Re-prompt the SAME session with a short continuation,
+    // bounded, so the run continues instead of ending mid-task. The bound is a
+    // constant, so a model that answers with reasoning only can never hold it.
+    let reasoning = await repromptWhileReasoningOnly({
+      session,
+      readEnding: () => observer.lastEnding(),
+      beginTurn: () => observer.startTurn(),
+      onReprompt: (n, max) =>
+        process.stderr.write(
+          `bob run ${opts.name}: the turn ended with reasoning only (no text, no tool call) — re-prompting (${n}/${max})\n`,
+        ),
+    });
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -957,27 +971,58 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
         await promptSession(session, CONTINUE_TURN);
+        reasoning = await repromptWhileReasoningOnly({
+          session,
+          readEnding: () => observer.lastEnding(),
+          beginTurn: () => observer.startTurn(),
+        });
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
       outcome = judge();
     }
+    // flair#256: a run whose last turn is STILL reasoning-only after the bound
+    // ended without a final report — never a normal completion. It is treated as
+    // a failure (a mail turn retries it; it is not "silence" with nothing to
+    // say).
+    if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
+      outcome = { ok: false, reason: "reasoning_only" };
+    }
     // A run with no final message whose last message ended on an error or an
     // abort FAILED; one that ended cleanly with nothing to say did not.
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
+    if (outcome.reason === "reasoning_only") failed = true;
     if (!outcome.ok) {
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
       exitCode = 1;
       reason = outcome.reason;
+      if (reason === "reasoning_only") {
+        // The honest outcome record: the run-ended-anyway outcome plus a bounded
+        // excerpt of the last reasoning (the run log is 0600, like the assistant
+        // messages it already records).
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: {
+              reason: "reasoning_only",
+              reprompts: reasoning.reprompts,
+              reasoningExcerpt: reasoning.reasoningExcerpt,
+            },
+          },
+          false,
+        );
+      }
       process.stderr.write(
         `bob run ${opts.name}: REFUSING to report success — ${reason}` +
           (reason === "settled_after_compaction"
             ? " (the session settled after a context compaction without a final message)"
             : reason === "final_shape_mismatch"
               ? " (the final message did not match the declared shape)"
-              : " (the session settled without a final message)") +
+              : reason === "reasoning_only"
+                ? ` (the session ended without a final report — its last turn carried reasoning only, no text and no tool call, after ${reasoning.reprompts} re-prompt(s))`
+                : " (the session settled without a final message)") +
           "\n",
       );
       const status = readWorktreeStatus(config.cwd);
