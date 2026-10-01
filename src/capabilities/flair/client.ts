@@ -28,6 +28,58 @@ import { normalizeEd25519PrivateKey } from "../../lib/ed25519-key.js";
 // other call path sees a bootstrap-specific type.
 const RESPONSE_TOO_LARGE_MARKER = "flair response exceeded the size bound";
 
+/** UTF-8 byte length of `text` — the unit the response bound counts. */
+function utf8ByteLength(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+/**
+ * Read a response body as text, refusing it once its UTF-8 BYTES exceed
+ * `maxBytes`. With a byte stream (`res.body`, which a real fetch response
+ * carries) the read stops and the stream is cancelled at the bound, so an
+ * oversized body is never fully buffered. A fake without a stream falls back to
+ * `text()`, bounded by the decoded text's byte length. Throws
+ * RESPONSE_TOO_LARGE_MARKER past the bound.
+ */
+async function readBodyTextBounded(
+  res: { text(): Promise<string>; body?: ResponseBody | null },
+  maxBytes: number,
+): Promise<string> {
+  // `res` is the injected fetch result; a real fetch Response carries `body`, a
+  // test fake may not. Read it if present.
+  const body = res.body;
+  if (body === undefined || body === null) {
+    const text = await res.text();
+    if (utf8ByteLength(text) > maxBytes) throw new Error(RESPONSE_TOO_LARGE_MARKER);
+    return text;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw new Error(RESPONSE_TOO_LARGE_MARKER);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
 export interface FlairSearchHit {
   id: string;
   content: string;
@@ -43,12 +95,14 @@ export interface FlairMemory {
   [k: string]: unknown;
 }
 
-// bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is the
-// rendered block bob appends to a session's system prompt; its sections (an
-// Identity section, "## Active Skills", predicted context) MAY appear, and a
-// long Active Skills section can exceed Flair's own selection budget, so the
-// CALLER bounds the block itself. `tokenEstimate` is Flair's own size figure,
-// optional because the caller does not rely on it.
+// bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is
+// candidate content: Flair's rendered block, which bob may append under its own
+// heading, or omit (a blank, over-budget, or web-session response appends
+// nothing). Its sections (an Identity section, "## Active Skills", predicted
+// context) MAY appear, and a long Active Skills section can exceed Flair's own
+// selection budget, so the CALLER bounds what it appends. `tokenEstimate`
+// measures the whole response Flair serialized, optional because the caller does
+// not rely on it.
 export interface FlairBootstrap {
   context: string;
   tokenEstimate?: number;
@@ -143,9 +197,24 @@ export interface FlairClient {
   bootstrap(opts?: FlairBootstrapOptions): Promise<FlairBootstrap>;
 }
 
+// The slice of a streaming body the bounded reader needs (structural, so no DOM
+// lib type is required): a real fetch response carries one. Kept OFF FetchLike so
+// the fetch seam every caller injects stays the minimal { ok, status, text() }
+// shape; signedFetch reads the stream off the response object directly.
+interface ResponseBodyReader {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  cancel(reason?: unknown): Promise<void>;
+  releaseLock?(): void;
+}
+interface ResponseBody {
+  getReader(): ResponseBodyReader;
+}
+
 // Minimal fetch shape we depend on (so tests pass a fake without DOM lib types).
 // `signal` is passed for the bootstrap timeout; a fake that ignores it is fine
-// because the timeout is also race-enforced by the caller.
+// because the timeout is also race-enforced by the caller. The size bound is
+// counted off the response's byte stream when it has one (a real fetch
+// response), else off the decoded text's UTF-8 byte length.
 type FetchLike = (
   url: string,
   init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
@@ -289,12 +358,13 @@ export class FlairHttpClient implements FlairClient {
       body: body !== undefined ? JSON.stringify(body) : undefined,
       ...(extra?.signal !== undefined ? { signal: extra.signal } : {}),
     });
-    const text = await res.text();
-    if (extra?.maxResponseBytes !== undefined && text.length > extra.maxResponseBytes) {
-      // The bound is enforced on the body AFTER it is read (the fetch seam
-      // returns text); it bounds what is kept and parsed, not what arrives.
-      throw new Error(RESPONSE_TOO_LARGE_MARKER);
-    }
+    // A bootstrap response is bounded by BYTES while it is read: a real fetch
+    // response streams, and the read stops and cancels at the bound. Every
+    // other call reads the whole body.
+    const text =
+      extra?.maxResponseBytes !== undefined
+        ? await readBodyTextBounded(res, extra.maxResponseBytes)
+        : await res.text();
     if (!res.ok) {
       if (nullOnStatus?.includes(res.status)) return null;
       // Never include request body or auth header — only status + a short,

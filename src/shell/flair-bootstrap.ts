@@ -8,9 +8,10 @@
 //
 // The block bob appends is bounded LOCALLY (heading included), because Flair
 // admits its skill lines outside its own selection budget. Over the bound, and
-// on any failure, the session STARTS with ONE line saying the context could not
-// be loaded (a bounded, secret-free reason), plus a log line. Never invent
-// context.
+// on a request, response, timeout or budget failure, the session STARTS with ONE
+// line saying the context could not be loaded (a bounded, secret-free reason),
+// plus a log line. An identity mismatch is not one of these: it refuses launch
+// (flairBootstrapTarget). Never invent context.
 
 import { FlairBootstrapError, FlairHttpClient } from "../capabilities/flair/client.js";
 import { type ConfigViewInput, configHoldsWeb } from "./data-class.js";
@@ -22,12 +23,12 @@ export const FLAIR_BOOTSTRAP_HEADING = "## Context from Flair (loaded at session
 // The default budget — bob.yaml's `flair.bootstrap_tokens` — when absent.
 export const DEFAULT_FLAIR_BOOTSTRAP_TOKENS = 2000;
 
-// Tokens are ESTIMATED from characters, not counted. Flair's own `tokenEstimate`
-// is deliberately not used: Flair admits the skill lines outside the maxTokens
-// selection budget, so its figure under-counts the block. The estimate (the
-// usual ~4 chars/token convention) is APPROXIMATE — a block of unusually short
-// tokens estimates under its true count — and it bounds the text BOB appends,
-// heading included.
+// Tokens are ESTIMATED from characters, not counted. Flair's `tokenEstimate`
+// measures the whole response Flair serialized (its `context` and skill lines
+// included), so it does not measure the block bob appends, which bob bounds
+// itself. The estimate (the usual ~4 chars/token convention) is APPROXIMATE — a
+// block of unusually short tokens estimates under its true count — and it bounds
+// the text BOB appends, heading included.
 export const FLAIR_BOOTSTRAP_CHARS_PER_TOKEN = 4;
 
 export function estimateFlairBootstrapTokens(text: string): number {

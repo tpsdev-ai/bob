@@ -18,8 +18,19 @@ const PEM = generateKeyPairSync("ed25519").privateKey.export({
 
 type Captured = { url: string; method: string; headers: Record<string, string>; body?: string };
 
+// A fake response body stream (the client's bounded reader consumes this shape).
+type StubBody = {
+  getReader(): {
+    read(): Promise<{ done: boolean; value?: Uint8Array }>;
+    cancel(reason?: unknown): Promise<void>;
+    releaseLock?(): void;
+  };
+};
+
 function clientWith(
-  reply: (captured: Captured) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>,
+  reply: (
+    captured: Captured,
+  ) => Promise<{ ok: boolean; status: number; text(): Promise<string>; body?: StubBody | null }>,
   extra: Partial<ConstructorParameters<typeof FlairHttpClient>[0]> = {},
 ): { client: FlairHttpClient; captured: Captured[] } {
   const captured: Captured[] = [];
@@ -165,5 +176,56 @@ describe("FlairHttpClient.bootstrap", () => {
     }
     expect(err).toBeInstanceOf(FlairBootstrapError);
     expect((err as FlairBootstrapError).failure).toBe("too_large");
+  });
+
+  it("refuses a body whose UTF-8 bytes exceed the bound though its UTF-16 length does not", async () => {
+    // 600k code units, ~1.2M UTF-8 bytes: a code-unit check accepts it, the byte
+    // bound must not.
+    const body = JSON.stringify({ context: "é".repeat(600_000) });
+    expect(body.length).toBeLessThan(1_000_000);
+    expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(1_000_000);
+    const { client } = clientWith(ok(body), { bootstrapMaxResponseBytes: 1_000_000 });
+    let err: unknown;
+    try {
+      await client.bootstrap({});
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(FlairBootstrapError);
+    expect((err as FlairBootstrapError).failure).toBe("too_large");
+  });
+
+  it("stops and cancels the read when a stream runs past the byte bound", async () => {
+    let cancelled = false;
+    let reads = 0;
+    const chunk = new Uint8Array(1000).fill(0x61); // 1000 bytes per chunk
+    const body: StubBody = {
+      getReader() {
+        return {
+          async read() {
+            reads += 1;
+            return { done: false, value: chunk };
+          },
+          async cancel() {
+            cancelled = true;
+          },
+          releaseLock() {},
+        };
+      },
+    };
+    const { client } = clientWith(
+      async () => ({ ok: true, status: 200, text: async () => "never", body }),
+      { bootstrapMaxResponseBytes: 2500 },
+    );
+    let err: unknown;
+    try {
+      await client.bootstrap({});
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(FlairBootstrapError);
+    expect((err as FlairBootstrapError).failure).toBe("too_large");
+    expect(cancelled).toBe(true);
+    expect(reads).toBe(3); // 1000, 2000, then 3000 > 2500 → stop
   });
 });

@@ -435,7 +435,7 @@ describe("entry paths carry the Flair bootstrap", () => {
     expect(JSON.parse(boot?.body ?? "{}")).toEqual({ agentId: "testbot", maxTokens: 333 });
   });
 
-  it("a failing Flair: the session starts, and the prompt carries the 'could not load' line, no fake context", async () => {
+  it("a failing Flair: the session starts, and the factory config carries the 'could not load' block, no fake context", async () => {
     const stub = await startStub(() => ({ status: 500, body: "nope" }));
     stubs.push(stub);
     scaffold(root, "testbot", { url: stub.url, keyFile });

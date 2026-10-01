@@ -5,7 +5,7 @@
   returned context after `soul.md`, under the heading
   `## Context from Flair (loaded at session start)`. Bob bounds the appended
   block, heading included, by `flair.bootstrap_tokens` (default 2000, estimated
-  at about 4 characters per token). On a timeout, an error, or an over-budget
-  context the session still starts, with one line saying the context could not
+  at about 4 characters per token). On a request, response, timeout or budget
+  failure the session still starts, with one line saying the context could not
   be loaded; a blank context appends nothing. A web session appends no
   bootstrap.
