@@ -68,7 +68,7 @@ describe("content types", () => {
 });
 
 describe("extraction", () => {
-  it("drops scripts, styles, the head and hidden elements, and keeps links inline", () => {
+  it("drops scripts, styles, the head and recognized hidden markers, and keeps links inline", () => {
     expect(extractText("text/html", RICH_HTML, BASE)).toBe(
       [
         "Heading",

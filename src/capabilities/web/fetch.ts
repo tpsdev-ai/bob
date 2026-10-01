@@ -22,8 +22,9 @@
 // Location is returned as the final response.
 //
 // LIMITS. One 15-second deadline covers the whole operation, every hop, and
-// the body read. The encoded body and the decoded body are each capped at 5 MB
-// and the cap is enforced while streaming, before extraction. The text is the
+// the body read. Bodies skipped on redirects or rejected content types are
+// destroyed. Accepted final responses have separate 5 MB encoded and decoded
+// caps, enforced while streaming before extraction. The text is the
 // operator's ceiling (web.fetch_max_chars, at most 100,000) unless the caller
 // asked for less; a cut is reported.
 
@@ -242,20 +243,11 @@ async function decodeBody(encoded: Buffer, encoding: string | undefined): Promis
   }
 }
 
-// Discard a response body this core does not read (a redirect's).
-async function discard(body: {
-  dump?: () => Promise<void>;
-  text?: () => Promise<string>;
-}): Promise<void> {
-  if (typeof body.dump === "function") {
-    await body.dump();
-    return;
-  }
-  if (typeof body.text === "function") {
-    await body.text();
-    return;
-  }
-  throw new WebFetchError("network", "the response body could not be discarded");
+// A body that cannot be used is terminated without reading untrusted bytes.
+// This closes its connection; a followed redirect opens another through the
+// same vetted dispatcher.
+export function discard(body: { destroy: () => void }): void {
+  body.destroy();
 }
 
 // Fetch one document for its text. Every refusal is a WebFetchError naming the
@@ -316,7 +308,7 @@ export async function fetchDocument(
         if (location === undefined) {
           return await readResult(response, status, current, maxChars);
         }
-        await discard(response.body);
+        discard(response.body);
         redirects += 1;
         if (redirects > MAX_REDIRECTS) {
           throw new WebFetchError(
@@ -349,7 +341,7 @@ async function readResult(
 ): Promise<FetchResult> {
   const media = mediaTypeOf(headerValue(response.headers["content-type"]));
   if (media === undefined || !allowedContentType(media)) {
-    await discard(response.body);
+    discard(response.body);
     throw new WebFetchError(
       "content-type",
       `content type ${media ?? "(none)"} is not one of ${ALLOWED_CONTENT_TYPES.join(", ")}`,

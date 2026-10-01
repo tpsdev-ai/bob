@@ -7,10 +7,10 @@
 // runtime bob ships on) through test/fixtures/web/fetch-harness.mjs, which
 // reports what each case observed as ONE JSON line. Every assertion is here.
 //
-// The two test seams are the address policy (the loopback peers' address, which
-// the real policy refuses) and the port set (the peers' ephemeral ports). The
-// caps, the deadline, the redirect limit, the headers, the content types, the
-// extraction and the text limit all run at their production value.
+// The harness injects the loopback address policy, ephemeral ports, DNS lookup,
+// TLS CA and a shorter deadline for deadline cases. The production deadline
+// constant is pinned separately. Caps, redirect limit, headers, content types,
+// extraction and text limit use their production values.
 
 import { afterAll, expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
@@ -122,10 +122,12 @@ const CASE_NAMES = [
   "redirect-scheme",
   "downgrade",
   "redirect-no-location",
+  "redirect-stream",
   "encoded-cap",
   "decoded-cap",
   "content-encoding",
   "content-type",
+  "content-type-stream",
   "allowed-types",
   "text-limit",
   "deadline",
@@ -301,6 +303,13 @@ test("returns a redirect status with no Location as the final response", () => {
   expect(observed.requestCount).toBe(1);
 });
 
+test("terminates a streaming redirect body before following its target", () => {
+  const observed = seen("redirect-stream");
+  expect(observed.text).toBe("target");
+  expect(observed.requestCount).toBe(2);
+  expect(Number(observed.abortedResponses)).toBeGreaterThan(0);
+});
+
 test("caps the encoded body at 5 MB while streaming", () => {
   const observed = seen("encoded-cap");
   expect(observed.cap).toBe(5 * 1024 * 1024);
@@ -333,6 +342,12 @@ test("refuses a content type it does not extract, naming the type", () => {
   expect(String(refusal("content-type", "pdfRefusal").detail)).toContain("application/pdf");
   expect(refusal("content-type", "noneRefusal").code).toBe("content-type");
   expect(String(refusal("content-type", "noneRefusal").detail)).toContain("(none)");
+});
+
+test("terminates a streaming body with a rejected content type", () => {
+  const observed = seen("content-type-stream");
+  expect(refusal("content-type-stream").code).toBe("content-type");
+  expect(Number(observed.abortedResponses)).toBeGreaterThan(0);
 });
 
 test("returns every allowed content type as its text", () => {

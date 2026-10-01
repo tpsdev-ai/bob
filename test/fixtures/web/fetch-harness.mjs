@@ -448,6 +448,32 @@ await record("redirect-no-location", async () => {
   return { status: result.status, text: result.text, requestCount: peer.requests.length };
 });
 
+await record("redirect-stream", async () => {
+  const peer = await httpPeer((req, res) => {
+    if (req.url === "/stream") {
+      res.writeHead(302, { location: "/target" });
+      res.write("an unfinished redirect body");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("target");
+  });
+  const result = await fetchDocument(
+    url(peer, "/stream"),
+    { settings: allowHttp() },
+    depsFor(peer, { deadlineMs: 500 }),
+  );
+  const abortDeadline = Date.now() + 1000;
+  while (peer.abortedResponses() === 0 && Date.now() < abortDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return {
+    text: result.text,
+    requestCount: peer.requests.length,
+    abortedResponses: peer.abortedResponses(),
+  };
+});
+
 await record("encoded-cap", async () => {
   const chunk = Buffer.alloc(64 * 1024, 0x61);
   const peer = await httpPeer((_req, res) => {
@@ -533,6 +559,21 @@ await record("content-type", async () => {
     fetchDocument(url(none), { settings: allowHttp() }, depsFor(none)),
   );
   return { pdfRefusal, noneRefusal };
+});
+
+await record("content-type-stream", async () => {
+  const peer = await httpPeer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/pdf" });
+    res.write("an unfinished rejected body");
+  });
+  const refusal = await refusalOf(
+    fetchDocument(url(peer), { settings: allowHttp() }, depsFor(peer, { deadlineMs: 500 })),
+  );
+  const abortDeadline = Date.now() + 1000;
+  while (peer.abortedResponses() === 0 && Date.now() < abortDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { refusal, abortedResponses: peer.abortedResponses() };
 });
 
 await record("allowed-types", async () => {

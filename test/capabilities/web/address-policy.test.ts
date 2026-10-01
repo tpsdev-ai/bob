@@ -1,7 +1,7 @@
 // The web fetch core's address policy and URL admission (bob#245 — web spec v3,
 // slice R1b). Pure: no sockets here. Every registry row and every prefix rule
 // is pinned by a sample address and the refusal it must produce; the loopback
-// transport tests live in fetch-core.test.ts.
+// transport tests live in fetch-core-node.test.ts.
 
 import { describe, expect, it } from "bun:test";
 import {
@@ -216,7 +216,7 @@ describe("the address policy", () => {
     }
   });
 
-  it("refuses the host's own interface addresses", () => {
+  it("refuses supplied and enumerated interface addresses", () => {
     const own = publicUnicastPolicy({ own: ["93.184.216.34", "2606:4700::1"] });
     expect(refusal("93.184.216.34", own)).toMatchObject({
       code: "own-interface",
@@ -228,9 +228,10 @@ describe("the address policy", () => {
 
     // The default policy refuses this host's real addresses.
     const ownAddresses = ownInterfaceAddresses();
+    const defaultPolicy = publicUnicastPolicy();
     expect(ownAddresses.length).toBeGreaterThan(0);
     for (const address of ownAddresses) {
-      expect(policy.classify(address).allowed).toBe(false);
+      expect(defaultPolicy.classify(address).allowed).toBe(false);
     }
   });
 

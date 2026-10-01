@@ -6,6 +6,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { discard } from "../../../src/capabilities/web/fetch.js";
 import {
   ACCEPT_HEADER,
   ADDRESS_POLICY_VERSION,
@@ -20,6 +21,23 @@ import {
 } from "../../../src/capabilities/web/index.js";
 
 const policy = publicUnicastPolicy({ own: [] });
+
+it("terminates a skipped body without waiting for or consuming it", () => {
+  let destroyed = false;
+  let consumed = false;
+  const body = {
+    destroy: () => {
+      destroyed = true;
+    },
+    dump: () => {
+      consumed = true;
+      return new Promise<void>(() => {});
+    },
+  };
+  discard(body);
+  expect(destroyed).toBe(true);
+  expect(consumed).toBe(false);
+});
 
 interface Recorded {
   options: unknown;

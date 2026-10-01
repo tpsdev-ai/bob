@@ -11,8 +11,8 @@
 // and anything outside 2000::/3; and every transition/translation prefix
 // (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16, Teredo inside
 // 2001::/23, the deprecated IPv4-compatible ::/96 and the IPv4-mapped
-// ::ffff:0:0/96). The host's own interface addresses are refused, so a request
-// can never reach the machine bob runs on. Anything unparsable is refused.
+// ::ffff:0:0/96). Addresses enumerated from the host's interfaces are
+// refused. Anything unparsable is refused.
 //
 // ONE REFUSED ADDRESS REFUSES THE REQUEST. Nothing here returns "the first
 // allowed answer": the caller refuses the whole request when any answer is
@@ -257,9 +257,7 @@ function canonicalText(address: ParsedAddress): string {
 }
 
 // The addresses of this host's own interfaces, one entry per address, with any
-// IPv6 zone identifier stripped. A read that fails returns an empty list: it
-// cannot make an address acceptable, because the policy still classifies it by
-// the registries.
+// IPv6 zone identifier stripped. A failed networkInterfaces() call propagates.
 export function ownInterfaceAddresses(
   interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces(),
 ): string[] {

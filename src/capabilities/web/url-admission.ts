@@ -1,8 +1,7 @@
 // URL admission for the fetch core (bob#245 — web spec v3, slice R1b). Every
 // URL the core will dispatch — the one it is given, and every redirect target
-// — goes through admitUrl, and the URL it returns is the SAME parsed URL the
-// core then dispatches (no second parse, so no gap between what was checked
-// and what is sent).
+// — goes through admitUrl. The core passes its canonical `href` to undici for
+// dispatch.
 //
 // WHAT IS CHECKED, in order: a zone identifier in the authority (WHATWG URL
 // refuses that form itself, so this runs first); a parse with WHATWG URL; empty
