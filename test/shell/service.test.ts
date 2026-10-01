@@ -315,7 +315,7 @@ function execStart(unit: string): string[] {
       tokens.push(token);
     }
   }
-  return tokens;
+  return tokens.map((t) => t.replace(/%%/g, "%").replace(/\$\$/g, "$"));
 }
 
 describe("systemd backend", () => {
@@ -423,6 +423,17 @@ describe("systemd backend", () => {
     expect(argv[0]).toBe('/usr/local/it "ner/bin/node');
     expect(argv[1]).toBe('/opt/bo"b \\path/bin/bob');
     expect(argv[3]).toBe("pulse");
+  });
+  it("ExecStart escapes %h and env vars through literally (bob#222)", () => {
+    const bobPath = `/opt/${HOME} with %h/work`;
+    const unit = renderSystemdUnit({
+      name: "pulse",
+      bobBin: bobPath,
+      interpreter: INTERPRETER,
+      home: HOME,
+    });
+    const argv = execStart(unit);
+    expect(argv[1]).toBe(bobPath);
   });
 
   it("renderSystemdUnit throws when an ExecStart arg contains line breaks (bob#222)", () => {
