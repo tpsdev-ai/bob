@@ -39,8 +39,8 @@ export const PI_BUILTIN_TOOLS = [
   "ls",
   "powershell",
   // bob#143: bob's own line-anchored editor, registered as a custom tool and
-  // shadowing nothing (pi ships no `replace_lines`). It rides with `edit` (see
-  // resolveToolPolicy), so it is listed here to be a namable, classified tool.
+  // shadowing nothing (pi ships no `replace_lines`). It is named by the `coder`,
+  // `writer` and `custom` roles and the `builder` position, and classified here.
   "replace_lines",
 ] as const;
 

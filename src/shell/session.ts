@@ -1157,8 +1157,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
 
     // bob#143: the tolerant `edit` (shadows pi's built-in) and `replace_lines`,
     // for a session that effectively allows `edit`. Registered as SDK custom
-    // tools so they shadow the built-ins by name; a name the policy does not
-    // allow is filtered out by pi, so this only ever adds edit's companions.
+    // tools, so the tolerant `edit` shadows pi's built-in by name and a name the
+    // policy does not allow is filtered out by pi.
     const bobEdit = bobEditCustomTools(policy, config.cwd);
 
     // bob#244: the web composition rule on what this session is ABOUT to

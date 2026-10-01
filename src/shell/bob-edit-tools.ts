@@ -218,8 +218,9 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
  * The bob-owned tools a session needs when it allows `edit`: the tolerant `edit`
  * (which shadows pi's built-in) and `replace_lines`. Empty when `edit` is not
  * effectively allowed, so a resident agent without the shell grant does not get
- * them. Both are registered as SDK custom tools, so they shadow the built-ins by
- * name without registering a second source for an allowlisted name.
+ * them. Registered as SDK custom tools, so the tolerant `edit` shadows pi's
+ * built-in by name; `replace_lines` is active where the allowlist names it (the
+ * `coder`, `writer` and `custom` roles and the `builder` position).
  */
 export function bobEditCustomTools(
   policy: { tools: readonly string[]; excludeTools: readonly string[] },
