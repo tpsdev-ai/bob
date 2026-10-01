@@ -117,7 +117,7 @@ describe("changelog fragments — check (bob#236)", () => {
       const { dir, changelogPath } = project();
       fragment(dir, name, "- **A thing was fixed.** Detail.\n");
       expect(() => cf.check({ dir, changelogPath }), name).toThrow(
-        `'${name.split("-")[0]}' is not a changelog category`,
+        `.changelog/unreleased/${name.split("-")[0]}-a-thing.md: '${name.split("-")[0]}' is not a changelog category`,
       );
       rmSync(join(dir, name));
     }
@@ -202,7 +202,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /not a \.md file\. Changelog fragments must be named/,
+      /\.changelog\/unreleased\/fixed\.txt: not a \.md file\. Changelog fragments must be named/,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -220,7 +220,9 @@ describe("changelog fragments — check (bob#236)", () => {
     const beforeFRags = readdirSync(dir)
       .map((n) => readFileSync(join(dir, n)))
       .sort();
-    expect(() => cf.check({ dir, changelogPath })).toThrow(/missing the '-<slug>' part/);
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      /\.changelog\/unreleased\/fixed\.md: missing the '-<slug>' part/,
+    );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
     expect(
@@ -238,7 +240,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /fixed-empty\.md: fragment is empty\. Write the changelog entry/,
+      /.changelog\/unreleased\/fixed-empty\.md: fragment is empty\. Write the changelog entry/,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -257,7 +259,7 @@ describe("changelog fragments — check (bob#236)", () => {
       .map((n) => readFileSync(join(dir, n)))
       .sort();
     expect(() => cf.check({ dir, changelogPath })).toThrow(
-      /continuation indent 0; tabs are not allowed/,
+      /.changelog\/unreleased\/fixed-tab\.md:2: continuation indent 0; tabs are not allowed/,
     );
     expect(readFileSync(changelogPath)).toEqual(beforeBytes);
     expect(readdirSync(dir).sort()).toEqual(beforeFNames);
@@ -585,7 +587,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       const beforeFNames = readdirSync(dir).sort();
       const beforeFRags = readdirSync(dir).map((n) => readFileSync(join(dir, n)));
       expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-        /git ls-files failed.*restore.*CHANGELOG\.md.*\.changelog\/unreleased/,
+        /git ls-files failed.*nothing was written.*repair.*ls-files succeeds.*retry promote/,
       );
       expect(readFileSync(changelogPath)).toEqual(beforeBytes);
       expect(readdirSync(dir).sort()).toEqual(beforeFNames);

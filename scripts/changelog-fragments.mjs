@@ -754,8 +754,8 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   ];
   if (lists.some((l) => !l.ok)) {
     throw new FragmentError(
-      `promote: git ls-files failed, so it cannot tell whether git could restore CHANGELOG.md and the ` +
-        `fragments; run git checkout -- CHANGELOG.md .changelog/unreleased to recover.`,
+      `promote: git ls-files failed, so nothing was written; repair the Git index or its environment ` +
+        `until ls-files succeeds, then retry promote.`,
     );
   }
   const set = (l) => new Set(l.out.split("\0").filter(Boolean));
