@@ -84,14 +84,14 @@ describe("reachy round 4 — the line bound discards through the newline", () =>
     // a valid proposal — arrives in the next write. It must be swallowed with its
     // line, not parsed as a fresh one (round 4 item 2: discard THROUGH the newline).
     const prefix = "x".repeat(MAX_LINE_BYTES + 1);
-    const lines = collect([prefix, `${proposal}\n`]);
+    const lines = collect([prefix, proposal + "\n"]);
     expect(lines.length).toBe(1);
     expect(decodeLine(lines[0])).toMatchObject({ kind: "malformed" });
     expect(lines.some((l) => decodeLine(l).kind === "proposal")).toBe(false);
   });
 
   it("an oversized line delivered WHOLE is one malformed, and nothing else", () => {
-    const lines = collect([`${"x".repeat(MAX_LINE_BYTES + 1) + proposal}\n`]);
+    const lines = collect(["x".repeat(MAX_LINE_BYTES + 1) + proposal + "\n"]);
     expect(lines.length).toBe(1);
     expect(decodeLine(lines[0])).toMatchObject({ kind: "malformed" });
     expect(lines.some((l) => decodeLine(l).kind === "proposal")).toBe(false);
@@ -105,7 +105,7 @@ describe("reachy round 4 — the line bound discards through the newline", () =>
       wakeHeard: true,
       speakerId: "spk-1",
     });
-    const lines = collect([`${"x".repeat(MAX_LINE_BYTES + 1)}\n`, `${valid}\n`]);
+    const lines = collect(["x".repeat(MAX_LINE_BYTES + 1) + "\n", valid + "\n"]);
     const kinds = lines.map((l) => decodeLine(l).kind);
     expect(kinds).toContain("malformed");
     expect(kinds).toContain("transcript");
@@ -125,7 +125,7 @@ describe("reachy round 4 — the line bound discards through the newline", () =>
 
   it("an oversized line split across chunks yields exactly ONE malformed", () => {
     const big = "y".repeat(MAX_LINE_BYTES + 10);
-    const lines = collect([big.slice(0, MAX_LINE_BYTES + 5), `${big.slice(MAX_LINE_BYTES + 5)}\n`]);
+    const lines = collect([big.slice(0, MAX_LINE_BYTES + 5), big.slice(MAX_LINE_BYTES + 5) + "\n"]);
     expect(lines.length).toBe(1);
     expect(decodeLine(lines[0])).toMatchObject({ kind: "malformed" });
   });
@@ -185,11 +185,11 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
     // The identical predicate pi's validateToolArguments runs against the tool's
     // parameters schema — an extra `memoryId` never validates, so an extra
     // argument never reaches `execute` in a live pi call.
-    expect(Value.Check(tool?.parameters as never, { text: "hi", memoryId: "m1" })).toBe(false);
-    expect(Value.Check(tool?.parameters as never, { text: "hi" })).toBe(true);
+    expect(Value.Check(tool!.parameters as never, { text: "hi", memoryId: "m1" })).toBe(false);
+    expect(Value.Check(tool!.parameters as never, { text: "hi" })).toBe(true);
     // And a DIRECT caller still gets the audited refusal (belt-and-braces).
-    const out = await tool?.execute("tc", { text: "hi", memoryId: "m1" });
-    expect(out.content[0]?.text).toContain("refused");
+    const out = await tool!.execute("tc", { text: "hi", memoryId: "m1" });
+    expect(out.content[0]!.text).toContain("refused");
   });
 
   it("reachy_state is LABELLED a placeholder in the manifest (no request/response correlation yet)", () => {
@@ -234,13 +234,13 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
     expect(refused).toBeDefined();
     // The failure is NAMED in the audit, so the (audit-first) memory event is
     // explicable rather than silently orphaned.
-    expect(refused?.summary).toContain("memory write failed after attempt");
+    expect(refused!.summary).toContain("memory write failed after attempt");
   });
 
   it("reachy_state sends a `state` command and returns the (no-correlation) reply", async () => {
     const { pi, commands } = wire();
-    const out = await pi.tools.get("reachy_state")?.execute("tc", {});
+    const out = await pi.tools.get("reachy_state")!.execute("tc", {});
     expect(commands.sent.map((s) => s.command)).toContain("state");
-    expect(out.content[0]?.text).toBe("{}"); // null today → {}; placeholder, documented
+    expect(out.content[0]!.text).toBe("{}"); // null today → {}; placeholder, documented
   });
 });
