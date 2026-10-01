@@ -13,7 +13,6 @@ import {
   adoptAgent,
   type BobRole,
   boolFlag,
-  countFlag,
   DEFAULT_FLAIR_URL,
   describeProvisioning,
   down,
@@ -89,9 +88,8 @@ Commands:
                       hanging: a wall clock (--timeout <seconds>,
                       run.wall_clock_seconds), a no-progress watchdog
                       (--no-progress-timeout <seconds>, run.no_progress_seconds),
-                      and a turn timeout with retries (--turn-timeout
-                      <seconds> / --turn-retries <n>, run.turn_timeout_seconds
-                      / run.turn_retries).
+                      and a turn timeout (--turn-timeout <seconds>,
+                      run.turn_timeout_seconds).
                       Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>
@@ -445,7 +443,6 @@ async function run(
   const wallClockMs = secondsFlagToMs(flags, "timeout");
   const noProgressMs = secondsFlagToMs(flags, "no-progress-timeout");
   const turnTimeoutMs = secondsFlagToMs(flags, "turn-timeout");
-  const turnRetries = countFlag(flags, "turn-retries");
   const result = await runAgent({
     name,
     prompt,
@@ -454,7 +451,6 @@ async function run(
     ...(wallClockMs !== undefined ? { wallClockMs } : {}),
     ...(noProgressMs !== undefined ? { noProgressMs } : {}),
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
-    ...(turnRetries !== undefined ? { turnRetries } : {}),
   });
   if (result.stdout && result.stdout.trim().length > 0) {
     console.log(result.stdout);

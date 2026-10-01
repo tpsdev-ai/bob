@@ -9,16 +9,17 @@
 //   * no_progress — no run-log event for N milliseconds. A stuck inference call
 //                   emits nothing, so the log stops growing; this is the
 //                   heartbeat the issue asks for, without external polling.
-//   * turn_timeout — ONE prompt turn's deadline, with a bounded retry, so a
-//                   single stuck turn cannot wedge the whole run.
+//   * turn_timeout — ONE prompt turn's deadline. A turn that misses it ends
+//                   the run; there is no retry.
 //
 // The wall-clock and the watchdog are RUN-LEVEL: either one, when it fires,
 // sets the run's reason and aborts the signal, and {@link RunBounds.guard}
 // turns that into a {@link RunAbortedError} at the next guarded await. The turn
 // bound is applied at every one-shot prompt (run.ts's `boundedPrompt`), which
-// races the prompt turn against {@link raceTimeout} and signals the session's
-// abort — pi's `prompt()` is a whole turn (model requests plus tool work) and
-// offers no per-request signal, so a turn is the smallest unit bob can bound.
+// races the prompt turn against {@link raceTimeout} and, when the deadline wins,
+// fires `turn_timeout` to end the run. pi's `prompt()` is a whole turn (model
+// requests plus tool work) and offers no per-request signal, so a turn is the
+// smallest unit bob can bound.
 //
 // Every timer is cleared by the time the run ends: {@link RunBounds.stop}
 // clears the run-level timers, and a fired run-level bound cancels the turn
@@ -33,29 +34,22 @@ export interface RunLimits {
   noProgressMs: number;
   /** One prompt turn's deadline, in milliseconds. */
   turnTimeoutMs: number;
-  /** Retries after a turn timeout (0 = one attempt, no retry). */
-  turnRetries: number;
 }
 
 export const DEFAULT_RUN_LIMITS: RunLimits = Object.freeze({
   wallClockMs: 30 * 60_000,
   noProgressMs: 10 * 60_000,
   turnTimeoutMs: 5 * 60_000,
-  turnRetries: 1,
 });
 
 /** Node's maximum timer delay: `setTimeout` clamps a larger delay to 1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
-
-/** The largest accepted turn-retry count — a bound on the retries, not a knob to spin. */
-export const MAX_TURN_RETRIES = 100;
 
 /** The `run:` block of bob.yaml, in SECONDS (the operator-facing unit). */
 export interface RunLimitsBlock {
   wallClockSeconds?: number;
   noProgressSeconds?: number;
   turnTimeoutSeconds?: number;
-  turnRetries?: number;
 }
 
 /** Per-invocation overrides (the `bob run` flags), already in milliseconds. */
@@ -63,7 +57,6 @@ export interface RunLimitsOverrides {
   wallClockMs?: number;
   noProgressMs?: number;
   turnTimeoutMs?: number;
-  turnRetries?: number;
 }
 
 /**
@@ -82,11 +75,9 @@ export function resolveRunLimits(block: RunLimitsBlock, overrides?: RunLimitsOve
     ...(block.turnTimeoutSeconds !== undefined
       ? { turnTimeoutMs: block.turnTimeoutSeconds * 1000 }
       : {}),
-    ...(block.turnRetries !== undefined ? { turnRetries: block.turnRetries } : {}),
     ...(o.wallClockMs !== undefined ? { wallClockMs: o.wallClockMs } : {}),
     ...(o.noProgressMs !== undefined ? { noProgressMs: o.noProgressMs } : {}),
     ...(o.turnTimeoutMs !== undefined ? { turnTimeoutMs: o.turnTimeoutMs } : {}),
-    ...(o.turnRetries !== undefined ? { turnRetries: o.turnRetries } : {}),
   };
 }
 
@@ -102,8 +93,8 @@ export class RunAbortedError extends Error {
 
 export interface RunBounds {
   limits: RunLimits;
-  /** Aborted when a run-level bound fires. A raced turn deadline watches it, so
-   *  it does not outlive the run. */
+  /** Aborted when any bound fires ({@link RunBounds.fire}). A raced turn
+   *  deadline watches it, so it does not outlive the run. */
   signal: AbortSignal;
   /** Why the run was aborted, or undefined while it is running. */
   reason(): TerminationReason | undefined;
@@ -111,9 +102,9 @@ export interface RunBounds {
   fire(reason: TerminationReason): void;
   /** Re-arm the no-progress watchdog — call on every run-log event. */
   noteProgress(): void;
-  /** Race `work` against the abort; rejects with {@link RunAbortedError} when a run-level bound fires. */
+  /** Race `work` against the abort; rejects with {@link RunAbortedError} once any bound has fired. */
   guard<T>(work: Promise<T>): Promise<T>;
-  /** Clear every timer. Safe to call more than once. */
+  /** Clear the run-level timers. Safe to call more than once. */
   stop(): void;
 }
 
@@ -138,15 +129,6 @@ export function createRunBounds(limits: RunLimits): RunBounds {
   assertWithinTimerRange("wall_clock", limits.wallClockMs);
   assertWithinTimerRange("no_progress", limits.noProgressMs);
   assertWithinTimerRange("turn_timeout", limits.turnTimeoutMs);
-  if (
-    !Number.isSafeInteger(limits.turnRetries) ||
-    limits.turnRetries < 0 ||
-    limits.turnRetries > MAX_TURN_RETRIES
-  ) {
-    throw new Error(
-      `run bounds: turn_retries must be a whole number between 0 and ${MAX_TURN_RETRIES} (got ${limits.turnRetries})`,
-    );
-  }
 
   const controller = new AbortController();
   let reason: TerminationReason | undefined;

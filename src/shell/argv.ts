@@ -42,7 +42,7 @@ export function stringFlag(
 // real (`--no-flair=true` likewise registered). A declared boolean now reaches
 // the consumers as a boolean, validated here. No looser coercion anywhere: the
 // whitelist keeps every boolean consumer's "on" identical.
-import { MAX_TIMER_MS, MAX_TURN_RETRIES } from "./run-bounds.js";
+import { MAX_TIMER_MS } from "./run-bounds.js";
 
 export class UsageError extends Error {}
 
@@ -100,30 +100,6 @@ function secondsToMs(name: string, raw: string): number {
   return ms;
 }
 
-// A non-negative whole-number flag (a count), capped at the value's own maximum.
-// Absent means "not given"; a bare or empty flag, a value that is not a whole
-// number, or one past the cap, is a UsageError naming the flag.
-export function countFlag(
-  flags: Readonly<Record<string, string | boolean>>,
-  name: string,
-  max = MAX_TURN_RETRIES,
-): number | undefined {
-  const raw = valueFlag(flags, name);
-  if (raw === undefined) return undefined;
-  return countValue(name, raw, max);
-}
-
-function countValue(name: string, raw: string, max: number): number {
-  if (!/^\d+$/.test(raw)) {
-    throw new UsageError(`--${name} must be a whole number (got '${raw}')`);
-  }
-  const n = Number(raw);
-  if (!Number.isSafeInteger(n) || n > max) {
-    throw new UsageError(`--${name} must be a whole number between 0 and ${max} (got '${raw}')`);
-  }
-  return n;
-}
-
 // The run-bound value flags whose value `parseArgs` validates on EVERY
 // occurrence, before any command runs — the numeric siblings of BOOLEAN_FLAGS.
 // A repeat must not hide an invalid earlier occurrence: `--timeout= --timeout=10`
@@ -134,21 +110,18 @@ const SECONDS_VALUE_FLAGS: ReadonlySet<string> = new Set([
   "no-progress-timeout",
   "turn-timeout",
 ]);
-const COUNT_VALUE_FLAGS: ReadonlySet<string> = new Set(["turn-retries"]);
 
 /** Validate ONE occurrence of a value flag, at parse time. Only the declared
  *  bound flags are checked here; every other value flag keeps its own reader's
  *  rule (a bare `--model` is "not given"). */
 function validateValueOccurrence(name: string, value: string | true): void {
-  const isSeconds = SECONDS_VALUE_FLAGS.has(name);
-  if (!isSeconds && !COUNT_VALUE_FLAGS.has(name)) return;
+  if (!SECONDS_VALUE_FLAGS.has(name)) return;
   if (value === true || value === "") {
     throw new UsageError(
       `--${name} needs a value; ${value === true ? "it was given with none" : "it was given empty"}`,
     );
   }
-  if (isSeconds) secondsToMs(name, value);
-  else countValue(name, value, MAX_TURN_RETRIES);
+  secondsToMs(name, value);
 }
 
 // The raw string of a value flag, or undefined when the flag is ABSENT. A bare
@@ -175,9 +148,8 @@ function valueFlag(
 // empty `--model=` form is the empty string — `stringFlag` reads both as "not
 // given". A DECLARED boolean flag (BOOLEAN_FLAGS) is validated here, on every
 // occurrence, and never consumes the next token; the declared bound flags
-// (SECONDS_VALUE_FLAGS / COUNT_VALUE_FLAGS) are validated here on every
-// occurrence too. `--` ends flag parsing and makes everything after it
-// positional.
+// (SECONDS_VALUE_FLAGS) are validated here on every occurrence too. `--` ends
+// flag parsing and makes everything after it positional.
 //
 // The `--key=value` form is consumed in ONE token and NEVER takes the next
 // token as its value: `bob run --model=foo ember "task"` keeps `ember` as the

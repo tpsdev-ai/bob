@@ -75,7 +75,6 @@ export {
   type Args,
   BOOLEAN_FLAGS,
   boolFlag,
-  countFlag,
   parseArgs,
   secondsFlagToMs,
   stringFlag,

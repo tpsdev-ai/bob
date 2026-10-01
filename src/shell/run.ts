@@ -501,9 +501,10 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
-  // Stop an in-flight turn. pi's AgentSession exposes `abort()`; bob's turn
-  // timeout calls it to unstick a prompt turn. Optional so a fake session in
-  // tests need not provide it.
+  // Stop an in-flight turn. pi's AgentSession exposes `abort()`, which resolves
+  // once the agent is idle; bob calls it when a bound ends a one-shot run.
+  // Optional so a fake session in tests need not provide it; without it, bob
+  // cannot confirm the session stopped.
   abort?(): Promise<void>;
   dispose(): void;
 }
@@ -695,7 +696,6 @@ export interface RunOptions {
   wallClockMs?: number;
   noProgressMs?: number;
   turnTimeoutMs?: number;
-  turnRetries?: number;
 }
 
 export interface RunResult {
@@ -719,9 +719,9 @@ export interface RunResult {
   // no final message that did NOT fail simply had nothing to say. (A mail turn
   // retries a failure and sends no reply for silence.)
   failed?: true;
-  // bob#135: set when a run-level bound ended the run — the wall clock, the
-  // no-progress watchdog, or the turn timeout after its retries — rather
-  // than the session. The exit code is non-zero.
+  // bob#135: set when a bound ended the run (the wall clock, the no-progress
+  // watchdog, or a turn timeout) rather than the session. The exit code is
+  // non-zero.
   aborted?: TerminationReason;
 }
 
@@ -790,7 +790,6 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
     ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
-    ...(opts.turnRetries !== undefined ? { turnRetries: opts.turnRetries } : {}),
   });
   const bounds = createRunBounds(limits);
   try {
@@ -1066,7 +1065,7 @@ async function runBoundedSession(
         session,
         // Every re-prompt goes through the SAME bounded sender as the first
         // prompt, so a stalled continuation is ended by the turn bound too.
-        send: (text) => boundedPrompt(session, text, bounds, opts.name),
+        send: (text) => boundedPrompt(session, text, bounds),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
         maxReprompts: budgetLeft(),
@@ -1081,7 +1080,7 @@ async function runBoundedSession(
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
     // expansion — see session.ts promptSession). Bounded per call (bob#135).
-    await boundedPrompt(session, prompt, bounds, opts.name);
+    await boundedPrompt(session, prompt, bounds);
     await bounds.guard(drainReasoningOnly());
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
@@ -1106,11 +1105,11 @@ async function runBoundedSession(
         observer.startTurn(); // the retry is its own turn: its final message counts
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
-        await boundedPrompt(session, CONTINUE_TURN, bounds, opts.name);
+        await boundedPrompt(session, CONTINUE_TURN, bounds);
         await bounds.guard(drainReasoningOnly()); // same budget: the total stays within the bound
       } catch (err) {
-        // A bound that fired during the retry ends the run; it must not be
-        // swallowed here and leave a silent exit 0.
+        // A bound that fired during the continue turn ends the run; it must not
+        // be swallowed here and leave a silent exit 0.
         if (err instanceof RunAbortedError) throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
@@ -1154,22 +1153,23 @@ async function runBoundedSession(
                 : " (the session settled without a final message)") +
           "\n",
       );
-      reportWorktreeStatus(opts.name, config.cwd);
+      reportWorktreeStatus(opts.name, config.cwd, true);
     }
   } catch (err) {
     exitCode = 1;
     failed = true;
     if (err instanceof RunAbortedError) {
-      // bob#135 — a run-level bound ended the run: name it and how to raise it,
-      // record the outcome in the log, and signal the stuck turn. The abort is
-      // bounded: pi's abort() waits for idle, so a turn that never becomes idle
-      // must not keep the run (and the CLI's process.exit) pending.
+      // bob#135 — a bound ended the run: name it and how to raise it, and record
+      // the outcome in the log. Then signal the session's abort and wait for it,
+      // at most the grace, BEFORE reading the workspace; if the abort did not
+      // resolve, the report says the workspace may still be changing. The wait
+      // is bounded: pi's abort() waits for idle, so a turn that never becomes
+      // idle must not keep the run (and the CLI's process.exit) pending.
       aborted = err.reason;
       writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
       process.stderr.write(boundMessage(opts.name, err.reason, limits));
-      reportWorktreeStatus(opts.name, config.cwd);
-      // Signal the stuck turn and give it the grace; the run does not wait on it.
-      await abortBounded(session, ABORT_GRACE_MS);
+      const idle = await abortBounded(session, ABORT_GRACE_MS);
+      reportWorktreeStatus(opts.name, config.cwd, idle);
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch
       // made a cap-hit look like a silent clean exit. Label a provider
@@ -1243,40 +1243,24 @@ function abortedRunResult(
   };
 }
 
-// One prompt turn under two bounds: the turn timeout and the run's own
-// abort (bounds.guard). A turn that does not finish within `turnTimeoutMs` is
-// signalled to stop and retried ONLY once the session is idle; when the abort
-// grace expires first the session may still be busy (pi rejects a prompt while
-// it is still processing), so the run ends as the turn timeout instead. pi's
-// PromptOptions carries no AbortSignal and `prompt()` is a whole turn — model
-// requests plus tool work — so a turn is the smallest unit bob can bound: bob
-// races the turn and signals the session's abort, at its own layer.
-async function boundedPrompt(
-  session: RunSession,
-  text: string,
-  bounds: RunBounds,
-  name: string,
-): Promise<void> {
-  const limits = bounds.limits;
-  for (let attempt = 0; ; attempt++) {
-    const outcome = await bounds.guard(
-      raceTimeout(promptSession(session, text), limits.turnTimeoutMs, bounds.signal),
-    );
-    if (outcome !== TIMED_OUT) return;
-    // The turn did not finish. Signal the stuck turn to stop, and retry only if
-    // it became idle — a busy session would reject the next prompt.
-    const idle = await abortBounded(session, ABORT_GRACE_MS);
-    if (!idle || attempt >= limits.turnRetries) {
-      // End as the turn timeout — or as the bound that fired first (a run-level
-      // bound can fire during the abort grace).
-      const reason = bounds.reason() ?? "turn_timeout";
-      bounds.fire(reason);
-      throw new RunAbortedError(reason);
-    }
-    process.stderr.write(
-      `bob run ${name}: no prompt turn finished within ${limits.turnTimeoutMs % 1000 === 0 ? `${limits.turnTimeoutMs / 1000}s` : `${limits.turnTimeoutMs}ms`} — retrying (${attempt + 1}/${limits.turnRetries})\n`,
-    );
-  }
+// One prompt turn under two bounds: the turn timeout and the run's own abort
+// (bounds.guard). A turn that does not finish within `turnTimeoutMs` ends the
+// run as `turn_timeout`; there is no retry. The caller's abort path then signals
+// the session's abort. pi's PromptOptions carries no AbortSignal and `prompt()`
+// is a whole turn (model requests plus tool work), so a turn is the smallest
+// unit bob can bound.
+async function boundedPrompt(session: RunSession, text: string, bounds: RunBounds): Promise<void> {
+  // A fired bound starts no further prompt. Checked here because guard()
+  // receives the prompt already started, so it cannot refuse it.
+  const fired = bounds.reason();
+  if (fired !== undefined) throw new RunAbortedError(fired);
+  const outcome = await bounds.guard(
+    raceTimeout(promptSession(session, text), bounds.limits.turnTimeoutMs, bounds.signal),
+  );
+  if (outcome !== TIMED_OUT) return;
+  // The first bound to fire is the one reported.
+  bounds.fire("turn_timeout");
+  throw new RunAbortedError(bounds.reason() ?? "turn_timeout");
 }
 
 // How long an abort may block the run. pi's abort() signals cancellation and
@@ -1286,11 +1270,11 @@ async function boundedPrompt(
 const ABORT_GRACE_MS = 1_000;
 
 /** Signal the session's abort and give it at most `graceMs` to settle. Returns
- *  true only when the abort SETTLED (the session is idle); a grace that expires
- *  first, and an abort() that rejects, are both "not idle". Never blocks past
- *  the grace. */
+ *  true only when abort() resolved within the grace (pi's abort() resolves once
+ *  the agent is idle). A missing abort(), one that rejects, and one still
+ *  pending when the grace ends all return false. Never blocks past the grace. */
 async function abortBounded(session: RunSession, graceMs: number): Promise<boolean> {
-  if (!session.abort) return true;
+  if (!session.abort) return false;
   const settled = await raceTimeout(
     Promise.resolve()
       .then(() => session.abort?.())
@@ -1305,16 +1289,25 @@ async function abortBounded(session: RunSession, graceMs: number): Promise<boole
 
 /** Print the agent cwd's worktree status: the paths a run may have left dirty,
  *  or that the status could not be read — never "clean" for a git that failed
- *  or timed out. */
-function reportWorktreeStatus(name: string, cwd: string): void {
+ *  or timed out. `idle` false means the session did not confirm it stopped:
+ *  the report says the workspace may still be changing, and a clean read is
+ *  not reported as final. */
+function reportWorktreeStatus(name: string, cwd: string, idle: boolean): void {
   const status = readWorktreeStatusResult(cwd);
+  if (!idle) {
+    process.stderr.write(
+      `bob run ${name}: the session did not confirm it stopped, so the workspace may still be changing\n`,
+    );
+  }
   if (!status.ok) {
     process.stderr.write(`bob run ${name}: workspace status unavailable in ${cwd}\n`);
   } else if (status.status.length > 0) {
     process.stderr.write(`bob run ${name}: uncommitted paths in ${cwd}:\n`);
     for (const line of status.status.split("\n")) process.stderr.write(`  ${line}\n`);
-  } else {
+  } else if (idle) {
     process.stderr.write(`bob run ${name}: no dirty paths in ${cwd} (nothing to commit there)\n`);
+  } else {
+    process.stderr.write(`bob run ${name}: no uncommitted paths in ${cwd} when read\n`);
   }
 }
 

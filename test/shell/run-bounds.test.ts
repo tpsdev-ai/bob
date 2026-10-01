@@ -7,7 +7,6 @@ import {
   boundMessage,
   createRunBounds,
   DEFAULT_RUN_LIMITS,
-  MAX_TURN_RETRIES,
   RunAbortedError,
   raceTimeout,
   resolveRunLimits,
@@ -15,13 +14,12 @@ import {
 } from "../../src/shell/run-bounds.js";
 
 describe("readRunLimits — the bob.yaml run: block", () => {
-  it("reads the four keys, in seconds", () => {
+  it("reads the three keys, in seconds", () => {
     const yaml = [
       "run:",
       "  wall_clock_seconds: 1800",
       "  no_progress_seconds: 600",
       "  turn_timeout_seconds: 300",
-      "  turn_retries: 2",
       "",
       "provider:",
       "  name: anthropic",
@@ -31,7 +29,6 @@ describe("readRunLimits — the bob.yaml run: block", () => {
       wallClockSeconds: 1800,
       noProgressSeconds: 600,
       turnTimeoutSeconds: 300,
-      turnRetries: 2,
     });
   });
 
@@ -39,28 +36,23 @@ describe("readRunLimits — the bob.yaml run: block", () => {
     expect(readRunLimits("provider:\n  name: anthropic\n")).toEqual({});
   });
 
-  it("allows turn_retries: 0", () => {
-    expect(readRunLimits("run:\n  turn_retries: 0\n")).toEqual({ turnRetries: 0 });
-  });
-
   it("refuses an unknown key by name", () => {
     expect(() => readRunLimits("run:\n  wall_clock: 60\n")).toThrow(BobYamlError);
     expect(() => readRunLimits("run:\n  wall_clock: 60\n")).toThrow(/unknown key "wall_clock"/);
+    // A turn timeout ends the run; there is no retry count to set.
+    expect(() => readRunLimits("run:\n  turn_retries: 1\n")).toThrow(/unknown key "turn_retries"/);
   });
 
-  it("refuses a value outside the accepted range (turn_retries: 0 is valid)", () => {
+  it("refuses a value outside the accepted range", () => {
     expect(() => readRunLimits("run:\n  wall_clock_seconds: 0\n")).toThrow(
       /whole number of seconds between 1 and/,
     );
     expect(() => readRunLimits("run:\n  no_progress_seconds: -5\n")).toThrow(
       /whole number of seconds between 1 and/,
     );
-    expect(() => readRunLimits("run:\n  turn_retries: -1\n")).toThrow(
-      /whole number of retries between 0 and/,
-    );
   });
 
-  it("refuses a seconds value past the runtime timer range, and a huge retry count", () => {
+  it("refuses a seconds value past the runtime timer range", () => {
     // 2147484 s → 2147484000 ms, past Node's 2^31-1 timer clamp (armed as 1 ms).
     expect(() => readRunLimits("run:\n  wall_clock_seconds: 2147484\n")).toThrow(
       /seconds between 1 and 2147483/,
@@ -68,11 +60,8 @@ describe("readRunLimits — the bob.yaml run: block", () => {
     expect(() => readRunLimits("run:\n  turn_timeout_seconds: 2147484\n")).toThrow(
       /seconds between 1 and 2147483/,
     );
-    expect(() => readRunLimits("run:\n  turn_retries: 101\n")).toThrow(
-      new RegExp(`retries between 0 and ${MAX_TURN_RETRIES}`),
-    );
     // A whole number in YAML but past Number.MAX_SAFE_INTEGER is refused too.
-    expect(() => readRunLimits("run:\n  turn_retries: 1e+21\n")).toThrow(BobYamlError);
+    expect(() => readRunLimits("run:\n  wall_clock_seconds: 1e+21\n")).toThrow(BobYamlError);
   });
 
   it("refuses the inline form", () => {
@@ -86,9 +75,9 @@ describe("resolveRunLimits — defaults, bob.yaml, then flags", () => {
   });
 
   it("converts the block's seconds to milliseconds", () => {
-    expect(resolveRunLimits({ wallClockSeconds: 90, turnRetries: 3 })).toMatchObject({
+    expect(resolveRunLimits({ wallClockSeconds: 90, turnTimeoutSeconds: 3 })).toMatchObject({
       wallClockMs: 90_000,
-      turnRetries: 3,
+      turnTimeoutMs: 3_000,
     });
   });
 
@@ -109,7 +98,6 @@ describe("createRunBounds — the abort guard", () => {
       wallClockMs: 60_000,
       noProgressMs: 60_000,
       turnTimeoutMs: 60_000,
-      turnRetries: 0,
     });
     try {
       bounds.fire("wall_clock");
@@ -125,7 +113,6 @@ describe("createRunBounds — the abort guard", () => {
       wallClockMs: 60_000,
       noProgressMs: 60_000,
       turnTimeoutMs: 60_000,
-      turnRetries: 0,
     });
     try {
       bounds.fire("no_progress");
@@ -136,13 +123,9 @@ describe("createRunBounds — the abort guard", () => {
     }
   });
 
-  it("refuses a turn_retries past the cap, and a limit past the timer range", () => {
+  it("refuses a limit past the timer range", () => {
     const base = { wallClockMs: 60_000, noProgressMs: 60_000, turnTimeoutMs: 60_000 };
-    expect(() => createRunBounds({ ...base, turnRetries: MAX_TURN_RETRIES + 1 })).toThrow(
-      /between 0 and/,
-    );
-    expect(() => createRunBounds({ ...base, turnRetries: 0.5 })).toThrow(/between 0 and/);
-    expect(() => createRunBounds({ ...base, turnRetries: 0, wallClockMs: 2_147_483_648 })).toThrow(
+    expect(() => createRunBounds({ ...base, wallClockMs: 2_147_483_648 })).toThrow(
       /at most 2147483647/,
     );
   });
@@ -153,7 +136,6 @@ describe("createRunBounds — the abort guard", () => {
         wallClockMs: 0,
         noProgressMs: 60_000,
         turnTimeoutMs: 60_000,
-        turnRetries: 0,
       }),
     ).toThrow(/positive number/);
   });
@@ -192,7 +174,6 @@ describe("boundMessage", () => {
       wallClockMs: 60,
       noProgressMs: 60_000,
       turnTimeoutMs: 60_000,
-      turnRetries: 0,
     });
     expect(msg).toContain("60ms");
     expect(msg).not.toContain("0s");

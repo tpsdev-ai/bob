@@ -10,7 +10,6 @@ import { describe, expect, it } from "bun:test";
 import {
   BOOLEAN_FLAGS,
   boolFlag,
-  countFlag,
   parseArgs,
   secondsFlagToMs,
   stringFlag,
@@ -143,9 +142,6 @@ describe("parseArgs", () => {
       "--timeout needs a value",
     );
     expect(() =>
-      parseArgs(["run", "ember", "task", "--turn-retries=abc", "--turn-retries=1"]),
-    ).toThrow("--turn-retries must be a whole number");
-    expect(() =>
       parseArgs(["run", "ember", "task", "--no-progress-timeout=0", "--no-progress-timeout=10"]),
     ).toThrow("--no-progress-timeout must be a positive whole number of seconds");
     // valid repeats still take the last value, as for every flag
@@ -199,30 +195,6 @@ describe("secondsFlagToMs", () => {
     // Past Number.MAX_SAFE_INTEGER, so the converted ms is not a safe integer.
     expect(() => secondsFlagToMs({ timeout: "9007199254740993" }, "timeout")).toThrow(
       /at most 2147483 seconds/,
-    );
-  });
-});
-
-describe("countFlag", () => {
-  it("reads a non-negative whole number up to the cap", () => {
-    expect(countFlag({ "turn-retries": "0" }, "turn-retries")).toBe(0);
-    expect(countFlag({ "turn-retries": "3" }, "turn-retries")).toBe(3);
-    expect(countFlag({ "turn-retries": "100" }, "turn-retries")).toBe(100);
-  });
-
-  it("treats an absent flag as not given, but a bare or empty flag as a UsageError", () => {
-    expect(countFlag({}, "turn-retries")).toBeUndefined();
-    expect(() => countFlag({ "turn-retries": true }, "turn-retries")).toThrow(UsageError);
-    expect(() => countFlag({ "turn-retries": "" }, "turn-retries")).toThrow(UsageError);
-  });
-
-  it("refuses a negative, fractional, non-numeric, unsafe or past-the-cap value", () => {
-    for (const bad of ["-1", "1.5", "abc"]) {
-      expect(() => countFlag({ "turn-retries": bad }, "turn-retries")).toThrow(/--turn-retries/);
-    }
-    expect(() => countFlag({ "turn-retries": "101" }, "turn-retries")).toThrow(/between 0 and 100/);
-    expect(() => countFlag({ "turn-retries": "9007199254740993" }, "turn-retries")).toThrow(
-      /between 0 and 100/,
     );
   });
 });
