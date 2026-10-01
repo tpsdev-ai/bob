@@ -8,6 +8,7 @@ on:
   schedule:
     # Weekly Monday 09:00 UTC catch-all in case the PR scans miss something
     - cron: "0 9 * * 1"
+  workflow_dispatch:
 
 jobs:
   analyze:

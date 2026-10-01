@@ -1,0 +1,1 @@
+- **CI and CodeQL can be started manually (`workflow_dispatch`) as fresh runs, without a new push (Closes #114).**

@@ -5,6 +5,7 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
 
 # The GitHub repository permission is read-only (contents: read): the workflow
 # token cannot write to the repository. No job needs write access, and no
