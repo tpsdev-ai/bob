@@ -1,7 +1,7 @@
 // bob#256 — a reasoning-only turn must not end the agent mid-task.
 //
 // Local reasoning models emit turns that carry only a thinking block: no text
-// and no tool call. pi treats a turn with no tool call as the agent being
+// beyond whitespace and no tool call. pi treats a turn with no tool call as the agent being
 // finished, so the run ends mid-task. bob re-prompts the SAME session with a
 // short continuation, BOUNDED, and reports the honest outcome.
 //

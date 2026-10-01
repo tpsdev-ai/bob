@@ -951,7 +951,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         maxReprompts: budgetLeft(),
         onReprompt: (n) =>
           process.stderr.write(
-            `bob run ${opts.name}: the turn ended with reasoning only (no text, no tool call) — re-prompting (${reasoningReprompts + n}/${DEFAULT_MAX_REASONING_REPROMPTS})\n`,
+            `bob run ${opts.name}: the turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${reasoningReprompts + n}/${DEFAULT_MAX_REASONING_REPROMPTS})\n`,
           ),
       });
       reasoningReprompts += spent.reprompts;
@@ -1026,7 +1026,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
             : reason === "final_shape_mismatch"
               ? " (the final message did not match the declared shape)"
               : reason === "reasoning_only"
-                ? ` (the session ended without a final report — its last turn carried reasoning only, no text and no tool call, after ${reasoningReprompts} re-prompt(s))`
+                ? ` (the session ended without a final report — its last turn carried reasoning only, no text beyond whitespace and no tool call, after ${reasoningReprompts} re-prompt(s))`
                 : " (the session settled without a final message)") +
           "\n",
       );

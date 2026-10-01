@@ -1,7 +1,7 @@
 // bob#256 — a reasoning-only turn is not a final answer.
 //
-// Local reasoning models regularly end a turn with a thinking block and no
-// text and no tool call. pi treats a turn with no tool call as the agent being
+// Local reasoning models regularly end a turn with a thinking block, no
+// text beyond whitespace and no tool call. pi treats a turn with no tool call as the agent being
 // finished, so such a run ends mid-task with the work unfinished. bob re-prompts
 // the SAME session with a short continuation instead of letting that end the
 // run.
@@ -32,7 +32,7 @@ export class ReasoningOnlyExhaustedError extends Error {
   readonly reprompts: number;
   constructor(reprompts: number) {
     super(
-      `the turn ended without a final report: its last turns carried reasoning only (no text, no tool call) after ${reprompts} re-prompt(s)`,
+      `the turn ended without a final report: its last turns carried reasoning only (no text beyond whitespace, no tool call) after ${reprompts} re-prompt(s)`,
     );
     this.name = "ReasoningOnlyExhaustedError";
     this.reprompts = reprompts;

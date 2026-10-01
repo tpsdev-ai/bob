@@ -87,7 +87,7 @@ export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
               beginTurn: () => endings.reset(),
               onReprompt: (n, max) =>
                 log(
-                  `[bob] turn ended with reasoning only (no text, no tool call) — re-prompting (${n}/${max})`,
+                  `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
                 ),
             });
             if (reasoning.endedReasoningOnly) {
