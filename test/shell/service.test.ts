@@ -441,15 +441,42 @@ describe("systemd backend", () => {
   });
 
   it("renderSystemdUnit throws when an ExecStart arg contains line breaks (bob#222)", () => {
-    const badPath = "/usr/local/bin/node\nbad";
-    expect(() =>
-      renderSystemdUnit({
+    for (const bad of [
+      "/usr/local/bin/node\nbad",
+      "/usr/local/bin/node\rbad",
+      "/usr/local/bin/node\0bad",
+    ]) {
+      expect(() =>
+        renderSystemdUnit({
+          name: "pulse",
+          bobBin: '/opt/bo"b \\path/bin/bob',
+          interpreter: bad,
+          home: HOME,
+        }),
+      ).toThrow(/refusing ExecStart argument with line breaks or NUL/);
+    }
+  });
+
+  it("installService with NUL in interpreter path writes nothing and never reloads (bob#222)", async () => {
+    const written: Array<{ path: string; contents: string }> = [];
+    const ctlCalls: string[][] = [];
+    const runner = async (args: string[]) => {
+      ctlCalls.push(args);
+      return { code: 0, stderr: "" };
+    };
+    await expect(
+      installService({
         name: "pulse",
-        bobBin: '/opt/bo"b \\path/bin/bob',
-        interpreter: badPath,
+        bobBin: BOB_BIN,
+        interpreter: "/usr/local/bin/node\nbad",
         home: HOME,
+        platform: "systemd",
+        writeFile: (path, contents) => written.push({ path, contents }),
+        runSystemctl: runner,
       }),
-    ).toThrow(/refusing ExecStart argument with line breaks/);
+    ).rejects.toThrow(/NUL/);
+    expect(written).toHaveLength(0);
+    expect(ctlCalls).toHaveLength(0);
   });
 });
 

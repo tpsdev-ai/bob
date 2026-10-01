@@ -494,12 +494,11 @@ export function renderSystemdUnit(opts: RenderServiceOptions): string {
   const workDir = join(home, "agents", opts.name, "work");
   const logDir = join(home, "agents", opts.name);
 
-  // Refuse line breaks in any ExecStart argument before quoting it.
   const args = serviceCommandArgs(opts);
   for (const arg of args) {
     if (arg.includes("\n") || arg.includes("\r") || arg.includes("\0")) {
       throw new Error(
-        `refusing ExecStart argument with line breaks: ${JSON.stringify(arg)} (use a path without line breaks)`,
+        `refusing ExecStart argument with line breaks or NUL: ${JSON.stringify(arg)} (use a path without line breaks)`,
       );
     }
   }
