@@ -1,0 +1,1 @@
+- **CI and CodeQL can be started by hand (`workflow_dispatch`), so a stuck run can be re-run without a new push (Closes #114).**
