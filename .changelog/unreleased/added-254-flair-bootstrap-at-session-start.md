@@ -1,4 +1,4 @@
-- **Session start loads Flair's bootstrap context for flair-configured agents.**
+- **Runtime launch loads Flair's bootstrap context for flair-configured agents.**
   When the agent's resolved capabilities include `flair`, the runtime session
   paths (`bob run` one-shot, the mail turn, the interactive launch, and the
   persistent runtime) call Flair's `POST /BootstrapMemories` and append the

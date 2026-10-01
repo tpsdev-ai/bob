@@ -1,4 +1,4 @@
-// bob#254 — the Flair session bootstrap. At session start, for an agent whose
+// bob#254 — the Flair session bootstrap. On runtime launch, for an agent whose
 // resolved capabilities include `flair`, the shell asks Flair for the agent's
 // bootstrap context and appends it to the system prompt AFTER soul.md. The
 // context MAY carry sections Flair renders — an Identity section, "## Active

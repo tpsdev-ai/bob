@@ -1,5 +1,5 @@
-// bob#254 — the Flair session bootstrap: the shell-side loader and every
-// entry path that builds a system prompt.
+// bob#254 — the Flair session bootstrap: the shell-side loader and the
+// runtime launch entry paths that build a system prompt.
 //
 // The unit tests drive loadFlairBootstrapContext through its seams. The entry
 // tests stand up a REAL local HTTP stub as Flair and run the actual paths:
@@ -453,7 +453,7 @@ describe("entry paths carry the Flair bootstrap", () => {
     expect(config?.flairBootstrap).not.toContain("Active Skills");
   });
 
-  it("an unreachable Flair: the session starts with the note", async () => {
+  it("an unreachable Flair: the session starts, and the factory config carries the 'could not load' note", async () => {
     const stub = await startStub(() => ({ status: 200, body: "{}" }));
     const url = stub.url;
     await stub.close(); // nothing is listening now

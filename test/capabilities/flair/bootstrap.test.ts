@@ -79,7 +79,7 @@ describe("FlairHttpClient.bootstrap", () => {
     });
   });
 
-  it("a non-2xx is an http_error carrying the status, and never the server body", async () => {
+  it("a readable non-2xx response within the size bound is an http_error carrying the status, and never the server body", async () => {
     const { client } = clientWith(async () => ({
       ok: false,
       status: 500,

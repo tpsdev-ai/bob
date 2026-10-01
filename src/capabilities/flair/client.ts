@@ -36,10 +36,11 @@ function utf8ByteLength(text: string): number {
 /**
  * Read a response body as text, refusing it once its UTF-8 BYTES exceed
  * `maxBytes`. With a byte stream (`res.body`, which a real fetch response
- * carries) the read stops and the stream is cancelled at the bound, so an
- * oversized body is never fully buffered. A fake without a stream falls back to
- * `text()`, bounded by the decoded text's byte length. Throws
- * RESPONSE_TOO_LARGE_MARKER past the bound.
+ * carries) each chunk's bytes are checked BEFORE it is retained: once the total
+ * passes the bound the stream is cancelled, and the earlier chunks — not the
+ * whole body — are what was held. A fake without a stream falls back to
+ * `text()`, whose complete body is received before its byte length is checked.
+ * Throws RESPONSE_TOO_LARGE_MARKER past the bound.
  */
 async function readBodyTextBounded(
   res: { text(): Promise<string>; body?: ResponseBody | null },
@@ -97,12 +98,12 @@ export interface FlairMemory {
 
 // bob#254 — the session bootstrap (POST /BootstrapMemories). `context` is
 // candidate content: Flair's rendered block, which bob may append under its own
-// heading, or omit (a blank, over-budget, or web-session response appends
-// nothing). Its sections (an Identity section, "## Active Skills", predicted
-// context) MAY appear, and a long Active Skills section can exceed Flair's own
-// selection budget, so the CALLER bounds what it appends. `tokenEstimate`
-// measures the whole response Flair serialized, optional because the caller does
-// not rely on it.
+// heading, or omit — a blank or web-session response yields nothing to append,
+// and an over-budget one is replaced by a failure note. Its sections (an
+// Identity section, "## Active Skills", predicted context) MAY appear, and a
+// long Active Skills section can exceed Flair's own selection budget, so the
+// CALLER bounds what it appends. `tokenEstimate` measures the whole response
+// Flair serialized, optional because the caller does not rely on it.
 export interface FlairBootstrap {
   context: string;
   tokenEstimate?: number;
