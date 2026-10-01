@@ -6,7 +6,7 @@
 // validated bob.yaml with, and REGISTERS NO TOOL. The fetch core (address
 // policy, redirects, limits, extraction) is slice R1b and lives in fetch.ts; it
 // is an internal module, exported here for `web_fetch` (R1c) and its tests, and
-// no config reaches it yet.
+// nothing wires it to a session's config yet.
 //
 // A session that holds this capability (or allows an egress tool) is a WEB
 // session. bob refuses to compose one with anything private beyond its

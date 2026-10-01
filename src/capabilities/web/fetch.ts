@@ -1,7 +1,7 @@
 // The fetch core (bob#245 — web spec v3, slice R1b). It is an INTERNAL module:
-// it registers no tool, and no config reaches it yet (slice R1c builds the
-// `web_fetch` tool on it). Everything a fetch must respect lives here, so the
-// tool slice can stay thin.
+// it registers no tool, and nothing wires it to a session's config yet (slice
+// R1c builds the `web_fetch` tool on it). Everything a fetch must respect lives
+// here, so the tool slice can stay thin.
 //
 // THE CONNECTION. One owned, direct undici Agent is built per call and
 // destroyed with it. Its connector's `lookup` is vettedLookup: it resolves the
@@ -11,9 +11,10 @@
 // global dispatcher is never used, no proxy dispatcher is ever built, and the
 // proxy environment is never read.
 //
-// THE REQUEST. GET only. The headers are exactly a fixed `bob/<version>`
-// User-Agent and a fixed Accept: no cookies, no Authorization, no referer, and
-// no caller-supplied header (there is no option for one).
+// THE REQUEST. GET only. The headers bob sets are a fixed `bob/<version>`
+// User-Agent and a fixed Accept (undici adds Host and Connection): no cookies,
+// no Authorization, no referer, and no caller-supplied header — there is no
+// option for one.
 //
 // REDIRECTS. Followed here, by hand, at most five, each target re-admitted
 // through admitUrl (scheme, port, userinfo, zone, downgrade, canonical literal)
