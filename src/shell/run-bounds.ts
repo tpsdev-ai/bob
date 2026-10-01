@@ -1,29 +1,30 @@
 // run-bounds.ts — the bounds that end a one-shot `bob run` that stalls.
 //
 // bob#135: a one-shot run has hung at startup and mid-run, with no timeout on
-// the inference call and nothing watching the run log, so the process sat until
-// someone killed it. Three independent bounds now apply, each configurable
-// (`bob run` flags, bob.yaml `run:` keys) with a sane default:
+// the inference call and nothing watching session events, so the process sat until
+// someone killed it. The wall clock and watchdog apply by default; an operator
+// can also configure a turn timeout (`bob run` flag or bob.yaml `run:` key):
 //
 //   * wall_clock  — the run's deadline, counted from createRunBounds. run.ts
 //                   calls it once the agent's configuration is resolved,
 //                   before the Flair bootstrap and the session start.
-//   * no_progress — no run-log event for N milliseconds. A stuck inference call
-//                   emits nothing, so the log stops growing; this is the
+//   * no_progress — no session event for N milliseconds. A stuck inference call
+//                   emits nothing; this is the
 //                   heartbeat the issue asks for, without external polling.
-//   * turn_timeout — the deadline for ONE prompt bob sends. A prompt that
+//   * turn_timeout — optional deadline for ONE prompt bob sends. A prompt that
 //                   misses it ends the run; there is no retry.
 //
 // The wall-clock and the watchdog are RUN-LEVEL: either one, when it fires,
 // sets the run's reason and aborts the signal, and {@link RunBounds.guard}
 // turns that into a {@link RunAbortedError} at the next guarded await. The turn
-// bound is applied to every prompt a one-shot run sends (the task, the continue
+// bound, when configured, is applied to every prompt a one-shot run sends (the task, the continue
 // turn and the reasoning re-prompts; run.ts's `boundedPrompt`), which races the
 // whole `prompt()` call against {@link raceTimeout} and, when the deadline wins,
 // fires `turn_timeout` to end the run. The compaction note is queued with
 // `steer()` and starts no turn of its own. pi's `prompt()` is a whole turn (model
 // requests plus tool work) and offers no per-request signal, so a turn is the
-// smallest unit bob can bound.
+// smallest unit bob can bound. With no turn setting, the wall clock and
+// no-progress watchdog alone bound the whole run.
 //
 // Every timer is cleared by the time the run ends: {@link RunBounds.stop}
 // clears the run-level timers, and a fired run-level bound cancels the turn
@@ -34,16 +35,15 @@ export type TerminationReason = "wall_clock" | "no_progress" | "turn_timeout";
 export interface RunLimits {
   /** The run's wall-clock deadline, in milliseconds, counted from createRunBounds. */
   wallClockMs: number;
-  /** No run-log event for this long ends the run, in milliseconds. */
+  /** No session event for this long ends the run, in milliseconds. */
   noProgressMs: number;
-  /** The deadline for one prompt bob sends, in milliseconds. */
-  turnTimeoutMs: number;
+  /** Optional deadline for one prompt bob sends, in milliseconds. */
+  turnTimeoutMs?: number;
 }
 
 export const DEFAULT_RUN_LIMITS: RunLimits = Object.freeze({
   wallClockMs: 30 * 60_000,
   noProgressMs: 10 * 60_000,
-  turnTimeoutMs: 5 * 60_000,
 });
 
 /** Node's maximum timer delay: `setTimeout` clamps a larger delay to 1 ms. */
@@ -97,6 +97,8 @@ export class RunAbortedError extends Error {
 
 export interface RunBounds {
   limits: RunLimits;
+  /** Timer source shared with the optional turn deadline (test seam). */
+  timer: RunTimer;
   /** Aborted when any bound fires ({@link RunBounds.fire}). A raced turn
    *  deadline watches it, so it does not outlive the run. */
   signal: AbortSignal;
@@ -104,13 +106,21 @@ export interface RunBounds {
   reason(): TerminationReason | undefined;
   /** Abort the run for `reason` (no-op if it already aborted). */
   fire(reason: TerminationReason): void;
-  /** Re-arm the no-progress watchdog — call on every run-log event. */
+  /** Re-arm the no-progress watchdog — call on every session event. */
   noteProgress(): void;
   /** Race `work` against the abort; rejects with {@link RunAbortedError} once any bound has fired. */
   guard<T>(work: Promise<T>): Promise<T>;
   /** Clear the run-level timers. Safe to call more than once. */
   stop(): void;
 }
+
+/** Timer source for deterministic bound tests; production uses native timers. */
+export interface RunTimer {
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const systemTimer: RunTimer = { setTimeout, clearTimeout };
 
 function assertPositive(name: string, value: number): void {
   if (!Number.isFinite(value) || value < 1) {
@@ -126,13 +136,15 @@ function assertWithinTimerRange(name: string, value: number): void {
   }
 }
 
-export function createRunBounds(limits: RunLimits): RunBounds {
+export function createRunBounds(limits: RunLimits, timer: RunTimer = systemTimer): RunBounds {
   assertPositive("wall_clock", limits.wallClockMs);
   assertPositive("no_progress", limits.noProgressMs);
-  assertPositive("turn_timeout", limits.turnTimeoutMs);
+  if (limits.turnTimeoutMs !== undefined) assertPositive("turn_timeout", limits.turnTimeoutMs);
   assertWithinTimerRange("wall_clock", limits.wallClockMs);
   assertWithinTimerRange("no_progress", limits.noProgressMs);
-  assertWithinTimerRange("turn_timeout", limits.turnTimeoutMs);
+  if (limits.turnTimeoutMs !== undefined) {
+    assertWithinTimerRange("turn_timeout", limits.turnTimeoutMs);
+  }
 
   const controller = new AbortController();
   let reason: TerminationReason | undefined;
@@ -142,16 +154,16 @@ export function createRunBounds(limits: RunLimits): RunBounds {
     controller.abort();
   };
 
-  const wallTimer = setTimeout(() => fire("wall_clock"), limits.wallClockMs);
+  const wallTimer = timer.setTimeout(() => fire("wall_clock"), limits.wallClockMs);
   let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
   const noteProgress = (): void => {
-    if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
-    watchdogTimer = setTimeout(() => fire("no_progress"), limits.noProgressMs);
+    if (watchdogTimer !== undefined) timer.clearTimeout(watchdogTimer);
+    watchdogTimer = timer.setTimeout(() => fire("no_progress"), limits.noProgressMs);
   };
 
   const stop = (): void => {
-    clearTimeout(wallTimer);
-    if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
+    timer.clearTimeout(wallTimer);
+    if (watchdogTimer !== undefined) timer.clearTimeout(watchdogTimer);
     watchdogTimer = undefined;
   };
 
@@ -181,6 +193,7 @@ export function createRunBounds(limits: RunLimits): RunBounds {
 
   return {
     limits,
+    timer,
     signal: controller.signal,
     reason: () => reason,
     fire,
@@ -200,23 +213,24 @@ export async function raceTimeout<T>(
   work: Promise<T>,
   ms: number,
   signal?: AbortSignal,
+  timerSource: RunTimer = systemTimer,
 ): Promise<T | typeof TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
     // Already aborted: there is no deadline to arm. The caller's guard rejects
     // `work` on its own, and a timer armed here would outlive the run.
     if (signal?.aborted === true) return;
-    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    timer = timerSource.setTimeout(() => resolve(TIMED_OUT), ms);
   });
   const onAbort = (): void => {
-    if (timer !== undefined) clearTimeout(timer);
+    if (timer !== undefined) timerSource.clearTimeout(timer);
     timer = undefined;
   };
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     return await Promise.race([work, deadline]);
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    if (timer !== undefined) timerSource.clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
   }
 }
@@ -230,8 +244,9 @@ export function boundMessage(name: string, reason: TerminationReason, limits: Ru
     case "wall_clock":
       return `bob run ${name}: WALL-CLOCK TIMEOUT — the run exceeded its ${secs(limits.wallClockMs)} wall clock and was ended (exit 1). Raise it with --timeout <seconds> or run.wall_clock_seconds in bob.yaml.\n`;
     case "no_progress":
-      return `bob run ${name}: NO-PROGRESS WATCHDOG — the run log saw no new event for ${secs(limits.noProgressMs)}, so the run was ended (exit 1). Raise it with --no-progress-timeout <seconds> or run.no_progress_seconds in bob.yaml.\n`;
+      return `bob run ${name}: NO-PROGRESS WATCHDOG — the session emitted no event for ${secs(limits.noProgressMs)}, so the run was ended (exit 1). Raise it with --no-progress-timeout <seconds> or run.no_progress_seconds in bob.yaml.\n`;
     case "turn_timeout":
+      if (limits.turnTimeoutMs === undefined) throw new Error("turn timeout is not configured");
       return `bob run ${name}: TURN TIMEOUT — the prompt turn did not finish within ${secs(limits.turnTimeoutMs)}, so the run was ended (exit 1). Raise it with --turn-timeout <seconds> or run.turn_timeout_seconds in bob.yaml.\n`;
   }
 }

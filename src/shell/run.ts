@@ -92,6 +92,7 @@ import {
   RunAbortedError,
   type RunBounds,
   type RunLimitsBlock,
+  type RunTimer,
   raceTimeout,
   resolveRunLimits,
   type TerminationReason,
@@ -679,6 +680,8 @@ export interface RunOptions {
   // Defaults to a fresh Date() per call. Lets a test pin the start millisecond so
   // two runs started in the same millisecond still get distinct files and locks.
   now?: () => Date;
+  // Deterministic bound timer for tests; production uses native timers.
+  timer?: RunTimer;
   // #145: the ONE completion contract this run is judged by. When the caller
   // (or bob.yaml) declares an expected final-assistant-message shape, a run only
   // settles exit 0 when the captured final text matches it. Omitted → the
@@ -801,7 +804,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
     ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
   });
-  const bounds = createRunBounds(limits);
+  const bounds = createRunBounds(limits, opts.timer);
   try {
     return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);
   } finally {
@@ -955,10 +958,6 @@ async function runBoundedSession(
         const n = Buffer.byteLength(line);
         appendFileSync(runLogPath, line);
         logBytes += n;
-        // bob#135 — any log growth is progress: re-arm the no-progress watchdog.
-        // A stuck inference call emits no events, so the log stops growing and the
-        // watchdog fires instead of the run hanging.
-        bounds.noteProgress();
         if (!deltaCapHit && logBytes >= capBytes) {
           // One line, ever, recording that the delta cap was hit — written BEFORE
           // the flag is set, so the flag never claims "delta cap hit" without the
@@ -994,6 +993,9 @@ async function runBoundedSession(
   }
 
   const unsubscribeRunLog = session.subscribe((event) => {
+    // Progress belongs to the session, regardless of whether its best-effort
+    // log was opened, an append succeeds, or streamed deltas pass the log cap.
+    bounds.noteProgress();
     // Post-mortem trail: record EVERY event (tool calls, results, errors,
     // retries), not just text — that's what makes a death diagnosable. The
     // FINAL-MESSAGE capture is NOT here: it lives on the compaction observer
@@ -1092,7 +1094,7 @@ async function runBoundedSession(
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
-    // expansion — see session.ts promptSession). Bounded per call (bob#135).
+    // expansion — see session.ts promptSession). Turn-bounded when configured (bob#135).
     await boundedPrompt(session, prompt, bounds);
     await bounds.guard(drainReasoningOnly());
 
@@ -1283,18 +1285,24 @@ function sendToSession(
   return session.steer(text);
 }
 
-// One prompt turn under two bounds: the turn timeout and the run's own abort
-// (bounds.guard). A turn that does not finish within `turnTimeoutMs` ends the
-// run as `turn_timeout`; there is no retry. The caller's abort path then signals
+// One prompt turn under the run's abort (bounds.guard), and an optional turn
+// timeout. A configured timeout that expires ends the run as `turn_timeout`;
+// there is no retry. The caller's abort path then signals
 // the session's abort. pi's PromptOptions carries no AbortSignal and `prompt()`
 // is a whole turn (model requests plus tool work), so a turn is the smallest
 // unit bob can bound.
 async function boundedPrompt(session: RunSession, text: string, bounds: RunBounds): Promise<void> {
+  const turnTimeoutMs = bounds.limits.turnTimeoutMs;
+  if (turnTimeoutMs === undefined) {
+    await bounds.guard(sendToSession(session, bounds, text, "turn"));
+    return;
+  }
   const outcome = await bounds.guard(
     raceTimeout(
       sendToSession(session, bounds, text, "turn"),
-      bounds.limits.turnTimeoutMs,
+      turnTimeoutMs,
       bounds.signal,
+      bounds.timer,
     ),
   );
   if (outcome !== TIMED_OUT) return;

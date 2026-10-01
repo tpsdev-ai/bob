@@ -88,8 +88,9 @@ Commands:
                       hanging: a wall clock (--timeout <seconds>,
                       run.wall_clock_seconds), a no-progress watchdog
                       (--no-progress-timeout <seconds>, run.no_progress_seconds),
-                      and a turn timeout (--turn-timeout <seconds>,
-                      run.turn_timeout_seconds).
+                      and an optional turn timeout (--turn-timeout <seconds>,
+                      run.turn_timeout_seconds). Defaults: 30 min wall clock,
+                      10 min without session events; no turn timeout.
                       Flags: --model <m>
   install-service <n> Write the agent's service unit (launchd on macOS / systemd
                       user unit on Linux) so it self-runs. Flags: --bob-bin <abs path> --model <m>

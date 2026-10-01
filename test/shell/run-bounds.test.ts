@@ -111,6 +111,7 @@ describe("readRunLimits — the bob.yaml run: block", () => {
 describe("resolveRunLimits — defaults, bob.yaml, then flags", () => {
   it("uses the defaults when nothing is set", () => {
     expect(resolveRunLimits({})).toEqual(DEFAULT_RUN_LIMITS);
+    expect(resolveRunLimits({}).turnTimeoutMs).toBeUndefined();
   });
 
   it("converts the block's seconds to milliseconds", () => {
@@ -202,7 +203,10 @@ describe("boundMessage", () => {
     expect(progress).toContain("--no-progress-timeout");
     expect(progress).toContain("run.no_progress_seconds");
 
-    const call = boundMessage("a", "turn_timeout", DEFAULT_RUN_LIMITS);
+    const call = boundMessage("a", "turn_timeout", {
+      ...DEFAULT_RUN_LIMITS,
+      turnTimeoutMs: 60_000,
+    });
     expect(call).toContain("TURN TIMEOUT");
     expect(call).toContain("--turn-timeout");
     expect(call).toContain("run.turn_timeout_seconds");

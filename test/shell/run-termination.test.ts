@@ -1,7 +1,7 @@
 // run-termination.test.ts — bob#135. A one-shot `bob run` must end when a bound
 // fires. These exercise the three bounds against the injectable session seam (a
 // `RunSession`, not a provider): a stalled session is ended by the wall clock
-// and by the turn timeout, a run-log stall trips the no-progress watchdog, and a
+// and by a configured turn timeout, a session-event stall trips the no-progress watchdog, and a
 // session that answers (once, or in a stream of events) is left unchanged. A
 // turn timeout ends the run: no second prompt starts, including when the wall
 // clock fires during the abort grace. A session whose `abort()` is missing,
@@ -15,15 +15,46 @@
 // missing or broken bound fails the case rather than hanging the suite.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
 import { runAgent } from "../../src/shell/run.js";
+import type { RunTimer } from "../../src/shell/run-bounds.js";
 
 type Emitter = (event: unknown) => void;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Run-level and optional turn deadlines use this timer seam; no real five-minute
+// wait is needed to show which bound wins after a long prompt.
+class FakeTimer implements RunTimer {
+  now = 0;
+  private nextId = 0;
+  private pending = new Map<number, { at: number; callback: () => void }>();
+
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout> {
+    const id = ++this.nextId;
+    this.pending.set(id, { at: this.now + ms, callback });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }
+
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void {
+    this.pending.delete(handle as unknown as number);
+  }
+
+  advance(ms: number): void {
+    const end = this.now + ms;
+    while (true) {
+      const next = [...this.pending].sort((a, b) => a[1].at - b[1].at)[0];
+      if (next === undefined || next[1].at > end) break;
+      this.now = next[1].at;
+      this.pending.delete(next[0]);
+      next[1].callback();
+    }
+    this.now = end;
+  }
+}
 
 const textDelta = (d: string): unknown => ({
   type: "message_update",
@@ -217,8 +248,72 @@ describe("runAgent termination bounds (bob#135)", () => {
     expect(fake.abortCount()).toBe(1);
   }, 15_000);
 
-  it("trips the no-progress watchdog when the run log stops growing", async () => {
-    // Emit two events, then stall forever: the log stops growing.
+  it("an unconfigured turn continues past five simulated minutes", async () => {
+    const timer = new FakeTimer();
+    const fake = fakeSession(async (emit) => {
+      // Let boundedPrompt arm any configured turn timer before advancing time.
+      await Promise.resolve();
+      timer.advance(6 * 60_000);
+      emit(messageEnd("done"));
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      timer,
+      wallClockMs: 8 * 60_000,
+      noProgressMs: 7 * 60_000,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.aborted).toBeUndefined();
+    expect(timer.now).toBe(6 * 60_000);
+    expect(fake.promptCalls).toEqual(["hi"]);
+  });
+
+  it("without a turn setting, the wall clock can end a long prompt", async () => {
+    const timer = new FakeTimer();
+    const fake = fakeSession(async () => {
+      await Promise.resolve();
+      timer.advance(8 * 60_000);
+      return new Promise<void>(() => {});
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      timer,
+      wallClockMs: 7 * 60_000,
+      noProgressMs: 9 * 60_000,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("wall_clock");
+  });
+
+  it("a configured turn timeout still ends a long prompt", async () => {
+    const timer = new FakeTimer();
+    const fake = fakeSession(async () => {
+      await Promise.resolve();
+      timer.advance(6 * 60_000);
+      return new Promise<void>(() => {});
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      timer,
+      wallClockMs: 8 * 60_000,
+      noProgressMs: 7 * 60_000,
+      turnTimeoutMs: 5 * 60_000,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("turn_timeout");
+  });
+
+  it("trips the no-progress watchdog when session events stop", async () => {
+    // Emit two events, then stall forever.
     const fake = fakeSession((emit) => {
       emit(textDelta("working"));
       emit(textDelta("..."));
@@ -254,6 +349,68 @@ describe("runAgent termination bounds (bob#135)", () => {
       noProgressMs: 150,
       turnTimeoutMs: 60_000,
     });
+    expect(res.exitCode).toBe(0);
+    expect(res.aborted).toBeUndefined();
+  }, 15_000);
+
+  async function runWithOnlyStreamingDeltas(runLogCapBytes?: number) {
+    const fake = fakeSession(async (emit) => {
+      for (let i = 0; i < 30; i++) {
+        emit(textDelta("x"));
+        await sleep(20);
+      }
+      emit(messageEnd("done"));
+    });
+    return runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 10_000,
+      noProgressMs: 200,
+      ...(runLogCapBytes !== undefined ? { runLogCapBytes } : {}),
+    });
+  }
+
+  it("session events keep the watchdog alive when run-log setup fails", async () => {
+    writeFileSync(join(agentsRoot, "testbot", "runs"), "not a directory");
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const err = await captureStderr(async () => {
+      res = await runWithOnlyStreamingDeltas();
+    });
+    expect(err).toContain("run log unavailable");
+    expect(res?.exitCode).toBe(0);
+    expect(res?.aborted).toBeUndefined();
+  }, 15_000);
+
+  it("session events keep the watchdog alive when log appends throw", async () => {
+    const runsDir = join(agentsRoot, "testbot", "runs");
+    const fake = fakeSession(async (emit) => {
+      const log = readdirSync(runsDir).find((name) => name.endsWith(".jsonl"));
+      expect(log).toBeDefined();
+      const path = join(runsDir, log as string);
+      unlinkSync(path);
+      mkdirSync(path); // appendFileSync(path, ...) now throws EISDIR on every event.
+      for (let i = 0; i < 30; i++) {
+        emit(textDelta("x"));
+        await sleep(20);
+      }
+      emit(messageEnd("done"));
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 10_000,
+      noProgressMs: 200,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.aborted).toBeUndefined();
+  }, 15_000);
+
+  it("deltas beyond the run-log cap still count as session progress", async () => {
+    const res = await runWithOnlyStreamingDeltas(1);
     expect(res.exitCode).toBe(0);
     expect(res.aborted).toBeUndefined();
   }, 15_000);
