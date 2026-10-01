@@ -80,7 +80,7 @@ function stageAll(): void {
     ["init", "-q"],
     ["add", "-A"],
   ]) {
-    const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    const r = spawnSync("git", args, { cwd: root, encoding: "utf8", timeout: 10_000 });
     if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
   }
 }
@@ -285,7 +285,10 @@ describe("changelog fragments — check (bob#236)", () => {
     mkdirSync(join(dir, "fixed-a-directory.md"));
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unexpected directory/);
     rmSync(join(dir, "fixed-a-directory.md"), { recursive: true });
-    const made = spawnSync("mkfifo", [join(dir, "fixed-a-fifo.md")], { encoding: "utf8" });
+    const made = spawnSync("mkfifo", [join(dir, "fixed-a-fifo.md")], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
     expect(made.status, made.stderr).toBe(0);
     expect(() => cf.check({ dir, changelogPath })).toThrow(/fixed-a-fifo\.md: not a regular file/);
   });
@@ -529,6 +532,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     const rm = spawnSync("git", ["rm", "-q", "--cached", "CHANGELOG.md"], {
       cwd: root,
       encoding: "utf8",
+      timeout: 10_000,
     });
     expect(rm.status, rm.stderr).toBe(0);
     expect(tryPromote).toThrow("untracked (not in the index): CHANGELOG.md");
@@ -651,7 +655,7 @@ describe("changelog fragments — render + promote (bob#236)", () => {
           "-m",
           "base",
         ],
-        { cwd: root, encoding: "utf8" },
+        { cwd: root, encoding: "utf8", timeout: 10_000 },
       );
       expect(commit.status, commit.stderr).toBe(0);
       const targetBefore = readFileSync(target);
@@ -758,7 +762,8 @@ describe("changelog fragments — render + promote (bob#236)", () => {
       const original = "- **a fix.** \n";
       fragment(dir, "fixed-a.md", original);
       stageAll();
-      const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      const gitIn = (...args: string[]) =>
+        spawnSync("git", args, { cwd: root, encoding: "utf8", timeout: 10_000 });
       const tryPromote = () => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
 
       // A hidden edit to a fragment.
@@ -794,7 +799,8 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     const lf = "- **a fix.** Detail.\n";
     fragment(dir, "fixed-a.md", lf);
     stageAll();
-    const gitIn = (...args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    const gitIn = (...args: string[]) =>
+      spawnSync("git", args, { cwd: root, encoding: "utf8", timeout: 10_000 });
     const rel = ".changelog/unreleased/fixed-a.md";
     expect(gitIn("config", "core.autocrlf", "input").status).toBe(0);
     expect(gitIn("update-index", "--assume-unchanged", rel).status).toBe(0);
@@ -1312,10 +1318,41 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     copyFileSync(SCRIPT, copy);
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
     const run = (...args: string[]) => {
-      const r = spawnSync("node", [copy, ...args], { encoding: "utf8" });
+      const r = spawnSync("node", [copy, ...args], { encoding: "utf8", timeout: 10_000 });
       return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     };
     return { run, dir, changelogPath };
+  }
+
+  for (const location of [".changelog", ".changelog/unreleased"] as const) {
+    for (const command of ["check", "promote"] as const) {
+      it(`${command} refuses a symbolic link at ${location} without changing files`, () => {
+        const { run, changelogPath } = cli();
+        const link = join(root, location);
+        const target = join(root, "linked-store");
+        renameSync(link, target);
+        symlinkSync(target, link);
+        const targetFragments = location === ".changelog" ? join(target, "unreleased") : target;
+        writeFileSync(join(targetFragments, "README.md"), "# fragments\n");
+        stageAll();
+
+        const changelogBefore = readFileSync(changelogPath);
+        const namesBefore = readdirSync(targetFragments).sort();
+        const filesBefore = namesBefore.map((name) => readFileSync(join(targetFragments, name)));
+        const result = command === "check" ? run(command) : run(command, "1.2.3");
+
+        expect(result.code, result.out).toBe(1);
+        expect(result.out).toContain(`${location}/ is a symbolic link`);
+        expect(result.out).toContain("Replace the link with the directory itself");
+        expect(readFileSync(changelogPath)).toEqual(changelogBefore);
+        expect(lstatSync(link).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(link)).toBe(target);
+        expect(readdirSync(targetFragments).sort()).toEqual(namesBefore);
+        expect(namesBefore.map((name) => readFileSync(join(targetFragments, name)))).toEqual(
+          filesBefore,
+        );
+      }, 15_000);
+    }
   }
 
   for (const cmd of ["render", "list", "check"]) {
@@ -1355,7 +1392,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
     fragment(dir, "fixed-not-a-list.md", "just some prose\n");
     symlinkSync(root, join(root, "link"));
     const viaLink = join(root, "link", "scripts", "changelog-fragments.mjs");
-    const r = spawnSync("node", [viaLink, "check"], { encoding: "utf8" });
+    const r = spawnSync("node", [viaLink, "check"], { encoding: "utf8", timeout: 10_000 });
     expect(r.status, `${r.stdout}${r.stderr}`).toBe(1);
     expect(r.stderr).toContain("fixed-not-a-list.md: fragment must start with '- '");
   });
@@ -1375,7 +1412,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
 // contents can conflict on that file; the README says so.)
 describe("changelog fragments — two PRs with distinct fragment filenames (bob#236)", () => {
   function git(cwd: string, ...args: string[]): { code: number; out: string } {
-    const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 10_000 });
     return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
   }
 
