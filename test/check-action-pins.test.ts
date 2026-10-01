@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkActionPins, createGithubResolver } from "../scripts/check-action-pins.mjs";
@@ -60,6 +60,18 @@ test("a malformed version comment is reported as missing or malformed", async ()
   expect(result.errors.join("\\n")).toContain(
     "missing or malformed version comment; write # v2.2.0",
   );
+});
+
+test(".yaml workflows and action.yaml metadata are scanned", async () => {
+  for (const composite of [false, true]) {
+    const root = fixture(`- uses: oven-sh/setup-bun@${WRONG} # v2.2.0`, composite);
+    const dir = join(root, composite ? ".github/actions/local" : ".github/workflows");
+    const from = join(dir, composite ? "action.yml" : "ci.yml");
+    renameSync(from, join(dir, composite ? "action.yaml" : "ci.yaml"));
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.checked).toBe(1);
+    expect(result.errors.join("\\n")).toContain("not the pinned SHA");
+  }
 });
 
 test("quoted action refs are checked", async () => {

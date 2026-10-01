@@ -35,8 +35,8 @@ function actionFiles(root) {
           stack.push(path);
         } else if (
           entry.isFile() &&
-          ((current === join(root, ".github/workflows") && entry.name.endsWith(".yml")) ||
-            (current !== join(root, ".github/workflows") && entry.name === "action.yml"))
+          ((current === join(root, ".github/workflows") && /\.ya?ml$/.test(entry.name)) ||
+            (current !== join(root, ".github/workflows") && /^action\.ya?ml$/.test(entry.name)))
         ) {
           files.push(path);
         }
