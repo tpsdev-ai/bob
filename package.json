@@ -39,6 +39,13 @@
     "typescript": "^7.0.2"
   },
   "overrides": {
+    "@earendil-works/pi-agent-core": "0.84.3",
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-client": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-protocol": "0.84.3",
+    "@earendil-works/pi-telemetry": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.3",
     "ws": "^8.21.0",
     "@discordjs/rest": "^2.6.3",
     "protobufjs": "^7.6.5",
