@@ -71,7 +71,16 @@ export interface BobConfig {
 
 export { MAIL_TURN_ENV, MAIL_TURN_PARENT_ENV } from "../capabilities/tps-mail/prompt.js";
 export { type AlignOptions, type AlignResult, runAlign } from "./align.js";
-export { type Args, BOOLEAN_FLAGS, boolFlag, parseArgs, stringFlag, UsageError } from "./argv.js";
+export {
+  type Args,
+  BOOLEAN_FLAGS,
+  boolFlag,
+  countFlag,
+  parseArgs,
+  secondsFlagToMs,
+  stringFlag,
+  UsageError,
+} from "./argv.js";
 export {
   BobYamlError,
   lineOf,

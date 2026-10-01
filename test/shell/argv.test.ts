@@ -10,7 +10,9 @@ import { describe, expect, it } from "bun:test";
 import {
   BOOLEAN_FLAGS,
   boolFlag,
+  countFlag,
   parseArgs,
+  secondsFlagToMs,
   stringFlag,
   UsageError,
 } from "../../src/shell/argv.js";
@@ -143,6 +145,45 @@ describe("boolFlag", () => {
     expect(boolFlag({ "dry-run": "false" }, "dry-run")).toBe(false);
     for (const bad of ["yes", "1", "TRUE", ""]) {
       expect(() => boolFlag({ "dry-run": bad }, "dry-run")).toThrow(UsageError);
+    }
+  });
+});
+
+// bob#135 — the numeric flags behind `bob run`'s bounds. A bad value is refused
+// by name before any run starts, never armed as a nonsense deadline.
+describe("secondsFlagToMs", () => {
+  it("reads a whole number of seconds as milliseconds", () => {
+    expect(secondsFlagToMs({ timeout: "90" }, "timeout")).toBe(90_000);
+  });
+
+  it("treats absent, bare and empty flags as not given", () => {
+    expect(secondsFlagToMs({}, "timeout")).toBeUndefined();
+    expect(secondsFlagToMs({ timeout: true }, "timeout")).toBeUndefined();
+    expect(secondsFlagToMs({ timeout: "" }, "timeout")).toBeUndefined();
+  });
+
+  it("refuses zero, negative and non-integer values by flag name", () => {
+    for (const bad of ["0", "-1", "1.5", "abc"]) {
+      expect(() => secondsFlagToMs({ timeout: bad }, "timeout")).toThrow(/--timeout/);
+    }
+  });
+});
+
+describe("countFlag", () => {
+  it("reads a non-negative whole number", () => {
+    expect(countFlag({ "call-retries": "0" }, "call-retries")).toBe(0);
+    expect(countFlag({ "call-retries": "3" }, "call-retries")).toBe(3);
+  });
+
+  it("treats absent, bare and empty flags as not given", () => {
+    expect(countFlag({}, "call-retries")).toBeUndefined();
+    expect(countFlag({ "call-retries": true }, "call-retries")).toBeUndefined();
+    expect(countFlag({ "call-retries": "" }, "call-retries")).toBeUndefined();
+  });
+
+  it("refuses a non-integer or negative value by flag name", () => {
+    for (const bad of ["-1", "1.5", "abc"]) {
+      expect(() => countFlag({ "call-retries": bad }, "call-retries")).toThrow(/--call-retries/);
     }
   });
 });

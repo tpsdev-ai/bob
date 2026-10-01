@@ -16,6 +16,7 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
+import type { RunLimitsBlock } from "./run-bounds.js";
 import {
   ModelBudgetError,
   parseSessionBudget,
@@ -328,6 +329,68 @@ export function readSessionBudget(yamlText: string): SessionBudget {
       err.message.replace(/^bob\.yaml "session:" block: /, ""),
     );
   }
+}
+
+// The one-shot run bounds, per agent (bob.yaml `run:`):
+//
+//   run:
+//     wall_clock_seconds: 1800
+//     no_progress_seconds: 600
+//     call_timeout_seconds: 300
+//     call_retries: 1
+//
+// Absent keys fall back to run-bounds.ts's defaults. Unknown keys and
+// non-positive values throw, so a misspelled bound is not read as "no bound".
+const RUN_KEYS = [
+  "wall_clock_seconds",
+  "no_progress_seconds",
+  "call_timeout_seconds",
+  "call_retries",
+] as const;
+
+function wholeNumber(value: unknown, allowZero: boolean): number | undefined {
+  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+  if (allowZero ? value < 0 : value < 1) return undefined;
+  return value;
+}
+
+export function readRunLimits(yamlText: string): RunLimitsBlock {
+  const inline = /^run[ \t]*:(.*)$/m.exec(yamlText);
+  const inlineValue = inline?.[1].trim() ?? "";
+  if (inlineValue !== "" && !inlineValue.startsWith("#")) {
+    throw new BobYamlError(
+      "run",
+      lineOf(yamlText, /^run[ \t]*:/m),
+      `the inline form is not supported — write "run:" on its own line, then wall_clock_seconds:/no_progress_seconds:/call_timeout_seconds:/call_retries: indented under it.`,
+    );
+  }
+  const raw = readBlock(yamlText, "run");
+  if (raw === undefined) return {};
+  const out: RunLimitsBlock = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(RUN_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "run",
+        lineOfKey(yamlText, "run", key),
+        `unknown key "${key}" — supported keys are ${RUN_KEYS.join(", ")}.`,
+      );
+    }
+    const n = wholeNumber(value, key === "call_retries");
+    if (n === undefined) {
+      throw new BobYamlError(
+        "run",
+        lineOfKey(yamlText, "run", key),
+        key === "call_retries"
+          ? `"${key}" must be a whole number of retries (0 or more).`
+          : `"${key}" must be a positive whole number of seconds.`,
+      );
+    }
+    if (key === "wall_clock_seconds") out.wallClockSeconds = n;
+    else if (key === "no_progress_seconds") out.noProgressSeconds = n;
+    else if (key === "call_timeout_seconds") out.callTimeoutSeconds = n;
+    else out.callRetries = n;
+  }
+  return out;
 }
 
 // The role this agent was hired into (bob.yaml `agent.role`). The role is the

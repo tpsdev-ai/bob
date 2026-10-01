@@ -56,6 +56,7 @@ import {
   readCron,
   readProviderLimits,
   readResident,
+  readRunLimits,
   readSessionBudget,
   readTools,
 } from "./bob-yaml.js";
@@ -84,6 +85,17 @@ import { resolveAdoptedConfig } from "./position-runtime.js";
 import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
+import {
+  boundMessage,
+  createRunBounds,
+  RunAbortedError,
+  type RunBounds,
+  type RunLimitsBlock,
+  raceTimeout,
+  resolveRunLimits,
+  type TerminationReason,
+  TIMED_OUT,
+} from "./run-bounds.js";
 import {
   createBobRuntimeFactory,
   OPENROUTER_KEY_CONSUMED_MESSAGE,
@@ -488,6 +500,10 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
+  // Stop an in-flight turn. pi's AgentSession exposes `abort()`; bob's per-call
+  // timeout calls it to unstick a provider call. Optional so a fake session in
+  // tests need not provide it.
+  abort?(): Promise<void>;
   dispose(): void;
 }
 
@@ -672,6 +688,13 @@ export interface RunOptions {
   // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
   // role or capability, is dropped.
   mailTurn?: boolean;
+  // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
+  // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
+  // Tests pass small values.
+  wallClockMs?: number;
+  noProgressMs?: number;
+  callTimeoutMs?: number;
+  callRetries?: number;
 }
 
 export interface RunResult {
@@ -695,6 +718,10 @@ export interface RunResult {
   // no final message that did NOT fail simply had nothing to say. (A mail turn
   // retries a failure and sends no reply for silence.)
   failed?: true;
+  // bob#135: set when a run-level bound ended the run — the wall clock, the
+  // no-progress watchdog, or the per-call timeout after its retries — rather
+  // than the session. The exit code is non-zero.
+  aborted?: TerminationReason;
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -744,7 +771,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { agentDir, provider, model, config, flairBootstrapTarget } = resolveRunConfig({
+  const resolved = resolveRunConfig({
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
@@ -752,6 +779,36 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
+
+  // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
+  // per-invocation flags. A run-level bound (wall clock, no-progress watchdog)
+  // or the per-call timeout ends the run with a non-zero exit; `stop()` in the
+  // `finally` clears every timer so a completed run leaves the event loop free.
+  const limits = resolveRunLimits(resolved.runLimits, {
+    ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
+    ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
+    ...(opts.callTimeoutMs !== undefined ? { callTimeoutMs: opts.callTimeoutMs } : {}),
+    ...(opts.callRetries !== undefined ? { callRetries: opts.callRetries } : {}),
+  });
+  const bounds = createRunBounds(limits);
+  try {
+    return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);
+  } finally {
+    bounds.stop();
+  }
+}
+
+// The run itself, under the bounds created by runAgent. Split out so the timer
+// lifecycle lives in one `finally` in runAgent, wrapping every await below.
+async function runBoundedSession(
+  opts: RunOptions,
+  prompt: string,
+  taskContract: string,
+  resolved: ResolvedRunConfig,
+  bounds: RunBounds,
+): Promise<RunResult> {
+  const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
+  const limits = bounds.limits;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -765,11 +822,22 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // #145: the task is the session's CONTRACT, carried in its system prompt
   // through the factory. (It is ALSO the first user message below, so a provider
   // that shows only messages still sees it; see the README's stated limits.)
-  const session = await factory({
-    ...config,
-    taskContract,
-    ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
-  });
+  // The factory is guarded too: a session that never finishes standing up (pi's
+  // resource/extension load) is ended by the wall clock rather than wedging the
+  // run before its log even exists.
+  let session: RunSession;
+  try {
+    session = await bounds.guard(
+      factory({
+        ...config,
+        taskContract,
+        ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
+      }),
+    );
+  } catch (err) {
+    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    throw err;
+  }
 
   // Tee every session event to a per-run JSONL log so a mid-run death (a provider
   // cap, an OOM, a crash) is post-mortem-able instead of leaving no trace. Logging
@@ -869,6 +937,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         const n = Buffer.byteLength(line);
         appendFileSync(runLogPath, line);
         logBytes += n;
+        // bob#135 — any log growth is progress: re-arm the no-progress watchdog.
+        // A stuck inference call emits no events, so the log stops growing and the
+        // watchdog fires instead of the run hanging.
+        bounds.noteProgress();
         if (!deltaCapHit && logBytes >= capBytes) {
           // One line, ever, recording that the delta cap was hit — written BEFORE
           // the flag is set, so the flag never claims "delta cap hit" without the
@@ -931,6 +1003,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   let exitCode = 0;
   let reason: SilenceReason | undefined;
   let failed = false;
+  let aborted: TerminationReason | undefined;
 
   // #145: after every non-aborted compaction the observer sends ONE best-effort
   // "what remains" note (a steer: the last thing the agent said, git status,
@@ -996,9 +1069,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
-    // expansion — see session.ts promptSession).
-    await promptSession(session, opts.prompt);
-    await drainReasoningOnly();
+    // expansion — see session.ts promptSession). Bounded per call (bob#135).
+    await boundedPrompt(session, prompt, bounds, opts.name);
+    await bounds.guard(drainReasoningOnly());
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -1022,9 +1095,12 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         observer.startTurn(); // the retry is its own turn: its final message counts
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
-        await promptSession(session, CONTINUE_TURN);
-        await drainReasoningOnly(); // same budget: the total stays within the bound
+        await boundedPrompt(session, CONTINUE_TURN, bounds, opts.name);
+        await bounds.guard(drainReasoningOnly()); // same budget: the total stays within the bound
       } catch (err) {
+        // A bound that fired during the retry ends the run; it must not be
+        // swallowed here and leave a silent exit 0.
+        if (err instanceof RunAbortedError) throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
@@ -1080,15 +1156,24 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   } catch (err) {
     exitCode = 1;
     failed = true;
-    // Surface the error instead of swallowing it: an underscore-ignored catch
-    // made a cap-hit look like a silent clean exit. Label a provider
-    // rate-limit/cap so a budget stall is distinguishable from a crash.
-    const msg = err instanceof Error ? err.message : String(err);
-    const isCap =
-      /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
-    process.stderr.write(
-      `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
-    );
+    if (err instanceof RunAbortedError) {
+      // bob#135 — a run-level bound ended the run: name it and how to raise it,
+      // record the outcome in the log, and stop the stuck call.
+      aborted = err.reason;
+      writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
+      process.stderr.write(boundMessage(opts.name, err.reason, limits));
+      if (session.abort) await session.abort().catch(() => {});
+    } else {
+      // Surface the error instead of swallowing it: an underscore-ignored catch
+      // made a cap-hit look like a silent clean exit. Label a provider
+      // rate-limit/cap so a budget stall is distinguishable from a crash.
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCap =
+        /rate.?limit|quota|\b429\b|too many requests|usage limit|capacity|overloaded/i.test(msg);
+      process.stderr.write(
+        `bob run ${opts.name}: ${isCap ? "PROVIDER RATE-LIMIT/CAP" : "run failed"} — ${msg}\n`,
+      );
+    }
   } finally {
     // Stop recording first: the done line below is this log's last record, and the
     // run is over whatever the turn did.
@@ -1126,8 +1211,59 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     model,
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(aborted !== undefined ? { aborted } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
+}
+
+// The result for a run a bound ended before/while the session came up (the
+// guarded factory), when there is no run log to record it in.
+function abortedRunResult(
+  opts: RunOptions,
+  resolved: ResolvedRunConfig,
+  bounds: RunBounds,
+  reason: TerminationReason,
+): RunResult {
+  process.stderr.write(boundMessage(opts.name, reason, bounds.limits));
+  return {
+    exitCode: 1,
+    agentDir: resolved.agentDir,
+    provider: resolved.provider,
+    model: resolved.model,
+    ...(opts.captureStdout ? { stdout: "" } : {}),
+    aborted: reason,
+    failed: true,
+  };
+}
+
+// One provider call under two bounds: the per-call timeout and the run's own
+// abort (bounds.guard). A call that does not answer within `callTimeoutMs` is
+// aborted on the session and retried up to `callRetries` times; after the last
+// retry the run ends as a per-call timeout. pi's PromptOptions carries no
+// AbortSignal, so bob bounds the call itself and calls the session's abort() to
+// stop the stuck turn — this is the nearest layer bob owns.
+async function boundedPrompt(
+  session: RunSession,
+  text: string,
+  bounds: RunBounds,
+  name: string,
+): Promise<void> {
+  const limits = bounds.limits;
+  for (let attempt = 0; ; attempt++) {
+    const outcome = await bounds.guard(
+      raceTimeout(promptSession(session, text), limits.callTimeoutMs),
+    );
+    if (outcome !== TIMED_OUT) return;
+    // The provider did not answer. Stop the stuck turn before retrying.
+    if (session.abort) await session.abort().catch(() => {});
+    if (attempt >= limits.callRetries) {
+      bounds.fire("call_timeout");
+      throw new RunAbortedError("call_timeout");
+    }
+    process.stderr.write(
+      `bob run ${name}: no provider answer within ${limits.callTimeoutMs % 1000 === 0 ? `${limits.callTimeoutMs / 1000}s` : `${limits.callTimeoutMs}ms`} — retrying (${attempt + 1}/${limits.callRetries})\n`,
+    );
+  }
 }
 
 // Resolve everything a pi session needs for an agent from disk: provider/model
@@ -1182,6 +1318,9 @@ export interface ResolvedRunConfig {
   // bob#254 — where to call Flair at session start, when the agent configures
   // the flair capability. Absent: no bootstrap is loaded.
   flairBootstrapTarget?: FlairBootstrapTarget;
+  // bob#135 — the agent's bob.yaml `run:` bounds (seconds). One-shot runs
+  // overlay the per-invocation flags on these; other entry paths ignore it.
+  runLimits: RunLimitsBlock;
 }
 
 // The tool policy for an agent's bob.yaml. ONE entry point for every launch
@@ -1811,6 +1950,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     agent,
     policy: toolPolicy,
     capabilities,
+    runLimits: readRunLimits(yamlText),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }

@@ -69,6 +69,35 @@ export function boolFlag(flags: Readonly<Record<string, string | boolean>>, name
   return boolValue(name, value);
 }
 
+// A positive whole number of SECONDS, in milliseconds. A bare/absent flag means
+// "not given"; a bad value (zero, negative, non-integer) is a UsageError naming
+// the flag rather than a timer armed with a nonsense deadline.
+export function secondsFlagToMs(
+  flags: Readonly<Record<string, string | boolean>>,
+  name: string,
+): number | undefined {
+  const raw = stringFlag(flags, name);
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new UsageError(`--${name} must be a positive whole number of seconds (got '${raw}')`);
+  }
+  return Number(raw) * 1000;
+}
+
+// A non-negative whole-number flag (a count). Bare/absent means "not given";
+// anything else is a UsageError naming the flag.
+export function countFlag(
+  flags: Readonly<Record<string, string | boolean>>,
+  name: string,
+): number | undefined {
+  const raw = stringFlag(flags, name);
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw)) {
+    throw new UsageError(`--${name} must be a whole number (got '${raw}')`);
+  }
+  return Number(raw);
+}
+
 // `parseArgs` produces the shape `cli.ts` consumes: the subcommand, the
 // positional arguments, and the flag map. A value flag with a value (`--model x`,
 // or the `--model=x` form) is the string value; a valueless one (`--model`
