@@ -117,7 +117,7 @@ describe("changelog fragments — check (bob#236)", () => {
       const { dir, changelogPath } = project();
       fragment(dir, name, "- **A thing was fixed.** Detail.\n");
       expect(() => cf.check({ dir, changelogPath }), name).toThrow(
-        `'${name.split("-")[0]}' is not a changelog category`,
+        `.changelog/unreleased/${name.split("-")[0]}-a-thing.md: '${name.split("-")[0]}' is not a changelog category`,
       );
       rmSync(join(dir, name));
     }
@@ -191,6 +191,91 @@ describe("changelog fragments — check (bob#236)", () => {
     const { dir, changelogPath } = project();
     rmSync(dir, { recursive: true });
     expect(() => cf.check({ dir, changelogPath })).toThrow(/unreleased\/: directory not found/);
+  });
+
+  it("REFUSES a non-.md extension, naming the file", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed.txt", "- **bad.** ext.\n");
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = readdirSync(dir).sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      new Error(
+        `.changelog/unreleased/fixed.txt: not a .md file. Changelog fragments must be named <category>-<slug>.md (categories: added, changed, deprecated, removed, fixed, security).`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
+  });
+  it("REFUSES a .md filename with no slug, naming the file", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed.md", "- **bad.** no slug.\n");
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = readdirSync(dir).sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      new Error(
+        `.changelog/unreleased/fixed.md: missing the '-<slug>' part. Name it fixed-<something-descriptive>.md.`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
+  });
+  it("REFUSES an empty fragment body (0-byte file), naming the file", () => {
+    const { dir, changelogPath } = project();
+    writeFileSync(join(dir, "fixed-empty.md"), "");
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = readdirSync(dir).sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      new Error(
+        `.changelog/unreleased/fixed-empty.md: fragment is empty. Write the changelog entry into it, or delete the file.`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
+  });
+  it("REFUSES a tab-indented continuation line, naming the file", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-tab.md", "- **ok.** lede\n\ttab indent\n");
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = readdirSync(dir).sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      new Error(
+        `.changelog/unreleased/fixed-tab.md:2: continuation indent 0; tabs are not allowed; indent continuation lines by an even number of spaces: 2 for the entry, 4 or more for nested content.`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
   });
 
   // Each entry is opened once and judged by its descriptor, not by a separate
@@ -467,6 +552,63 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
     expect(readFileSync(changelogPath).equals(before)).toBe(true);
     expect(readdirSync(dir).sort()).toEqual(["fixed-a.md", "fixed-bad-utf8.md"]);
+  });
+
+  it("promote REFUSES no fragments in the directory, and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    stageAll();
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = cf
+      .readFragments(dir)
+      .map((f) => f.name)
+      .sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      new Error(
+        `promote: no fragments in .changelog/unreleased/ — refusing to cut v1.2.3 with an empty changelog section. Add the entries for this release before running the release step.`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(
+      cf
+        .readFragments(dir)
+        .map((f) => f.name)
+        .sort(),
+    ).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
+  });
+  it("promote REFUSES git ls-files failure and writes nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    // Replace the default index path (.git/index) with a directory so ls-files fails regardless of file permissions.
+    const index = join(root, ".git", "index");
+    const save = `${index}.save`;
+    renameSync(index, save);
+    mkdirSync(index, { recursive: true });
+    try {
+      const beforeBytes = readFileSync(changelogPath);
+      const beforeFNames = readdirSync(dir).sort();
+      const beforeFRags = readdirSync(dir).map((n) => readFileSync(join(dir, n)));
+      expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+        new Error(
+          `promote: git ls-files failed, so nothing was written; repair the Git index or its environment until ls-files succeeds, then retry promote.`,
+        ),
+      );
+      expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+      expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+      const afterFRags = readdirSync(dir).map((n) => readFileSync(join(dir, n)));
+      expect(afterFRags).toEqual(beforeFRags);
+    } finally {
+      rmSync(index, { recursive: true, force: true });
+      renameSync(save, index);
+    }
   });
 
   it("REFUSES a CHANGELOG.md that is not valid UTF-8, in check and in promote, and writes nothing", () => {
