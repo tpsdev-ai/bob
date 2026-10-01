@@ -3,10 +3,20 @@
 //   * the tolerant `edit` lands a whitespace-run mismatch, refuses an ambiguous
 //     normalised match, and keeps pi's exact-match behaviour otherwise;
 //   * `replace_lines` replaces/deletes an inclusive line range, refuses an
-//     inverted or out-of-range one, and resolves paths the way pi's file tools
-//     do (relative to the session cwd).
+//     inverted or out-of-range one, keeps the line numbers decisive when a line
+//     repeats, validates before any write, and is confined to the session cwd
+//     (relative paths resolve against it; an absolute path, `..` escape or
+//     escaping symlink outside it is refused).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -126,7 +136,7 @@ describe("createReplaceLinesToolDefinition", () => {
     ).rejects.toThrow(/out-of-range/);
   });
 
-  it("resolves a relative path against the session cwd and an absolute path as given", async () => {
+  it("resolves a relative path against the session cwd and an absolute path inside it", async () => {
     mkdirSync(join(cwd, "sub"));
     writeFileSync(join(cwd, "sub", "f.ts"), "one\ntwo\n");
     const tool = createReplaceLinesToolDefinition(cwd);
@@ -138,11 +148,72 @@ describe("createReplaceLinesToolDefinition", () => {
     expect(readFileSync(abs, "utf8")).toBe("ONE\nTWO\n");
   });
 
-  it("propagates an access failure (missing file) rather than reading it as no match", async () => {
+  it("makes the line number decisive when the line repeats elsewhere", async () => {
+    // The selected text occurs on three lines; pi's unique-text edit would
+    // refuse it. The range must still land, at line 2 only.
+    writeFileSync(join(cwd, "f.ts"), "dup\ndup\ndup\n");
+    const tool = createReplaceLinesToolDefinition(cwd);
+    await run(tool, { path: "f.ts", startLine: 2, endLine: 2, newText: "X" });
+    expect(readFileSync(join(cwd, "f.ts"), "utf8")).toBe("dup\nX\ndup\n");
+  });
+
+  it("refuses an inverted range before any write, leaving a NUL/marker file byte-identical", async () => {
+    // A file may contain NUL bytes and the old probe marker; a refused call must
+    // not touch it.
+    const bytes = Buffer.from("a\u0000bob-replace-lines-probe\u0000\nb\nc\n", "utf8");
+    writeFileSync(join(cwd, "f.bin"), bytes);
+    const tool = createReplaceLinesToolDefinition(cwd);
+    await expect(
+      run(tool, { path: "f.bin", startLine: 3, endLine: 1, newText: "X" }),
+    ).rejects.toThrow(/inverted range/);
+    expect(readFileSync(join(cwd, "f.bin"))).toEqual(bytes);
+  });
+
+  it("refuses an absolute path outside the workspace root", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "bob-confine-"));
+    const ws = join(parent, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(parent, "outside.ts"), "a\nb\n");
+    const tool = createReplaceLinesToolDefinition(ws);
+    await expect(
+      run(tool, { path: join(parent, "outside.ts"), startLine: 1, endLine: 1, newText: "X" }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(parent, "outside.ts"), "utf8")).toBe("a\nb\n");
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it("refuses a `..` escape out of the workspace root", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "bob-confine-"));
+    const ws = join(parent, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(parent, "outside.ts"), "a\nb\n");
+    const tool = createReplaceLinesToolDefinition(ws);
+    await expect(
+      run(tool, { path: "../outside.ts", startLine: 1, endLine: 1, newText: "X" }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(parent, "outside.ts"), "utf8")).toBe("a\nb\n");
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it("refuses a symlink that leaves the workspace root", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "bob-confine-"));
+    const ws = join(parent, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(parent, "outside.ts"), "a\nb\n");
+    symlinkSync(join(parent, "outside.ts"), join(ws, "link.ts"));
+    const tool = createReplaceLinesToolDefinition(ws);
+    await expect(
+      run(tool, { path: "link.ts", startLine: 1, endLine: 1, newText: "X" }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(parent, "outside.ts"), "utf8")).toBe("a\nb\n");
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it("refuses a missing file (it does not resolve inside the workspace) rather than reading it as no match", async () => {
     const tool = createReplaceLinesToolDefinition(cwd);
     await expect(
       run(tool, { path: "absent.ts", startLine: 1, endLine: 1, newText: "X" }),
-    ).rejects.toThrow(/Could not edit file/);
+    ).rejects.toThrow(/refusing to write/);
     expect(existsSync(join(cwd, "absent.ts"))).toBe(false);
   });
 });

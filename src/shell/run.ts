@@ -95,7 +95,12 @@ import {
 } from "./session.js";
 import type { ModelLimits, ThinkingSetting } from "./session-budget.js";
 import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
-import { DEFAULT_TOOL_LOOP_LIMIT, ToolLoopDetector } from "./tool-loop.js";
+import {
+  DEFAULT_TOOL_LOOP_LIMIT,
+  loopBreakMessage,
+  ToolLoopDetector,
+  ToolLoopError,
+} from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError } from "./turn-origin.js";
 
@@ -726,35 +731,8 @@ export async function attachFlairBootstrap(
   if (text.length > 0) config.flairBootstrap = text;
 }
 
-// bob#143 item 3 — the loop breaker error. Thrown into the awaited turn when the
-// same tool call has repeated `limit` times in a row, so the run ends instead of
-// looping. `call` names the repeated call for the message.
-class ToolLoopError extends Error {
-  readonly toolName: string;
-  readonly count: number;
-  constructor(toolName: string, count: number) {
-    super(`the tool call ${toolName} repeated ${count} times in a row`);
-    this.name = "ToolLoopError";
-    this.toolName = toolName;
-    this.count = count;
-  }
-}
-
-function summarizeArgs(args: unknown): string {
-  if (args === undefined) return "(no arguments)";
-  try {
-    const json = JSON.stringify(args);
-    if (json === undefined) return String(args);
-    return json.length > 200 ? `${json.slice(0, 200)}…` : json;
-  } catch {
-    return String(args);
-  }
-}
-
-function loopBreakMessage(name: string, toolName: string, args: unknown, count: number): string {
-  return `bob run ${name}: LOOP BREAKER — the same tool call repeated ${count} times in a row: ${toolName} ${summarizeArgs(args)}; ending the turn. Use a different mechanism (for example replace_lines for a line-based edit), or stop and report BLOCKED.\n`;
-}
-
+// bob#143 item 3 — the loop breaker error and its log line live in
+// tool-loop.ts, shared with the persistent turn path so both abort identically.
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);

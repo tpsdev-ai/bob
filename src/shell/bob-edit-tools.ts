@@ -11,26 +11,27 @@
 //                     path resolution, write queue and diff. The result says how
 //                     many edits needed the normalisation.
 //   * `replace_lines` — replace an inclusive 1-based line range without
-//                     reproducing the old lines. It reads AND writes THROUGH
-//                     pi's edit tool (a probe oldText forces the read), so it
-//                     inherits pi's path resolution and confinement.
+//                     reproducing the old lines. It reads the file, validates
+//                     the range against that content, then writes the range back
+//                     directly — the LINE NUMBERS decide the range, so a range
+//                     containing a line repeated elsewhere still lands.
 //
-// Neither tool invents a sandbox: both resolve paths and write through pi's edit
-// tool and its EditOperations.
+// Neither tool invents a sandbox. The tolerant `edit` resolves and writes
+// through pi's edit tool exactly as pi does (pi resolves absolute paths as
+// given). `replace_lines` writes with bob's own write control, confined to the
+// run's workspace root (confined-read.ts's checkWriteTarget).
 
 import { constants } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import {
   createEditToolDefinition,
   type EditOperations,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { checkWriteTarget } from "./confined-read.js";
 import { type EditRequest, locateTolerantEdits } from "./edit-tolerance.js";
-
-// A probe oldText that cannot occur in a real file (it holds NUL bytes), used to
-// make pi's edit tool read a file, resolve its path and then fail on the match.
-const PROBE = "\u0000bob-replace-lines-probe\u0000";
 
 // pi's edit failure messages that mean "the oldText did not match": NOT the
 // access failure ("Could not edit file"), which must propagate untouched.
@@ -136,23 +137,7 @@ function lineSpans(content: string): Array<{ start: number; end: number }> {
   return spans;
 }
 
-function noteRange(result: unknown, path: string, startLine: number, endLine: number): unknown {
-  const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (block?.type === "text" && typeof block.text === "string") {
-        block.text = `Replaced lines ${startLine}-${endLine} in ${path}.`;
-      }
-    }
-  }
-  return result;
-}
-
 export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
-  const capturing = capturingOperations();
-  const base = createEditToolDefinition(cwd, { operations: capturing.operations });
-  const runBase = base.execute as unknown as PiEditExecute;
-
   return {
     name: "replace_lines",
     label: "replace_lines",
@@ -182,15 +167,20 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
         endLine: number;
         newText: string;
       };
-      // Read through pi's edit tool: the probe forces it to resolve the path and
-      // read the file (its confinement), then fail on the match.
+      // Confine the write to the run's workspace root: a relative path resolves
+      // against it, and an absolute path, a `..` escape or an escaping symlink
+      // resolves outside it and is refused before any read or write.
+      const requested = isAbsolute(path) ? path : resolve(cwd, path);
+      const target = checkWriteTarget(requested, cwd);
+      // Read the file's real content, then validate the range against it — no
+      // write happens before this check.
+      let text: string;
       try {
-        await runBase("", { path, edits: [{ oldText: PROBE, newText: "" }] });
+        text = await readFile(target, "utf-8");
       } catch (err) {
-        const message = err instanceof Error ? err.message : "";
-        if (!/^Could not find/.test(message)) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`replace_lines: could not read ${path}: ${message}`);
       }
-      const text = capturing.content();
       const spans = lineSpans(text);
       if (startLine > endLine) {
         throw new Error(
@@ -202,14 +192,18 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
           `replace_lines: out-of-range in ${path}: lines ${startLine}-${endLine}, but the file has ${spans.length} line(s).`,
         );
       }
-      const oldText = text.slice(spans[startLine - 1].start, spans[endLine - 1].end);
+      const from = spans[startLine - 1].start;
+      const to = spans[endLine - 1].end;
+      const oldText = text.slice(from, to);
       // Preserve the range's own trailing newline when the replacement omits one.
       const replacement =
         newText !== "" && oldText.endsWith("\n") && !newText.endsWith("\n")
           ? `${newText}\n`
           : newText;
-      const result = await runBase("", { path, edits: [{ oldText, newText: replacement }] });
-      return noteRange(result, path, startLine, endLine);
+      await writeFile(target, text.slice(0, from) + replacement + text.slice(to), "utf-8");
+      return {
+        content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
+      };
     },
   } as unknown as ToolDefinition;
 }

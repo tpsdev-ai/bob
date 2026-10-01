@@ -4,6 +4,12 @@ import { createAssistantEndingTracker } from "./compaction-contract.js";
 import { ReasoningOnlyExhaustedError, repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
+import {
+  DEFAULT_TOOL_LOOP_LIMIT,
+  loopBreakMessage,
+  ToolLoopDetector,
+  ToolLoopError,
+} from "./tool-loop.js";
 import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
 
 export interface TurnAdmission {
@@ -21,9 +27,22 @@ export interface TurnAdmission {
 // Every admitted turn is also re-prompted while its last turn ends with
 // reasoning only (bob#256), bounded; an exhausted admitted turn FAILS the turn
 // (it throws), so a cron/Discord turn cannot end the agent mid-task either.
-export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
+//
+// bob#143 item 3: every admitted turn runs the same loop breaker as a one-shot
+// `bob run`. The detector counts consecutive identical tool calls within the
+// turn; at the configured limit the turn is aborted with `ToolLoopError`.
+export function createTurnAdmission(
+  opts: { log?: (m: string) => void; toolLoopLimit?: number; name?: string } = {},
+) {
   const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
-  type Turn = { origin: TurnOrigin; messages: unknown[] };
+  const limit = opts.toolLoopLimit ?? DEFAULT_TOOL_LOOP_LIMIT;
+  const agentName = opts.name ?? "agent";
+  type Turn = {
+    origin: TurnOrigin;
+    messages: unknown[];
+    detector: ToolLoopDetector;
+    abort?: (err: Error) => void;
+  };
   const context = new AsyncLocalStorage<Turn>();
   const endings = createAssistantEndingTracker();
   let active: Turn | undefined;
@@ -39,6 +58,20 @@ export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
       session = value;
       value.subscribe((event) => {
         endings.observe(event);
+        if (event.type === "tool_execution_start") {
+          const turn = context.getStore();
+          if (turn && turn === active) {
+            const { toolName, args } = event as unknown as { toolName: string; args: unknown };
+            const observation = turn.detector.observe(toolName, args);
+            if (observation.fire && turn.abort) {
+              const abort = turn.abort;
+              turn.abort = undefined;
+              log(loopBreakMessage(agentName, toolName, args, observation.count));
+              abort(new ToolLoopError(toolName, observation.count));
+              void session?.abort?.();
+            }
+          }
+        }
         if (event.type !== "agent_end") return;
         const turn = context.getStore();
         if (turn !== active || !turn) return;
@@ -70,29 +103,46 @@ export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
         if (!target) throw new Error("bob: turn admission has no session");
         await target.waitForIdle?.();
         if (closed) throw new Error("bob: turn admission is closed");
-        const turn: Turn = { origin: approved, messages: [] };
+        const turn: Turn = {
+          origin: approved,
+          messages: [],
+          detector: new ToolLoopDetector(limit),
+        };
+        let abortTurn!: (err: Error) => void;
+        const loopAbort = new Promise<never>((_resolve, reject) => {
+          abortTurn = reject;
+        });
+        turn.abort = (err) => abortTurn(err);
         active = turn;
         try {
           // No await between installing the context and invoking the prompt.
           await context.run(turn, async () => {
             endings.reset();
-            await promptSession(target, text);
-            // bob#256: continue through reasoning-only turns, bounded. Exhaustion
-            // is a FAILED turn — thrown so the callers (the cron scheduler, the
-            // Discord inbound listener) handle it as a failure rather than a
-            // successful fire/reply.
-            const reasoning = await repromptWhileReasoningOnly({
-              session: target,
-              readEnding: () => endings.current(),
-              beginTurn: () => endings.reset(),
-              onReprompt: (n, max) =>
-                log(
-                  `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
-                ),
-            });
-            if (reasoning.endedReasoningOnly) {
-              throw new ReasoningOnlyExhaustedError(reasoning.reprompts);
-            }
+            // Race the turn against the loop breaker: when the detector fires,
+            // `loopAbort` rejects and the turn fails, the same way a one-shot
+            // `bob run` ends on a repeated call.
+            await Promise.race([
+              (async () => {
+                await promptSession(target, text);
+                // bob#256: continue through reasoning-only turns, bounded. Exhaustion
+                // is a FAILED turn — thrown so the callers (the cron scheduler, the
+                // Discord inbound listener) handle it as a failure rather than a
+                // successful fire/reply.
+                const reasoning = await repromptWhileReasoningOnly({
+                  session: target,
+                  readEnding: () => endings.current(),
+                  beginTurn: () => endings.reset(),
+                  onReprompt: (n, max) =>
+                    log(
+                      `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
+                    ),
+                });
+                if (reasoning.endedReasoningOnly) {
+                  throw new ReasoningOnlyExhaustedError(reasoning.reprompts);
+                }
+              })(),
+              loopAbort,
+            ]);
           });
           return turn.messages;
         } finally {

@@ -2,8 +2,8 @@
 //
 // A local model can repeat the SAME tool call (identical name and arguments)
 // for many turns: the issue's run issued the same `edit` and the same
-// whitespace-inspection command 8-16 times each and never recovered. The model
-// cannot see its own repetition; the runtime can.
+// whitespace-inspection command 8-16 times each and never recovered. The
+// runtime can observe the repetition even when the model does not.
 //
 // This detector counts CONSECUTIVE identical calls. Any call with a different
 // name or different arguments resets the run of repeats to one — only an
@@ -71,4 +71,41 @@ export class ToolLoopDetector {
     this.lastKey = undefined;
     this.count = 0;
   }
+}
+
+// The error thrown into the awaited turn when the same call has repeated
+// `limit` times in a row, so the turn ends instead of looping. `toolName` names
+// the repeated call for the message. Shared by the one-shot and persistent turn
+// paths, so both abort identically.
+export class ToolLoopError extends Error {
+  readonly toolName: string;
+  readonly count: number;
+  constructor(toolName: string, count: number) {
+    super(`the tool call ${toolName} repeated ${count} times in a row`);
+    this.name = "ToolLoopError";
+    this.toolName = toolName;
+    this.count = count;
+  }
+}
+
+function summarizeArgs(args: unknown): string {
+  if (args === undefined) return "(no arguments)";
+  try {
+    const json = JSON.stringify(args);
+    if (json === undefined) return String(args);
+    return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+  } catch {
+    return String(args);
+  }
+}
+
+// The line the runtime logs when it ends a turn for a repeated call. Names the
+// call and points at a different mechanism.
+export function loopBreakMessage(
+  name: string,
+  toolName: string,
+  args: unknown,
+  count: number,
+): string {
+  return `bob run ${name}: LOOP BREAKER — the same tool call repeated ${count} times in a row: ${toolName} ${summarizeArgs(args)}; ending the turn. Use a different mechanism (for example replace_lines for a line-based edit), or stop and report BLOCKED.\n`;
 }
