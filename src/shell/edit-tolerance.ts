@@ -8,13 +8,12 @@
 //
 // This module answers one question for the edit wrapper: given the file's
 // content and the model's edits, what EXACT substring of the file does each
-// oldText mean? Positions are counted with overlapping occurrences included. An
-// oldText that occurs exactly at one position wins; one that occurs exactly at
-// more than one position fails, naming that count. With no exact occurrence,
-// the content and the oldText are canonicalised (runs of spaces/tabs → one
-// space, trailing whitespace dropped), and the edit is accepted only when the
-// canonical oldText occurs at exactly one position; otherwise it fails, naming
-// the count.
+// oldText mean? Positions are counted with overlapping occurrences included.
+// The exact pass runs first: an oldText at one exact position is applied, and
+// one at more than one exact position fails, naming that count. Only when it
+// occurs nowhere exactly does the whitespace-run-normalised pass run (runs of
+// spaces/tabs → one space, trailing whitespace dropped): it accepts only one
+// normalised position and otherwise fails, naming the count.
 //
 // The returned edits carry the file's exact substring as `oldText`, so the
 // wrapper can hand them to pi's own edit tool and reuse its path resolution,
@@ -140,7 +139,7 @@ function describe(path: string, index: number, total: number): string {
 }
 
 function notFoundMessage(path: string, index: number, total: number): string {
-  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must occur at one position, exactly or under that normalisation.`;
+  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must occur at one exact position or, with no exact occurrence, at one position under that normalisation.`;
 }
 
 function exactDuplicateMessage(path: string, index: number, total: number, count: number): string {
@@ -159,10 +158,11 @@ function emptyMessage(path: string, index: number, total: number): string {
 }
 
 /**
- * Resolve every edit's oldText to an exact file substring. Throws
- * {@link EditMatchError}, naming the count, on a blank oldText, an oldText that
- * occurs at more than one position (overlapping occurrences included), or no
- * match at all.
+ * Resolve every edit's oldText to an exact file substring, exact pass first.
+ * Throws {@link EditMatchError}, naming the count, on a blank oldText, an
+ * oldText at more than one exact position, an oldText at no exact position and
+ * more than one normalised position, or no match at all (overlapping
+ * occurrences included in every count).
  */
 export function locateTolerantEdits(
   content: string,

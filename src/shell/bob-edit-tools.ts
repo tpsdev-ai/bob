@@ -8,8 +8,10 @@
 //                     exactly at more than one position (overlapping
 //                     occurrences included) is refused. On pi's exact/fuzzy
 //                     match failure the wrapper resolves each oldText through
-//                     edit-tolerance.ts (exact, then whitespace-run-normalised,
-//                     each accepted only at exactly one position) and hands
+//                     edit-tolerance.ts: the exact pass first, and only for an
+//                     oldText that occurs nowhere exactly the whitespace-run-
+//                     normalised pass, which accepts only one normalised
+//                     position (overlapping occurrences included). It hands
 //                     pi's own tool the exact file substrings, so pi keeps its
 //                     path resolution, write queue and diff. A successful
 //                     normalised retry's result says how many edits needed the

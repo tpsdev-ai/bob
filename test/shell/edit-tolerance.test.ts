@@ -1,7 +1,9 @@
 // edit-tolerance.test.ts — bob#143 item 1. The pure matcher behind the tolerant
-// `edit`: exact match first, then a whitespace-run-normalised match. An oldText
-// is accepted only at one position; one that occurs at more than one position
-// (overlapping occurrences included) fails with that count, exact or normalised.
+// `edit`. The exact pass runs first: an oldText at one exact position is
+// applied, and one at more than one exact position fails with that count. Only
+// when it occurs nowhere exactly does the whitespace-run-normalised pass run,
+// accepting only one normalised position. Counts include overlapping
+// occurrences.
 import { describe, expect, it } from "bun:test";
 import {
   EditMatchError,
@@ -86,7 +88,7 @@ describe("locateTolerantEdits — refusals", () => {
     }
   });
 
-  it("fails when the normalised oldText occurs at two positions, naming the count", () => {
+  it("fails for an oldText at no exact position and two normalised positions, naming the count", () => {
     // Two lines collapse to the same canonical form.
     const content = `x${align(2)}y\nx${align(5)}y\n`;
     try {
@@ -135,7 +137,7 @@ describe("locateTolerantEdits — refusals", () => {
     ).toThrow(/^edits\[1\]\.oldText matches 2 places exactly in f\.ts \(overlapping/);
   });
 
-  it("refuses a normalised oldText at two overlapping positions", () => {
+  it("refuses an oldText at no exact position and two overlapping normalised positions", () => {
     // Canonically "a a a": "a a" occurs at positions 0 and 2, which overlap.
     try {
       locateTolerantEdits("a  a   a", [{ oldText: "a a", newText: "X" }], "f.ts");
@@ -162,11 +164,26 @@ describe("locateTolerantEdits — refusals", () => {
     }
   });
 
-  it("still accepts an oldText at exactly one position, exact or normalised", () => {
+  it("still accepts one exact position, or one normalised position when none is exact", () => {
     const exact = locateTolerantEdits("aab", [{ oldText: "ab", newText: "X" }], "f.ts");
     expect(exact.edits[0]).toMatchObject({ kind: "exact", index: 1, length: 2 });
     const normalised = locateTolerantEdits("a  b a", [{ oldText: "a b", newText: "X" }], "f.ts");
     expect(normalised.edits[0]).toMatchObject({ kind: "whitespace", oldText: "a  b", index: 0 });
+  });
+
+  it("exact-first rule: one exact position is applied though normalising would find two", () => {
+    // "a a" occurs exactly once (line 1) and twice after normalising (lines 1
+    // and 2). The exact pass runs first and wins; the normalised pass never runs.
+    const content = "a a\na  a\n";
+    const { edits, normalizedCount } = locateTolerantEdits(
+      content,
+      [{ oldText: "a a", newText: "X" }],
+      "f.ts",
+    );
+    expect(normalizedCount).toBe(0);
+    expect(edits).toEqual([
+      { editIndex: 0, oldText: "a a", newText: "X", index: 0, length: 3, kind: "exact" },
+    ]);
   });
 
   it("fails on an empty oldText", () => {

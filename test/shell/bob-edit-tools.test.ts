@@ -1,9 +1,9 @@
 // bob-edit-tools.test.ts — bob#143 items 1 and 2. The two pi-facing tools,
 // exercised against real files in a temp cwd:
 //   * the tolerant `edit` lands a whitespace-run mismatch, applies an oldText
-//     at one exact position unchanged, and refuses an oldText that occurs at
-//     more than one position (overlapping occurrences included), exactly or
-//     after normalisation;
+//     at one exact position unchanged, refuses one at more than one exact
+//     position, and, for an oldText at no exact position, refuses more than one
+//     normalised position (overlapping occurrences included in both counts);
 //   * `replace_lines` replaces/deletes an inclusive line range, refuses an
 //     inverted or out-of-range one, keeps the line numbers decisive when a line
 //     repeats, validates before any write, and is confined to the session cwd
@@ -91,7 +91,7 @@ describe("createTolerantEditToolDefinition", () => {
     expect(readFileSync(join(cwd, "f.md")).equals(before)).toBe(true);
   });
 
-  it("refuses a normalised oldText at two overlapping positions, leaving the file byte-identical", async () => {
+  it("refuses an oldText at no exact position and two overlapping normalised positions, leaving the file byte-identical", async () => {
     writeFileSync(join(cwd, "f.md"), "a  a   a\n");
     const before = readFileSync(join(cwd, "f.md"));
     const tool = createTolerantEditToolDefinition(cwd);
@@ -108,7 +108,7 @@ describe("createTolerantEditToolDefinition", () => {
     expect(readFileSync(join(cwd, "f.md"), "utf8")).toBe("aX\n");
   });
 
-  it("refuses a normalised oldText at two positions, naming the count", async () => {
+  it("refuses an oldText at no exact position and two normalised positions, naming the count", async () => {
     writeFileSync(join(cwd, "f.md"), "- x   y\n- x  y\n");
     const tool = createTolerantEditToolDefinition(cwd);
     await expect(
@@ -170,8 +170,9 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     expect(resultText(rb)).toContain("Matched 1 edit(s)");
   });
 
-  it("another file's read cannot make a normalised oldText at two positions apply", async () => {
-    // b.md holds "x y" twice under normalisation, so its edit must be refused;
+  it("another file's read cannot make an oldText at no exact and two normalised positions apply", async () => {
+    // b.md holds "x y" nowhere exactly and twice under normalisation, so its
+    // edit must be refused;
     // a.md holds it once, and its span "x  y" also occurs exactly once in b.md.
     writeFileSync(join(cwd, "a.md"), "x  y\n");
     writeFileSync(join(cwd, "b.md"), "x  y\nx   y\n");
