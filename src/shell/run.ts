@@ -968,7 +968,13 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
     let outcome = judge();
-    if (!outcome.ok && outcome.reason === "settled_after_compaction") {
+    if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
+      // Budget exhausted on a reasoning-only ending: report the honest failure
+      // BEFORE the compaction retry. The retry recovers a SILENT settlement (a
+      // compaction erased the plan); it is not a fourth reasoning turn, and a
+      // text reply to it must never turn the run green.
+      outcome = { ok: false, reason: "reasoning_only" };
+    } else if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
       // explicit "continue from the state above" turn. This retry is meaningful
       // because the task is still in the system prompt.
@@ -986,13 +992,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
       outcome = judge();
-    }
-    // bob#256: a run whose last turn is STILL reasoning-only after the bound
-    // ended without a final report — never a normal completion. It is treated as
-    // a failure (a mail turn retries it; it is not "silence" with nothing to
-    // say).
-    if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
-      outcome = { ok: false, reason: "reasoning_only" };
+      // Still reasoning-only after the retry is a failure, never a normal
+      // completion.
+      if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
+        outcome = { ok: false, reason: "reasoning_only" };
+      }
     }
     // A run with no final message whose last message ended on an error or an
     // abort FAILED; one that ended cleanly with nothing to say did not.

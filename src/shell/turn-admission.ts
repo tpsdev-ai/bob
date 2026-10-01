@@ -19,8 +19,8 @@ export interface TurnAdmission {
 // reads run, even while an admitted prompt is paused before before_agent_start.
 //
 // Every admitted turn is also re-prompted while its last turn ends with
-// reasoning only (bob#256), bounded, so a cron/Discord turn cannot end the
-// agent mid-task either.
+// reasoning only (bob#256), bounded; an exhausted admitted turn FAILS the turn
+// (it throws), so a cron/Discord turn cannot end the agent mid-task either.
 export function createTurnAdmission(opts: { log?: (m: string) => void } = {}) {
   const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
   type Turn = { origin: TurnOrigin; messages: unknown[] };

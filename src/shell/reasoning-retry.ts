@@ -7,8 +7,9 @@
 // run.
 //
 // The re-prompting is BOUNDED by a constant (DEFAULT_MAX_REASONING_REPROMPTS),
-// never by the model's output: after that many consecutive reasoning-only
-// endings the run stops and reports the honest outcome. A model that answers
+// never by the model's output: after that many re-prompts (one budget for the
+// whole run) a still-reasoning-only ending ends the run with the honest outcome.
+// A model that answers
 // with reasoning only forever therefore cannot hold the run — the loop's exit
 // does not depend on a turn ever producing text. The caller sends the first
 // prompt (through promptSession) and then calls repromptWhileReasoningOnly,
@@ -41,8 +42,7 @@ export class ReasoningOnlyExhaustedError extends Error {
 export interface ReasoningRetryResult {
   /** How many reasoning-only endings were re-prompted (0..maxReprompts). */
   reprompts: number;
-  /** True when the LAST turn still ended reasoning-only (the run ended without a
-   *  final report). */
+  /** True when the turn that just ended is still reasoning-only. */
   endedReasoningOnly: boolean;
 }
 
@@ -51,9 +51,9 @@ export interface ReasoningRetryOptions {
   /** The last assistant ending observed so far (undefined when the transport
    *  ends no message, in which case there is nothing to re-prompt). */
   readEnding: () => AssistantEnding | undefined;
-  /** Max consecutive reasoning-only endings to re-prompt. Must be a finite
-   *  positive number; capped at DEFAULT_MAX_REASONING_REPROMPTS so no caller can
-   *  make the loop unbounded. Defaults to that constant. */
+  /** Max reasoning-only re-prompts. Must be a positive INTEGER; capped at
+   *  DEFAULT_MAX_REASONING_REPROMPTS so no caller can make the loop unbounded.
+   *  Defaults to that constant. */
   maxReprompts?: number;
   /** Called before each re-prompt's own turn, so the caller can open a fresh
    *  turn boundary (the observer's startTurn). */
@@ -63,15 +63,15 @@ export interface ReasoningRetryOptions {
 }
 
 /**
- * Resolve the re-prompt budget: a finite positive number, capped at the constant
- * ceiling. Rejects a non-finite or non-positive value rather than looping.
+ * Resolve the re-prompt budget: a positive INTEGER, capped at the constant
+ * ceiling. Rejects a non-integer or non-positive value rather than looping.
  */
 export function resolveMaxReprompts(value?: number): number {
   const raw = value ?? DEFAULT_MAX_REASONING_REPROMPTS;
-  if (!Number.isFinite(raw) || raw <= 0) {
-    throw new Error(`invalid maxReprompts: ${raw} (must be a finite positive number)`);
+  if (!Number.isInteger(raw) || raw <= 0) {
+    throw new Error(`invalid maxReprompts: ${raw} (must be a positive integer)`);
   }
-  return Math.min(Math.floor(raw), DEFAULT_MAX_REASONING_REPROMPTS);
+  return Math.min(raw, DEFAULT_MAX_REASONING_REPROMPTS);
 }
 
 /**

@@ -42,15 +42,11 @@ export const CONTINUE_TURN =
  *  run going, bounded (DEFAULT_MAX_REASONING_REPROMPTS). */
 export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give your final report.";
 
-/** The most consecutive reasoning-only endings re-prompted before a run ends
- *  with the honest outcome. A CONSTANT, not a function of the model's output,
- *  so a model that answers with reasoning only can never hold the run: after
- *  this many re-prompts the run stops and reports it. */
+/** The most reasoning-only re-prompts in a run before it ends with the honest
+ *  outcome. A CONSTANT, not a function of the model's output, so a model that
+ *  answers with reasoning only can never hold the run: after this many
+ *  re-prompts a still-reasoning-only ending ends the run and reports it. */
 export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
-
-/** Cap on the reasoning excerpt carried in the honest outcome (never the whole
- *  reasoning, which can be long). */
-export const DEFAULT_REASONING_EXCERPT_CHARS = 400;
 
 /** How many recent tool calls the generated worktree note lists. */
 export const DEFAULT_RECENT_TOOL_CALLS = 5;
@@ -195,8 +191,10 @@ function textFromContent(content: unknown): string {
  * blocks, `reasoning` its thinking blocks, `hasToolCall` whether it called a
  * tool. `reasoningOnly` is the shape the issue names — NO tool call, NO
  * non-empty text, and ACTUAL thinking content — which pi would otherwise take
- * as the agent being finished. An empty or whitespace-only message has no
- * thinking content, so it is NOT reasoning-only (it is silence).
+ * as the agent being finished. A message with NO actual thinking content is not
+ * reasoning-only (it is silence), even when its text is empty or whitespace-only;
+ * a message with substantive thinking content and whitespace-only text IS
+ * reasoning-only.
  */
 export interface AssistantEnding {
   text: string;

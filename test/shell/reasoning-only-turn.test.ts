@@ -202,22 +202,29 @@ describe("reasoning-only turn (#256)", () => {
     expect(res.stdout).toBe("All done.");
   }, 10_000);
 
-  it("f1: ONE budget is shared across the compaction retry — total re-prompts never exceed the bound", async () => {
-    // Every prompt compacts AND ends reasoning-only, so the reasoning loop
-    // spends the whole budget and the compaction retry finds none left.
-    const stub = stubSession(() => [COMPACTION, REASONING_ONLY()]);
+  it("f1: a fifth-call text response is never sent; the fourth ending fails the run", async () => {
+    // Every prompt up to the bound compacts AND ends reasoning-only; a FIFTH
+    // call would return text. The run must stop at the bound with the failed
+    // outcome and never send that fifth call.
+    const stub = stubSession((call) =>
+      call <= DEFAULT_MAX_REASONING_REPROMPTS + 1
+        ? [COMPACTION, REASONING_ONLY()]
+        : [TEXT_FINAL("late text")],
+    );
     const res = await runAgent({
       name: "testbot",
       prompt: "do the thing",
       agentsRoot,
       sessionFactory: factoryReturning(stub.session),
     });
-    const rePrompts = stub.promptCalls.filter((t) => t === REASONING_CONTINUE_TURN).length;
-    expect(rePrompts).toBe(DEFAULT_MAX_REASONING_REPROMPTS);
-    // initial prompt + 3 re-prompts + 1 compaction continue turn.
-    expect(stub.promptCalls).toHaveLength(DEFAULT_MAX_REASONING_REPROMPTS + 2);
+    // Exactly the bound: the initial prompt + DEFAULT_MAX_REASONING_REPROMPTS
+    // re-prompts, and NO compaction continue turn.
+    expect(stub.promptCalls).toHaveLength(DEFAULT_MAX_REASONING_REPROMPTS + 1);
+    expect(stub.promptCalls.filter((t) => t === REASONING_CONTINUE_TURN)).toHaveLength(
+      DEFAULT_MAX_REASONING_REPROMPTS,
+    );
+    expect(res.exitCode).toBe(1);
     expect(res.reason).toBe("reasoning_only");
-    // The logged count is the run's total, not the last loop's.
     expect(outcomeRecord(agentsRoot, "testbot")).toEqual({
       reason: "reasoning_only",
       reprompts: DEFAULT_MAX_REASONING_REPROMPTS,
@@ -287,7 +294,7 @@ describe("reasoning-only turn (#256)", () => {
     expect(rec).toEqual({ reason: "reasoning_only", reprompts: DEFAULT_MAX_REASONING_REPROMPTS });
   }, 10_000);
 
-  it("resolveMaxReprompts rejects a non-finite or non-positive budget and caps at the ceiling", () => {
+  it("resolveMaxReprompts rejects a non-integer or non-positive budget and caps at the ceiling", () => {
     expect(resolveMaxReprompts(undefined)).toBe(DEFAULT_MAX_REASONING_REPROMPTS);
     expect(resolveMaxReprompts(1)).toBe(1);
     expect(resolveMaxReprompts(99)).toBe(DEFAULT_MAX_REASONING_REPROMPTS);
@@ -295,6 +302,10 @@ describe("reasoning-only turn (#256)", () => {
     expect(() => resolveMaxReprompts(Number.NaN)).toThrow(/invalid maxReprompts/);
     expect(() => resolveMaxReprompts(0)).toThrow(/invalid maxReprompts/);
     expect(() => resolveMaxReprompts(-1)).toThrow(/invalid maxReprompts/);
+    // Fractions on BOTH sides of one (0.5 floored to 0 / 1.5 floored to 1 would
+    // both violate the positive-integer contract).
+    expect(() => resolveMaxReprompts(0.5)).toThrow(/invalid maxReprompts/);
+    expect(() => resolveMaxReprompts(1.5)).toThrow(/invalid maxReprompts/);
   }, 10_000);
 
   it("an exhausted admitted turn REJECTS with a failure the callers can handle", async () => {

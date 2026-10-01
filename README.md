@@ -330,10 +330,10 @@ change one, the named test is what tells you.
   settles exit 0 only when the last assistant message that ENDED after the last
   compaction carries text — exactly the text of that message, never rebuilt from
   streamed deltas; a message that ended empty or on an error is no final
-  message. A turn that ends with reasoning only (no text, no tool call, actual
-  thinking content) is re-prompted with a short continuation, up to three
-  re-prompts — one budget for the whole run, the compaction retry included —
-  and stops if the fourth ending is still reasoning-only; a silent settlement
+  message. A turn that ends with reasoning only (no text, no tool call, and
+  actual thinking content) is re-prompted with a short continuation, up to three
+  re-prompts — one budget for the whole run — and a still-reasoning-only ending
+  after them ends the run, with no further turn; a silent settlement
   after a compaction retries ONCE with an explicit continue turn; if it is
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
