@@ -65,7 +65,7 @@ export async function checkActionPins({ root = ROOT, resolver }) {
         if (!comment || !FULL_TAG.test(comment)) {
           const tag = await resolver.findTagForSha(owner, repo, sha);
           errors.push(
-            `${location}: ${comment ? `# ${comment} is not a full release tag` : "missing version comment"}; ` +
+            `${location}: ${comment ? `# ${comment} is not a full release tag` : "missing or malformed version comment"}; ` +
               (tag ? `write # ${tag}` : "no full release tag found for this SHA"),
           );
           continue;

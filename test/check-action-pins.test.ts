@@ -54,6 +54,14 @@ test("sub-path action refs with several segments are checked", async () => {
   expect(result.errors.join("\n")).toContain("github/codeql-action/upload/sarif@");
 });
 
+test("a malformed version comment is reported as missing or malformed", async () => {
+  const root = fixture(`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0 extra`);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\\n")).toContain(
+    "missing or malformed version comment; write # v2.2.0",
+  );
+});
+
 test("quoted action refs are checked", async () => {
   const root = fixture(`- uses: "oven-sh/setup-bun@${WRONG}" # v2.2.0`);
   const result = await checkActionPins({ root, resolver: resolver() });
