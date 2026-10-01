@@ -217,4 +217,15 @@ describe("createPiRunSession — the tool policy reaches the session", () => {
     });
     expect(tools).toEqual(["read"]);
   });
+
+  it("starts a session that allows replace_lines without edit (bob#143)", async () => {
+    // The two bob-owned tools register from their OWN allowance: a policy that
+    // names only replace_lines must come up with it active (and pass the
+    // active-tool audit), and a policy that names only edit must not carry
+    // replace_lines along with it (the shipped `qa` role).
+    expect(await activeTools({ tools: ["replace_lines"], excludeTools: [] })).toEqual([
+      "replace_lines",
+    ]);
+    expect(await activeTools({ tools: ["edit"], excludeTools: [] })).toEqual(["edit"]);
+  });
 });

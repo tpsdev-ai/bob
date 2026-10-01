@@ -168,8 +168,8 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
         newText: string;
       };
       // Confine the write to the run's workspace root: a relative path resolves
-      // against it, and an absolute path, a `..` escape or an escaping symlink
-      // resolves outside it and is refused before any read or write.
+      // against it, while an absolute path, a `..` escape or an escaping symlink
+      // that leaves the root is refused before any read or write.
       const requested = isAbsolute(path) ? path : resolve(cwd, path);
       const target = checkWriteTarget(requested, cwd);
       // Read the file's real content, then validate the range against it — no
@@ -209,17 +209,21 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
 }
 
 /**
- * The bob-owned tools a session needs when it allows `edit`: the tolerant `edit`
- * (which shadows pi's built-in) and `replace_lines`. Empty when `edit` is not
- * effectively allowed, so a resident agent without the shell grant does not get
- * them. Registered as SDK custom tools, so the tolerant `edit` shadows pi's
- * built-in by name; `replace_lines` is active where the allowlist names it (the
- * `coder`, `writer` and `custom` roles and the `builder` position).
+ * The bob-owned tools a session needs. Each is registered from its OWN
+ * effective allowance: the tolerant `edit` (which shadows pi's built-in) when
+ * `edit` is allowed, and `replace_lines` when the policy names it — a policy
+ * may name either without the other. Registered as SDK custom tools, so the
+ * tolerant `edit` shadows pi's built-in by name, and neither is active where
+ * the allowlist does not name it.
  */
 export function bobEditCustomTools(
   policy: { tools: readonly string[]; excludeTools: readonly string[] },
   cwd: string,
 ): ToolDefinition[] {
-  if (!(policy.tools.includes("edit") && !policy.excludeTools.includes("edit"))) return [];
-  return [createTolerantEditToolDefinition(cwd), createReplaceLinesToolDefinition(cwd)];
+  const allows = (name: string): boolean =>
+    policy.tools.includes(name) && !policy.excludeTools.includes(name);
+  const tools: ToolDefinition[] = [];
+  if (allows("edit")) tools.push(createTolerantEditToolDefinition(cwd));
+  if (allows("replace_lines")) tools.push(createReplaceLinesToolDefinition(cwd));
+  return tools;
 }

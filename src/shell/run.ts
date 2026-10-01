@@ -683,7 +683,7 @@ export interface RunOptions {
   // role or capability, is dropped.
   mailTurn?: boolean;
   // bob#143 item 3: the loop breaker's limit — how many consecutive identical
-  // tool calls end the turn. Overrides bob.yaml's `run.tool_loop_limit`.
+  // tool calls stop the turn. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
 }
 
@@ -732,7 +732,7 @@ export async function attachFlairBootstrap(
 }
 
 // bob#143 item 3 — the loop breaker error and its log line live in
-// tool-loop.ts, shared with the persistent turn path so both abort identically.
+// tool-loop.ts, shared by the one-shot run and the persistent turn path.
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -771,7 +771,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
-  // bob#143 item 3: how many consecutive identical tool calls end the turn.
+  // bob#143 item 3: how many consecutive identical tool calls stop the turn.
   const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the

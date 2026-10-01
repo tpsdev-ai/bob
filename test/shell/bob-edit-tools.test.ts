@@ -6,7 +6,7 @@
 //     inverted or out-of-range one, keeps the line numbers decisive when a line
 //     repeats, validates before any write, and is confined to the session cwd
 //     (relative paths resolve against it; an absolute path, `..` escape or
-//     escaping symlink outside it is refused).
+//     escaping symlink that leaves it is refused).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,
@@ -219,12 +219,21 @@ describe("createReplaceLinesToolDefinition", () => {
 });
 
 describe("bobEditCustomTools", () => {
-  it("returns the two tools only when edit is effectively allowed", () => {
-    expect(bobEditCustomTools({ tools: ["read"], excludeTools: [] }, "/tmp")).toEqual([]);
-    expect(bobEditCustomTools({ tools: ["edit"], excludeTools: ["edit"] }, "/tmp")).toEqual([]);
-    const names = bobEditCustomTools({ tools: ["edit"], excludeTools: [] }, "/tmp").map(
-      (t) => t.name,
-    );
-    expect(names).toEqual(["edit", "replace_lines"]);
+  it("registers each tool from its own effective allowance", () => {
+    const names = (policy: { tools: readonly string[]; excludeTools: readonly string[] }) =>
+      bobEditCustomTools(policy, "/tmp").map((t) => t.name);
+    expect(names({ tools: ["read"], excludeTools: [] })).toEqual([]);
+    expect(names({ tools: ["edit"], excludeTools: ["edit"] })).toEqual([]);
+    // Either name can be allowed without the other.
+    expect(names({ tools: ["edit"], excludeTools: [] })).toEqual(["edit"]);
+    expect(names({ tools: ["replace_lines"], excludeTools: [] })).toEqual(["replace_lines"]);
+    expect(names({ tools: ["edit", "replace_lines"], excludeTools: [] })).toEqual([
+      "edit",
+      "replace_lines",
+    ]);
+    // An excluded name is not registered even when its partner is allowed.
+    expect(names({ tools: ["edit", "replace_lines"], excludeTools: ["replace_lines"] })).toEqual([
+      "edit",
+    ]);
   });
 });

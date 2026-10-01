@@ -442,9 +442,8 @@ export function checkReadTarget(absolutePath: string, opts: ConfineReadOptions):
 
 // Check the ABSOLUTE path a write (bob#143 replace_lines) is about to open. The
 // target must resolve inside the workspace root, following symlinks and `..`,
-// exactly as checkReadTarget does for a read (same `realpathSync.native` +
-// relative check, so the two controls cannot drift). Returns the canonical path
-// to write; throws otherwise.
+// with the same `realpathSync.native` + relative comparison checkReadTarget uses
+// for a read. Returns the canonical path to write; throws otherwise.
 export function checkWriteTarget(absolutePath: string, workspaceRoot: string): string {
   if (typeof absolutePath !== "string" || absolutePath.trim() === "") {
     throw new Error("bob: refusing to write: a path is required.");

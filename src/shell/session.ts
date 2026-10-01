@@ -1156,9 +1156,9 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const confinedRead = confinedReadCustomTools(policy, config);
 
     // bob#143: the tolerant `edit` (shadows pi's built-in) and `replace_lines`,
-    // for a session that effectively allows `edit`. Registered as SDK custom
-    // tools, so the tolerant `edit` shadows pi's built-in by name and a name the
-    // policy does not allow is filtered out by pi.
+    // each registered from its own effective allowance. Registered as SDK
+    // custom tools, so the tolerant `edit` shadows pi's built-in by name and a
+    // name the policy does not allow is filtered out by pi.
     const bobEdit = bobEditCustomTools(policy, config.cwd);
 
     // bob#244: the web composition rule on what this session is ABOUT to

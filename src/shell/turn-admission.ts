@@ -30,18 +30,30 @@ export interface TurnAdmission {
 //
 // bob#143 item 3: every admitted turn runs the same loop breaker as a one-shot
 // `bob run`. The detector counts consecutive identical tool calls within the
-// turn; at the configured limit the turn is aborted with `ToolLoopError`.
+// turn; at the configured limit the turn is signalled to stop and the admission
+// fails with `ToolLoopError`.
 export function createTurnAdmission(
-  opts: { log?: (m: string) => void; toolLoopLimit?: number; name?: string } = {},
+  opts: {
+    log?: (m: string) => void;
+    toolLoopLimit?: number;
+    name?: string;
+    // How long admitTurn waits for a loop-broken prompt to settle before it
+    // stops holding the turn's origin binding (test seam; default below).
+    loopAbortGraceMs?: number;
+  } = {},
 ) {
   const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
   const limit = opts.toolLoopLimit ?? DEFAULT_TOOL_LOOP_LIMIT;
+  const graceMs = opts.loopAbortGraceMs ?? LOOP_ABORT_GRACE_MS;
   const agentName = opts.name ?? "agent";
   type Turn = {
     origin: TurnOrigin;
     messages: unknown[];
     detector: ToolLoopDetector;
     abort?: (err: Error) => void;
+    // Set when the detector fires: the session's abort(), so admitTurn can wait
+    // for the aborted prompt to settle before it releases the origin binding.
+    stopping?: Promise<void>;
   };
   const context = new AsyncLocalStorage<Turn>();
   const endings = createAssistantEndingTracker();
@@ -68,7 +80,16 @@ export function createTurnAdmission(
               turn.abort = undefined;
               log(loopBreakMessage(agentName, toolName, args, observation.count));
               abort(new ToolLoopError(toolName, observation.count));
-              void session?.abort?.();
+              // Signal the session to stop, and RECORD the promise: admitTurn
+              // holds the turn's origin binding until it settles, so an
+              // in-flight tool the abort has not reached yet still sees the
+              // turn's origin rather than `run`. Never rejects.
+              turn.stopping = Promise.resolve()
+                .then(() => session?.abort?.())
+                .then(
+                  () => undefined,
+                  () => undefined,
+                );
             }
           }
         }
@@ -146,8 +167,22 @@ export function createTurnAdmission(
           });
           return turn.messages;
         } finally {
-          turn.origin = { kind: "run" };
-          active = undefined;
+          // bob#143: the origin binding outlives the aborted prompt. The
+          // detector rejects `loopAbort` the moment it fires, which ends THIS
+          // admission, but pi's prompt is still running — its parallel tool
+          // path can execute a call prepared before the abort. Hold the binding
+          // until the abort settles, bounded so a prompt that never settles
+          // cannot pin the admission either; if it does not settle in the
+          // bound, keep the binding and report it.
+          const settled = turn.stopping ? await settledWithin(turn.stopping, graceMs) : true;
+          if (settled) {
+            turn.origin = { kind: "run" };
+            active = undefined;
+          } else {
+            log(
+              `[bob] loop breaker: the aborted turn did not settle within ${graceMs}ms; keeping its origin binding`,
+            );
+          }
         }
       };
       if (closed) return Promise.reject(new Error("bob: turn admission is closed"));
@@ -169,6 +204,30 @@ export function createTurnAdmission(
     },
   };
   return admission;
+}
+
+// How long admitTurn holds a loop-broken turn's origin binding while it waits
+// for the aborted prompt to settle.
+const LOOP_ABORT_GRACE_MS = 1_000;
+
+// Wait at most `ms` for `p`; true when it settled (either way), false when the
+// bound elapsed first. The timer is cleared either way, so a settled turn
+// leaves nothing holding the event loop.
+async function settledWithin(p: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // Dependency injection through pi's per-loader event bus. This passes the

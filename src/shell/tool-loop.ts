@@ -8,7 +8,7 @@
 // This detector counts CONSECUTIVE identical calls. Any call with a different
 // name or different arguments resets the run of repeats to one — only an
 // unbroken run of the same call fires. When the run reaches `limit` the caller
-// ends the turn.
+// signals the turn to stop.
 
 /** Default number of consecutive identical calls that ends a turn. */
 export const DEFAULT_TOOL_LOOP_LIMIT = 4;
@@ -74,9 +74,9 @@ export class ToolLoopDetector {
 }
 
 // The error thrown into the awaited turn when the same call has repeated
-// `limit` times in a row, so the turn ends instead of looping. `toolName` names
-// the repeated call for the message. Shared by the one-shot and persistent turn
-// paths, so both abort identically.
+// `limit` times in a row, so the turn is stopped instead of looping. `toolName`
+// names the repeated call for the message. Shared by the one-shot and
+// persistent turn paths.
 export class ToolLoopError extends Error {
   readonly toolName: string;
   readonly count: number;
@@ -99,13 +99,13 @@ function summarizeArgs(args: unknown): string {
   }
 }
 
-// The line the runtime logs when it ends a turn for a repeated call. Names the
-// call and points at a different mechanism.
+// The line the runtime logs when it breaks a repeated call. Names the call and
+// points at a different mechanism.
 export function loopBreakMessage(
   name: string,
   toolName: string,
   args: unknown,
   count: number,
 ): string {
-  return `bob run ${name}: LOOP BREAKER — the same tool call repeated ${count} times in a row: ${toolName} ${summarizeArgs(args)}; ending the turn. Use a different mechanism (for example replace_lines for a line-based edit), or stop and report BLOCKED.\n`;
+  return `bob run ${name}: LOOP BREAKER — the same tool call repeated ${count} times in a row: ${toolName} ${summarizeArgs(args)}; stopping the turn. Use a different mechanism (for example replace_lines for a line-based edit), or stop and report BLOCKED.\n`;
 }
