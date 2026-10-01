@@ -63,10 +63,10 @@ const isBlank = (ch: string): boolean => ch === " " || ch === "\t";
 
 /**
  * Canonicalise a text for the tolerant pass: every run of spaces/tabs becomes a
- * single space, a run that reaches the end of its line is dropped, and all
- * other characters are kept. `start`/`end` map each canonical character back to
- * the original span it replaced, so a canonical match can be widened back to
- * the exact original substring.
+ * single space, a run that reaches the end of its line is dropped, and CRLF/CR
+ * line endings become LF. Other characters are kept. `start`/`end` map each
+ * canonical character back to the original span it replaced, so a canonical
+ * match can be widened back to the exact original substring.
  */
 export function canonicalizeWhitespaceRuns(text: string): Canonical {
   const canon: string[] = [];
@@ -80,7 +80,7 @@ export function canonicalizeWhitespaceRuns(text: string): Canonical {
       let j = i;
       while (j < n && isBlank(text[j])) j++;
       // A run followed by a newline (or EOF) is trailing whitespace: drop it.
-      if (j >= n || text[j] === "\n") {
+      if (j >= n || text[j] === "\n" || text[j] === "\r") {
         i = j;
         continue;
       }
@@ -88,6 +88,14 @@ export function canonicalizeWhitespaceRuns(text: string): Canonical {
       start.push(i);
       end.push(j);
       i = j;
+      continue;
+    }
+    if (ch === "\r") {
+      const next = text[i + 1] === "\n" ? i + 2 : i + 1;
+      canon.push("\n");
+      start.push(i);
+      end.push(next);
+      i = next;
       continue;
     }
     canon.push(ch);

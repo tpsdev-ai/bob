@@ -72,6 +72,33 @@ describe("createTolerantEditToolDefinition", () => {
     expect(resultText(result)).toContain("normalising runs of spaces/tabs");
   });
 
+  it("lands CRLF edits with trailing whitespace in oldText and keeps the file's CRLF endings", async () => {
+    const file = join(cwd, "f.ts");
+    const tool = createTolerantEditToolDefinition(cwd);
+    for (const oldText of ["x y \r\n", "x y \n"]) {
+      writeFileSync(file, "header\r\nx  y\r\ntail\r\n");
+      const result = await run(tool, {
+        path: "f.ts",
+        edits: [{ oldText, newText: "X Y\n" }],
+      });
+      expect(readFileSync(file, "utf8")).toBe("header\r\nX Y\r\ntail\r\n");
+      expect(resultText(result)).toContain("Matched 1 edit(s) after normalising");
+    }
+  });
+
+  it("lands an edit in a CR-only file when oldText has trailing whitespace before CR", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "first\rx  y\rlast\r");
+    const tool = createTolerantEditToolDefinition(cwd);
+    const result = await run(tool, {
+      path: "f.ts",
+      edits: [{ oldText: "x y \r", newText: "X Y\n" }],
+    });
+    // Pi reads CR as LF and writes the edited CR-only file with LF endings.
+    expect(readFileSync(file, "utf8")).toBe("first\nX Y\nlast\n");
+    expect(resultText(result)).toContain("Matched 1 edit(s) after normalising");
+  });
+
   it("refuses an exact duplicate with its exact count", async () => {
     writeFileSync(join(cwd, "f.md"), "x y\nx y\nx   y\n");
     const tool = createTolerantEditToolDefinition(cwd);

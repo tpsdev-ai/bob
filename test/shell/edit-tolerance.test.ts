@@ -61,6 +61,42 @@ describe("locateTolerantEdits — whitespace-run normalisation", () => {
     expect(content.slice(edits[0].index, edits[0].index + edits[0].length)).toBe("value = 1;");
   });
 
+  it("ignores trailing whitespace before CRLF and maps LF oldText to the original CRLF span", () => {
+    const content = "header\r\nx  y\r\ntail\r\n";
+    for (const oldText of ["x y \r\n", "x y \n"]) {
+      const { edits, normalizedCount } = locateTolerantEdits(
+        content,
+        [{ oldText, newText: "X Y\n" }],
+        "f.ts",
+      );
+      expect(normalizedCount).toBe(1);
+      expect(edits[0]).toMatchObject({
+        kind: "whitespace",
+        oldText: "x  y\r\n",
+        index: "header\r\n".length,
+        length: "x  y\r\n".length,
+      });
+      expect(content.slice(edits[0].index, edits[0].index + edits[0].length)).toBe("x  y\r\n");
+    }
+  });
+
+  it("ignores trailing whitespace before CR and maps the original CR span", () => {
+    const content = "first\rx  y\rlast\r";
+    const { edits, normalizedCount } = locateTolerantEdits(
+      content,
+      [{ oldText: "x y \r", newText: "X Y\n" }],
+      "f.ts",
+    );
+    expect(normalizedCount).toBe(1);
+    expect(edits[0]).toMatchObject({
+      kind: "whitespace",
+      oldText: "x  y\r",
+      index: "first\r".length,
+      length: "x  y\r".length,
+    });
+    expect(content.slice(edits[0].index, edits[0].index + edits[0].length)).toBe("x  y\r");
+  });
+
   it("resolves several edits, each against the original content", () => {
     const content = `a${align(3)}b\nc${align(3)}d\n`;
     const { edits, normalizedCount } = locateTolerantEdits(
