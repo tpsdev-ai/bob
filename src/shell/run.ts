@@ -502,11 +502,18 @@ export interface RunSession {
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
   // Stop an in-flight turn. pi's AgentSession exposes `abort()`, which resolves
-  // once the agent is idle; bob calls it when a bound ends a one-shot run whose
-  // session has started.
+  // once the agent is idle; bob calls it when a bound ends a one-shot run after
+  // the session factory has returned.
   // Optional so a fake session in tests need not provide it; without it, bob
   // cannot confirm the session stopped.
   abort?(): Promise<void>;
+  // Queue a message for the agent. pi's AgentSession `steer()` only queues; it
+  // never starts a turn. pi delivers the queue at the start of its next agent
+  // run, after each assistant turn, and in the continuation it runs after an
+  // auto-compaction. A one-shot run sends its compaction note this way.
+  // Optional so a fake session in tests need not provide it; without it, the
+  // note is not sent.
+  steer?(text: string): Promise<void>;
   dispose(): void;
 }
 
@@ -819,8 +826,9 @@ async function runBoundedSession(
   // (the mail turn reaches runAgent through `bob launch`). The persistent
   // runtime calls the same helper in persistent.ts; the interactive launch path
   // below covers the TUI. Setup sessions (onboard/align) are not runtime turns
-  // and do not load it. Guarded like the factory below: a bootstrap that never
-  // answers is ended by a run-level bound, not left to wedge the run.
+  // and do not load it. Guarded like the factory below: when a run-level bound
+  // fires first, the run returns without waiting for the bootstrap (the guard
+  // does not cancel it).
   try {
     await bounds.guard(attachFlairBootstrap(flairBootstrapTarget, config));
   } catch (err) {
@@ -832,9 +840,9 @@ async function runBoundedSession(
   // #145: the task is the session's CONTRACT, carried in its system prompt
   // through the factory. (It is ALSO the first user message below, so a provider
   // that shows only messages still sees it; see the README's stated limits.)
-  // The factory is guarded too: a session that never finishes standing up (pi's
-  // resource/extension load) is ended by a run-level bound rather than wedging
-  // the run before its log even exists.
+  // The factory is guarded too: when a run-level bound fires before a session
+  // finishes standing up (pi's resource/extension load), the run returns
+  // without waiting for it. The guard does not cancel the factory.
   let session: RunSession;
   try {
     session = await bounds.guard(
@@ -1026,7 +1034,7 @@ async function runBoundedSession(
     // bob#244: the note carries workspace data (git status), so a web session
     // refuses it; the observer logs the refusal and the run carries on.
     // bob#135: through the run's one sender, so no note is sent once a bound
-    // has fired.
+    // has fired, and queued with steer(), so the note never starts a turn.
     inject: gatedNoteInjection(config, "compaction-note", (text) =>
       sendToSession(session, bounds, text, "steer"),
     ),
@@ -1228,9 +1236,11 @@ async function runBoundedSession(
   };
 }
 
-// The result for a run a bound ended during the Flair bootstrap or the session
-// start (the guarded factory): there is no session to abort, no run log to
-// record it in, and no workspace status read.
+// The result for a run a bound ended during the Flair bootstrap or before the
+// session factory returned: bob has no returned session handle, so it signals
+// no abort and reads no workspace status, and there is no run log to record it
+// in. A session the factory returns after this is never used, aborted or
+// disposed; in the `bob` CLI, `process.exit` ends it.
 function abortedRunResult(
   opts: RunOptions,
   resolved: ResolvedRunConfig,
@@ -1249,12 +1259,14 @@ function abortedRunResult(
   };
 }
 
-// bob#135 — the ONE place a one-shot run calls `session.prompt`: the task, the
+// bob#135 — the ONE place a one-shot run sends to its session. The task, the
 // continue turn and the reasoning re-prompts go through it as turns (through
-// promptSession, so template expansion stays off), and the compaction note as a
-// steer. Once any bound has fired it sends nothing and throws that bound's
-// RunAbortedError. It throws synchronously, before a prompt promise exists, so a
-// caller that races the send is never left holding an unhandled rejection.
+// promptSession, so template expansion stays off; boundedPrompt times each one).
+// The compaction note goes through it as a steer: queued with `steer()`, which
+// never starts a turn, so pi delivers it inside a turn bob sent and timed. Once
+// any bound has fired it sends nothing and throws that bound's RunAbortedError.
+// It throws synchronously, before a prompt promise exists, so a caller that
+// races the send is never left holding an unhandled rejection.
 function sendToSession(
   session: RunSession,
   bounds: RunBounds,
@@ -1263,9 +1275,11 @@ function sendToSession(
 ): Promise<void> {
   const fired = bounds.reason();
   if (fired !== undefined) throw new RunAbortedError(fired);
-  return as === "turn"
-    ? promptSession(session, text)
-    : session.prompt(text, { streamingBehavior: "steer" });
+  if (as === "turn") return promptSession(session, text);
+  if (session.steer === undefined) {
+    throw new Error("the session has no steer(), so the note is not sent");
+  }
+  return session.steer(text);
 }
 
 // One prompt turn under two bounds: the turn timeout and the run's own abort

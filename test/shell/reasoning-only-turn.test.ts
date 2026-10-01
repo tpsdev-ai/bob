@@ -81,9 +81,12 @@ function stubSession(
       listeners.push(listener);
       return () => {};
     },
+    // The best-effort compaction note is queued with steer() (bob#135): it is
+    // not a turn and not a model call.
+    async steer() {},
     async prompt(text: string, options?: unknown) {
-      // A STEER (the best-effort compaction note) is not a turn: do not run the
-      // script for it, and do not count it as a model call.
+      // A STEER is not a turn: do not run the script for it, and do not count it
+      // as a model call.
       const streaming = (options as { streamingBehavior?: string } | undefined)?.streamingBehavior;
       if (streaming !== undefined) return;
       promptCalls.push(text);

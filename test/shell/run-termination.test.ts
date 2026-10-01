@@ -48,7 +48,11 @@ const thinkingEnd = (thinking: string): unknown => ({
 
 interface Fake {
   session: RunSession;
+  /** Every prompt() call that started a turn. */
   promptCalls: string[];
+  /** Every message queued without starting a turn: steer(), or a steering
+   *  prompt() while a turn is streaming. */
+  queued: string[];
   abortCount: () => number;
 }
 
@@ -58,12 +62,25 @@ interface Fake {
 // pi's abort() waiting for a turn that never becomes idle, or `null` for a
 // session with no abort() at all. `runAbort` gets the emitter, so an abort can
 // deliver session events while the run waits for it.
+//
+// The fake follows pi's queueing rule: `steer()` only queues, and a prompt()
+// with `streamingBehavior` queues while a turn is streaming but STARTS a turn
+// when the session is idle. A turn streams while `runPrompt` runs; `runPrompt`
+// can call `setStreaming(false)` to model pi's pre-prompt compaction, which
+// runs inside prompt() before the agent run starts.
 function fakeSession(
-  runPrompt: (emit: Emitter, text: string, call: number) => Promise<void>,
+  runPrompt: (
+    emit: Emitter,
+    text: string,
+    call: number,
+    setStreaming: (streaming: boolean) => void,
+  ) => Promise<void>,
   runAbort?: ((emit: Emitter) => Promise<void>) | null,
 ): Fake {
   const listeners: Array<(event: unknown) => void> = [];
   const promptCalls: string[] = [];
+  const queued: string[] = [];
+  let streaming = false;
   let aborts = 0;
   const emit: Emitter = (event) => {
     for (const listener of listeners) listener(event);
@@ -76,9 +93,23 @@ function fakeSession(
         if (i >= 0) listeners.splice(i, 1);
       };
     },
-    async prompt(text) {
+    async prompt(text, options) {
+      if (options?.streamingBehavior !== undefined && streaming) {
+        queued.push(text);
+        return;
+      }
       promptCalls.push(text);
-      await runPrompt(emit, text, promptCalls.length);
+      streaming = true;
+      try {
+        await runPrompt(emit, text, promptCalls.length, (b) => {
+          streaming = b;
+        });
+      } finally {
+        streaming = false;
+      }
+    },
+    async steer(text) {
+      queued.push(text);
     },
     dispose() {
       // no-op
@@ -90,7 +121,7 @@ function fakeSession(
       if (runAbort) await runAbort(emit);
     };
   }
-  return { session, promptCalls, abortCount: () => aborts };
+  return { session, promptCalls, queued, abortCount: () => aborts };
 }
 
 function factoryReturning(session: RunSession): RunSessionFactory {
@@ -410,18 +441,15 @@ describe("runAgent termination bounds (bob#135)", () => {
     expect(fake.abortCount()).toBe(1);
   }, 15_000);
 
-  it("a compaction that ends after the turn timeout fired sends no note: no further session.prompt", async () => {
-    // Known-present: a compaction during the live turn sends the "what remains"
-    // note as a steer (prompt call 2). Known-absent: the turn then times out, and
-    // a compaction that ends while the abort is pending sends nothing more.
+  it("a compaction that ends after the turn timeout fired sends no note", async () => {
+    // Known-present: a compaction during the live turn queues the "what remains"
+    // note. Known-absent: the turn then times out, and a compaction that ends
+    // while the abort is pending sends nothing more.
     const compactionEnd = { type: "compaction_end", reason: "threshold" };
     const fake = fakeSession(
-      (emit, _text, call) => {
-        if (call === 1) {
-          emit(compactionEnd);
-          return new Promise<void>(() => {});
-        }
-        return Promise.resolve(); // the steer note is queued, not a turn
+      (emit) => {
+        emit(compactionEnd);
+        return new Promise<void>(() => {});
       },
       async (emit) => {
         emit(compactionEnd);
@@ -439,13 +467,59 @@ describe("runAgent termination bounds (bob#135)", () => {
         turnTimeoutMs: 40,
       });
     });
-    expect(fake.promptCalls.length).toBe(2);
-    expect(fake.promptCalls[0]).toBe("hi");
-    expect(fake.promptCalls[1]).toContain("[BOB WHAT REMAINS");
+    expect(fake.queued.length).toBe(1);
+    expect(fake.queued[0]).toContain("[BOB WHAT REMAINS");
+    expect(fake.promptCalls).toEqual(["hi"]);
     expect(res?.exitCode).toBe(1);
     expect(res?.aborted).toBe("turn_timeout");
     expect(fake.abortCount()).toBe(1);
     expect(err).toContain("the run was ended by its turn_timeout bound");
+  }, 15_000);
+
+  it("a compaction during a live turn still delivers the note, queued into that turn", async () => {
+    const fake = fakeSession(async (emit) => {
+      emit({ type: "compaction_end", reason: "threshold" });
+      emit(messageEnd("done"));
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 60_000,
+    });
+    expect(fake.queued.length).toBe(1);
+    expect(fake.queued[0]).toContain("[BOB WHAT REMAINS");
+    expect(fake.promptCalls).toEqual(["hi"]);
+    expect(res.exitCode).toBe(0);
+  }, 15_000);
+
+  it("an idle compaction starts no turn: the note is queued, never sent as a prompt", async () => {
+    // pi's pre-prompt compaction runs inside prompt() BEFORE the agent run
+    // starts, so the session is idle when compaction_end arrives. A steering
+    // prompt() there would start a turn outside boundedPrompt; steer() queues.
+    const fake = fakeSession(async (emit, _text, call, setStreaming) => {
+      if (call > 1) return new Promise<void>(() => {}); // an unbounded turn
+      setStreaming(false);
+      emit({ type: "compaction_end", reason: "threshold" });
+      setStreaming(true);
+      emit(messageEnd("done"));
+    });
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 60_000,
+    });
+    expect(fake.promptCalls).toEqual(["hi"]);
+    expect(fake.queued.length).toBe(1);
+    expect(fake.queued[0]).toContain("[BOB WHAT REMAINS");
+    expect(res.exitCode).toBe(0);
   }, 15_000);
 
   it("reads the workspace status after the abort, so a write made before abort() resolves is reported", async () => {

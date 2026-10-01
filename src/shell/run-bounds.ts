@@ -11,16 +11,17 @@
 //   * no_progress — no run-log event for N milliseconds. A stuck inference call
 //                   emits nothing, so the log stops growing; this is the
 //                   heartbeat the issue asks for, without external polling.
-//   * turn_timeout — ONE prompt turn's deadline. A turn that misses it ends
-//                   the run; there is no retry.
+//   * turn_timeout — the deadline for ONE prompt bob sends. A prompt that
+//                   misses it ends the run; there is no retry.
 //
 // The wall-clock and the watchdog are RUN-LEVEL: either one, when it fires,
 // sets the run's reason and aborts the signal, and {@link RunBounds.guard}
 // turns that into a {@link RunAbortedError} at the next guarded await. The turn
-// bound is applied to each one-shot prompt turn (the task, the continue turn and
-// the reasoning re-prompts; run.ts's `boundedPrompt`), which races the turn
-// against {@link raceTimeout} and, when the deadline wins, fires `turn_timeout`
-// to end the run. pi's `prompt()` is a whole turn (model
+// bound is applied to every prompt a one-shot run sends (the task, the continue
+// turn and the reasoning re-prompts; run.ts's `boundedPrompt`), which races the
+// whole `prompt()` call against {@link raceTimeout} and, when the deadline wins,
+// fires `turn_timeout` to end the run. The compaction note is queued with
+// `steer()` and starts no turn of its own. pi's `prompt()` is a whole turn (model
 // requests plus tool work) and offers no per-request signal, so a turn is the
 // smallest unit bob can bound.
 //
@@ -35,7 +36,7 @@ export interface RunLimits {
   wallClockMs: number;
   /** No run-log event for this long ends the run, in milliseconds. */
   noProgressMs: number;
-  /** One prompt turn's deadline, in milliseconds. */
+  /** The deadline for one prompt bob sends, in milliseconds. */
   turnTimeoutMs: number;
 }
 
