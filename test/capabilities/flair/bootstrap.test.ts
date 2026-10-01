@@ -116,23 +116,13 @@ describe("FlairHttpClient.bootstrap", () => {
   it("a body that is not JSON is an invalid_response", async () => {
     const { client } = clientWith(ok("not json at all"));
     await expect(client.bootstrap({})).rejects.toThrow(FlairBootstrapError);
-    await client.bootstrap({}).catch((e: FlairBootstrapError) => {
-      expect(e.failure).toBe("invalid_response");
-    });
+    await expect(client.bootstrap({})).rejects.toMatchObject({ failure: "invalid_response" });
   });
 
   it("a JSON object with no context string is an invalid_response", async () => {
     const { client } = clientWith(ok(JSON.stringify({ tokenEstimate: 10 })));
-    await client.bootstrap({}).catch((e: FlairBootstrapError) => {
-      expect(e.failure).toBe("invalid_response");
-    });
-    let err: unknown;
-    try {
-      await client.bootstrap({});
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(FlairBootstrapError);
+    await expect(client.bootstrap({})).rejects.toThrow(FlairBootstrapError);
+    await expect(client.bootstrap({})).rejects.toMatchObject({ failure: "invalid_response" });
   });
 
   it("an empty body is an invalid_response, not an empty context", async () => {
