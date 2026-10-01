@@ -67,6 +67,7 @@ import {
 import {
   CONTINUE_TURN,
   createCompactionObserver,
+  DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
   readWorktreeStatus,
   type SilenceReason,
@@ -80,6 +81,7 @@ import {
 } from "./flair-bootstrap.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
+import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
 import {
@@ -972,17 +974,44 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     });
 
   try {
+    // ONE re-prompt budget for the WHOLE run, shared across the compaction
+    // retry: the total number of reasoning-only re-prompts never exceeds the
+    // bound, whichever phase spends them (bob#256).
+    let reasoningReprompts = 0;
+    const budgetLeft = (): number => DEFAULT_MAX_REASONING_REPROMPTS - reasoningReprompts;
+    const drainReasoningOnly = async (): Promise<void> => {
+      if (budgetLeft() <= 0) return;
+      const spent = await repromptWhileReasoningOnly({
+        session,
+        readEnding: () => observer.lastEnding(),
+        beginTurn: () => observer.startTurn(),
+        maxReprompts: budgetLeft(),
+        onReprompt: (n) =>
+          process.stderr.write(
+            `bob run ${opts.name}: the turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${reasoningReprompts + n}/${DEFAULT_MAX_REASONING_REPROMPTS})\n`,
+          ),
+      });
+      reasoningReprompts += spent.reprompts;
+    };
+
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
     // expansion — see session.ts promptSession).
     await promptSession(session, opts.prompt);
+    await drainReasoningOnly();
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
     let outcome = judge();
-    if (!outcome.ok && outcome.reason === "settled_after_compaction") {
+    if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
+      // Budget exhausted on a reasoning-only ending: report the honest failure
+      // BEFORE the compaction retry. The retry recovers a SILENT settlement after
+      // compaction; it is not a fourth reasoning turn, and a
+      // text reply to it must never turn the run green.
+      outcome = { ok: false, reason: "reasoning_only" };
+    } else if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
       // explicit "continue from the state above" turn. This retry is meaningful
       // because the task is still in the system prompt.
@@ -994,27 +1023,48 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
         await promptSession(session, CONTINUE_TURN);
+        await drainReasoningOnly(); // same budget: the total stays within the bound
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
       outcome = judge();
+      // Still reasoning-only after the retry is a failure, never a normal
+      // completion.
+      if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
+        outcome = { ok: false, reason: "reasoning_only" };
+      }
     }
     // A run with no final message whose last message ended on an error or an
     // abort FAILED; one that ended cleanly with nothing to say did not.
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
+    if (outcome.reason === "reasoning_only") failed = true;
     if (!outcome.ok) {
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
       exitCode = 1;
       reason = outcome.reason;
+      if (reason === "reasoning_only") {
+        // The honest outcome record. NO model reasoning is written: length
+        // limiting cannot establish that a model's thinking carries no secret
+        // (bob#256), so the record has only the reason and the re-prompt count.
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: { reason: "reasoning_only", reprompts: reasoningReprompts },
+          },
+          false,
+        );
+      }
       process.stderr.write(
         `bob run ${opts.name}: REFUSING to report success — ${reason}` +
           (reason === "settled_after_compaction"
             ? " (the session settled after a context compaction without a final message)"
             : reason === "final_shape_mismatch"
               ? " (the final message did not match the declared shape)"
-              : " (the session settled without a final message)") +
+              : reason === "reasoning_only"
+                ? ` (the session ended without a final report — its last turn carried reasoning only, no text beyond whitespace and no tool call, after ${reasoningReprompts} re-prompt(s))`
+                : " (the session settled without a final message)") +
           "\n",
       );
       const status = readWorktreeStatus(config.cwd);

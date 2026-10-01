@@ -7,6 +7,7 @@ import {
 } from "../../../src/capabilities/discord/capability.js";
 import type { DiscordCapabilityConfig } from "../../../src/capabilities/discord/config.js";
 import type { DiscordClient, DiscordMessage } from "../../../src/shell/discord-types.js";
+import { ReasoningOnlyExhaustedError } from "../../../src/shell/reasoning-retry.js";
 import { createTurnAdmission } from "../../../src/shell/turn-admission.js";
 import type { TurnOrigin } from "../../../src/shell/turn-origin.js";
 
@@ -887,4 +888,28 @@ describe("wireDiscordCapability — secret hygiene", () => {
     // tokenFile is a PATH, not the token.
     expect(config.tokenFile).toBe("/secrets/bot.token");
   });
+});
+
+describe("wireDiscordCapability — a failed admitted turn", () => {
+  it("signals the failure and sends no reply when an admitted turn is exhausted (reasoning-only)", async () => {
+    const pi = new FakePi();
+    const client = new FakeDiscordClient();
+    const logs: string[] = [];
+    wireDiscordCapability({
+      pi,
+      admitTurn: async () => {
+        throw new ReasoningOnlyExhaustedError(3);
+      },
+      readOrigin: pi.readOrigin,
+      client,
+      config: { tokenFile: "/secrets/bot.token", channelIds: ["channel-A"], dispatchAll: false },
+      log: (m) => logs.push(m),
+    });
+    client.fire({ channelId: "channel-A", content: "<@1> hi", mentionsBot: true });
+    await sleep(10);
+    expect(
+      logs.some((l) => l.includes("inbound turn/reply failed") && l.includes("reasoning only")),
+    ).toBe(true);
+    expect(client.replies).toHaveLength(0);
+  }, 10_000);
 });
