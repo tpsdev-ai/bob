@@ -713,8 +713,15 @@ export function promote(
 // requires a git work tree and refuses while CHANGELOG.md or any fragment is
 // untracked (not in the index) or differs from the index, naming each: git could
 // not restore those as they are, and a deleted untracked fragment would be gone.
+// `env: process.env` is Node's default; it is explicit for a caller that imports
+// this module under Bun, which otherwise starts the child with the environment
+// the process started with rather than process.env as it is now.
 function git(cwd, args) {
-  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000 });
+  const r = spawnSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: process.env,
+  });
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "" };
 }
 

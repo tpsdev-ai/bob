@@ -78,6 +78,10 @@ const gitEnv: Record<string, string> = {
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TEMPLATE_DIR: "/dev/null",
 };
+// Bun starts a child spawned WITHOUT an `env` option with the environment the
+// test process started with, not with process.env as changed since. So setting
+// process.env here reaches a child only when the spawn passes `env:
+// process.env`: every spawn in this file does, and so does the script's git().
 const priorGitEnv = new Map(Object.keys(gitEnv).map((key) => [key, process.env[key]]));
 beforeAll(() => {
   for (const [key, value] of Object.entries(gitEnv)) process.env[key] = value;
@@ -94,6 +98,7 @@ function gitSync(cwd: string, args: string[]) {
     cwd,
     encoding: "utf8",
     timeout: CHILD_TIMEOUT_MS,
+    env: process.env,
   });
 }
 
@@ -1357,6 +1362,7 @@ describe("changelog fragments — the CLI (bob#236)", () => {
       const r = spawnSync("node", [copy, ...args], {
         encoding: "utf8",
         timeout: CHILD_TIMEOUT_MS,
+        env: process.env,
       });
       return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     };
@@ -1394,10 +1400,13 @@ describe("changelog fragments — the CLI (bob#236)", () => {
   });
 
   it("the script's Git children inherit the test's maintenance settings", () => {
-    cli();
+    const { dir, changelogPath } = cli();
     stageAll();
     expect(gitSync(root, ["config", "maintenance.auto", "true"]).status).toBe(0);
     expect(gitSync(root, ["config", "gc.auto", "100"]).status).toBe(0);
+    // The test's own Git children (gitSync stages and commits) see them too.
+    expect(gitSync(root, ["config", "--get", "maintenance.auto"]).stdout).toBe("false\n");
+    expect(gitSync(root, ["config", "--get", "gc.auto"]).stdout).toBe("0\n");
 
     const bin = join(root, "bin");
     const trace = join(root, "git-child-config.log");
@@ -1423,6 +1432,30 @@ process.exit(result.status ?? 1);
 `,
     );
     chmodSync(shim, 0o755);
+    const shimEnv: Record<string, string> = {
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      BOB_TEST_GIT_PATH: process.env.PATH ?? "",
+      BOB_TEST_GIT_TRACE: join(root, "in-process-git-child-config.log"),
+      BOB_TEST_REPO: root,
+    };
+    // The script imported into this process: Bun starts its Git children.
+    const priorShimEnv = new Map(Object.keys(shimEnv).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, shimEnv);
+    try {
+      cf.gitRestorableOrThrow({ changelogPath, dir, names: ["fixed-a.md"] });
+    } finally {
+      for (const [key, value] of priorShimEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    expect(
+      existsSync(shimEnv.BOB_TEST_GIT_TRACE),
+      "the in-process script's Git children were started without process.env (PATH did not reach them)",
+    ).toBe(true);
+    expect(readFileSync(shimEnv.BOB_TEST_GIT_TRACE, "utf8")).toMatch(/^(false\n0\n)+$/);
+
+    // The script run by node: Node starts its Git children.
     const run = spawnSync(
       "node",
       [join(root, "scripts", "changelog-fragments.mjs"), "promote", "1.2.3", "--date=2026-01-01"],
@@ -1452,6 +1485,7 @@ process.exit(result.status ?? 1);
     const r = spawnSync("node", [viaLink, "check"], {
       encoding: "utf8",
       timeout: CHILD_TIMEOUT_MS,
+      env: process.env,
     });
     expect(r.status, `${r.stdout}${r.stderr}`).toBe(1);
     expect(r.stderr).toContain("fixed-not-a-list.md: fragment must start with '- '");
