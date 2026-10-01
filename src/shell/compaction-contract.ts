@@ -36,7 +36,7 @@ export const CONTINUE_TURN =
   "restate what remains in one line, finish the task, and end with a final message describing " +
   "the outcome (including any commit/push the task asked for).";
 
-/** The continuation sent when a run's turn ends with reasoning only — no text
+/** The continuation sent when a run's turn ends with reasoning only — no text beyond whitespace
  *  and no tool call (bob#256). A reasoning-only turn is not a final answer:
  *  local reasoning models emit it regularly, so bob sends this and keeps the
  *  run going, bounded (DEFAULT_MAX_REASONING_REPROMPTS). */
@@ -66,7 +66,7 @@ export type SilenceReason =
   // A final message EXISTS but does not match the declared expected shape — it
   // is not silence, so it gets its own reason.
   | "final_shape_mismatch"
-  // The run ended with a reasoning-only turn (no text, no tool call), re-prompted
+  // The run ended with a reasoning-only turn (no text beyond whitespace, no tool call), re-prompted
   // up to the bound and still reasoning-only — "ended without a final report".
   | "reasoning_only";
 
@@ -190,7 +190,7 @@ function textFromContent(content: unknown): string {
  * One assistant message's ending, classified (bob#256). `text` is its text
  * blocks, `reasoning` its thinking blocks, `hasToolCall` whether it called a
  * tool. `reasoningOnly` is the shape the issue names — NO tool call, NO
- * non-empty text, and ACTUAL thinking content — which pi would otherwise take
+ * text beyond whitespace, and ACTUAL thinking content — which pi would otherwise take
  * as the agent being finished. A message with NO actual thinking content is not
  * reasoning-only (it is silence), even when its text is empty or whitespace-only;
  * a message with substantive thinking content and whitespace-only text IS

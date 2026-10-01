@@ -330,7 +330,7 @@ change one, the named test is what tells you.
   settles exit 0 only when the last assistant message that ENDED after the last
   compaction carries text — exactly the text of that message, never rebuilt from
   streamed deltas; a message that ended empty or on an error is no final
-  message. A turn that ends with reasoning only (no text, no tool call, and
+  message. A turn that ends with reasoning only (no text beyond whitespace, no tool call, and
   actual thinking content) is re-prompted with a short continuation, up to three
   re-prompts — one budget for the whole run — and a still-reasoning-only ending
   after them ends the run, with no further turn; a silent settlement
