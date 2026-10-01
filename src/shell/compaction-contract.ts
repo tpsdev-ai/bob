@@ -191,10 +191,9 @@ function textFromContent(content: unknown): string {
  * blocks, `reasoning` its thinking blocks, `hasToolCall` whether it called a
  * tool. `reasoningOnly` is the shape the issue names — NO tool call, NO
  * text beyond whitespace, and ACTUAL thinking content — which pi would otherwise take
- * as the agent being finished. A message with NO actual thinking content is not
- * reasoning-only (it is silence), even when its text is empty or whitespace-only;
- * a message with substantive thinking content and whitespace-only text IS
- * reasoning-only.
+ * as the agent being finished. Empty or whitespace-only text with neither
+ * substantive thinking nor a tool call is silence, not reasoning-only; a message
+ * with substantive thinking content and whitespace-only text IS reasoning-only.
  */
 export interface AssistantEnding {
   text: string;
