@@ -11,7 +11,7 @@ import { join } from "node:path";
 const root = join(import.meta.dir, "..");
 const SCOPE = "@earendil-works/";
 
-// One line per bun.lock entry that breaks the pin; [] when the lock holds it.
+// Report malformed or mismatched entries, and report when no family entry is found; [] means the check passed.
 function pinViolations(lockText: string, overrides: Record<string, unknown>): string[] {
   // bun.lock is JSONC (trailing commas); Bun's own parser reads it.
   const { packages = {} } = Bun.JSONC.parse(lockText) as { packages?: Record<string, unknown> };
