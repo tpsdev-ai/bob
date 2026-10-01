@@ -408,17 +408,18 @@ function knownProviderBaseUrl(bobProvider: string): string | undefined {
 
 // pi's `api` for an OpenAI-compatible endpoint (the shape ollama.com/v1 speaks),
 // and the declared limits for its model. A provider block WITHOUT `api` is one pi
-// cannot resolve at all (bob#132: "Unknown provider"); the model entry needs
-// `reasoning`/`input` and a window/output cap. bob applies the agent's real
-// window and output cap at session creation (bob#214), so the defaults here are
-// the shape pi needs when the scaffold carries no window, not a server-enforced
-// value. Mirrors buildOpenrouterProvider in session.ts.
+// cannot resolve at all (bob#132: "Unknown provider"). pi fills in the model's
+// reasoning/input/window/output cap when they are absent; bob writes them so the
+// scaffold states the values the agent runs with. bob replaces the window with
+// provider.context_window at session creation (bob#214); the 16 384 output cap
+// is what pi sends on every request unless bob.yaml sets
+// provider.max_output_tokens. The model fields mirror buildOpenrouterProvider.
 const PI_OPENAI_COMPLETIONS_API = "openai-completions";
 const PI_MODEL_DEFAULT_CONTEXT_WINDOW = 128_000;
 const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
 
-/** The full model entry for an OpenAI-compatible provider (cost is zero: bob's
- *  transport, not pi, owns the endpoint and the price). */
+/** The full model entry for an OpenAI-compatible provider (cost is zero: bob
+ *  does not track this provider's pricing, so pi reports $0 for it). */
 function piOpenAiCompletionsModel(opts: InitOptions): Record<string, unknown> {
   return {
     id: opts.model,

@@ -611,7 +611,7 @@ describe("initAgent — the context window (bob#214)", () => {
 
 // bob#132 — a fresh onboard's .pi-agent files must RESOLVE in pi. This drives
 // pi's real ModelRuntime over the generated models.json/auth.json with NO
-// network (ModelRuntime.create's allowNetwork defaults to false), so it fails
+// network (ModelRuntime.create refreshes from the network only when allowModelNetwork is true), so it fails
 // on a scaffold pi cannot resolve.
 describe("initAgent — the generated provider resolves in pi (bob#132)", () => {
   let tmpRoot: string;
