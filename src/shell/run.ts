@@ -71,6 +71,7 @@ import {
   DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
   readWorktreeStatus,
+  readWorktreeStatusResult,
   type SilenceReason,
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
@@ -783,7 +784,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. A run-level bound (wall clock, no-progress watchdog)
   // or the turn timeout ends the run with a non-zero exit; `stop()` in the
-  // `finally` clears every timer so a completed run leaves the event loop free.
+  // `finally` clears the run-level timers, and a fired bound cancels a pending
+  // turn deadline, so a completed run leaves the event loop free.
   const limits = resolveRunLimits(resolved.runLimits, {
     ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
@@ -829,8 +831,8 @@ async function runBoundedSession(
   // through the factory. (It is ALSO the first user message below, so a provider
   // that shows only messages still sees it; see the README's stated limits.)
   // The factory is guarded too: a session that never finishes standing up (pi's
-  // resource/extension load) is ended by the wall clock rather than wedging the
-  // run before its log even exists.
+  // resource/extension load) is ended by a run-level bound rather than wedging
+  // the run before its log even exists.
   let session: RunSession;
   try {
     session = await bounds.guard(
@@ -1166,6 +1168,7 @@ async function runBoundedSession(
       writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
       process.stderr.write(boundMessage(opts.name, err.reason, limits));
       reportWorktreeStatus(opts.name, config.cwd);
+      // Signal the stuck turn and give it the grace; the run does not wait on it.
       await abortBounded(session, ABORT_GRACE_MS);
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch
@@ -1242,11 +1245,12 @@ function abortedRunResult(
 
 // One prompt turn under two bounds: the turn timeout and the run's own
 // abort (bounds.guard). A turn that does not finish within `turnTimeoutMs` is
-// signalled to abort and retried up to `turnRetries` times; after the last
-// retry the run ends as a turn timeout. pi's PromptOptions carries no
-// AbortSignal and `prompt()` is a whole turn — model requests plus tool work —
-// so a turn is the smallest unit bob can bound: bob races the turn and signals
-// the session's abort, at its own layer.
+// signalled to stop and retried ONLY once the session is idle; when the abort
+// grace expires first the session may still be busy (pi rejects a prompt while
+// it is still processing), so the run ends as the turn timeout instead. pi's
+// PromptOptions carries no AbortSignal and `prompt()` is a whole turn — model
+// requests plus tool work — so a turn is the smallest unit bob can bound: bob
+// races the turn and signals the session's abort, at its own layer.
 async function boundedPrompt(
   session: RunSession,
   text: string,
@@ -1256,14 +1260,18 @@ async function boundedPrompt(
   const limits = bounds.limits;
   for (let attempt = 0; ; attempt++) {
     const outcome = await bounds.guard(
-      raceTimeout(promptSession(session, text), limits.turnTimeoutMs),
+      raceTimeout(promptSession(session, text), limits.turnTimeoutMs, bounds.signal),
     );
     if (outcome !== TIMED_OUT) return;
-    // The turn did not finish. Signal the stuck turn to stop before retrying.
-    await abortBounded(session, ABORT_GRACE_MS);
-    if (attempt >= limits.turnRetries) {
-      bounds.fire("turn_timeout");
-      throw new RunAbortedError("turn_timeout");
+    // The turn did not finish. Signal the stuck turn to stop, and retry only if
+    // it became idle — a busy session would reject the next prompt.
+    const idle = await abortBounded(session, ABORT_GRACE_MS);
+    if (!idle || attempt >= limits.turnRetries) {
+      // End as the turn timeout — or as the bound that fired first (a run-level
+      // bound can fire during the abort grace).
+      const reason = bounds.reason() ?? "turn_timeout";
+      bounds.fire(reason);
+      throw new RunAbortedError(reason);
     }
     process.stderr.write(
       `bob run ${name}: no prompt turn finished within ${limits.turnTimeoutMs % 1000 === 0 ? `${limits.turnTimeoutMs / 1000}s` : `${limits.turnTimeoutMs}ms`} — retrying (${attempt + 1}/${limits.turnRetries})\n`,
@@ -1277,24 +1285,34 @@ async function boundedPrompt(
 // this long to settle before the run returns on its own.
 const ABORT_GRACE_MS = 1_000;
 
-/** Signal the session's abort and give it at most `graceMs` to settle. Never
- *  rejects and never blocks past the grace — the run ends either way. */
-async function abortBounded(session: RunSession, graceMs: number): Promise<void> {
-  if (!session.abort) return;
-  await raceTimeout(
+/** Signal the session's abort and give it at most `graceMs` to settle. Returns
+ *  true only when the abort SETTLED (the session is idle); a grace that expires
+ *  first, and an abort() that rejects, are both "not idle". Never blocks past
+ *  the grace. */
+async function abortBounded(session: RunSession, graceMs: number): Promise<boolean> {
+  if (!session.abort) return true;
+  const settled = await raceTimeout(
     Promise.resolve()
       .then(() => session.abort?.())
-      .catch(() => {}),
+      .then(
+        () => true,
+        () => false,
+      ),
     graceMs,
   );
+  return settled === true;
 }
 
-/** Print the agent cwd's worktree status: the paths a run may have left dirty. */
+/** Print the agent cwd's worktree status: the paths a run may have left dirty,
+ *  or that the status could not be read — never "clean" for a git that failed
+ *  or timed out. */
 function reportWorktreeStatus(name: string, cwd: string): void {
-  const status = readWorktreeStatus(cwd);
-  if (status.length > 0) {
+  const status = readWorktreeStatusResult(cwd);
+  if (!status.ok) {
+    process.stderr.write(`bob run ${name}: workspace status unavailable in ${cwd}\n`);
+  } else if (status.status.length > 0) {
     process.stderr.write(`bob run ${name}: uncommitted paths in ${cwd}:\n`);
-    for (const line of status.split("\n")) process.stderr.write(`  ${line}\n`);
+    for (const line of status.status.split("\n")) process.stderr.write(`  ${line}\n`);
   } else {
     process.stderr.write(`bob run ${name}: no dirty paths in ${cwd} (nothing to commit there)\n`);
   }
@@ -1352,8 +1370,9 @@ export interface ResolvedRunConfig {
   // bob#254 — where to call Flair at session start, when the agent configures
   // the flair capability. Absent: no bootstrap is loaded.
   flairBootstrapTarget?: FlairBootstrapTarget;
-  // bob#135 — the agent's bob.yaml `run:` bounds (seconds). One-shot runs
-  // overlay the per-invocation flags on these; other entry paths ignore it.
+  // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
+  // validated for every caller. A one-shot `bob run` overlays its per-invocation
+  // flags on these to arm the run.
   runLimits: RunLimitsBlock;
 }
 

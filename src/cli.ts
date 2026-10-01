@@ -440,7 +440,8 @@ async function run(
   //
   // bob#135 — the one-shot bounds. Each flag overrides the agent's bob.yaml
   // `run:` key, which overrides run-bounds.ts's default. A bare, empty or
-  // out-of-range value is a UsageError (exit 2) before the run starts.
+  // out-of-range value is a UsageError (exit 2), on every occurrence of a
+  // repeated flag, before the run starts.
   const wallClockMs = secondsFlagToMs(flags, "timeout");
   const noProgressMs = secondsFlagToMs(flags, "no-progress-timeout");
   const turnTimeoutMs = secondsFlagToMs(flags, "turn-timeout");

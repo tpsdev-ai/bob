@@ -3,8 +3,13 @@
 // `RunSession`, not a provider): a stalled session is ended by the wall clock
 // and by the turn timeout, a run-log stall trips the no-progress watchdog, and a
 // session that answers (once, or in a stream of events) is left unchanged. A
-// session whose `abort()` never settles is ended regardless, and a subprocess
-// proves the process itself exits with the run's code then.
+// session whose `abort()` never settles is ended regardless — and is not
+// retried, since it may still be busy — and a subprocess proves the process
+// itself exits with the run's code then. A run-level bound that fires during the
+// abort grace is the bound that gets reported, and a child given a long turn
+// timer exits without waiting for it. The abort path's git read is bounded too,
+// and a worktree git cannot read is reported as an unavailable status, never as
+// clean.
 //
 // The bound cases pass a SHORT configured bound and their own bun timeout, so a
 // missing or broken bound fails the case rather than hanging the suite.
@@ -86,6 +91,22 @@ function fakeSession(
 
 function factoryReturning(session: RunSession): RunSessionFactory {
   return async () => session;
+}
+
+/** Capture what a run writes to stderr, without touching the real stream. */
+async function captureStderr(fn: () => Promise<void>): Promise<string> {
+  let out = "";
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    out += chunk.toString();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = original;
+  }
+  return out;
 }
 
 describe("runAgent termination bounds (bob#135)", () => {
@@ -288,6 +309,136 @@ describe("runAgent termination bounds (bob#135)", () => {
     expect(out.stderr).toContain("CHILD_RUN_CODE=1");
     expect(Date.now() - started).toBeLessThan(6_000);
   }, 20_000);
+
+  it("ends as a turn timeout when the abort grace expires, without retrying a busy session", async () => {
+    // pi rejects a prompt while the session is still processing, so a retry after
+    // an abort that never settled would surface as a generic failure instead of
+    // the promise. The session here is BUSY: the first prompt never settles,
+    // abort() never settles, and a second prompt throws.
+    let inFlight = false;
+    const fake = fakeSession(
+      () => {
+        if (inFlight) throw new Error("the session is still processing the previous prompt");
+        inFlight = true;
+        return new Promise<void>(() => {});
+      },
+      () => new Promise<void>(() => {}),
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 40,
+      turnRetries: 3, // retries are available, and must NOT be spent on a busy session
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("turn_timeout");
+    expect(fake.promptCalls.length).toBe(1);
+  }, 15_000);
+
+  it("ends as a turn timeout when abort() itself rejects — a rejecting abort is not idle", async () => {
+    const fake = fakeSession(
+      () => new Promise<void>(() => {}),
+      () => Promise.reject(new Error("abort refused")),
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 40,
+      turnRetries: 3,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("turn_timeout");
+    expect(fake.promptCalls.length).toBe(1);
+  }, 15_000);
+
+  it("reports the run-level bound that fired during the abort grace, not the turn timeout", async () => {
+    // The turn times out first (40ms); while the abort is given its grace the
+    // wall clock fires (120ms). The run must report the wall clock.
+    const fake = fakeSession(
+      () => new Promise<void>(() => {}),
+      () => new Promise<void>(() => {}),
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+      wallClockMs: 120,
+      noProgressMs: 60_000,
+      turnTimeoutMs: 40,
+      turnRetries: 1,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.aborted).toBe("wall_clock");
+  }, 15_000);
+
+  it("a short run-level bound leaves no long turn timer: the child exits without waiting for it", () => {
+    // The bound fires at 60ms while a 5s turn deadline is pending. With the
+    // deadline cancelled by the run's abort, the child ends at bound + abort
+    // grace (~1.1s). A turn timer that outlived the run would hold the child
+    // until 5s. NO process.exit here: the child must end on its own.
+    const script = join(agentsRoot, "linger-child.ts");
+    writeFileSync(
+      script,
+      [
+        `import { runAgent } from ${JSON.stringify(join(import.meta.dir, "../../src/shell/run.ts"))};`,
+        "const session = {",
+        "  subscribe: () => () => {},",
+        "  prompt: () => new Promise(() => {}),",
+        "  abort: () => new Promise(() => {}),",
+        "  dispose: () => {},",
+        "};",
+        "const res = await runAgent({",
+        '  name: "testbot",',
+        '  prompt: "hi",',
+        `  agentsRoot: ${JSON.stringify(agentsRoot)},`,
+        "  sessionFactory: async () => session,",
+        "  wallClockMs: 60,",
+        "  noProgressMs: 60000,",
+        "  turnTimeoutMs: 5000,",
+        "  turnRetries: 0,",
+        "});",
+        'process.stderr.write("CHILD_RUN_CODE=" + res.exitCode + "\\n");',
+      ].join("\n"),
+    );
+    const started = Date.now();
+    const out = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 12_000 });
+    const elapsed = Date.now() - started;
+    expect(out.status).toBe(0);
+    expect(out.stderr).toContain("CHILD_RUN_CODE=1");
+    expect(elapsed).toBeLessThan(3_000);
+  }, 20_000);
+
+  it("reports a workspace git cannot read as unavailable on the abort path, never as clean", async () => {
+    // The agent's work dir here is not a git repository, so `git status` fails:
+    // the status is unreadable, which is not the same as a clean worktree.
+    const fake = fakeSession(() => new Promise<void>(() => {}));
+    let res: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const err = await captureStderr(async () => {
+      res = await runAgent({
+        name: "testbot",
+        prompt: "hi",
+        agentsRoot,
+        sessionFactory: factoryReturning(fake.session),
+        wallClockMs: 60,
+        noProgressMs: 60_000,
+        turnTimeoutMs: 60_000,
+        turnRetries: 0,
+      });
+    });
+    expect(res?.exitCode).toBe(1);
+    expect(res?.aborted).toBe("wall_clock");
+    expect(err).toContain("workspace status unavailable");
+    expect(err).not.toContain("no dirty paths");
+  }, 15_000);
 
   it("leaves a normally-answering session unchanged", async () => {
     const fake = fakeSession(async (emit) => {

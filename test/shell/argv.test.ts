@@ -129,6 +129,30 @@ describe("parseArgs", () => {
   it("a repeated flag keeps the LAST value (the object key is overwritten)", () => {
     expect(parseArgs(["run", "--model", "a", "--model", "b"]).flags.model).toBe("b");
   });
+
+  it("validates EVERY occurrence of a repeated bound flag (a bad earlier one cannot be hidden)", () => {
+    // bob#135 r3: `--timeout= --timeout=10` used to parse to the valid 10s.
+    expect(() => parseArgs(["run", "ember", "task", "--timeout=", "--timeout=10"])).toThrow(
+      UsageError,
+    );
+    expect(() => parseArgs(["run", "ember", "task", "--timeout=", "--timeout=10"])).toThrow(
+      "--timeout needs a value",
+    );
+    // the bare occurrence is validated too, wherever it sits
+    expect(() => parseArgs(["run", "ember", "task", "--timeout", "--timeout=10"])).toThrow(
+      "--timeout needs a value",
+    );
+    expect(() =>
+      parseArgs(["run", "ember", "task", "--turn-retries=abc", "--turn-retries=1"]),
+    ).toThrow("--turn-retries must be a whole number");
+    expect(() =>
+      parseArgs(["run", "ember", "task", "--no-progress-timeout=0", "--no-progress-timeout=10"]),
+    ).toThrow("--no-progress-timeout must be a positive whole number of seconds");
+    // valid repeats still take the last value, as for every flag
+    expect(parseArgs(["run", "ember", "task", "--timeout=10", "--timeout=20"]).flags.timeout).toBe(
+      "20",
+    );
+  });
 });
 
 // `boolFlag` is the second guard: the same whitelist for a flag map built by
@@ -150,8 +174,8 @@ describe("boolFlag", () => {
 });
 
 // bob#135 — the numeric flags behind `bob run`'s bounds. A bare, empty or
-// out-of-range value is refused by name before any run starts, never armed as a
-// nonsense deadline.
+// out-of-range value is refused by name before any run starts — on every
+// occurrence of a repeated flag — never armed as a nonsense deadline.
 describe("secondsFlagToMs", () => {
   it("reads a whole number of seconds as milliseconds", () => {
     expect(secondsFlagToMs({ timeout: "90" }, "timeout")).toBe(90_000);

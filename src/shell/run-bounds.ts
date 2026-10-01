@@ -20,8 +20,10 @@
 // abort — pi's `prompt()` is a whole turn (model requests plus tool work) and
 // offers no per-request signal, so a turn is the smallest unit bob can bound.
 //
-// Every timer is cleared by {@link RunBounds.stop}, which the run calls in a
-// `finally`, so a completed run leaves no timer holding the event loop open.
+// Every timer is cleared by the time the run ends: {@link RunBounds.stop}
+// clears the run-level timers, and a fired run-level bound cancels the turn
+// deadline ({@link raceTimeout} takes the run's signal), so a completed run
+// leaves no timer holding the event loop open.
 export type TerminationReason = "wall_clock" | "no_progress" | "turn_timeout";
 
 export interface RunLimits {
@@ -100,6 +102,9 @@ export class RunAbortedError extends Error {
 
 export interface RunBounds {
   limits: RunLimits;
+  /** Aborted when a run-level bound fires. A raced turn deadline watches it, so
+   *  it does not outlive the run. */
+  signal: AbortSignal;
   /** Why the run was aborted, or undefined while it is running. */
   reason(): TerminationReason | undefined;
   /** Abort the run for `reason` (no-op if it already aborted). */
@@ -188,22 +193,45 @@ export function createRunBounds(limits: RunLimits): RunBounds {
   // (the startup hang) is bounded by it too, not only by the wall clock.
   noteProgress();
 
-  return { limits, reason: () => reason, fire, noteProgress, guard, stop };
+  return {
+    limits,
+    signal: controller.signal,
+    reason: () => reason,
+    fire,
+    noteProgress,
+    guard,
+    stop,
+  };
 }
 
 /** Sentinel returned by {@link raceTimeout} when the deadline wins. */
 export const TIMED_OUT: unique symbol = Symbol("run-bounds.timed-out");
 
-/** Resolve `work`, or {@link TIMED_OUT} after `ms`. The timer is always cleared. */
-export async function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+/** Resolve `work`, or {@link TIMED_OUT} after `ms`. The timer is always cleared:
+ *  when the race settles, and when `signal` aborts — a run-level bound that wins
+ *  cancels the deadline rather than leaving it to hold the event loop open. */
+export async function raceTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<T | typeof TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
+    // Already aborted: there is no deadline to arm. The caller's guard rejects
+    // `work` on its own, and a timer armed here would outlive the run.
+    if (signal?.aborted === true) return;
     timer = setTimeout(() => resolve(TIMED_OUT), ms);
   });
+  const onAbort = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     return await Promise.race([work, deadline]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -218,6 +246,6 @@ export function boundMessage(name: string, reason: TerminationReason, limits: Ru
     case "no_progress":
       return `bob run ${name}: NO-PROGRESS WATCHDOG — the run log saw no new event for ${secs(limits.noProgressMs)}, so the run was ended (exit 1). Raise it with --no-progress-timeout <seconds> or run.no_progress_seconds in bob.yaml.\n`;
     case "turn_timeout":
-      return `bob run ${name}: TURN TIMEOUT — the prompt turn did not finish within ${secs(limits.turnTimeoutMs)} after ${limits.turnRetries} retr${limits.turnRetries === 1 ? "y" : "ies"}, so the run was ended (exit 1). Raise it with --turn-timeout <seconds> or run.turn_timeout_seconds in bob.yaml.\n`;
+      return `bob run ${name}: TURN TIMEOUT — the prompt turn did not finish within ${secs(limits.turnTimeoutMs)}, so the run was ended (exit 1). Raise it with --turn-timeout <seconds> or run.turn_timeout_seconds in bob.yaml.\n`;
   }
 }

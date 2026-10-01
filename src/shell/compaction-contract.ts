@@ -477,21 +477,65 @@ export function buildStandingContract(opts: {
   return lines.join("\n");
 }
 
+/** How long `git status --short` may take before the status is unavailable. */
+export const GIT_STATUS_TIMEOUT_MS = 5_000;
+
+/** A cwd's worktree status. `ok: false` means git did not answer (a failure, a
+ *  timeout, or no repository) — NOT "clean". */
+export interface WorktreeStatusResult {
+  ok: boolean;
+  status: string;
+}
+
+/** Read options for {@link readWorktreeStatusResult}. */
+export interface WorktreeStatusOptions {
+  /** Cap on the paths reported. */
+  maxLines?: number;
+  /** How long git may take before the status is unavailable. */
+  timeoutMs?: number;
+  /** The git executable. A test seam for a git that fails or hangs. */
+  git?: string;
+}
+
 /**
- * `git status --short` for `cwd`. Returns "" when cwd is not a git worktree (or
- * any git failure) — a dirty-path note is best-effort, never fatal. Bounded: a
- * repo with thousands of paths still yields a short note.
+ * `git status --short` for `cwd`, BOUNDED: a git that hangs is killed at
+ * `timeoutMs` and reported as not-ok. A `spawnSync` with no timeout blocks the
+ * event loop, so no timer can end a run stuck here. `ok` is false when git
+ * fails, times out, or throws — the caller must not read that as clean. Bounded
+ * the other way too: a repo with thousands of paths still yields a short note.
+ */
+export function readWorktreeStatusResult(
+  cwd: string,
+  opts: WorktreeStatusOptions = {},
+): WorktreeStatusResult {
+  const maxLines = opts.maxLines ?? DEFAULT_WORKTREE_STATUS_LINES;
+  try {
+    const r = spawnSync(opts.git ?? "git", ["status", "--short"], {
+      cwd,
+      encoding: "utf8",
+      timeout: opts.timeoutMs ?? GIT_STATUS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (r.status !== 0 || typeof r.stdout !== "string") return { ok: false, status: "" };
+    return {
+      ok: true,
+      status: r.stdout
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .slice(0, maxLines)
+        .join("\n"),
+    };
+  } catch {
+    return { ok: false, status: "" };
+  }
+}
+
+/**
+ * {@link readWorktreeStatusResult}, as the note's git-status line: "" for a
+ * clean worktree AND for a status that could not be read — a dirty-path note is
+ * best-effort, never fatal. A caller that reports the state to an operator uses
+ * the result form, so "could not read" is never printed as "clean".
  */
 export function readWorktreeStatus(cwd: string, maxLines = DEFAULT_WORKTREE_STATUS_LINES): string {
-  try {
-    const r = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
-    if (r.status !== 0 || typeof r.stdout !== "string") return "";
-    return r.stdout
-      .split("\n")
-      .filter((l) => l.length > 0)
-      .slice(0, maxLines)
-      .join("\n");
-  } catch {
-    return "";
-  }
+  return readWorktreeStatusResult(cwd, { maxLines }).status;
 }

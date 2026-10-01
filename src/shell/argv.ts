@@ -76,12 +76,18 @@ export function boolFlag(flags: Readonly<Record<string, string | boolean>>, name
 // means "not given"; a bare (`--timeout`) or empty (`--timeout=`) flag, and any
 // value that is not a positive whole number of seconds in range, is a
 // UsageError naming the flag rather than a timer armed with a nonsense deadline.
+// `parseArgs` runs the same check on EVERY occurrence of this flag, so a repeat
+// cannot hide a bad earlier value (`--timeout= --timeout=10`).
 export function secondsFlagToMs(
   flags: Readonly<Record<string, string | boolean>>,
   name: string,
 ): number | undefined {
   const raw = valueFlag(flags, name);
   if (raw === undefined) return undefined;
+  return secondsToMs(name, raw);
+}
+
+function secondsToMs(name: string, raw: string): number {
   if (!/^\d+$/.test(raw) || Number(raw) < 1) {
     throw new UsageError(`--${name} must be a positive whole number of seconds (got '${raw}')`);
   }
@@ -104,6 +110,10 @@ export function countFlag(
 ): number | undefined {
   const raw = valueFlag(flags, name);
   if (raw === undefined) return undefined;
+  return countValue(name, raw, max);
+}
+
+function countValue(name: string, raw: string, max: number): number {
   if (!/^\d+$/.test(raw)) {
     throw new UsageError(`--${name} must be a whole number (got '${raw}')`);
   }
@@ -112,6 +122,33 @@ export function countFlag(
     throw new UsageError(`--${name} must be a whole number between 0 and ${max} (got '${raw}')`);
   }
   return n;
+}
+
+// The run-bound value flags whose value `parseArgs` validates on EVERY
+// occurrence, before any command runs — the numeric siblings of BOOLEAN_FLAGS.
+// A repeat must not hide an invalid earlier occurrence: `--timeout= --timeout=10`
+// parsed as the valid 10s and armed a 10s timer. The readers validate the
+// effective (last) value again.
+const SECONDS_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "timeout",
+  "no-progress-timeout",
+  "turn-timeout",
+]);
+const COUNT_VALUE_FLAGS: ReadonlySet<string> = new Set(["turn-retries"]);
+
+/** Validate ONE occurrence of a value flag, at parse time. Only the declared
+ *  bound flags are checked here; every other value flag keeps its own reader's
+ *  rule (a bare `--model` is "not given"). */
+function validateValueOccurrence(name: string, value: string | true): void {
+  const isSeconds = SECONDS_VALUE_FLAGS.has(name);
+  if (!isSeconds && !COUNT_VALUE_FLAGS.has(name)) return;
+  if (value === true || value === "") {
+    throw new UsageError(
+      `--${name} needs a value; ${value === true ? "it was given with none" : "it was given empty"}`,
+    );
+  }
+  if (isSeconds) secondsToMs(name, value);
+  else countValue(name, value, MAX_TURN_RETRIES);
 }
 
 // The raw string of a value flag, or undefined when the flag is ABSENT. A bare
@@ -137,8 +174,10 @@ function valueFlag(
 // alone, `--model` followed by another flag) is the boolean `true`, and the
 // empty `--model=` form is the empty string — `stringFlag` reads both as "not
 // given". A DECLARED boolean flag (BOOLEAN_FLAGS) is validated here, on every
-// occurrence, and never consumes the next token. `--` ends flag parsing and
-// makes everything after it positional.
+// occurrence, and never consumes the next token; the declared bound flags
+// (SECONDS_VALUE_FLAGS / COUNT_VALUE_FLAGS) are validated here on every
+// occurrence too. `--` ends flag parsing and makes everything after it
+// positional.
 //
 // The `--key=value` form is consumed in ONE token and NEVER takes the next
 // token as its value: `bob run --model=foo ember "task"` keeps `ember` as the
@@ -171,7 +210,12 @@ export function parseArgs(argv: string[]): Args {
         // and the empty `--model=` form is "not given" for stringFlag.
         const key = tok.slice(2, eq);
         const value = tok.slice(eq + 1);
-        flags[key] = BOOLEAN_FLAGS.has(key) ? boolValue(key, value) : value;
+        if (BOOLEAN_FLAGS.has(key)) {
+          flags[key] = boolValue(key, value);
+        } else {
+          validateValueOccurrence(key, value);
+          flags[key] = value;
+        }
       } else {
         const key = tok.slice(2);
         const next = rest[i + 1];
@@ -187,8 +231,10 @@ export function parseArgs(argv: string[]): Args {
         } else if (!next || next.startsWith("--")) {
           // `--key` (no `=`): a trailing non-flag token is its value, else it is
           // the bare form.
+          validateValueOccurrence(key, true);
           flags[key] = true;
         } else {
+          validateValueOccurrence(key, next);
           flags[key] = next;
           i++;
         }
