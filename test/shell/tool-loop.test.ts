@@ -1,6 +1,7 @@
 // tool-loop.test.ts — bob#143 item 3. The pure detector behind the loop breaker:
 // consecutive identical calls only, reset by any different call, firing at the
-// limit and not before.
+// limit and not before; and the call key, which keeps every own argument key
+// (`__proto__` included), ignores object-key order and keeps array order.
 import { describe, expect, it } from "bun:test";
 import {
   DEFAULT_TOOL_LOOP_LIMIT,
@@ -65,5 +66,72 @@ describe("toolCallKey", () => {
     expect(toolCallKey("edit", { a: [1, 2] })).not.toBe(toolCallKey("edit", { a: [2, 1] }));
     expect(toolCallKey("edit", { a: 1 })).not.toBe(toolCallKey("edit", { a: 2 }));
     expect(toolCallKey("edit", { a: 1 })).not.toBe(toolCallKey("read", { a: 1 }));
+  });
+
+  it("keeps an own __proto__ key: arguments parsed from JSON that differ only there differ", () => {
+    // JSON.parse makes `__proto__` an OWN key, as pi's parsed tool arguments do.
+    const one = JSON.parse('{"path":"f.ts","__proto__":{"x":1}}');
+    const two = JSON.parse('{"path":"f.ts","__proto__":{"x":2}}');
+    expect(Object.keys(one)).toEqual(["path", "__proto__"]);
+    expect(toolCallKey("edit", one)).not.toBe(toolCallKey("edit", two));
+    expect(toolCallKey("edit", one)).toBe(
+      toolCallKey("edit", JSON.parse('{"__proto__":{"x":1},"path":"f.ts"}')),
+    );
+    // A scalar __proto__ value, and one nested inside another object.
+    expect(toolCallKey("edit", JSON.parse('{"__proto__":1}'))).not.toBe(
+      toolCallKey("edit", JSON.parse('{"__proto__":2}')),
+    );
+    expect(toolCallKey("edit", JSON.parse('{"o":{"__proto__":1}}'))).not.toBe(
+      toolCallKey("edit", JSON.parse('{"o":{"__proto__":2}}')),
+    );
+    // Present versus absent.
+    expect(toolCallKey("edit", JSON.parse('{"a":1,"__proto__":null}'))).not.toBe(
+      toolCallKey("edit", JSON.parse('{"a":1}')),
+    );
+  });
+
+  it("nested objects: key order is ignored at every depth, array order is not", () => {
+    const a = JSON.parse(
+      '{"edits":[{"oldText":"x","newText":"y"}],"opts":{"b":1,"a":{"d":2,"c":3}}}',
+    );
+    const b = JSON.parse(
+      '{"opts":{"a":{"c":3,"d":2},"b":1},"edits":[{"newText":"y","oldText":"x"}]}',
+    );
+    expect(toolCallKey("edit", a)).toBe(toolCallKey("edit", b));
+    const swapped = JSON.parse('{"edits":[{"oldText":"p"},{"oldText":"q"}]}');
+    const original = JSON.parse('{"edits":[{"oldText":"q"},{"oldText":"p"}]}');
+    expect(toolCallKey("edit", swapped)).not.toBe(toolCallKey("edit", original));
+    expect(toolCallKey("edit", { o: { a: { b: 1 } } })).not.toBe(
+      toolCallKey("edit", { o: { a: { b: 2 } } }),
+    );
+  });
+
+  it("gives every value a defined string, keeping values JSON cannot encode apart", () => {
+    expect(toolCallKey("t", { a: undefined })).not.toBe(toolCallKey("t", {}));
+    expect(toolCallKey("t", { a: undefined })).not.toBe(toolCallKey("t", { a: null }));
+    expect(toolCallKey("t", Symbol("s"))).toBe("t\u0000Symbol(s)");
+    expect(toolCallKey("t", 0)).not.toBe(toolCallKey("t", -0));
+    expect(toolCallKey("t", Number.NaN)).not.toBe(toolCallKey("t", null));
+    expect(toolCallKey("t", { a: "<circular>" })).not.toBe(
+      toolCallKey(
+        "t",
+        (() => {
+          const cyclic: Record<string, unknown> = {};
+          cyclic.a = cyclic;
+          return cyclic;
+        })(),
+      ),
+    );
+  });
+});
+
+describe("ToolLoopDetector — arguments parsed from JSON", () => {
+  it("a different __proto__ value resets the count; the same value repeats", () => {
+    const detector = new ToolLoopDetector(2);
+    expect(detector.observe("edit", JSON.parse('{"__proto__":{"x":1}}')).count).toBe(1);
+    const changed = detector.observe("edit", JSON.parse('{"__proto__":{"x":2}}'));
+    expect(changed).toEqual({ count: 1, fire: false });
+    const repeated = detector.observe("edit", JSON.parse('{"__proto__":{"x":2}}'));
+    expect(repeated).toEqual({ count: 2, fire: true });
   });
 });

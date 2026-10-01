@@ -1,8 +1,8 @@
 // persistent-loop-breaker.test.ts — bob#143 item 3. The persistent turn path
 // (promptless `bob run` → startPersistent) wires the configured loop limit into
-// its admission and signals the affected turn to stop, the same way a one-shot
-// `bob run` ends on a repeated call. Driven with a fake warm session that emits
-// tool_execution_start events during a prompt.
+// its admission, fails the affected turn and asks the session to stop, the same
+// way a one-shot `bob run` ends on a repeated call. Driven with a fake warm
+// session that emits tool_execution_start events during a prompt.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

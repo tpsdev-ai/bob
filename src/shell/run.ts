@@ -495,8 +495,9 @@ export interface RunSession {
   // it. (pi's AgentSession doesn't expose this method directly, so the real
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
-  // Stop an in-flight turn (pi's AgentSession.abort). The loop breaker calls it
-  // to end a stuck turn. Optional so a fake session in tests need not provide it.
+  // Ask the session to stop an in-flight turn (pi's AgentSession.abort). The
+  // loop breaker calls it after a repeated call; the request can fail. Optional
+  // so a fake session in tests need not provide it.
   abort?(): Promise<void>;
   dispose(): void;
 }
@@ -683,7 +684,7 @@ export interface RunOptions {
   // role or capability, is dropped.
   mailTurn?: boolean;
   // bob#143 item 3: the loop breaker's limit — how many consecutive identical
-  // tool calls stop the turn. Overrides bob.yaml's `run.tool_loop_limit`.
+  // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
 }
 
@@ -771,7 +772,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
-  // bob#143 item 3: how many consecutive identical tool calls stop the turn.
+  // bob#143 item 3: how many consecutive identical tool calls trip the loop breaker.
   const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
@@ -1151,7 +1152,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     exitCode = 1;
     failed = true;
     if (err instanceof ToolLoopError) {
-      // bob#143 item 3 — the loop breaker ended the turn; the message was written
+      // bob#143 item 3 — the loop breaker failed the run; the message was written
       // when it fired. Ask the session to stop the turn; a session without
       // abort(), or an abort that fails, is reported.
       try {

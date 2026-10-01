@@ -164,7 +164,7 @@ export function createTurnAdmission(
           // bob#143: the origin binding is released only when the PROMPT
           // settles. A loop break rejects `loopAbort` the moment the detector
           // fires, while pi's prompt may still be running: its parallel tool
-          // path can execute a call prepared before the abort, and the
+          // path can execute a call prepared before the stop request, and the
           // session's abort() may be missing or fail. admitTurn waits for the
           // prompt at most `graceMs`; past that it keeps the binding, reports
           // it, and releases it when the prompt settles. The binding belongs to
@@ -177,7 +177,7 @@ export function createTurnAdmission(
             release();
           } else {
             log(
-              `[bob] loop breaker: the aborted turn did not settle within ${graceMs}ms; keeping its origin binding until it settles`,
+              `[bob] loop breaker: the loop-broken turn's prompt did not settle within ${graceMs}ms; keeping its origin binding until it settles`,
             );
             prompt.then(release, release);
           }

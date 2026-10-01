@@ -605,7 +605,7 @@ describe("wireDiscordCapability — a loop break keeps the turn's origin binding
       // Two identical calls in a row: the second one fires the loop breaker.
       h.emitToolStart("edit", { path: "f.ts" });
       h.emitToolStart("edit", { path: "f.ts" });
-      // The break has fired and the session has been signalled to stop, but the
+      // The break has fired and the session has been asked to stop, but the
       // prompt has NOT settled: a tool call pi prepared before the abort runs.
       await new Promise<void>((r) => setTimeout(r, 5));
       report.resolve({
