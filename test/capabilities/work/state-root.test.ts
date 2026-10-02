@@ -91,7 +91,8 @@ describe("private persistent work state", () => {
   }
 
   it("creates private persistent records and separate temporary captures, ignoring the legacy root", async () => {
-    const legacy = join(tmpdir(), `bob-work-${process.getuid?.() ?? "user"}`);
+    // beforeEach sets TMPDIR to scratch/tmp, so this is the path os.tmpdir() gives the code under test.
+    const legacy = join(scratch, "tmp", `bob-work-${process.getuid?.() ?? "user"}`);
     mkdirSync(legacy);
     writeFileSync(join(legacy, "sentinel"), "unchanged");
     process.env.BOB_STATE_DIR = join(scratch, "missing", "parent", "state");
