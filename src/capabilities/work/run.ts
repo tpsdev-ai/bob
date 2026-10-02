@@ -399,21 +399,26 @@ const errCode = (err: unknown): string =>
 // to hand a child a directory descriptor as its cwd, and the child's own chdir
 // re-resolves that string. So `run` cannot make the directory a command starts in
 // BE the one it checked; it narrows the window in which they can differ:
-//   1. resolve the cwd and the workspace through symlinks (realpath) and confine
-//      the one to the other (resolveCwd);
+//   1. resolve the cwd and the workspace through symlinks (realpath), pin the
+//      workspace root's device + inode, and confine the one to the other
+//      (resolveCwd);
 //   2. open the resolved path (O_DIRECTORY | O_NOFOLLOW) and hold it open:
 //      the PIN. While it is held the inode stays allocated (on a local POSIX file
 //      system), so no other directory can take its device + inode;
 //   3. immediately after pinning, and again immediately before the spawn,
 //      re-resolve the cwd (realpath): it must still be the same canonical path,
-//      inside the originally checked canonical workspace, and a no-follow stat of
-//      it must still be a directory with the pin's device + inode;
+//      inside the originally checked canonical workspace, a no-follow stat of
+//      it must still be a directory with the pin's device + inode, and the
+//      workspace root must still have the device + inode pinned in step 1;
 //   4. release the pin, then spawn: no pin step runs after the spawn.
 // Any step that cannot establish its fact (a failed realpath, stat, open, fstat
 // or close) refuses: unknown is never taken as inside.
 //
-// What remains: between the last re-check and the child's own chdir, a path
-// component can still be replaced (see the capability README).
+// Inside one re-check the realpath and the no-follow stat are two calls, and the
+// workspace-root check another; a path component replaced between them is refused
+// by the comparison that follows (run.test.ts drives that interval). What remains
+// is the window AFTER the last re-check: between it and the child's own chdir, a
+// path component can still be replaced (see the capability README).
 
 // The file-system calls the pin makes, as a seam (like GroupOps) so a test can
 // make one of them fail — a realpath or stat that errors, an fstat that throws
@@ -451,15 +456,25 @@ interface DirPin {
   ino: bigint;
 }
 
+// The workspace root's identity, pinned when the cwd is resolved, so a root
+// replaced by another directory at the same path is refused (not just its string).
+interface WorkspacePin {
+  dev: bigint;
+  ino: bigint;
+}
+
 type PinStage = "when it was pinned" | "immediately before the spawn";
 
-// The cwd must still be the checked canonical path and the directory pinned at open: the same canonical path,
-// inside the checked canonical workspace, and (no-follow) the pinned device +
-// inode. Throws a RunRefusal naming the failed check or mismatch.
+// The cwd must still be the checked canonical path and the directory pinned at
+// open: the same canonical path, inside the checked canonical workspace, and
+// (no-follow) the pinned device + inode; and the workspace root must still have
+// the device + inode pinned when the cwd was resolved. Throws a RunRefusal naming
+// the failed check or mismatch.
 function assertStillPinned(
   ops: DirPinOps,
   dir: string,
   workspace: string,
+  workspacePin: WorkspacePin,
   pin: DirPin,
   stage: PinStage,
 ): void {
@@ -468,7 +483,7 @@ function assertStillPinned(
     real = ops.realpath(dir);
   } catch (err) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): resolving it failed, so whether it is still the directory that was checked is unknown. Nothing was started.`,
+      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): resolving it failed, so whether it is still the checked canonical path and the directory pinned at open is unknown. Nothing was started.`,
     );
   }
   if (!isInsideCanonical(workspace, real)) {
@@ -494,13 +509,31 @@ function assertStillPinned(
       `run refused: the working directory ${dir} does not match its pin ${stage}: a no-follow stat of it is not a directory with the pinned device and inode. Nothing was started; retry once the directory is stable.`,
     );
   }
+  let wst: DirStat;
+  try {
+    wst = ops.lstat(workspace);
+  } catch (err) {
+    throw new RunRefusal(
+      `run refused: the workspace ${workspace} could not be re-checked ${stage} (${errCode(err)}). Nothing was started.`,
+    );
+  }
+  if (!wst.isDirectory() || wst.dev !== workspacePin.dev || wst.ino !== workspacePin.ino) {
+    throw new RunRefusal(
+      `run refused: the workspace ${workspace} no longer has the device and inode it had when the cwd was checked ${stage}, so the workspace root was replaced. Nothing was started; retry once the directory is stable.`,
+    );
+  }
 }
 
 // Open and verify the pin. On a failure after the open, closing the descriptor is
 // ATTEMPTED before the refusal is thrown, and the refusal says how that close
 // went: "closed" only when the close returned, "unknown" when it failed (a failed
 // close may or may not have released the descriptor; this code cannot tell).
-function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
+function pinDirectory(
+  ops: DirPinOps,
+  dir: string,
+  workspace: string,
+  workspacePin: WorkspacePin,
+): DirPin {
   let fd: number;
   try {
     // O_NOFOLLOW: the final component must be the real directory, not a symlink
@@ -530,7 +563,7 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
     }
     const pin: DirPin = { fd, dev: st.dev, ino: st.ino };
     // The pin must be the checked canonical path and the directory pinned at open: re-resolve now it is open.
-    assertStillPinned(ops, dir, workspace, pin, "when it was pinned");
+    assertStillPinned(ops, dir, workspace, workspacePin, pin, "when it was pinned");
     return pin;
   } catch (err) {
     failure =
@@ -831,7 +864,10 @@ export class JobManager {
 
   // The cwd, resolved through symlinks, and the canonical workspace it was
   // confined to (kept: the pin re-checks against THIS root, not a re-resolved one).
-  private resolveCwd(ctxCwd: string | undefined, raw: unknown): { dir: string; workspace: string } {
+  private resolveCwd(
+    ctxCwd: string | undefined,
+    raw: unknown,
+  ): { dir: string; workspace: string; workspacePin: WorkspacePin } {
     if (typeof ctxCwd !== "string" || ctxCwd === "") {
       throw new RunRefusal(
         "run refused: pi supplied no tool execution context cwd, so there is no workspace to run in. This is a wiring fault in the session, not in the command.",
@@ -843,15 +879,20 @@ export class JobManager {
       );
     }
     const dir = raw === undefined || raw === null || raw === "" ? ctxCwd : resolve(ctxCwd, raw);
-    let ok = false;
+    // The existence check reports the FAILED CHECK, never a cause it did not
+    // observe: a stat that cannot run is "could not be checked" with its errno,
+    // and only a stat that returns a non-directory says "is not a directory".
+    let st: ReturnType<typeof statSync>;
     try {
-      ok = statSync(dir).isDirectory();
-    } catch {
-      ok = false;
-    }
-    if (!ok) {
+      st = statSync(dir);
+    } catch (err) {
       throw new RunRefusal(
-        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not an existing directory. Pass an existing directory, relative to the workspace, or omit cwd.`,
+        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) could not be checked (${errCode(err)}). Pass an existing directory, relative to the workspace, or omit cwd.`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new RunRefusal(
+        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not a directory. Pass a directory, relative to the workspace, or omit cwd.`,
       );
     }
     // Containment: the directory must stay inside the workspace. Both paths are
@@ -864,6 +905,24 @@ export class JobManager {
     } catch (err) {
       throw new RunRefusal(
         `run refused: the workspace ${ctxCwd} could not be resolved through its symlinks (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
+      );
+    }
+    // Pin the workspace root's identity (device + inode), not just its string: a
+    // root replaced between here and the pin by another directory at the same
+    // path passes a string containment check, so the re-checks compare this too.
+    let workspacePin: WorkspacePin;
+    try {
+      const wst = this.dirPinOps.lstat(workspace);
+      if (!wst.isDirectory()) {
+        throw new RunRefusal(
+          `run refused: the workspace ${ctxCwd} (resolved to ${workspace}) is not a directory, so no cwd can be confined to it. Nothing was started.`,
+        );
+      }
+      workspacePin = { dev: wst.dev, ino: wst.ino };
+    } catch (err) {
+      if (err instanceof RunRefusal) throw err;
+      throw new RunRefusal(
+        `run refused: the workspace ${ctxCwd} (resolved to ${workspace}) could not be checked (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
       );
     }
     let resolved: string;
@@ -879,7 +938,7 @@ export class JobManager {
         `run refused: cwd resolves outside the workspace ${ctxCwd} (resolved to ${resolved}). Pass a path inside the workspace.`,
       );
     }
-    return { dir: resolved, workspace };
+    return { dir: resolved, workspace, workspacePin };
   }
 
   private ensureRunDir(workspaces: string[]): { run: string; jobs: string; out: string } {
@@ -957,7 +1016,7 @@ export class JobManager {
     }
     const command = req.command;
     const timeout = this.resolveTimeout(req.timeout_s);
-    const { dir: cwd, workspace } = this.resolveCwd(ctxCwd, req.cwd);
+    const { dir: cwd, workspace, workspacePin } = this.resolveCwd(ctxCwd, req.cwd);
     // From this live-job limit check to the job's registration (`this.jobs.set`
     // below) NOTHING may await: a yield in between would let a concurrent start
     // pass the same check, and the limit would not hold. The one await on the way
@@ -1011,11 +1070,18 @@ export class JobManager {
     let child: ChildProcess;
     try {
       this.beforePin?.(cwd);
-      const pin = pinDirectory(this.dirPinOps, cwd, workspace);
+      const pin = pinDirectory(this.dirPinOps, cwd, workspace, workspacePin);
       let recheck: { err: unknown } | null = null;
       try {
         this.beforeSpawn?.(cwd);
-        assertStillPinned(this.dirPinOps, cwd, workspace, pin, "immediately before the spawn");
+        assertStillPinned(
+          this.dirPinOps,
+          cwd,
+          workspace,
+          workspacePin,
+          pin,
+          "immediately before the spawn",
+        );
       } catch (err) {
         recheck = { err };
       }
