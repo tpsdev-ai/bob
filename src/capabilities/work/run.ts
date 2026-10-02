@@ -988,7 +988,8 @@ export class JobManager {
     try {
       run = mkdtempSync(join(this.stateRoot, "run-"));
       ensurePrivateDir(run, false);
-      out = mkdtempSync(join(tmpdir(), "bob-run-"));
+      const scratchRoot = realpathSync(tmpdir());
+      out = mkdtempSync(join(scratchRoot, "bob-run-"));
       ensurePrivateDir(out, false);
       mkdirSync(join(run, "jobs"), { mode: 0o700 });
       const scratch = lstatSync(out, { bigint: true });
@@ -1000,6 +1001,7 @@ export class JobManager {
         supervisor_identity: typeof identity === "object" ? identity : null,
         started_at: new Date().toISOString(),
         scratch_dir: out,
+        scratch_root: scratchRoot,
         scratch_dev: String(scratch.dev),
         scratch_ino: String(scratch.ino),
       });
@@ -1786,7 +1788,9 @@ export class JobManager {
   private removeStaleScratch(meta: Record<string, unknown>): void {
     const path = meta.scratch_dir;
     if (typeof path !== "string" || !isAbsolute(path)) return;
-    if (canonicalPath(dirname(path)) !== canonicalPath(tmpdir())) return;
+    const root = meta.scratch_root === undefined ? tmpdir() : meta.scratch_root;
+    if (typeof root !== "string" || !isAbsolute(root)) return;
+    if (canonicalPath(dirname(path)) !== canonicalPath(root)) return;
     if (!/^bob-run-[A-Za-z0-9]{6}$/.test(basename(path))) return;
     try {
       ensurePrivateDir(path, false);

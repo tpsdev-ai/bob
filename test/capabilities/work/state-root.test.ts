@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -150,32 +151,90 @@ describe("private persistent work state", () => {
     expect(readdirSync(manager.stateRoot)).toEqual([]);
   });
 
-  for (const kind of ["matching", "changed-inode", "symlink", "outside-temp"] as const) {
-    it(`boot sweep handles ${kind} scratch without trusting a path alone`, async () => {
-      const out = mkdtempSync(join(kind === "outside-temp" ? scratch : tmpdir(), "bob-run-"));
-      const st = statSync(out, { bigint: true });
-      let path = out;
-      if (kind === "symlink") {
-        path = join(tmpdir(), "bob-run-abcdef");
-        symlinkSync(out, path);
-      }
+  it("sweeps a crashed run's captures after TMPDIR changes", async () => {
+    manager = new JobManager();
+    const job = await manager.start({ command: "echo captured" }, join(scratch, "workspace"));
+    await job.done;
+    const capture = manager.report(job).output_ref;
+    const run = manager.runDir as string;
+    const record = join(run, "run.json");
+    const meta = JSON.parse(readFileSync(record, "utf8"));
+    meta.supervisor_instance = "gone";
+    writeFileSync(record, JSON.stringify(meta));
+    const originalRoot = realpathSync(tmpdir());
+    process.env.TMPDIR = join(scratch, "other-tmp");
+    mkdirSync(process.env.TMPDIR);
+
+    await new JobManager().bootSweep();
+
+    expect(existsSync(dirname(capture))).toBe(false);
+    expect(existsSync(join(run, "ended.json"))).toBe(true);
+    expect(meta.scratch_root).toBe(originalRoot);
+  });
+
+  for (const root of ["different-root", "parent-root", "relative", "", null, 42] as const) {
+    it(`refuses the tampered recorded scratch root ${JSON.stringify(root)}`, async () => {
       manager = new JobManager();
-      const run = join(manager.stateRoot, "run-stale");
-      mkdirSync(join(run, "jobs"), { recursive: true, mode: 0o700 });
-      writeFileSync(
-        join(run, "run.json"),
-        JSON.stringify({
-          v: 1,
-          supervisor_pid: process.pid,
-          supervisor_instance: "gone",
-          scratch_dir: path,
-          scratch_dev: String(st.dev),
-          scratch_ino: kind === "changed-inode" ? "-1" : String(st.ino),
-        }),
-      );
-      await manager.bootSweep();
-      expect(existsSync(out)).toBe(kind !== "matching");
+      const job = await manager.start({ command: "echo captured" }, join(scratch, "workspace"));
+      await job.done;
+      const capture = manager.report(job).output_ref;
+      const run = manager.runDir as string;
+      const record = join(run, "run.json");
+      const meta = JSON.parse(readFileSync(record, "utf8"));
+      const otherRoot = join(scratch, "other-tmp");
+      mkdirSync(otherRoot);
+      meta.supervisor_instance = "gone";
+      meta.scratch_root =
+        root === "different-root" ? otherRoot : root === "parent-root" ? scratch : root;
+      writeFileSync(record, JSON.stringify(meta));
+
+      await new JobManager().bootSweep();
+
+      expect(readFileSync(capture, "utf8")).toBe("captured\n");
       expect(existsSync(join(run, "ended.json"))).toBe(true);
     });
+  }
+
+  for (const recordedRoot of [false, true]) {
+    for (const kind of [
+      "matching",
+      "changed-inode",
+      "changed-device",
+      "symlink",
+      "group-writable",
+      "world-readable",
+      "outside-temp",
+    ] as const) {
+      it(`boot sweep handles ${kind} scratch with recorded root ${recordedRoot}`, async () => {
+        const out = mkdtempSync(join(kind === "outside-temp" ? scratch : tmpdir(), "bob-run-"));
+        const st = statSync(out, { bigint: true });
+        let path = out;
+        if (kind === "symlink") {
+          path = join(tmpdir(), "bob-run-abcdef");
+          symlinkSync(out, path);
+        }
+        if (kind === "group-writable" || kind === "world-readable") {
+          chmodSync(out, kind === "group-writable" ? 0o720 : 0o704);
+        }
+        manager = new JobManager();
+        const run = join(manager.stateRoot, "run-stale");
+        mkdirSync(join(run, "jobs"), { recursive: true, mode: 0o700 });
+        writeFileSync(
+          join(run, "run.json"),
+          JSON.stringify({
+            v: 1,
+            supervisor_pid: process.pid,
+            supervisor_instance: "gone",
+            scratch_dir: path,
+            ...(recordedRoot ? { scratch_root: realpathSync(tmpdir()) } : {}),
+            scratch_dev: kind === "changed-device" ? "-1" : String(st.dev),
+            scratch_ino: kind === "changed-inode" ? "-1" : String(st.ino),
+          }),
+        );
+        await manager.bootSweep();
+        expect(existsSync(out)).toBe(kind !== "matching");
+        expect(existsSync(join(run, "ended.json"))).toBe(true);
+      });
+    }
   }
 });

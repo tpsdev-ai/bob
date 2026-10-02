@@ -182,7 +182,8 @@ named error.
   held by a descendant that left the group; the result says
   `output_complete: false` and `cleanup_state: escaped_or_unverified`, and the
   tool does not hang.
-- **Retention.** Captures are deleted when the run ends. The small job records
+- **Retention.** Run end attempts to remove captures; boot sweep removes leftovers
+  only after the checks below pass. The small job records
   (no output, a SHA-256 of
   the command rather than the command) are kept 24 hours after their run ended,
   then deleted by a later boot sweep.
@@ -221,15 +222,20 @@ locations inside the workspace or repository are refused. The old
   disposes its session and exits), an exit hook SIGKILLs every group the run
   still owns, records it and logs it.
 - **Boot sweep.** When the capability loads, it looks at every earlier run:
-  - An **ended** run is swept by the retention bound alone, whoever holds its
-    supervisor's pid now: its captures go at once, its records after 24 hours.
+  - An **ended** run's records are deleted after 24 hours, regardless of its
+    supervisor's pid.
   - A run whose supervisor is **gone** — its pid is dead; or the pid is this
     process but the instance id is another's; or the pid is live but no longer
     has the pinned identity; or its identity cannot be compared (none on
     record, or the read could not tell) and the heartbeat is more than 10
-    minutes stale — has its captures deleted, is marked ended, and each job
-    still recorded as running is reported. An identity read that fails for any
+    minutes stale — is marked ended, and each job still recorded as running is
+    reported. An identity read that fails for any
     reason other than "no such process" means "cannot tell", never "replaced".
+  - For ended or gone-supervisor runs, captures are deleted only from a
+    non-symlink, same-owner directory with no group/world permissions, named
+    `bob-run-XXXXXX`, whose device/inode match the run record and whose parent
+    matches the recorded temporary root (the current OS temp root for older
+    records without one).
   - Such a job's group is signalled **only while its leader has the identity
     pinned at spawn**, checked again immediately before every signal: SIGTERM,
     then SIGKILL after the grace. If the identity was never pinned (no
