@@ -139,9 +139,10 @@ const RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS = 250;
 // uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
 // with the group id and counted (`reapExhausted`). `close` is kept only to
 // collect the result, which arrives once the reaping has freed the pipes.
-// If cleanup gives up after the launcher has exited, result collection waits
-// only RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS longer, closes its side of the
-// output pipes, and applies the normal result parser to the bytes already read.
+// Once cleanup has given up and the launcher has exited, result collection
+// starts a timer set to fire RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS later. If that
+// timer fires while the turn is still active, a zero-exit launcher uses the
+// normal result parser on the bytes already read before Bob closes the output pipes.
 // Stated limit: signals go to the numeric group id. POSIX keeps a group id in
 // use while any member lives, so it cannot name another group while a
 // descendant survives. Once every member has exited, the id is free: the window
@@ -217,7 +218,6 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
       };
       const collectResult = (code: number | null, sig: NodeJS.Signals | null) => {
         if (settled) return;
-        if (reapExhausted) reportResultAfterReapExhausted();
         if (signal.aborted) {
           const reason = signal.reason === "timeout" ? "timeout" : "stopped";
           finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
@@ -232,6 +232,7 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
           });
           return;
         }
+        if (reapExhausted) reportResultAfterReapExhausted();
         const result = parseMailTurnResult(stdout);
         if (!result) {
           finish({ kind: "failed", reason: "no-result", detail: "launcher wrote no result line" });

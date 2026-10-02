@@ -1024,14 +1024,14 @@ describe("changelog fragments — the migration (bob#236)", () => {
     {
       fragment: "added-03-the-tps-mail-capability-a-bob.md",
       was: "- **The `tps-mail` capability: a bob agent answers TPS mail (#200).**",
-      why: "A reap-exhausted output holder now gets bounded result collection instead of delaying the result until the turn timeout (#208).",
+      why: "After launcher exit and reap exhaustion, Bob starts a result timer set to fire 250 ms later; when that timer fires before output close, turn timeout, or shutdown, and the launcher exited zero and the turn is still active, Bob parses held output without rerunning the turn instead of waiting for timeout (#208).",
       edits: [
         [
-          ", except a member cleanup cannot kill (it still delays the result until the turn timeout): SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`);",
-          ". If a member survives cleanup and keeps the output open, result collection waits one short bounded interval after reaping gives up, closes its output ends, and applies the normal result parser to the bytes already read: a complete result stands, while an incomplete result fails the turn as usual. Reaping sends SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`); result collection after that exhaustion is also logged with the group id and counted (`resultCollectedAfterReapExhausted`);",
+          ", so a descendant holding that output cannot hold up the turn or its result, except a member cleanup cannot kill (it still delays the result until the turn timeout): SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`);",
+          ". Once the launcher has exited and process-group reaping is exhausted, Bob starts a result timer set to fire 250 ms later (subject to event-loop delay). If reaping is exhausted and that timer fires before the output closes, Bob ends result collection and then closes its output ends. If the timer fired before the turn timeout or shutdown, the launcher exited zero, and the turn is still active, the normal result parser uses the bytes already read: a complete result stands without rerunning the turn, while an incomplete result fails as `no-result`. Under those conditions, result collection does not wait for the turn timeout. Reaping sends SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`); parser use after that exhaustion is also logged with the group id and counted (`resultCollectedAfterReapExhausted`);",
         ],
       ],
-      dropped: ["delays", "except", "kill", "still"],
+      dropped: ["cleanup", "delays", "descendant", "except", "hold", "holding", "kill", "member"],
     },
     {
       fragment: "fixed-04-a-resident-agent-keeps-a-tool.md",

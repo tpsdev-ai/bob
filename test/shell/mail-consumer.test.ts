@@ -1273,7 +1273,7 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
     }
   };
 
-  function heldOutputLauncher(output: string): { launcher: string; pidFile: string } {
+  function heldOutputLauncher(output: string, exitCode = 0): { launcher: string; pidFile: string } {
     const pidFile = join(root, "holder.pid");
     const launcher = join(root, "holding-launcher");
     writeFileSync(
@@ -1287,7 +1287,7 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
         `sh -c 'trap "" TERM; exec sleep 60' &`,
         `echo $! > ${pidFile}`,
         `echo x >> ${join(root, "holding-launcher.count")}`,
-        "exit 0",
+        `exit ${exitCode}`,
         "",
       ].join("\n"),
     );
@@ -1441,6 +1441,76 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
         resultCollectedAfterReapExhausted: 1,
       });
       expect(h.logs.join("\n")).toContain("turn FAILED (no-result: launcher wrote no result line)");
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("a timeout during the post-reap result wait does not report result collection", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"too-late"}'`,
+    );
+    const h = harness({
+      launcherPath: launcher,
+      runTurn: undefined,
+      turnTimeoutMs: 300,
+      turnRunner: {
+        killGraceMs: 0,
+        reapLimitMs: 0,
+        groupOps: { exists: () => true, signal: () => {} },
+      },
+    });
+
+    await h.consumer.poll();
+    // poll() returns when the turn timeout wins. Let the still-pending result
+    // timer fire too, so this pins the later collection callback as a no-op.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 1,
+        reapExhausted: 1,
+      });
+      expect({
+        counter: h.consumer.stats.resultCollectedAfterReapExhausted,
+        logs: h.logs.filter((line) =>
+          /result collection .* ended after reap exhaustion/.test(line),
+        ),
+      }).toEqual({ counter: 0, logs: [] });
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("a nonzero launcher exit after reap exhaustion does not report result collection", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"ignored"}'`,
+      7,
+    );
+    const h = harness({ launcherPath: launcher, ...exhaustedRunner() });
+
+    await h.consumer.poll();
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 0,
+        reapExhausted: 1,
+      });
+      expect(h.logs.join("\n")).toContain("turn FAILED (exit: launcher exited 7)");
+      expect({
+        counter: h.consumer.stats.resultCollectedAfterReapExhausted,
+        logs: h.logs.filter((line) =>
+          /result collection .* ended after reap exhaustion/.test(line),
+        ),
+      }).toEqual({ counter: 0, logs: [] });
     } finally {
       if (alive(holder)) process.kill(holder, "SIGKILL");
     }
