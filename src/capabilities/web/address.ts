@@ -10,7 +10,7 @@
 // loopback, this-network/unspecified, private-use, link-local, shared address
 // space (CGNAT), benchmarking, documentation, reserved, multicast and the
 // broadcast address; on v6 unique-local, link-local, multicast and site-local,
-// and anything outside 2000::/3; and every transition/translation prefix
+// and anything outside 2000::/3; and the listed transition/translation prefixes
 // (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16, Teredo inside
 // 2001::/23, the deprecated IPv4-compatible ::/96 and the IPv4-mapped
 // ::ffff:0:0/96). Addresses enumerated from the host's interfaces are
@@ -38,7 +38,7 @@ export type AddressRefusalCode =
   | "ipv4-special"
   // A selected IPv6 policy range based on the IANA special-purpose registry.
   | "ipv6-special"
-  // A transition/translation prefix (NAT64, 6to4, Teredo, IPv4-compatible).
+  // A transition/translation prefix (NAT64, 6to4, IPv4-compatible).
   | "transition"
   // An address of this host's own interfaces.
   | "own-interface"
@@ -123,6 +123,7 @@ export const IPV6_REGISTRY_ROWS: readonly RegistryRow[] = Object.freeze([
   ipv6Row("100::/64", "Discard-Only Address Block"),
   ipv6Row("64:ff9b::/96", "IPv4-IPv6 Translation", "transition"),
   ipv6Row("64:ff9b:1::/48", "IPv4-IPv6 Translation", "transition"),
+  // This covering row refuses Teredo with the default "ipv6-special" code.
   ipv6Row("2001::/23", "IETF Protocol Assignments"),
   ipv6Row("2001:db8::/32", "Documentation"),
   ipv6Row("2002::/16", "6to4", "transition"),

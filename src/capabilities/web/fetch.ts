@@ -94,9 +94,10 @@ export type DnsLookup = (
 ) => void;
 
 // A lookup that vets every answer and refuses the whole request when any one is
-// refused. `net.connect` calls this with `all: true`, and the answers that come
-// back are the addresses it may use — none other, so there is no second
-// resolution to race.
+// refused. `net.connect` may call this with `all: true` or request one address.
+// The wrapper asks the base resolver for all answers and vets what it returns;
+// the callback returns the vetted list or its first address in the requested form.
+// There is no second resolution to race.
 export function vettedLookup(base: DnsLookup, policy: AddressPolicy): DnsLookup {
   return (hostname, options, callback) => {
     base(hostname, { ...options, all: true, verbatim: true }, (error, addresses, family) => {
