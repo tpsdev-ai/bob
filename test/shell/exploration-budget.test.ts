@@ -83,6 +83,26 @@ function makeSession(opts: {
           toolName,
           args: { path: `f${i}.ts` },
         });
+        // A write-class call that really edited a file ends with the tool's own
+        // success evidence, so the run counts as a verified edit (bob#283) and the
+        // completion rule does not refuse it.
+        if (toolName === "edit_lines") {
+          emit({
+            type: "tool_execution_end",
+            toolCallId: `t${i}`,
+            toolName,
+            isError: false,
+            result: {
+              content: [{ type: "text", text: "edited f0.ts" }],
+              details: {
+                fingerprint: "F#0123456789abcdef",
+                lineCount: 8,
+                lineDelta: 2,
+                signals: [],
+              },
+            },
+          });
+        }
         i += 1;
       }
       if (opts.resolve === true) {

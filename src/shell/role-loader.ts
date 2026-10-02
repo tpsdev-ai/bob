@@ -31,6 +31,12 @@ export interface RoleTemplate {
   // value that is not a positive whole number is a load error, like any other
   // role.json defect.
   exploration_budget?: number;
+  // bob#283: whether a one-shot run must end with a verified file edit or a
+  // final message that begins with BLOCKED. `builder-local` opts in; a role that
+  // names none (every other shipped role) keeps today's completion rule.
+  // Validated at load: a value that is not true or false is a load error, like
+  // any other role.json defect.
+  require_edit_or_blocked?: boolean;
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think
   // (off | low | high). bob.yaml's `session:` block overrides either key for
@@ -93,12 +99,22 @@ export function loadRole(role: BobRole): RoleTemplate {
         );
       }
     }
+    let requireEditOrBlocked: boolean | undefined;
+    if (config.require_edit_or_blocked !== undefined) {
+      if (typeof config.require_edit_or_blocked !== "boolean") {
+        throw new Error(`${configPath}: "require_edit_or_blocked" must be true or false.`);
+      }
+      requireEditOrBlocked = config.require_edit_or_blocked;
+    }
     return {
       role,
       soul,
       ...config,
       ...(session !== undefined ? { session } : {}),
       ...(explorationBudget !== undefined ? { exploration_budget: explorationBudget } : {}),
+      ...(requireEditOrBlocked !== undefined
+        ? { require_edit_or_blocked: requireEditOrBlocked }
+        : {}),
     } as RoleTemplate;
   }
   throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);

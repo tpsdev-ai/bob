@@ -277,7 +277,11 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
         ? {
             fix: "the last run read past its exploration budget with no edit — give the task an exact edit, or raise run.exploration_budget in bob.yaml (or exploration_budget in the role's role.json)",
           }
-        : {}),
+        : reason === "no_edit_no_blocked"
+          ? {
+              fix: "the last run made no file edit and did not report BLOCKED — give the task an exact edit, or have the run begin its final message with BLOCKED",
+            }
+          : {}),
     });
   }
 

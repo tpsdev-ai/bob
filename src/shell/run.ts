@@ -78,6 +78,7 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
+import { isVerifiedFileEdit } from "./edit-evidence.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -724,6 +725,10 @@ export interface RunOptions {
   // the run. Overrides the resolved bob.yaml/role value (tests use a small
   // value). Undefined leaves the resolved value in force.
   explorationBudget?: number;
+  // bob#283: whether this run must end with a verified file edit or an explicit
+  // BLOCKED report. Overrides the role's `require_edit_or_blocked` (tests use
+  // it); undefined leaves the resolved role value in force.
+  requireEditOrBlocked?: boolean;
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
   // Tests pass small values.
@@ -765,6 +770,10 @@ export interface RunResult {
   // is non-zero, and the run log carries the `exploration_budget_exhausted`
   // outcome.
   explorationBudgetExhausted?: { limit: number; readOnlyCalls: number };
+  // bob#283: set when a run that made no verified edit ended without a BLOCKED
+  // report — the exit code is non-zero and the run log carries the
+  // `no_edit_no_blocked` outcome.
+  noEditNoBlocked?: true;
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -787,6 +796,12 @@ export async function attachFlairBootstrap(
 
 // bob#143 item 3 — the loop breaker error and its log line live in
 // tool-loop.ts, shared by the one-shot run and the persistent turn path.
+// bob#283 — the line the runtime prints when a run that made no verified edit
+// also did not report BLOCKED, so it is not reported as a success.
+function noEditNoBlockedMessage(name: string): string {
+  return `bob run ${name}: NO EDIT AND NO BLOCKED REPORT — the run made no verified file edit and its final message did not begin with BLOCKED, so it was not reported as a success (exit 1). Make the edit, or end with a message that begins with BLOCKED.\n`;
+}
+
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -861,6 +876,13 @@ async function runBoundedSession(
   // or undefined when neither the role nor bob.yaml configures one. Only the
   // one-shot run observes it.
   const explorationLimit = opts.explorationBudget ?? resolved.explorationBudget;
+  // bob#283: whether this run must end with a verified file edit or an explicit
+  // BLOCKED report. The role opts in (role.json `require_edit_or_blocked`, true
+  // in builder-local) and an explicit option overrides it. A mail turn keeps its
+  // own completion contract, and the persistent runtime does not judge its turns
+  // here.
+  const requireEditOrBlocked =
+    opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -1043,6 +1065,10 @@ async function runBoundedSession(
   const loopController = new AbortController();
   let loopBreaker: { toolName: string; count: number } | undefined;
   let explorationExhausted: { limit: number; readOnlyCalls: number } | undefined;
+  // bob#283: the run's verified file edits (edit-evidence.ts) — what the
+  // completion rule below reads to decide whether the run made progress.
+  let verifiedEdits = 0;
+  let noEditNoBlocked = false;
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
     if (loopBreaker !== undefined) {
       // A synchronous session may emit the breaking event before its prompt
@@ -1153,6 +1179,14 @@ async function runBoundedSession(
         process.stderr.write(loopBreakMessage(opts.name, toolName, args, observation.count));
         loopController.abort();
       }
+    }
+    // bob#283: count the calls that count as an edit — a write-class file-edit
+    // tool that ended without an error and carried its own success evidence.
+    if (event.type === "tool_execution_end") {
+      const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
+      const isError = (event as unknown as { isError?: unknown }).isError;
+      const result = (event as unknown as { result?: unknown }).result;
+      if (isVerifiedFileEdit(toolName, isError, result)) verifiedEdits += 1;
     }
     // bob#279: count consecutive READ-ONLY calls; at the budget, inject the one
     // instruction; at twice the budget, end the run. A write-class call resets
@@ -1368,6 +1402,19 @@ async function runBoundedSession(
       );
       reportWorktreeStatus(opts.name, config.cwd, true);
     }
+    // bob#283: for a role that opts in, a run the judge accepted is a completion
+    // only when it made a verified edit or its final message is an explicit
+    // BLOCKED report. With neither, it exits non-zero with the distinct outcome
+    // `no_edit_no_blocked`, recorded in the log like the others.
+    if (exitCode === 0 && requireEditOrBlocked && verifiedEdits === 0) {
+      if (!finalTextNow().startsWith("BLOCKED")) {
+        exitCode = 1;
+        noEditNoBlocked = true;
+        writeRunLog({ t: now().toISOString(), outcome: { reason: "no_edit_no_blocked" } }, false);
+        process.stderr.write(noEditNoBlockedMessage(opts.name));
+        reportWorktreeStatus(opts.name, config.cwd, true);
+      }
+    }
   } catch (err) {
     exitCode = 1;
     failed = true;
@@ -1443,6 +1490,7 @@ async function runBoundedSession(
     ...(explorationExhausted !== undefined
       ? { explorationBudgetExhausted: explorationExhausted }
       : {}),
+    ...(noEditNoBlocked ? { noEditNoBlocked: true as const } : {}),
     ...(aborted !== undefined ? { aborted } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
@@ -1637,6 +1685,9 @@ export interface ResolvedRunConfig {
   // over the role's role.json `exploration_budget`. Absent when neither sets one,
   // which leaves the budget off. Only a one-shot `bob run` observes it.
   explorationBudget?: number;
+  // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
+  // when the role does not. Only a one-shot `bob run` observes it.
+  requireEditOrBlocked?: true;
   // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
   // validated for every caller. A one-shot `bob run` overlays its per-invocation
   // flags on these to arm the run.
@@ -2124,6 +2175,14 @@ export function resolveExplorationBudget(yamlText: string): number | undefined {
   return own ?? role;
 }
 
+// bob#283: whether a one-shot run of this agent must end with a verified file
+// edit or an explicit BLOCKED report. Role-scoped: role.json
+// `require_edit_or_blocked` (true in builder-local); a role that names none
+// keeps today's completion rule.
+export function resolveRequireEditOrBlocked(yamlText: string): boolean {
+  return loadRole(readAgentRole(yamlText) as BobRole).require_edit_or_blocked === true;
+}
+
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -2208,6 +2267,8 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // bob#279: the exploration budget (bob.yaml `run.exploration_budget` over
   // role.json `exploration_budget`), or undefined when neither sets one.
   const explorationBudget = resolveExplorationBudget(yamlText);
+  // bob#283: the role's edit-or-blocked opt-in.
+  const requireEditOrBlocked = resolveRequireEditOrBlocked(yamlText);
 
   // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
   // applied HERE, after both branches, so it binds an ADOPTED agent's grant
@@ -2286,6 +2347,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     runLimits: readRunLimits(yamlText),
     ...(explorationBudget !== undefined ? { explorationBudget } : {}),
+    ...(requireEditOrBlocked ? { requireEditOrBlocked: true as const } : {}),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }
