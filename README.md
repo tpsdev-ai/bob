@@ -348,7 +348,7 @@ change one, the named test is what tells you.
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.
-  The exploration budget uses the same edit predicate. Tracked files reuse hashes
+  The exploration budget uses the same edit predicate. Regular tracked files reuse hashes
   when `(dev, ino, size, mtimeNs, ctimeNs, mode)` is unchanged; files above 1 MiB are streamed.
   The history-equal check excludes trees reachable from refs at launch. If enumeration
   exceeds 10,000 commits, times out or fails, only file-edit tools can give edit credit.
