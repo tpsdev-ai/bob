@@ -3,11 +3,11 @@
 // R1c builds the `web_fetch` tool on it). Everything a fetch must respect lives
 // here, so the tool slice can stay thin.
 //
-// THE CONNECTION. One owned, direct undici Agent is built per call and
-// destroyed with it. Its connector's `lookup` is vettedLookup: it resolves the
-// name, vets EVERY answer against the address policy, and hands those same
-// answers to the socket — so the address that is checked is the address that is
-// connected to. A canonical literal is vetted in admitUrl before dispatch. The
+// THE CONNECTION. One owned, direct undici Agent is built per hop and
+// destroyed before the next hop. Its connector's `lookup` is vettedLookup: it
+// resolves names, vets EVERY answer against the address policy, and hands
+// those same answers to the socket — so the checked address is the one connected
+// to. A canonical literal is vetted in admitUrl before dispatch. The
 // global dispatcher is never used, no proxy dispatcher is ever built, and the
 // proxy environment is never read.
 //
@@ -18,7 +18,8 @@
 //
 // REDIRECTS. Followed here, by hand, at most five, each target re-admitted
 // through admitUrl (scheme, port, userinfo, zone, downgrade, canonical literal)
-// and each hop re-vetted by the same lookup. A redirect status without a
+// and each named hop uses a new connection with a fresh vetted DNS lookup.
+// Canonical literals are vetted at admission. A redirect status without a
 // Location is returned as the final response.
 //
 // LIMITS. One 15-second deadline covers the whole operation, every hop, and
@@ -256,10 +257,11 @@ async function decodeBody(encoded: Buffer, encoding: string | undefined): Promis
 }
 
 // A body that cannot be used is terminated without reading untrusted bytes.
-// This closes its connection; a followed redirect opens another through the
-// same vetted dispatcher. Destroying an undici body before it is read raises an
-// abort error on the body, and with no 'error' listener node treats that as
-// unhandled and aborts the process — so the listener is attached before the
+// Destroying an unfinished body aborts its request; a completed response may
+// leave its connection reusable until the hop's dispatcher is destroyed.
+// Destroying an undici body before it is read raises an abort error on the
+// body, and with no 'error' listener node treats that as unhandled and aborts
+// the process — so the listener is attached before the
 // destroy. The body is being discarded: that error carries nothing this call
 // can use.
 export function discard(body: {
@@ -285,14 +287,6 @@ export async function fetchDocument(
   const maxChars = resolveMaxChars(options.maxChars, options.settings.fetchMaxChars);
   const deadlineMs = deps.deadlineMs ?? TOTAL_DEADLINE_MS;
 
-  const dispatcher = new Agent({
-    connect: {
-      timeout: deadlineMs,
-      lookup: vettedLookup(deps.lookup ?? (nodeLookup as unknown as DnsLookup), policy.address),
-      ...(deps.tlsCa === undefined ? {} : { ca: deps.tlsCa }),
-    },
-  });
-
   const controller = new AbortController();
   let expired = false;
   const timer = setTimeout(() => {
@@ -307,47 +301,60 @@ export async function fetchDocument(
     let redirects = 0;
 
     for (;;) {
-      let response: Awaited<ReturnType<typeof request>>;
+      // No pooled connection survives a hop, including a completed keep-alive
+      // redirect response. A followed name must connect through a fresh vetted
+      // lookup, even when it names the same origin.
+      const dispatcher = new Agent({
+        connect: {
+          timeout: deadlineMs,
+          lookup: vettedLookup(deps.lookup ?? (nodeLookup as unknown as DnsLookup), policy.address),
+          ...(deps.tlsCa === undefined ? {} : { ca: deps.tlsCa }),
+        },
+      });
       try {
-        response = await request(current.href, {
-          dispatcher,
-          method: "GET",
-          headers: { "user-agent": USER_AGENT, accept: ACCEPT_HEADER },
-          signal: controller.signal,
-        });
-      } catch (error) {
-        if (expired) throw deadlineError();
-        const refusal = refusalIn(error);
-        if (refusal !== undefined) throw refusal;
-        throw new WebFetchError("network", boundedDetail(error));
-      }
-
-      const status = response.statusCode;
-      if (REDIRECT_STATUSES.includes(status)) {
-        const location = headerValue(response.headers.location);
-        if (location === undefined) {
-          return await readResult(response, status, current, maxChars);
+        let response: Awaited<ReturnType<typeof request>>;
+        try {
+          response = await request(current.href, {
+            dispatcher,
+            method: "GET",
+            headers: { "user-agent": USER_AGENT, accept: ACCEPT_HEADER },
+            signal: controller.signal,
+          });
+        } catch (error) {
+          if (expired) throw deadlineError();
+          const refusal = refusalIn(error);
+          if (refusal !== undefined) throw refusal;
+          throw new WebFetchError("network", boundedDetail(error));
         }
-        discard(response.body);
-        redirects += 1;
-        if (redirects > MAX_REDIRECTS) {
-          throw new WebFetchError(
-            "redirect-limit",
-            `the response redirects more than ${MAX_REDIRECTS} times`,
-          );
-        }
-        current = admitUrl(location, policy, { from: current });
-        continue;
-      }
 
-      return await readResult(response, status, current, maxChars);
+        const status = response.statusCode;
+        if (REDIRECT_STATUSES.includes(status)) {
+          const location = headerValue(response.headers.location);
+          if (location === undefined) {
+            return await readResult(response, status, current, maxChars);
+          }
+          discard(response.body);
+          redirects += 1;
+          if (redirects > MAX_REDIRECTS) {
+            throw new WebFetchError(
+              "redirect-limit",
+              `the response redirects more than ${MAX_REDIRECTS} times`,
+            );
+          }
+          current = admitUrl(location, policy, { from: current });
+          continue;
+        }
+
+        return await readResult(response, status, current, maxChars);
+      } finally {
+        await dispatcher.destroy();
+      }
     }
   } catch (error) {
     if (expired) throw deadlineError();
     throw error;
   } finally {
     clearTimeout(timer);
-    await dispatcher.destroy();
   }
 }
 

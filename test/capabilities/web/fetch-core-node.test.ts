@@ -117,6 +117,7 @@ const CASE_NAMES = [
   "http-default-off",
   "port-not-allowed",
   "redirects",
+  "redirect-relookup",
   "redirect-private",
   "redirect-scheme",
   "downgrade",
@@ -177,7 +178,7 @@ const seen = (name: string): Record<string, unknown> => {
 };
 const refusal = (name: string, key = "refusal"): Refusal => seen(name)[key] as Refusal;
 
-test("fetches an HTTPS page, sending GET and only the fixed headers", () => {
+test("fetches an HTTPS page with fixed User-Agent and Accept and no credential headers", () => {
   const observed = seen("https-page");
   expect(observed.status).toBe(200);
   expect(observed.contentType).toBe("text/html");
@@ -263,6 +264,18 @@ test("follows redirects by hand, at most five, resolving relative targets", () =
   }
   expect(observed.maxRedirects).toBe(5);
   expect((observed.six as Refusal).code).toBe("redirect-limit");
+});
+
+test("opens a fresh vetted connection for each completed same-origin redirect hop", () => {
+  const observed = seen("redirect-relookup");
+  expect(observed.allowedText).toBe("done");
+  expect(observed.allowedLookups).toEqual(["peer.test", "peer.test"]);
+  expect(observed.allowedConnections).toBe(2);
+  expect(observed.allowedRequests).toBe(2);
+  expect((observed.denied as Refusal).code).toBe("address");
+  expect(observed.deniedLookups).toBe(2);
+  expect(observed.deniedConnections).toBe(1);
+  expect(observed.deniedRequests).toBe(1);
 });
 
 test("refuses a redirect to a private address, and the private peer sees nothing", () => {

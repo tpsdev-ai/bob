@@ -8,10 +8,11 @@
 // walked: script, style, noscript, template, head, iframe, svg, canvas, object
 // and embed subtrees are dropped, an element that is hidden (the `hidden`
 // attribute, `display: none`, `visibility: hidden`, `aria-hidden="true"`) is
-// dropped with its subtree, block elements become line breaks, and a link is
-// kept inline as `text (resolved url)` with its href resolved against the page
-// URL. Every other allowed type is returned as it arrived, trimmed: the core
-// does not restructure JSON, XML, RSS or Markdown.
+// dropped with its subtree, only the tags in BLOCK_TAGS add line breaks, and a
+// link is kept inline as `text (resolved url)` when its href resolves against
+// the page URL (otherwise its text alone is kept). Every other allowed type is
+// decoded as UTF-8 and trimmed: the core does not restructure JSON, XML, RSS
+// or Markdown.
 //
 // LIMIT. truncateText cuts to the character limit the caller resolved (the
 // operator's ceiling, or a lower value the model asked for) and says whether it

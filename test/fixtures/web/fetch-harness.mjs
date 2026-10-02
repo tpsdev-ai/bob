@@ -128,8 +128,8 @@ async function httpsPeer(handler, address = LOOPBACK) {
 
 // ── the seams a loopback case needs ────────────────────────────────────────
 
-// A policy that allows exactly the addresses named and classifies everything
-// else with the real registry.
+// Add the named addresses to public-unicast classification; all others use
+// that real policy with own-address exclusions disabled for these tests.
 function testPolicy(allowed) {
   const base = publicUnicastPolicy({ own: [] });
   return {
@@ -376,6 +376,53 @@ await record("redirects", async () => {
     headers,
     maxRedirects: MAX_REDIRECTS,
     six,
+  };
+});
+
+await record("redirect-relookup", async () => {
+  const peer = await httpPeer((req, res) => {
+    if (req.url === "/start") {
+      res.writeHead(302, { location: "/finish", "content-length": "0" });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("done");
+  });
+  const allowedLookups = [];
+  const allowed = await fetchDocument(
+    url(peer, "/start"),
+    { settings: allowHttp() },
+    {
+      ...depsFor(peer),
+      lookup: cannedLookup([{ address: LOOPBACK, family: 4 }], (host) => allowedLookups.push(host)),
+    },
+  );
+  const allowedConnections = peer.connections();
+  const allowedRequests = peer.requests.length;
+  let deniedLookups = 0;
+  const denied = await refusalOf(
+    fetchDocument(
+      url(peer, "/start"),
+      { settings: allowHttp() },
+      {
+        ...depsFor(peer),
+        lookup: (_host, _options, callback) => {
+          deniedLookups += 1;
+          callback(null, [{ address: deniedLookups === 1 ? LOOPBACK : "127.0.0.2", family: 4 }]);
+        },
+      },
+    ),
+  );
+  return {
+    allowedText: allowed.text,
+    allowedLookups,
+    allowedConnections,
+    allowedRequests,
+    denied,
+    deniedLookups,
+    deniedConnections: peer.connections() - allowedConnections,
+    deniedRequests: peer.requests.length - allowedRequests,
   };
 });
 
