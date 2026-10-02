@@ -22,8 +22,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants as fsConstants,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -116,6 +118,8 @@ export interface ApplyPatchDeps {
   // VERIFIED BYTES are applied. A test replaces the artifact file here to prove
   // a reopened pathname is never applied.
   afterDigestVerified?: (bytes: Buffer, artifactPath: string) => void;
+  beforeCandidateWrite?: (dir: string) => void;
+  writeCandidateRecord?: (fd: number, data: string) => void;
   // Seam: a unique suffix for the candidate record's temp file name (default: random).
   uniqueSuffix?: () => string;
   // Seam: the clock for the record timestamp.
@@ -518,13 +522,9 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
   }
 }
 
-// Open and verify the candidate directory — the one pre-existing directory the
-// tool writes records into. It must be a plain directory of this account,
-// owner-only: `mkdirSync` alone accepts a symlink to a directory, and the
-// record write and its rename would then follow it into whatever it points at,
-// including the caller's checkout. The returned descriptor pins the verified
-// directory, so a pathname replaced after this check is not written through.
-function openCandidateDir(dir: string): { ok: true; fd: number } | ApplyPatchRefusal {
+function openCandidateDir(
+  dir: string,
+): { ok: true; fd: number; dev: bigint; ino: bigint } | ApplyPatchRefusal {
   try {
     mkdirSync(dir, { mode: 0o700 });
   } catch (err) {
@@ -535,9 +535,9 @@ function openCandidateDir(dir: string): { ok: true; fd: number } | ApplyPatchRef
       );
     }
   }
-  let st: ReturnType<typeof lstatSync>;
+  let st: BigIntStats;
   try {
-    st = lstatSync(dir);
+    st = lstatSync(dir, { bigint: true });
   } catch {
     return refuse(
       "storage_failed",
@@ -551,40 +551,35 @@ function openCandidateDir(dir: string): { ok: true; fd: number } | ApplyPatchRef
     );
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (uid !== undefined && st.uid !== uid) {
+  if (uid !== undefined && st.uid !== BigInt(uid)) {
     return refuse(
       "storage_failed",
       `apply_patch refused: the candidate directory ${dir} is owned by uid ${st.uid}, not this user (${uid}).`,
     );
   }
-  if ((st.mode & 0o077) !== 0) {
+  if ((st.mode & 0o077n) !== 0n) {
     return refuse(
       "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} has mode ${(st.mode & 0o777).toString(8)}, readable by other users.`,
+      `apply_patch refused: the candidate directory ${dir} has mode ${(st.mode & 0o777n).toString(8)}, readable by other users.`,
     );
   }
-  let fd: number;
+  let fd: number | undefined;
   try {
-    fd = openSync(
-      dir,
-      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | fsConstants.O_NOFOLLOW,
-    );
+    fd = openSync(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const pin = fstatSync(fd, { bigint: true });
+    if (pin.dev !== st.dev || pin.ino !== st.ino) {
+      throw new Error("the candidate directory changed while being pinned");
+    }
+    return { ok: true, fd, dev: pin.dev, ino: pin.ino };
   } catch (err) {
+    if (fd !== undefined) closeSync(fd);
     return refuse(
       "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} could not be opened without following a link (${(err as NodeJS.ErrnoException).code ?? "error"}).`,
+      `apply_patch refused: the candidate directory ${dir} could not be pinned (${err instanceof Error ? err.message : String(err)}).`,
     );
   }
-  return { ok: true, fd };
 }
 
-// Store the candidate record atomically under the tool-owned state root. The
-// record is written to a temp file and renamed into place, so a reader never
-// sees a half-written candidate. Both steps go through the descriptor of the
-// verified candidate directory (openCandidateDir), so neither follows a
-// pathname replaced after that check; a failed rename removes the temporary
-// record. Failure refuses (storage_failed) — a candidate whose record was not
-// stored is not returned as a success.
 function storeCandidate(
   stateRoot: string,
   record: CandidateRecord,
@@ -593,22 +588,28 @@ function storeCandidate(
   const dir = join(stateRoot, "candidates");
   const opened = openCandidateDir(dir);
   if (!opened.ok) return opened;
-  const via = `/dev/fd/${opened.fd}`;
   const tmpName = `.tmp-${deps.uniqueSuffix?.() ?? `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-  let wroteTmp = false;
+  const tmpPath = join(dir, tmpName);
+  let fd: number | undefined;
   try {
-    writeFileSync(join(via, tmpName), `${JSON.stringify(record, null, 2)}\n`, {
-      mode: 0o600,
-      flag: "wx",
-    });
-    wroteTmp = true;
-    renameSync(join(via, tmpName), join(via, `${record.candidate_id}.json`));
+    deps.beforeCandidateWrite?.(dir);
+    fd = openSync(
+      tmpPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    (deps.writeCandidateRecord ?? writeFileSync)(fd, `${JSON.stringify(record, null, 2)}\n`);
+    const after = lstatSync(dir, { bigint: true });
+    if (after.dev !== opened.dev || after.ino !== opened.ino) {
+      throw new Error("the candidate directory changed after it was pinned");
+    }
+    renameSync(tmpPath, join(dir, `${record.candidate_id}.json`));
     return { ok: true };
   } catch (err) {
     let leftover = "";
-    if (wroteTmp) {
+    if (fd !== undefined) {
       try {
-        rmSync(join(via, tmpName), { force: true });
+        rmSync(tmpPath, { force: true });
       } catch (rerr) {
         leftover = `; the temporary record ${tmpName} could not be removed (${rerr instanceof Error ? rerr.message : String(rerr)})`;
       }
@@ -618,7 +619,11 @@ function storeCandidate(
       `apply_patch refused: the candidate could not be stored under ${dir} (${err instanceof Error ? err.message : String(err)})${leftover}.`,
     );
   } finally {
-    closeSync(opened.fd);
+    try {
+      if (fd !== undefined) closeSync(fd);
+    } finally {
+      closeSync(opened.fd);
+    }
   }
 }
 
