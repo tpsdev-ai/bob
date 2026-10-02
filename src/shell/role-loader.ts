@@ -23,11 +23,7 @@ export interface RoleTemplate {
   default_provider?: string;
   default_model?: string;
   exploration_budget?: number;
-  // bob#283: whether a one-shot run must end with a verified file edit or a
-  // final message that begins with BLOCKED. `builder-local` opts in; a role that
-  // names none (every other shipped role) keeps today's completion rule.
-  // Validated at load: a value that is not true or false is a load error, like
-  // any other role.json defect.
+  // Completion gate for bob run and launch with a prompt; mail turns are exempt.
   require_edit_or_blocked?: boolean;
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think

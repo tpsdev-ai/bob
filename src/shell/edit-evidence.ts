@@ -1,21 +1,3 @@
-// bob#283 — the ONE rule for a "verified edit": a write-class FILE-EDIT tool
-// whose execution ended without an error, without a refusal, and with the
-// tool's own success evidence in its result.
-//
-// A write-class row is not enough on its own. `run`/`bash`/`powershell` are
-// writer rows (a command can change anything) but they are commands, not file
-// edits; `flair_write` and the other writer tools (a memory write, an egress)
-// are not file edits either. Only the names below carry per-file success
-// evidence, read from their implementations:
-//   edit_lines, insert_after  details.fingerprint (F# + 16 hex), details.lineDelta
-//   write_file                details.fingerprint, details.bytes
-//   edit                      details.diff, nonblank
-//   write                     a text block "Successfully wrote N bytes to <path>"
-//   replace_lines             a text block "Replaced lines A-B in <path>."
-// A refusal (`details.refused`, the shape the setup tools return) is never
-// evidence, and a name with no row is never evidence: an unknown tool is not a
-// success.
-
 import { TOOL_EFFECTS } from "./tool-allowlist.js";
 
 // Writer effects that run a command or a request rather than editing a file.
@@ -31,9 +13,26 @@ export function isFileEditTool(toolName: string): boolean {
 }
 
 export function hasEditSuccessEvidence(toolName: string, result: unknown): boolean {
-  if (result === null || typeof result !== "object") return false;
-  const output = result as { details?: Record<string, unknown>; content?: unknown };
-  const details = output.details;
+  if (result === null || typeof result !== "object" || Array.isArray(result)) return false;
+  const output = result as { details?: unknown; content?: unknown };
+  if (!Array.isArray(output.content) || output.content.length === 0) return false;
+  for (const block of output.content) {
+    if (
+      block === null ||
+      typeof block !== "object" ||
+      Array.isArray(block) ||
+      block.type !== "text" ||
+      typeof block.text !== "string" ||
+      block.text.trim().length === 0
+    )
+      return false;
+  }
+  if (
+    output.details !== undefined &&
+    (output.details === null || typeof output.details !== "object" || Array.isArray(output.details))
+  )
+    return false;
+  const details = output.details as Record<string, unknown> | undefined;
   // A refusal is not an edit, whatever else the result carries.
   if (details?.refused) return false;
   switch (toolName) {
@@ -60,13 +59,7 @@ export function hasEditSuccessEvidence(toolName: string, result: unknown): boole
         toolName === "write"
           ? /^Successfully wrote \d+ bytes to [\s\S]+$/
           : /^Replaced lines [1-9]\d*-[1-9]\d* in [\s\S]+\.$/;
-      return (
-        Array.isArray(output.content) &&
-        output.content.some(
-          (block) =>
-            block?.type === "text" && typeof block.text === "string" && success.test(block.text),
-        )
-      );
+      return output.content.some((block) => success.test(block.text));
     }
     default:
       return false;

@@ -275,7 +275,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
           }
         : reason === "no_edit_no_blocked"
           ? {
-              fix: "the last run made no file edit and did not report BLOCKED — give the task an exact edit, or have the run begin its final message with BLOCKED",
+              fix: "the last run had no verified file-edit-tool evidence and did not report BLOCKED — give the task an exact edit, or have the run begin its final message with BLOCKED",
             }
           : {}),
     });

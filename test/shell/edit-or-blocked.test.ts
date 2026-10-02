@@ -1,10 +1,3 @@
-// bob#283 — a builder-local run ends with a verified file edit or an explicit
-// BLOCKED report. Through runAgent with a fabricated session: a run whose final
-// text is a plan with no edit exits non-zero with the outcome
-// `no_edit_no_blocked`; a run with a verified edit completes normally; a run
-// ending in BLOCKED with no edit exits as a BLOCKED report; a refused edit
-// followed by a plan does not count; and a role without the opt-in keeps
-// today's completion rule. The last case also checks the run log and doctor.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,12 +15,9 @@ import {
   type RunSessionFactory,
   resolveRequireEditOrBlocked,
   runAgent,
+  runLaunch,
 } from "../../src/shell/run.js";
 
-// The result shapes below are the ones the real tools emit, read from their
-// implementations: anchored-edit's details (src/capabilities/anchored-edit/
-// core.ts), bob's replace_lines (src/shell/bob-edit-tools.ts) and pi's write
-// and edit (dist/core/tools/*.js).
 const EDIT_LINES_OK = {
   content: [{ type: "text", text: "edited f0.ts" }],
   details: { fingerprint: "F#0123456789abcdef", lineCount: 8, lineDelta: 2, signals: [] },
@@ -150,6 +140,45 @@ describe("the verified-edit predicate", () => {
     expect(isFileEditTool("edit_lines")).toBe(true);
   });
 
+  for (const [tool, result] of [
+    ["edit_lines", EDIT_LINES_OK],
+    ["insert_after", EDIT_LINES_OK],
+    ["write_file", WRITE_FILE_OK],
+    ["edit", PI_EDIT_OK],
+    ["write", PI_WRITE_OK],
+    ["replace_lines", REPLACE_LINES_OK],
+  ] as const) {
+    it(`${tool} rejects missing content`, () => {
+      const { content: _content, ...missing } = result;
+      expect(isVerifiedFileEdit(tool, false, missing)).toBe(false);
+    });
+
+    it.each([
+      ["undefined", undefined],
+      ["null", null],
+      ["string", "success"],
+      ["object", { type: "text", text: "success" }],
+      ["empty array", []],
+      ["null block", [null]],
+      ["string block", ["success"]],
+      ["missing type", [{ text: "success" }]],
+      ["wrong type", [{ type: "image", text: "success" }]],
+      ["missing text", [{ type: "text" }]],
+      ["numeric text", [{ type: "text", text: 12 }]],
+      ["blank text", [{ type: "text", text: "  " }]],
+      ["malformed trailing block", [...result.content, { type: "text", text: 12 }]],
+    ])(`${tool} rejects malformed content: %s`, (_label, content) => {
+      expect(isVerifiedFileEdit(tool, false, { ...result, content })).toBe(false);
+    });
+
+    it.each([[null], [false], ["details"], [[]]])(
+      `${tool} rejects malformed details: %p`,
+      (details) => {
+        expect(isVerifiedFileEdit(tool, false, { ...result, details })).toBe(false);
+      },
+    );
+  }
+
   it("does not count an error, a refusal, a command, a read or an unknown name", () => {
     expect(isVerifiedFileEdit("edit_lines", true, EDIT_LINES_OK)).toBe(false);
     expect(
@@ -173,14 +202,19 @@ describe("the verified-edit predicate", () => {
     expect(hasEditSuccessEvidence("edit_lines", {})).toBe(false);
     expect(
       hasEditSuccessEvidence("edit_lines", {
+        ...EDIT_LINES_OK,
         details: { fingerprint: "not-a-fingerprint", lineDelta: 1 },
       }),
     ).toBe(false);
     expect(
-      hasEditSuccessEvidence("edit_lines", { details: { fingerprint: "F#0123456789abcdef" } }),
+      hasEditSuccessEvidence("edit_lines", {
+        ...EDIT_LINES_OK,
+        details: { fingerprint: "F#0123456789abcdef" },
+      }),
     ).toBe(false);
     expect(
       hasEditSuccessEvidence("write_file", {
+        ...WRITE_FILE_OK,
         details: { fingerprint: "F#0123456789abcdef", bytes: -1 },
       }),
     ).toBe(false);
@@ -199,8 +233,10 @@ describe("the verified-edit predicate", () => {
         content: [{ type: "text", text: "Replaced lines 3-4 in f0.ts" }],
       }),
     ).toBe(false);
-    expect(hasEditSuccessEvidence("edit", { details: { diff: "   " } })).toBe(false);
-    expect(hasEditSuccessEvidence("edit", { details: { diff: "-a\n+b" } })).toBe(true);
+    expect(hasEditSuccessEvidence("edit", { ...PI_EDIT_OK, details: { diff: "   " } })).toBe(false);
+    expect(hasEditSuccessEvidence("edit", { ...PI_EDIT_OK, details: { diff: "-a\n+b" } })).toBe(
+      true,
+    );
   });
 });
 
@@ -259,6 +295,8 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
       ["null-error", "edit_lines", null, EDIT_LINES_OK, false],
       ["string-error", "edit_lines", "false", EDIT_LINES_OK, false],
       ["numeric-error", "edit_lines", 0, EDIT_LINES_OK, false],
+      ["missing-content", "edit_lines", false, { details: EDIT_LINES_OK.details }, false],
+      ["malformed-content", "edit_lines", false, { ...EDIT_LINES_OK, content: "edited" }, false],
     ] as const) {
       mkAgent(name, "builder-local", toolName);
       const fake = makeSession({
@@ -335,6 +373,117 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     expect(lastOutcomeReason("blocked")).toBeUndefined();
   }, 15_000);
 
+  it.each(["BLOCKEDNESS is not a report.", "BLOCKED-glued text is not a report."])(
+    "rejects a BLOCKED prefix without a standalone token: %s",
+    async (finalText) => {
+      mkAgent("prefix", "builder-local", "read_lines");
+      const fake = makeSession({ finalText });
+      const res = await runAgent({
+        name: "prefix",
+        prompt: "do the task",
+        agentsRoot,
+        sessionFactory: factoryReturning(fake.session),
+      });
+      expect(res.exitCode).toBe(1);
+      expect(res.noEditNoBlocked).toBe(true);
+      expect(lastOutcomeReason("prefix")).toBe("no_edit_no_blocked");
+    },
+    15_000,
+  );
+
+  it.each(["BLOCKED", "BLOCKED missing input.", "BLOCKED\nMissing input."])(
+    "accepts a standalone BLOCKED opening token: %s",
+    async (finalText) => {
+      mkAgent("token", "builder-local", "read_lines");
+      const fake = makeSession({ finalText });
+      const res = await runAgent({
+        name: "token",
+        prompt: "do the task",
+        agentsRoot,
+        sessionFactory: factoryReturning(fake.session),
+      });
+      expect(res.exitCode).toBe(0);
+      expect(res.noEditNoBlocked).toBeUndefined();
+    },
+    15_000,
+  );
+
+  it.each([
+    ["plan", "I will edit next.", false, 1],
+    ["blocked", "BLOCKED: missing input.", false, 0],
+    ["edited", "Edited f0.ts.", true, 0],
+  ] as const)(
+    "launch with a prompt applies the gate: %s",
+    async (name, finalText, edited, code) => {
+      mkAgent(name, "builder-local", "edit_lines");
+      const fake = makeSession({
+        finalText,
+        calls: edited ? [{ toolName: "edit_lines", result: EDIT_LINES_OK }] : [],
+      });
+      expect(
+        await runLaunch({
+          name,
+          prompt: "do the task",
+          agentsRoot,
+          sessionFactory: factoryReturning(fake.session),
+        }),
+      ).toBe(code);
+      expect(lastOutcomeReason(name)).toBe(code === 1 ? "no_edit_no_blocked" : undefined);
+    },
+    15_000,
+  );
+
+  it("launch without a prompt uses the interactive path", async () => {
+    mkAgent("interactive", "builder-local", "read_lines");
+    let opened = false;
+    expect(
+      await runLaunch({
+        name: "interactive",
+        agentsRoot,
+        sessionFactory: async () => {
+          throw new Error("unexpected one-shot run");
+        },
+        interactive: async () => {
+          opened = true;
+          return 0;
+        },
+      }),
+    ).toBe(0);
+    expect(opened).toBe(true);
+  }, 15_000);
+
+  it("preserves an earlier completion failure", async () => {
+    mkAgent("shape", "builder-local", "read_lines");
+    const fake = makeSession({ finalText: "Here is the plan." });
+    const res = await runAgent({
+      name: "shape",
+      prompt: "do the task",
+      agentsRoot,
+      expectedFinal: (text) => text.startsWith("DONE"),
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.reason).toBe("final_shape_mismatch");
+    expect(res.noEditNoBlocked).toBeUndefined();
+    expect(lastOutcomeReason("shape")).not.toBe("no_edit_no_blocked");
+  }, 15_000);
+
+  it("enforces the gate even when the run log cannot be created", async () => {
+    mkAgent("unlogged", "builder-local", "read_lines");
+    const runsPath = join(agentsRoot, "unlogged", "runs");
+    writeFileSync(runsPath, "not a directory");
+    const fake = makeSession({ finalText: "Here is the plan." });
+    const res = await runAgent({
+      name: "unlogged",
+      prompt: "do the task",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.noEditNoBlocked).toBe(true);
+    expect(readFileSync(runsPath, "utf8")).toBe("not a directory");
+  }, 15_000);
+
   it("does not count a refused edit: a plan after it is still no_edit_no_blocked", async () => {
     mkAgent("refused", "builder-local", "edit_lines");
     const fake = makeSession({
@@ -394,5 +543,6 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     expect(lastRun?.detail).toContain("no_edit_no_blocked");
     expect(lastRun?.status).toBe("warn");
     expect(lastRun?.fix).toContain("BLOCKED");
+    expect(lastRun?.fix).toContain("no verified file-edit-tool evidence");
   }, 15_000);
 });
