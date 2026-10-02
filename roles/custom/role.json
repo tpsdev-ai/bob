@@ -1,6 +1,15 @@
 {
   "tools": {
-    "allow": ["read", "bash", "write", "edit", "flair_search", "flair_write", "flair_get"]
+    "allow": [
+      "read",
+      "bash",
+      "write",
+      "edit",
+      "replace_lines",
+      "flair_search",
+      "flair_write",
+      "flair_get"
+    ]
   },
   "default_provider": "exe-dev-gateway",
   "default_model": "claude-opus-4-7"

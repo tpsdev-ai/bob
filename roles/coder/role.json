@@ -5,6 +5,7 @@
       "bash",
       "write",
       "edit",
+      "replace_lines",
       "grep",
       "find",
       "flair_search",

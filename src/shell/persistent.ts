@@ -126,17 +126,26 @@ function neverResolves(): Promise<void> {
 export async function startPersistent(opts: RunPersistentOptions): Promise<PersistentHandle> {
   const log = opts.log ?? ((m: string) => console.error(m));
   const root = opts.agentsRoot ?? join(homedir(), "agents");
-  const { provider, model, config, cron, agent, capabilities, agentDir, flairBootstrapTarget } =
-    resolveRunConfig({
-      name: opts.name,
-      agentsRoot: root,
-      model: opts.model,
-      // The persistent runtime is resident by definition: this process stays up
-      // behind the agent's service unit with nobody at the keyboard, which is
-      // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
-      // `resident: true` says the same thing for the one-shot path.
-      persistent: true,
-    });
+  const {
+    provider,
+    model,
+    config,
+    cron,
+    agent,
+    capabilities,
+    agentDir,
+    flairBootstrapTarget,
+    toolLoopLimit,
+  } = resolveRunConfig({
+    name: opts.name,
+    agentsRoot: root,
+    model: opts.model,
+    // The persistent runtime is resident by definition: this process stays up
+    // behind the agent's service unit with nobody at the keyboard, which is
+    // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
+    // `resident: true` says the same thing for the one-shot path.
+    persistent: true,
+  });
 
   // Mark this as the persistent runtime so "serving" capabilities (discord's
   // inbound gateway) open their connection — createPiRunSession surfaces it as
@@ -193,7 +202,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
   // the launcher, so the consumer above neither holds nor submits to it.
-  const admission = createTurnAdmission({ log });
+  const admission = createTurnAdmission({ log, toolLoopLimit, name: opts.name });
   config.turnAdmission = admission;
   let session: RunSession;
   try {

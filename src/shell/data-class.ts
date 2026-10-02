@@ -90,6 +90,7 @@ export const BUILTIN_TOOL_DATA_CLASS = Object.freeze({
   read: "private", // returns the bytes of a local file
   bash: "private", // runs a command whose output can carry any local data
   edit: "private", // edits a local file; its result quotes the file
+  replace_lines: "private", // bob#143: rewrites a local file's line range
   write: "private", // writes a local file; its result reports on local paths
   grep: "private", // returns matching lines of local files
   find: "private", // lists local paths

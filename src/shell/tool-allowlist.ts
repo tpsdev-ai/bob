@@ -38,6 +38,10 @@ export const PI_BUILTIN_TOOLS = [
   "find",
   "ls",
   "powershell",
+  // bob#143: bob's own line-anchored editor, registered as a custom tool and
+  // shadowing nothing (pi ships no `replace_lines`). It is named by the `coder`,
+  // `writer` and `custom` roles and the `builder` position, and classified here.
+  "replace_lines",
 ] as const;
 
 // What each tool an agent's allowlist can name does, reviewed by hand, one row
@@ -79,6 +83,7 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze(
   bash: "writer", // pi: runs a command
   write: "writer", // pi: writes a file
   edit: "writer", // pi: edits a file
+  replace_lines: "writer", // bob#143: replaces a line range
   powershell: "writer", // pi (Windows): runs a command
   run: "writer", // work: runs a command
   write_file: "writer", // anchored-edit: writes a file
@@ -491,11 +496,13 @@ export function resolveToolPolicy(opts: ResolveToolPolicyOptions): ToolPolicy {
       ]
     : [];
 
+  const excludeTools = [...new Set([...declaredExclusions, ...residentExclusions])];
+
   return {
     tools,
     // A declared exclusion wins over the allowlist (pi applies `excludeTools`
     // after `tools`), and the resident policy rides on top of both.
-    excludeTools: [...new Set([...declaredExclusions, ...residentExclusions])],
+    excludeTools,
     resident,
     allowResidentShell,
     allowResidentWeb,

@@ -2,7 +2,7 @@
 // the bob.yaml `run:` reader, the layered limit resolution, the abort guard, the
 // turn race, and the operator messages.
 import { describe, expect, it } from "bun:test";
-import { BobYamlError, readRunLimits } from "../../src/shell/bob-yaml.js";
+import { BobYamlError, readRunLimits, readToolLoopLimit } from "../../src/shell/bob-yaml.js";
 import {
   boundMessage,
   createRunBounds,
@@ -14,6 +14,16 @@ import {
 } from "../../src/shell/run-bounds.js";
 
 describe("readRunLimits — the bob.yaml run: block", () => {
+  it("accepts bounds and the loop limit in the same run block", () => {
+    const yaml =
+      "run:\n  wall_clock_seconds: 60\n  turn_timeout_seconds: 10\n  tool_loop_limit: 3\n";
+    expect(readRunLimits(yaml)).toEqual({ wallClockSeconds: 60, turnTimeoutSeconds: 10 });
+    expect(readToolLoopLimit(yaml)).toBe(3);
+    expect(() => readRunLimits(`${yaml}  tool_loop_limit: 4\n`)).toThrow(
+      /"tool_loop_limit" is set again/,
+    );
+  });
+
   it("reads the three keys, in seconds", () => {
     const yaml = [
       "run:",

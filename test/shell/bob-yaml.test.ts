@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { BobYamlError, readBlock, readCapabilities } from "../../src/shell/bob-yaml.js";
+import {
+  BobYamlError,
+  readBlock,
+  readCapabilities,
+  readToolLoopLimit,
+} from "../../src/shell/bob-yaml.js";
 
 describe("readCapabilities", () => {
   it("reads a block-sequence list", () => {
@@ -308,5 +313,42 @@ describe("readBlock — unsupported shapes throw", () => {
     const yaml = ["good:", "  a: 1", "bad:", "  n:", "    m: 2", ""].join("\n");
     expect(readBlock(yaml, "good")).toEqual({ a: 1 });
     expect(() => readBlock(yaml, "bad")).toThrow(BobYamlError);
+  });
+});
+
+describe("readToolLoopLimit (bob#143)", () => {
+  it("reads the limit, and rejects an unknown key", () => {
+    expect(readToolLoopLimit("run:\n  tool_loop_limit: 3\n")).toBe(3);
+    expect(readToolLoopLimit("agent:\n  id: x\n")).toBeUndefined();
+    expect(() => readToolLoopLimit("run:\n  tool_loop_limt: 3\n")).toThrow(
+      /unknown key "tool_loop_limt"/,
+    );
+  });
+
+  it("rejects a __proto__ key instead of losing it", () => {
+    for (const value of ["1", "[a]", "x"]) {
+      let err: unknown;
+      try {
+        readToolLoopLimit(`run:\n  __proto__: ${value}\n`);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(BobYamlError);
+      expect((err as BobYamlError).message).toBe(
+        'bob.yaml "run:" block, line 2: "__proto__" is a reserved key and is not supported.',
+      );
+    }
+  });
+});
+
+describe("readBlock — reserved keys", () => {
+  it("rejects __proto__ as a direct sub-key and inside a list item", () => {
+    expect(() => readBlock("x:\n  __proto__: 1\n", "x")).toThrow(/"__proto__" is a reserved key/);
+    expect(() => readBlock("x:\n  items:\n    - name: a\n      __proto__: 1\n", "x")).toThrow(
+      /line 4: "__proto__" is a reserved key/,
+    );
+    expect(() => readBlock("x:\n  items:\n    - __proto__: 1\n", "x")).toThrow(
+      /line 3: "__proto__" is a reserved key/,
+    );
   });
 });

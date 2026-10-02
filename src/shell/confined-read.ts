@@ -358,6 +358,10 @@ function refusal(path: string, why: string): Error {
   return new Error(`bob: refusing to read "${path}": ${why}.`);
 }
 
+function writeRefusal(path: string, why: string): Error {
+  return new Error(`bob: refusing to write "${path}": ${why}.`);
+}
+
 function errCode(err: unknown): string {
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   return typeof code === "string" ? code : "unknown error";
@@ -434,6 +438,36 @@ export function checkReadTarget(absolutePath: string, opts: ConfineReadOptions):
     }
   }
   return { path: target, dev, ino };
+}
+
+// Check the ABSOLUTE path a write (bob#143 replace_lines) is about to open. The
+// target must resolve inside the workspace root, following symlinks and `..`,
+// with the same `realpathSync.native` + relative comparison checkReadTarget uses
+// for a read. Returns the canonical path to write; throws otherwise.
+export function checkWriteTarget(absolutePath: string, workspaceRoot: string): string {
+  if (typeof absolutePath !== "string" || absolutePath.trim() === "") {
+    throw new Error("bob: refusing to write: a path is required.");
+  }
+  let root: string;
+  try {
+    root = realpathSync.native(workspaceRoot);
+  } catch (err) {
+    throw writeRefusal(
+      absolutePath,
+      `the agent's workspace root is not readable (${errCode(err)})`,
+    );
+  }
+  let target: string;
+  try {
+    target = realpathSync.native(absolutePath);
+  } catch {
+    throw writeRefusal(absolutePath, NOT_IN_WORKSPACE);
+  }
+  const rel = relative(root, target);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw writeRefusal(absolutePath, NOT_IN_WORKSPACE);
+  }
+  return target;
 }
 
 // Open the CHECKED canonical path and verify the descriptor is the checked file

@@ -58,6 +58,7 @@ import {
   readResident,
   readRunLimits,
   readSessionBudget,
+  readToolLoopLimit,
   readTools,
 } from "./bob-yaml.js";
 import {
@@ -108,6 +109,13 @@ import {
 } from "./session.js";
 import type { ModelLimits, ThinkingSetting } from "./session-budget.js";
 import { applyMailTurnPolicy, resolveToolPolicy, type ToolPolicy } from "./tool-allowlist.js";
+import {
+  DEFAULT_TOOL_LOOP_LIMIT,
+  LOOP_ABORT_GRACE_MS,
+  loopBreakMessage,
+  ToolLoopDetector,
+  ToolLoopError,
+} from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError } from "./turn-origin.js";
 
@@ -503,8 +511,7 @@ export interface RunSession {
   // persistent factory wraps it — see persistent.ts.)
   waitForIdle?(): Promise<void>;
   // Stop an in-flight turn. pi's AgentSession exposes `abort()`, which resolves
-  // once the agent is idle; bob calls it when a bound ends a one-shot run after
-  // the session factory has returned.
+  // once the agent is idle; bob calls it when a bound or loop break ends a run.
   // Optional so a fake session in tests need not provide it; without it, bob
   // cannot confirm the session stopped.
   abort?(): Promise<void>;
@@ -701,6 +708,9 @@ export interface RunOptions {
   // MAIL_TURN_ALLOWED_TOOLS: the Flair memory tools); every other tool, from any
   // role or capability, is dropped.
   mailTurn?: boolean;
+  // bob#143 item 3: the loop breaker's limit — how many consecutive identical
+  // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
+  toolLoopLimit?: number;
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
   // Tests pass small values.
@@ -730,6 +740,9 @@ export interface RunResult {
   // no final message that did NOT fail simply had nothing to say. (A mail turn
   // retries a failure and sends no reply for silence.)
   failed?: true;
+  // bob#143 item 3: set when the loop breaker ended the run — the same tool call
+  // repeated `toolLoopLimit` times in a row. The exit code is non-zero.
+  loopBreaker?: { toolName: string; count: number };
   // bob#135: set when a bound ended the run (the wall clock, the no-progress
   // watchdog, or a turn timeout) rather than the session. The exit code is
   // non-zero.
@@ -754,6 +767,8 @@ export async function attachFlairBootstrap(
   if (text.length > 0) config.flairBootstrap = text;
 }
 
+// bob#143 item 3 — the loop breaker error and its log line live in
+// tool-loop.ts, shared by the one-shot run and the persistent turn path.
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -791,7 +806,6 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
-
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. The wall clock and the watchdog start HERE, once the
   // configuration is resolved and before the Flair bootstrap and the session
@@ -823,6 +837,8 @@ async function runBoundedSession(
 ): Promise<RunResult> {
   const { agentDir, provider, model, config, flairBootstrapTarget } = resolved;
   const limits = bounds.limits;
+  // bob#143 item 3: how many consecutive identical calls trip the loop breaker.
+  const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -992,6 +1008,36 @@ async function runBoundedSession(
     );
   }
 
+  // A run of identical tool calls is watched as events arrive. The breaker
+  // rejects the bounded turn sent through sendToSession when the limit fires.
+  const loopDetector = new ToolLoopDetector(toolLoopLimit);
+  const loopController = new AbortController();
+  let loopBreaker: { toolName: string; count: number } | undefined;
+  const raceLoop = <T>(work: Promise<T>): Promise<T> => {
+    if (loopBreaker !== undefined) {
+      // A synchronous session may emit the breaking event before its prompt
+      // promise is returned. Keep observing that promise's eventual rejection.
+      void work.catch(() => {});
+      return Promise.reject(new ToolLoopError(loopBreaker.toolName, loopBreaker.count));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(new ToolLoopError(loopBreaker?.toolName ?? "", loopBreaker?.count ?? 0));
+      };
+      loopController.signal.addEventListener("abort", onAbort, { once: true });
+      work.then(
+        (value) => {
+          loopController.signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (err) => {
+          loopController.signal.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+      );
+    });
+  };
+
   const unsubscribeRunLog = session.subscribe((event) => {
     // Progress belongs to the session, regardless of whether its best-effort
     // log was opened, an append succeeds, or streamed deltas pass the log cap.
@@ -1008,6 +1054,24 @@ async function runBoundedSession(
       },
       isDeltaEvent(event.type),
     );
+    // bob#143 item 3: count consecutive identical tool calls as they start.
+    if (event.type === "tool_execution_start") {
+      const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
+      const args = (event as unknown as { args?: unknown }).args;
+      const observation = loopDetector.observe(toolName, args);
+      if (observation.fire && loopBreaker === undefined) {
+        loopBreaker = { toolName, count: observation.count };
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: { reason: "tool_loop", toolName, count: observation.count },
+          },
+          false,
+        );
+        process.stderr.write(loopBreakMessage(opts.name, toolName, args, observation.count));
+        loopController.abort();
+      }
+    }
   });
 
   // bob#214: one flat usage record per model request (prompt, cached-prompt,
@@ -1080,7 +1144,7 @@ async function runBoundedSession(
         session,
         // Every re-prompt goes through the SAME bounded sender as the first
         // prompt, so a stalled continuation is ended by the turn bound too.
-        send: (text) => boundedPrompt(session, text, bounds),
+        send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
         maxReprompts: budgetLeft(),
@@ -1094,9 +1158,10 @@ async function runBoundedSession(
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
-    // expansion — see session.ts promptSession). Turn-bounded when configured (bob#135).
-    await boundedPrompt(session, prompt, bounds);
-    await bounds.guard(drainReasoningOnly());
+    // expansion — see session.ts promptSession). Both bounds and loop breaker
+    // observe the turn; every send goes through the single bounded sender.
+    await raceLoop(boundedPrompt(session, prompt, bounds, loopController.signal));
+    await raceLoop(bounds.guard(drainReasoningOnly()));
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -1120,12 +1185,11 @@ async function runBoundedSession(
         observer.startTurn(); // the retry is its own turn: its final message counts
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
-        await boundedPrompt(session, CONTINUE_TURN, bounds);
-        await bounds.guard(drainReasoningOnly()); // same budget: the total stays within the bound
+        await raceLoop(boundedPrompt(session, CONTINUE_TURN, bounds, loopController.signal));
+        await raceLoop(bounds.guard(drainReasoningOnly())); // shared re-prompt budget
       } catch (err) {
-        // A bound that fired during the continue turn ends the run; it must not
-        // be swallowed here and leave a silent exit 0.
-        if (err instanceof RunAbortedError) throw err;
+        // Either termination mechanism must fail the whole run.
+        if (err instanceof RunAbortedError || err instanceof ToolLoopError) throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
@@ -1173,7 +1237,24 @@ async function runBoundedSession(
   } catch (err) {
     exitCode = 1;
     failed = true;
-    if (err instanceof RunAbortedError) {
+    if (err instanceof ToolLoopError) {
+      // The event subscriber has already logged the break and named the call.
+      // Use the same bounded abort as every other one-shot termination.
+      const stopped = await abortBounded(session, LOOP_ABORT_GRACE_MS);
+      if (stopped.timedOut) {
+        process.stderr.write(
+          `bob run ${opts.name}: the stop request did not settle within ${LOOP_ABORT_GRACE_MS}ms; ending the run anyway\n`,
+        );
+      } else if (!stopped.idle) {
+        const m = stopped.missing
+          ? "the session has no abort()"
+          : stopped.error instanceof Error
+            ? stopped.error.message
+            : String(stopped.error);
+        process.stderr.write(`bob run ${opts.name}: could not stop the repeated turn — ${m}\n`);
+      }
+      reportWorktreeStatus(opts.name, config.cwd, stopped.idle);
+    } else if (err instanceof RunAbortedError) {
       // bob#135 — a bound ended the run: name it and how to raise it, and record
       // the outcome in the log. Then signal the session's abort and wait for it,
       // at most the grace, BEFORE reading the workspace; if the abort did not
@@ -1183,8 +1264,8 @@ async function runBoundedSession(
       aborted = err.reason;
       writeRunLog({ t: now().toISOString(), outcome: { reason: err.reason } }, false);
       process.stderr.write(boundMessage(opts.name, err.reason, limits));
-      const idle = await abortBounded(session, ABORT_GRACE_MS);
-      reportWorktreeStatus(opts.name, config.cwd, idle);
+      const stopped = await abortBounded(session, ABORT_GRACE_MS);
+      reportWorktreeStatus(opts.name, config.cwd, stopped.idle);
     } else {
       // Surface the error instead of swallowing it: an underscore-ignored catch
       // made a cap-hit look like a silent clean exit. Label a provider
@@ -1233,6 +1314,7 @@ async function runBoundedSession(
     model,
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(loopBreaker !== undefined ? { loopBreaker } : {}),
     ...(aborted !== undefined ? { aborted } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
@@ -1291,7 +1373,12 @@ function sendToSession(
 // the session's abort. pi's PromptOptions carries no AbortSignal and `prompt()`
 // is a whole turn (model requests plus tool work), so a turn is the smallest
 // unit bob can bound.
-async function boundedPrompt(session: RunSession, text: string, bounds: RunBounds): Promise<void> {
+async function boundedPrompt(
+  session: RunSession,
+  text: string,
+  bounds: RunBounds,
+  loopSignal: AbortSignal,
+): Promise<void> {
   const turnTimeoutMs = bounds.limits.turnTimeoutMs;
   if (turnTimeoutMs === undefined) {
     await bounds.guard(sendToSession(session, bounds, text, "turn"));
@@ -1301,7 +1388,7 @@ async function boundedPrompt(session: RunSession, text: string, bounds: RunBound
     raceTimeout(
       sendToSession(session, bounds, text, "turn"),
       turnTimeoutMs,
-      bounds.signal,
+      AbortSignal.any([bounds.signal, loopSignal]),
       bounds.timer,
     ),
   );
@@ -1317,22 +1404,26 @@ async function boundedPrompt(session: RunSession, text: string, bounds: RunBound
 // this long to settle before the run returns on its own.
 const ABORT_GRACE_MS = 1_000;
 
-/** Signal the session's abort and give it at most `graceMs` to settle. Returns
- *  true only when abort() resolved within the grace (pi's abort() resolves once
- *  the agent is idle). A missing abort(), one that rejects, and one still
- *  pending when the grace ends all return false. Never blocks past the grace. */
-async function abortBounded(session: RunSession, graceMs: number): Promise<boolean> {
-  if (!session.abort) return false;
+/** Signal the session's abort and give it at most `graceMs` to settle. The
+ *  result reports idle only when abort() resolved within the grace (pi's abort()
+ *  resolves once the agent is idle). Missing, rejected and pending aborts are
+ *  distinct so callers can report the cause. Never blocks past the grace. */
+async function abortBounded(
+  session: RunSession,
+  graceMs: number,
+): Promise<{ idle: boolean; missing?: boolean; timedOut?: boolean; error?: unknown }> {
+  const abort = session.abort;
+  if (abort === undefined) return { idle: false, missing: true };
   const settled = await raceTimeout(
     Promise.resolve()
-      .then(() => session.abort?.())
+      .then(() => abort.call(session))
       .then(
-        () => true,
-        () => false,
+        () => ({ idle: true }),
+        (error: unknown) => ({ idle: false, error }),
       ),
     graceMs,
   );
-  return settled === true;
+  return settled === TIMED_OUT ? { idle: false, timedOut: true } : settled;
 }
 
 /** Print the agent cwd's worktree status: the paths a run may have left dirty,
@@ -1411,6 +1502,9 @@ export interface ResolvedRunConfig {
   // bob#254 — where to call Flair at session start, when the agent configures
   // the flair capability. Absent: no bootstrap is loaded.
   flairBootstrapTarget?: FlairBootstrapTarget;
+  // bob#143 item 3 — bob.yaml `run.tool_loop_limit`, or the default. One-shot
+  // runs and the persistent runtime both observe it.
+  toolLoopLimit: number;
   // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
   // validated for every caller. A one-shot `bob run` overlays its per-invocation
   // flags on these to arm the run.
@@ -2044,6 +2138,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     agent,
     policy: toolPolicy,
     capabilities,
+    toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     runLimits: readRunLimits(yamlText),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };

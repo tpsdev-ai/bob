@@ -575,6 +575,7 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       "find",
       "grep",
       "read",
+      "replace_lines",
       "write",
     ]);
     const tools = await mailTurnTools("m2", DEFAULT_POSITIONS_ROOT);
@@ -1077,6 +1078,7 @@ describe("positions (bob#195) — 3. boot refusals for an ungranted role / capab
       "find",
       "grep",
       "read",
+      "replace_lines",
       "write",
     ]);
 
@@ -1210,7 +1212,14 @@ describe("positions (bob#195) — 5. two hires stay independent (files AND grant
       positionsRoot: DEFAULT_POSITIONS_ROOT,
       sessionFactory: capturingFactory(sinkA),
     });
-    expect(sinkA[0].tools.slice().sort()).toEqual(["bash", "edit", "grep", "read", "write"]);
+    expect(sinkA[0].tools.slice().sort()).toEqual([
+      "bash",
+      "edit",
+      "grep",
+      "read",
+      "replace_lines",
+      "write",
+    ]);
 
     // B's files and grant are byte-for-byte what they were; its session holds `find`.
     expect(readFileSync(grantFile("twin-b")).equals(bGrantBefore)).toBe(true);
@@ -1230,6 +1239,7 @@ describe("positions (bob#195) — 5. two hires stay independent (files AND grant
       "find",
       "grep",
       "read",
+      "replace_lines",
       "write",
     ]);
     expect(
@@ -1335,6 +1345,7 @@ describe("positions (bob#195) — an un-adopted `bob init` agent boots unchanged
       "bash",
       "write",
       "edit",
+      "replace_lines",
       "flair_search",
       "flair_write",
       "flair_get",

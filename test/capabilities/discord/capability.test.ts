@@ -337,29 +337,65 @@ describe("wireDiscordCapability — reply routing (inbound → originating chann
 // fakes — the serialization and the origin binding are production code. The
 // fake session records that each prompt STARTED and with which origin, runs an
 // optional per-turn body (where the test drives tool calls, exactly as the
-// agent would mid-turn), blocks until the test releases it, then emits agent_end
-// so the admission captures the turn's messages.
-function setupRealAdmission() {
+// agent would mid-turn), blocks until the test (or a stopping abort) releases
+// it, then emits agent_end so the admission captures the turn's messages.
+//
+// `abort` picks the session's abort(): "stops" (the default) works like pi's —
+// it waits on `holdAbort`'s gate, then ends the prompt that was running when it
+// was called, once that prompt's body has returned; "rejects" rejects and stops
+// nothing; "missing" leaves abort() off the session.
+function setupRealAdmission(
+  opts: {
+    toolLoopLimit?: number;
+    loopAbortGraceMs?: number;
+    abort?: "stops" | "rejects" | "missing";
+  } = {},
+) {
+  const { abort: abortMode = "stops", ...admissionOpts } = opts;
   const pi = new FakePi();
   const client = new FakeDiscordClient();
   const logs: string[] = [];
-  const admission = createTurnAdmission();
+  const admission = createTurnAdmission({ ...admissionOpts, log: (m) => logs.push(m) });
   const started: string[] = [];
   const originAtStart: TurnOrigin[] = [];
   const releases = new Map<string, () => void>();
+  // A prompt released (by the test or by a stopping abort) before it parks
+  // does not park at all.
+  const released = new Set<string>();
+  const releasePrompt = (text: string): void => {
+    released.add(text);
+    releases.get(text)?.();
+  };
   let onTurn: ((text: string) => void | Promise<void>) | undefined;
   let listener: ((event: { type: string; messages?: unknown[] }) => void) | undefined;
+  let abortGate: Promise<void> | undefined;
+  let aborts = 0;
   const session = {
     subscribe(l: (event: { type: string; messages?: unknown[] }) => void) {
       listener = l;
       return () => {};
     },
     async waitForIdle(): Promise<void> {},
+    ...(abortMode === "missing"
+      ? {}
+      : {
+          // The session's abort. `holdAbort` parks it so a test can observe
+          // the interval between the loop break and the abort settling.
+          async abort(): Promise<void> {
+            aborts += 1;
+            if (abortMode === "rejects") throw new Error("abort failed");
+            const text = started[started.length - 1];
+            if (abortGate) await abortGate;
+            if (text !== undefined) releasePrompt(text);
+          },
+        }),
     async prompt(text: string): Promise<void> {
       started.push(text);
       originAtStart.push(admission.readOrigin());
       await onTurn?.(text);
-      await new Promise<void>((resolve) => releases.set(text, resolve));
+      if (!released.has(text)) {
+        await new Promise<void>((resolve) => releases.set(text, resolve));
+      }
       listener?.({
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: `${text}::answer` }] }],
@@ -383,16 +419,26 @@ function setupRealAdmission() {
   return {
     pi,
     client,
+    logs,
     started,
     originAtStart,
     // The real admission's reader. It is bound to the prompt's async context,
     // so it names a turn only when called from inside that turn's body.
     readOrigin: admission.readOrigin,
+    aborts: () => aborts,
+    // Park the session's abort() until the given promise settles.
+    holdAbort(promise: Promise<void>) {
+      abortGate = promise;
+    },
+    // The session's own tool_execution_start, exactly as pi emits it.
+    emitToolStart(toolName: string, args: unknown) {
+      listener?.({ type: "tool_execution_start", toolName, args } as never);
+    },
     setOnTurn(fn: (text: string) => void | Promise<void>) {
       onTurn = fn;
     },
     release(text: string) {
-      releases.get(text)?.();
+      releasePrompt(text);
     },
     // Emit an agent_end through the session's subscription, exactly as pi would
     // at an agent-loop boundary (a retry / continuation fires one mid-prompt).
@@ -540,6 +586,180 @@ describe("wireDiscordCapability — a real queued turn keeps its own origin (iss
     h.release("A?");
     await h.flush();
   });
+});
+
+// bob#143 item 3: a loop break fails THIS admission, but pi's prompt may still
+// be running — its parallel tool path can execute a call prepared before the
+// abort, and the session's abort() may be missing or fail. The turn's origin
+// binding must last until the prompt settles, or the in-flight tool reads `run`
+// (which the outbound check exempts) and reaches a channel the turn is not
+// bound to.
+describe("wireDiscordCapability — a loop break keeps the turn's origin binding (bob#143)", () => {
+  it("an in-flight tool after the loop break sees the turn's origin while the abort is pending", async () => {
+    const h = setupRealAdmission({ toolLoopLimit: 2 });
+    const abortGate = deferred();
+    h.holdAbort(abortGate.promise);
+    const report = deferred<{ origin: TurnOrigin; crossChannel: string; ownChannel: string }>();
+    h.setOnTurn(async (text) => {
+      if (text !== "A?") return;
+      // Two identical calls in a row: the second one fires the loop breaker.
+      h.emitToolStart("edit", { path: "f.ts" });
+      h.emitToolStart("edit", { path: "f.ts" });
+      // The break has fired and the session has been asked to stop, but the
+      // prompt has NOT settled: a tool call pi prepared before the abort runs.
+      await new Promise<void>((r) => setTimeout(r, 5));
+      report.resolve({
+        origin: h.readOrigin(),
+        crossChannel: await attempt(h.pi, "discord_reply", { channelId: "222", text: "sneak" }),
+        ownChannel: await attempt(h.pi, "discord_reply", { channelId: "111", text: "ok on A" }),
+      });
+    });
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    await h.flush();
+    const r = await report.promise;
+    // The origin is still this turn's, so the turn-channel binding still holds:
+    // the other channel is refused and nothing reached it.
+    expect(r.origin).toEqual({ kind: "discord", channelId: "111" });
+    expect(r.crossChannel).toMatch(/bound to channel 111.*refusing to use channel 222/);
+    expect(r.ownChannel).toBe("ok");
+    expect(h.client.replies).toEqual([{ channelId: "111", text: "ok on A", replyTo: undefined }]);
+    expect(h.logs.some((m) => m.includes("LOOP BREAKER") && m.includes("edit"))).toBe(true);
+    // Let the abort finish: it ends the prompt, the admission's rejection
+    // follows, and the inbound path reports the failed turn.
+    abortGate.resolve();
+    await h.flush();
+    expect(h.aborts()).toBe(1);
+    expect(
+      h.logs.some((m) => m.includes("inbound turn/reply failed") && m.includes("repeated 2 times")),
+    ).toBe(true);
+  }, 15_000);
+
+  it("if the prompt does not settle in the bound, the binding is kept and the runtime reports it", async () => {
+    const h = setupRealAdmission({ toolLoopLimit: 2, loopAbortGraceMs: 20 });
+    h.holdAbort(new Promise<void>(() => {})); // the abort never settles
+    const report = deferred<{ origin: TurnOrigin; crossChannel: string }>();
+    h.setOnTurn(async (text) => {
+      if (text !== "A?") return;
+      h.emitToolStart("edit", { path: "f.ts" });
+      h.emitToolStart("edit", { path: "f.ts" });
+      // Wait PAST the bound, so the admission has given up waiting.
+      await new Promise<void>((r) => setTimeout(r, 60));
+      report.resolve({
+        origin: h.readOrigin(),
+        crossChannel: await attempt(h.pi, "discord_reply", { channelId: "222", text: "sneak" }),
+      });
+    });
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    await h.flush();
+    const r = await report.promise;
+    expect(r.origin).toEqual({ kind: "discord", channelId: "111" });
+    expect(r.crossChannel).toMatch(/bound to channel 111.*refusing to use channel 222/);
+    expect(h.logs.some((m) => m.includes("did not settle within 20ms"))).toBe(true);
+    // Let the fake prompt finish so the harness leaves nothing parked.
+    h.release("A?");
+    await h.flush();
+  }, 15_000);
+
+  it("an abort that rejects: a delayed tool keeps the turn's origin, even after a queued turn starts, until the prompt settles", async () => {
+    const h = setupRealAdmission({ toolLoopLimit: 2, loopAbortGraceMs: 200, abort: "rejects" });
+    const bStarted = deferred();
+    const settledA = deferred();
+    let originAfterSettle: Promise<TurnOrigin> | undefined;
+    const report = deferred<{ origin: TurnOrigin; crossChannel: string; ownChannel: string }>();
+    h.setOnTurn(async (text) => {
+      if (text === "B?") {
+        bStarted.resolve();
+        return;
+      }
+      if (text !== "A?") return;
+      // Registered inside A's prompt, so it reads A's origin when it runs.
+      originAfterSettle = settledA.promise.then(() => h.readOrigin());
+      h.emitToolStart("edit", { path: "f.ts" });
+      h.emitToolStart("edit", { path: "f.ts" });
+      // The abort rejected, so nothing stops A's prompt. The admission gives up
+      // after its 200ms bound and the queued turn B starts while A still runs.
+      await bStarted.promise;
+      report.resolve({
+        origin: h.readOrigin(),
+        crossChannel: await attempt(h.pi, "discord_reply", { channelId: "222", text: "sneak" }),
+        ownChannel: await attempt(h.pi, "discord_reply", { channelId: "111", text: "ok on A" }),
+      });
+    });
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    h.client.fire({ id: "mB", channelId: "222", content: "<@1> B?", mentionsBot: true });
+    await h.flush();
+    const startedWhileAdmitted = [...h.started];
+    const r = await report.promise;
+    // A's delayed tool still has A's origin, after B started with its own.
+    expect(r.origin).toEqual({ kind: "discord", channelId: "111" });
+    expect(r.crossChannel).toMatch(/bound to channel 111.*refusing to use channel 222/);
+    expect(r.ownChannel).toBe("ok");
+    expect(startedWhileAdmitted, "B is queued while A's admission runs").toEqual(["A?"]);
+    expect(h.started).toEqual(["A?", "B?"]);
+    expect(h.originAtStart[1]).toEqual({ kind: "discord", channelId: "222" });
+    expect(h.client.replies).toEqual([{ channelId: "111", text: "ok on A", replyTo: undefined }]);
+    expect(h.aborts()).toBe(1);
+    expect(
+      h.logs.some((m) => m.includes("could not signal the session to stop (abort failed)")),
+    ).toBe(true);
+    expect(h.logs.some((m) => m.includes("did not settle within 200ms"))).toBe(true);
+    expect(
+      h.logs.some((m) => m.includes("inbound turn/reply failed") && m.includes("repeated 2 times")),
+    ).toBe(true);
+    // A's prompt settles: only now is its binding released.
+    h.release("A?");
+    await h.flush();
+    settledA.resolve();
+    expect(await originAfterSettle).toEqual({ kind: "run" });
+    // B finishes on its own channel.
+    h.release("B?");
+    await h.flush();
+    expect(h.client.replies).toEqual([
+      { channelId: "111", text: "ok on A", replyTo: undefined },
+      { channelId: "222", text: "B?::answer", replyTo: "mB" },
+    ]);
+  }, 15_000);
+
+  it("a session with no abort(): a delayed tool keeps the turn's origin until the prompt settles", async () => {
+    const h = setupRealAdmission({ toolLoopLimit: 2, abort: "missing" });
+    const settledA = deferred();
+    let originAfterSettle: Promise<TurnOrigin> | undefined;
+    const report = deferred<{ origin: TurnOrigin; crossChannel: string; ownChannel: string }>();
+    h.setOnTurn(async (text) => {
+      if (text !== "A?") return;
+      originAfterSettle = settledA.promise.then(() => h.readOrigin());
+      h.emitToolStart("edit", { path: "f.ts" });
+      h.emitToolStart("edit", { path: "f.ts" });
+      // Nothing can stop the prompt; a tool call runs after the break.
+      await new Promise<void>((r) => setTimeout(r, 5));
+      report.resolve({
+        origin: h.readOrigin(),
+        crossChannel: await attempt(h.pi, "discord_reply", { channelId: "222", text: "sneak" }),
+        ownChannel: await attempt(h.pi, "discord_reply", { channelId: "111", text: "ok on A" }),
+      });
+    });
+    h.client.fire({ id: "mA", channelId: "111", content: "<@1> A?", mentionsBot: true });
+    await h.flush();
+    const r = await report.promise;
+    expect(r.origin).toEqual({ kind: "discord", channelId: "111" });
+    expect(r.crossChannel).toMatch(/bound to channel 111.*refusing to use channel 222/);
+    expect(r.ownChannel).toBe("ok");
+    expect(h.client.replies).toEqual([{ channelId: "111", text: "ok on A", replyTo: undefined }]);
+    expect(
+      h.logs.some((m) =>
+        m.includes("could not signal the session to stop (the session has no abort())"),
+      ),
+    ).toBe(true);
+    // The prompt settles: the binding is released and the turn is reported failed.
+    h.release("A?");
+    await h.flush();
+    settledA.resolve();
+    expect(await originAfterSettle).toEqual({ kind: "run" });
+    expect(
+      h.logs.some((m) => m.includes("inbound turn/reply failed") && m.includes("repeated 2 times")),
+    ).toBe(true);
+    expect(h.logs.some((m) => m.includes("did not settle"))).toBe(false);
+  }, 15_000);
 });
 
 describe("wireDiscordCapability — a turn's tools are bound to its channel (issue #227)", () => {
