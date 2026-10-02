@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ExplorationBudgetError, parseExplorationBudget } from "./exploration-budget.js";
 import type { BobRole } from "./index.js";
 import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
 
@@ -21,6 +22,15 @@ export interface RoleTemplate {
   };
   default_provider?: string;
   default_model?: string;
+  // bob#279: the role's exploration budget — consecutive read-only tool calls
+  // before the runtime injects its instruction, and again before a one-shot run
+  // ends with `exploration_budget_exhausted`. `builder-local` ships 20. A role
+  // that names none (every other shipped role) leaves the budget OFF, so a run
+  // that is meant to read and report is never told to edit. bob.yaml's
+  // `run.exploration_budget` overrides it for one agent. Validated at load: a
+  // value that is not a positive whole number is a load error, like any other
+  // role.json defect.
+  exploration_budget?: number;
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think
   // (off | low | high). bob.yaml's `session:` block overrides either key for
@@ -74,7 +84,22 @@ export function loadRole(role: BobRole): RoleTemplate {
         `${configPath} "session"`,
       );
     }
-    return { role, soul, ...config, ...(session !== undefined ? { session } : {}) } as RoleTemplate;
+    let explorationBudget: number | undefined;
+    if (config.exploration_budget !== undefined) {
+      explorationBudget = parseExplorationBudget(config.exploration_budget);
+      if (explorationBudget === undefined) {
+        throw new ExplorationBudgetError(
+          `${configPath}: "exploration_budget" must be a positive whole number.`,
+        );
+      }
+    }
+    return {
+      role,
+      soul,
+      ...config,
+      ...(session !== undefined ? { session } : {}),
+      ...(explorationBudget !== undefined ? { exploration_budget: explorationBudget } : {}),
+    } as RoleTemplate;
   }
   throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);
 }

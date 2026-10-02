@@ -54,6 +54,7 @@ import {
   readBlock,
   readCapabilities,
   readCron,
+  readExplorationBudget,
   readProviderLimits,
   readResident,
   readRunLimits,
@@ -77,6 +78,13 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
+import {
+  EXPLORATION_INSTRUCTION,
+  ExplorationBudgetDetector,
+  ExplorationBudgetExhaustedError,
+  explorationExhaustedMessage,
+  explorationInstructionMessage,
+} from "./exploration-budget.js";
 import {
   type FlairBootstrapTarget,
   loadFlairBootstrapContext,
@@ -711,6 +719,11 @@ export interface RunOptions {
   // bob#143 item 3: the loop breaker's limit — how many consecutive identical
   // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
+  // bob#279: the exploration budget's limit — consecutive read-only tool calls
+  // before the runtime injects its instruction and, at twice the limit, ends
+  // the run. Overrides the resolved bob.yaml/role value (tests use a small
+  // value). Undefined leaves the resolved value in force.
+  explorationBudget?: number;
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
   // Tests pass small values.
@@ -747,6 +760,11 @@ export interface RunResult {
   // watchdog, or a turn timeout) rather than the session. The exit code is
   // non-zero.
   aborted?: TerminationReason;
+  // bob#279: set when the exploration budget ended the run — consecutive
+  // read-only tool calls reached twice the budget with no edit. The exit code
+  // is non-zero, and the run log carries the `exploration_budget_exhausted`
+  // outcome.
+  explorationBudgetExhausted?: { limit: number; readOnlyCalls: number };
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -839,6 +857,10 @@ async function runBoundedSession(
   const limits = bounds.limits;
   // bob#143 item 3: how many consecutive identical calls trip the loop breaker.
   const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
+  // bob#279: how many consecutive read-only calls trip the exploration budget,
+  // or undefined when neither the role nor bob.yaml configures one. Only the
+  // one-shot run observes it.
+  const explorationLimit = opts.explorationBudget ?? resolved.explorationBudget;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -1010,9 +1032,17 @@ async function runBoundedSession(
 
   // A run of identical tool calls is watched as events arrive. The breaker
   // rejects the bounded turn sent through sendToSession when the limit fires.
+  // bob#279: a second, independent stop — the exploration budget — rejects the
+  // same turn when a run of read-only calls with no edit reaches twice its
+  // limit, after the runtime has injected its instruction. Either stop aborts
+  // `loopController`; when both have fired the error is the loop breaker's
+  // (checked first below), else the exploration budget's.
   const loopDetector = new ToolLoopDetector(toolLoopLimit);
+  const explorationDetector =
+    explorationLimit !== undefined ? new ExplorationBudgetDetector(explorationLimit) : undefined;
   const loopController = new AbortController();
   let loopBreaker: { toolName: string; count: number } | undefined;
+  let explorationExhausted: { limit: number; readOnlyCalls: number } | undefined;
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
     if (loopBreaker !== undefined) {
       // A synchronous session may emit the breaking event before its prompt
@@ -1020,9 +1050,30 @@ async function runBoundedSession(
       void work.catch(() => {});
       return Promise.reject(new ToolLoopError(loopBreaker.toolName, loopBreaker.count));
     }
+    if (explorationExhausted !== undefined) {
+      void work.catch(() => {});
+      return Promise.reject(
+        new ExplorationBudgetExhaustedError(
+          explorationExhausted.limit,
+          explorationExhausted.readOnlyCalls,
+        ),
+      );
+    }
     return new Promise<T>((resolve, reject) => {
       const onAbort = (): void => {
-        reject(new ToolLoopError(loopBreaker?.toolName ?? "", loopBreaker?.count ?? 0));
+        if (loopBreaker !== undefined) {
+          reject(new ToolLoopError(loopBreaker.toolName, loopBreaker.count));
+        } else if (explorationExhausted !== undefined) {
+          reject(
+            new ExplorationBudgetExhaustedError(
+              explorationExhausted.limit,
+              explorationExhausted.readOnlyCalls,
+            ),
+          );
+        } else {
+          // Only the two stops above abort this controller.
+          reject(new ToolLoopError("", 0));
+        }
       };
       loopController.signal.addEventListener("abort", onAbort, { once: true });
       work.then(
@@ -1036,6 +1087,37 @@ async function runBoundedSession(
         },
       );
     });
+  };
+
+  // Best-effort delivery of the exploration instruction: a session without
+  // steer(), or a bound that fired first, must not throw into the subscriber.
+  const reportInstructionUndelivered = (err: unknown): void => {
+    const m = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `bob run ${opts.name}: the exploration-budget instruction was not delivered (${m}); the run continues\n`,
+    );
+  };
+
+  // bob#135/bob#143/bob#279 — stop the session after a turn-level stop (the loop
+  // breaker, or the exploration budget) and read the workspace, at most the
+  // grace. The wait is bounded: pi's abort() waits for idle, so a turn that
+  // never becomes idle must not keep the run (and the CLI's process.exit)
+  // pending.
+  const stopTurn = async (what: "repeated" | "over-budget"): Promise<void> => {
+    const stopped = await abortBounded(session, LOOP_ABORT_GRACE_MS);
+    if (stopped.timedOut) {
+      process.stderr.write(
+        `bob run ${opts.name}: the stop request did not settle within ${LOOP_ABORT_GRACE_MS}ms; ending the run anyway\n`,
+      );
+    } else if (!stopped.idle) {
+      const m = stopped.missing
+        ? "the session has no abort()"
+        : stopped.error instanceof Error
+          ? stopped.error.message
+          : String(stopped.error);
+      process.stderr.write(`bob run ${opts.name}: could not stop the ${what} turn — ${m}\n`);
+    }
+    reportWorktreeStatus(opts.name, config.cwd, stopped.idle);
   };
 
   const unsubscribeRunLog = session.subscribe((event) => {
@@ -1069,6 +1151,53 @@ async function runBoundedSession(
           false,
         );
         process.stderr.write(loopBreakMessage(opts.name, toolName, args, observation.count));
+        loopController.abort();
+      }
+    }
+    // bob#279: count consecutive READ-ONLY calls; at the budget, inject the one
+    // instruction; at twice the budget, end the run. A write-class call resets
+    // the count (the detector does that). Skipped once the budget is spent.
+    if (
+      event.type === "tool_execution_start" &&
+      explorationDetector !== undefined &&
+      explorationExhausted === undefined
+    ) {
+      const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
+      const budget = explorationDetector.observe(toolName);
+      if (budget.inject) {
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            exploration: { readOnlyCalls: budget.readOnlyCalls, action: "instruction" },
+          },
+          false,
+        );
+        process.stderr.write(explorationInstructionMessage(opts.name, budget.readOnlyCalls));
+        try {
+          const sent = sendToSession(session, bounds, EXPLORATION_INSTRUCTION, "steer");
+          void sent.catch(reportInstructionUndelivered);
+        } catch (err) {
+          reportInstructionUndelivered(err);
+        }
+      } else if (budget.exhaust) {
+        explorationExhausted = {
+          limit: explorationDetector.limit,
+          readOnlyCalls: budget.readOnlyCalls,
+        };
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: {
+              reason: "exploration_budget_exhausted",
+              limit: explorationDetector.limit,
+              readOnlyCalls: budget.readOnlyCalls,
+            },
+          },
+          false,
+        );
+        process.stderr.write(
+          explorationExhaustedMessage(opts.name, explorationDetector.limit, budget.readOnlyCalls),
+        );
         loopController.abort();
       }
     }
@@ -1188,8 +1317,13 @@ async function runBoundedSession(
         await raceLoop(boundedPrompt(session, CONTINUE_TURN, bounds, loopController.signal));
         await raceLoop(bounds.guard(drainReasoningOnly())); // shared re-prompt budget
       } catch (err) {
-        // Either termination mechanism must fail the whole run.
-        if (err instanceof RunAbortedError || err instanceof ToolLoopError) throw err;
+        // Every turn-level stop must fail the whole run.
+        if (
+          err instanceof RunAbortedError ||
+          err instanceof ToolLoopError ||
+          err instanceof ExplorationBudgetExhaustedError
+        )
+          throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
@@ -1240,20 +1374,11 @@ async function runBoundedSession(
     if (err instanceof ToolLoopError) {
       // The event subscriber has already logged the break and named the call.
       // Use the same bounded abort as every other one-shot termination.
-      const stopped = await abortBounded(session, LOOP_ABORT_GRACE_MS);
-      if (stopped.timedOut) {
-        process.stderr.write(
-          `bob run ${opts.name}: the stop request did not settle within ${LOOP_ABORT_GRACE_MS}ms; ending the run anyway\n`,
-        );
-      } else if (!stopped.idle) {
-        const m = stopped.missing
-          ? "the session has no abort()"
-          : stopped.error instanceof Error
-            ? stopped.error.message
-            : String(stopped.error);
-        process.stderr.write(`bob run ${opts.name}: could not stop the repeated turn — ${m}\n`);
-      }
-      reportWorktreeStatus(opts.name, config.cwd, stopped.idle);
+      await stopTurn("repeated");
+    } else if (err instanceof ExplorationBudgetExhaustedError) {
+      // The event subscriber has already logged the outcome and named the
+      // budget (it set `explorationExhausted`). Same bounded abort.
+      await stopTurn("over-budget");
     } else if (err instanceof RunAbortedError) {
       // bob#135 — a bound ended the run: name it and how to raise it, and record
       // the outcome in the log. Then signal the session's abort and wait for it,
@@ -1315,6 +1440,9 @@ async function runBoundedSession(
     ...(opts.captureStdout ? { stdout: finalStdout } : {}),
     ...(reason !== undefined ? { reason } : {}),
     ...(loopBreaker !== undefined ? { loopBreaker } : {}),
+    ...(explorationExhausted !== undefined
+      ? { explorationBudgetExhausted: explorationExhausted }
+      : {}),
     ...(aborted !== undefined ? { aborted } : {}),
     ...(failed ? { failed: true as const } : {}),
   };
@@ -1505,6 +1633,10 @@ export interface ResolvedRunConfig {
   // bob#143 item 3 — bob.yaml `run.tool_loop_limit`, or the default. One-shot
   // runs and the persistent runtime both observe it.
   toolLoopLimit: number;
+  // bob#279 — the effective exploration budget: bob.yaml `run.exploration_budget`
+  // over the role's role.json `exploration_budget`. Absent when neither sets one,
+  // which leaves the budget off. Only a one-shot `bob run` observes it.
+  explorationBudget?: number;
   // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
   // validated for every caller. A one-shot `bob run` overlays its per-invocation
   // flags on these to arm the run.
@@ -1982,6 +2114,16 @@ export function resolveSessionBudget(yamlText: string): {
   };
 }
 
+// bob#279: the exploration budget for this agent — bob.yaml `run.exploration_budget`
+// over the role's role.json `exploration_budget`. Undefined when neither sets one
+// (the budget is OFF: a run that is meant to read and report is never told to
+// edit). `builder-local` ships a role default of 20.
+export function resolveExplorationBudget(yamlText: string): number | undefined {
+  const own = readExplorationBudget(yamlText);
+  const role = loadRole(readAgentRole(yamlText) as BobRole).exploration_budget;
+  return own ?? role;
+}
+
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
@@ -2063,6 +2205,9 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // resolved after the tool policy so a config the policy already refuses is
   // reported by that refusal first.
   const budget = resolveSessionBudget(yamlText);
+  // bob#279: the exploration budget (bob.yaml `run.exploration_budget` over
+  // role.json `exploration_budget`), or undefined when neither sets one.
+  const explorationBudget = resolveExplorationBudget(yamlText);
 
   // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
   // applied HERE, after both branches, so it binds an ADOPTED agent's grant
@@ -2140,6 +2285,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilities,
     toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     runLimits: readRunLimits(yamlText),
+    ...(explorationBudget !== undefined ? { explorationBudget } : {}),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }
