@@ -1,1 +1,1 @@
-- **Keep work state in a private per-user directory (#284)**, overridable with absolute `BOB_STATE_DIR`; run captures remain in temporary scratch. The old temp state root is ignored.
+- **Keep work state in a private per-user directory (#284)**, overridable with absolute `BOB_STATE_DIR`; run captures remain in temporary scratch. The old temp state root is not selected automatically or migrated.

@@ -189,12 +189,12 @@ named error.
 
 ## Job state and the sweeps
 
-Persistent work state uses `$XDG_STATE_HOME/bob` on Linux (default
-`~/.local/state/bob`) and `~/Library/Application Support/bob` on macOS.
+Persistent work state uses `$XDG_STATE_HOME/bob` on Linux when `XDG_STATE_HOME`
+is absolute (otherwise `~/.local/state/bob`) and `~/Library/Application Support/bob` on macOS.
 `BOB_STATE_DIR` overrides these defaults and must be absolute. The root is
 created with mode 0700; symlinks, other owners, group/world permissions, and
 locations inside the workspace or repository are refused. The old
-`<temp dir>/bob-work-<uid>` root is ignored; nothing is migrated from it.
+`<temp dir>/bob-work-<uid>` root is not selected automatically, and nothing is migrated from it.
 
 - Every job is recorded on disk, keyed by its process group, in the run's own
   state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`
