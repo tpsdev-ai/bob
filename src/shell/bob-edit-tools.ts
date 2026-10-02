@@ -2,8 +2,9 @@
 //
 // TWO custom tools bob registers, each from its own allowance:
 //
-//   * `edit`        — pi's edit tool, wrapped so a model whose oldText differs
-//                     only in runs of spaces/tabs still lands. When pi has read
+//   * `edit`        — pi's edit tool, wrapped so bob can resolve an oldText that
+//                     differs only in runs of spaces/tabs (pi may still refuse
+//                     the edit under its own matching). When pi has read
 //                     the file and before it matches, an oldText that occurs
 //                     exactly at more than one position, or nowhere exactly
 //                     and at multiple normalised positions (overlaps included),
