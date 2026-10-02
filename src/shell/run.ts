@@ -719,10 +719,6 @@ export interface RunOptions {
   // bob#143 item 3: the loop breaker's limit — how many consecutive identical
   // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
-  // bob#279: the exploration budget's limit — consecutive read-only tool calls
-  // before the runtime injects its instruction and, at twice the limit, ends
-  // the run. Overrides the resolved bob.yaml/role value (tests use a small
-  // value). Undefined leaves the resolved value in force.
   explorationBudget?: number;
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
@@ -760,11 +756,7 @@ export interface RunResult {
   // watchdog, or a turn timeout) rather than the session. The exit code is
   // non-zero.
   aborted?: TerminationReason;
-  // bob#279: set when the exploration budget ended the run — consecutive
-  // read-only tool calls reached twice the budget with no edit. The exit code
-  // is non-zero, and the run log carries the `exploration_budget_exhausted`
-  // outcome.
-  explorationBudgetExhausted?: { limit: number; readOnlyCalls: number };
+  explorationBudgetExhausted?: { limit: number; nonProgressCalls: number };
 }
 
 // bob#254 — load the Flair bootstrap for this session and attach the rendered
@@ -857,9 +849,6 @@ async function runBoundedSession(
   const limits = bounds.limits;
   // bob#143 item 3: how many consecutive identical calls trip the loop breaker.
   const toolLoopLimit = opts.toolLoopLimit ?? resolved.toolLoopLimit;
-  // bob#279: how many consecutive read-only calls trip the exploration budget,
-  // or undefined when neither the role nor bob.yaml configures one. Only the
-  // one-shot run observes it.
   const explorationLimit = opts.explorationBudget ?? resolved.explorationBudget;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
@@ -1030,19 +1019,12 @@ async function runBoundedSession(
     );
   }
 
-  // A run of identical tool calls is watched as events arrive. The breaker
-  // rejects the bounded turn sent through sendToSession when the limit fires.
-  // bob#279: a second, independent stop — the exploration budget — rejects the
-  // same turn when a run of read-only calls with no edit reaches twice its
-  // limit, after the runtime has injected its instruction. Either stop aborts
-  // `loopController`; when both have fired the error is the loop breaker's
-  // (checked first below), else the exploration budget's.
   const loopDetector = new ToolLoopDetector(toolLoopLimit);
   const explorationDetector =
     explorationLimit !== undefined ? new ExplorationBudgetDetector(explorationLimit) : undefined;
   const loopController = new AbortController();
   let loopBreaker: { toolName: string; count: number } | undefined;
-  let explorationExhausted: { limit: number; readOnlyCalls: number } | undefined;
+  let explorationExhausted: { limit: number; nonProgressCalls: number } | undefined;
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
     if (loopBreaker !== undefined) {
       // A synchronous session may emit the breaking event before its prompt
@@ -1055,7 +1037,7 @@ async function runBoundedSession(
       return Promise.reject(
         new ExplorationBudgetExhaustedError(
           explorationExhausted.limit,
-          explorationExhausted.readOnlyCalls,
+          explorationExhausted.nonProgressCalls,
         ),
       );
     }
@@ -1067,7 +1049,7 @@ async function runBoundedSession(
           reject(
             new ExplorationBudgetExhaustedError(
               explorationExhausted.limit,
-              explorationExhausted.readOnlyCalls,
+              explorationExhausted.nonProgressCalls,
             ),
           );
         } else {
@@ -1154,28 +1136,26 @@ async function runBoundedSession(
         loopController.abort();
       }
     }
-    // bob#279/bob#281: count consecutive READ-ONLY calls; at the budget, inject
-    // the one instruction; at twice the budget, end the run. A write-class call
-    // resets the count only when its execution ENDED WITHOUT AN ERROR, and a
-    // command runner never resets it (a command may have only read); a call's
-    // start, a failed or refused call and an unknown name reset nothing. Skipped
-    // once the budget is spent.
     if (
-      event.type === "tool_execution_start" &&
+      (event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
       explorationDetector !== undefined &&
       explorationExhausted === undefined
     ) {
-      const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
-      const budget = explorationDetector.observeStart(toolName);
+      const call = event as unknown as { toolName?: unknown; isError?: unknown };
+      const toolName = String(call.toolName ?? "");
+      const budget =
+        event.type === "tool_execution_start"
+          ? explorationDetector.observeStart(toolName)
+          : explorationDetector.observeEnd(toolName, call.isError);
       if (budget.inject) {
         writeRunLog(
           {
             t: now().toISOString(),
-            exploration: { readOnlyCalls: budget.readOnlyCalls, action: "instruction" },
+            exploration: { nonProgressCalls: budget.nonProgressCalls, action: "instruction" },
           },
           false,
         );
-        process.stderr.write(explorationInstructionMessage(opts.name, budget.readOnlyCalls));
+        process.stderr.write(explorationInstructionMessage(opts.name, budget.nonProgressCalls));
         try {
           const sent = sendToSession(session, bounds, EXPLORATION_INSTRUCTION, "steer");
           void sent.catch(reportInstructionUndelivered);
@@ -1185,7 +1165,7 @@ async function runBoundedSession(
       } else if (budget.exhaust) {
         explorationExhausted = {
           limit: explorationDetector.limit,
-          readOnlyCalls: budget.readOnlyCalls,
+          nonProgressCalls: budget.nonProgressCalls,
         };
         writeRunLog(
           {
@@ -1193,28 +1173,19 @@ async function runBoundedSession(
             outcome: {
               reason: "exploration_budget_exhausted",
               limit: explorationDetector.limit,
-              readOnlyCalls: budget.readOnlyCalls,
+              nonProgressCalls: budget.nonProgressCalls,
             },
           },
           false,
         );
         process.stderr.write(
-          explorationExhaustedMessage(opts.name, explorationDetector.limit, budget.readOnlyCalls),
+          explorationExhaustedMessage(
+            opts.name,
+            explorationDetector.limit,
+            budget.nonProgressCalls,
+          ),
         );
         loopController.abort();
-      }
-    }
-    // bob#281: a tool call ENDED. Only an execution that ended WITHOUT an error
-    // is progress. The flag is credited on an explicit `false`: `isError` absent
-    // is not read as "no error", so an unknown outcome never resets the count.
-    if (
-      event.type === "tool_execution_end" &&
-      explorationDetector !== undefined &&
-      explorationExhausted === undefined
-    ) {
-      const ended = event as unknown as { toolName?: unknown; isError?: unknown };
-      if (ended.isError === false) {
-        explorationDetector.observeEndWithoutError(String(ended.toolName ?? ""));
       }
     }
   });

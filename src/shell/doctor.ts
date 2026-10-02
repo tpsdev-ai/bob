@@ -258,10 +258,6 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       : "not present — fine if using a provider without custom routing",
   });
 
-  // bob#279: the LAST run's outcome, so a run that ended without an edit — an
-  // exhausted exploration budget above all — is visible without opening the log.
-  // A past failed run is a WARN, not a FAIL: the agent is healthy, the run is
-  // the thing to look at.
   const lastRun = readLastRunSummary(join(agentDir, "runs"));
   if (lastRun === undefined) {
     checks.push({ name: "last run", status: "skip", detail: "no run log yet" });
@@ -275,7 +271,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       detail: `${lastRun.file} — ${reason}${exit}`,
       ...(reason === "exploration_budget_exhausted"
         ? {
-            fix: "the last run read past its exploration budget with no edit — give the task an exact edit, or raise run.exploration_budget in bob.yaml (or exploration_budget in the role's role.json)",
+            fix: "the last run exhausted its exploration budget — give the task an exact edit, or raise run.exploration_budget in bob.yaml (or exploration_budget in the role's role.json)",
           }
         : {}),
     });
@@ -1288,11 +1284,6 @@ function scanRunLogTail(
   return { outcome, exitCode };
 }
 
-// The reason string a run's recorded outcome carries, for display. A missing or
-// malformed reason reads as "no outcome recorded", never as a success — the
-// last-run line's STATUS is separate: it follows the exit code (`exitCode === 0`
-// is OK), so a run that exited 0 and recorded no outcome is shown OK with that
-// reason, and one that exited non-zero is a warn.
 export function lastRunOutcomeReason(outcome: unknown): string {
   if (outcome !== null && typeof outcome === "object" && "reason" in outcome) {
     const reason = (outcome as { reason?: unknown }).reason;
