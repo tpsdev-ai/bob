@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import { gitEnvironment } from "./git-environment.js";
 import { TOOL_EFFECTS } from "./tool-allowlist.js";
 
 // Writer effects that run a command or a request rather than editing a file.
@@ -68,8 +70,13 @@ export function hasEditSuccessEvidence(toolName: string, result: unknown): boole
   }
 }
 
+interface RepositoryIdentity {
+  workTree: string;
+  gitDir: string;
+}
+
 export type RepositoryState =
-  | { kind: "git"; head: string; diffHash: string }
+  | ({ kind: "git"; head: string; trackedHash: string } & RepositoryIdentity)
   | { kind: "not a git work tree" | "unavailable" };
 
 export interface RepositoryEditEvidence {
@@ -78,24 +85,146 @@ export interface RepositoryEditEvidence {
   after: RepositoryState;
 }
 
-function git(cwd: string, args: string[]) {
-  return spawnSync("git", ["--no-replace-objects", ...args], {
-    cwd,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1" },
-    encoding: "buffer",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5_000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
+function git(cwd: string, args: string[], repository?: RepositoryIdentity) {
+  return spawnSync(
+    "git",
+    [
+      "--no-replace-objects",
+      "-c",
+      "core.abbrev=no",
+      "-c",
+      "core.quotePath=false",
+      "-c",
+      "core.fsmonitor=false",
+      ...(repository
+        ? [`--git-dir=${repository.gitDir}`, `--work-tree=${repository.workTree}`]
+        : []),
+      ...args,
+    ],
+    {
+      cwd,
+      env: gitEnvironment(),
+      encoding: "buffer",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
 }
 
-function readGit(cwd: string, args: string[]): Buffer {
-  const result = git(cwd, args);
+function readGit(cwd: string, args: string[], repository?: RepositoryIdentity): Buffer {
+  const result = git(cwd, args, repository);
   if (result.error || result.status !== 0) throw new Error("git evidence unavailable");
   return result.stdout;
 }
 
-export function captureRepositoryState(cwd: string): RepositoryState {
+function gitLine(cwd: string, args: string[], repository?: RepositoryIdentity): string {
+  const output = readGit(cwd, args, repository).toString();
+  if (!output.endsWith("\n")) throw new Error("incomplete git output");
+  return output.slice(0, -1);
+}
+
+function resolveRepository(cwd: string): RepositoryIdentity {
+  return {
+    workTree: realpathSync(gitLine(cwd, ["rev-parse", "--show-toplevel"])),
+    gitDir: realpathSync(gitLine(cwd, ["rev-parse", "--absolute-git-dir"])),
+  };
+}
+
+function sameRepository(left: RepositoryIdentity, right: RepositoryIdentity): boolean {
+  return left.workTree === right.workTree && left.gitDir === right.gitDir;
+}
+
+type TrackedEntry = { mode: string; object: string };
+
+function trackedEntries(output: Buffer, tree: boolean): Map<string, TrackedEntry> {
+  const entries = new Map<string, TrackedEntry>();
+  const records = output.toString("latin1").split("\0");
+  if (records.pop() !== "") throw new Error("incomplete tracked listing");
+  for (const record of records) {
+    const tab = record.indexOf("\t");
+    const fields = record.slice(0, tab).split(" ");
+    const path = record.slice(tab + 1);
+    const [mode, object] = tree ? [fields[0], fields[2]] : fields;
+    if (
+      tab < 0 ||
+      fields.length !== 3 ||
+      !/^(100644|100755|120000|160000)$/.test(mode) ||
+      !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(object) ||
+      (!tree && fields[2] !== "0") ||
+      path.split("/").some((part) => !part || part === "." || part === "..")
+    )
+      throw new Error("unsupported tracked entry");
+    entries.set(path, { mode, object });
+  }
+  return entries;
+}
+
+function trackedFingerprint(repository: RepositoryIdentity, head: string): string {
+  const { workTree } = repository;
+  const tree = trackedEntries(
+    readGit(workTree, ["ls-tree", "-r", "-z", "--full-tree", head], repository),
+    true,
+  );
+  const index = trackedEntries(
+    readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository),
+    false,
+  );
+  const hash = createHash("sha256");
+  const paths = [...new Set([...tree.keys(), ...index.keys()])].sort();
+  for (const path of paths) {
+    const name = Buffer.from(path, "latin1");
+    const absolute = Buffer.concat([Buffer.from(`${workTree}/`), name]);
+    const baseline = tree.get(path);
+    let mode = "deleted";
+    let bytes = Buffer.alloc(0);
+    let object = "";
+    let stat: Stats | undefined;
+    try {
+      stat = lstatSync(absolute);
+    } catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+    if (stat?.isSymbolicLink()) {
+      mode = "120000";
+      bytes = readlinkSync(absolute, { encoding: "buffer" });
+    } else if (stat?.isFile()) {
+      mode = stat.mode & 0o111 ? "100755" : "100644";
+      bytes = readFileSync(absolute);
+    } else if (stat?.isDirectory() && (index.get(path) ?? baseline)?.mode === "160000") {
+      mode = "160000";
+      const childPath = absolute.toString();
+      if (!Buffer.from(childPath).equals(absolute)) throw new Error("unsupported submodule path");
+      const child = resolveRepository(childPath);
+      object =
+        child.workTree === realpathSync(childPath)
+          ? gitLine(childPath, ["rev-parse", "--verify", "HEAD^{commit}"], child)
+          : ((index.get(path) ?? baseline)?.object ?? "");
+      bytes = Buffer.from(object);
+    } else if (stat) {
+      throw new Error("unsupported tracked file type");
+    }
+    if (mode !== "deleted" && mode !== "160000") {
+      object = createHash(head.length === 64 ? "sha256" : "sha1")
+        .update(`blob ${bytes.length}\0`)
+        .update(bytes)
+        .digest("hex");
+    }
+    if (baseline?.mode === mode && baseline.object === object) continue;
+    if (!baseline && mode === "deleted") continue;
+    hash
+      .update(name)
+      .update("\0")
+      .update(mode)
+      .update("\0")
+      .update(createHash("sha256").update(bytes).digest())
+      .update("\0");
+  }
+  return hash.digest("hex");
+}
+
+export function captureRepositoryState(cwd: string, launch?: RepositoryState): RepositoryState {
+  if (launch && launch.kind !== "git") return { kind: "unavailable" };
   try {
     const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
     if (
@@ -108,30 +237,17 @@ export function captureRepositoryState(cwd: string): RepositoryState {
     if (inside.error || inside.status !== 0 || inside.stdout.toString().trim() !== "true") {
       return { kind: "unavailable" };
     }
-    const head = readGit(cwd, ["rev-parse", "--verify", "HEAD^{commit}"]).toString().trim();
-    const diff = readGit(cwd, [
-      "diff",
-      "--binary",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--no-renames",
-      "--no-color",
-      "--no-relative",
-      "--src-prefix=a/",
-      "--dst-prefix=b/",
-      "--unified=0",
-      "--inter-hunk-context=0",
-      "--diff-algorithm=myers",
-      "--no-indent-heuristic",
-      "--ignore-submodules=dirty",
-      "--submodule=short",
-      head,
-      "--",
-    ]);
-    if (readGit(cwd, ["rev-parse", "--verify", "HEAD^{commit}"]).toString().trim() !== head) {
+    const repository = resolveRepository(cwd);
+    if (launch?.kind === "git" && !sameRepository(launch, repository))
       return { kind: "unavailable" };
-    }
-    return { kind: "git", head, diffHash: createHash("sha256").update(diff).digest("hex") };
+    const head = gitLine(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], repository);
+    const trackedHash = trackedFingerprint(repository, head);
+    if (
+      gitLine(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], repository) !== head ||
+      !sameRepository(repository, resolveRepository(cwd))
+    )
+      return { kind: "unavailable" };
+    return { kind: "git", ...repository, head, trackedHash };
   } catch {
     return { kind: "unavailable" };
   }
@@ -149,13 +265,16 @@ export function isVerifiedEdit(
   if (repository?.before.kind !== "git" || repository.after.kind !== "git") return false;
   const { cwd, before, after } = repository;
   try {
+    if (!sameRepository(before, after) || !sameRepository(before, resolveRepository(cwd)))
+      return false;
     const committedChange =
       before.head !== after.head &&
-      readGit(cwd, ["rev-list", "--max-count=1", after.head, `^${before.head}`, "--"]).length > 0 &&
-      !readGit(cwd, ["rev-parse", "--verify", `${before.head}^{tree}`]).equals(
-        readGit(cwd, ["rev-parse", "--verify", `${after.head}^{tree}`]),
+      readGit(cwd, ["rev-list", "--max-count=1", after.head, `^${before.head}`, "--"], before)
+        .length > 0 &&
+      !readGit(cwd, ["rev-parse", "--verify", `${before.head}^{tree}`], before).equals(
+        readGit(cwd, ["rev-parse", "--verify", `${after.head}^{tree}`], before),
       );
-    return committedChange || before.diffHash !== after.diffHash;
+    return committedChange || before.trackedHash !== after.trackedHash;
   } catch {
     return false;
   }

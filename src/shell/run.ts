@@ -78,7 +78,7 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
-import { captureRepositoryState, isVerifiedEdit } from "./edit-evidence.js";
+import { captureRepositoryState, isVerifiedEdit, type RepositoryState } from "./edit-evidence.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -866,7 +866,10 @@ async function runBoundedSession(
   // Applies to bob run and launch with a prompt; mail turns are exempt.
   const requireEditOrBlocked =
     opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
-  const repositoryAtLaunch = captureRepositoryState(config.cwd);
+  const repositoryAtLaunch: RepositoryState =
+    requireEditOrBlocked || explorationLimit !== undefined
+      ? captureRepositoryState(config.cwd)
+      : { kind: "unavailable" };
   let repositoryAtLastTool = repositoryAtLaunch;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
@@ -1174,7 +1177,7 @@ async function runBoundedSession(
           ? {
               cwd: config.cwd,
               before: repositoryAtLastTool,
-              after: captureRepositoryState(config.cwd),
+              after: captureRepositoryState(config.cwd, repositoryAtLaunch),
             }
           : undefined;
       const budget =
@@ -1398,7 +1401,7 @@ async function runBoundedSession(
       !isVerifiedEdit("", undefined, undefined, {
         cwd: config.cwd,
         before: repositoryAtLaunch,
-        after: captureRepositoryState(config.cwd),
+        after: captureRepositoryState(config.cwd, repositoryAtLaunch),
       })
     ) {
       if (!/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {

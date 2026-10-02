@@ -1,8 +1,22 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readWorktreeStatusResult } from "../../src/shell/compaction-contract.js";
+import { captureRepositoryState, isVerifiedEdit } from "../../src/shell/edit-evidence.js";
+import { initOverrideRepo } from "../../src/shell/overrides.js";
 import { type RunSession, runAgent } from "../../src/shell/run.js";
 
 const gitEnv = {
@@ -133,6 +147,210 @@ describe("repository evidence in the completion gate and exploration budget", ()
       expect(result.noEditNoBlocked).toBe(true);
     },
   );
+
+  function changePresentation() {
+    for (const [key, value] of Object.entries({
+      "core.abbrev": "40",
+      "diff.renames": "true",
+      "core.quotePath": "false",
+      "diff.noprefix": "true",
+      "core.fileMode": "false",
+      "core.autocrlf": "true",
+      "diff.algorithm": "histogram",
+      "diff.relative": "true",
+      "diff.orderFile": join(agentsRoot, "order"),
+    }))
+      git(cwd, "config", key, value);
+  }
+
+  function dirtyFixture() {
+    writeFileSync(join(cwd, "quoted\t\n-é"), "before\n");
+    commit(cwd, launchHead);
+    git(cwd, "config", "core.abbrev", "7");
+    writeFileSync(join(agentsRoot, "order"), "tracked\n");
+    writeFileSync(join(cwd, "tracked"), "pre-existing\n");
+    renameSync(join(cwd, "quoted\t\n-é"), join(cwd, "renamed"));
+    git(cwd, "add", ".");
+  }
+
+  it("ignores presentation-only changes in a dirty tree but accepts new bytes", async () => {
+    dirtyFixture();
+    const before = captureRepositoryState(cwd);
+    const result = await run([{ toolName: "run", action: changePresentation }]);
+    const after = captureRepositoryState(cwd);
+    const edited = await run([
+      { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "real edit\n") },
+    ]);
+    expect({ result: result.noEditNoBlocked, after }).toEqual({ result: true, after: before });
+    expect(result.exitCode).toBe(1);
+    expect(edited.exitCode).toBe(0);
+  });
+
+  it("does not award exploration credit for presentation-only changes", async () => {
+    dirtyFixture();
+    const result = await run(
+      [
+        { toolName: "read" },
+        { toolName: "run", action: changePresentation },
+        { toolName: "read" },
+        { toolName: "read" },
+      ],
+      undefined,
+      2,
+    );
+    expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+  });
+
+  it("ignores ambient repository selectors for edits, history and exploration", async () => {
+    const other = join(agentsRoot, "other");
+    mkdirSync(other);
+    init(other);
+    const saved = { ...process.env };
+    try {
+      Object.assign(process.env, { GIT_DIR: join(other, ".git"), GIT_WORK_TREE: other });
+      const edited = await run(
+        [
+          { toolName: "read" },
+          { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "real edit\n") },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        2,
+      );
+      const committed = await run([{ toolName: "run", action: () => commit(cwd, launchHead) }]);
+      const unrelated = await run([
+        { toolName: "run", action: () => writeFileSync(join(other, "tracked"), "other edit\n") },
+      ]);
+      expect(edited.explorationBudgetExhausted).toBeUndefined();
+      expect(edited.exitCode).toBe(0);
+      expect(committed.exitCode).toBe(0);
+      expect(unrelated.noEditNoBlocked).toBe(true);
+    } finally {
+      for (const key of ["GIT_DIR", "GIT_WORK_TREE"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+  });
+
+  it("allowlists the environment on every Bob Git subprocess", () => {
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(cwd, "tracked"), "commit edit\n");
+    commit(cwd, launchHead);
+    const probe = spyOn(childProcess, "spawnSync");
+    const setupProbe = spyOn(childProcess, "execFileSync");
+    process.env.BOB_EVIDENCE_UNLISTED = "must not be inherited";
+    try {
+      const after = captureRepositoryState(cwd);
+      expect(after.kind).toBe("git");
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(true);
+      expect(readWorktreeStatusResult(cwd).ok).toBe(true);
+      initOverrideRepo(join(agentsRoot, "builder"));
+      const calls = [...probe.mock.calls, ...setupProbe.mock.calls].filter(
+        ([command]) => command === "git",
+      );
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        const options = call[2] as { env: Record<string, string> };
+        expect(Object.keys(options.env).sort()).toEqual([
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_NOSYSTEM",
+          "GIT_NO_LAZY_FETCH",
+          "GIT_OPTIONAL_LOCKS",
+          "HOME",
+          "LANG",
+          "LC_ALL",
+          "PATH",
+        ]);
+        expect(options.env.LC_ALL).toBe("C");
+        expect(options.env.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+      }
+    } finally {
+      delete process.env.BOB_EVIDENCE_UNLISTED;
+      probe.mockRestore();
+      setupProbe.mockRestore();
+    }
+  });
+
+  it.each([
+    ["worktree", "completion"],
+    ["gitdir", "completion"],
+    ["worktree", "exploration"],
+    ["gitdir", "exploration"],
+  ])("rejects changed %s resolution during %s", async (kind, gate) => {
+    const other = join(agentsRoot, "replacement");
+    mkdirSync(other);
+    if (kind === "worktree") {
+      const gitdir = join(agentsRoot, "fixed-git-dir");
+      renameSync(join(cwd, ".git"), gitdir);
+      writeFileSync(join(cwd, ".git"), `gitdir: ${gitdir}\n`);
+    }
+    const redirect = () => {
+      if (kind === "worktree") {
+        cpSync(cwd, other, { recursive: true });
+        rmSync(cwd, { recursive: true });
+        symlinkSync(other, cwd);
+        writeFileSync(join(other, "tracked"), "other tree\n");
+      } else {
+        const gitdir = join(other, ".git");
+        cpSync(join(cwd, ".git"), gitdir, { recursive: true });
+        rmSync(join(cwd, ".git"), { recursive: true });
+        writeFileSync(join(cwd, ".git"), `gitdir: ${gitdir}\n`);
+        writeFileSync(join(cwd, "tracked"), "changed\n");
+      }
+    };
+    const result = await run(
+      [
+        { toolName: "run", action: redirect },
+        {
+          toolName: "run",
+          action: () =>
+            writeFileSync(join(kind === "worktree" ? other : cwd, "tracked"), "changed again\n"),
+        },
+        { toolName: "read" },
+        { toolName: "read" },
+      ],
+      undefined,
+      gate === "exploration" ? 2 : 20,
+    );
+    if (gate === "exploration") {
+      expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    } else {
+      expect(result.noEditNoBlocked).toBe(true);
+    }
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("skips evidence Git probes when completion and exploration gates are disabled", async () => {
+    const probe = spyOn(childProcess, "spawnSync");
+    const config = join(agentsRoot, "builder", "bob.yaml");
+    writeFileSync(
+      config,
+      readFileSync(config, "utf8").replace("builder-local", "coder").replace("- run", "- bash"),
+    );
+    try {
+      const result = await runAgent({
+        name: "builder",
+        agentsRoot,
+        prompt: "Read the file.",
+        requireEditOrBlocked: false,
+        sessionFactory: async () => session([]),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(probe.mock.calls.filter(([command]) => command === "git")).toEqual([]);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("counts a working-tree mode change even when Git ignores file modes", async () => {
+    git(cwd, "config", "core.fileMode", "false");
+    const result = await run([
+      { toolName: "run", action: () => chmodSync(join(cwd, "tracked"), 0o755) },
+    ]);
+    expect(result.exitCode).toBe(0);
+  });
 
   it("rejects an empty commit", async () => {
     const result = await run([

@@ -11,12 +11,8 @@
 // raced it; under Bun, its rmSync returned without an error and left the tree
 // behind in some of the observed runs.
 //
-// Git's own trace (GIT_TRACE2_EVENT, which the initializer's Git subprocesses
-// inherit from bob's environment) records each Git process's command line and
-// how it exited, and the command line of each child command it runs, so this
-// checks what ran, not how long it took.
-
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as childProcess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -77,7 +73,16 @@ function traceProblems(events: TraceEvent[]): string[] {
 
 describe("the override repository's initializing Git calls start no automatic maintenance or gc (bob#248)", () => {
   const scratch: string[] = [];
-  const savedTrace = process.env.GIT_TRACE2_EVENT;
+  let traceSpy: ReturnType<typeof spyOn> | undefined;
+  function traceGit(tracePath: string) {
+    const execute = childProcess.execFileSync;
+    traceSpy = spyOn(childProcess, "execFileSync").mockImplementation((command, args, options) =>
+      execute(command, args as string[], {
+        ...options,
+        env: { ...options?.env, GIT_TRACE2_EVENT: tracePath },
+      }),
+    );
+  }
 
   const scratchDir = (): string => {
     const dir = mkdtempSync(join(tmpdir(), "bob-ovr248-"));
@@ -86,8 +91,7 @@ describe("the override repository's initializing Git calls start no automatic ma
   };
 
   afterEach(() => {
-    if (savedTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
-    else process.env.GIT_TRACE2_EVENT = savedTrace;
+    traceSpy?.mockRestore();
     for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -96,7 +100,7 @@ describe("the override repository's initializing Git calls start no automatic ma
     const agentDir = join(base, "agent");
     mkdirSync(agentDir);
     const tracePath = join(base, "git-trace.json");
-    process.env.GIT_TRACE2_EVENT = tracePath;
+    traceGit(tracePath);
     initOverrideRepo(agentDir);
     expect(existsSync(join(agentDir, "overrides", ".git"))).toBe(true);
     expect(traceProblems(parseTrace(traceLines(tracePath)))).toEqual([]);
@@ -107,7 +111,7 @@ describe("the override repository's initializing Git calls start no automatic ma
     const agentsRoot = join(base, "agents");
     mkdirSync(agentsRoot);
     const tracePath = join(base, "git-trace.json");
-    process.env.GIT_TRACE2_EVENT = tracePath;
+    traceGit(tracePath);
     const hired = await hireAgent({
       name: "ovr-hire",
       positionName: "builder",
@@ -132,7 +136,7 @@ describe("the override repository's initializing Git calls start no automatic ma
     const agentDir = join(base, "agent");
     mkdirSync(agentDir);
     const tracePath = join(base, "git-trace.json");
-    process.env.GIT_TRACE2_EVENT = tracePath;
+    traceGit(tracePath);
     initOverrideRepo(agentDir);
     const lines = traceLines(tracePath);
     expect(traceProblems(parseTrace(lines))).toEqual([]);

@@ -27,6 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { gitEnvironment } from "./git-environment.js";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
 
 export interface Overrides {
@@ -377,11 +378,10 @@ function git(args: string[], cwd: string): void {
   try {
     // Internal bookkeeping must not read the operator's global/system config
     // or copy an operator template with executable hooks into this new repo.
-    const { GIT_TEMPLATE_DIR: _templateDir, ...env } = process.env;
     execFileSync("git", [...NO_AUTO_HOUSEKEEPING, ...args], {
       cwd,
       stdio: "ignore",
-      env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      env: gitEnvironment(),
     });
   } catch (err) {
     throw new Error(

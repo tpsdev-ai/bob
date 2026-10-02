@@ -28,6 +28,7 @@
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
 
 import { spawnSync } from "node:child_process";
+import { gitEnvironment } from "./git-environment.js";
 
 /** The explicit continue turn sent as the single retry. */
 export const CONTINUE_TURN =
@@ -512,6 +513,7 @@ export function readWorktreeStatusResult(
   try {
     const r = spawnSync(opts.git ?? "git", ["status", "--short"], {
       cwd,
+      env: gitEnvironment(),
       encoding: "utf8",
       timeout: opts.timeoutMs ?? GIT_STATUS_TIMEOUT_MS,
       killSignal: "SIGKILL",
