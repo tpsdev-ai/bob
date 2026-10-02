@@ -878,9 +878,11 @@ async function runBoundedSession(
   const explorationLimit = opts.explorationBudget ?? resolved.explorationBudget;
   // bob#283: whether this run must end with a verified file edit or an explicit
   // BLOCKED report. The role opts in (role.json `require_edit_or_blocked`, true
-  // in builder-local) and an explicit option overrides it. A mail turn keeps its
-  // own completion contract, and the persistent runtime does not judge its turns
-  // here.
+  // in builder-local) and an explicit option overrides it. A mail turn is never
+  // judged by it: its session holds only the mail allowlist's Flair tools, so no
+  // file edit is possible there, and its own contract (a reply, or silence) is
+  // what the consumer expects. The persistent runtime does not judge its turns
+  // here either.
   const requireEditOrBlocked =
     opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
 
