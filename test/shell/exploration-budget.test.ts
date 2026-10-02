@@ -12,6 +12,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -332,6 +333,13 @@ describe("readLastRunSummary", () => {
     mkdirSync(join(dir, "runs"), { recursive: true });
     expect(readLastRunSummary(join(dir, "runs"))).toBeUndefined();
     expect(existsSync(join(dir, "runs"))).toBe(true);
+  });
+
+  it("returns undefined when a listed log is missing at open", () => {
+    const runs = join(dir, "runs");
+    mkdirSync(runs, { recursive: true });
+    symlinkSync(join(runs, "vanished-target"), join(runs, "vanished.jsonl"));
+    expect(readLastRunSummary(runs)).toBeUndefined();
   });
 
   it("reports a missing or malformed outcome as 'no outcome recorded', never as success", () => {

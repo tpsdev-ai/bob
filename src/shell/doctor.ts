@@ -34,6 +34,7 @@ import { spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -1164,25 +1165,37 @@ export function readLastRunSummary(
     return undefined;
   }
   if (names.length === 0) return undefined;
-  let newest: { name: string; mtimeMs: number } | undefined;
+  let newest: { name: string; mtimeMs: number; size: number; fd: number } | undefined;
   for (const name of names) {
+    let fd: number | undefined;
     try {
-      const mtimeMs = statSync(join(runsDir, name)).mtimeMs;
-      if (newest === undefined || mtimeMs > newest.mtimeMs) newest = { name, mtimeMs };
+      fd = openSync(join(runsDir, name), "r");
+      const { mtimeMs, size } = fstatSync(fd);
+      if (newest === undefined || mtimeMs > newest.mtimeMs) {
+        if (newest !== undefined) closeSync(newest.fd);
+        newest = { name, mtimeMs, size, fd };
+        fd = undefined;
+      }
     } catch {
-      // A log that vanished or cannot be stat'd is skipped, not guessed at.
+      // A log that vanished or cannot be opened or inspected is skipped, not guessed at.
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
   }
   if (newest === undefined) return undefined;
-  const { outcome, exitCode } = scanRunLogTail(join(runsDir, newest.name), {
-    outcome: false,
-    exitCode: false,
-  });
-  return {
-    file: newest.name,
-    ...(outcome !== undefined ? { outcome } : {}),
-    ...(exitCode !== undefined ? { exitCode } : {}),
-  };
+  try {
+    const { outcome, exitCode } = scanRunLogTail(newest.fd, newest.size, {
+      outcome: false,
+      exitCode: false,
+    });
+    return {
+      file: newest.name,
+      ...(outcome !== undefined ? { outcome } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    };
+  } finally {
+    closeSync(newest.fd);
+  }
 }
 
 // How much of a run log the backward scan reads before giving up.
@@ -1195,21 +1208,10 @@ const RUN_LOG_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 // newlines), so a line is parsed only when it is whole — a line split by a chunk
 // boundary is carried into the next (earlier) chunk.
 function scanRunLogTail(
-  path: string,
+  fd: number,
+  size: number,
   want: { outcome: boolean; exitCode: boolean },
 ): { outcome?: unknown; exitCode?: number } {
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return {};
-  }
-  let fd: number;
-  try {
-    fd = openSync(path, "r");
-  } catch {
-    return {};
-  }
   let outcome: unknown;
   let exitCode: number | undefined;
   try {
@@ -1220,9 +1222,9 @@ function scanRunLogTail(
       const start = Math.max(0, end - RUN_LOG_SCAN_CHUNK_BYTES);
       const len = end - start;
       const buf = Buffer.allocUnsafe(len);
-      readSync(fd, buf, 0, len, start);
-      scanned += len;
-      const lines = (buf.toString("utf8") + carry).split("\n");
+      const bytesRead = readSync(fd, buf, 0, len, start);
+      scanned += bytesRead;
+      const lines = (buf.toString("utf8", 0, bytesRead) + carry).split("\n");
       carry = lines.shift() ?? "";
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim();
@@ -1246,8 +1248,9 @@ function scanRunLogTail(
       }
       end = start;
     }
-  } finally {
-    closeSync(fd);
+  } catch {
+    // Doctor is diagnostic: a log that becomes unreadable yields what was
+    // already found (usually nothing) instead of making the command fail.
   }
   return { outcome, exitCode };
 }
