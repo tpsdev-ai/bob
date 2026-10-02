@@ -9,13 +9,14 @@ its own runtime. This capability gives the builder a tool that owns execution:
 every command has a deadline, the tool owns and cancels only the process groups
 it started, and a command's outcome is never reported as success unless it was.
 
-It registers three tools through `pi.registerTool`:
+It registers four tools through `pi.registerTool`:
 
 | tool | takes | does |
 | --- | --- | --- |
 | `run` | `command`, `cwd?`, `timeout_s?`, `background?` | runs `bash -c command`; waits for the outcome, or with `background: true` returns a `run_id` at once |
 | `run_status` | `run_id?` | one job's state, outcome, cleanup and output excerpt; with no `run_id`, every job this run owns |
 | `run_cancel` | `run_id` | cancels one of this run's jobs by its recorded process group |
+| `apply_patch` | `patch_artifact: { path, sha256 }`, `expected_base` | applies a launcher-authorized patch to a fresh tool-owned index built from the task's pinned base and stores the resulting candidate (see below) |
 
 `cwd` is relative to the workspace, or an absolute path inside it; omitted, the
 command starts in the workspace. It must be an existing directory, and after
@@ -74,14 +75,64 @@ directory with search but not read permission is therefore refused, although a
 command could start in it. That is the safe direction; make it readable
 (`chmod u+r`) or pass another directory.
 
+## apply_patch and the task binding (bob#275, S2a)
+
+`apply_patch` builds a candidate tree from a launcher-authorized patch, so the
+published change is the change that was verified.
+
+**The task binding.** A task binding is the launcher's authority over a builder
+session: the task and publication identities, the repository and workspace, the
+pinned base commit, the mode (`build` or `apply`), the artifact root, the
+declared paths, the required check commands and the authorized publication
+destination. It is supplied by the LAUNCHER, carried by the ONE session factory
+(`session.ts`) into this capability through the environment variable
+`BOB_TASK_BINDING`, and kept here, independent of model messages. A missing
+binding refuses the dependent operation with the reason `unknown_task`; a
+malformed one refuses with `invalid_binding`. No tool argument, repository file
+or agent-writable `bob.yaml` can supply it: the resolver never reads a task
+binding from configuration.
+
+**What it does.** It takes `patch_artifact: { path, sha256 }` (a patch file under
+the task's artifact root) and `expected_base` (the task's pinned base commit
+object ID). It reads the artifact once, verifies its digest, and applies those
+**verified bytes** — never a reopened pathname — to a fresh, tool-owned
+`GIT_INDEX_FILE` initialized from the pinned base (`git read-tree`), then writes
+the resulting tree. The caller's worktree, index, HEAD and refs are never used
+as application input and are left untouched. In `apply` mode the artifact must
+also match the task-authorized digest.
+
+It supports ordinary file additions, modifications, deletions, renames,
+executable-bit changes and Git binary patches, and preserves line endings. It
+refuses a symlink or a submodule change explicitly (`unsupported_entry_type`),
+and never selects paths, drops hunks, repairs whitespace, resolves conflicts or
+falls back to another base: the whole patch applies to the fresh index or
+nothing does (`patch_does_not_apply`).
+
+**Refusals.** A structured refusal carries a stable reason: `unknown_task`,
+`invalid_binding`, `invalid_base`, `base_mismatch`, `artifact_missing`,
+`unsafe_artifact_path`, `digest_mismatch`, `malformed_patch`,
+`patch_does_not_apply`, `unsafe_git_path`, `unsupported_entry_type`,
+`apply_failed`, `storage_failed`. A refusal returns no candidate and leaves the
+caller's checkout unchanged.
+
+**Success** returns `{ candidate_id, base_oid, patch_sha256, tree_oid,
+changed_paths }`. The candidate is stored under the tool-owned state root
+(`<state dir>/candidates/<candidate_id>.json`) with its task and repository
+association, and its Git objects are written into the repository for a later
+publication. **A candidate id is not permission to publish it.**
+
+`apply_patch` builds a candidate; it writes no file the model names and runs no
+command, so its `TOOL_EFFECTS` row is `writer` and a resident agent drops it with
+the other writers.
+
 ## Enabling it
 
 The `work` capability is what enables `run`. `roles/builder-local/role.json`
-allows `run`, `run_status` and `run_cancel`, and does not allow `bash`: in that
-role, `run` replaces pi's shell, and that is a fact of the config (tool
-availability is a per-role allow-list), not of load order. An agent opts in the
-same way as for `anchored-edit`: `work` under `capabilities:` in `bob.yaml` and
-the three names in `tools.allow:`.
+allows `run`, `run_status`, `run_cancel` and `apply_patch`, and does not allow
+`bash`: in that role, `run` replaces pi's shell, and that is a fact of the config
+(tool availability is a per-role allow-list), not of load order. An agent opts in
+the same way as for `anchored-edit`: `work` under `capabilities:` in `bob.yaml`
+and the four names in `tools.allow:`.
 
 `run` executes arbitrary commands, so the resident policy treats it as a shell:
 its `TOOL_EFFECTS` row is `writer`, so it is in `RESIDENT_EXCLUDED_TOOLS` with

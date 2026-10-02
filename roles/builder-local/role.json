@@ -8,6 +8,7 @@
       "run",
       "run_status",
       "run_cancel",
+      "apply_patch",
       "grep",
       "find",
       "ls",

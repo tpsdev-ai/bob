@@ -48,6 +48,7 @@ import {
   MAIL_TURN_INPUT_MAX_BYTES,
   parseMailTurnInput,
 } from "../capabilities/tps-mail/prompt.js";
+import type { TaskBinding } from "../capabilities/work/task-binding.js";
 import {
   type ProviderLimitsBlock,
   readAgentRole,
@@ -641,6 +642,14 @@ export interface RunSessionConfig {
   // bob#214: the thinking level handed to pi (bob.yaml `session:` over
   // role.json `session`). Absent: pi's default.
   thinking?: ThinkingSetting;
+  // bob#275 (S2a): the launcher-supplied task binding the work capability reads
+  // (via the task-binding environment hand-off). It carries the task and
+  // publication identities, repository/workspace, pinned base, mode, artifact
+  // root, declared paths, check commands and publication destination. Set by a
+  // LAUNCHER only — the resolver never reads it from bob.yaml, so an agent
+  // cannot write its own authority. Absent: the session has no task, and the
+  // dependent operations refuse.
+  taskBinding?: TaskBinding;
 }
 
 // The injectable seam. Production builds a real pi AgentSession through bob's
@@ -672,6 +681,9 @@ export interface RunOptions {
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
   positionsRoot?: string;
+  // bob#275 (S2a): the launcher-supplied task binding for this run, passed
+  // through to the session factory. Absent: the session has no task.
+  taskBinding?: TaskBinding;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
   // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
@@ -805,6 +817,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.mailTurn ? { mailTurn: true } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
   });
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. The wall clock and the watchdog start HERE, once the
@@ -1478,6 +1491,9 @@ export interface ResolveRunConfigOptions {
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
   positionsRoot?: string;
+  // bob#275 (S2a): the launcher-supplied task binding, threaded into
+  // RunSessionConfig.taskBinding. A launcher supplies it; bob.yaml cannot.
+  taskBinding?: TaskBinding;
 }
 
 export interface ResolvedRunConfig {
@@ -2112,6 +2128,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     extensionSources,
     capabilityBySource,
     capabilityEnv,
+    ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
     // bob#230: the residency decision the policy made, and the credential files
     // from the SAME parsed + validated config the capabilities receive.
     resident: toolPolicy.resident,

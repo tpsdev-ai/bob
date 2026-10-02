@@ -110,7 +110,12 @@ describe("blessed catalog", () => {
     expect(entry).toBeDefined();
     expect(entry?.notYetImplemented).toBeFalsy();
     expect(entry?.manifest.name).toBe("work");
-    expect(entry?.manifest.provides?.tools).toEqual(["run", "run_status", "run_cancel"]);
+    expect(entry?.manifest.provides?.tools).toEqual([
+      "run",
+      "run_status",
+      "run_cancel",
+      "apply_patch",
+    ]);
     expect(entry?.manifest.provides?.serves).toBe(false);
     expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/work");
   });
