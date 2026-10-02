@@ -1,7 +1,6 @@
 // The fetch core (bob#245 — web spec v3, slice R1b). It is an INTERNAL module:
 // it registers no tool, and nothing wires it to a session's config yet (slice
-// R1c builds the `web_fetch` tool on it). Everything a fetch must respect lives
-// here, so the tool slice can stay thin.
+// R1c builds the `web_fetch` tool on it).
 //
 // THE CONNECTION. One owned, direct undici Agent is built per hop and
 // destroyed before the next hop. Its connector's `lookup` is vettedLookup: it
@@ -22,15 +21,16 @@
 // Canonical literals are vetted at admission. A redirect status without a
 // Location is returned as the final response.
 //
-// LIMITS. One 15-second deadline covers the whole operation, every hop, and
-// the body read. Bodies skipped on redirects or rejected content types are
-// destroyed. Accepted final responses have separate 5 MB encoded and decoded
-// caps, enforced while streaming before extraction. The text is the
-// operator's ceiling (web.fetch_max_chars, at most 100,000) unless the caller
-// asked for less; a cut is reported.
+// LIMITS. One 15-second deadline covers every hop, the body read, decoding,
+// extraction, and the final success path. Bodies skipped on redirects or
+// rejected content types are destroyed. Accepted final responses have separate
+// 5 MB encoded and decoded caps, enforced while streaming before extraction.
+// The text is the operator's ceiling (web.fetch_max_chars, at most 100,000)
+// unless the caller asked for less; a cut is reported.
 
 import { type LookupAddress, type LookupOptions, lookup as nodeLookup } from "node:dns";
 import { readFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { Agent, request } from "undici";
@@ -47,7 +47,7 @@ import {
 } from "./extract.js";
 import { addressRefused, admitUrl, type UrlPolicy, WEB_PORTS } from "./url-admission.js";
 
-// One deadline for the whole operation: every hop, and the body read.
+// One deadline for the whole operation, including decoding and extraction.
 export const TOTAL_DEADLINE_MS = 15_000;
 // At most five redirects (five targets beyond the URL that was given).
 export const MAX_REDIRECTS = 5;
@@ -226,7 +226,11 @@ export async function readEncodedBody(body: AsyncIterable<Uint8Array>): Promise<
 
 // Decode a body, capping the DECODED bytes too (a small compressed body can
 // expand past the cap). An encoding this core does not decode is refused.
-async function decodeBody(encoded: Buffer, encoding: string | undefined): Promise<Buffer> {
+async function decodeBody(
+  encoded: Buffer,
+  encoding: string | undefined,
+  signal: AbortSignal,
+): Promise<Buffer> {
   const name = (encoding ?? "").trim().toLowerCase();
   if (name === "" || name === "identity") return encoded;
   const decoder =
@@ -245,12 +249,19 @@ async function decodeBody(encoded: Buffer, encoding: string | undefined): Promis
   }
   const source = Readable.from(encoded);
   const decoded = source.pipe(decoder);
+  const abort = (): void => {
+    source.destroy();
+    decoded.destroy();
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
   try {
     return await readCapped(decoded, MAX_BODY_BYTES, "decoded");
   } catch (error) {
     if (isWebFetchError(error)) throw error;
     throw new WebFetchError("content-encoding", `the body could not be decoded as ${name}`);
   } finally {
+    signal.removeEventListener("abort", abort);
     source.destroy();
     decoded.destroy();
   }
@@ -289,12 +300,21 @@ export async function fetchDocument(
 
   const controller = new AbortController();
   let expired = false;
+  const deadlineAt = performance.now() + deadlineMs;
   const timer = setTimeout(() => {
     expired = true;
     controller.abort();
   }, deadlineMs);
   const deadlineError = (): WebFetchError =>
     new WebFetchError("deadline", `the request took longer than ${deadlineMs} ms`);
+  const deadlineReached = (): boolean =>
+    expired || controller.signal.aborted || performance.now() >= deadlineAt;
+  const checkDeadline = (): void => {
+    if (!deadlineReached()) return;
+    expired = true;
+    controller.abort();
+    throw deadlineError();
+  };
 
   try {
     let current = admitUrl(rawUrl, policy);
@@ -321,7 +341,7 @@ export async function fetchDocument(
             signal: controller.signal,
           });
         } catch (error) {
-          if (expired) throw deadlineError();
+          checkDeadline();
           const refusal = refusalIn(error);
           if (refusal !== undefined) throw refusal;
           throw new WebFetchError("network", boundedDetail(error));
@@ -331,7 +351,14 @@ export async function fetchDocument(
         if (REDIRECT_STATUSES.includes(status)) {
           const location = headerValue(response.headers.location);
           if (location === undefined) {
-            return await readResult(response, status, current, maxChars);
+            return await readResult(
+              response,
+              status,
+              current,
+              maxChars,
+              controller.signal,
+              checkDeadline,
+            );
           }
           discard(response.body);
           redirects += 1;
@@ -345,13 +372,23 @@ export async function fetchDocument(
           continue;
         }
 
-        return await readResult(response, status, current, maxChars);
+        return await readResult(
+          response,
+          status,
+          current,
+          maxChars,
+          controller.signal,
+          checkDeadline,
+        );
       } finally {
         await dispatcher.destroy();
+        // A completed response can outlive its request signal while its body is
+        // decoded, extracted, or its dispatcher is destroyed.
+        checkDeadline();
       }
     }
   } catch (error) {
-    if (expired) throw deadlineError();
+    if (deadlineReached()) throw deadlineError();
     throw error;
   } finally {
     clearTimeout(timer);
@@ -360,11 +397,14 @@ export async function fetchDocument(
 
 // The text of a final response: the content type is checked BEFORE the body is
 // read, then the encoded and decoded caps, then extraction and the text limit.
-async function readResult(
+export async function readResult(
   response: Awaited<ReturnType<typeof request>>,
   status: number,
   url: URL,
   maxChars: number,
+  signal: AbortSignal,
+  checkDeadline: () => void,
+  extract: (media: string, body: string, url: string) => string | Promise<string> = extractText,
 ): Promise<FetchResult> {
   const media = mediaTypeOf(headerValue(response.headers["content-type"]));
   if (media === undefined || !allowedContentType(media)) {
@@ -375,8 +415,15 @@ async function readResult(
     );
   }
   const encoded = await readEncodedBody(response.body);
-  const decoded = await decodeBody(encoded, headerValue(response.headers["content-encoding"]));
-  const text = extractText(media, decoded.toString("utf8"), url.href);
+  checkDeadline();
+  const decoded = await decodeBody(
+    encoded,
+    headerValue(response.headers["content-encoding"]),
+    signal,
+  );
+  checkDeadline();
+  const text = await extract(media, decoded.toString("utf8"), url.href);
+  checkDeadline();
   const cut = truncateText(text, maxChars);
   return {
     finalUrl: url.href,

@@ -7,7 +7,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { discard, readEncodedBody } from "../../../src/capabilities/web/fetch.js";
+import { discard, readEncodedBody, readResult } from "../../../src/capabilities/web/fetch.js";
 import {
   ACCEPT_HEADER,
   ADDRESS_POLICY_VERSION,
@@ -73,6 +73,53 @@ it("preserves refusals raised while reading the encoded body", async () => {
       ),
     ),
   ).rejects.toBe(refusal);
+});
+
+it("refuses when the deadline fires during extraction after the body is read", async () => {
+  const controller = new AbortController();
+  const response = {
+    headers: { "content-type": "text/plain" },
+    body: Readable.from([Buffer.from("ready")]),
+  } as unknown as Parameters<typeof readResult>[0];
+  let extractionStarted!: () => void;
+  let releaseExtraction!: () => void;
+  const started = new Promise<void>((resolve) => {
+    extractionStarted = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    releaseExtraction = resolve;
+  });
+  const result = readResult(
+    response,
+    200,
+    new URL("https://example.test/page"),
+    100,
+    controller.signal,
+    () => {
+      if (controller.signal.aborted) {
+        throw new WebFetchError("deadline", "the request took longer than 5 ms");
+      }
+    },
+    async () => {
+      extractionStarted();
+      await held;
+      return "late text";
+    },
+  );
+  await started;
+  const timer = setTimeout(() => {
+    controller.abort();
+    releaseExtraction();
+  }, 5);
+  try {
+    await expect(result).rejects.toMatchObject({
+      code: "deadline",
+      detail: "the request took longer than 5 ms",
+    });
+  } finally {
+    clearTimeout(timer);
+    releaseExtraction();
+  }
 });
 
 interface Recorded {

@@ -1,8 +1,7 @@
-// The web capability's core (bob#152, spec v3). Slice R1a ships the settings
-// the fetch core enforces: the validated config block with its defaults
-// applied. The fetch core itself — the address policy, redirects, limits and
-// extraction (fetch.ts) — is slice R1b, and the `web_fetch` tool is R1c, which
-// is the slice that will register a tool in this capability.
+// The web capability's core (bob#152, spec v3). Slice R1a ships the validated
+// settings with defaults applied. The fetch core itself — the address policy,
+// redirects, limits and extraction (fetch.ts) — is slice R1b. Slice R1c will
+// register the `web_fetch` tool in this capability.
 
 import {
   FETCH_MAX_CHARS_DEFAULT,
