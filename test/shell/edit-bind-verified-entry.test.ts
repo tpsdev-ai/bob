@@ -137,6 +137,57 @@ describe("edit / replace_lines bind the write to the checked entry (bob#273)", (
   });
 });
 
+describe("edit is confined to the workspace root (bob#273)", () => {
+  let base: string;
+  let ws: string;
+  let outside: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "bob-edit-confine-"));
+    ws = join(base, "ws");
+    outside = join(base, "outside");
+    mkdirSync(ws);
+    mkdirSync(outside);
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("refuses an absolute path outside the workspace root", async () => {
+    writeFileSync(join(outside, "out.ts"), "OUT\n");
+    const tool = createTolerantEditToolDefinition(ws);
+    await expect(
+      run(tool, { path: join(outside, "out.ts"), edits: [{ oldText: "OUT", newText: "X" }] }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(outside, "out.ts"), "utf8")).toBe("OUT\n");
+  });
+
+  it("refuses a `..` escape out of the workspace root", async () => {
+    writeFileSync(join(outside, "out.ts"), "OUT\n");
+    const tool = createTolerantEditToolDefinition(ws);
+    await expect(
+      run(tool, { path: "../outside/out.ts", edits: [{ oldText: "OUT", newText: "X" }] }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(outside, "out.ts"), "utf8")).toBe("OUT\n");
+  });
+
+  it("refuses a symlink inside the workspace that leaves it", async () => {
+    writeFileSync(join(outside, "out.ts"), "OUT\n");
+    symlinkSync(join(outside, "out.ts"), join(ws, "link.ts"));
+    const tool = createTolerantEditToolDefinition(ws);
+    await expect(
+      run(tool, { path: "link.ts", edits: [{ oldText: "OUT", newText: "X" }] }),
+    ).rejects.toThrow(/refusing to write/);
+    expect(readFileSync(join(outside, "out.ts"), "utf8")).toBe("OUT\n");
+  });
+
+  it("still edits a file inside the workspace root", async () => {
+    writeFileSync(join(ws, "f.ts"), "l1\nl2\n");
+    const tool = createTolerantEditToolDefinition(ws);
+    await run(tool, { path: "f.ts", edits: [{ oldText: "l1", newText: "ONE" }] });
+    expect(readFileSync(join(ws, "f.ts"), "utf8")).toBe("ONE\nl2\n");
+  });
+});
+
 describe("openVerifiedWriteTarget — the check-to-open race", () => {
   let base: string;
   let ws: string;
