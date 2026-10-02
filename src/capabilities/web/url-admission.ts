@@ -3,9 +3,10 @@
 // — goes through admitUrl. The core passes its canonical `href` to undici for
 // dispatch.
 //
-// WHAT IS CHECKED, in order: a zone identifier in the authority (WHATWG URL
-// refuses that form itself, so this runs first); a parse with WHATWG URL; empty
-// userinfo; the scheme (http/https only); the port (443 and 80); a downgrade
+// WHAT IS CHECKED, in order: a zone identifier in a bracketed authority host
+// (WHATWG URL refuses that form itself, so this runs first); a parse with WHATWG
+// URL; userinfo, including an empty userinfo delimiter; the scheme (http/https
+// only); the port (443 and 80); a downgrade
 // (an https URL may not be followed to http, whatever allow_http says); plain
 // HTTP when allow_http is off; and, when the host is an address literal, the
 // canonical literal against the address policy. A name is not resolved here:
@@ -28,18 +29,40 @@ export interface UrlPolicy {
   address: AddressPolicy;
 }
 
-// The authority of a raw URL string ("//" to the first "/", "?" or "#").
-function authorityOf(raw: string): string {
-  const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(raw);
-  return match?.[1] ?? "";
+// The authority of an absolute URL or a scheme-relative redirect, before
+// WHATWG URL can erase empty userinfo. This also handles short scheme forms
+// when no same-scheme base makes them relative. Match special-scheme backslashes:
+// WHATWG treats them as authority separators. Its input preprocessing strips
+// edge C0/space and removes tabs and newlines.
+function authorityOf(raw: string, from?: URL): string {
+  let start = 0;
+  let end = raw.length;
+  while (start < end && raw.charCodeAt(start) <= 32) start++;
+  while (end > start && raw.charCodeAt(end - 1) <= 32) end--;
+  const input = raw
+    .slice(start, end)
+    .replaceAll("\t", "")
+    .replaceAll("\n", "")
+    .replaceAll("\r", "")
+    .replaceAll("\\", "/");
+  const match = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?\/\/+([^/?#]*)/.exec(input);
+  if (match !== null) return match[1];
+  // Without a same-scheme base, WHATWG also reads `https:@host` and
+  // `https:/@host` as authorities. With one, they are relative paths.
+  const short = /^(https?):\/?([^/?#]*)/i.exec(input);
+  if (short !== null && (from === undefined || from.protocol !== `${short[1].toLowerCase()}:`)) {
+    return short[2];
+  }
+  return "";
 }
 
-// A zone identifier (fe80::1%eth0): WHATWG URL rejects the form, so it is
-// detected on the raw string. A "%" anywhere in the authority, or inside a
-// bracketed host, is read as one.
-export function hasZoneIdentifier(raw: string): boolean {
-  if (authorityOf(raw).includes("%")) return true;
-  return /\[[^\]]*%[^\]]*\]/.test(raw);
+// A zone identifier belongs inside a bracketed IPv6 host, not in a percent-
+// escaped DNS name, userinfo, path or query. WHATWG rejects IPv6 zones itself,
+// so inspect the raw host before parsing to give the specific refusal.
+export function hasZoneIdentifier(raw: string, from?: URL): boolean {
+  const authority = authorityOf(raw, from);
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  return /^\[[^\]]*:[^\]]*%[^\]]*\]/.test(host);
 }
 
 function refuse(code: WebFetchError["code"], detail: string): WebFetchError {
@@ -60,7 +83,7 @@ export interface AdmitOptions {
 // Admit a URL, returning the parsed URL to dispatch. Throws WebFetchError with
 // the rule that refused it.
 export function admitUrl(raw: string, policy: UrlPolicy, options: AdmitOptions = {}): URL {
-  if (hasZoneIdentifier(raw)) {
+  if (hasZoneIdentifier(raw, options.from)) {
     throw refuse("zone-identifier", "the URL's host carries a zone identifier");
   }
 
@@ -72,7 +95,7 @@ export function admitUrl(raw: string, policy: UrlPolicy, options: AdmitOptions =
     throw refuse("url-invalid", "the URL could not be parsed");
   }
 
-  if (url.username !== "" || url.password !== "") {
+  if (authorityOf(raw, options.from).includes("@") || url.username !== "" || url.password !== "") {
     throw refuse("userinfo", "the URL carries userinfo (user@host)");
   }
 

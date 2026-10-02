@@ -295,18 +295,71 @@ describe("URL admission", () => {
     expect(admitUrl("http://example.test:80/", urlPolicy(true)).host).toBe("example.test");
   });
 
-  it("refuses userinfo and zone identifiers", () => {
-    expect(refuser(() => admitUrl("https://user:pw@example.test/", urlPolicy())).code).toBe(
-      "userinfo",
+  it("refuses userinfo, including empty credentials on initial and redirect URLs", () => {
+    const from = new URL("https://origin.test/start");
+    for (const raw of [
+      "https://user:pw@example.test/",
+      "https://user@example.test/",
+      "https://@example.test/",
+      "https://:@example.test/",
+      "https:////@example.test/",
+      "https:@example.test/",
+      "https:/@example.test/",
+      String.raw`https:\\@example.test/`,
+      `${String.fromCharCode(0)}https://@example.test/`,
+    ]) {
+      expect(refuser(() => admitUrl(raw, urlPolicy())).code, raw).toBe("userinfo");
+    }
+    for (const raw of ["//@example.test/", "//:@example.test/"]) {
+      expect(refuser(() => admitUrl(raw, urlPolicy(), { from })).code, raw).toBe("userinfo");
+    }
+    expect(
+      refuser(() =>
+        admitUrl("https:@example.test/", urlPolicy(true), {
+          from: new URL("http://origin.test/start"),
+        }),
+      ).code,
+    ).toBe("userinfo");
+    expect(admitUrl("https:@example.test/", urlPolicy(), { from }).href).toBe(
+      "https://origin.test/@example.test/",
     );
-    expect(refuser(() => admitUrl("https://user@example.test/", urlPolicy())).code).toBe(
-      "userinfo",
-    );
-    expect(refuser(() => admitUrl("https://[fe80::1%25eth0]/", urlPolicy())).code).toBe(
+    expect(admitUrl("/a@b?q=@c", urlPolicy(), { from }).href).toBe("https://origin.test/a@b?q=@c");
+  });
+
+  it("reports zones only in bracketed authority hosts", () => {
+    const from = new URL("https://origin.test/start");
+    for (const raw of [
+      "https://[fe80::1%25eth0]/",
+      "//[fe80::1%25eth0]/",
+      String.raw`https:\\[fe80::1%25eth0]/`,
+    ]) {
+      expect(hasZoneIdentifier(raw), raw).toBe(true);
+      expect(refuser(() => admitUrl(raw, urlPolicy(), { from })).code, raw).toBe("zone-identifier");
+    }
+    expect(hasZoneIdentifier("https:[fe80::1%25eth0]/")).toBe(true);
+    expect(refuser(() => admitUrl("https:[fe80::1%25eth0]/", urlPolicy())).code).toBe(
       "zone-identifier",
     );
-    expect(hasZoneIdentifier("https://[fe80::1%25eth0]/")).toBe(true);
-    expect(hasZoneIdentifier("https://example.test/a%20b")).toBe(false);
+    expect(hasZoneIdentifier("https:[fe80::1%25eth0]/", from)).toBe(false);
+    expect(admitUrl("https:[fe80::1%25eth0]/", urlPolicy(), { from }).pathname).toBe(
+      "/[fe80::1%25eth0]/",
+    );
+    for (const raw of [
+      "https://exa%6Dple.test/",
+      "https://example.test/a%20b",
+      "https://example.test/[x%20y]",
+      "https://example.test/?q=[x%20y]",
+      "https://user%40name@example.test/",
+    ]) {
+      expect(hasZoneIdentifier(raw), raw).toBe(false);
+    }
+    expect(admitUrl("https://exa%6Dple.test/", urlPolicy()).hostname).toBe("example.test");
+    expect(admitUrl("https://example.test/[x%20y]?q=[x%20y]", urlPolicy()).href).toBe(
+      "https://example.test/[x%20y]?q=[x%20y]",
+    );
+    expect(refuser(() => admitUrl("https://user%40name@example.test/", urlPolicy())).code).toBe(
+      "userinfo",
+    );
   });
 
   it("refuses to downgrade https to http, whatever allow_http says", () => {
