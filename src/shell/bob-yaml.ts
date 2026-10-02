@@ -224,25 +224,15 @@ export interface DeclaredModelLimits {
 export interface ProviderLimitsBlock extends DeclaredModelLimits {
   // Other models this agent may run on (a per-call `--model`), by model id.
   models: Record<string, DeclaredModelLimits>;
-  // bob#141: the endpoint override for a keyless LOCAL provider. Absent means
-  // the provider's built-in endpoint.
   baseUrl?: string;
 }
 
-/** The explicitly keyless LOCAL providers bob may redirect with base_url. */
-const EXPLICIT_KEYLESS_PROVIDERS = new Set(["ollama-newton", "omlx"]);
+const REDIRECTABLE_PROVIDERS = new Set(["ollama-newton", "omlx"]);
 
-/**
- * bob#141: a `provider.base_url` override is allowed ONLY for a keyless local
- * provider — one that ignores its key (a home-lab Ollama, `ollama-newton`,
- * `omlx`). For every other provider the URL is REFUSED: a key must never be
- * sent to an endpoint bob.yaml can redirect. Returns the refusal reason, or
- * undefined when the override is allowed.
- *
- * `ollama` is local only when the host is not `ollama.com` — that host is the
- * keyed cloud provider.
- */
 export function providerBaseUrlRefusal(provider: string, baseUrl: string): string | undefined {
+  if (Array.from(baseUrl).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)) {
+    return "provider.base_url must not contain control characters.";
+  }
   let parsed: URL;
   try {
     parsed = new URL(baseUrl);
@@ -255,12 +245,10 @@ export function providerBaseUrlRefusal(provider: string, baseUrl: string): strin
   if (parsed.username !== "" || parsed.password !== "") {
     return `provider.base_url must not carry credentials (a username or password in the URL).`;
   }
-  if (EXPLICIT_KEYLESS_PROVIDERS.has(provider)) return undefined;
-  if (provider === "ollama" && parsed.hostname !== "ollama.com") return undefined;
-  return (
-    `provider.base_url is only allowed for a keyless local provider (ollama on a non-ollama.com host, ` +
-    `ollama-newton, omlx) — "${provider}" is not one, and a key must not be sent to a URL bob.yaml can redirect.`
-  );
+  if (REDIRECTABLE_PROVIDERS.has(provider)) return undefined;
+  if (provider === "ollama" && parsed.hostname.replace(/\.+$/, "") !== "ollama.com")
+    return undefined;
+  return `provider.base_url is only allowed for ollama on a non-ollama.com host, ollama-newton, or omlx (got "${provider}").`;
 }
 
 function tokensFor(yamlText: string, key: string, value: unknown): number {
@@ -298,11 +286,11 @@ export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
         );
       }
       const name = typeof raw.name === "string" ? raw.name : "";
-      const refusal = providerBaseUrlRefusal(name, value.trim());
+      const refusal = providerBaseUrlRefusal(name, value);
       if (refusal !== undefined) {
         throw new BobYamlError("provider", lineOfKey(yamlText, "provider", key), refusal);
       }
-      out.baseUrl = value.trim();
+      out.baseUrl = new URL(value).href;
     } else if (key === "models") {
       const line = lineOfKey(yamlText, "provider", key);
       if (!Array.isArray(value)) {

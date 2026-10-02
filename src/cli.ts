@@ -8,6 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { providerBaseUrlRefusal } from "./shell/bob-yaml.js";
 import {
   type Args,
   adoptAgent,
@@ -65,8 +66,10 @@ Commands:
                       Flags: --context-window <tokens> (required: the model's
                              context window as the server enforces it)
                              --role <r> --provider <p> --model <m>
-                             --base-url <url> (keyless local providers only:
+                             --base-url <url> (init-time models.json scaffold:
                              ollama on a non-ollama.com host, ollama-newton, omlx)
+                             base_url mismatch refuses a session:
+                             run bob init to apply provider.base_url
                              --flair-url <u> --no-flair
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
@@ -195,9 +198,12 @@ async function onboard(
     `bob onboard ${name}`,
     `${provider}/${model}`,
   );
-  // bob#141: an endpoint override for a keyless local provider (Ollama on a
-  // LAN host). Refused for a keyed provider before anything is written.
-  const baseUrl = stringFlag(flags, "base-url");
+  let baseUrl = stringFlag(flags, "base-url");
+  if (baseUrl !== undefined) {
+    const refusal = providerBaseUrlRefusal(provider, baseUrl);
+    if (refusal !== undefined) throw new UsageError(refusal);
+    baseUrl = new URL(baseUrl).href;
+  }
 
   if (dryRun) {
     const template = loadRole(role);

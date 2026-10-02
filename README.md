@@ -959,22 +959,18 @@ entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a com
 unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
 path's persisted files (`(c)`).
 
-### A keyless local endpoint (`provider.base_url`)
-
-An agent on a home-lab model server (Ollama over a LAN or Tailscale host) takes a base-URL override:
+### Endpoint scaffold (`provider.base_url`)
 
 ```bash
 bob onboard newton --role ea --provider ollama --model qwen3.8:27b-mxfp8 \
   --context-window 262144 --base-url http://newton.lan:11434/v1
 ```
 
-bob writes it to `bob.yaml` as `provider.base_url` and to `.pi-agent/models.json` as
-`providers.<name>.baseUrl`, with a placeholder key in `auth.json` (the local server ignores it).
-The override is accepted ONLY for a keyless local provider: `ollama` on a host other than
-`ollama.com`, `ollama-newton`, or `omlx`. For every other provider, a `base_url` in
-`bob.yaml` is REFUSED at load, naming the rule — a key must never be sent to a URL `bob.yaml` can
-redirect. The URL must be absolute `http`/`https` with no embedded credentials. A provider without a
-`base_url` emits the same `models.json` as before (`local-provider-base-url-141.test.ts`).
+`--base-url` is an init-time scaffold value written to `bob.yaml` and `.pi-agent/models.json`.
+A session refuses to start when `provider.base_url` differs from the effective model's `baseUrl`:
+"run bob init to apply provider.base_url".
+Overrides are accepted for `ollama` except `ollama.com` (including terminal dots),
+`ollama-newton`, and `omlx`. bob's transport sends a constant placeholder key and strips request headers.
 
 ### Moving an agent to a subscription model
 

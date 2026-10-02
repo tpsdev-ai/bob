@@ -101,9 +101,6 @@ export interface InitOptions {
   // start without one, so an agent scaffolded without it gets a commented
   // placeholder and a warning, and must have it set before it runs.
   contextWindow?: number;
-  // bob#141: the endpoint override for a keyless LOCAL provider. Written to
-  // bob.yaml as provider.base_url and to models.json as providers.<name>.baseUrl.
-  // Refused for a provider that carries an API key (see bob-yaml.ts).
   baseUrl?: string;
 }
 
@@ -142,6 +139,7 @@ export function initAgent(opts: InitOptions): InitResult {
   if (opts.baseUrl !== undefined) {
     const refusal = providerBaseUrlRefusal(opts.provider, opts.baseUrl);
     if (refusal !== undefined) throw new Error(`bob: ${refusal}`);
+    opts = { ...opts, baseUrl: new URL(opts.baseUrl).href };
   }
   // Validates the role + loads the template. Throws on unknown / unsafe role.
   const template = loadRole(opts.role);
@@ -263,7 +261,6 @@ ${
 }${
   opts.baseUrl !== undefined
     ? `
-  # Keyless local provider endpoint (bob#141) — the provider ignores its key.
   base_url: ${opts.baseUrl}`
     : ""
 }
@@ -407,8 +404,7 @@ function resolvePiProvider(bobProvider: string): string {
 //   default endpoint.
 // - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
 //   literal value is never checked — the gateway authenticates via VM
-//   identity). Every other provider gets a clearly-labeled placeholder the
-//   human must replace with a real key before the agent can run.
+//   identity). Endpoint overrides get bob's constant placeholder.
 function knownProviderBaseUrl(bobProvider: string): string | undefined {
   switch (bobProvider) {
     case "exe-dev-gateway":
@@ -455,11 +451,15 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const isEnvKeyProvider = opts.provider === "openrouter";
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
   // entry (bob#132).
-  const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
-  // bob#141: an explicit keyless local endpoint wins over the built-in one
-  // (e.g. `ollama` defaults to ollama.com/v1; base_url points it at a local host).
+  const isOpenAiCompatible =
+    opts.provider === "ollama-cloud" || opts.provider === "ollama" || opts.baseUrl !== undefined;
   const baseUrl = opts.baseUrl ?? knownProviderBaseUrl(opts.provider);
-  const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
+  const key =
+    opts.baseUrl !== undefined
+      ? "bob-base-url-placeholder-not-a-secret"
+      : isGateway
+        ? "exe-gateway-placeholder"
+        : "REPLACE_WITH_YOUR_API_KEY";
 
   const modelsPath = join(piDir, "models.json");
   const authPath = join(piDir, "auth.json");
@@ -495,11 +495,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
 
   if (isEnvKeyProvider) {
     console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
-  } else if (opts.baseUrl !== undefined) {
-    console.error(
-      `⚠ ${opts.provider} uses the keyless local endpoint ${opts.baseUrl}; the placeholder key in ${authPath} is ignored.`,
-    );
-  } else if (!isGateway) {
+  } else if (!isGateway && opts.baseUrl === undefined) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );

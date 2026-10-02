@@ -1,17 +1,13 @@
-// bob#141 — a keyless local model endpoint via bob.yaml `provider.base_url`.
-//
-// An agent on a home-lab Ollama host needs `providers.<name>.baseUrl` in
-// `.pi-agent/models.json`, which a hand edit sets and the next `bob init`
-// reverts. `bob init` now writes it from `provider.base_url`, and a base_url is
-// allowed ONLY for a keyless local provider — a keyed provider's key must never
-// be sent to a URL bob.yaml can redirect (the lesson of the openrouter rounds,
-// #184).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { readProviderLimits } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
+import { resolveRunConfig } from "../../src/shell/run.js";
+import { createBobRuntimeFactory } from "../../src/shell/session.js";
+import { SpawnError, spawnNode } from "../cli-spawn.js";
 
 let tmpRoot: string;
 let keysRoot: string;
@@ -19,6 +15,221 @@ let keysRoot: string;
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), "bob-141-"));
   keysRoot = mkdtempSync(join(tmpdir(), "bob-141-keys-"));
+});
+
+describe("provider.base_url containment", () => {
+  it.each(["https://ollama.com./v1", "https://ollama.com%2e/v1"])(
+    "refuses cloud hostname %s before writes",
+    (baseUrl) => {
+      expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/provider.base_url is only allowed/);
+      expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
+      expect(() =>
+        readProviderLimits(`provider:\n  name: ollama\n  base_url: ${baseUrl}\n`),
+      ).toThrow(/provider.base_url is only allowed/);
+    },
+  );
+
+  it.each(["http://new\nton.lan/v1", "http://new\tton.lan/v1", "http://newton.lan/v1\r"])(
+    "refuses control characters in %s before writes",
+    (baseUrl) => {
+      expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/control characters/);
+      expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
+    },
+  );
+
+  it("writes canonical URLs to YAML and models.json", () => {
+    const res = initAgent(baseOpts({ baseUrl: "HTTP://NEWTON.LAN:80/a/../v1" }));
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(yaml).toContain("base_url: http://newton.lan/v1");
+    expect(readProviderLimits(yaml).baseUrl).toBe("http://newton.lan/v1");
+    expect(
+      JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8")).providers.ollama.baseUrl,
+    ).toBe("http://newton.lan/v1");
+  });
+
+  it.each(["ollama-newton", "omlx"])("pi resolves the scaffolded %s model", async (provider) => {
+    const res = initAgent(baseOpts({ provider, baseUrl: LOCAL_URL }));
+    const runtime = await ModelRuntime.create({
+      authPath: join(res.agentDir, ".pi-agent", "auth.json"),
+      modelsPath: modelsPath(res.agentDir),
+    });
+    expect(runtime.getModel(provider, "qwen3.8:27b-mxfp8")).toMatchObject({
+      api: "openai-completions",
+      baseUrl: LOCAL_URL,
+    });
+  });
+
+  it.each(["yaml", "model"])(
+    "refuses a %s endpoint mismatch at session startup",
+    async (source) => {
+      const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+      if (source === "yaml") {
+        const path = join(res.agentDir, "bob.yaml");
+        writeFileSync(
+          path,
+          readFileSync(path, "utf8").replace(LOCAL_URL, "http://other.example/v1"),
+        );
+      } else {
+        const path = modelsPath(res.agentDir);
+        const models = JSON.parse(readFileSync(path, "utf8"));
+        models.providers.ollama.models[0].baseUrl = "http://other.example/v1";
+        writeFileSync(path, JSON.stringify(models));
+      }
+      const { config, policy } = resolveRunConfig({ name: "newton", agentsRoot: tmpRoot });
+      const factory = createBobRuntimeFactory({ config, policy });
+      await expect(
+        factory({ sessionManager: SessionManager.inMemory(config.cwd) }).then((result) => {
+          result.session.dispose();
+          return result;
+        }),
+      ).rejects.toThrow("run bob init to apply provider.base_url");
+    },
+  );
+
+  it.each([
+    "--base-url",
+    "--base-url=",
+    "--base-url=   ",
+    "--base-url= --base-url=http://newton.lan/v1",
+    "--provider=anthropic --base-url=http://other.example/v1",
+    "--base-url=ftp://newton.lan/v1",
+  ])("rejects invalid CLI input before a dry-run plan: %s", (flag) => {
+    let error: unknown;
+    try {
+      spawnNode(
+        [
+          join(import.meta.dir, "../../dist/cli.js"),
+          "init",
+          "newton",
+          "--no-flair",
+          "--context-window=262144",
+          "--dry-run",
+          ...flag.split(/ (?=--)/),
+        ],
+        { env: { ...process.env, HOME: tmpRoot } },
+      );
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(SpawnError);
+    expect((error as SpawnError).code).toBe(2);
+    expect((error as SpawnError).stdout).not.toContain("PLAN");
+    expect(existsSync(join(tmpRoot, "agents", "newton"))).toBe(false);
+  });
+
+  it("captures placeholder-only requests with secrets in every credential source, including after refresh", async () => {
+    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const sentinels = [
+      "SENTINEL_AUTH",
+      "SENTINEL_ENV",
+      "SENTINEL_MODELS",
+      "SENTINEL_OVERRIDE",
+      "SENTINEL_REFRESH",
+    ];
+    writeFileSync(
+      join(res.agentDir, ".pi-agent", "auth.json"),
+      JSON.stringify({
+        ollama: { type: "api_key", key: sentinels[0] },
+      }),
+    );
+    const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+    Object.assign(models.providers.ollama, {
+      apiKey: sentinels[2],
+      headers: { "x-api-key": sentinels[2], cookie: sentinels[2] },
+    });
+    writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+    const previousEnv = process.env.OLLAMA_API_KEY;
+    process.env.OLLAMA_API_KEY = sentinels[1];
+    const realFetch = globalThis.fetch;
+    const captured: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      captured.push({
+        url: String(url),
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body: String(init?.body),
+      });
+      return new Response(
+        'data: {"id":"1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof globalThis.fetch;
+    let session: { dispose(): void } | undefined;
+    try {
+      const { config, policy } = resolveRunConfig({ name: "newton", agentsRoot: tmpRoot });
+      const result = await createBobRuntimeFactory({ config, policy })({
+        sessionManager: SessionManager.inMemory(config.cwd),
+      });
+      session = result.session as unknown as { dispose(): void };
+      await result.session.prompt("hi");
+      expect(captured).toHaveLength(1);
+      expect(captured[0]?.headers.authorization).toBe(
+        "Bearer bob-base-url-placeholder-not-a-secret",
+      );
+      for (const sentinel of sentinels) expect(JSON.stringify(captured[0])).not.toContain(sentinel);
+      const runtime = result.services.modelRuntime as ModelRuntime;
+      const model = runtime.getModel("ollama", config.model)!;
+      const context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as const;
+      const options = {
+        apiKey: sentinels[3],
+        env: { OLLAMA_API_KEY: sentinels[3] },
+        headers: { authorization: sentinels[3], "x-api-key": sentinels[3], cookie: sentinels[3] },
+        transformHeaders: () => ({ authorization: sentinels[3] }),
+      };
+      for (const refreshed of [false, true]) {
+        if (refreshed) {
+          Object.assign(models.providers.ollama, {
+            apiKey: sentinels[4],
+            headers: { authorization: sentinels[4] },
+            oauth: "radius",
+          });
+          writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+          writeFileSync(
+            join(res.agentDir, ".pi-agent", "auth.json"),
+            JSON.stringify({
+              ollama: { type: "oauth", access: sentinels[4], refresh: sentinels[4], expires: 0 },
+            }),
+          );
+          await runtime.refresh({ allowNetwork: true, providers: ["ollama"] });
+          expect((await runtime.getAuth(model, { apiKey: sentinels[3] }))?.auth.apiKey).toBe(
+            "bob-base-url-placeholder-not-a-secret",
+          );
+          expect(captured).toHaveLength(3);
+          models.providers.ollama.baseUrl = undefined;
+          writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+          await runtime.refresh({ allowNetwork: true, providers: ["ollama"] });
+        }
+        for (const verb of ["streamSimple", "stream"] as const) {
+          const reply = await runtime[verb](
+            { ...model, headers: { authorization: sentinels[2] } },
+            context as never,
+            options as never,
+          ).result();
+          expect(reply.stopReason).not.toBe("error");
+        }
+      }
+      expect(captured).toHaveLength(5);
+      for (const request of captured) {
+        expect(request.url).toBe(`${LOCAL_URL}/chat/completions`);
+        expect(request.headers.authorization).toBe("Bearer bob-base-url-placeholder-not-a-secret");
+        for (const sentinel of sentinels) expect(JSON.stringify(request)).not.toContain(sentinel);
+      }
+      const bad = await runtime
+        .streamSimple(
+          { ...model, baseUrl: "http://other.example/v1" },
+          context as never,
+          options as never,
+        )
+        .result();
+      expect(bad.stopReason).toBe("error");
+      expect(bad.errorMessage).toContain("run bob init to apply provider.base_url");
+      expect(captured).toHaveLength(5);
+    } finally {
+      session?.dispose();
+      globalThis.fetch = realFetch;
+      if (previousEnv === undefined) delete process.env.OLLAMA_API_KEY;
+      else process.env.OLLAMA_API_KEY = previousEnv;
+    }
+  });
 });
 afterEach(() => {
   rmSync(tmpRoot, { recursive: true, force: true });
@@ -77,16 +288,16 @@ function modelsPath(agentDir: string): string {
   return join(agentDir, ".pi-agent", "models.json");
 }
 
-describe("bob#141 — provider.base_url for a keyless local provider", () => {
+describe("bob#141 — provider.base_url", () => {
   it("init writes the override into models.json and bob.yaml, idempotently", () => {
     const first = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const firstYaml = readFileSync(join(first.agentDir, "bob.yaml"), "utf8");
     const firstModels = readFileSync(modelsPath(first.agentDir), "utf8");
     const parsed = JSON.parse(firstModels) as { providers: Record<string, { baseUrl?: string }> };
     expect(parsed.providers.ollama?.baseUrl).toBe(LOCAL_URL);
     expect(readFileSync(join(first.agentDir, "bob.yaml"), "utf8")).toContain(
       `base_url: ${LOCAL_URL}`,
     );
-    // A placeholder auth entry is written (the local server ignores the key).
     expect(
       Object.hasOwn(
         JSON.parse(readFileSync(join(first.agentDir, ".pi-agent", "auth.json"), "utf8")),
@@ -97,9 +308,7 @@ describe("bob#141 — provider.base_url for a keyless local provider", () => {
     // A second init (--force) keeps the override byte-for-byte.
     const second = initAgent(baseOpts({ baseUrl: LOCAL_URL, noClobber: false }));
     expect(readFileSync(modelsPath(second.agentDir), "utf8")).toBe(firstModels);
-    expect(readFileSync(join(second.agentDir, "bob.yaml"), "utf8")).toBe(
-      readFileSync(join(first.agentDir, "bob.yaml"), "utf8"),
-    );
+    expect(readFileSync(join(second.agentDir, "bob.yaml"), "utf8")).toBe(firstYaml);
   });
 
   it("init with no base_url leaves models.json unchanged from main", () => {
@@ -124,7 +333,7 @@ describe("bob#141 — provider.base_url for a keyless local provider", () => {
       "  base_url: http://evil.example/v1",
       "",
     ].join("\n");
-    expect(() => readProviderLimits(yaml)).toThrow(/keyless local provider/);
+    expect(() => readProviderLimits(yaml)).toThrow(/provider.base_url is only allowed/);
     // ...and refused before init writes anything.
     expect(() =>
       initAgent(
@@ -134,7 +343,8 @@ describe("bob#141 — provider.base_url for a keyless local provider", () => {
           baseUrl: "http://evil.example/v1",
         }),
       ),
-    ).toThrow(/keyless local provider/);
+    ).toThrow(/provider.base_url is only allowed/);
+    expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
   });
 
   it("an ollama base_url pointing at ollama.com (the keyed cloud) is refused", () => {
@@ -145,7 +355,7 @@ describe("bob#141 — provider.base_url for a keyless local provider", () => {
       "  base_url: https://ollama.com/v1",
       "",
     ].join("\n");
-    expect(() => readProviderLimits(yaml)).toThrow(/keyless local provider/);
+    expect(() => readProviderLimits(yaml)).toThrow(/provider.base_url is only allowed/);
   });
 
   it("a URL carrying credentials, or a non-http scheme, is refused", () => {
