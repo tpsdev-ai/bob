@@ -1,8 +1,9 @@
 // bob#273 — `edit` and `replace_lines` bind their read and their write to the
-// workspace entry they checked. A checked canonical path's final component
+// workspace entry they checked. Bob's edit call renderer uses arguments only.
+// A checked canonical path's final component
 // swapped between the check and the bound open is refused. The swap is
 // deterministic: a test hook runs in the window the binding closes.
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
@@ -12,8 +13,10 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import {
   createReplaceLinesToolDefinition,
   createTolerantEditToolDefinition,
@@ -137,7 +140,7 @@ describe("edit / replace_lines bind the write to the checked entry (bob#273)", (
   });
 });
 
-describe("edit is confined to the workspace root (bob#273)", () => {
+describe("edit execution is confined and pi renders its call from arguments (bob#273)", () => {
   let base: string;
   let ws: string;
   let outside: string;
@@ -161,15 +164,45 @@ describe("edit is confined to the workspace root (bob#273)", () => {
     expect(readFileSync(join(outside, "out.ts"), "utf8")).toBe("OUT\n");
   });
 
-  it("an outside-path edit preview request has no file-reading renderer", () => {
+  it("pi renders an outside-path edit call from arguments without reading the file", () => {
     const path = join(outside, "out.ts");
-    writeFileSync(path, "OUT\n");
-    const tool = createTolerantEditToolDefinition(ws) as {
-      renderCall?: (input: unknown) => unknown;
+    writeFileSync(path, "DISK_ONLY\n");
+    const tool = createTolerantEditToolDefinition(ws);
+    const request = {
+      path,
+      edits: [{ oldText: `old-${"x".repeat(160)}`, newText: "new-from-arguments" }],
     };
-    const request = { path, edits: [{ oldText: "OUT", newText: "X" }] };
-    expect(tool.renderCall).toBeUndefined();
-    expect(tool.renderCall?.(request)).toBeUndefined();
+    initTheme("dark");
+    const access = spyOn(fsPromises, "access");
+    const readFile = spyOn(fsPromises, "readFile");
+    try {
+      const component = new ToolExecutionComponent(
+        "edit",
+        "call",
+        request,
+        {},
+        tool,
+        { requestRender() {} } as never,
+        ws,
+      );
+      // This is pi's selection method: a nullish custom renderer selects its
+      // built-in preview, which accesses and reads the requested path.
+      const selected = (component as unknown as { getCallRenderer(): unknown }).getCallRenderer();
+      expect(selected).toBe(tool.renderCall);
+      component.setArgsComplete();
+      const rendered = component.render(500).join("\n");
+      expect(rendered).toContain(path);
+      expect(rendered).toContain("1 edit(s) requested");
+      expect(rendered).toContain("old-");
+      expect(rendered).toContain("new-from-arguments");
+      expect(rendered).not.toContain("x".repeat(100));
+      expect(rendered).not.toContain("DISK_ONLY");
+      expect(access).not.toHaveBeenCalled();
+      expect(readFile).not.toHaveBeenCalled();
+    } finally {
+      access.mockRestore();
+      readFile.mockRestore();
+    }
   });
 
   it("refuses a `..` escape out of the workspace root", async () => {

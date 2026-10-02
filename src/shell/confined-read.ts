@@ -42,7 +42,8 @@
 // (O_NOFOLLOW) and uses the descriptor only when its device + inode are the
 // checked entry's; `edit`'s write also requires the identity its read saw. It
 // closes the checked canonical path's FINAL component swapped for a symlink or
-// another file between the check and the open/write. It is an IN-PROCESS guard against MODEL MISTAKES,
+// another file between the check and the open. After the open, the verified
+// handle is used. It is an IN-PROCESS guard against MODEL MISTAKES,
 // not a sandbox: a same-user process with write access to the workspace is
 // outside what it can stop. That is the OS boundary's job (bob#189, bob under
 // nono).

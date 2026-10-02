@@ -32,11 +32,12 @@
 // refused), opens it with O_NOFOLLOW, and works from the descriptor only when
 // its device and inode are the checked entry's; the write also requires the
 // identity the read saw. `replace_lines` does the same with one O_RDWR
-// descriptor it both reads and writes through. The edit call's inherited diff
-// preview is disabled because it reads without these checks. This closes the
-// checked canonical path's FINAL component swapped between the check and the
-// open/write; an intermediate directory swapped for a symlink between the check
-// and the open is NOT detected when the new path still leads to the same device
+// descriptor it both reads and writes through. Bob renders the edit call from
+// its arguments; pi's inherited diff preview reads by path without these checks.
+// This closes the checked canonical path's FINAL component swapped between the
+// check and the open; after that open, reads and writes use the verified handle.
+// An intermediate directory swapped for a symlink between the check and the
+// open is NOT detected when the new path still leads to the same device
 // and inode (Node exposes no openat on any platform this runs on, and O_NOFOLLOW
 // guards only the final component). It is an in-process guard
 // against MODEL MISTAKES: a hostile local process that can write the workspace
@@ -50,6 +51,7 @@ import {
   type ToolDefinition,
   withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { checkWriteTargetVerified, openVerifiedWriteTarget } from "./confined-read.js";
 import {
@@ -65,6 +67,28 @@ const MATCH_ERROR =
   /^(Could not find (?:the exact text|edits\[\d+\])|Found \d+ occurrences of (?:the text|edits\[\d+\]))/;
 
 type EditInput = { path: string; edits: EditRequest[] };
+
+// Show only call arguments. Limit each excerpt before escaping control characters.
+function editArgumentExcerpt(value: unknown): string {
+  if (typeof value !== "string") return "(pending)";
+  const limit = 80;
+  return `${JSON.stringify(value.slice(0, limit))}${value.length > limit ? "…" : ""}`;
+}
+
+function renderEditCallArguments(args: unknown): Text {
+  const input = args as Partial<EditInput> | undefined;
+  const edits = Array.isArray(input?.edits) ? input.edits : [];
+  const lines = [
+    `edit ${JSON.stringify(typeof input?.path === "string" ? input.path : "(pending path)")}`,
+    `${edits.length} edit(s) requested`,
+  ];
+  for (const [index, edit] of edits.slice(0, 2).entries()) {
+    lines.push(`  ${index + 1}. old: ${editArgumentExcerpt(edit?.oldText)}`);
+    lines.push(`     new: ${editArgumentExcerpt(edit?.newText)}`);
+  }
+  if (edits.length > 2) lines.push(`  … ${edits.length - 2} more edit(s)`);
+  return new Text(lines.join("\n"), 0, 0);
+}
 
 type PiEditExecute = (
   callId: string,
@@ -197,9 +221,9 @@ export function createTolerantEditToolDefinition(
   const base = createEditToolDefinition(cwd);
   return {
     ...base,
-    // pi's inherited call renderer reads the requested path for a diff preview
-    // without using our checked operations. Let pi render this call generically.
-    renderCall: undefined,
+    // pi falls back to its path-reading built-in edit preview for a nullish
+    // renderCall. This callable renders arguments only, with no file access.
+    renderCall: renderEditCallArguments,
     async execute(
       callId: string,
       input: unknown,
