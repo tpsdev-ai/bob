@@ -31,16 +31,18 @@ working directory by a string that the child resolves again when it changes into
 it. So `run` cannot make the directory a command starts in *be* the one it
 checked. It narrows the window in which the two can differ:
 
-1. It resolves `cwd` and the workspace through symlinks and confines the one to
-   the other, keeping that canonical workspace.
+1. It resolves `cwd` and the workspace through symlinks, records the workspace
+   root's device and inode, and confines the one to the other, keeping that
+   canonical workspace.
 2. It opens the resolved path (no-follow on the final component) and holds
    it open: the pin. While the pin is held, the directory's inode stays
    allocated (on a local POSIX file system), so no other directory can take its
    device + inode.
 3. As the pin is taken, and again immediately before the spawn, it re-resolves
    `cwd`. The result must still be the same canonical path, inside the canonical
-   workspace it kept, and a no-follow stat of it must still be a directory with
-   the pin's device + inode. If, at either re-check, a path component — the
+   workspace it kept, a no-follow stat of it must still be a directory with the
+   pin's device + inode, and the workspace root must still match the device and
+   inode recorded in step 1. If, at either re-check, a path component — the
    final one or an intermediate one — has been replaced or moved so that this no
    longer holds, `run` refuses and starts nothing. It also refuses when any step
    cannot establish its fact (a realpath, stat, open, fstat or close that fails);
@@ -270,11 +272,16 @@ named error.
   cannot be closed from here. A live supervisor with no pinned identity whose
   event loop stalls for more than 10 minutes reads as dead to another bob's
   sweep, which then deletes that run's captures.
-- **The pin is taken after `cwd` is resolved.** A replacement between the
-  resolution and the pin that keeps the same canonical path inside the workspace
-  becomes the pinned directory, and the re-checks, which compare against the
-  pin, do not detect it. Containment still holds: the re-check as the pin is
-  taken still requires that path to resolve inside the workspace.
+- **The pin is taken after `cwd` is resolved.** `resolveCwd` records the workspace
+  root's device and inode, and each re-check compares them. This detects a
+  replacement while the original inode remains allocated. No descriptor holds
+  the root inode allocated, so inode reuse before a re-check can make a
+  replacement indistinguishable. A component below the root (`cwd` itself, or
+  an intermediate one) replaced by
+  another directory that keeps the same canonical path inside the workspace still
+  becomes the pinned directory, and the re-checks, which compare against the pin,
+  do not detect it. Containment still holds: the re-check as the pin is taken
+  still requires that path to resolve inside the workspace.
 - **The `cwd` re-check narrows the race between the check and the start; it
   does not close it.** A path component replaced after the last re-check and
   before the child has changed directory is not detected (see "Where a command
