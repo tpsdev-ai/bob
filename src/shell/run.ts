@@ -1141,12 +1141,12 @@ async function runBoundedSession(
       explorationDetector !== undefined &&
       explorationExhausted === undefined
     ) {
-      const call = event as unknown as { toolName?: unknown; isError?: unknown };
+      const call = event as unknown as { toolName?: unknown; isError?: unknown; result?: unknown };
       const toolName = String(call.toolName ?? "");
       const budget =
         event.type === "tool_execution_start"
           ? explorationDetector.observeStart(toolName)
-          : explorationDetector.observeEnd(toolName, call.isError);
+          : explorationDetector.observeEnd(toolName, call.isError, call.result);
       if (budget.inject) {
         writeRunLog(
           {
