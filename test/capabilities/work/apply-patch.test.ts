@@ -621,13 +621,14 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     if (!out.ok) expect(out.reason).toBe("storage_failed");
   });
 
-  it("a state root whose parent does not exist: storage_failed, naming the create failure", async () => {
+  it("a state root whose parent is a regular file: storage_failed, naming the directory failure", async () => {
     const fx = makeFixture();
     const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
     writeArtifact(fx, "p.patch", patch);
-    // The parent is absent, so the state root cannot be created at all: the
-    // refusal must name that failure, not describe a root that is not there.
-    const stateRoot = join(scratch, "absent-parent", "state");
+    const before = snapshot(fx.repo);
+    const parent = join(scratch, "parent-file");
+    writeFileSync(parent, "not a dir\n");
+    const stateRoot = join(parent, "state");
     const out = applyPatch({
       binding: binding(fx),
       params: {
@@ -639,9 +640,12 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     expect(out.ok).toBe(false);
     if (!out.ok) {
       expect(out.reason).toBe("storage_failed");
-      expect(out.message).toContain("could not be created");
-      expect(out.message).toContain("ENOENT");
+      expect(out.message).toContain("ENOTDIR");
+      expect(out.message).toContain(stateRoot);
     }
+    expect(snapshot(fx.repo)).toEqual(before);
+    expect(readFileSync(parent, "utf8")).toBe("not a dir\n");
+    expect(existsSync(stateRoot)).toBe(false);
   });
 
   it("a state root inside the repository: storage_failed, the checkout unchanged and no candidate stored", async () => {
