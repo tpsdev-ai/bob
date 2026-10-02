@@ -171,6 +171,89 @@ describe("repository evidence in the completion gate and exploration budget", ()
     );
   });
 
+  function nestedFixture() {
+    const parent = join(cwd, "dir");
+    mkdirSync(parent);
+    writeFileSync(join(parent, "file"), "nested original\n");
+    launchHead = commit(cwd, launchHead);
+    return parent;
+  }
+
+  it.each(["completion", "exploration"])(
+    "ignores external changes through a symlinked parent for %s",
+    async (gate) => {
+      const parent = nestedFixture();
+      const external = join(agentsRoot, "external");
+      renameSync(parent, external);
+      symlinkSync(external, parent);
+      const before = captureRepositoryState(cwd);
+      const deleted = git(cwd, "diff", "--name-status", "HEAD");
+      expect(deleted).toBe("D\tdir/file");
+      expect(before.kind).toBe("git");
+      const open = spyOn(fs, "openSync");
+      try {
+        const result = await run(
+          [
+            {
+              toolName: "run",
+              action: () => writeFileSync(join(external, "file"), "external change\n"),
+            },
+            { toolName: "read" },
+            { toolName: "read" },
+            { toolName: "read" },
+          ],
+          undefined,
+          gate === "exploration" ? 2 : 20,
+        );
+        expect(captureRepositoryState(cwd)).toEqual(before);
+        expect(git(cwd, "diff", "--name-status", "HEAD")).toBe(deleted);
+        expect(open.mock.calls.some(([path]) => String(path).endsWith("/dir/file"))).toBe(false);
+        if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+        else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+        expect(result.exitCode).toBe(1);
+      } finally {
+        open.mockRestore();
+      }
+    },
+  );
+
+  it.each(["missing", "file"])("treats a %s parent as deletion", (kind) => {
+    const parent = nestedFixture();
+    rmSync(parent, { recursive: true });
+    const deleted = captureRepositoryState(cwd);
+    expect(deleted.kind).toBe("git");
+    if (kind === "file") writeFileSync(parent, "not a directory\n");
+    expect(captureRepositoryState(cwd)).toEqual(deleted);
+  });
+
+  it.each(["symlink", "directory"])("rejects a parent swapped mid-read to a %s", (kind) => {
+    const parent = nestedFixture();
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(parent, "file"), "changed\n");
+    const read = fs.readFileSync;
+    let swapped = false;
+    const probe = spyOn(fs, "readFileSync").mockImplementation((...args) => {
+      if (typeof args[0] === "number" && !swapped) {
+        swapped = true;
+        renameSync(parent, join(agentsRoot, "original-parent"));
+        if (kind === "symlink") symlinkSync(join(agentsRoot, "original-parent"), parent);
+        else {
+          mkdirSync(parent);
+          writeFileSync(join(parent, "file"), "replacement\n");
+        }
+      }
+      return read(...args);
+    });
+    try {
+      const after = captureRepositoryState(cwd);
+      expect(swapped).toBe(true);
+      expect(after).toEqual({ kind: "unavailable" });
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
   it("refuses a FIFO at a tracked path without blocking", () => {
     rmSync(join(cwd, "tracked"));
     execFileSync("mkfifo", [join(cwd, "tracked")]);

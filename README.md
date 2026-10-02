@@ -346,14 +346,9 @@ change one, the named test is what tells you.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`)*
 
-- **builder-local requires an edit or a BLOCKED report.** After the completion
-  judge accepts, `bob run` and prompted `bob launch` require verified file-tool
-  success, a changed HEAD tree with a newly reachable commit, a changed fingerprint
-  of tracked bytes and modes differing from HEAD, or a final message beginning
-  with the standalone token `BLOCKED`. Repository observations stay bound to the
-  launch worktree and Git directory. Untracked files and submodule dirt do not count.
-  The exploration budget uses the same predicate between successful observations.
-  Mail turns, interactive launch and the persistent runtime keep their completion rules.
+- **builder-local requires an edit or a BLOCKED report.** `bob run` and prompted
+  `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.
+  The exploration budget uses the same edit predicate.
   *(`test/shell/edit-or-blocked.test.ts`, `repository-edit-evidence.test.ts`)*
 
 ### Stated exceptions
@@ -399,7 +394,8 @@ change one, the named test is what tells you.
 4. **The "what remains" note is best-effort, and the judge judges the message.**
    After a compaction bob sends one note — the last thing the agent said,
    whatever it was, or `git status --short` plus the recent tool calls — as a
-   steer. If that send fails it is logged and nothing else happens: the TASK is
+   steer. The status probe ignores the user's global Git config. If that send
+   fails it is logged and nothing else happens: the TASK is
    not lost (it is in the system prompt), but the text the note would have
    quoted can be. And the completion judge checks for a real final MESSAGE, not
    that the work it describes was done.

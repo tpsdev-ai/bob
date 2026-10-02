@@ -170,6 +170,40 @@ function trackedEntries(output: Buffer, tree: boolean): Map<string, TrackedEntry
   return entries;
 }
 
+function parentStat(path: Buffer): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? ""))
+      return undefined;
+    throw error;
+  }
+}
+
+function trackedParents(absolute: Buffer) {
+  const parents: { path: Buffer; stat: Stats | undefined }[] = [];
+  for (let end = 1; end < absolute.length; end++) {
+    if (end !== 1 && absolute[end] !== 0x2f) continue;
+    const path = absolute.subarray(0, end);
+    const stat = parentStat(path);
+    parents.push({ path, stat });
+    if (!stat?.isDirectory()) return { parents, available: false };
+  }
+  return { parents, available: true };
+}
+
+function recheckParents(parents: ReturnType<typeof trackedParents>["parents"]): void {
+  for (const { path, stat: before } of parents) {
+    const after = parentStat(path);
+    if (
+      before?.dev !== after?.dev ||
+      before?.ino !== after?.ino ||
+      before?.isDirectory() !== after?.isDirectory()
+    )
+      throw new Error("tracked parent changed during observation");
+  }
+}
+
 function trackedFingerprint(repository: RepositoryIdentity, head: string): string {
   const { workTree } = repository;
   const tree = trackedEntries(
@@ -191,13 +225,16 @@ function trackedFingerprint(repository: RepositoryIdentity, head: string): strin
     let object = "";
     let stat: Stats | undefined;
     let fd: number | undefined;
+    const { parents, available } = trackedParents(absolute);
     try {
-      try {
-        fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code ?? "";
-        if (code === "ELOOP") stat = lstatSync(absolute);
-        else if (!["ENOENT", "ENOTDIR"].includes(code)) throw error;
+      if (available) {
+        try {
+          fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "";
+          if (code === "ELOOP") stat = lstatSync(absolute);
+          else if (!["ENOENT", "ENOTDIR"].includes(code)) throw error;
+        }
       }
       if (fd !== undefined) stat = fstatSync(fd);
       if (stat?.isSymbolicLink()) {
@@ -219,6 +256,7 @@ function trackedFingerprint(repository: RepositoryIdentity, head: string): strin
       } else if (stat) {
         throw new Error("unsupported tracked file type");
       }
+      recheckParents(parents);
     } finally {
       if (fd !== undefined) closeSync(fd);
     }
