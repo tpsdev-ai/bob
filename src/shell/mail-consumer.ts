@@ -172,6 +172,9 @@ export interface LauncherTurnRunnerOptions {
   onReapExhausted?: (pgid: number) => void;
   // Called when result collection ends after an exhausted reap.
   onResultCollectedAfterReapExhausted?: (pgid: number) => void;
+  // Seam (tests): called when the bounded wait expires, before the collector
+  // reads the bytes accumulated at that boundary.
+  onResultWaitExpired?: (pgid: number) => void;
 }
 
 export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner {
@@ -250,6 +253,7 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
         resultWait = setTimeout(() => {
           resultWait = undefined;
           if (settled) return;
+          if (pgid !== undefined) opts.onResultWaitExpired?.(pgid);
           collectResult(exit.code, exit.signal);
           // An unkillable group member may retain the write ends indefinitely.
           // We have consumed the bytes available at the bound; close our ends.
@@ -370,7 +374,10 @@ export interface MailConsumerOptions {
   lockHooks?: { afterStaleCheck?: () => void };
   lockWaitMs?: number;
   // Seams (tests): options for the DEFAULT launcher runner.
-  turnRunner?: Pick<LauncherTurnRunnerOptions, "killGraceMs" | "reapLimitMs" | "groupOps">;
+  turnRunner?: Pick<
+    LauncherTurnRunnerOptions,
+    "killGraceMs" | "reapLimitMs" | "groupOps" | "onResultWaitExpired"
+  >;
 }
 
 export interface MailConsumerStats {
