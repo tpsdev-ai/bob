@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import {
   chmodSync,
   cpSync,
@@ -114,6 +116,77 @@ describe("repository evidence in the completion gate and exploration budget", ()
       explorationBudget,
       sessionFactory: async () => session(calls, finalAction),
     });
+
+  it.each([0o644, 0o755])("preserves regular-file fingerprints for mode %s", (mode) => {
+    const clean = captureRepositoryState(cwd);
+    expect(clean.kind).toBe("git");
+    if (clean.kind !== "git") throw new Error("missing repository evidence");
+    expect(clean.trackedHash).toBe(createHash("sha256").digest("hex"));
+    const bytes = Buffer.from([0, 0xff, 10, 13, 0x80]);
+    writeFileSync(join(cwd, "tracked"), bytes);
+    chmodSync(join(cwd, "tracked"), mode);
+    const changed = captureRepositoryState(cwd);
+    expect(changed.kind).toBe("git");
+    if (changed.kind !== "git") throw new Error("missing repository evidence");
+    expect(changed.trackedHash).toBe(
+      createHash("sha256")
+        .update(`tracked\0${mode === 0o755 ? "100755" : "100644"}\0`)
+        .update(createHash("sha256").update(bytes).digest())
+        .update("\0")
+        .digest("hex"),
+    );
+  });
+
+  it("reads the opened file when its path becomes a symlink after fstat", () => {
+    const before = captureRepositoryState(cwd);
+    expect(before.kind).toBe("git");
+    const fstat = fs.fstatSync;
+    const probe = spyOn(fs, "fstatSync").mockImplementation((fd) => {
+      const stat = fstat(fd);
+      renameSync(join(cwd, "tracked"), join(agentsRoot, "opened"));
+      writeFileSync(join(agentsRoot, "replacement"), "replacement bytes\n");
+      symlinkSync(join(agentsRoot, "replacement"), join(cwd, "tracked"));
+      return stat;
+    });
+    try {
+      expect(captureRepositoryState(cwd)).toEqual(before);
+      expect(probe).toHaveBeenCalledTimes(1);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("fingerprints a symlink's target text", () => {
+    rmSync(join(cwd, "tracked"));
+    symlinkSync("missing-target", join(cwd, "tracked"));
+    const state = captureRepositoryState(cwd);
+    expect(state.kind).toBe("git");
+    if (state.kind !== "git") throw new Error("missing repository evidence");
+    expect(state.trackedHash).toBe(
+      createHash("sha256")
+        .update("tracked\0" + "120000\0")
+        .update(createHash("sha256").update("missing-target").digest())
+        .update("\0")
+        .digest("hex"),
+    );
+  });
+
+  it("refuses a FIFO at a tracked path without blocking", () => {
+    rmSync(join(cwd, "tracked"));
+    execFileSync("mkfifo", [join(cwd, "tracked")]);
+    const module = new URL("../../src/shell/edit-evidence.ts", import.meta.url).href;
+    const child = childProcess.spawnSync(
+      process.execPath,
+      [
+        "--eval",
+        `import { captureRepositoryState } from ${JSON.stringify(module)}; console.log(JSON.stringify(captureRepositoryState(${JSON.stringify(cwd)})));`,
+      ],
+      { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL" },
+    );
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ kind: "unavailable" });
+  });
 
   it.each(["bash", "run", "powershell"])("accepts a %s-only edit and commit", async (toolName) => {
     const result = await run([

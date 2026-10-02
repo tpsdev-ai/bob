@@ -1,6 +1,16 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  type Stats,
+} from "node:fs";
 import { gitEnvironment } from "./git-environment.js";
 import { TOOL_EFFECTS } from "./tool-allowlist.js";
 
@@ -180,29 +190,37 @@ function trackedFingerprint(repository: RepositoryIdentity, head: string): strin
     let bytes = Buffer.alloc(0);
     let object = "";
     let stat: Stats | undefined;
+    let fd: number | undefined;
     try {
-      stat = lstatSync(absolute);
-    } catch (error) {
-      if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
-    }
-    if (stat?.isSymbolicLink()) {
-      mode = "120000";
-      bytes = readlinkSync(absolute, { encoding: "buffer" });
-    } else if (stat?.isFile()) {
-      mode = stat.mode & 0o111 ? "100755" : "100644";
-      bytes = readFileSync(absolute);
-    } else if (stat?.isDirectory() && (index.get(path) ?? baseline)?.mode === "160000") {
-      mode = "160000";
-      const childPath = absolute.toString();
-      if (!Buffer.from(childPath).equals(absolute)) throw new Error("unsupported submodule path");
-      const child = resolveRepository(childPath);
-      object =
-        child.workTree === realpathSync(childPath)
-          ? gitLine(childPath, ["rev-parse", "--verify", "HEAD^{commit}"], child)
-          : ((index.get(path) ?? baseline)?.object ?? "");
-      bytes = Buffer.from(object);
-    } else if (stat) {
-      throw new Error("unsupported tracked file type");
+      try {
+        fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code ?? "";
+        if (code === "ELOOP") stat = lstatSync(absolute);
+        else if (!["ENOENT", "ENOTDIR"].includes(code)) throw error;
+      }
+      if (fd !== undefined) stat = fstatSync(fd);
+      if (stat?.isSymbolicLink()) {
+        mode = "120000";
+        bytes = readlinkSync(absolute, { encoding: "buffer" });
+      } else if (fd !== undefined && stat?.isFile()) {
+        mode = stat.mode & 0o111 ? "100755" : "100644";
+        bytes = readFileSync(fd);
+      } else if (stat?.isDirectory() && (index.get(path) ?? baseline)?.mode === "160000") {
+        mode = "160000";
+        const childPath = absolute.toString();
+        if (!Buffer.from(childPath).equals(absolute)) throw new Error("unsupported submodule path");
+        const child = resolveRepository(childPath);
+        object =
+          child.workTree === realpathSync(childPath)
+            ? gitLine(childPath, ["rev-parse", "--verify", "HEAD^{commit}"], child)
+            : ((index.get(path) ?? baseline)?.object ?? "");
+        bytes = Buffer.from(object);
+      } else if (stat) {
+        throw new Error("unsupported tracked file type");
+      }
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
     if (mode !== "deleted" && mode !== "160000") {
       object = createHash(head.length === 64 ? "sha256" : "sha1")
