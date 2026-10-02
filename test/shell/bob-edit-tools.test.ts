@@ -20,13 +20,14 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   bobEditCustomTools,
   createReplaceLinesToolDefinition,
   createTolerantEditToolDefinition,
+  IncompleteWriteError,
 } from "../../src/shell/bob-edit-tools.js";
 
 type Tool = { execute: (callId: string, input: unknown, ...rest: unknown[]) => Promise<unknown> };
@@ -40,27 +41,48 @@ function resultText(result: unknown): string {
   return content.map((block) => block.text ?? "").join("\n");
 }
 
-// Hold the first replace_lines read after taking its snapshot. If the queue is
-// bypassed, a concurrent call can finish against that stale snapshot.
+// Hold the first call after its verified read, leaving its snapshot pending.
+// A second read during the hold means the queue did not serialize the calls.
 function holdFirstReplaceRead() {
   let enter!: () => void;
   let release!: () => void;
   const entered = new Promise<void>((resolve) => (enter = resolve));
   const gate = new Promise<void>((resolve) => (release = resolve));
   let reads = 0;
-  const read = async (path: string): Promise<string> => {
-    const text = await readFile(path, "utf-8");
+  const hook = async (): Promise<void> => {
     if (++reads === 1) {
       enter();
       await gate;
     }
-    return text;
   };
-  return { read, entered, release };
+  return { hook, entered, release, reads: () => reads };
+}
+
+function shortWritingHandle(handle: FileHandle, limit: number, zeroAfter = false): FileHandle {
+  let writes = 0;
+  return new Proxy(handle, {
+    get(target, property) {
+      if (property === "write") {
+        return async (bytes: Buffer, offset: number, length: number, position: number) => {
+          writes++;
+          if (zeroAfter && writes === 2) return { bytesWritten: 0, buffer: bytes };
+          return target.write(bytes, offset, Math.min(length, limit), position);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 async function allowConcurrentCallToRun(call: Promise<unknown>): Promise<void> {
-  await Promise.race([call.then(() => undefined), new Promise<void>((r) => setTimeout(r, 30))]);
+  await Promise.race([
+    call.then(
+      () => undefined,
+      () => undefined,
+    ),
+    new Promise<void>((r) => setTimeout(r, 30)),
+  ]);
 }
 
 describe("createTolerantEditToolDefinition", () => {
@@ -82,6 +104,34 @@ describe("createTolerantEditToolDefinition", () => {
     expect(readFileSync(join(cwd, "f.ts"), "utf8")).toBe("const a = 9;\nconst b = 2;\n");
     expect(resultText(result)).toContain("Successfully replaced");
     expect(resultText(result)).not.toContain("normalising runs of spaces/tabs");
+  });
+
+  it("finishes an edit when the verified handle writes only part of the buffer per call", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "before\n");
+    const tool = createTolerantEditToolDefinition(cwd, {
+      wrapOpenedFileHandle: (handle, phase) =>
+        phase === "write" ? shortWritingHandle(handle, 2) : handle,
+    });
+    const result = await run(tool, {
+      path: "f.ts",
+      edits: [{ oldText: "before", newText: "after" }],
+    });
+    expect(resultText(result)).toContain("Successfully replaced");
+    expect(readFileSync(file, "utf8")).toBe("after\n");
+  });
+
+  it("refuses edit success when a verified handle stops making write progress", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "before\n");
+    const tool = createTolerantEditToolDefinition(cwd, {
+      wrapOpenedFileHandle: (handle, phase) =>
+        phase === "write" ? shortWritingHandle(handle, 2, true) : handle,
+    });
+    await expect(
+      run(tool, { path: "f.ts", edits: [{ oldText: "before", newText: "after" }] }),
+    ).rejects.toThrow(IncompleteWriteError);
+    expect(readFileSync(file, "utf8")).not.toBe("after\n");
   });
 
   it("lands an edit whose oldText has different runs of spaces than the file, and says so", async () => {
@@ -200,28 +250,25 @@ describe("createTolerantEditToolDefinition", () => {
   });
 });
 
-// Holds the FIRST read of each file until the test releases it, so the test
-// decides the order in which two concurrent executions' reads land. The read
-// itself is synchronous, so only the release order decides that order.
+// Hold the FIRST read-phase open of each file until the test releases it.
+// Releasing a.md first makes its read reach the tool before b.md's; both calls
+// are paused before those reads while the hooks are held.
 function gatedFirstReads(expected: number) {
   const releases = new Map<string, () => void>();
   let allHeld!: () => void;
   const held = new Promise<void>((resolve) => {
     allHeld = resolve;
   });
-  const read = async (absolutePath: string): Promise<Buffer> => {
-    const buffer = readFileSync(absolutePath);
-    if (!releases.has(absolutePath)) {
-      const gate = new Promise<void>((resolve) => releases.set(absolutePath, resolve));
-      if (releases.size === expected) allHeld();
-      await gate;
-    }
-    return buffer;
+  const hook = async (canonicalPath: string, phase: "read" | "write"): Promise<void> => {
+    if (phase !== "read" || releases.has(canonicalPath)) return;
+    const gate = new Promise<void>((resolve) => releases.set(canonicalPath, resolve));
+    if (releases.size === expected) allHeld();
+    await gate;
   };
   const release = (name: string): void => {
     for (const [path, resolve] of releases) if (basename(path) === name) resolve();
   };
-  return { read, held, release };
+  return { hook, held, release };
 }
 
 describe("createTolerantEditToolDefinition — concurrent calls (pi runs a response's tool calls in parallel by default)", () => {
@@ -237,11 +284,11 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     writeFileSync(join(cwd, "a.md"), "- a     b\n");
     writeFileSync(join(cwd, "b.md"), "- c     d\n");
     const reads = gatedFirstReads(2);
-    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const tool = createTolerantEditToolDefinition(cwd, { betweenCheckAndOpen: reads.hook });
     const first = run(tool, { path: "a.md", edits: [{ oldText: "- a b", newText: "- A B" }] });
     const second = run(tool, { path: "b.md", edits: [{ oldText: "- c d", newText: "- C D" }] });
     await reads.held;
-    // a.md's read lands, then b.md's, both before a.md's fallback runs.
+    // Release a.md's open first, then b.md's.
     reads.release("a.md");
     reads.release("b.md");
     const [ra, rb] = await Promise.all([first, second]);
@@ -258,7 +305,7 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     writeFileSync(join(cwd, "a.md"), "x  y\n");
     writeFileSync(join(cwd, "b.md"), "x  y\nx   y\n");
     const reads = gatedFirstReads(2);
-    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const tool = createTolerantEditToolDefinition(cwd, { betweenCheckAndOpen: reads.hook });
     const onB = run(tool, { path: "b.md", edits: [{ oldText: "x y", newText: "Z" }] });
     const onA = run(tool, { path: "a.md", edits: [{ oldText: "x y", newText: "W" }] });
     const refusedB = onB.then(
@@ -266,7 +313,7 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
       (err: unknown) => (err instanceof Error ? err.message : String(err)),
     );
     await reads.held;
-    // b.md's read lands, then a.md's, both before b.md's fallback runs.
+    // Release b.md's open first, then a.md's.
     reads.release("b.md");
     reads.release("a.md");
     expect(await refusedB).toMatch(/^Found 2 occurrences of the text in b\.md after normalising/);
@@ -291,6 +338,29 @@ describe("createReplaceLinesToolDefinition", () => {
     const result = await run(tool, { path: "f.ts", startLine: 2, endLine: 2, newText: "L2" });
     expect(readFileSync(join(cwd, "f.ts"), "utf8")).toBe("l1\nL2\nl3\n");
     expect(resultText(result)).toContain("Replaced lines 2-2");
+  });
+
+  it("finishes a replacement when the verified handle writes only part of the buffer per call", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\nb\n");
+    const tool = createReplaceLinesToolDefinition(cwd, {
+      wrapOpenedFileHandle: (handle) => shortWritingHandle(handle, 2),
+    });
+    const result = await run(tool, { path: "f.ts", startLine: 1, endLine: 1, newText: "ALPHA" });
+    expect(resultText(result)).toContain("Replaced lines");
+    expect(readFileSync(file, "utf8")).toBe("ALPHA\nb\n");
+  });
+
+  it("refuses replacement success when a verified handle stops making write progress", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\nb\n");
+    const tool = createReplaceLinesToolDefinition(cwd, {
+      wrapOpenedFileHandle: (handle) => shortWritingHandle(handle, 2, true),
+    });
+    await expect(
+      run(tool, { path: "f.ts", startLine: 1, endLine: 1, newText: "ALPHA" }),
+    ).rejects.toThrow(IncompleteWriteError);
+    expect(readFileSync(file, "utf8")).not.toBe("ALPHA\nb\n");
   });
 
   it("preserves the selected line's CRLF terminator", async () => {
@@ -321,12 +391,28 @@ describe("createReplaceLinesToolDefinition", () => {
     const file = join(cwd, "f.ts");
     writeFileSync(file, "a\nb\nc\n");
     const held = holdFirstReplaceRead();
-    const tool = createReplaceLinesToolDefinition(cwd, held.read);
+    const tool = createReplaceLinesToolDefinition(cwd, { afterVerifiedRead: held.hook });
     const first = run(tool, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
     await held.entered;
     const second = run(tool, { path: "f.ts", startLine: 3, endLine: 3, newText: "C" });
-    await allowConcurrentCallToRun(second);
-    held.release();
+    let secondSettled = false;
+    void second.then(
+      () => {
+        secondSettled = true;
+      },
+      () => {
+        secondSettled = true;
+      },
+    );
+    try {
+      await allowConcurrentCallToRun(second);
+      expect(held.reads()).toBe(1);
+      expect(secondSettled).toBe(false);
+      expect(readFileSync(file, "utf8")).toBe("a\nb\nc\n");
+    } finally {
+      held.release();
+      await Promise.allSettled([first, second]);
+    }
     await Promise.all([first, second]);
     expect(readFileSync(file, "utf8")).toBe("A\nb\nC\n");
   });
@@ -335,16 +421,37 @@ describe("createReplaceLinesToolDefinition", () => {
     const file = join(cwd, "f.ts");
     writeFileSync(file, "a\nb\nc\n");
     const held = holdFirstReplaceRead();
-    const replace = createReplaceLinesToolDefinition(cwd, held.read);
-    const edit = createTolerantEditToolDefinition(cwd);
+    const replace = createReplaceLinesToolDefinition(cwd, { afterVerifiedRead: held.hook });
+    let editReads = 0;
+    const edit = createTolerantEditToolDefinition(cwd, {
+      afterVerifiedRead: () => {
+        editReads++;
+      },
+    });
     const first = run(replace, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
     await held.entered;
     const second = run(edit, {
       path: "f.ts",
       edits: [{ oldText: "c", newText: "C" }],
     });
-    await allowConcurrentCallToRun(second);
-    held.release();
+    let secondSettled = false;
+    void second.then(
+      () => {
+        secondSettled = true;
+      },
+      () => {
+        secondSettled = true;
+      },
+    );
+    try {
+      await allowConcurrentCallToRun(second);
+      expect(editReads).toBe(0);
+      expect(secondSettled).toBe(false);
+      expect(readFileSync(file, "utf8")).toBe("a\nb\nc\n");
+    } finally {
+      held.release();
+      await Promise.allSettled([first, second]);
+    }
     await Promise.all([first, second]);
     expect(readFileSync(file, "utf8")).toBe("A\nb\nC\n");
   });

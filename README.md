@@ -124,8 +124,11 @@ The trust layers, from the top down:
    The grant is stored under the host state root (`~/.bob/host`), outside the
    agent's directory and its session cwd — but that placement is NOT a
    containment boundary. Any same-user writer can edit the grant file, and that
-   includes the agent's own built-in file tools (`write`, `edit`), which resolve
-   paths outside the session cwd; the sandbox work (bob#189) is the real
+   includes the agent's `write` tool, which can reach host state outside the
+   session cwd. Bob's `edit` and `replace_lines` refuse a write outside the
+   workspace root and bind the write to the entry they checked, an in-process
+   guard against model mistakes rather than a boundary a hostile local process
+   is held to. The sandbox work (bob#189) is the real
    boundary, and slice 1 does not ship it. What the grant gives is boot checks,
    not authentication. Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189. Every boot compares the grant's pinned name, version, hash and role against the packaged position, AND compares the grant's frozen agent, tool set, capability set and resident-shell flag against the booted agent, the selected manifest's sets and the packaged role's flag, refusing each mismatch by field (the field, the grant value, the packaged value and the remedy). The PACKAGED role's resident-shell flag — never the grant's — is what tool-policy resolution receives. A
    previously bound agent is pinned by a binding marker in its directory: if the
