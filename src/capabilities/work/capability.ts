@@ -100,7 +100,7 @@ const CANCEL_DESCRIPTION =
 const APPLY_PATCH_DESCRIPTION =
   "Apply a patch artifact under the task's artifact root to a fresh, tool-owned index built from the task's pinned base, and store the resulting candidate. " +
   "Takes patch_artifact { path, sha256 } (a patch file under the task's artifact root) and expected_base (the task's pinned base commit object ID). " +
-  "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply; the caller's worktree, index, HEAD and refs are never used and are left untouched. " +
+  "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply. " +
   "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +
   "It refuses, with a stable reason, when the session holds no valid task binding, the base or the digest does not match, the result is not the tree apply mode pins, the artifact is missing or outside its root, the patch is malformed or does not apply, it changes a symlink or a submodule, or it names an unsafe Git path. " +
   `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
@@ -112,7 +112,7 @@ function applyPatchSuccessText(r: ApplyPatchSuccess): string {
     `patch_sha256: ${r.patch_sha256}`,
     `tree_oid: ${r.tree_oid}`,
     `changed_paths: ${r.changed_paths.length === 0 ? "(none)" : r.changed_paths.join(", ")}`,
-    "The caller's worktree, index and HEAD are untouched. A candidate id is not permission to publish it.",
+    "A candidate id is not permission to publish it.",
   ].join("\n");
 }
 

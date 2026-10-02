@@ -112,6 +112,98 @@ function setup() {
 }
 
 describe("candidate storage with stubbed git and real filesystem operations", () => {
+  for (const replacement of ["record", "staging directory"] as const) {
+    it(`refuses a swapped ${replacement} after writing without changing the checkout`, () => {
+      const fx = setup();
+      const checkoutRecord = join(fx.repo, "record.json");
+      writeFileSync(checkoutRecord, "checkout record\n");
+      const before = readdirSync(fx.repo, { recursive: true }).sort();
+      const out = fx.apply({
+        writeCandidateRecord: (fd, data) => {
+          writeFileSync(fd, data);
+          const [name] = readdirSync(fx.dir);
+          const stage = join(fx.dir, name);
+          if (replacement === "record") {
+            rmSync(join(stage, "record.json"));
+            symlinkSync(checkoutRecord, join(stage, "record.json"));
+          } else {
+            renameSync(stage, join(fx.stateRoot, "moved-stage"));
+            symlinkSync(fx.repo, stage);
+          }
+        },
+      });
+      expect(out.ok).toBe(false);
+      if (!out.ok) expect(out.reason).toBe("storage_failed");
+      expect(existsSync(fx.recordPath)).toBe(false);
+      expect(readFileSync(checkoutRecord, "utf8")).toBe("checkout record\n");
+      expect(readdirSync(fx.repo, { recursive: true }).sort()).toEqual(before);
+      rmSync(checkoutRecord);
+      fx.assertUntouched();
+    });
+  }
+
+  it("refuses a replaced destination after rename instead of reporting a candidate", () => {
+    const fx = setup();
+    const actualRename = fs.renameSync;
+    const rename = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      actualRename(from, to);
+      if (String(to) === fx.recordPath) {
+        rmSync(to);
+        symlinkSync(join(fx.repo, "a.txt"), to);
+      }
+    });
+    try {
+      const out = fx.apply();
+      expect(out.ok).toBe(false);
+      if (!out.ok) expect(out.reason).toBe("storage_failed");
+      expect(existsSync(fx.recordPath)).toBe(false);
+      fx.assertUntouched();
+    } finally {
+      rename.mockRestore();
+    }
+  });
+
+  for (const failure of ["throw", "leave scratch"] as const) {
+    it(`scratch removal ${failure} refuses before candidate storage and reports cleanup`, () => {
+      const fx = setup();
+      const actualRemove = fs.rmSync;
+      let failedPath: string | undefined;
+      let wrote = false;
+      const remove = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+        if (String(path).startsWith(join(fx.stateRoot, "apply-"))) {
+          failedPath = String(path);
+          if (failure === "throw") throw new Error("injected scratch removal failure");
+          return;
+        }
+        actualRemove(path, options);
+      });
+      try {
+        const out = fx.apply({
+          writeCandidateRecord: () => {
+            wrote = true;
+          },
+        });
+        expect(failedPath).toBeDefined();
+        expect(out.ok).toBe(false);
+        if (!out.ok) {
+          expect(out.reason).toBe("storage_failed");
+          expect(out.message).toContain(
+            failure === "throw"
+              ? "injected scratch removal failure"
+              : "scratch directory still exists",
+          );
+          expect(out.detail).toEqual({ cleanup: "failed", scratch_path: failedPath });
+        }
+        expect(wrote).toBe(false);
+        expect(existsSync(fx.recordPath)).toBe(false);
+        expect(existsSync(failedPath as string)).toBe(true);
+        fx.assertUntouched();
+      } finally {
+        remove.mockRestore();
+      }
+    });
+  }
+
   it("stores a complete owner-only record from a private staging directory", () => {
     const fx = setup();
     const out = fx.apply({
@@ -134,7 +226,7 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
   });
 
   for (const replacement of ["symlink", "directory"] as const) {
-    it(`a candidates ${replacement} swapped after the pin: storage_failed, created file removed, checkout unchanged`, () => {
+    it(`a candidates ${replacement} swapped after the pin refuses before writing`, () => {
       const fx = setup();
       const moved = join(fx.stateRoot, "pinned-candidates");
       let wrote = false;
@@ -152,7 +244,7 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
           wrote = true;
         },
       });
-      expect(wrote).toBe(true);
+      expect(wrote).toBe(false);
       expect(out.ok).toBe(false);
       if (!out.ok) {
         expect(out.reason).toBe("storage_failed");

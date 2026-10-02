@@ -54,7 +54,7 @@ export type ApplyRefusalReason =
   | "unsafe_git_path" // the patch names a path git refuses (.git, .., absolute)
   | "unsupported_entry_type" // the patch changes a symlink or a submodule
   | "apply_failed" // a git step failed unexpectedly
-  | "storage_failed"; // the candidate record could not be stored
+  | "storage_failed"; // state-root, scratch or candidate storage failed
 
 export interface ApplyPatchParams {
   patch_artifact: { path: string; sha256: string };
@@ -255,8 +255,7 @@ export interface ApplyPatchInput {
   // When the binding was present but malformed, the parse error's message.
   bindingError?: string;
   params: ApplyPatchParams;
-  // The tool-owned state root (the JobManager's). Candidates are stored under
-  // it; nothing is written into the caller's checkout.
+  // The tool-owned state root (the JobManager's).
   stateRoot: string;
   deps?: ApplyPatchDeps;
 }
@@ -370,10 +369,6 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
     );
   }
 
-  // The tool's own scratch: one directory per call, holding only the fresh
-  // index. The finally below removes it on EVERY path — success or any refusal
-  // — so no scratch entry outlives the call, and concurrent calls cannot share
-  // an index.
   let scratchDir: string;
   try {
     scratchDir = mkdtempSync(join(stateRoot, "apply-"));
@@ -384,10 +379,30 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
     );
   }
   const indexFile = join(scratchDir, "index");
+  const cleanupScratch = (): ApplyPatchRefusal | undefined => {
+    try {
+      rmSync(scratchDir, { recursive: true, force: true });
+      try {
+        lstatSync(scratchDir);
+        throw new Error("scratch directory still exists");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    } catch (err) {
+      return refuse(
+        "storage_failed",
+        `apply_patch refused: scratch cleanup failed at ${scratchDir} (${err instanceof Error ? err.message : String(err)}). No candidate was stored.`,
+        { cleanup: "failed", scratch_path: scratchDir },
+      );
+    }
+    return undefined;
+  };
 
-  try {
+  const prepare = ():
+    | ApplyPatchRefusal
+    | { record: CandidateRecord; success: ApplyPatchSuccess } => {
     // Fresh, tool-owned index initialized from the pinned base. The caller's
-    // index file is never touched: every git call below names THIS file.
+    // index file is never touched: every index-touching call names THIS file.
     const read = git(["read-tree", binding.base_oid], { cwd: binding.repository, indexFile });
     if (read.status !== 0) {
       if (
@@ -502,20 +517,32 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
       changed_paths: changedPaths,
       created_at: (deps.now?.() ?? new Date()).toISOString(),
     };
-    const store = storeCandidate(stateRoot, record, deps);
-    if (!store.ok) return store;
-
     return {
-      ok: true,
-      candidate_id: candidateId,
-      base_oid: binding.base_oid,
-      patch_sha256: digest,
-      tree_oid: treeOid,
-      changed_paths: changedPaths,
+      record,
+      success: {
+        ok: true,
+        candidate_id: candidateId,
+        base_oid: binding.base_oid,
+        patch_sha256: digest,
+        tree_oid: treeOid,
+        changed_paths: changedPaths,
+      },
     };
-  } finally {
-    rmSync(scratchDir, { recursive: true, force: true });
+  };
+  let prepared: ReturnType<typeof prepare>;
+  try {
+    prepared = prepare();
+  } catch (err) {
+    prepared = refuse(
+      "apply_failed",
+      `apply_patch refused: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
+  const cleanup = cleanupScratch();
+  if (cleanup !== undefined) return cleanup;
+  if ("ok" in prepared) return prepared;
+  const store = storeCandidate(stateRoot, prepared.record, deps);
+  return store.ok ? prepared.success : store;
 }
 
 function openCandidateDir(
@@ -567,17 +594,43 @@ function storeCandidate(
   record: CandidateRecord,
   deps: ApplyPatchDeps,
 ): { ok: true } | ApplyPatchRefusal {
+  let rootPin: { dev: bigint; ino: bigint };
+  try {
+    ensurePrivateDir(stateRoot, false);
+    rootPin = lstatSync(stateRoot, { bigint: true });
+  } catch (err) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: state directory could not be pinned (${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
   const dir = join(stateRoot, "candidates");
   const opened = openCandidateDir(dir);
   if (!opened.ok) return opened;
   const finalPath = join(dir, `${record.candidate_id}.json`);
   let stagingDir: string | undefined;
+  let stagingPin: { dev: bigint; ino: bigint } | undefined;
   let fd: number | undefined;
   let dirFd: number | undefined = opened.fd;
   let renamed = false;
+  const checkDirectories = () => {
+    const root = lstatSync(stateRoot, { bigint: true });
+    ensurePrivateDir(stateRoot, false);
+    if (root.dev !== rootPin.dev || root.ino !== rootPin.ino) {
+      throw new Error("the state directory changed after it was pinned");
+    }
+    const after = lstatSync(dir, { bigint: true });
+    if (!after.isDirectory() || after.dev !== opened.dev || after.ino !== opened.ino) {
+      throw new Error("the candidate directory changed after it was pinned");
+    }
+  };
   try {
     deps.beforeCandidateWrite?.(dir);
+    checkDirectories();
     stagingDir = mkdtempSync(join(dir, ".tmp-"));
+    const createdStage = lstatSync(stagingDir, { bigint: true });
+    if (!createdStage.isDirectory()) throw new Error("staging is not a directory");
+    stagingPin = createdStage;
     const tmpPath = join(stagingDir, "record.json");
     fd = openSync(
       tmpPath,
@@ -585,15 +638,27 @@ function storeCandidate(
       0o600,
     );
     (deps.writeCandidateRecord ?? writeFileSync)(fd, `${JSON.stringify(record, null, 2)}\n`);
+    const recordPin = fstatSync(fd, { bigint: true });
+    if (!recordPin.isFile()) throw new Error("the written descriptor is not a regular file");
     const writtenFd = fd;
     fd = undefined;
     closeSync(writtenFd);
-    const after = lstatSync(dir, { bigint: true });
-    if (after.dev !== opened.dev || after.ino !== opened.ino) {
-      throw new Error("the candidate directory changed after it was pinned");
+    checkDirectories();
+    const stage = lstatSync(stagingDir, { bigint: true });
+    if (!stage.isDirectory() || stage.dev !== stagingPin.dev || stage.ino !== stagingPin.ino) {
+      throw new Error("the staging directory changed after it was pinned");
+    }
+    const source = lstatSync(tmpPath, { bigint: true });
+    if (!source.isFile() || source.dev !== recordPin.dev || source.ino !== recordPin.ino) {
+      throw new Error("the staging record changed after it was written");
     }
     renameSync(tmpPath, finalPath);
     renamed = true;
+    const published = lstatSync(finalPath, { bigint: true });
+    if (!published.isFile() || published.dev !== recordPin.dev || published.ino !== recordPin.ino) {
+      throw new Error("the published record differs from the written descriptor");
+    }
+    checkDirectories();
     rmdirSync(stagingDir);
     stagingDir = undefined;
     const pinnedFd = dirFd;
@@ -605,6 +670,17 @@ function storeCandidate(
     for (const path of [renamed ? finalPath : undefined, stagingDir]) {
       if (path === undefined) continue;
       try {
+        checkDirectories();
+        if (path === stagingDir && stagingPin !== undefined) {
+          const stage = lstatSync(path, { bigint: true });
+          if (
+            !stage.isDirectory() ||
+            stage.dev !== stagingPin.dev ||
+            stage.ino !== stagingPin.ino
+          ) {
+            throw new Error("staging identity changed; cleanup skipped");
+          }
+        }
         rmSync(path, { recursive: path === stagingDir, force: true });
       } catch (rerr) {
         leftover += `; ${path} could not be removed (${rerr instanceof Error ? rerr.message : String(rerr)})`;

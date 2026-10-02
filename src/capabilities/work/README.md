@@ -100,8 +100,7 @@ the task's artifact root) and `expected_base` (the task's pinned base commit
 object ID). It reads the artifact once, verifies its digest, and applies those
 **verified bytes** — never a reopened pathname — to a fresh, tool-owned
 `GIT_INDEX_FILE` initialized from the pinned base (`git read-tree`), then writes
-the resulting tree. The caller's worktree, index, HEAD and refs are never used
-as application input and are left untouched. In `apply` mode the artifact must
+the resulting tree. In `apply` mode the artifact must
 also match the task-authorized digest.
 
 It supports ordinary file additions, modifications, deletions, renames,
@@ -115,8 +114,7 @@ nothing does (`patch_does_not_apply`).
 `invalid_binding`, `invalid_base`, `base_mismatch`, `artifact_missing`,
 `unsafe_artifact_path`, `digest_mismatch`, `tree_mismatch`, `malformed_patch`,
 `patch_does_not_apply`, `unsafe_git_path`, `unsupported_entry_type`,
-`apply_failed`, `storage_failed`. A refusal returns no candidate and leaves the
-caller's checkout unchanged.
+`apply_failed`, `storage_failed`. A refusal returns no candidate.
 
 **Success** returns `{ candidate_id, base_oid, patch_sha256, tree_oid,
 changed_paths }`. The candidate is stored under the tool-owned state root
@@ -126,7 +124,7 @@ publication. **A candidate id is not permission to publish it.**
 
 `apply_patch` builds a candidate; it writes no file the model names and runs no
 command the model writes, so its `TOOL_EFFECTS` row is `writer` and a resident
-agent drops it with the other writers.
+agent drops it unless its role permits resident writers.
 
 ## Enabling it
 

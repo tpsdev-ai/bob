@@ -3,8 +3,7 @@
 //
 // Local git fixtures, no network. Cases drive the tool the capability registers
 // (through wireWork) or applyPatch directly; the success cases apply a real
-// patch and assert the resulting tree, and that the caller's worktree, index and
-// HEAD are byte-identical after.
+// patch and assert the resulting tree, Git status, refs, HEAD and index digest.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -235,7 +234,7 @@ describe("apply_patch — success shapes yield the expected tree", () => {
       expect(existsSync(candidateRecordPath(w.stateRoot, String(out.details.candidate_id)))).toBe(
         true,
       );
-      // The caller's checkout is byte-identical.
+      // Git status, refs, HEAD and index digest match.
       expect(snapshot(fx.repo)).toEqual(before);
     });
   }
@@ -310,7 +309,7 @@ describe("apply_patch — success shapes yield the expected tree", () => {
   });
 });
 
-describe("apply_patch — no scratch outlives the call (bob#277 leak check)", () => {
+describe("apply_patch — scratch cleanup (bob#277 leak check)", () => {
   it("a success and a refusal that reaches the index both leave no scratch dir", async () => {
     const fx = makeFixture();
     const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
@@ -322,7 +321,6 @@ describe("apply_patch — no scratch outlives the call (bob#277 leak check)", ()
       expected_base: fx.base,
     });
     expect(ok.details.refused).toBe(false);
-    // The only entry the tool left under its state root is the candidate record.
     expect(readdirSync(w.stateRoot)).toEqual(["candidates"]);
 
     // A refusal that parses the patch and reaches the fresh index must not leave
@@ -722,7 +720,7 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     const stateRoot = join(scratch, "state");
     mkdirSync(stateRoot, { mode: 0o700 });
     // The candidate directory is a symlink into the caller's checkout: a
-    // recursive mkdir accepts it and the record write follows it there.
+    // recursive mkdir previously accepted it and the record write followed it there.
     const planted = join(fx.repo, "planted");
     mkdirSync(planted);
     symlinkSync(planted, join(stateRoot, "candidates"));
@@ -737,7 +735,7 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.reason).toBe("storage_failed");
-    // Nothing was written through the link, and the checkout is byte-identical.
+    // Nothing was written through the link; the Git snapshot matches.
     expect(readdirSync(planted)).toEqual([]);
     expect(snapshot(fx.repo)).toEqual(before);
   });

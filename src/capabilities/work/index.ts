@@ -5,8 +5,7 @@
 // validate the (empty) config → read the launcher-supplied task binding
 // (bob#275, S2a) from the environment → wire run / run_status / run_cancel /
 // apply_patch (wireWork) → wait for the boot sweep, which cancels and reports
-// jobs left behind by a bob run whose supervisor died. All logic and tests live
-// in run.ts / apply-patch.ts / task-binding.ts / capability.ts.
+// jobs left behind by a bob run whose supervisor died.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { wireWork } from "./capability.js";
