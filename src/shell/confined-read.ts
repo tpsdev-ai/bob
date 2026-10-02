@@ -37,13 +37,24 @@
 // a CHANGED file — a different device or inode at the checked path — is
 // refused. That is all this step claims.
 //
+// The SAME binding guards the writes `edit` and `replace_lines` make (bob#273).
+// A write resolves its target inside the workspace root, then opens it
+// (O_NOFOLLOW) and uses the descriptor only when its device + inode are the
+// checked entry's; `edit`'s write also requires the identity its read saw. It
+// closes a FINAL component swapped for a symlink or for another file between the
+// check and the open/write. It is an IN-PROCESS guard against MODEL MISTAKES,
+// not a sandbox: a same-user process with write access to the workspace is
+// outside what it can stop. That is the OS boundary's job (bob#189, bob under
+// nono).
+//
 // What this does NOT cover:
 //   * an ANCESTOR directory of the checked path replaced between the check and
 //     the open: O_NOFOLLOW guards only the final component, and the fstat
 //     comparison only catches a different file, so a replaced ancestor that
 //     still leads to the same device + inode is not detected. Opening along an
 //     ancestor-stable path (component by component from a held directory) is a
-//     separate control, not built here;
+//     separate control, not built here, and Node exposes no openat on any
+//     platform this runs on;
 //   * other tools that read files (pi's grep/find/ls, anchored-edit's
 //     read_lines) — they are not confined by this module;
 //   * a credential path is only refused as bob's parser reads it.
@@ -440,11 +451,22 @@ export function checkReadTarget(absolutePath: string, opts: ConfineReadOptions):
   return { path: target, dev, ino };
 }
 
-// Check the ABSOLUTE path a write (bob#143 replace_lines) is about to open. The
+// The entry a write check approved: its canonical path and its identity.
+export interface CheckedWriteTarget {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+// Check the ABSOLUTE path a write (`edit`, `replace_lines`) is about to open, and
+// return the approved entry's canonical path and identity (device + inode). The
 // target must resolve inside the workspace root, following symlinks and `..`,
 // with the same `realpathSync.native` + relative comparison checkReadTarget uses
-// for a read. Returns the canonical path to write; throws otherwise.
-export function checkWriteTarget(absolutePath: string, workspaceRoot: string): string {
+// for a read, and must be a regular file. Throws a refusal otherwise.
+export function checkWriteTargetVerified(
+  absolutePath: string,
+  workspaceRoot: string,
+): CheckedWriteTarget {
   if (typeof absolutePath !== "string" || absolutePath.trim() === "") {
     throw new Error("bob: refusing to write: a path is required.");
   }
@@ -467,7 +489,20 @@ export function checkWriteTarget(absolutePath: string, workspaceRoot: string): s
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw writeRefusal(absolutePath, NOT_IN_WORKSPACE);
   }
-  return target;
+  let st: BigIntStats;
+  try {
+    st = statSync(target, { bigint: true });
+  } catch (err) {
+    throw writeRefusal(absolutePath, `it could not be checked (${errCode(err)})`);
+  }
+  if (!st.isFile()) throw writeRefusal(absolutePath, "it is not a regular file");
+  return { path: target, dev: st.dev, ino: st.ino };
+}
+
+// Check the ABSOLUTE path a write is about to open. Kept for callers that only
+// need the canonical path; checkWriteTargetVerified carries the identity too.
+export function checkWriteTarget(absolutePath: string, workspaceRoot: string): string {
+  return checkWriteTargetVerified(absolutePath, workspaceRoot).path;
 }
 
 // Open the CHECKED canonical path and verify the descriptor is the checked file
@@ -506,6 +541,56 @@ export async function openCheckedReadTarget(
   opts: ConfineReadOptions,
 ): Promise<FileHandle> {
   return openVerifiedReadTarget(checkReadTarget(absolutePath, opts), absolutePath);
+}
+
+// Open the CHECKED canonical path and verify the descriptor is the checked entry
+// (device + inode, still a regular file) before anything is read from it or
+// written through it. O_NOFOLLOW refuses a FINAL component swapped for a symlink;
+// the fstat comparison refuses a DIFFERENT file; `expected` refuses a file that
+// changed since the caller's own earlier check (the read of an `edit`). A
+// replaced ancestor directory is not detected (see the header).
+export interface OpenVerifiedWriteOptions {
+  // Open read-only: for a read that must be bound to the same checked entry.
+  readOnly?: boolean;
+  // The identity the entry had when the caller last verified it. Refused when a
+  // different file now sits at the checked path.
+  expected?: { dev: bigint; ino: bigint };
+}
+
+export async function openVerifiedWriteTarget(
+  checked: CheckedWriteTarget,
+  absolutePath: string,
+  opts: OpenVerifiedWriteOptions = {},
+): Promise<FileHandle> {
+  const access = opts.readOnly ? constants.O_RDONLY : constants.O_RDWR;
+  const flags = access | (constants.O_NOFOLLOW ?? 0);
+  let fh: FileHandle;
+  try {
+    fh = await open(checked.path, flags);
+  } catch (err) {
+    const code = errCode(err);
+    if (code === "ELOOP") {
+      throw writeRefusal(absolutePath, "it is a symlink now, after it was checked");
+    }
+    throw writeRefusal(absolutePath, `it could not be opened after it was checked (${code})`);
+  }
+  try {
+    const st = await fh.stat({ bigint: true });
+    if (!st.isFile() || st.dev !== checked.dev || st.ino !== checked.ino) {
+      throw writeRefusal(absolutePath, "it changed between the check and the open");
+    }
+    if (
+      opts.expected !== undefined &&
+      (st.dev !== opts.expected.dev || st.ino !== opts.expected.ino)
+    ) {
+      throw writeRefusal(absolutePath, "it changed between the read and the write");
+    }
+    return fh;
+  } catch (err) {
+    await fh.close().catch(() => {});
+    if (err instanceof Error && err.message.startsWith("bob: refusing")) throw err;
+    throw writeRefusal(absolutePath, `it could not be checked (${errCode(err)})`);
+  }
 }
 
 // ─── Image sniffing on the verified descriptor ──────────────────────────────

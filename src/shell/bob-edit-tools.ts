@@ -25,13 +25,22 @@
 //                     decide the range, so a range containing a line repeated
 //                     elsewhere still lands.
 //
-// Neither tool invents a sandbox. The tolerant `edit` resolves and writes
-// through pi's edit tool exactly as pi does (pi resolves absolute paths as
-// given). `replace_lines` writes with bob's own write control, confined to the
-// run's workspace root (confined-read.ts's checkWriteTarget).
+// Neither tool invents a sandbox. Both BIND their read and their write to the
+// workspace entry they checked (bob#273). The tolerant `edit` plugs bob's
+// operations into pi's edit tool: each operation resolves and checks the
+// ABSOLUTE path pi is about to open (a target outside the workspace root is
+// refused), opens it with O_NOFOLLOW, and works from the descriptor only when
+// its device and inode are the checked entry's; the write also requires the
+// identity the read saw. `replace_lines` does the same with one O_RDWR
+// descriptor it both reads and writes through. This closes a FINAL component
+// swapped for a symlink or for another file between the check and the
+// open/write; an intermediate directory swapped for a symlink between the check
+// and the open is NOT detected when the new path still leads to the same device
+// and inode (Node exposes no openat on any platform this runs on, and O_NOFOLLOW
+// guards only the final component). It is an in-process guard
+// against MODEL MISTAKES: a hostile local process that can write the workspace
+// is the OS boundary's job (bob#189, bob under nono), not this.
 
-import { constants } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
   createEditToolDefinition,
@@ -40,7 +49,7 @@ import {
   withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { checkWriteTarget } from "./confined-read.js";
+import { checkWriteTargetVerified, openVerifiedWriteTarget } from "./confined-read.js";
 import {
   EditMatchError,
   type EditRequest,
@@ -70,30 +79,72 @@ interface CapturingOps {
   check: (input: unknown) => void;
 }
 
-type ReadSource = (absolutePath: string) => Promise<Buffer>;
+// A test seam: runs after a target is checked and before it is opened, in the
+// window the binding closes. Production passes nothing.
+export interface EditWriteHooks {
+  betweenCheckAndOpen?: (canonicalPath: string, phase: "read" | "write") => void | Promise<void>;
+}
 
-// pi's default local operations, with the file's content captured so the caller
-// can match against exactly what pi resolved and read. One capture per edit
-// execution: pi runs a response's tool calls in parallel by default, so a
-// capture shared across calls could hold another file's content when the
-// fallback reads it.
+// pi's edit operations, bound to the checked workspace entry. Each operation
+// resolves and checks the ABSOLUTE path pi is about to open, runs the test hook,
+// then opens it with O_NOFOLLOW and works from the descriptor only when its
+// device and inode are the checked entry's; the write also requires the identity
+// the read saw. One capture per edit execution: pi runs a response's tool calls
+// in parallel by default, so a capture shared across calls could hold another
+// file's content when the fallback reads it.
 //
 // The read rejects ambiguous exact matches, or ambiguous normalised matches
 // when there is no exact match. It runs before pi matches, so pi's own count,
 // which skips overlapping occurrences, never decides these cases.
-function capturingOperations(read: ReadSource): CapturingOps {
+function boundEditOperations(cwd: string, hooks: EditWriteHooks | undefined): CapturingOps {
   let captured = "";
   let pending: EditInput | undefined;
+  let readIdentity: { dev: bigint; ino: bigint } | undefined;
+  const openBound = async (
+    absolutePath: string,
+    phase: "read" | "write",
+    expected?: { dev: bigint; ino: bigint },
+  ) => {
+    const checked = checkWriteTargetVerified(absolutePath, cwd);
+    await hooks?.betweenCheckAndOpen?.(checked.path, phase);
+    return openVerifiedWriteTarget(checked, absolutePath, {
+      ...(phase === "read" ? { readOnly: true } : {}),
+      ...(expected !== undefined ? { expected } : {}),
+    });
+  };
   return {
     operations: {
-      access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
-      readFile: async (absolutePath) => {
-        const buffer = await read(absolutePath);
-        captured = buffer.toString("utf-8");
-        refuseAmbiguousOldTextBeforePiMatch(captured, pending?.edits, String(pending?.path ?? ""));
-        return buffer;
+      access: async (absolutePath) => {
+        const fh = await openBound(absolutePath, "read");
+        await fh.close();
       },
-      writeFile: (absolutePath, text) => writeFile(absolutePath, text, "utf-8"),
+      readFile: async (absolutePath) => {
+        const fh = await openBound(absolutePath, "read");
+        try {
+          const buffer = await fh.readFile();
+          const st = await fh.stat({ bigint: true });
+          readIdentity = { dev: st.dev, ino: st.ino };
+          captured = buffer.toString("utf-8");
+          refuseAmbiguousOldTextBeforePiMatch(
+            captured,
+            pending?.edits,
+            String(pending?.path ?? ""),
+          );
+          return buffer;
+        } finally {
+          await fh.close();
+        }
+      },
+      writeFile: async (absolutePath, text) => {
+        const fh = await openBound(absolutePath, "write", readIdentity);
+        try {
+          const bytes = Buffer.from(text, "utf-8");
+          await fh.truncate(0);
+          await fh.write(bytes, 0, bytes.length, 0);
+        } finally {
+          await fh.close();
+        }
+      },
     },
     content: () => captured,
     check: (input) => {
@@ -115,11 +166,12 @@ function noteNormalisation(result: unknown, count: number): unknown {
   return result;
 }
 
-// pi's edit tool, with the whitespace-run-tolerant retry in front of its failure.
-// `read` is a test seam for the file read pi's edit makes (default: fs readFile).
+// pi's edit tool, with the whitespace-run-tolerant retry in front of its
+// failure, and bob's bound operations in front of pi's reads and writes.
+// `hooks` is a test seam (see EditWriteHooks); production passes none.
 export function createTolerantEditToolDefinition(
   cwd: string,
-  read: ReadSource = (absolutePath) => readFile(absolutePath),
+  hooks?: EditWriteHooks,
 ): ToolDefinition {
   const base = createEditToolDefinition(cwd);
   return {
@@ -132,7 +184,7 @@ export function createTolerantEditToolDefinition(
       ctx?: unknown,
     ) {
       // This execution's own capture and its own pi edit over it.
-      const capturing = capturingOperations(read);
+      const capturing = boundEditOperations(cwd, hooks);
       const runBase = createEditToolDefinition(cwd, { operations: capturing.operations })
         .execute as unknown as PiEditExecute;
       try {
@@ -175,10 +227,14 @@ function lineSpans(content: string): Array<{ start: number; end: number }> {
   return spans;
 }
 
+// `replace_lines` reads and writes through ONE O_RDWR descriptor, opened
+// O_NOFOLLOW after the target is checked and used only while its device and
+// inode are the checked entry's: a FINAL component swapped for a symlink or for
+// another file between the check and the open is refused, and nothing is written.
+// `hooks` is a test seam (see EditWriteHooks); production passes none.
 export function createReplaceLinesToolDefinition(
   cwd: string,
-  read: (absolutePath: string) => Promise<string> = (absolutePath) =>
-    readFile(absolutePath, "utf-8"),
+  hooks?: EditWriteHooks,
 ): ToolDefinition {
   return {
     name: "replace_lines",
@@ -212,49 +268,58 @@ export function createReplaceLinesToolDefinition(
       // Confine the write to the run's workspace root: a relative path resolves
       // against it, and a path that resolves outside it (absolute, through `..`
       // or through a symlink) is refused before any read or write. An absolute
-      // path inside the root is accepted.
+      // path inside the root is accepted. The checked entry's identity binds the
+      // read and the write that follow to it.
       const requested = isAbsolute(path) ? path : resolve(cwd, path);
-      const target = checkWriteTarget(requested, cwd);
+      const checked = checkWriteTargetVerified(requested, cwd);
       // Share pi's queue with edit/write. The read, range check, and write must
       // all see the same turn's preceding mutations before the next one starts.
-      return withFileMutationQueue(target, async () => {
-        let text: string;
+      return withFileMutationQueue(checked.path, async () => {
+        await hooks?.betweenCheckAndOpen?.(checked.path, "write");
+        const fh = await openVerifiedWriteTarget(checked, path);
         try {
-          text = await read(target);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          throw new Error(`replace_lines: could not read ${path}: ${message}`);
+          let text: string;
+          try {
+            text = (await fh.readFile()).toString("utf-8");
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            throw new Error(`replace_lines: could not read ${path}: ${message}`);
+          }
+          const spans = lineSpans(text);
+          if (startLine > endLine) {
+            throw new Error(
+              `replace_lines: inverted range in ${path}: startLine ${startLine} > endLine ${endLine}.`,
+            );
+          }
+          if (startLine < 1 || endLine > spans.length) {
+            throw new Error(
+              `replace_lines: out-of-range in ${path}: lines ${startLine}-${endLine}, but the file has ${spans.length} line(s).`,
+            );
+          }
+          const from = spans[startLine - 1].start;
+          const to = spans[endLine - 1].end;
+          const oldText = text.slice(from, to);
+          // For nonempty newText without a terminator, keep the final selected line's terminator if present.
+          const terminator = oldText.endsWith("\r\n")
+            ? "\r\n"
+            : oldText.endsWith("\n")
+              ? "\n"
+              : oldText.endsWith("\r")
+                ? "\r"
+                : "";
+          const replacement =
+            newText !== "" && terminator && !/[\r\n]$/.test(newText)
+              ? `${newText}${terminator}`
+              : newText;
+          const bytes = Buffer.from(text.slice(0, from) + replacement + text.slice(to), "utf-8");
+          await fh.truncate(0);
+          await fh.write(bytes, 0, bytes.length, 0);
+          return {
+            content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
+          };
+        } finally {
+          await fh.close();
         }
-        const spans = lineSpans(text);
-        if (startLine > endLine) {
-          throw new Error(
-            `replace_lines: inverted range in ${path}: startLine ${startLine} > endLine ${endLine}.`,
-          );
-        }
-        if (startLine < 1 || endLine > spans.length) {
-          throw new Error(
-            `replace_lines: out-of-range in ${path}: lines ${startLine}-${endLine}, but the file has ${spans.length} line(s).`,
-          );
-        }
-        const from = spans[startLine - 1].start;
-        const to = spans[endLine - 1].end;
-        const oldText = text.slice(from, to);
-        // For nonempty newText without a terminator, keep the final selected line's terminator if present.
-        const terminator = oldText.endsWith("\r\n")
-          ? "\r\n"
-          : oldText.endsWith("\n")
-            ? "\n"
-            : oldText.endsWith("\r")
-              ? "\r"
-              : "";
-        const replacement =
-          newText !== "" && terminator && !/[\r\n]$/.test(newText)
-            ? `${newText}${terminator}`
-            : newText;
-        await writeFile(target, text.slice(0, from) + replacement + text.slice(to), "utf-8");
-        return {
-          content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
-        };
       });
     },
   } as unknown as ToolDefinition;

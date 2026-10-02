@@ -20,7 +20,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -40,23 +39,22 @@ function resultText(result: unknown): string {
   return content.map((block) => block.text ?? "").join("\n");
 }
 
-// Hold the first replace_lines read after taking its snapshot. If the queue is
-// bypassed, a concurrent call can finish against that stale snapshot.
-function holdFirstReplaceRead() {
+// Hold the first replace_lines target open (after its path check and before the
+// bound open). If the queue is bypassed, a concurrent call can finish against
+// that stale snapshot.
+function holdFirstReplaceOpen() {
   let enter!: () => void;
   let release!: () => void;
   const entered = new Promise<void>((resolve) => (enter = resolve));
   const gate = new Promise<void>((resolve) => (release = resolve));
-  let reads = 0;
-  const read = async (path: string): Promise<string> => {
-    const text = await readFile(path, "utf-8");
-    if (++reads === 1) {
+  let opens = 0;
+  const hook = async (): Promise<void> => {
+    if (++opens === 1) {
       enter();
       await gate;
     }
-    return text;
   };
-  return { read, entered, release };
+  return { hook, entered, release };
 }
 
 async function allowConcurrentCallToRun(call: Promise<unknown>): Promise<void> {
@@ -200,28 +198,24 @@ describe("createTolerantEditToolDefinition", () => {
   });
 });
 
-// Holds the FIRST read of each file until the test releases it, so the test
-// decides the order in which two concurrent executions' reads land. The read
-// itself is synchronous, so only the release order decides that order.
+// Hold the FIRST read-phase open of each file until the test releases it, so the
+// test decides the order in which two concurrent executions' reads land.
 function gatedFirstReads(expected: number) {
   const releases = new Map<string, () => void>();
   let allHeld!: () => void;
   const held = new Promise<void>((resolve) => {
     allHeld = resolve;
   });
-  const read = async (absolutePath: string): Promise<Buffer> => {
-    const buffer = readFileSync(absolutePath);
-    if (!releases.has(absolutePath)) {
-      const gate = new Promise<void>((resolve) => releases.set(absolutePath, resolve));
-      if (releases.size === expected) allHeld();
-      await gate;
-    }
-    return buffer;
+  const hook = async (canonicalPath: string, phase: "read" | "write"): Promise<void> => {
+    if (phase !== "read" || releases.has(canonicalPath)) return;
+    const gate = new Promise<void>((resolve) => releases.set(canonicalPath, resolve));
+    if (releases.size === expected) allHeld();
+    await gate;
   };
   const release = (name: string): void => {
     for (const [path, resolve] of releases) if (basename(path) === name) resolve();
   };
-  return { read, held, release };
+  return { hook, held, release };
 }
 
 describe("createTolerantEditToolDefinition — concurrent calls (pi runs a response's tool calls in parallel by default)", () => {
@@ -237,7 +231,7 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     writeFileSync(join(cwd, "a.md"), "- a     b\n");
     writeFileSync(join(cwd, "b.md"), "- c     d\n");
     const reads = gatedFirstReads(2);
-    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const tool = createTolerantEditToolDefinition(cwd, { betweenCheckAndOpen: reads.hook });
     const first = run(tool, { path: "a.md", edits: [{ oldText: "- a b", newText: "- A B" }] });
     const second = run(tool, { path: "b.md", edits: [{ oldText: "- c d", newText: "- C D" }] });
     await reads.held;
@@ -258,7 +252,7 @@ describe("createTolerantEditToolDefinition — concurrent calls (pi runs a respo
     writeFileSync(join(cwd, "a.md"), "x  y\n");
     writeFileSync(join(cwd, "b.md"), "x  y\nx   y\n");
     const reads = gatedFirstReads(2);
-    const tool = createTolerantEditToolDefinition(cwd, reads.read);
+    const tool = createTolerantEditToolDefinition(cwd, { betweenCheckAndOpen: reads.hook });
     const onB = run(tool, { path: "b.md", edits: [{ oldText: "x y", newText: "Z" }] });
     const onA = run(tool, { path: "a.md", edits: [{ oldText: "x y", newText: "W" }] });
     const refusedB = onB.then(
@@ -320,8 +314,8 @@ describe("createReplaceLinesToolDefinition", () => {
   it("serialises two replacements of different lines in the same file", async () => {
     const file = join(cwd, "f.ts");
     writeFileSync(file, "a\nb\nc\n");
-    const held = holdFirstReplaceRead();
-    const tool = createReplaceLinesToolDefinition(cwd, held.read);
+    const held = holdFirstReplaceOpen();
+    const tool = createReplaceLinesToolDefinition(cwd, { betweenCheckAndOpen: held.hook });
     const first = run(tool, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
     await held.entered;
     const second = run(tool, { path: "f.ts", startLine: 3, endLine: 3, newText: "C" });
@@ -334,8 +328,8 @@ describe("createReplaceLinesToolDefinition", () => {
   it("serialises replace_lines with pi's edit on the same file", async () => {
     const file = join(cwd, "f.ts");
     writeFileSync(file, "a\nb\nc\n");
-    const held = holdFirstReplaceRead();
-    const replace = createReplaceLinesToolDefinition(cwd, held.read);
+    const held = holdFirstReplaceOpen();
+    const replace = createReplaceLinesToolDefinition(cwd, { betweenCheckAndOpen: held.hook });
     const edit = createTolerantEditToolDefinition(cwd);
     const first = run(replace, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
     await held.entered;
