@@ -16,6 +16,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -449,6 +450,29 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     expect(snapshot(fx.repo)).toEqual(before);
   });
 
+  it("apply mode with the authorized digest but a different result tree: tree_mismatch", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    // The tree another authorized edit to the same base produces.
+    const wrongTree = patchFrom(fx, (r) =>
+      writeFileSync(join(r, "b.txt"), "one\ntwo\nthree\nfour\n"),
+    ).tree;
+    writeArtifact(fx, "p.patch", patch);
+    const before = snapshot(fx.repo);
+    const w = wire(
+      binding(fx, { mode: "apply", patch_sha256: sha256(patch), expected_tree_oid: wrongTree }),
+    );
+    const out = await w.apply({
+      patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+      expected_base: fx.base,
+    });
+    w.manager.endRunSync();
+    expect(out.details.refused).toBe(true);
+    expect(out.details.reason).toBe("tree_mismatch");
+    expect(snapshot(fx.repo)).toEqual(before);
+    expect(existsSync(join(w.stateRoot, "candidates"))).toBe(false);
+  });
+
   it("a malformed patch: malformed_patch", async () => {
     const fx = makeFixture();
     writeArtifact(fx, "p.patch", Buffer.from("this is not a patch\n"));
@@ -585,6 +609,73 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.reason).toBe("storage_failed");
+  });
+
+  it("a state root inside the repository: storage_failed, the checkout unchanged and no candidate stored", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const before = snapshot(fx.repo);
+    // A temp directory under the caller's own tree: TMPDIR inside the workspace.
+    const stateRoot = join(fx.repo, "state");
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("storage_failed");
+    expect(snapshot(fx.repo)).toEqual(before);
+    // Nothing was created there, so no candidate record can exist.
+    expect(existsSync(stateRoot)).toBe(false);
+    expect(existsSync(candidateRecordPath(stateRoot, "candidate"))).toBe(false);
+  });
+
+  it("a state root that is a symlink: storage_failed", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const target = join(scratch, "real-state");
+    mkdirSync(target);
+    const stateRoot = join(scratch, "state-link");
+    symlinkSync(target, stateRoot);
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("storage_failed");
+    // The link's target was not written through either.
+    expect(readdirSync(target)).toEqual([]);
+    expect(existsSync(candidateRecordPath(target, "candidate"))).toBe(false);
+  });
+
+  it("a state root with mode 0755: storage_failed", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const stateRoot = join(scratch, "state-0755");
+    mkdirSync(stateRoot);
+    chmodSync(stateRoot, 0o755);
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("storage_failed");
+    expect(readdirSync(stateRoot)).toEqual([]);
+    expect(existsSync(candidateRecordPath(stateRoot, "candidate"))).toBe(false);
   });
 });
 

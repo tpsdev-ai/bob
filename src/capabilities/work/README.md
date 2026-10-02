@@ -110,7 +110,7 @@ nothing does (`patch_does_not_apply`).
 
 **Refusals.** A structured refusal carries a stable reason: `unknown_task`,
 `invalid_binding`, `invalid_base`, `base_mismatch`, `artifact_missing`,
-`unsafe_artifact_path`, `digest_mismatch`, `malformed_patch`,
+`unsafe_artifact_path`, `digest_mismatch`, `tree_mismatch`, `malformed_patch`,
 `patch_does_not_apply`, `unsafe_git_path`, `unsupported_entry_type`,
 `apply_failed`, `storage_failed`. A refusal returns no candidate and leaves the
 caller's checkout unchanged.

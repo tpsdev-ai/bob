@@ -386,7 +386,7 @@ function isInsideCanonical(root: string, child: string): boolean {
 
 // `child` is `parent` or below it, for paths that may not exist yet (both are
 // canonicalised first; see canonicalPath).
-function isInside(parent: string, child: string): boolean {
+export function isInside(parent: string, child: string): boolean {
   return isInsideCanonical(canonicalPath(parent), canonicalPath(child));
 }
 
@@ -587,7 +587,7 @@ function releasePin(
 
 // An owner-only directory: a real directory (not a symlink), owned by this user,
 // with no group or world bits. Created when `create` is set and it is missing.
-function ensurePrivateDir(path: string, create: boolean): void {
+export function ensurePrivateDir(path: string, create: boolean): void {
   if (create) {
     try {
       mkdirSync(path, { mode: 0o700 });

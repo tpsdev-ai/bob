@@ -32,6 +32,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
+import { ensurePrivateDir, isInside } from "./run.js";
 import type { TaskBinding } from "./task-binding.js";
 
 // The stable refusal reasons. Unknown evidence is never read as success: every
@@ -44,11 +45,12 @@ export type ApplyRefusalReason =
   | "artifact_missing" // the artifact does not exist or is not a regular file
   | "unsafe_artifact_path" // the artifact is outside its root
   | "digest_mismatch" // the artifact's digest is not the expected one
+  | "tree_mismatch" // the patch's result tree is not the tree the task pins
   | "malformed_patch" // git cannot parse the patch
   | "patch_does_not_apply" // git parses it but it does not apply to the base
   | "unsafe_git_path" // the patch names a path git refuses (.git, .., absolute)
   | "unsupported_entry_type" // the patch changes a symlink or a submodule
-  | "apply_failed" // a git or storage step failed unexpectedly
+  | "apply_failed" // a git step failed unexpectedly
   | "storage_failed"; // the candidate record could not be stored
 
 export interface ApplyPatchParams {
@@ -335,13 +337,44 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
 
   deps.afterDigestVerified?.(bytes, resolved.path);
 
+  // The state root must lie outside the caller's checkout and be owner-only:
+  // the two checks `run` makes before it writes under its own state root
+  // (run.ts ensureRunDir). A root inside the workspace or the repository would
+  // leave the candidate record and the scratch index as stray files in the
+  // caller's tree; a root that is a symlink, a file, another account's
+  // directory or group/world-readable lets that account choose what the index
+  // holds between read-tree and write-tree.
+  const inside = (
+    [
+      [binding.workspace, "the workspace"],
+      [binding.repository, "the repository"],
+    ] as Array<[string, string]>
+  ).filter(([root]) => isInside(root, stateRoot));
+  if (inside.length > 0) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the tool state directory ${stateRoot} is inside ${inside
+        .map(([root, what]) => `${what} ${root}`)
+        .join(
+          " and ",
+        )}, where the candidate record and the scratch index would become stray files in the caller's checkout. Run bob with a temp directory (TMPDIR) outside the workspace and the repository.`,
+    );
+  }
+  try {
+    ensurePrivateDir(stateRoot, true);
+  } catch {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the tool state directory ${stateRoot} is not a plain, owner-only directory of this user (a symlink, a file, another account's directory, or group/world-readable permissions). Remove it (or run chmod 700 on it); apply_patch stores candidate records there owner-only.`,
+    );
+  }
+
   // The tool's own scratch: one directory per call, holding only the fresh
   // index. The finally below removes it on EVERY path — success or any refusal
   // — so no scratch entry outlives the call, and concurrent calls cannot share
   // an index.
   let scratchDir: string;
   try {
-    mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
     scratchDir = mkdtempSync(join(stateRoot, "apply-"));
   } catch {
     return refuse(
@@ -397,6 +430,19 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
         `apply_patch refused: the written tree id ${JSON.stringify(treeOid)} is not a 40-character object ID.`,
       );
     }
+    // Apply mode pins the result as well as the artifact: an authorized patch
+    // whose verified bytes produce another tree is not the change the task
+    // authorized.
+    if (
+      binding.mode === "apply" &&
+      binding.expected_tree_oid !== undefined &&
+      treeOid !== binding.expected_tree_oid
+    ) {
+      return refuse(
+        "tree_mismatch",
+        `apply_patch refused: the patch's result tree ${treeOid} is not the tree the task pins ${binding.expected_tree_oid}. No candidate was stored; the caller's checkout is untouched.`,
+      );
+    }
 
     const diff = git(["diff-tree", "-r", "--no-renames", "--raw", binding.base_oid, treeOid], {
       cwd: binding.repository,
@@ -423,7 +469,7 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
     if (unsupported.length > 0) {
       return refuse(
         "unsupported_entry_type",
-        `apply_patch refused: the patch changes a symlink or submodule (${unsupported.map((e) => e.path).join(", ")}). Those entry types are not applied. Nothing was applied; the caller's checkout is untouched.`,
+        `apply_patch refused: the patch changes a symlink or submodule (${unsupported.map((e) => e.path).join(", ")}). Those entry types are not applied. No candidate was stored; the caller's checkout is untouched.`,
       );
     }
 

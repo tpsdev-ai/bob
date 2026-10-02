@@ -101,7 +101,7 @@ const APPLY_PATCH_DESCRIPTION =
   "Takes patch_artifact { path, sha256 } (a patch file under the task's artifact root) and expected_base (the task's pinned base commit object ID). " +
   "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply; the caller's worktree, index, HEAD and refs are never used and are left untouched. " +
   "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +
-  "It refuses, with a stable reason, when the session holds no valid task binding, the base or the digest does not match, the artifact is missing or outside its root, the patch is malformed or does not apply, it changes a symlink or a submodule, or it names an unsafe Git path. " +
+  "It refuses, with a stable reason, when the session holds no valid task binding, the base or the digest does not match, the result is not the tree apply mode pins, the artifact is missing or outside its root, the patch is malformed or does not apply, it changes a symlink or a submodule, or it names an unsafe Git path. " +
   `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
 
 function applyPatchSuccessText(r: ApplyPatchSuccess): string {
