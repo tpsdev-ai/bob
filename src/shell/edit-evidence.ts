@@ -2,10 +2,6 @@
 // whose execution ended without an error, without a refusal, and with the
 // tool's own success evidence in its result.
 //
-// It lives in its own module, exported, so the exploration budget's check for
-// the call that resets its count (bob#282) can use it rather than a second copy
-// of the rule.
-//
 // A write-class row is not enough on its own. `run`/`bash`/`powershell` are
 // writer rows (a command can change anything) but they are commands, not file
 // edits; `flair_write` and the other writer tools (a memory write, an egress)
@@ -34,11 +30,6 @@ export function isFileEditTool(toolName: string): boolean {
   );
 }
 
-/**
- * True when a tool result carries that tool's own success evidence. Shape-only:
- * the caller decides the error and refusal state around it, and a malformed
- * result is never evidence.
- */
 export function hasEditSuccessEvidence(toolName: string, result: unknown): boolean {
   if (result === null || typeof result !== "object") return false;
   const output = result as { details?: Record<string, unknown>; content?: unknown };
@@ -51,14 +42,13 @@ export function hasEditSuccessEvidence(toolName: string, result: unknown): boole
       return (
         typeof details?.fingerprint === "string" &&
         /^F#[0-9a-f]{16}$/.test(details.fingerprint) &&
-        typeof details?.lineDelta === "number" &&
         Number.isSafeInteger(details.lineDelta)
       );
     case "write_file":
       return (
         typeof details?.fingerprint === "string" &&
         /^F#[0-9a-f]{16}$/.test(details.fingerprint) &&
-        typeof details?.bytes === "number" &&
+        typeof details.bytes === "number" &&
         Number.isSafeInteger(details.bytes) &&
         details.bytes >= 0
       );
@@ -83,12 +73,6 @@ export function hasEditSuccessEvidence(toolName: string, result: unknown): boole
   }
 }
 
-/**
- * The verified-edit answer: a write-class file-edit tool that ended without an
- * error (the event's `isError` is not true) and whose result is success
- * evidence. Every other call — a read, a command, a refusal, a malformed
- * result — is not one.
- */
 export function isVerifiedFileEdit(toolName: string, isError: unknown, result: unknown): boolean {
-  return isError !== true && isFileEditTool(toolName) && hasEditSuccessEvidence(toolName, result);
+  return isError === false && isFileEditTool(toolName) && hasEditSuccessEvidence(toolName, result);
 }

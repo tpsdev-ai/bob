@@ -15,6 +15,7 @@ import {
   isFileEditTool,
   isVerifiedFileEdit,
 } from "../../src/shell/edit-evidence.js";
+import { EXPLORATION_INSTRUCTION } from "../../src/shell/exploration-budget.js";
 import { loadRole } from "../../src/shell/role-loader.js";
 import {
   type RunSession,
@@ -56,10 +57,11 @@ const READ_LINES_OK = {
 // scripted tool calls (a start and its end, so the result is observed), then
 // ends one assistant message with the run's final text.
 function makeSession(opts: {
-  calls?: Array<{ toolName: string; result?: unknown; isError?: boolean }>;
+  calls?: Array<{ toolName: string; result?: unknown; isError?: unknown }>;
   finalText?: string;
-}): { session: RunSession; aborts: () => number } {
+}): { session: RunSession; aborts: () => number; steers: string[] } {
   const listeners: Array<(event: unknown) => void> = [];
+  const steers: string[] = [];
   let aborts = 0;
   const emit = (event: unknown): void => {
     for (const listener of listeners) listener(event);
@@ -87,7 +89,7 @@ function makeSession(opts: {
           toolCallId: `t${i}`,
           toolName: call.toolName,
           result: call.result,
-          isError: call.isError ?? false,
+          isError: Object.hasOwn(call, "isError") ? call.isError : false,
         });
         i += 1;
       }
@@ -103,8 +105,8 @@ function makeSession(opts: {
       }
       return;
     },
-    async steer() {
-      // no-op
+    async steer(text) {
+      steers.push(text);
     },
     async abort() {
       aborts += 1;
@@ -113,7 +115,7 @@ function makeSession(opts: {
       // no-op
     },
   };
-  return { session, aborts: () => aborts };
+  return { session, aborts: () => aborts, steers };
 }
 
 function factoryReturning(session: RunSession): RunSessionFactory {
@@ -240,6 +242,46 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
   afterEach(() => {
     rmSync(agentsRoot, { recursive: true, force: true });
   });
+
+  it("the budget and completion gate agree on refused, failed, successful and command results", async () => {
+    for (const [name, toolName, isError, result, accepted] of [
+      [
+        "refused",
+        "edit_lines",
+        false,
+        { ...EDIT_LINES_OK, details: { ...EDIT_LINES_OK.details, refused: true } },
+        false,
+      ],
+      ["failed", "edit_lines", true, EDIT_LINES_OK, false],
+      ["successful", "edit_lines", false, EDIT_LINES_OK, true],
+      ["command", "run", false, EDIT_LINES_OK, false],
+      ["missing-error", "edit_lines", undefined, EDIT_LINES_OK, false],
+      ["null-error", "edit_lines", null, EDIT_LINES_OK, false],
+      ["string-error", "edit_lines", "false", EDIT_LINES_OK, false],
+      ["numeric-error", "edit_lines", 0, EDIT_LINES_OK, false],
+    ] as const) {
+      mkAgent(name, "builder-local", toolName);
+      const fake = makeSession({
+        calls: [
+          { toolName: "read_lines", result: READ_LINES_OK },
+          { toolName, isError, result },
+        ],
+        finalText: "Here is the final report.",
+      });
+      const res = await runAgent({
+        name,
+        prompt: "do the task",
+        agentsRoot,
+        explorationBudget: 2,
+        sessionFactory: factoryReturning(fake.session),
+      });
+      expect(fake.steers).toEqual(accepted ? [] : [EXPLORATION_INSTRUCTION]);
+      expect(res.exitCode).toBe(accepted ? 0 : 1);
+      expect(res.noEditNoBlocked).toBe(accepted ? undefined : true);
+      expect(res.explorationBudgetExhausted).toBeUndefined();
+      expect(lastOutcomeReason(name)).toBe(accepted ? undefined : "no_edit_no_blocked");
+    }
+  }, 15_000);
 
   it("exits non-zero with no_edit_no_blocked for a plan with no edit", async () => {
     mkAgent("planner", "builder-local", "read_lines");

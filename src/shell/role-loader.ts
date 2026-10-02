@@ -22,14 +22,6 @@ export interface RoleTemplate {
   };
   default_provider?: string;
   default_model?: string;
-  // bob#279: the role's exploration budget — consecutive read-only tool calls
-  // before the runtime injects its instruction, and again before a one-shot run
-  // ends with `exploration_budget_exhausted`. `builder-local` ships 20. A role
-  // that names none (every other shipped role) leaves the budget OFF, so a run
-  // that is meant to read and report is never told to edit. bob.yaml's
-  // `run.exploration_budget` overrides it for one agent. Validated at load: a
-  // value that is not a positive whole number is a load error, like any other
-  // role.json defect.
   exploration_budget?: number;
   // bob#283: whether a one-shot run must end with a verified file edit or a
   // final message that begins with BLOCKED. `builder-local` opts in; a role that
