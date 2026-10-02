@@ -41,6 +41,7 @@ describe("builder-local: run replaces bash (config-level)", () => {
       "run",
       "run_status",
       "run_cancel",
+      "apply_patch",
     ]);
   });
 

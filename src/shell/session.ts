@@ -51,6 +51,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { TASK_BINDING_ENV } from "../capabilities/work/task-binding.js";
 import { bobEditCustomTools } from "./bob-edit-tools.js";
 import { confinedReadCustomTools } from "./confined-read.js";
 import {
@@ -1207,6 +1208,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       process.env[key] = value;
     }
     process.env.BOB_PERSISTENT = config.persistent ? "1" : "";
+    // bob#275 (S2a): the launcher-supplied task binding the work capability
+    // reads at load. It is DATA from the launcher, never from bob.yaml; set on
+    // EVERY session (to "" when absent) so a replacement session cannot inherit
+    // a stale binding from an earlier session in this process.
+    process.env[TASK_BINDING_ENV] = config.taskBinding ? JSON.stringify(config.taskBinding) : "";
     // The operator's Flair password never enters an agent session: bob's CLI
     // takes it out of the environment at startup (takeFlairAdminPassFromEnv),
     // and every session — onboard's interview, align's check-in, run, launch,

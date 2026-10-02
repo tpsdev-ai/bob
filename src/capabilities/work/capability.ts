@@ -16,6 +16,13 @@
 
 import { type TSchema, Type } from "typebox";
 import {
+  type ApplyPatchDeps,
+  type ApplyPatchParams,
+  type ApplyPatchRefusal,
+  type ApplyPatchSuccess,
+  applyPatch,
+} from "./apply-patch.js";
+import {
   type BootReap,
   CAPTURE_MAX_BYTES,
   DEFAULT_TIMEOUT_S,
@@ -27,6 +34,7 @@ import {
   PI_PRIMITIVES,
   RunRefusal,
 } from "./run.js";
+import type { TaskBinding } from "./task-binding.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: unknown };
 
@@ -51,6 +59,13 @@ export interface WorkPiLike {
 
 export interface WireWorkOptions extends JobManagerOptions {
   pi: WorkPiLike;
+  // The launcher-supplied task binding (bob#275, S2a) this session retained, or
+  // the parse error when one was present but malformed. Retained here, never
+  // read from a tool argument, a model message or a file.
+  taskBinding?: TaskBinding;
+  taskBindingError?: string;
+  // Seams for apply_patch (a fake git runner, the artifact-swap hook).
+  applyPatchDeps?: ApplyPatchDeps;
 }
 
 // The two Limits sentences of bob#211, verbatim, plus what else the reader needs.
@@ -81,6 +96,30 @@ const CANCEL_DESCRIPTION =
   "Reports the job's REAL terminal outcome: a job that had already finished is reported as it finished, never as cancelled, and a second cancel is idempotent. " +
   "It cancels only this tool's own jobs; it never matches processes by name or command line, and it is not a way to stop any other process. " +
   "Limits: process-group backend, same user, not a sandbox; a descendant that left the job's group may survive.";
+
+const APPLY_PATCH_DESCRIPTION =
+  "Apply a patch artifact under the task's artifact root to a fresh, tool-owned index built from the task's pinned base, and attempt candidate storage. " +
+  "Takes patch_artifact { path, sha256 } (a patch file under the task's artifact root) and expected_base (the task's pinned base commit object ID). " +
+  "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply. " +
+  "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +
+  "It refuses, with a stable reason, when the session holds no valid task binding, the base or the digest does not match, the result is not the tree apply mode pins, the artifact is missing or outside its root, the patch is malformed or does not apply, it changes a symlink or a submodule, or it names an unsafe Git path. " +
+  `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
+
+function applyPatchSuccessText(r: ApplyPatchSuccess): string {
+  return [
+    `apply_patch: candidate ${r.candidate_id}`,
+    "Refuses detected changes to the staging directory, source or destination; a concurrent same-user writer can still race rename until builder confinement (bob#189).",
+    `base_oid: ${r.base_oid}`,
+    `patch_sha256: ${r.patch_sha256}`,
+    `tree_oid: ${r.tree_oid}`,
+    `changed_paths: ${r.changed_paths.length === 0 ? "(none)" : r.changed_paths.join(", ")}`,
+    "A candidate id is not permission to publish it.",
+  ].join("\n");
+}
+
+function applyPatchRefusalText(r: ApplyPatchRefusal): string {
+  return `${r.message} (reason: ${r.reason})`;
+}
 
 function statusLine(r: JobReport): string {
   switch (r.outcome) {
@@ -301,6 +340,53 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
     },
   });
 
+  pi.registerTool({
+    name: "apply_patch",
+    label: "Apply Patch",
+    description: APPLY_PATCH_DESCRIPTION,
+    parameters: Type.Object({
+      patch_artifact: Type.Object({
+        path: Type.String({
+          minLength: 1,
+          description:
+            "Path to the patch file, relative to the task's artifact root (or absolute inside it).",
+        }),
+        sha256: Type.String({
+          pattern: "^[0-9a-fA-F]{64}$",
+          description: "The artifact's expected sha256 digest.",
+        }),
+      }),
+      expected_base: Type.String({
+        pattern: "^[0-9a-f]{40}$",
+        description: "The full Git commit object ID that must equal the task's pinned base.",
+      }),
+    }),
+    async execute(_id, params) {
+      const outcome = applyPatch({
+        binding: opts.taskBinding,
+        ...(opts.taskBindingError !== undefined ? { bindingError: opts.taskBindingError } : {}),
+        params: params as unknown as ApplyPatchParams,
+        stateRoot: manager.stateRoot,
+        ...(opts.applyPatchDeps !== undefined ? { deps: opts.applyPatchDeps } : {}),
+      });
+      if (outcome.ok) {
+        return {
+          content: [{ type: "text", text: applyPatchSuccessText(outcome) }],
+          details: { refused: false, ...outcome },
+        };
+      }
+      return {
+        content: [{ type: "text", text: applyPatchRefusalText(outcome) }],
+        details: {
+          refused: true,
+          reason: outcome.reason,
+          message: outcome.message,
+          ...(outcome.detail ?? {}),
+        },
+      };
+    },
+  });
+
   pi.on?.("session_shutdown", async () => {
     await manager.endRun();
   });
@@ -309,6 +395,6 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
     log(`work: boot sweep failed: ${(err as Error).message}`);
     return [] as BootReap[];
   });
-  log("work capability: registered run / run_status / run_cancel");
+  log("work capability: registered run / run_status / run_cancel / apply_patch");
   return { manager, bootSweep };
 }
