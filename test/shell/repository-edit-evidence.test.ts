@@ -134,6 +134,47 @@ describe("repository evidence in the completion gate and exploration budget", ()
     },
   );
 
+  it("rejects an empty commit", async () => {
+    const result = await run([
+      {
+        toolName: "bash",
+        action: () => {
+          commit(cwd, launchHead);
+        },
+      },
+    ]);
+    expect(git(cwd, "rev-list", "--count", "HEAD", `^${launchHead}`)).toBe("1");
+    expect(git(cwd, "diff", launchHead, "HEAD")).toBe("");
+    expect(git(cwd, "diff", "HEAD")).toBe("");
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it("rejects a commit followed by its revert", async () => {
+    const result = await run([
+      {
+        toolName: "bash",
+        action: () => {
+          writeFileSync(join(cwd, "tracked"), "temporary edit\n");
+          commit(cwd, launchHead);
+        },
+      },
+      {
+        toolName: "bash",
+        action: () => {
+          const editedHead = git(cwd, "rev-parse", "HEAD");
+          git(cwd, "revert", "--no-commit", editedHead);
+          commit(cwd, editedHead);
+        },
+      },
+    ]);
+    expect(git(cwd, "rev-list", "--count", "HEAD", `^${launchHead}`)).toBe("2");
+    expect(git(cwd, "diff", launchHead, "HEAD")).toBe("");
+    expect(git(cwd, "diff", "HEAD")).toBe("");
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
   it.each([false, true])(
     "accepts changed tracked content in a dirty tree (staged: %s)",
     async (staged) => {

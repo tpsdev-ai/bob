@@ -348,8 +348,8 @@ change one, the named test is what tells you.
 
 - **builder-local requires an edit or a BLOCKED report.** After the completion
   judge accepts, `bob run` and `bob launch <name> <prompt>` require verified
-  file-edit tool success without error or refusal, a commit reachable from
-  final HEAD but not launch HEAD, a tracked diff hash different from launch,
+  file-edit tool success without error or refusal, a changed HEAD tree with a commit
+  reachable from final HEAD but not launch HEAD, a tracked diff hash different from launch,
   or a final message beginning with the standalone token `BLOCKED`.
   Bob reads Git state in the run's working-directory repository; submodule
   gitlinks count, but untracked files and submodule dirt do not.

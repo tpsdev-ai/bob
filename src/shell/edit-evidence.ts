@@ -149,10 +149,13 @@ export function isVerifiedEdit(
   if (repository?.before.kind !== "git" || repository.after.kind !== "git") return false;
   const { cwd, before, after } = repository;
   try {
-    const newCommit =
+    const committedChange =
       before.head !== after.head &&
-      readGit(cwd, ["rev-list", "--max-count=1", after.head, `^${before.head}`, "--"]).length > 0;
-    return newCommit || before.diffHash !== after.diffHash;
+      readGit(cwd, ["rev-list", "--max-count=1", after.head, `^${before.head}`, "--"]).length > 0 &&
+      !readGit(cwd, ["rev-parse", "--verify", `${before.head}^{tree}`]).equals(
+        readGit(cwd, ["rev-parse", "--verify", `${after.head}^{tree}`]),
+      );
+    return committedChange || before.diffHash !== after.diffHash;
   } catch {
     return false;
   }
