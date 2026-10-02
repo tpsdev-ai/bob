@@ -9,8 +9,9 @@
 // the compiled core against them, and prints ONE JSON line of what each case
 // observed. Every assertion lives in the bun test that drives this file.
 //
-// Invoked as: node fetch-harness.mjs <tls-dir>
-// <tls-dir> holds cert.pem + key.pem for the HTTPS peer.
+// Invoked as: node fetch-harness.mjs <tls-dir> [redirect-private-skip-reason]
+// <tls-dir> holds cert.pem + key.pem for the HTTPS peer. The optional reason is
+// present only when the parent setup could not bind 127.0.0.2.
 
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -36,6 +37,7 @@ if (!tlsDir) {
 }
 const certificate = readFileSync(`${tlsDir}/cert.pem`, "utf8");
 const privateKey = readFileSync(`${tlsDir}/key.pem`, "utf8");
+const redirectPrivateSkipReason = process.argv[3];
 
 const LOOPBACK = "127.0.0.1";
 const allowHttp = () => resolveWebSettings({ allow_http: true });
@@ -184,7 +186,16 @@ const headerSubset = (headers) => ({
 // ── cases ──────────────────────────────────────────────────────────────────
 
 const cases = {};
+const skippedCases = new Map();
+if (redirectPrivateSkipReason !== undefined) {
+  skippedCases.set("redirect-private", redirectPrivateSkipReason);
+}
 const record = async (name, fn) => {
+  const skipReason = skippedCases.get(name);
+  if (skipReason !== undefined) {
+    cases[name] = { ok: false, skipped: skipReason };
+    return;
+  }
   try {
     cases[name] = { ok: true, ...(await fn()) };
   } catch (error) {

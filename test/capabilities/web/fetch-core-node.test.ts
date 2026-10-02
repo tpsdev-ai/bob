@@ -15,6 +15,7 @@
 import { expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,26 @@ const DIST_CORE = fileURLToPath(
   new URL("../../../dist/capabilities/web/index.js", import.meta.url),
 );
 const HARNESS_TIMEOUT_MS = 120_000;
+const PRIVATE_LOOPBACK_ALIAS = "127.0.0.2";
+const PRIVATE_LOOPBACK_SKIP_REASON = `missing loopback alias ${PRIVATE_LOOPBACK_ALIAS}`;
+
+// macOS does not provide every address in 127/8 as a bindable alias by
+// default. Probe the alias before registering the platform-gated assertion so
+// the skipped test names the exact missing prerequisite. The Node harness gets
+// the same result and omits only that case; every other case still has to run.
+const hasPrivateLoopbackAlias = await new Promise<boolean>((resolve) => {
+  const probe = createServer();
+  const finish = (available: boolean) => {
+    probe.removeAllListeners();
+    if (probe.listening) {
+      probe.close(() => resolve(available));
+      return;
+    }
+    resolve(available);
+  };
+  probe.once("error", () => finish(false));
+  probe.listen(0, PRIVATE_LOOPBACK_ALIAS, () => finish(true));
+});
 
 // A self-signed cert with an IP SAN, generated with openssl (the CI image ships
 // it). The harness gives it to both the HTTPS peer and the fetch core's TLS CA.
@@ -68,9 +89,12 @@ function makeCert(tlsDir: string): void {
 
 function runHarness(
   tlsDir: string,
+  redirectPrivateSkipReason: string | undefined,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("node", [HARNESS, tlsDir], { stdio: ["ignore", "pipe", "pipe"] });
+    const args = [HARNESS, tlsDir];
+    if (redirectPrivateSkipReason !== undefined) args.push(redirectPrivateSkipReason);
+    const child = spawn("node", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
@@ -99,6 +123,7 @@ interface Refusal {
 interface CaseReport {
   ok: boolean;
   error?: string;
+  skipped?: string;
   [key: string]: unknown;
 }
 
@@ -107,8 +132,8 @@ interface HarnessReport {
   cases: Record<string, CaseReport>;
 }
 
-// The cases the harness must run, in the order it runs them. A case that
-// disappears fails this test rather than passing quietly.
+// The cases the harness must report, in order. A case that disappears fails
+// this test rather than passing quietly.
 const CASE_NAMES = [
   "https-page",
   "vetted-address",
@@ -148,18 +173,25 @@ test(
         throw new Error(`the harness runs the built core; ${DIST_CORE} is missing — run the build`);
       }
       makeCert(tlsDir);
-      const { code, stdout, stderr } = await runHarness(tlsDir);
+      const redirectPrivateSkipReason = hasPrivateLoopbackAlias
+        ? undefined
+        : PRIVATE_LOOPBACK_SKIP_REASON;
+      const { code, stdout, stderr } = await runHarness(tlsDir, redirectPrivateSkipReason);
       if (code !== 0) {
         throw new Error(`harness exited ${code}\nstdout: ${stdout}\nstderr: ${stderr}`);
       }
       const lines = stdout.trim().split("\n");
       report = JSON.parse(lines[lines.length - 1]) as HarnessReport;
 
-      // The harness ran exactly the cases this test asserts.
+      // The harness reported exactly the cases this test asserts.
       expect(report.caseNames).toEqual(CASE_NAMES);
       for (const name of CASE_NAMES) {
         const observed = report.cases[name];
         expect(observed).toBeDefined();
+        if (name === "redirect-private" && !hasPrivateLoopbackAlias) {
+          expect(observed).toEqual({ ok: false, skipped: PRIVATE_LOOPBACK_SKIP_REASON });
+          continue;
+        }
         if (observed?.ok !== true) {
           throw new Error(`case ${name} did not run: ${String(observed?.error)}`);
         }
@@ -278,14 +310,19 @@ test("opens a fresh vetted connection for each completed same-origin redirect ho
   expect(observed.deniedRequests).toBe(1);
 });
 
-test("refuses a redirect to a private address, and the private peer sees nothing", () => {
-  expect(refusal("redirect-private").code).toBe("address");
-  expect(String(refusal("redirect-private").detail)).toContain(
-    'iana-ipv4-special-registry 127.0.0.0/8 "Loopback"',
-  );
-  expect(seen("redirect-private").internalConnections).toBe(0);
-  expect(seen("redirect-private").frontRequests).toBe(1);
-});
+test.skipIf(!hasPrivateLoopbackAlias)(
+  `refuses a redirect to a private address, and the private peer sees nothing${
+    hasPrivateLoopbackAlias ? "" : ` — skipped: ${PRIVATE_LOOPBACK_SKIP_REASON}`
+  }`,
+  () => {
+    expect(refusal("redirect-private").code).toBe("address");
+    expect(String(refusal("redirect-private").detail)).toContain(
+      'iana-ipv4-special-registry 127.0.0.0/8 "Loopback"',
+    );
+    expect(seen("redirect-private").internalConnections).toBe(0);
+    expect(seen("redirect-private").frontRequests).toBe(1);
+  },
+);
 
 test("refuses a redirect to another scheme", () => {
   const results = seen("redirect-scheme").results as Array<{
