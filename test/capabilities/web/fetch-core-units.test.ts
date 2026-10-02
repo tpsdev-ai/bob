@@ -307,16 +307,22 @@ describe("the fixed User-Agent and the character limit", () => {
 
 describe("the capability surface", () => {
   it("registers no tool", async () => {
+    const previous = process.env.BOB_CAP_WEB;
     process.env.BOB_CAP_WEB = "{}";
-    const extension = (await import("../../../src/capabilities/web/index.js")).default as (
-      pi: ExtensionAPI,
-    ) => void;
-    const registered: string[] = [];
-    extension({
-      registerTool: (tool: { name: string }) => {
-        registered.push(tool.name);
-      },
-    } as unknown as ExtensionAPI);
-    expect(registered).toEqual([]);
+    try {
+      const extension = (await import("../../../src/capabilities/web/index.js")).default as (
+        pi: ExtensionAPI,
+      ) => void;
+      const registered: string[] = [];
+      extension({
+        registerTool: (tool: { name: string }) => {
+          registered.push(tool.name);
+        },
+      } as unknown as ExtensionAPI);
+      expect(registered).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BOB_CAP_WEB;
+      else process.env.BOB_CAP_WEB = previous;
+    }
   });
 });
