@@ -53,7 +53,7 @@ function init(cwd: string): string {
   return commit(cwd);
 }
 
-type Call = { toolName: string; action?: () => void };
+type Call = { toolName: string; action?: () => void; result?: unknown };
 
 function session(calls: Call[], finalAction?: () => void): RunSession {
   const listeners = new Set<(event: never) => void>();
@@ -73,7 +73,9 @@ function session(calls: Call[], finalAction?: () => void): RunSession {
           type: "tool_execution_end",
           toolName: call.toolName,
           isError: false,
-          result: { content: [{ type: "text", text: "DONE: edited and committed everything." }] },
+          result: call.result ?? {
+            content: [{ type: "text", text: "DONE: edited and committed everything." }],
+          },
         });
       }
       finalAction?.();
@@ -153,7 +155,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
   });
 
   it.each(["run", "bash"])(
-    "credits a committed %s edit when launch enumeration exceeds a lowered limit",
+    "denies a committed %s edit when launch enumeration exceeds a lowered limit",
     async (toolName) => {
       writeFileSync(join(cwd, "tracked"), "second commit\n");
       launchHead = commit(cwd, launchHead);
@@ -178,8 +180,8 @@ describe("repository evidence in the completion gate and exploration budget", ()
           undefined,
           2,
         );
-        expect(result.exitCode).toBe(0);
-        expect(result.explorationBudgetExhausted).toBeUndefined();
+        expect(result.exitCode).toBe(1);
+        expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
         const summary = readLastRunSummary(join(agentsRoot, "builder", "runs"));
         expect(summary?.repositoryHistoryCheckSkipped).toBe("limit");
         const diagnosis = await runDoctor({
@@ -514,6 +516,58 @@ describe("repository evidence in the completion gate and exploration budget", ()
     },
   );
 
+  it.each(
+    ["failure", "overflow", "timeout"].flatMap((kind) =>
+      ["completion", "exploration"].map((gate) => [kind, gate]),
+    ),
+  )(
+    "rejects a pre-existing branch when launch history is incomplete: %s at %s",
+    async (kind, gate) => {
+      writeFileSync(join(cwd, "tracked"), "existing branch\n");
+      const existing = commit(cwd, launchHead);
+      git(cwd, "branch", "existing", existing);
+      const spawn = childProcess.spawnSync;
+      const tree = git(cwd, "rev-parse", "HEAD^{tree}");
+      const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+        if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
+          expect(args[1]).toContain("--max-count=10001");
+          const result = spawn(...args);
+          return {
+            ...result,
+            status: kind === "failure" || kind === "timeout" ? 1 : 0,
+            error:
+              kind === "timeout"
+                ? Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })
+                : undefined,
+            stdout: Buffer.from(`${tree}\n`.repeat(10_001)),
+          };
+        }
+        return spawn(...args);
+      });
+      try {
+        git(cwd, "reset", "--hard", launchHead);
+        const result = await run(
+          [
+            { toolName: "run", action: () => git(cwd, "switch", "existing") },
+            { toolName: "read" },
+            { toolName: "read" },
+            { toolName: "read" },
+          ],
+          undefined,
+          gate === "exploration" ? 2 : 20,
+        );
+        if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+        else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+        expect(result.exitCode).toBe(1);
+        expect(
+          probe.mock.calls.filter(([, args]) => (args as string[]).includes("--all")),
+        ).toHaveLength(1);
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
   it.each(["completion", "exploration"])(
     "accepts new bytes with and without a commit at %s",
     async (gate) => {
@@ -589,7 +643,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
   );
 
   it.each(["failure", "overflow", "timeout"])(
-    "preserves content evidence on launch history %s",
+    "uses only file-tool evidence on incomplete launch history: %s",
     async (kind) => {
       const spawn = childProcess.spawnSync;
       const tree = git(cwd, "rev-parse", "HEAD^{tree}");
@@ -623,8 +677,27 @@ describe("repository evidence in the completion gate and exploration budget", ()
             undefined,
             gate === "exploration" ? 2 : 20,
           );
-          expect(result.exitCode).toBe(0);
-          expect(result.explorationBudgetExhausted).toBeUndefined();
+          expect(result.exitCode).toBe(1);
+          if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+          else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+          const fileEdit = await run(
+            [
+              { toolName: "read" },
+              {
+                toolName: "write",
+                action: () => writeFileSync(join(cwd, "tracked"), `file edit ${gate}\n`),
+                result: {
+                  content: [{ type: "text", text: "Successfully wrote 20 bytes to tracked" }],
+                },
+              },
+              { toolName: "read" },
+              { toolName: "read" },
+            ],
+            undefined,
+            gate === "exploration" ? 2 : 20,
+          );
+          expect(fileEdit.exitCode).toBe(0);
+          expect(fileEdit.explorationBudgetExhausted).toBeUndefined();
           expect(
             readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
           ).toBe(kind === "failure" ? "unavailable" : kind === "overflow" ? "limit" : "timeout");

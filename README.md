@@ -351,8 +351,9 @@ change one, the named test is what tells you.
   The exploration budget uses the same edit predicate. Tracked files reuse hashes
   when `(dev, ino, size, mtimeNs, ctimeNs, mode)` is unchanged; files above 1 MiB are streamed.
   The history-equal check excludes trees reachable from refs at launch. If enumeration
-  exceeds 10,000 commits, times out or fails, only that check is skipped, recorded in
-  the run log and doctor. Unreachable trees are not checked;
+  exceeds 10,000 commits, times out or fails, only file-edit tools can give edit credit.
+  A completed run records the skipped check in its final record if logging succeeds;
+  doctor shows it when that record is the latest readable run. Unreachable trees are not checked;
   adversarial containment requires [bob#189](https://github.com/tpsdev-ai/bob/issues/189).
   *(`test/shell/edit-or-blocked.test.ts`, `repository-edit-evidence.test.ts`)*
 

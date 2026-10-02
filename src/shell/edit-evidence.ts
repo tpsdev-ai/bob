@@ -497,6 +497,7 @@ export function isVerifiedEdit(
   }
   if (repository?.before.kind !== "git" || repository.after.kind !== "git") return false;
   const { cwd, before, after } = repository;
+  if (before.historyCheckSkipped || after.historyCheckSkipped) return false;
   try {
     if (!sameRepository(before, after) || !sameRepository(before, resolveRepository(cwd)))
       return false;
