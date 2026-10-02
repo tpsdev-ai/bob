@@ -2,8 +2,10 @@
 // that emits tool_execution_start events: a run that keeps reading gets ONE
 // instruction after the budget and ends with `exploration_budget_exhausted`
 // after twice the budget; a run that edits within budget is unaffected; a
-// write-class call resets the count; the outcome is in the run log and doctor's
-// last-run line; and the budget is read from the role/agent config.
+// write-class call that ENDS WITHOUT AN ERROR resets the count, while a failed
+// or refused call, a command runner and an unknown name reset nothing (bob#281);
+// the outcome is in the run log and doctor's last-run line; and the budget is
+// read from the role/agent config.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
@@ -35,13 +37,18 @@ import {
   runAgent,
 } from "../../src/shell/run.js";
 
+// A scripted tool call: a name (a call that has STARTED and not ended), or an
+// object that also ENDS the call — `{ tool, error }` ends it with
+// isError = error === true (a failed or refused execution).
+type ScriptedCall = string | { tool: string; error?: boolean };
+
 // A fabricated AgentSession matching the RunSession seam. prompt() emits one
 // tool_execution_start per call, then either ends an assistant message (a clean
 // run) or hangs (so the run is ended by its own stop). `script` replaces that
 // for the nth prompt() call, for the turn scripts the budget needs (a turn that
 // compacts and goes silent, then a continue turn that overruns).
 function makeSession(opts: {
-  calls?: string[];
+  calls?: ScriptedCall[];
   resolve?: boolean;
   script?: Array<(emit: (event: unknown) => void) => void>;
 }): {
@@ -73,16 +80,27 @@ function makeSession(opts: {
         return;
       }
       let i = 0;
-      for (const toolName of opts.calls ?? []) {
+      for (const call of opts.calls ?? []) {
         if (done) break; // once the run is ended, stop feeding it
+        const toolName = typeof call === "string" ? call : call.tool;
+        const toolCallId = `t${i}`;
         // Varying args keep the loop breaker (identical calls) out of the way;
         // this test is about the exploration budget (varied read-only calls).
         emit({
           type: "tool_execution_start",
-          toolCallId: `t${i}`,
+          toolCallId,
           toolName,
           args: { path: `f${i}.ts` },
         });
+        if (typeof call !== "string") {
+          emit({
+            type: "tool_execution_end",
+            toolCallId,
+            toolName,
+            result: { content: [] },
+            isError: call.error === true,
+          });
+        }
         i += 1;
       }
       if (opts.resolve === true) {
@@ -138,29 +156,49 @@ function agentYaml(name: string, role: string, runBlock?: string): string {
 describe("ExplorationBudgetDetector", () => {
   it("counts consecutive read-only calls, injects at the limit and exhausts at twice it", () => {
     const d = new ExplorationBudgetDetector(3);
-    expect(d.observe("read")).toEqual({ readOnlyCalls: 1, inject: false, exhaust: false });
-    expect(d.observe("grep")).toEqual({ readOnlyCalls: 2, inject: false, exhaust: false });
-    expect(d.observe("read_lines")).toEqual({ readOnlyCalls: 3, inject: true, exhaust: false });
-    expect(d.observe("find")).toEqual({ readOnlyCalls: 4, inject: false, exhaust: false });
-    expect(d.observe("ls")).toEqual({ readOnlyCalls: 5, inject: false, exhaust: false });
-    expect(d.observe("flair_search")).toEqual({ readOnlyCalls: 6, inject: false, exhaust: true });
+    expect(d.observeStart("read")).toEqual({ readOnlyCalls: 1, inject: false, exhaust: false });
+    expect(d.observeStart("grep")).toEqual({ readOnlyCalls: 2, inject: false, exhaust: false });
+    expect(d.observeStart("read_lines")).toEqual({
+      readOnlyCalls: 3,
+      inject: true,
+      exhaust: false,
+    });
+    expect(d.observeStart("find")).toEqual({ readOnlyCalls: 4, inject: false, exhaust: false });
+    expect(d.observeStart("ls")).toEqual({ readOnlyCalls: 5, inject: false, exhaust: false });
+    expect(d.observeStart("flair_search")).toEqual({
+      readOnlyCalls: 6,
+      inject: false,
+      exhaust: true,
+    });
   });
 
-  it("treats every non-read-only call — a writer, an effect, an egress tool, `run`, or an unknown name — as write-class and resets the count", () => {
+  it("resets only on a write-class call that ended without an error — never on a start, a command runner or an unknown name", () => {
     const d = new ExplorationBudgetDetector(2);
-    d.observe("read");
-    expect(d.observe("edit_lines")).toEqual({ readOnlyCalls: 0, inject: false, exhaust: false });
-    d.observe("read");
-    expect(d.observe("run").readOnlyCalls).toBe(0);
-    d.observe("read");
-    expect(d.observe("flair_write").readOnlyCalls).toBe(0);
-    d.observe("read");
-    expect(d.observe("web_fetch").readOnlyCalls).toBe(0);
-    d.observe("read");
-    expect(d.observe("not_a_real_tool").readOnlyCalls).toBe(0);
+    d.observeStart("read");
+    // A start alone is not progress: the call is still running.
+    expect(d.observeStart("edit_lines").readOnlyCalls).toBe(1);
+    // Its end without an error is.
+    d.observeEndWithoutError("edit_lines");
+    expect(d.readOnlyCalls).toBe(0);
+    // A command runner's clean exit is not (a command may have only read).
+    d.observeStart("read");
+    expect(d.observeStart("run").readOnlyCalls).toBe(1);
+    d.observeEndWithoutError("run");
+    d.observeEndWithoutError("bash");
+    expect(d.readOnlyCalls).toBe(1);
+    // Neither is a name with no row in TOOL_EFFECTS.
+    expect(d.observeStart("not_a_real_tool").readOnlyCalls).toBe(1);
+    d.observeEndWithoutError("not_a_real_tool");
+    expect(d.readOnlyCalls).toBe(1);
+    // A read-only call was counted at its start, so its own end changes nothing.
+    d.observeEndWithoutError("read");
+    expect(d.readOnlyCalls).toBe(1);
+    // An effect is a change or a report: its successful end resets.
+    d.observeEndWithoutError("flair_write");
+    expect(d.readOnlyCalls).toBe(0);
     // A fresh run of read-only calls still injects at the limit.
-    d.observe("read");
-    expect(d.observe("read").inject).toBe(true);
+    d.observeStart("read");
+    expect(d.observeStart("read").inject).toBe(true);
   });
 
   it("refuses a limit that is not a positive whole number", () => {
@@ -254,7 +292,11 @@ describe("runAgent exploration budget", () => {
 
   it("does not fire when the run edits within budget", async () => {
     mkAgent("editor", "builder-local", "  exploration_budget: 5");
-    const fake = makeSession({ calls: ["read_lines", "read_lines", "edit_lines"], resolve: true });
+    // The edit's execution ENDS without an error, so it resets the count.
+    const fake = makeSession({
+      calls: ["read_lines", "read_lines", { tool: "edit_lines" }],
+      resolve: true,
+    });
     const res = await runAgent({
       name: "editor",
       prompt: "do the task",
@@ -266,11 +308,12 @@ describe("runAgent exploration budget", () => {
     expect(res.explorationBudgetExhausted).toBeUndefined();
   }, 15_000);
 
-  it("resets the count on a write-class call", async () => {
+  it("a successful edit resets the count: reads around it never reach the budget (bob#281)", async () => {
     mkAgent("mixed", "builder-local", "  exploration_budget: 3");
-    // 2 reads, a write, 2 reads: the longest read-only run is 2, under the limit.
+    // 2 reads, a successful edit, 2 reads: the edit resets, so the read-only run
+    // never reaches 3. (Without the reset, the 3rd read would inject.)
     const fake = makeSession({
-      calls: ["read_lines", "read_lines", "edit_lines", "read_lines", "read_lines"],
+      calls: ["read_lines", "read_lines", { tool: "edit_lines" }, "read_lines", "read_lines"],
       resolve: true,
     });
     const res = await runAgent({
@@ -281,6 +324,104 @@ describe("runAgent exploration budget", () => {
     });
     expect(fake.steers).toEqual([]);
     expect(res.exitCode).toBe(0);
+    expect(res.explorationBudgetExhausted).toBeUndefined();
+  }, 15_000);
+
+  it("reads alternating with FAILED edits still exhaust the budget (bob#281)", async () => {
+    mkAgent("stale", "builder-local", "  exploration_budget: 3");
+    // Each edit's execution ends WITH an error (a refused edit, e.g. a stale
+    // anchor): a failed call is no progress, so the read-only run still reaches
+    // twice the budget and the run ends.
+    const fake = makeSession({
+      calls: [
+        "read_lines",
+        { tool: "edit_lines", error: true },
+        "read_lines",
+        { tool: "edit_lines", error: true },
+        "read_lines",
+        { tool: "edit_lines", error: true },
+        "read_lines",
+        { tool: "edit_lines", error: true },
+        "read_lines",
+        { tool: "edit_lines", error: true },
+        "read_lines",
+        { tool: "edit_lines", error: true },
+      ],
+      resolve: false,
+    });
+    const res = await runAgent({
+      name: "stale",
+      prompt: "do the task",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(fake.steers).toEqual([EXPLORATION_INSTRUCTION]);
+    expect(res.exitCode).toBe(1);
+    expect(res.explorationBudgetExhausted).toEqual({ limit: 3, readOnlyCalls: 6 });
+  }, 15_000);
+
+  it("reads alternating with `run` calls that change nothing still exhaust the budget (bob#281)", async () => {
+    mkAgent("shelling", "builder-local", "  exploration_budget: 3");
+    // Each `run` completes cleanly (no error) but changes nothing — a command
+    // may have only read — so a command runner is not progress and the read-only
+    // run still reaches twice the budget.
+    const fake = makeSession({
+      calls: [
+        "read_lines",
+        { tool: "run" },
+        "read_lines",
+        { tool: "run" },
+        "read_lines",
+        { tool: "run" },
+        "read_lines",
+        { tool: "run" },
+        "read_lines",
+        { tool: "run" },
+        "read_lines",
+        { tool: "run" },
+      ],
+      resolve: false,
+    });
+    const res = await runAgent({
+      name: "shelling",
+      prompt: "do the task",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(fake.steers).toEqual([EXPLORATION_INSTRUCTION]);
+    expect(res.exitCode).toBe(1);
+    expect(res.explorationBudgetExhausted).toEqual({ limit: 3, readOnlyCalls: 6 });
+  }, 15_000);
+
+  it("reads alternating with an UNKNOWN tool name still exhaust the budget (bob#281)", async () => {
+    mkAgent("unknown", "builder-local", "  exploration_budget: 3");
+    // A name with no TOOL_EFFECTS row is not a change: it resets nothing.
+    const fake = makeSession({
+      calls: [
+        "read_lines",
+        { tool: "not_a_real_tool" },
+        "read_lines",
+        { tool: "not_a_real_tool" },
+        "read_lines",
+        { tool: "not_a_real_tool" },
+        "read_lines",
+        { tool: "not_a_real_tool" },
+        "read_lines",
+        { tool: "not_a_real_tool" },
+        "read_lines",
+        { tool: "not_a_real_tool" },
+      ],
+      resolve: false,
+    });
+    const res = await runAgent({
+      name: "unknown",
+      prompt: "do the task",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(fake.steers).toEqual([EXPLORATION_INSTRUCTION]);
+    expect(res.exitCode).toBe(1);
+    expect(res.explorationBudgetExhausted).toEqual({ limit: 3, readOnlyCalls: 6 });
   }, 15_000);
 
   it("ends the run when the post-compaction continue turn exhausts the budget (#279)", async () => {
@@ -426,4 +567,84 @@ describe("readLastRunSummary", () => {
     expect(lastRunOutcomeReason({ reason: "" })).toBe("no outcome recorded");
     expect(lastRunOutcomeReason({ reason: "wall_clock" })).toBe("wall_clock");
   });
+
+  it("parses the FIRST line of a log shorter than one chunk (bob#281)", () => {
+    const runs = join(dir, "runs");
+    mkdirSync(runs, { recursive: true });
+    // A log small enough to be read in one chunk: the file STARTS on its first
+    // line, so there is no earlier chunk for it to continue into and it must be
+    // parsed like any other complete line.
+    writeFileSync(
+      join(runs, "short.jsonl"),
+      [
+        JSON.stringify({ t: "1", outcome: { reason: "wall_clock" } }),
+        JSON.stringify({ done: true, exitCode: 1 }),
+      ].join("\n"),
+    );
+    const summary = readLastRunSummary(runs);
+    expect(summary?.file).toBe("short.jsonl");
+    expect(lastRunOutcomeReason(summary?.outcome)).toBe("wall_clock");
+    expect(summary?.exitCode).toBe(1);
+  });
+
+  it("parses a line whose multibyte character is split across a 64 KiB chunk boundary (bob#281)", () => {
+    const runs = join(dir, "runs");
+    mkdirSync(runs, { recursive: true });
+    const CHUNK = 64 * 1024;
+    const target = JSON.stringify({
+      t: "2",
+      outcome: { reason: "wall_clock", note: "é" },
+    });
+    const targetBytes = Buffer.from(target);
+    const accentAt = targetBytes.indexOf(Buffer.from("é"));
+    expect(accentAt).toBeGreaterThan(0);
+    // Size the tail so the accent's SECOND byte is the first byte of the final
+    // 64 KiB chunk: a reader that decodes each chunk on its own corrupts the
+    // line that carries the outcome.
+    const tailLen = CHUNK + accentAt - targetBytes.length;
+    expect(tailLen).toBeGreaterThan(0);
+    const tail = `${"b".repeat(tailLen - 1)}\n`;
+    const file = Buffer.concat([targetBytes, Buffer.from(`\n${tail}`)]);
+    // The construction is only meaningful if the boundary really splits the é.
+    expect(file.length - CHUNK).toBe(accentAt + 1);
+    writeFileSync(join(runs, "split.jsonl"), file);
+    const summary = readLastRunSummary(runs);
+    expect(summary?.file).toBe("split.jsonl");
+    // The whole line decoded: the é survived, so the record parsed.
+    expect(summary?.outcome).toEqual({ reason: "wall_clock", note: "é" });
+    expect(lastRunOutcomeReason(summary?.outcome)).toBe("wall_clock");
+  });
+});
+
+describe("doctor's last-run status for a run with no recorded outcome (bob#281)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bob-lastrun-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("follows the exit code: 0 with no recorded outcome is OK, non-zero is a warn", () => {
+    const agentDir = join(root, "quiet");
+    mkdirSync(join(agentDir, "runs"), { recursive: true });
+    mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+    writeFileSync(join(agentDir, "bob.yaml"), agentYaml("quiet", "builder-local"));
+    writeFileSync(join(agentDir, "soul.md"), "You are a builder.");
+    const log = join(agentDir, "runs", "a.jsonl");
+    const lastRunOf = (exitCode: number): { status?: string; detail?: string } | undefined => {
+      writeFileSync(log, `${JSON.stringify({ done: true, exitCode })}\n`);
+      const report = runDoctor({ name: "quiet", agentsRoot: root, homeDir: root });
+      return report.checks.find((c) => c.name === "last run");
+    };
+    // The reason is still "no outcome recorded"; the STATUS is the exit code's.
+    const ok = lastRunOf(0);
+    expect(ok?.status).toBe("ok");
+    expect(ok?.detail).toContain("no outcome recorded");
+    expect(ok?.detail).toContain("(exit 0)");
+    const warn = lastRunOf(1);
+    expect(warn?.status).toBe("warn");
+    expect(warn?.detail).toContain("no outcome recorded");
+    expect(warn?.detail).toContain("(exit 1)");
+  }, 15_000);
 });

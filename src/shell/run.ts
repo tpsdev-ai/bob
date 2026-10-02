@@ -1154,16 +1154,18 @@ async function runBoundedSession(
         loopController.abort();
       }
     }
-    // bob#279: count consecutive READ-ONLY calls; at the budget, inject the one
-    // instruction; at twice the budget, end the run. A write-class call resets
-    // the count (the detector does that). Skipped once the budget is spent.
+    // bob#279/bob#281: count consecutive READ-ONLY calls; at the budget, inject
+    // the one instruction; at twice the budget, end the run. Only a write-class
+    // call that ENDED WITHOUT AN ERROR resets the count (see the end event
+    // below): a call's start, a failed or refused call, a command runner and an
+    // unknown name reset nothing. Skipped once the budget is spent.
     if (
       event.type === "tool_execution_start" &&
       explorationDetector !== undefined &&
       explorationExhausted === undefined
     ) {
       const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
-      const budget = explorationDetector.observe(toolName);
+      const budget = explorationDetector.observeStart(toolName);
       if (budget.inject) {
         writeRunLog(
           {
@@ -1199,6 +1201,19 @@ async function runBoundedSession(
           explorationExhaustedMessage(opts.name, explorationDetector.limit, budget.readOnlyCalls),
         );
         loopController.abort();
+      }
+    }
+    // bob#281: a tool call ENDED. Only an execution that ended WITHOUT an error
+    // is progress. The flag is credited on an explicit `false`: `isError` absent
+    // is not read as "no error", so an unknown outcome never resets the count.
+    if (
+      event.type === "tool_execution_end" &&
+      explorationDetector !== undefined &&
+      explorationExhausted === undefined
+    ) {
+      const ended = event as unknown as { toolName?: unknown; isError?: unknown };
+      if (ended.isError === false) {
+        explorationDetector.observeEndWithoutError(String(ended.toolName ?? ""));
       }
     }
   });

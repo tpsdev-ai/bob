@@ -6,21 +6,25 @@
 // in the brief did not change that — the runtime can see what the model does not
 // report.
 //
-// This counts CONSECUTIVE read-only tool calls with no write-class call. A call
-// is read-only when its row in tool-allowlist.ts's TOOL_EFFECTS is `read-only`
-// (read, read_lines, grep, find, ls, run_status, flair_search, flair_get, ...).
-// EVERY other call — a writer, an effect, an egress tool, or a name with no row
-// — is write-class and RESETS the count: it is a change or a report, not more
-// reading. `run` is a writer row (`work` runs a command), so a `run` call is
-// write-class, never read-only.
+// This counts CONSECUTIVE read-only tool calls with no PROGRESS. A call is
+// read-only when its row in tool-allowlist.ts's TOOL_EFFECTS is `read-only`
+// (read, read_lines, grep, find, ls, run_status, flair_search, flair_get, ...): a
+// read-only call counts as it STARTS. Any other call may be progress, but only
+// when it ENDS (bob#281): the count resets on a write-class call whose tool
+// execution ends WITHOUT an error — a writer, an effect or an egress tool. A
+// call that failed or was refused (its execution ended with an error) resets
+// nothing, and a name with no row in TOOL_EFFECTS resets nothing either: an
+// unknown name is not a change. A COMMAND RUNNER (`run`, `bash`, `powershell`)
+// resets nothing however it exits: it ran a command, which does not prove a
+// change, so a run that explores with commands is still pushed to edit.
 //
 // At `limit` consecutive read-only calls the runtime injects ONE fixed
 // instruction into the next turn (EXPLORATION_INSTRUCTION): make the edit now,
 // or report BLOCKED with what is missing. At `2 * limit` calls with still no
-// write-class call the budget is EXHAUSTED and the run ends with the distinct
-// outcome `exploration_budget_exhausted` — never a silent timeout. A write-class
-// call resets the count, so a run that edits and then explores again gets a
-// fresh budget.
+// reset the budget is EXHAUSTED and the run ends with the distinct outcome
+// `exploration_budget_exhausted` — never a silent timeout. A successful
+// write-class call resets the count, so a run that edits and then explores again
+// gets a fresh budget.
 //
 // The limit is per role (role.json `exploration_budget`) and per agent (bob.yaml
 // `run.exploration_budget`, which overrides the role). A role that names none —
@@ -36,6 +40,13 @@ import { TOOL_EFFECTS } from "./tool-allowlist.js";
  * for that role.
  */
 export const BUILDER_LOCAL_EXPLORATION_BUDGET = 20;
+
+/**
+ * The tool rows that RUN A COMMAND. A clean exit is not taken as progress
+ * (bob#281): the command may have only read, and the budget's promise is that a
+ * run edits or reports BLOCKED, so running commands must not keep it alive.
+ */
+const COMMAND_RUNNER_TOOLS: ReadonlySet<string> = new Set(["run", "bash", "powershell"]);
 
 /**
  * The ONE instruction the runtime injects when the budget is reached. It is
@@ -66,7 +77,7 @@ export function parseExplorationBudget(value: unknown): number | undefined {
 export interface ExplorationObservation {
   /**
    * Length of the current run of consecutive read-only calls (0 after a
-   * write-class call).
+   * write-class call that ended without an error).
    */
   readOnlyCalls: number;
   /** True when this call reached the limit and the instruction is due. */
@@ -92,12 +103,15 @@ export class ExplorationBudgetDetector {
     this.limit = limit;
   }
 
-  observe(toolName: string): ExplorationObservation {
+  /**
+   * A tool call STARTED. A read-only call is counted; any other call counts
+   * nothing yet — whether it is progress is known only when it ends.
+   */
+  observeStart(toolName: string): ExplorationObservation {
     if (TOOL_EFFECTS[toolName] !== "read-only") {
-      // A write-class call (or a name with no row): the run did something other
-      // than read, so the run of read-only calls is over.
-      this.count = 0;
-      return { readOnlyCalls: 0, inject: false, exhaust: false };
+      // A write-class call (or a name with no row) has reset nothing yet: its
+      // result is not known until its execution ends (bob#281).
+      return { readOnlyCalls: this.count, inject: false, exhaust: false };
     }
     this.count += 1;
     return {
@@ -107,6 +121,18 @@ export class ExplorationBudgetDetector {
       // And the run ends if the same run of reads reaches twice the limit.
       exhaust: this.count >= this.limit * 2,
     };
+  }
+
+  /**
+   * A tool call ENDED WITHOUT an error: a write-class call is PROGRESS and
+   * resets the count. A read-only call (already counted at its start), a name
+   * with no row, and a command runner reset nothing.
+   */
+  observeEndWithoutError(toolName: string): void {
+    const row = TOOL_EFFECTS[toolName];
+    if (row === undefined || row === "read-only") return;
+    if (COMMAND_RUNNER_TOOLS.has(toolName)) return;
+    this.count = 0;
   }
 
   /** Read-only calls in the current run (0 when none). */

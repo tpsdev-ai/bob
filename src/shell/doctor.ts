@@ -1212,8 +1212,14 @@ const RUN_LOG_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 // Read a JSONL run log from the END in fixed chunks, returning the last
 // `outcome` field and the last `done.exitCode`, or undefined for either not
 // found within the bound. A record is one line (JSON.stringify escapes
-// newlines), so a line is parsed only when it is whole — a line split by a chunk
-// boundary is carried into the next (earlier) chunk.
+// newlines), so a line is parsed only when it is whole. Chunks are joined and
+// split as RAW BYTES, never as a decoded string, so a multibyte character split
+// across a chunk boundary is reassembled before it is decoded (bob#281): a JSON
+// line never holds a raw newline byte, and a UTF-8 continuation byte is never
+// one, so the newline byte is an exact separator. A line split by a boundary is
+// carried into the next (earlier) chunk; at offset 0 there is no earlier chunk,
+// so the bytes before the first newline are a whole line (the file begins
+// there) and the FIRST line is parsed too (bob#281).
 function scanRunLogTail(
   fd: number,
   size: number,
@@ -1224,17 +1230,37 @@ function scanRunLogTail(
   try {
     let end = size;
     let scanned = 0;
-    let carry = "";
+    // The head of a line whose tail is in the chunk already read, as raw bytes.
+    let carry = Buffer.alloc(0);
     while (end > 0 && scanned < RUN_LOG_SCAN_MAX_BYTES) {
       const start = Math.max(0, end - RUN_LOG_SCAN_CHUNK_BYTES);
       const len = end - start;
       const buf = Buffer.allocUnsafe(len);
       const bytesRead = readSync(fd, buf, 0, len, start);
       scanned += bytesRead;
-      const lines = (buf.toString("utf8", 0, bytesRead) + carry).split("\n");
-      carry = lines.shift() ?? "";
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
+      const chunk = Buffer.concat([buf.subarray(0, bytesRead), carry]);
+      // The byte ranges between newlines, in file order. The last is the tail
+      // after the final newline: a whole line when the file ends there, else the
+      // head of a line the carried tail completes.
+      const parts: Array<{ from: number; to: number }> = [];
+      let from = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] === 0x0a) {
+          parts.push({ from, to: i });
+          from = i + 1;
+        }
+      }
+      parts.push({ from, to: chunk.length });
+      if (start === 0) {
+        // The file begins here, so the leading fragment is a whole line too.
+        carry = Buffer.alloc(0);
+      } else {
+        // It continues into an earlier chunk: carry it, unread, as bytes.
+        carry = chunk.subarray(parts[0].from, parts[0].to);
+        parts.shift();
+      }
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const line = chunk.subarray(parts[i].from, parts[i].to).toString("utf8").trim();
         if (line === "") continue;
         let record: Record<string, unknown>;
         try {
@@ -1263,7 +1289,10 @@ function scanRunLogTail(
 }
 
 // The reason string a run's recorded outcome carries, for display. A missing or
-// malformed reason reads as "no outcome recorded", never as a success.
+// malformed reason reads as "no outcome recorded", never as a success — the
+// last-run line's STATUS is separate: it follows the exit code (`exitCode === 0`
+// is OK), so a run that exited 0 and recorded no outcome is shown OK with that
+// reason, and one that exited non-zero is a warn.
 export function lastRunOutcomeReason(outcome: unknown): string {
   if (outcome !== null && typeof outcome === "object" && "reason" in outcome) {
     const reason = (outcome as { reason?: unknown }).reason;
