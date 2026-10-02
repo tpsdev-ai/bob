@@ -5,15 +5,13 @@
 // patch with shell instructions lets the two differ, so this tool owns the
 // application: it reads the artifact ONCE, verifies its digest, and applies
 // those VERIFIED BYTES to a fresh, tool-owned index initialized from the task's
-// pinned base. The caller's worktree, index, HEAD and refs are never used as
-// application input and are left untouched.
+// pinned base.
 //
 // It never selects paths, drops hunks, repairs whitespace, resolves conflicts
 // or falls back to another base: `git apply` runs with no `--reject`, no
 // `--3way`, no fuzz, and `--whitespace=nowarn` (so a repo's own
 // `apply.whitespace=fix` cannot make it repair whitespace). The whole patch
-// applies to the fresh index or nothing does. A refusal returns a stable reason
-// and leaves no candidate.
+// applies to the fresh index or nothing does.
 //
 // The authority — repository, base, mode and artifact root — comes from the
 // task binding (task-binding.ts), retained by the capability, never from a tool
@@ -22,7 +20,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  type BigIntStats,
   closeSync,
   constants as fsConstants,
   fstatSync,
@@ -33,6 +30,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -120,8 +118,6 @@ export interface ApplyPatchDeps {
   afterDigestVerified?: (bytes: Buffer, artifactPath: string) => void;
   beforeCandidateWrite?: (dir: string) => void;
   writeCandidateRecord?: (fd: number, data: string) => void;
-  // Seam: a unique suffix for the candidate record's temp file name (default: random).
-  uniqueSuffix?: () => string;
   // Seam: the clock for the record timestamp.
   now?: () => Date;
 }
@@ -535,47 +531,33 @@ function openCandidateDir(
       );
     }
   }
-  let st: BigIntStats;
-  try {
-    st = lstatSync(dir, { bigint: true });
-  } catch {
-    return refuse(
-      "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} cannot be read.`,
-    );
-  }
-  if (st.isSymbolicLink() || !st.isDirectory()) {
-    return refuse(
-      "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} is not a plain directory (a symlink or a file is there). Candidate records are stored there; remove it and apply_patch recreates it owner-only.`,
-    );
-  }
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (uid !== undefined && st.uid !== BigInt(uid)) {
-    return refuse(
-      "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} is owned by uid ${st.uid}, not this user (${uid}).`,
-    );
-  }
-  if ((st.mode & 0o077n) !== 0n) {
-    return refuse(
-      "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} has mode ${(st.mode & 0o777n).toString(8)}, readable by other users.`,
-    );
-  }
   let fd: number | undefined;
   try {
     fd = openSync(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
     const pin = fstatSync(fd, { bigint: true });
-    if (pin.dev !== st.dev || pin.ino !== st.ino) {
-      throw new Error("the candidate directory changed while being pinned");
+    if (!pin.isDirectory()) {
+      throw new Error("not a directory");
+    }
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (uid !== undefined && pin.uid !== BigInt(uid)) {
+      throw new Error(`owned by uid ${pin.uid}, not this user (${uid})`);
+    }
+    if ((pin.mode & 0o077n) !== 0n) {
+      throw new Error(`mode ${(pin.mode & 0o777n).toString(8)} permits group or other access`);
     }
     return { ok: true, fd, dev: pin.dev, ino: pin.ino };
   } catch (err) {
-    if (fd !== undefined) closeSync(fd);
+    let leftover = "";
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch (cerr) {
+        leftover = `; directory close failed (${cerr instanceof Error ? cerr.message : String(cerr)})`;
+      }
+    }
     return refuse(
       "storage_failed",
-      `apply_patch refused: the candidate directory ${dir} could not be pinned (${err instanceof Error ? err.message : String(err)}).`,
+      `apply_patch refused: the candidate directory ${dir} could not be pinned (${err instanceof Error ? err.message : String(err)})${leftover}.`,
     );
   }
 }
@@ -588,42 +570,58 @@ function storeCandidate(
   const dir = join(stateRoot, "candidates");
   const opened = openCandidateDir(dir);
   if (!opened.ok) return opened;
-  const tmpName = `.tmp-${deps.uniqueSuffix?.() ?? `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-  const tmpPath = join(dir, tmpName);
+  const finalPath = join(dir, `${record.candidate_id}.json`);
+  let stagingDir: string | undefined;
   let fd: number | undefined;
+  let dirFd: number | undefined = opened.fd;
+  let renamed = false;
   try {
     deps.beforeCandidateWrite?.(dir);
+    stagingDir = mkdtempSync(join(dir, ".tmp-"));
+    const tmpPath = join(stagingDir, "record.json");
     fd = openSync(
       tmpPath,
       fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
       0o600,
     );
     (deps.writeCandidateRecord ?? writeFileSync)(fd, `${JSON.stringify(record, null, 2)}\n`);
+    const writtenFd = fd;
+    fd = undefined;
+    closeSync(writtenFd);
     const after = lstatSync(dir, { bigint: true });
     if (after.dev !== opened.dev || after.ino !== opened.ino) {
       throw new Error("the candidate directory changed after it was pinned");
     }
-    renameSync(tmpPath, join(dir, `${record.candidate_id}.json`));
+    renameSync(tmpPath, finalPath);
+    renamed = true;
+    rmdirSync(stagingDir);
+    stagingDir = undefined;
+    const pinnedFd = dirFd;
+    dirFd = undefined;
+    closeSync(pinnedFd);
     return { ok: true };
   } catch (err) {
     let leftover = "";
-    if (fd !== undefined) {
+    for (const path of [renamed ? finalPath : undefined, stagingDir]) {
+      if (path === undefined) continue;
       try {
-        rmSync(tmpPath, { force: true });
+        rmSync(path, { recursive: path === stagingDir, force: true });
       } catch (rerr) {
-        leftover = `; the temporary record ${tmpName} could not be removed (${rerr instanceof Error ? rerr.message : String(rerr)})`;
+        leftover += `; ${path} could not be removed (${rerr instanceof Error ? rerr.message : String(rerr)})`;
+      }
+    }
+    for (const remainingFd of [fd, dirFd]) {
+      if (remainingFd === undefined) continue;
+      try {
+        closeSync(remainingFd);
+      } catch (cerr) {
+        leftover += `; descriptor close failed (${cerr instanceof Error ? cerr.message : String(cerr)})`;
       }
     }
     return refuse(
       "storage_failed",
       `apply_patch refused: the candidate could not be stored under ${dir} (${err instanceof Error ? err.message : String(err)})${leftover}.`,
     );
-  } finally {
-    try {
-      if (fd !== undefined) closeSync(fd);
-    } finally {
-      closeSync(opened.fd);
-    }
   }
 }
 

@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -103,7 +105,6 @@ function setup() {
                 throw new Error(`unexpected git call: ${args.join(" ")}`);
             }
           },
-          uniqueSuffix: () => "storage-test",
           ...deps,
         },
       }),
@@ -111,9 +112,20 @@ function setup() {
 }
 
 describe("candidate storage with stubbed git and real filesystem operations", () => {
-  it("stores a complete owner-only record by path", () => {
+  it("stores a complete owner-only record from a private staging directory", () => {
     const fx = setup();
-    const out = fx.apply();
+    const out = fx.apply({
+      writeCandidateRecord: (fd, data) => {
+        const stages = readdirSync(fx.dir);
+        expect(stages).toHaveLength(1);
+        const stage = join(fx.dir, stages[0]);
+        expect(lstatSync(stage).isDirectory()).toBe(true);
+        expect(lstatSync(stage).mode & 0o777).toBe(0o700);
+        expect(readdirSync(stage)).toEqual(["record.json"]);
+        writeFileSync(fd, data);
+        expect(readFileSync(join(stage, "record.json"), "utf8")).toBe(data);
+      },
+    });
     expect(out.ok).toBe(true);
     expect(JSON.parse(readFileSync(fx.recordPath, "utf8")).tree_oid).toBe(fx.tree);
     expect(lstatSync(fx.recordPath).mode & 0o777).toBe(0o600);
@@ -134,7 +146,9 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
         },
         writeCandidateRecord: (fd, data) => {
           writeFileSync(fd, data);
-          expect(readFileSync(join(fx.dir, ".tmp-storage-test"), "utf8")).toBe(data);
+          const stage = readdirSync(fx.dir).find((name) => name.startsWith(".tmp-"));
+          expect(stage).toBeDefined();
+          expect(readFileSync(join(fx.dir, stage as string, "record.json"), "utf8")).toBe(data);
           wrote = true;
         },
       });
@@ -144,7 +158,7 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
         expect(out.reason).toBe("storage_failed");
         expect(out.message).toContain("changed after it was pinned");
       }
-      expect(existsSync(join(fx.dir, ".tmp-storage-test"))).toBe(false);
+      expect(readdirSync(fx.dir).filter((name) => name.startsWith(".tmp-"))).toEqual([]);
       expect(existsSync(fx.recordPath)).toBe(false);
       expect(readdirSync(moved)).toEqual([]);
       fx.assertUntouched();
@@ -178,4 +192,172 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
     expect(readdirSync(fx.dir)).toEqual([basename(fx.recordPath)]);
     fx.assertUntouched();
   });
+
+  for (const mode of [0o720, 0o702, 0o750, 0o705]) {
+    it(`refuses candidate directory mode ${mode.toString(8)} before writing`, () => {
+      const fx = setup();
+      mkdirSync(fx.dir, { recursive: true, mode: 0o700 });
+      chmodSync(fx.dir, mode);
+      let wrote = false;
+      const out = fx.apply({
+        writeCandidateRecord: () => {
+          wrote = true;
+        },
+      });
+      expect(out.ok).toBe(false);
+      if (!out.ok) expect(out.reason).toBe("storage_failed");
+      expect(wrote).toBe(false);
+      expect(readdirSync(fx.dir)).toEqual([]);
+      fx.assertUntouched();
+    });
+  }
+
+  for (const replacement of ["symlink", "file"] as const) {
+    it(`refuses a candidates ${replacement} before writing`, () => {
+      const fx = setup();
+      mkdirSync(fx.stateRoot, { mode: 0o700 });
+      if (replacement === "symlink") symlinkSync(fx.repo, fx.dir);
+      else writeFileSync(fx.dir, "occupied");
+      let wrote = false;
+      const out = fx.apply({
+        writeCandidateRecord: () => {
+          wrote = true;
+        },
+      });
+      expect(out.ok).toBe(false);
+      if (!out.ok) expect(out.reason).toBe("storage_failed");
+      expect(wrote).toBe(false);
+      fx.assertUntouched();
+    });
+  }
+
+  it("refuses a foreign owner reported by fstat before writing", () => {
+    const fx = setup();
+    const actualFstat = fs.fstatSync;
+    const stat = spyOn(fs, "fstatSync").mockImplementation(((
+      ...args: Parameters<typeof actualFstat>
+    ) => {
+      const result = actualFstat(...args);
+      if (typeof result.uid === "bigint") result.uid += 1n;
+      return result;
+    }) as typeof actualFstat);
+    try {
+      let wrote = false;
+      const out = fx.apply({
+        writeCandidateRecord: () => {
+          wrote = true;
+        },
+      });
+      expect(out.ok).toBe(false);
+      if (!out.ok) {
+        expect(out.reason).toBe("storage_failed");
+        expect(out.message).toContain("owned by uid");
+      }
+      expect(wrote).toBe(false);
+      expect(readdirSync(fx.dir)).toEqual([]);
+      fx.assertUntouched();
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
+  it("a failed staging-directory removal rolls back the renamed record", () => {
+    const fx = setup();
+    const out = fx.apply({
+      writeCandidateRecord: (fd, data) => {
+        writeFileSync(fd, data);
+        const [stage] = readdirSync(fx.dir);
+        writeFileSync(join(fx.dir, stage, "block-removal"), "occupied");
+      },
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("storage_failed");
+    expect(readdirSync(fx.dir)).toEqual([]);
+    fx.assertUntouched();
+  });
+
+  it("a failed staging-directory creation refuses without leaving a record", () => {
+    const fx = setup();
+    const actualMkdtemp = fs.mkdtempSync;
+    const makeTemp = spyOn(fs, "mkdtempSync").mockImplementation(((
+      ...args: Parameters<typeof actualMkdtemp>
+    ) => {
+      if (String(args[0]) === join(fx.dir, ".tmp-")) throw new Error("mkdtemp failed");
+      return actualMkdtemp(...args);
+    }) as typeof actualMkdtemp);
+    try {
+      const out = fx.apply();
+      expect(out.ok).toBe(false);
+      if (!out.ok) {
+        expect(out.reason).toBe("storage_failed");
+        expect(out.message).toContain("mkdtemp failed");
+      }
+      expect(readdirSync(fx.dir)).toEqual([]);
+      fx.assertUntouched();
+    } finally {
+      makeTemp.mockRestore();
+    }
+  });
+
+  it("a failed record open removes the staging directory", () => {
+    const fx = setup();
+    const actualOpen = fs.openSync;
+    const open = spyOn(fs, "openSync").mockImplementation((...args) => {
+      if (basename(String(args[0])) === "record.json") throw new Error("open failed");
+      return actualOpen(...args);
+    });
+    try {
+      const out = fx.apply();
+      expect(out.ok).toBe(false);
+      if (!out.ok) {
+        expect(out.reason).toBe("storage_failed");
+        expect(out.message).toContain("open failed");
+      }
+      expect(readdirSync(fx.dir)).toEqual([]);
+      fx.assertUntouched();
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  for (const failedClose of ["record", "directory"] as const) {
+    it(`a failed ${failedClose} close refuses and removes the created record`, () => {
+      const fx = setup();
+      const actualOpen = fs.openSync;
+      const actualClose = fs.closeSync;
+      let targetFd: number | undefined;
+      let injected = false;
+      const open = spyOn(fs, "openSync").mockImplementation((...args) => {
+        const fd = actualOpen(...args);
+        if (failedClose === "directory" && String(args[0]) === fx.dir) targetFd = fd;
+        return fd;
+      });
+      const close = spyOn(fs, "closeSync").mockImplementation((fd) => {
+        actualClose(fd);
+        if (fd === targetFd && !injected) {
+          injected = true;
+          throw new Error(`${failedClose} close failed`);
+        }
+      });
+      try {
+        const out = fx.apply({
+          writeCandidateRecord: (fd, data) => {
+            if (failedClose === "record") targetFd = fd;
+            writeFileSync(fd, data);
+          },
+        });
+        expect(injected).toBe(true);
+        expect(out.ok).toBe(false);
+        if (!out.ok) {
+          expect(out.reason).toBe("storage_failed");
+          expect(out.message).toContain(`${failedClose} close failed`);
+        }
+        expect(readdirSync(fx.dir)).toEqual([]);
+        fx.assertUntouched();
+      } finally {
+        open.mockRestore();
+        close.mockRestore();
+      }
+    });
+  }
 });
