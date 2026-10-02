@@ -41,11 +41,23 @@ type ScriptedCall =
 
 const editResults: Record<string, object> = {
   write: { content: [{ type: "text", text: "Successfully wrote 0 bytes to f.ts" }] },
-  edit: { details: { diff: "-1 before\n+1 after" } },
+  edit: {
+    content: [{ type: "text", text: "edited f.ts" }],
+    details: { diff: "-1 before\n+1 after" },
+  },
   replace_lines: { content: [{ type: "text", text: "Replaced lines 1-1 in f.ts." }] },
-  write_file: { details: { fingerprint: "F#0123456789abcdef", bytes: 0 } },
-  edit_lines: { details: { fingerprint: "F#0123456789abcdef", lineDelta: 0 } },
-  insert_after: { details: { fingerprint: "F#0123456789abcdef", lineDelta: 1 } },
+  write_file: {
+    content: [{ type: "text", text: "edited f.ts" }],
+    details: { fingerprint: "F#0123456789abcdef", bytes: 0 },
+  },
+  edit_lines: {
+    content: [{ type: "text", text: "edited f.ts" }],
+    details: { fingerprint: "F#0123456789abcdef", lineDelta: 0 },
+  },
+  insert_after: {
+    content: [{ type: "text", text: "edited f.ts" }],
+    details: { fingerprint: "F#0123456789abcdef", lineDelta: 1 },
+  },
 };
 
 // A fabricated AgentSession matching the RunSession seam. prompt() emits one
@@ -310,10 +322,19 @@ describe("ExplorationBudgetDetector", () => {
   it("does not credit malformed success evidence", () => {
     const d = new ExplorationBudgetDetector(2);
     for (const [tool, result] of [
-      ["edit", { details: { diff: "" } }],
-      ["edit_lines", { details: { fingerprint: "invalid", lineDelta: 1 } }],
-      ["insert_after", { details: { fingerprint: "F#0123456789abcdef" } }],
-      ["write_file", { details: { fingerprint: "F#0123456789abcdef", bytes: -1 } }],
+      ["edit", { ...editResults.edit, details: { diff: "" } }],
+      [
+        "edit_lines",
+        { ...editResults.edit_lines, details: { fingerprint: "invalid", lineDelta: 1 } },
+      ],
+      [
+        "insert_after",
+        { ...editResults.insert_after, details: { fingerprint: "F#0123456789abcdef" } },
+      ],
+      [
+        "write_file",
+        { ...editResults.write_file, details: { fingerprint: "F#0123456789abcdef", bytes: -1 } },
+      ],
       ["write", { content: [{ type: "text", text: "ERROR: write failed" }] }],
       ["replace_lines", { content: [{ type: "text", text: "No lines replaced" }] }],
     ] as const) {

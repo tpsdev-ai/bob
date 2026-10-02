@@ -1,61 +1,9 @@
-import { TOOL_EFFECTS } from "./tool-allowlist.js";
+import { isFileEditTool, isVerifiedFileEdit } from "./edit-evidence.js";
 
 export const BUILDER_LOCAL_EXPLORATION_BUDGET = 20;
 
-const COMMAND_RUNNER_TOOLS: ReadonlySet<string> = new Set(["run", "bash", "powershell"]);
-
-function isFileEditTool(toolName: string): boolean {
-  return (
-    Object.hasOwn(TOOL_EFFECTS, toolName) &&
-    TOOL_EFFECTS[toolName] === "writer" &&
-    !COMMAND_RUNNER_TOOLS.has(toolName)
-  );
-}
-
 export const EXPLORATION_INSTRUCTION =
   "You have made tool calls since the last credited edit. Make the edit now, or stop and report BLOCKED with what is missing.";
-
-function hasEditSuccessEvidence(toolName: string, result: unknown): boolean {
-  if (result === null || typeof result !== "object") return false;
-  const output = result as { details?: Record<string, unknown>; content?: unknown };
-  const details = output.details;
-  if (details?.refused) return false;
-  switch (toolName) {
-    case "edit_lines":
-    case "insert_after":
-      return (
-        typeof details?.fingerprint === "string" &&
-        /^F#[0-9a-f]{16}$/.test(details.fingerprint) &&
-        Number.isSafeInteger(details.lineDelta)
-      );
-    case "write_file":
-      return (
-        typeof details?.fingerprint === "string" &&
-        /^F#[0-9a-f]{16}$/.test(details.fingerprint) &&
-        typeof details.bytes === "number" &&
-        Number.isSafeInteger(details.bytes) &&
-        details.bytes >= 0
-      );
-    case "edit":
-      return typeof details?.diff === "string" && details.diff.trim().length > 0;
-    case "write":
-    case "replace_lines": {
-      const success =
-        toolName === "write"
-          ? /^Successfully wrote \d+ bytes to [\s\S]+$/
-          : /^Replaced lines [1-9]\d*-[1-9]\d* in [\s\S]+\.$/;
-      return (
-        Array.isArray(output.content) &&
-        output.content.some(
-          (block) =>
-            block?.type === "text" && typeof block.text === "string" && success.test(block.text),
-        )
-      );
-    }
-    default:
-      return false;
-  }
-}
 
 export class ExplorationBudgetError extends Error {
   constructor(message: string) {
@@ -97,7 +45,7 @@ export class ExplorationBudgetDetector {
 
   observeEnd(toolName: string, isError: unknown, result: unknown): ExplorationObservation {
     if (isFileEditTool(toolName)) {
-      if (isError !== false || !hasEditSuccessEvidence(toolName, result)) {
+      if (!isVerifiedFileEdit(toolName, isError, result)) {
         return this.countNonProgress();
       }
       this.count = 0;
