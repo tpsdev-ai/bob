@@ -6,7 +6,7 @@
 // The built extension is loaded from the blessed catalog (as a published
 // install loads it), with no test seams.
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -29,6 +29,24 @@ import { createBobRuntimeFactory } from "../../../src/shell/session.js";
 
 const STUB_PROVIDER = "bob-apply-patch-stub";
 const STUB_MODEL = "stub-1";
+
+// The production session path resolves the capability's default state root
+// under the OS temp directory (<tmpdir>/bob-work-<uid>). Point TMPDIR at a
+// scratch dir for the session, as production.test.ts does, so the state root
+// lands inside this test's scratch and is removed with it.
+let scratch: string;
+let savedTmpdir: string | undefined;
+beforeEach(() => {
+  scratch = mkdtempSync(join(tmpdir(), "bob-apply-patch-prod-"));
+  savedTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = join(scratch, "tmp");
+  mkdirSync(join(scratch, "tmp"));
+});
+afterEach(() => {
+  if (savedTmpdir === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmpdir;
+  rmSync(scratch, { recursive: true, force: true });
+});
 
 function oneCallThenDone(args: Record<string, unknown>) {
   let calls = 0;
@@ -92,7 +110,6 @@ interface Setup {
 }
 
 function setup(): Setup {
-  const scratch = mkdtempSync(join(tmpdir(), "bob-apply-patch-prod-"));
   const repo = join(scratch, "repo");
   const artifactRoot = join(scratch, "artifacts");
   mkdirSync(repo, { recursive: true });

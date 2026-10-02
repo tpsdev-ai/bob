@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import {
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -110,7 +111,7 @@ export interface ApplyPatchDeps {
   // VERIFIED BYTES are applied. A test replaces the artifact file here to prove
   // a reopened pathname is never applied.
   afterDigestVerified?: (bytes: Buffer, artifactPath: string) => void;
-  // Seam: a unique suffix for the fresh index file name (default: random).
+  // Seam: a unique suffix for the candidate record's temp file name (default: random).
   uniqueSuffix?: () => string;
   // Seam: the clock for the record timestamp.
   now?: () => Date;
@@ -334,19 +335,21 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
 
   deps.afterDigestVerified?.(bytes, resolved.path);
 
-  const indexFile = join(
-    stateRoot,
-    "indexes",
-    `apply-${deps.uniqueSuffix?.() ?? `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`}.index`,
-  );
+  // The tool's own scratch: one directory per call, holding only the fresh
+  // index. The finally below removes it on EVERY path — success or any refusal
+  // — so no scratch entry outlives the call, and concurrent calls cannot share
+  // an index.
+  let scratchDir: string;
   try {
-    mkdirSync(join(stateRoot, "indexes"), { recursive: true, mode: 0o700 });
+    mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+    scratchDir = mkdtempSync(join(stateRoot, "apply-"));
   } catch {
     return refuse(
       "storage_failed",
-      `apply_patch refused: could not create the index directory under ${stateRoot}.`,
+      `apply_patch refused: could not create the tool's scratch directory under ${stateRoot}.`,
     );
   }
+  const indexFile = join(scratchDir, "index");
 
   try {
     // Fresh, tool-owned index initialized from the pinned base. The caller's
@@ -464,7 +467,7 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
       changed_paths: changedPaths,
     };
   } finally {
-    rmSync(indexFile, { force: true });
+    rmSync(scratchDir, { recursive: true, force: true });
   }
 }
 

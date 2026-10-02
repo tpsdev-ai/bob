@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -295,6 +296,37 @@ describe("apply_patch — success shapes yield the expected tree", () => {
     w.manager.endRunSync();
     expect(out.details.tree_oid).toBe(tree);
     expect(snapshot(fx.repo)).toEqual(before);
+  });
+});
+
+describe("apply_patch — no scratch outlives the call (bob#277 leak check)", () => {
+  it("a success and a refusal that reaches the index both leave no scratch dir", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const w = wire(binding(fx));
+
+    const ok = await w.apply({
+      patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+      expected_base: fx.base,
+    });
+    expect(ok.details.refused).toBe(false);
+    // The only entry the tool left under its state root is the candidate record.
+    expect(readdirSync(w.stateRoot)).toEqual(["candidates"]);
+
+    // A refusal that parses the patch and reaches the fresh index must not leave
+    // the scratch directory behind either.
+    const nope = Buffer.from(
+      "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-nope\n+stillnope\n",
+    );
+    writeArtifact(fx, "nope.patch", nope);
+    const refused = await w.apply({
+      patch_artifact: { path: "nope.patch", sha256: sha256(nope) },
+      expected_base: fx.base,
+    });
+    expect(refused.details.refused).toBe(true);
+    expect(readdirSync(w.stateRoot).filter((n) => n.startsWith("apply-"))).toEqual([]);
+    w.manager.endRunSync();
   });
 });
 
