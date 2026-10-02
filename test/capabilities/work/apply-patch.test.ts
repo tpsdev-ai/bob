@@ -611,6 +611,29 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     if (!out.ok) expect(out.reason).toBe("storage_failed");
   });
 
+  it("a state root whose parent does not exist: storage_failed, naming the create failure", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    // The parent is absent, so the state root cannot be created at all: the
+    // refusal must name that failure, not describe a root that is not there.
+    const stateRoot = join(scratch, "absent-parent", "state");
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("storage_failed");
+      expect(out.message).toContain("could not be created");
+      expect(out.message).toContain("ENOENT");
+    }
+  });
+
   it("a state root inside the repository: storage_failed, the checkout unchanged and no candidate stored", async () => {
     const fx = makeFixture();
     const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));

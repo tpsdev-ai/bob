@@ -341,9 +341,10 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
   // the two checks `run` makes before it writes under its own state root
   // (run.ts ensureRunDir). A root inside the workspace or the repository would
   // leave the candidate record and the scratch index as stray files in the
-  // caller's tree; a root that is a symlink, a file, another account's
-  // directory or group/world-readable lets that account choose what the index
-  // holds between read-tree and write-tree.
+  // caller's tree; a root that is a symlink, a file or another account's
+  // directory lets that account choose what the index holds between read-tree
+  // and write-tree; group or world permission bits expose or open the
+  // candidate records to other users.
   const inside = (
     [
       [binding.workspace, "the workspace"],
@@ -362,10 +363,10 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
   }
   try {
     ensurePrivateDir(stateRoot, true);
-  } catch {
+  } catch (err) {
     return refuse(
       "storage_failed",
-      `apply_patch refused: the tool state directory ${stateRoot} is not a plain, owner-only directory of this user (a symlink, a file, another account's directory, or group/world-readable permissions). Remove it (or run chmod 700 on it); apply_patch stores candidate records there owner-only.`,
+      `apply_patch refused: ${err instanceof Error ? err.message.replace(/^run refused: /, "") : String(err)}`,
     );
   }
 
