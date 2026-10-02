@@ -415,11 +415,14 @@ const errCode = (err: unknown): string =>
 // or close) refuses: unknown is never taken as inside.
 //
 // Inside one re-check the realpath and no-follow stat are separate calls. If a
-// component is replaced with a different directory at that path between them,
-// the comparison refuses it (run.test.ts drives that interval). Moving a
-// component away and replacing it with a symlink back to the pinned directory is
-// not detected there; the OS-specific directory-descriptor boundary described in
-// the capability README would cover it. After the last re-check and before the
+// component is replaced between them so that the no-follow stat no longer finds
+// a directory with the pin's device + inode (or the workspace root no longer
+// matches its recorded device + inode), the comparison refuses it (run.test.ts
+// drives that interval with a different directory at the final component). A
+// swap that still leads the path to the pinned directory, for example a symlink
+// back to it or the pinned directory moved under the replacement, is not
+// detected there; the OS-specific directory-descriptor boundary described in the
+// capability README would cover it. After the last re-check and before the
 // child's own chdir, a component can still be replaced.
 
 // The file-system calls the pin makes, as a seam (like GroupOps) so a test can
