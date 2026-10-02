@@ -1155,10 +1155,11 @@ async function runBoundedSession(
       }
     }
     // bob#279/bob#281: count consecutive READ-ONLY calls; at the budget, inject
-    // the one instruction; at twice the budget, end the run. Only a write-class
-    // call that ENDED WITHOUT AN ERROR resets the count (see the end event
-    // below): a call's start, a failed or refused call, a command runner and an
-    // unknown name reset nothing. Skipped once the budget is spent.
+    // the one instruction; at twice the budget, end the run. A write-class call
+    // resets the count only when its execution ENDED WITHOUT AN ERROR, and a
+    // command runner never resets it (a command may have only read); a call's
+    // start, a failed or refused call and an unknown name reset nothing. Skipped
+    // once the budget is spent.
     if (
       event.type === "tool_execution_start" &&
       explorationDetector !== undefined &&

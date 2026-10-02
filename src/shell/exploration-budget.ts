@@ -9,14 +9,14 @@
 // This counts CONSECUTIVE read-only tool calls with no PROGRESS. A call is
 // read-only when its row in tool-allowlist.ts's TOOL_EFFECTS is `read-only`
 // (read, read_lines, grep, find, ls, run_status, flair_search, flair_get, ...): a
-// read-only call counts as it STARTS. Any other call may be progress, but only
-// when it ENDS (bob#281): the count resets on a write-class call whose tool
-// execution ends WITHOUT an error — a writer, an effect or an egress tool. A
-// call that failed or was refused (its execution ended with an error) resets
-// nothing, and a name with no row in TOOL_EFFECTS resets nothing either: an
-// unknown name is not a change. A COMMAND RUNNER (`run`, `bash`, `powershell`)
-// resets nothing however it exits: it ran a command, which does not prove a
-// change, so a run that explores with commands is still pushed to edit.
+// read-only call counts as it STARTS. Whether any other call is progress is
+// known only when it ENDS (bob#281): a write-class call resets the count only
+// if its tool execution ended WITHOUT an error, and a COMMAND RUNNER (`run`,
+// `bash`, `powershell`) resets nothing however it exits — it ran a command,
+// which does not prove a change, so a run that explores with commands is still
+// pushed to edit. A call that failed or was refused (its execution ended with an
+// error) resets nothing, and a name with no row in TOOL_EFFECTS resets nothing
+// either: an unknown name is not a change.
 //
 // At `limit` consecutive read-only calls the runtime injects ONE fixed
 // instruction into the next turn (EXPLORATION_INSTRUCTION): make the edit now,
@@ -124,9 +124,10 @@ export class ExplorationBudgetDetector {
   }
 
   /**
-   * A tool call ENDED WITHOUT an error: a write-class call is PROGRESS and
-   * resets the count. A read-only call (already counted at its start), a name
-   * with no row, and a command runner reset nothing.
+   * A tool call ENDED WITHOUT an error. A write-class call resets the count
+   * here, unless it is a command runner, which resets nothing however it exits;
+   * a read-only call (already counted at its start) and a name with no row
+   * reset nothing either.
    */
   observeEndWithoutError(toolName: string): void {
     const row = TOOL_EFFECTS[toolName];

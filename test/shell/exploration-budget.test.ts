@@ -1,9 +1,10 @@
 // bob#279 — the exploration budget. Through runAgent with a fabricated session
 // that emits tool_execution_start events: a run that keeps reading gets ONE
 // instruction after the budget and ends with `exploration_budget_exhausted`
-// after twice the budget; a run that edits within budget is unaffected; a
-// write-class call that ENDS WITHOUT AN ERROR resets the count, while a failed
-// or refused call, a command runner and an unknown name reset nothing (bob#281);
+// after twice the budget; a run that edits within budget is unaffected; the
+// count resets when a write-class call ENDS WITHOUT AN ERROR and never for a
+// command runner or an unknown name, while a failed or refused call resets
+// nothing (bob#281);
 // the outcome is in the run log and doctor's last-run line; and the budget is
 // read from the role/agent config.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -172,7 +173,7 @@ describe("ExplorationBudgetDetector", () => {
     });
   });
 
-  it("resets only on a write-class call that ended without an error — never on a start, a command runner or an unknown name", () => {
+  it("resets on a write-class call that ended without an error, and never on a start, a command runner or an unknown name", () => {
     const d = new ExplorationBudgetDetector(2);
     d.observeStart("read");
     // A start alone is not progress: the call is still running.
@@ -193,7 +194,7 @@ describe("ExplorationBudgetDetector", () => {
     // A read-only call was counted at its start, so its own end changes nothing.
     d.observeEndWithoutError("read");
     expect(d.readOnlyCalls).toBe(1);
-    // An effect is a change or a report: its successful end resets.
+    // An effect is not a read: its successful end resets.
     d.observeEndWithoutError("flair_write");
     expect(d.readOnlyCalls).toBe(0);
     // A fresh run of read-only calls still injects at the limit.
