@@ -2,10 +2,9 @@
 // whose execution ended without an error, without a refusal, and with the
 // tool's own success evidence in its result.
 //
-// Two callers need the same answer — the exploration budget credits the call
-// that resets its count (bob#282) and the completion rule refuses to report a
-// builder run as finished without one (bob#283) — so the predicate lives here,
-// once, and both read this.
+// It lives in its own module, exported, so the exploration budget's check for
+// the call that resets its count (bob#282) can use it rather than a second copy
+// of the rule.
 //
 // A write-class row is not enough on its own. `run`/`bash`/`powershell` are
 // writer rows (a command can change anything) but they are commands, not file
