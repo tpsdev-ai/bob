@@ -1295,6 +1295,36 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
     return { launcher, pidFile };
   }
 
+  function lateResultLauncher(): {
+    launcher: string;
+    pidFile: string;
+    releaseFile: string;
+    attemptedFile: string;
+  } {
+    const pidFile = join(root, "late-holder.pid");
+    const releaseFile = join(root, "release-late-result");
+    const attemptedFile = join(root, "late-result-attempted");
+    const launcher = join(root, "late-result-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        `printf '%s' '{"bobMailTurn":1,"outcome":"final"'`,
+        // The test creates releaseFile only after the post-reap timer has fired
+        // and poll() has returned no-result. The descendant then completes a
+        // valid result line on the inherited stdout. Moving the copy only after
+        // cat returns records that the late write was attempted.
+        `sh -c 'trap "" TERM PIPE; while [ ! -e "${releaseFile}" ]; do sleep 0.01; done; printf "%s\\n" ",\\"text\\":\\"too-late\\"}" > "${attemptedFile}.pending"; cat "${attemptedFile}.pending" || true; mv "${attemptedFile}.pending" "${attemptedFile}"; exec sleep 60' &`,
+        `echo $! > ${pidFile}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    return { launcher, pidFile, releaseFile, attemptedFile };
+  }
+
   function exhaustedRunner(): Pick<
     MailConsumerOptions,
     "turnRunner" | "turnTimeoutMs" | "runTurn"
@@ -1441,6 +1471,44 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
         resultCollectedAfterReapExhausted: 1,
       });
       expect(h.logs.join("\n")).toContain("turn FAILED (no-result: launcher wrote no result line)");
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("a valid result written only after the post-reap timer fires is not used", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile, releaseFile, attemptedFile } = lateResultLauncher();
+    const h = harness({ launcherPath: launcher, ...exhaustedRunner() });
+
+    await h.consumer.poll();
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.logs.join("\n")).toContain("turn FAILED (no-result: launcher wrote no result line)");
+
+      // The valid completion is released only after the result timer settled
+      // the turn from the incomplete prefix that was available at expiry.
+      writeFileSync(releaseFile, "release\n");
+      const deadline = Date.now() + 2000;
+      while (!existsSync(attemptedFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const lateBytes = readFileSync(attemptedFile, "utf8");
+      expect(lateBytes).toBe(',"text":"too-late"}\n');
+      expect(JSON.parse(`{"bobMailTurn":1,"outcome":"final"${lateBytes}`)).toEqual({
+        bobMailTurn: 1,
+        outcome: "final",
+        text: "too-late",
+      });
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(inDir("cur")).toEqual([]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 0,
+        reapExhausted: 1,
+        resultCollectedAfterReapExhausted: 1,
+      });
     } finally {
       if (alive(holder)) process.kill(holder, "SIGKILL");
     }

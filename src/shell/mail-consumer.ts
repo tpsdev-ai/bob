@@ -139,10 +139,12 @@ const RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS = 250;
 // uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
 // with the group id and counted (`reapExhausted`). `close` is kept only to
 // collect the result, which arrives once the reaping has freed the pipes.
-// Once cleanup has given up and the launcher has exited, result collection
-// starts a timer set to fire RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS later. If that
-// timer fires while the turn is still active, a zero-exit launcher uses the
-// normal result parser on the bytes already read before Bob closes the output pipes.
+// Once cleanup has given up and the launcher has exited, if result collection
+// is still pending, Bob starts a timer set to fire
+// RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS later. If that timer fires while the turn
+// is still active, a zero-exit launcher uses the normal result parser on the
+// bytes already read before Bob closes the output pipes. The bytes read at
+// timer expiry decide the outcome; bytes written later are not used.
 // Stated limit: signals go to the numeric group id. POSIX keeps a group id in
 // use while any member lives, so it cannot name another group while a
 // descendant survives. Once every member has exited, the id is free: the window
