@@ -15,37 +15,27 @@
 import { expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { USER_AGENT } from "../../../src/capabilities/web/index.js";
+import {
+  PRIVATE_LOOPBACK_SKIP_REASON,
+  probePrivateLoopbackAlias,
+} from "./private-loopback-probe.js";
 
 const HARNESS = fileURLToPath(new URL("../../fixtures/web/fetch-harness.mjs", import.meta.url));
 const DIST_CORE = fileURLToPath(
   new URL("../../../dist/capabilities/web/index.js", import.meta.url),
 );
 const HARNESS_TIMEOUT_MS = 120_000;
-const PRIVATE_LOOPBACK_ALIAS = "127.0.0.2";
-const PRIVATE_LOOPBACK_SKIP_REASON = `missing loopback alias ${PRIVATE_LOOPBACK_ALIAS}`;
 
 // macOS does not provide every address in 127/8 as a bindable alias by
 // default. Probe the alias before registering the platform-gated assertion so
 // the skipped test names the exact missing prerequisite. The Node harness gets
 // the same result and omits only that case; every other case still has to run.
-const hasPrivateLoopbackAlias = await new Promise<boolean>((resolve) => {
-  const probe = createServer();
-  const finish = (available: boolean) => {
-    probe.removeAllListeners();
-    if (probe.listening) {
-      probe.close(() => resolve(available));
-      return;
-    }
-    resolve(available);
-  };
-  probe.once("error", () => finish(false));
-  probe.listen(0, PRIVATE_LOOPBACK_ALIAS, () => finish(true));
-});
+const redirectPrivateSkipReason = await probePrivateLoopbackAlias();
+const hasPrivateLoopbackAlias = redirectPrivateSkipReason === undefined;
 
 // A self-signed cert with an IP SAN, generated with openssl (the CI image ships
 // it). The harness gives it to both the HTTPS peer and the fetch core's TLS CA.
@@ -173,9 +163,6 @@ test(
         throw new Error(`the harness runs the built core; ${DIST_CORE} is missing — run the build`);
       }
       makeCert(tlsDir);
-      const redirectPrivateSkipReason = hasPrivateLoopbackAlias
-        ? undefined
-        : PRIVATE_LOOPBACK_SKIP_REASON;
       const { code, stdout, stderr } = await runHarness(tlsDir, redirectPrivateSkipReason);
       if (code !== 0) {
         throw new Error(`harness exited ${code}\nstdout: ${stdout}\nstderr: ${stderr}`);
