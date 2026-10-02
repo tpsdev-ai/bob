@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import {
   chmodSync,
   existsSync,
@@ -14,7 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { defaultStateRoot, JobManager } from "../../../src/capabilities/work/run.js";
+import { defaultStateRoot, JobManager, RunRefusal } from "../../../src/capabilities/work/run.js";
 
 let scratch: string;
 let savedState: string | undefined;
@@ -123,7 +124,9 @@ describe("private persistent work state", () => {
       mkdirSync(cwd);
       process.env.BOB_STATE_DIR = join(location === "workspace" ? cwd : repo, "state");
       manager = new JobManager();
-      await expect(manager.start({ command: "true" }, cwd)).rejects.toThrow(/inside/);
+      await expect(manager.start({ command: "true" }, cwd)).rejects.toThrow(
+        /state directory .* is inside/,
+      );
       expect(existsSync(process.env.BOB_STATE_DIR)).toBe(false);
     });
   }
@@ -138,6 +141,17 @@ describe("private persistent work state", () => {
     );
   });
 
+  it("names an explicit stateRoot as the state directory in a containment refusal", async () => {
+    delete process.env.BOB_STATE_DIR;
+    const workspace = join(scratch, "workspace");
+    const stateRoot = join(workspace, "state");
+    manager = new JobManager({ stateRoot });
+    await expect(manager.start({ command: "true" }, workspace)).rejects.toThrow(
+      `run refused: state directory (${stateRoot}) is inside`,
+    );
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
   it("removes scratch and partial records when the supervisor record cannot be written", async () => {
     manager = new JobManager({
       writeRecord: () => {
@@ -149,6 +163,85 @@ describe("private persistent work state", () => {
     );
     expect(readdirSync(tmpdir())).toEqual([]);
     expect(readdirSync(manager.stateRoot)).toEqual([]);
+  });
+
+  for (const failedRemoval of ["scratch", "run", "both"] as const) {
+    it(`preserves the storage refusal when ${failedRemoval} removal throws`, async () => {
+      let run = "";
+      let out = "";
+      manager = new JobManager({
+        writeRecord: (path, value) => {
+          run = dirname(path);
+          out = (value as { scratch_dir: string }).scratch_dir;
+          throw Object.assign(new Error("allocation failed"), { code: "EIO" });
+        },
+      });
+      const attempts: string[] = [];
+      const remove = fs.rmSync;
+      const removal = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+        const target = String(path);
+        attempts.push(target);
+        if (failedRemoval === "both" || target === (failedRemoval === "scratch" ? out : run)) {
+          throw Object.assign(new Error("removal failed"), { code: "EACCES" });
+        }
+        remove(path, options);
+      });
+      let caught: unknown;
+      try {
+        await manager.start({ command: "touch started" }, join(scratch, "workspace"));
+      } catch (err) {
+        caught = err;
+      } finally {
+        removal.mockRestore();
+      }
+      expect(attempts).toEqual([out, run]);
+      expect(caught).toBeInstanceOf(RunRefusal);
+      const message = (caught as Error).message;
+      expect(message).toStartWith("run refused: private run storage could not be created (EIO).");
+      for (const path of [out, run]) {
+        const failed =
+          failedRemoval === "both" || path === (failedRemoval === "scratch" ? out : run);
+        expect(existsSync(path)).toBe(failed);
+        if (failed) expect(message).toContain(`Cleanup could not remove ${path} (EACCES).`);
+      }
+      expect(manager.runDir).toBeNull();
+      expect(existsSync(join(scratch, "workspace", "started"))).toBe(false);
+    });
+  }
+
+  it("rethrows the original RunRefusal after attempting both removals", async () => {
+    const refusal = new RunRefusal("run refused: injected allocation refusal.");
+    let run = "";
+    let out = "";
+    manager = new JobManager({
+      writeRecord: (path, value) => {
+        run = dirname(path);
+        out = (value as { scratch_dir: string }).scratch_dir;
+        throw refusal;
+      },
+    });
+    const attempts: string[] = [];
+    const remove = fs.rmSync;
+    const removal = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+      attempts.push(String(path));
+      if (String(path) === out) {
+        throw Object.assign(new Error("removal failed"), { code: "EACCES" });
+      }
+      remove(path, options);
+    });
+    let caught: unknown;
+    try {
+      await manager.start({ command: "true" }, join(scratch, "workspace"));
+    } catch (err) {
+      caught = err;
+    } finally {
+      removal.mockRestore();
+    }
+    expect(attempts).toEqual([out, run]);
+    expect(caught).toBe(refusal);
+    expect(refusal.message).toStartWith("run refused: injected allocation refusal.");
+    expect(refusal.message).toContain(`Cleanup could not remove ${out} (EACCES).`);
+    expect(existsSync(run)).toBe(false);
   });
 
   it("sweeps a crashed run's captures after TMPDIR changes", async () => {

@@ -224,12 +224,13 @@ locations inside the workspace or repository are refused. The old
 - **Boot sweep.** When the capability loads, it looks at every earlier run:
   - An **ended** run's records are deleted after 24 hours, regardless of its
     supervisor's pid.
-  - A run whose supervisor is **gone** — its pid is dead; or the pid is this
+  - The sweep attempts to mark a run ended when its supervisor is **gone** —
+    its pid is dead; or the pid is this
     process but the instance id is another's; or the pid is live but no longer
     has the pinned identity; or its identity cannot be compared (none on
     record, or the read could not tell) and the heartbeat is more than 10
-    minutes stale — is marked ended, and each job still recorded as running is
-    reported. An identity read that fails for any
+    minutes stale — and reports each job still recorded as running.
+    An identity read that fails for any
     reason other than "no such process" means "cannot tell", never "replaced".
   - For ended or gone-supervisor runs, captures are deleted only from a
     non-symlink, same-owner directory with no group/world permissions, named

@@ -971,7 +971,7 @@ export class JobManager {
     }
     for (const root of roots) {
       for (const [name, path] of [
-        ["BOB_STATE_DIR", this.stateRoot],
+        ["state directory", this.stateRoot],
         ["TMPDIR", tmpdir()],
       ]) {
         if (isInside(root, path)) {
@@ -1006,11 +1006,21 @@ export class JobManager {
         scratch_ino: String(scratch.ino),
       });
     } catch (err) {
-      if (out) rmSync(out, { recursive: true, force: true });
-      if (run) rmSync(run, { recursive: true, force: true });
-      throw new RunRefusal(
-        `run refused: private run storage could not be created (${errCode(err)}).`,
-      );
+      const refusal =
+        err instanceof RunRefusal
+          ? err
+          : new RunRefusal(
+              `run refused: private run storage could not be created (${errCode(err)}).`,
+            );
+      for (const path of [out, run]) {
+        if (!path) continue;
+        try {
+          rmSync(path, { recursive: true, force: true });
+        } catch (cleanupError) {
+          refusal.message += ` Cleanup could not remove ${path} (${errCode(cleanupError)}).`;
+        }
+      }
+      throw refusal;
     }
     const dirs = { run, jobs: join(run, "jobs"), out };
     // The heartbeat: the run record's mtime, refreshed while this run lives.
@@ -1747,8 +1757,7 @@ export class JobManager {
       const ended = readJson(endedPath);
       const endedAt = typeof ended?.ended_at === "string" ? Date.parse(ended.ended_at) : Number.NaN;
       if (!Number.isNaN(endedAt)) {
-        // An ENDED run is swept by the retention bound alone, whoever holds its
-        // supervisor's pid now: captures go at once, records after the bound.
+        // Check scratch before removal; delete ended records after the retention bound.
         this.removeStaleScratch(meta);
         if (now - endedAt > REGISTRY_RETENTION_MS) rmSync(dir, { recursive: true, force: true });
         continue;
