@@ -1150,9 +1150,10 @@ function countFiles(dir: string): number {
 
 // bob#279: the last run log in a runs/ directory (newest by mtime), and the
 // outcome it recorded, for doctor's last-run line. It reads the tail BACKWARD in
-// fixed chunks and stops at the first `outcome` and `done` records, so a huge
-// log is not read whole; the bound is RUN_LOG_SCAN_MAX_BYTES. Returns undefined
-// when there is no runs directory or no log.
+// fixed chunks and stops once it has found both the last `outcome` field and
+// the last `done` record — or when the scan reaches RUN_LOG_SCAN_MAX_BYTES — so
+// a huge log is not read whole. Returns undefined when there is no runs
+// directory or no log.
 export function readLastRunSummary(
   runsDir: string,
 ): { file: string; outcome?: unknown; exitCode?: number } | undefined {

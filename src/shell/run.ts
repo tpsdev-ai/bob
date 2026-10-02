@@ -1035,7 +1035,8 @@ async function runBoundedSession(
   // bob#279: a second, independent stop — the exploration budget — rejects the
   // same turn when a run of read-only calls with no edit reaches twice its
   // limit, after the runtime has injected its instruction. Either stop aborts
-  // `loopController`; the error it carries is whichever stop fired.
+  // `loopController`; when both have fired the error is the loop breaker's
+  // (checked first below), else the exploration budget's.
   const loopDetector = new ToolLoopDetector(toolLoopLimit);
   const explorationDetector =
     explorationLimit !== undefined ? new ExplorationBudgetDetector(explorationLimit) : undefined;

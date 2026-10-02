@@ -32,8 +32,8 @@ import { TOOL_EFFECTS } from "./tool-allowlist.js";
 /**
  * The exploration budget `builder-local` ships (roles/builder-local/role.json
  * `exploration_budget`): consecutive read-only calls before the runtime injects
- * its instruction, and again before the run ends. The value the issue measured
- * runs against.
+ * its instruction, and again before the run ends. The default the issue names
+ * for that role.
  */
 export const BUILDER_LOCAL_EXPLORATION_BUDGET = 20;
 
@@ -54,8 +54,8 @@ export class ExplorationBudgetError extends Error {
 }
 
 /**
- * A positive whole number of calls, or undefined for "not one". Used by the
- * role.json and bob.yaml readers so both refuse the same shapes.
+ * A positive whole number of calls, or undefined for "not one". The role.json
+ * reader refuses a role that names a budget in any other shape, naming the file.
  */
 export function parseExplorationBudget(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return undefined;
