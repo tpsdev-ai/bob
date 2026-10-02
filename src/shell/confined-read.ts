@@ -41,8 +41,8 @@
 // A write resolves its target inside the workspace root, then opens it
 // (O_NOFOLLOW) and uses the descriptor only when its device + inode are the
 // checked entry's; `edit`'s write also requires the identity its read saw. It
-// closes a FINAL component swapped for a symlink or for another file between the
-// check and the open/write. It is an IN-PROCESS guard against MODEL MISTAKES,
+// closes the checked canonical path's FINAL component swapped for a symlink or
+// another file between the check and the open/write. It is an IN-PROCESS guard against MODEL MISTAKES,
 // not a sandbox: a same-user process with write access to the workspace is
 // outside what it can stop. That is the OS boundary's job (bob#189, bob under
 // nono).
@@ -545,7 +545,8 @@ export async function openCheckedReadTarget(
 
 // Open the CHECKED canonical path and verify the descriptor is the checked entry
 // (device + inode, still a regular file) before anything is read from it or
-// written through it. O_NOFOLLOW refuses a FINAL component swapped for a symlink;
+// written through it. O_NOFOLLOW refuses the checked canonical path's FINAL
+// component swapped for a symlink;
 // the fstat comparison refuses a DIFFERENT file; `expected` refuses a file that
 // changed since the caller's own earlier check (the read of an `edit`). A
 // replaced ancestor directory is not detected (see the header).

@@ -1,6 +1,6 @@
 // bob#273 — `edit` and `replace_lines` bind their read and their write to the
-// workspace entry they checked. A target swapped between the check and the bound
-// open is refused, and nothing outside the workspace is written. The swap is
+// workspace entry they checked. A checked canonical path's final component
+// swapped between the check and the bound open is refused. The swap is
 // deterministic: a test hook runs in the window the binding closes.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
@@ -119,7 +119,7 @@ describe("edit / replace_lines bind the write to the checked entry (bob#273)", (
     expect(readFileSync(join(ws, "f.ts"), "utf8")).toBe("OTHER\n");
   });
 
-  it("the normal paths are unchanged (a no-op hook present)", async () => {
+  it("simple in-workspace edit and replace_lines paths work (a no-op hook present)", async () => {
     writeFileSync(join(ws, "f.ts"), "l1\nl2\n");
     const edit = createTolerantEditToolDefinition(
       ws,
@@ -159,6 +159,17 @@ describe("edit is confined to the workspace root (bob#273)", () => {
       run(tool, { path: join(outside, "out.ts"), edits: [{ oldText: "OUT", newText: "X" }] }),
     ).rejects.toThrow(/refusing to write/);
     expect(readFileSync(join(outside, "out.ts"), "utf8")).toBe("OUT\n");
+  });
+
+  it("an outside-path edit preview request has no file-reading renderer", () => {
+    const path = join(outside, "out.ts");
+    writeFileSync(path, "OUT\n");
+    const tool = createTolerantEditToolDefinition(ws) as {
+      renderCall?: (input: unknown) => unknown;
+    };
+    const request = { path, edits: [{ oldText: "OUT", newText: "X" }] };
+    expect(tool.renderCall).toBeUndefined();
+    expect(tool.renderCall?.(request)).toBeUndefined();
   });
 
   it("refuses a `..` escape out of the workspace root", async () => {

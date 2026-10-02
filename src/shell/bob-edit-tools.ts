@@ -32,8 +32,9 @@
 // refused), opens it with O_NOFOLLOW, and works from the descriptor only when
 // its device and inode are the checked entry's; the write also requires the
 // identity the read saw. `replace_lines` does the same with one O_RDWR
-// descriptor it both reads and writes through. This closes a FINAL component
-// swapped for a symlink or for another file between the check and the
+// descriptor it both reads and writes through. The edit call's inherited diff
+// preview is disabled because it reads without these checks. This closes the
+// checked canonical path's FINAL component swapped between the check and the
 // open/write; an intermediate directory swapped for a symlink between the check
 // and the open is NOT detected when the new path still leads to the same device
 // and inode (Node exposes no openat on any platform this runs on, and O_NOFOLLOW
@@ -41,6 +42,7 @@
 // against MODEL MISTAKES: a hostile local process that can write the workspace
 // is the OS boundary's job (bob#189, bob under nono), not this.
 
+import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
   createEditToolDefinition,
@@ -79,10 +81,27 @@ interface CapturingOps {
   check: (input: unknown) => void;
 }
 
-// A test seam: runs after a target is checked and before it is opened, in the
-// window the binding closes. Production passes nothing.
+// Test seams for the check-to-open window, the verified-read-to-write window,
+// and short writes. Production passes nothing.
 export interface EditWriteHooks {
   betweenCheckAndOpen?: (canonicalPath: string, phase: "read" | "write") => void | Promise<void>;
+  afterVerifiedRead?: (canonicalPath: string) => void | Promise<void>;
+  wrapOpenedFileHandle?: (handle: FileHandle, phase: "read" | "write") => FileHandle;
+}
+
+export class IncompleteWriteError extends Error {
+  override name = "IncompleteWriteError";
+}
+
+async function writeAll(fh: FileHandle, bytes: Buffer, path: string): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesWritten } = await fh.write(bytes, offset, bytes.length - offset, offset);
+    if (bytesWritten <= 0) {
+      throw new IncompleteWriteError(`bob: incomplete write to ${path}: no progress`);
+    }
+    offset += bytesWritten;
+  }
 }
 
 // pi's edit operations, bound to the checked workspace entry. Each operation
@@ -107,10 +126,11 @@ function boundEditOperations(cwd: string, hooks: EditWriteHooks | undefined): Ca
   ) => {
     const checked = checkWriteTargetVerified(absolutePath, cwd);
     await hooks?.betweenCheckAndOpen?.(checked.path, phase);
-    return openVerifiedWriteTarget(checked, absolutePath, {
+    const fh = await openVerifiedWriteTarget(checked, absolutePath, {
       ...(phase === "read" ? { readOnly: true } : {}),
       ...(expected !== undefined ? { expected } : {}),
     });
+    return hooks?.wrapOpenedFileHandle?.(fh, phase) ?? fh;
   };
   return {
     operations: {
@@ -125,6 +145,7 @@ function boundEditOperations(cwd: string, hooks: EditWriteHooks | undefined): Ca
           const st = await fh.stat({ bigint: true });
           readIdentity = { dev: st.dev, ino: st.ino };
           captured = buffer.toString("utf-8");
+          await hooks?.afterVerifiedRead?.(absolutePath);
           refuseAmbiguousOldTextBeforePiMatch(
             captured,
             pending?.edits,
@@ -140,7 +161,7 @@ function boundEditOperations(cwd: string, hooks: EditWriteHooks | undefined): Ca
         try {
           const bytes = Buffer.from(text, "utf-8");
           await fh.truncate(0);
-          await fh.write(bytes, 0, bytes.length, 0);
+          await writeAll(fh, bytes, absolutePath);
         } finally {
           await fh.close();
         }
@@ -176,6 +197,9 @@ export function createTolerantEditToolDefinition(
   const base = createEditToolDefinition(cwd);
   return {
     ...base,
+    // pi's inherited call renderer reads the requested path for a diff preview
+    // without using our checked operations. Let pi render this call generically.
+    renderCall: undefined,
     async execute(
       callId: string,
       input: unknown,
@@ -229,8 +253,8 @@ function lineSpans(content: string): Array<{ start: number; end: number }> {
 
 // `replace_lines` reads and writes through ONE O_RDWR descriptor, opened
 // O_NOFOLLOW after the target is checked and used only while its device and
-// inode are the checked entry's: a FINAL component swapped for a symlink or for
-// another file between the check and the open is refused, and nothing is written.
+// inode are the checked entry's: the checked canonical path's FINAL component
+// swapped for a symlink or another file before the open is refused.
 // `hooks` is a test seam (see EditWriteHooks); production passes none.
 export function createReplaceLinesToolDefinition(
   cwd: string,
@@ -267,7 +291,7 @@ export function createReplaceLinesToolDefinition(
       };
       // Confine the write to the run's workspace root: a relative path resolves
       // against it, and a path that resolves outside it (absolute, through `..`
-      // or through a symlink) is refused before any read or write. An absolute
+      // or through a symlink) is refused before reading file content or writing. An absolute
       // path inside the root is accepted. The checked entry's identity binds the
       // read and the write that follow to it.
       const requested = isAbsolute(path) ? path : resolve(cwd, path);
@@ -276,11 +300,13 @@ export function createReplaceLinesToolDefinition(
       // all see the same turn's preceding mutations before the next one starts.
       return withFileMutationQueue(checked.path, async () => {
         await hooks?.betweenCheckAndOpen?.(checked.path, "write");
-        const fh = await openVerifiedWriteTarget(checked, path);
+        const opened = await openVerifiedWriteTarget(checked, path);
+        const fh = hooks?.wrapOpenedFileHandle?.(opened, "write") ?? opened;
         try {
           let text: string;
           try {
             text = (await fh.readFile()).toString("utf-8");
+            await hooks?.afterVerifiedRead?.(checked.path);
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             throw new Error(`replace_lines: could not read ${path}: ${message}`);
@@ -313,7 +339,7 @@ export function createReplaceLinesToolDefinition(
               : newText;
           const bytes = Buffer.from(text.slice(0, from) + replacement + text.slice(to), "utf-8");
           await fh.truncate(0);
-          await fh.write(bytes, 0, bytes.length, 0);
+          await writeAll(fh, bytes, path);
           return {
             content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
           };
