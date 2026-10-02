@@ -17,9 +17,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readWorktreeStatusResult } from "../../src/shell/compaction-contract.js";
+import { readLastRunSummary, runDoctor } from "../../src/shell/doctor.js";
+import * as evidence from "../../src/shell/edit-evidence.js";
 import { captureRepositoryState, isVerifiedEdit } from "../../src/shell/edit-evidence.js";
 import { initOverrideRepo } from "../../src/shell/overrides.js";
 import { type RunSession, runAgent } from "../../src/shell/run.js";
+
+const WHOLE_FILE_HASH_CAP_BYTES = 1024 * 1024;
 
 const gitEnv = {
   ...process.env,
@@ -117,6 +121,121 @@ describe("repository evidence in the completion gate and exploration budget", ()
       sessionFactory: async () => session(calls, finalAction),
     });
 
+  it("re-hashes only the edited file across tool observations and completion", async () => {
+    writeFileSync(join(cwd, "other"), "other bytes\n");
+    writeFileSync(join(cwd, "third"), "third bytes\n");
+    commit(cwd, launchHead);
+    const read = spyOn(fs, "readFileSync");
+    try {
+      const result = await run([
+        { toolName: "read" },
+        { toolName: "bash", action: () => writeFileSync(join(cwd, "tracked"), "new edit\n") },
+        { toolName: "read" },
+      ]);
+      expect(result.exitCode).toBe(0);
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(4);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it.each(["run", "bash"])(
+    "credits a committed %s edit when launch enumeration exceeds a lowered limit",
+    async (toolName) => {
+      writeFileSync(join(cwd, "tracked"), "second commit\n");
+      launchHead = commit(cwd, launchHead);
+      const capture = evidence.captureRepositoryState;
+      const probe = spyOn(evidence, "captureRepositoryState").mockImplementation((path, launch) =>
+        capture(path, launch, { launchCommitLimit: 1 }),
+      );
+      try {
+        const result = await run(
+          [
+            { toolName: "read" },
+            {
+              toolName,
+              action: () => {
+                writeFileSync(join(cwd, "tracked"), "committed edit\n");
+                commit(cwd, launchHead);
+              },
+            },
+            { toolName: "read" },
+            { toolName: "read" },
+          ],
+          undefined,
+          2,
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.explorationBudgetExhausted).toBeUndefined();
+        const summary = readLastRunSummary(join(agentsRoot, "builder", "runs"));
+        expect(summary?.repositoryHistoryCheckSkipped).toBe("limit");
+        const diagnosis = await runDoctor({
+          name: "builder",
+          agentsRoot,
+          homeDir: agentsRoot,
+          pathEnv: "",
+        });
+        expect(
+          diagnosis.checks.find((check) => check.name === "repository history check")?.detail,
+        ).toBe("skipped: limit");
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it("denies an unchanged run when launch enumeration exceeds a lowered limit", async () => {
+    writeFileSync(join(cwd, "tracked"), "second commit\n");
+    commit(cwd, launchHead);
+    const capture = evidence.captureRepositoryState;
+    const probe = spyOn(evidence, "captureRepositoryState").mockImplementation((path, launch) =>
+      capture(path, launch, { launchCommitLimit: 1 }),
+    );
+    try {
+      const result = await run([{ toolName: "run" }]);
+      expect(result.noEditNoBlocked).toBe(true);
+      expect(
+        readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+      ).toBe("limit");
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("streams files above the whole-file cap with the Git blob hash", () => {
+    writeFileSync(join(cwd, "tracked"), Buffer.alloc(WHOLE_FILE_HASH_CAP_BYTES + 1, 0x61));
+    const expected = git(cwd, "hash-object", "tracked");
+    const read = spyOn(fs, "readFileSync");
+    const stream = spyOn(fs, "readSync");
+    try {
+      const state = captureRepositoryState(cwd);
+      expect(state.kind).toBe("git");
+      if (state.kind !== "git") throw new Error("missing repository evidence");
+      expect(state.tracked.get("tracked")?.object).toBe(expected);
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(0);
+      expect(stream.mock.calls.length).toBeGreaterThan(1);
+      expect(stream.mock.calls.every(([, chunk]) => chunk.byteLength <= 64 * 1024)).toBe(true);
+    } finally {
+      read.mockRestore();
+      stream.mockRestore();
+    }
+  });
+
+  it("invalidates cached bytes after a same-size edit with restored mtime", () => {
+    const before = captureRepositoryState(cwd);
+    const stat = fs.statSync(join(cwd, "tracked"));
+    writeFileSync(join(cwd, "tracked"), "replaced\n");
+    fs.utimesSync(join(cwd, "tracked"), stat.atime, stat.mtime);
+    const read = spyOn(fs, "readFileSync");
+    try {
+      const after = captureRepositoryState(cwd, before);
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(true);
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(1);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it.each([0o644, 0o755])("records regular-file bytes and mode %s", (mode) => {
     const clean = captureRepositoryState(cwd);
     expect(clean.kind).toBe("git");
@@ -139,7 +258,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
     expect(before.kind).toBe("git");
     const fstat = fs.fstatSync;
     const probe = spyOn(fs, "fstatSync").mockImplementation((fd) => {
-      const stat = fstat(fd);
+      const stat = fstat(fd, { bigint: true });
       renameSync(join(cwd, "tracked"), join(agentsRoot, "opened"));
       writeFileSync(join(agentsRoot, "replacement"), "replacement bytes\n");
       symlinkSync(join(agentsRoot, "replacement"), join(cwd, "tracked"));
@@ -172,6 +291,32 @@ describe("repository evidence in the completion gate and exploration budget", ()
     launchHead = commit(cwd, launchHead);
     return parent;
   }
+
+  it("rechecks shared parents after cached observations", () => {
+    const parent = nestedFixture();
+    const before = captureRepositoryState(cwd);
+    const external = join(agentsRoot, "external");
+    mkdirSync(external);
+    writeFileSync(join(external, "file"), "external bytes\n");
+    const canonicalFile = join(fs.realpathSync(cwd), "dir", "file");
+    const lstat = fs.lstatSync;
+    const probe = spyOn(fs, "lstatSync").mockImplementation((...args) => {
+      const stat = lstat(...args);
+      if (Buffer.isBuffer(args[0]) && args[0].toString() === canonicalFile) {
+        renameSync(parent, join(agentsRoot, "saved-parent"));
+        symlinkSync(external, parent);
+      }
+      return stat;
+    });
+    const read = spyOn(fs, "readFileSync");
+    try {
+      expect(captureRepositoryState(cwd, before).kind).toBe("unavailable");
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(0);
+    } finally {
+      probe.mockRestore();
+      read.mockRestore();
+    }
+  });
 
   it.each(["completion", "exploration"])(
     "ignores external changes through a symlinked parent for %s",
@@ -433,39 +578,52 @@ describe("repository evidence in the completion gate and exploration budget", ()
     },
   );
 
-  it.each(["failure", "overflow"])("fails closed on launch history %s", async (kind) => {
-    const spawn = childProcess.spawnSync;
-    const tree = git(cwd, "rev-parse", "HEAD^{tree}");
-    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
-      if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
-        const result = spawn(...args);
-        return {
-          ...result,
-          status: kind === "failure" ? 1 : 0,
-          stdout: Buffer.from(`${tree}\n`.repeat(10_001)),
-        };
+  it.each(["failure", "overflow", "timeout"])(
+    "preserves content evidence on launch history %s",
+    async (kind) => {
+      const spawn = childProcess.spawnSync;
+      const tree = git(cwd, "rev-parse", "HEAD^{tree}");
+      const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+        if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
+          const result = spawn(...args);
+          return {
+            ...result,
+            status: kind === "failure" || kind === "timeout" ? 1 : 0,
+            error:
+              kind === "timeout"
+                ? Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })
+                : undefined,
+            stdout: Buffer.from(`${tree}\n`.repeat(10_001)),
+          };
+        }
+        return spawn(...args);
+      });
+      try {
+        for (const gate of ["completion", "exploration"]) {
+          const result = await run(
+            [
+              {
+                toolName: "run",
+                action: () => writeFileSync(join(cwd, "tracked"), `new edit ${gate}\n`),
+              },
+              { toolName: "read" },
+              { toolName: "read" },
+              { toolName: "read" },
+            ],
+            undefined,
+            gate === "exploration" ? 2 : 20,
+          );
+          expect(result.exitCode).toBe(0);
+          expect(result.explorationBudgetExhausted).toBeUndefined();
+          expect(
+            readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+          ).toBe(kind === "failure" ? "unavailable" : kind === "overflow" ? "limit" : "timeout");
+        }
+      } finally {
+        probe.mockRestore();
       }
-      return spawn(...args);
-    });
-    try {
-      for (const gate of ["completion", "exploration"]) {
-        const result = await run(
-          [
-            { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "new edit\n") },
-            { toolName: "read" },
-            { toolName: "read" },
-            { toolName: "read" },
-          ],
-          undefined,
-          gate === "exploration" ? 2 : 20,
-        );
-        if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
-        else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
-      }
-    } finally {
-      probe.mockRestore();
-    }
-  });
+    },
+  );
 
   it.each(["sha1", "sha256"])("matches Git trees without touching the index (%s)", (format) => {
     rmSync(join(cwd, ".git"), { recursive: true });

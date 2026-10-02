@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   fstatSync,
@@ -8,6 +9,7 @@ import {
   openSync,
   readFileSync,
   readlinkSync,
+  readSync,
   realpathSync,
   type Stats,
 } from "node:fs";
@@ -92,6 +94,7 @@ export type RepositoryState =
       tree: string;
       launchTrees: Set<string>;
       objectFormat: "sha1" | "sha256";
+      historyCheckSkipped?: "limit" | "timeout" | "unavailable";
     } & RepositoryIdentity)
   | { kind: "not a git work tree" | "unavailable" };
 
@@ -101,7 +104,7 @@ export interface RepositoryEditEvidence {
   after: RepositoryState;
 }
 
-function git(cwd: string, args: string[], repository?: RepositoryIdentity) {
+function git(cwd: string, args: string[], repository?: RepositoryIdentity, timeout = 5_000) {
   return spawnSync(
     "git",
     [
@@ -122,7 +125,7 @@ function git(cwd: string, args: string[], repository?: RepositoryIdentity) {
       env: gitEnvironment(),
       encoding: "buffer",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 5_000,
+      timeout,
       maxBuffer: 16 * 1024 * 1024,
     },
   );
@@ -152,6 +155,41 @@ function sameRepository(left: RepositoryIdentity, right: RepositoryIdentity): bo
 }
 
 type TrackedEntry = { mode: string; object: string };
+
+export const WHOLE_FILE_HASH_CAP_BYTES = 1024 * 1024;
+const HASH_CHUNK_BYTES = 64 * 1024;
+type StatKey = Pick<BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs" | "mode">;
+type ContentCache = Map<string, { stat: StatKey; entry: TrackedEntry }>;
+const contentCaches = new WeakMap<RepositoryState, ContentCache>();
+
+function sameStat(left: StatKey, right: StatKey): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.mode === right.mode
+  );
+}
+
+function hashFile(fd: number, stat: BigIntStats, objectFormat: "sha1" | "sha256"): string {
+  const hash = createHash(objectFormat).update(`blob ${stat.size}\0`);
+  if (stat.size <= BigInt(WHOLE_FILE_HASH_CAP_BYTES)) {
+    return hash.update(readFileSync(fd)).digest("hex");
+  }
+  const chunk = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+  let size = 0n;
+  for (;;) {
+    const read = readSync(fd, chunk, 0, chunk.length, null);
+    if (read === 0) break;
+    size += BigInt(read);
+    if (size > stat.size) throw new Error("tracked file grew during hashing");
+    hash.update(chunk.subarray(0, read));
+  }
+  if (size !== stat.size) throw new Error("tracked file shrank during hashing");
+  return hash.digest("hex");
+}
 
 function trackedEntries(output: Buffer): Map<string, TrackedEntry> {
   const entries = new Map<string, TrackedEntry>();
@@ -186,13 +224,19 @@ function parentStat(path: Buffer): Stats | undefined {
   }
 }
 
-function trackedParents(absolute: Buffer) {
+function trackedParents(
+  absolute: Buffer,
+  observed?: Map<string, { path: Buffer; stat: Stats | undefined }>,
+) {
   const parents: { path: Buffer; stat: Stats | undefined }[] = [];
   for (let end = 1; end < absolute.length; end++) {
     if (end !== 1 && absolute[end] !== 0x2f) continue;
     const path = absolute.subarray(0, end);
-    const stat = parentStat(path);
-    parents.push({ path, stat });
+    const key = path.toString("latin1");
+    const observation = observed?.get(key) ?? { path, stat: parentStat(path) };
+    observed?.set(key, observation);
+    const { stat } = observation;
+    parents.push(observation);
     if (!stat?.isDirectory()) return { parents, available: false };
   }
   return { parents, available: true };
@@ -214,12 +258,14 @@ function trackedContent(
   repository: RepositoryIdentity,
   objectFormat: "sha1" | "sha256",
   launch?: Map<string, TrackedEntry>,
+  cache: ContentCache = new Map(),
 ): Map<string, TrackedEntry> {
   const { workTree } = repository;
   const index = trackedEntries(
     readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository),
   );
   const content = new Map<string, TrackedEntry>();
+  const observedParents = new Map<string, { path: Buffer; stat: Stats | undefined }>();
   const paths = [...new Set([...(launch?.keys() ?? []), ...index.keys()])].sort();
   for (const path of paths) {
     const name = Buffer.from(path, "latin1");
@@ -228,26 +274,41 @@ function trackedContent(
     let mode = "deleted";
     let bytes = Buffer.alloc(0);
     let object = "";
-    let stat: Stats | undefined;
+    let stat: BigIntStats | undefined;
     let fd: number | undefined;
-    const { parents, available } = trackedParents(absolute);
+    let { parents, available } = trackedParents(absolute, observedParents);
     try {
       if (available) {
+        let current: BigIntStats | undefined;
+        try {
+          current = lstatSync(absolute, { bigint: true });
+        } catch (error) {
+          if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? ""))
+            throw error;
+        }
+        const cached = cache.get(path);
+        if (current && cached && sameStat(current, cached.stat)) {
+          content.set(path, cached.entry);
+          continue;
+        }
+        cache.delete(path);
+        ({ parents, available } = trackedParents(absolute));
+        if (!available) throw new Error("tracked parent changed before hashing");
         try {
           fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code ?? "";
-          if (code === "ELOOP") stat = lstatSync(absolute);
+          if (code === "ELOOP") stat = lstatSync(absolute, { bigint: true });
           else if (!["ENOENT", "ENOTDIR"].includes(code)) throw error;
         }
       }
-      if (fd !== undefined) stat = fstatSync(fd);
+      if (fd !== undefined) stat = fstatSync(fd, { bigint: true });
       if (stat?.isSymbolicLink()) {
         mode = "120000";
         bytes = readlinkSync(absolute, { encoding: "buffer" });
       } else if (fd !== undefined && stat?.isFile()) {
-        mode = stat.mode & 0o111 ? "100755" : "100644";
-        bytes = readFileSync(fd);
+        mode = stat.mode & 0o111n ? "100755" : "100644";
+        object = hashFile(fd, stat, objectFormat);
       } else if (stat?.isDirectory() && (index.get(path) ?? baseline)?.mode === "160000") {
         mode = "160000";
         const childPath = absolute.toString();
@@ -265,38 +326,57 @@ function trackedContent(
     } finally {
       if (fd !== undefined) closeSync(fd);
     }
-    if (mode !== "deleted" && mode !== "160000") {
+    if (mode === "120000") {
       object = createHash(objectFormat)
         .update(`blob ${bytes.length}\0`)
         .update(bytes)
         .digest("hex");
     }
-    content.set(path, { mode, object });
+    const entry = { mode, object };
+    content.set(path, entry);
+    if (stat?.isFile() || stat?.isSymbolicLink()) cache.set(path, { stat, entry });
+    else cache.delete(path);
   }
+  recheckParents([...observedParents.values()]);
   return content;
 }
 
 const LAUNCH_COMMIT_LIMIT = 10_000;
 
-function launchTrees(repository: RepositoryIdentity): Set<string> {
-  const output = gitLine(
+export interface RepositoryCaptureOptions {
+  launchCommitLimit?: number;
+  historyTimeoutMs?: number;
+}
+
+function launchTrees(
+  repository: RepositoryIdentity,
+  options: RepositoryCaptureOptions,
+): {
+  trees: Set<string>;
+  historyCheckSkipped?: "limit" | "timeout" | "unavailable";
+} {
+  const limit = options.launchCommitLimit ?? LAUNCH_COMMIT_LIMIT;
+  const result = git(
     repository.workTree,
-    [
-      "rev-list",
-      "--all",
-      `--max-count=${LAUNCH_COMMIT_LIMIT + 1}`,
-      "--format=%T",
-      "--no-commit-header",
-    ],
+    ["rev-list", "--all", `--max-count=${limit + 1}`, "--format=%T", "--no-commit-header"],
     repository,
+    options.historyTimeoutMs,
   );
-  const trees = output.split("\n");
-  if (
-    trees.length > LAUNCH_COMMIT_LIMIT ||
-    trees.some((tree) => !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(tree))
-  )
-    throw new Error("launch history unavailable or exceeds bound");
-  return new Set(trees);
+  if (result.error || result.status !== 0) {
+    return {
+      trees: new Set(),
+      historyCheckSkipped:
+        (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+          ? "timeout"
+          : "unavailable",
+    };
+  }
+  const output = result.stdout.toString();
+  const trees = output.endsWith("\n") ? output.slice(0, -1).split("\n") : [];
+  if (trees.length > limit) return { trees: new Set(), historyCheckSkipped: "limit" };
+  if (!output.endsWith("\n") || trees.some((tree) => !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(tree)))
+    return { trees: new Set(), historyCheckSkipped: "unavailable" };
+  return { trees: new Set(trees) };
 }
 
 function contentTree(content: Map<string, TrackedEntry>, objectFormat: "sha1" | "sha256"): string {
@@ -353,7 +433,11 @@ function sameContent(left: Map<string, TrackedEntry>, right: Map<string, Tracked
   return true;
 }
 
-export function captureRepositoryState(cwd: string, launch?: RepositoryState): RepositoryState {
+export function captureRepositoryState(
+  cwd: string,
+  launch?: RepositoryState,
+  options: RepositoryCaptureOptions = {},
+): RepositoryState {
   if (launch && launch.kind !== "git") return { kind: "unavailable" };
   try {
     const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
@@ -376,15 +460,30 @@ export function captureRepositoryState(cwd: string, launch?: RepositoryState): R
         : gitLine(cwd, ["rev-parse", "--show-object-format"], repository);
     if (objectFormat !== "sha1" && objectFormat !== "sha256")
       throw new Error("unsupported object format");
-    const trees = launch?.kind === "git" ? launch.launchTrees : launchTrees(repository);
+    const history =
+      launch?.kind === "git"
+        ? { trees: launch.launchTrees, historyCheckSkipped: launch.historyCheckSkipped }
+        : launchTrees(repository, options);
+    const cache = (launch && contentCaches.get(launch)) ?? new Map();
     const tracked = trackedContent(
       repository,
       objectFormat,
       launch?.kind === "git" ? launch.tracked : undefined,
+      cache,
     );
     const tree = contentTree(tracked, objectFormat);
     if (!sameRepository(repository, resolveRepository(cwd))) return { kind: "unavailable" };
-    return { kind: "git", ...repository, tracked, tree, launchTrees: trees, objectFormat };
+    const state: RepositoryState = {
+      kind: "git",
+      ...repository,
+      tracked,
+      tree,
+      launchTrees: history.trees,
+      objectFormat,
+      ...(history.historyCheckSkipped ? { historyCheckSkipped: history.historyCheckSkipped } : {}),
+    };
+    contentCaches.set(state, cache);
+    return state;
   } catch {
     return { kind: "unavailable" };
   }

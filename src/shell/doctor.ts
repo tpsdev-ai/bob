@@ -281,6 +281,14 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     });
   }
 
+  if (lastRun?.repositoryHistoryCheckSkipped) {
+    checks.push({
+      name: "repository history check",
+      status: "warn",
+      detail: `skipped: ${lastRun.repositoryHistoryCheckSkipped}`,
+    });
+  }
+
   // bob#200: the tps-mail capability. When it is declared its own checks cover
   // the inbox, so the generic inbox check below runs only for an agent without it.
   const bobYamlPath = join(agentDir, "bob.yaml");
@@ -1160,7 +1168,9 @@ function countFiles(dir: string): number {
 // directory or no log.
 export function readLastRunSummary(
   runsDir: string,
-): { file: string; outcome?: unknown; exitCode?: number } | undefined {
+):
+  | { file: string; outcome?: unknown; exitCode?: number; repositoryHistoryCheckSkipped?: string }
+  | undefined {
   let names: string[];
   try {
     names = readdirSync(runsDir).filter((f) => f.endsWith(".jsonl"));
@@ -1191,14 +1201,19 @@ export function readLastRunSummary(
   }
   if (newest === undefined) return undefined;
   try {
-    const { outcome, exitCode } = scanRunLogTail(newest.fd, newest.size, {
-      outcome: false,
-      exitCode: false,
-    });
+    const { outcome, exitCode, repositoryHistoryCheckSkipped } = scanRunLogTail(
+      newest.fd,
+      newest.size,
+      {
+        outcome: false,
+        exitCode: false,
+      },
+    );
     return {
       file: newest.name,
       ...(outcome !== undefined ? { outcome } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(repositoryHistoryCheckSkipped ? { repositoryHistoryCheckSkipped } : {}),
     };
   } finally {
     closeSync(newest.fd);
@@ -1224,9 +1239,10 @@ function scanRunLogTail(
   fd: number,
   size: number,
   want: { outcome: boolean; exitCode: boolean },
-): { outcome?: unknown; exitCode?: number } {
+): { outcome?: unknown; exitCode?: number; repositoryHistoryCheckSkipped?: string } {
   let outcome: unknown;
   let exitCode: number | undefined;
+  let repositoryHistoryCheckSkipped: string | undefined;
   try {
     let end = size;
     let scanned = 0;
@@ -1275,9 +1291,12 @@ function scanRunLogTail(
         }
         if (!want.exitCode && record.done === true && typeof record.exitCode === "number") {
           exitCode = record.exitCode;
+          if (typeof record.repositoryHistoryCheckSkipped === "string")
+            repositoryHistoryCheckSkipped = record.repositoryHistoryCheckSkipped;
           want.exitCode = true;
         }
-        if (want.outcome && want.exitCode) return { outcome, exitCode };
+        if (want.outcome && want.exitCode)
+          return { outcome, exitCode, repositoryHistoryCheckSkipped };
       }
       end = start;
     }
@@ -1285,7 +1304,7 @@ function scanRunLogTail(
     // Doctor is diagnostic: a log that becomes unreadable yields what was
     // already found (usually nothing) instead of making the command fail.
   }
-  return { outcome, exitCode };
+  return { outcome, exitCode, repositoryHistoryCheckSkipped };
 }
 
 export function lastRunOutcomeReason(outcome: unknown): string {

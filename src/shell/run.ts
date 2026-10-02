@@ -1455,7 +1455,16 @@ async function runBoundedSession(
     // A synchronous append is on disk when writeRunLog returns, so a mid-run crash
     // leaves every record written before it — the post-mortem trail this log exists
     // for.
-    writeRunLog({ done: true, exitCode }, false);
+    writeRunLog(
+      {
+        done: true,
+        exitCode,
+        ...(repositoryAtLaunch.kind === "git" && repositoryAtLaunch.historyCheckSkipped
+          ? { repositoryHistoryCheckSkipped: repositoryAtLaunch.historyCheckSkipped }
+          : {}),
+      },
+      false,
+    );
 
     // Run end: drop the sidecar lock so retention no longer sees this log as
     // live. Best-effort — a leaked lock names a now-dead PID, which the next
