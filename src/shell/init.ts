@@ -16,6 +16,7 @@
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
 import type { BobRole } from "./index.js";
@@ -100,6 +101,10 @@ export interface InitOptions {
   // start without one, so an agent scaffolded without it gets a commented
   // placeholder and a warning, and must have it set before it runs.
   contextWindow?: number;
+  // bob#141: the endpoint override for a keyless LOCAL provider. Written to
+  // bob.yaml as provider.base_url and to models.json as providers.<name>.baseUrl.
+  // Refused for a provider that carries an API key (see bob-yaml.ts).
+  baseUrl?: string;
 }
 
 export interface InitResult {
@@ -133,6 +138,10 @@ export function initAgent(opts: InitOptions): InitResult {
     throw new Error(
       `bob: the context window must be a positive whole number of tokens (got ${String(opts.contextWindow)})`,
     );
+  }
+  if (opts.baseUrl !== undefined) {
+    const refusal = providerBaseUrlRefusal(opts.provider, opts.baseUrl);
+    if (refusal !== undefined) throw new Error(`bob: ${refusal}`);
   }
   // Validates the role + loads the template. Throws on unknown / unsafe role.
   const template = loadRole(opts.role);
@@ -251,6 +260,12 @@ ${
     : `  # REQUIRED before this agent runs: the context window (tokens) the server
   # enforces for this model. bob refuses to start a session without it.
   # context_window: <tokens>`
+}${
+  opts.baseUrl !== undefined
+    ? `
+  # Keyless local provider endpoint (bob#141) — the provider ignores its key.
+  base_url: ${opts.baseUrl}`
+    : ""
 }
 
 identity:
@@ -441,7 +456,9 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
   // entry (bob#132).
   const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
-  const baseUrl = knownProviderBaseUrl(opts.provider);
+  // bob#141: an explicit keyless local endpoint wins over the built-in one
+  // (e.g. `ollama` defaults to ollama.com/v1; base_url points it at a local host).
+  const baseUrl = opts.baseUrl ?? knownProviderBaseUrl(opts.provider);
   const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
 
   const modelsPath = join(piDir, "models.json");
@@ -478,6 +495,10 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
 
   if (isEnvKeyProvider) {
     console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
+  } else if (opts.baseUrl !== undefined) {
+    console.error(
+      `⚠ ${opts.provider} uses the keyless local endpoint ${opts.baseUrl}; the placeholder key in ${authPath} is ignored.`,
+    );
   } else if (!isGateway) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,

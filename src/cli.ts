@@ -65,6 +65,8 @@ Commands:
                       Flags: --context-window <tokens> (required: the model's
                              context window as the server enforces it)
                              --role <r> --provider <p> --model <m>
+                             --base-url <url> (keyless local providers only:
+                             ollama on a non-ollama.com host, ollama-newton, omlx)
                              --flair-url <u> --no-flair
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
@@ -193,6 +195,9 @@ async function onboard(
     `bob onboard ${name}`,
     `${provider}/${model}`,
   );
+  // bob#141: an endpoint override for a keyless local provider (Ollama on a
+  // LAN host). Refused for a keyed provider before anything is written.
+  const baseUrl = stringFlag(flags, "base-url");
 
   if (dryRun) {
     const template = loadRole(role);
@@ -201,7 +206,7 @@ async function onboard(
   agent.role      = ${role}
   provider.name   = ${provider}
   provider.model  = ${model}
-  provider.context_window = ${contextWindow}
+  provider.context_window = ${contextWindow}${baseUrl !== undefined ? `\n  provider.base_url = ${baseUrl}` : ""}
   soul (from template, ${template.soul.length} chars) → ~/agents/${name}/soul.md
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
@@ -217,6 +222,7 @@ async function onboard(
     provider,
     model,
     contextWindow,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
     noClobber: !force,
     skipFlair: noFlair,
     flairUrl,
