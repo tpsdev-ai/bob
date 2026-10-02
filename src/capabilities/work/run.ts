@@ -399,7 +399,7 @@ const errCode = (err: unknown): string =>
 // to hand a child a directory descriptor as its cwd, and the child's own chdir
 // re-resolves that string. So `run` cannot make the directory a command starts in
 // BE the one it checked; it narrows the window in which they can differ:
-//   1. resolve the cwd and the workspace through symlinks (realpath), pin the
+//   1. resolve the cwd and the workspace through symlinks (realpath), record the
 //      workspace root's device + inode, and confine the one to the other
 //      (resolveCwd);
 //   2. open the resolved path (O_DIRECTORY | O_NOFOLLOW) and hold it open:
@@ -409,16 +409,18 @@ const errCode = (err: unknown): string =>
 //      re-resolve the cwd (realpath): it must still be the same canonical path,
 //      inside the originally checked canonical workspace, a no-follow stat of
 //      it must still be a directory with the pin's device + inode, and the
-//      workspace root must still have the device + inode pinned in step 1;
+//      workspace root must still match the device + inode recorded in step 1;
 //   4. release the pin, then spawn: no pin step runs after the spawn.
 // Any step that cannot establish its fact (a failed realpath, stat, open, fstat
 // or close) refuses: unknown is never taken as inside.
 //
-// Inside one re-check the realpath and the no-follow stat are two calls, and the
-// workspace-root check another; a path component replaced between them is refused
-// by the comparison that follows (run.test.ts drives that interval). What remains
-// is the window AFTER the last re-check: between it and the child's own chdir, a
-// path component can still be replaced (see the capability README).
+// Inside one re-check the realpath and no-follow stat are separate calls. If a
+// component is replaced with a different directory at that path between them,
+// the comparison refuses it (run.test.ts drives that interval). Moving a
+// component away and replacing it with a symlink back to the pinned directory is
+// not detected there; the OS-specific directory-descriptor boundary described in
+// the capability README would cover it. After the last re-check and before the
+// child's own chdir, a component can still be replaced.
 
 // The file-system calls the pin makes, as a seam (like GroupOps) so a test can
 // make one of them fail — a realpath or stat that errors, an fstat that throws
@@ -456,8 +458,8 @@ interface DirPin {
   ino: bigint;
 }
 
-// The workspace root's identity, pinned when the cwd is resolved, so a root
-// replaced by another directory at the same path is refused (not just its string).
+// resolveCwd records the workspace root's device and inode. Each re-check compares
+// them, detecting a replacement while the original inode remains allocated.
 interface WorkspacePin {
   dev: bigint;
   ino: bigint;
@@ -467,8 +469,8 @@ type PinStage = "when it was pinned" | "immediately before the spawn";
 
 // The cwd must still be the checked canonical path and the directory pinned at
 // open: the same canonical path, inside the checked canonical workspace, and
-// (no-follow) the pinned device + inode; and the workspace root must still have
-// the device + inode pinned when the cwd was resolved. Throws a RunRefusal naming
+// (no-follow) the pinned device + inode; and the workspace root must still match
+// the device + inode recorded when the cwd was resolved. Throws a RunRefusal naming
 // the failed check or mismatch.
 function assertStillPinned(
   ops: DirPinOps,
@@ -907,9 +909,8 @@ export class JobManager {
         `run refused: the workspace ${ctxCwd} could not be resolved through its symlinks (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
       );
     }
-    // Pin the workspace root's identity (device + inode), not just its string: a
-    // root replaced between here and the pin by another directory at the same
-    // path passes a string containment check, so the re-checks compare this too.
+    // Record the workspace root's identity, not just its string. Each re-check
+    // compares its device and inode with these values.
     let workspacePin: WorkspacePin;
     try {
       const wst = this.dirPinOps.lstat(workspace);

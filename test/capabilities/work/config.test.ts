@@ -163,8 +163,7 @@ describe("not a sandbox — stated where a reader meets it", () => {
     // Collapse line wrapping so the phrases can be compared whole.
     const flat = (s: string) => s.replace(/\s+/g, " ");
     const readme = flat(readFileSync(join(WORK_SRC, "README.md"), "utf8"));
-    // The description and the README carry the SAME phrases for the remaining
-    // window, so the tool surface and the doc cannot drift apart.
+    // These two pinned phrases match in both the description and the README.
     for (const phrase of [
       "narrows the race between the check and the start; it does not close it",
       "replaced after the last re-check and before the child has changed directory is not detected",
