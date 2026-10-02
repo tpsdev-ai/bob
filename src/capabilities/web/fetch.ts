@@ -245,8 +245,16 @@ async function decodeBody(encoded: Buffer, encoding: string | undefined): Promis
 
 // A body that cannot be used is terminated without reading untrusted bytes.
 // This closes its connection; a followed redirect opens another through the
-// same vetted dispatcher.
-export function discard(body: { destroy: () => void }): void {
+// same vetted dispatcher. Destroying an undici body before it is read raises an
+// abort error on the body, and with no 'error' listener node treats that as
+// unhandled and aborts the process — so the listener is attached before the
+// destroy. The body is being discarded: that error carries nothing this call
+// can use.
+export function discard(body: {
+  destroy: () => void;
+  on?: (event: "error", listener: (error: unknown) => void) => unknown;
+}): void {
+  body.on?.("error", () => {});
   body.destroy();
 }
 
