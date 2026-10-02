@@ -151,20 +151,10 @@ named error.
 
 - stdout and stderr are captured, in arrival order and up to a 64 MiB cap, to
   `output_ref`: a file
-  (mode 0600) in the run's own directory under an owner-only state directory,
-  `<temp dir>/bob-work-<uid>/` — outside the git worktree, so it can never be a
-  committable stray file, and never a shared path. `run` refuses to start when
-  that state directory is inside the workspace, is a symlink, belongs to another
-  user, or is readable by group or others.
-- The run's directory is created by `mkdtemp` under the verified state
-  directory: a fresh, unpredictable name (`run-XXXXXX`), mode 0700, never an
-  existing entry. Each capture file is created inside it exclusively
-  (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600): anything already at the path — a
-  file, or a live or dangling symlink — refuses the call by name, nothing is
-  started, and nothing is written through it.
-- **It is same-user readable.** The permissions keep it off the candidate tree
-  and out of shared paths; they are not a confidentiality boundary against code
-  running as the same user.
+  (mode 0600) in a private `bob-run-XXXXXX` directory created with `mkdtemp`
+  under the OS temp directory. `run` refuses scratch inside the workspace or
+  repository. Captures are created exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`).
+- **It is same-user readable.**
 - The model sees a bounded tail excerpt (16 KiB, 400 lines). Before the cut, the
   window is passed through bob's existing secret redaction (the observatory's
   `redactSecrets`: provider token shapes, `Authorization` / `Proxy-Authorization`
@@ -192,12 +182,19 @@ named error.
   held by a descendant that left the group; the result says
   `output_complete: false` and `cleanup_state: escaped_or_unverified`, and the
   tool does not hang.
-- **Retention.** Captures are deleted when the run ends (or, after a crash, by
-  the next session's boot sweep). The small job records (no output, a SHA-256 of
+- **Retention.** Captures are deleted when the run ends. The small job records
+  (no output, a SHA-256 of
   the command rather than the command) are kept 24 hours after their run ended,
   then deleted by a later boot sweep.
 
 ## Job state and the sweeps
+
+Persistent work state uses `$XDG_STATE_HOME/bob` on Linux (default
+`~/.local/state/bob`) and `~/Library/Application Support/bob` on macOS.
+`BOB_STATE_DIR` overrides these defaults and must be absolute. The root is
+created with mode 0700; symlinks, other owners, group/world permissions, and
+locations inside the workspace or repository are refused. The old
+`<temp dir>/bob-work-<uid>` root is ignored; nothing is migrated from it.
 
 - Every job is recorded on disk, keyed by its process group, in the run's own
   state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`

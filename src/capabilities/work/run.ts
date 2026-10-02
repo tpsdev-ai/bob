@@ -30,6 +30,7 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   constants as fsc,
   fstatSync,
   lstatSync,
@@ -47,7 +48,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { formatSize, getShellConfig, truncateTail } from "@earendil-works/pi-coding-agent";
 import {
@@ -315,8 +316,6 @@ interface Job {
 }
 
 export interface JobManagerOptions {
-  // Where run directories live. Default: <os tmpdir>/bob-work-<uid>, an
-  // owner-only directory outside any workspace. Tests pass a scratch dir.
   stateRoot?: string;
   defaultTimeoutS?: number;
   maxTimeoutS?: number;
@@ -358,9 +357,24 @@ export interface StartRequest {
 
 // --- helpers -------------------------------------------------------------------
 
-export function defaultStateRoot(): string {
-  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-  return join(tmpdir(), `bob-work-${uid}`);
+export function defaultStateRoot({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+}: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+} = {}): string {
+  if (env.BOB_STATE_DIR !== undefined) {
+    if (!isAbsolute(env.BOB_STATE_DIR)) {
+      throw new RunRefusal("run refused: BOB_STATE_DIR must be an absolute path.");
+    }
+    return resolve(env.BOB_STATE_DIR);
+  }
+  if (platform === "darwin") return join(home, "Library", "Application Support", "bob");
+  const xdg = env.XDG_STATE_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "state"), "bob");
 }
 
 // The canonical form of a path that may not exist yet: the realpath of its
@@ -628,11 +642,12 @@ function releasePin(
 function ensurePrivateDir(path: string, create: boolean): void {
   if (create) {
     try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       mkdirSync(path, { mode: 0o700 });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         throw new RunRefusal(
-          `run refused: the job state directory ${path} could not be created (${(err as NodeJS.ErrnoException).code ?? "error"}). The run tool keeps job output there; check the temp directory is writable.`,
+          `run refused: the job state directory ${path} could not be created (${(err as NodeJS.ErrnoException).code ?? "error"}). Check that the parent directory is writable.`,
         );
       }
     }
@@ -651,7 +666,7 @@ function ensurePrivateDir(path: string, create: boolean): void {
   }
   if ((st.mode & 0o077) !== 0) {
     throw new RunRefusal(
-      `run refused: the job state directory ${path} has mode ${(st.mode & 0o777).toString(8)}, readable by other users. Run chmod 700 on it (or remove it); the run tool keeps job output owner-only.`,
+      `run refused: the job state directory ${path} has mode ${(st.mode & 0o777).toString(8)}, with group or world permissions. Run chmod 700 on it.`,
     );
   }
 }
@@ -807,8 +822,6 @@ export function readExcerpt(
 // their registry records and their output captures.
 export class JobManager {
   readonly stateRoot: string;
-  // The run's own directory, created on the first `run` by mkdtemp under the
-  // state root: a fresh, unpredictable name, mode 0700. Null until then.
   private dirs: { run: string; jobs: string; out: string } | null = null;
   private readonly jobs = new Map<string, Job>();
   private seq = 0;
@@ -946,42 +959,58 @@ export class JobManager {
   }
 
   private ensureRunDir(workspaces: string[]): { run: string; jobs: string; out: string } {
-    for (const w of workspaces) {
-      if (isInside(w, this.stateRoot)) {
-        throw new RunRefusal(
-          `run refused: the job state directory ${this.stateRoot} is inside the workspace ${w}, where captured output would become a committable stray file. Run bob with a temp directory (TMPDIR) outside the workspace.`,
-        );
+    const roots = new Set(workspaces);
+    for (const workspace of workspaces) {
+      let ancestor = canonicalPath(workspace);
+      while (true) {
+        if (existsSync(join(ancestor, ".git"))) roots.add(ancestor);
+        const parent = dirname(ancestor);
+        if (parent === ancestor) break;
+        ancestor = parent;
       }
     }
-    if (this.dirs !== null) return this.dirs;
-    // The tool's own base: owner-only, verified (not a symlink, this user's,
-    // no group/world bits) before anything is created under it.
+    for (const root of roots) {
+      for (const [name, path] of [
+        ["BOB_STATE_DIR", this.stateRoot],
+        ["TMPDIR", tmpdir()],
+      ]) {
+        if (isInside(root, path)) {
+          throw new RunRefusal(
+            `run refused: ${name} (${path}) is inside the workspace or repository ${root}. Choose a directory outside it.`,
+          );
+        }
+      }
+    }
     ensurePrivateDir(this.stateRoot, true);
-    // The run's directory: mkdtemp picks a fresh, unpredictable name and
-    // creates it 0700 — never a predictable path, never an existing entry.
-    let run: string;
+    if (this.dirs !== null) return this.dirs;
+    let run: string | undefined;
+    let out: string | undefined;
     try {
       run = mkdtempSync(join(this.stateRoot, "run-"));
+      ensurePrivateDir(run, false);
+      out = mkdtempSync(join(tmpdir(), "bob-run-"));
+      ensurePrivateDir(out, false);
+      mkdirSync(join(run, "jobs"), { mode: 0o700 });
+      const scratch = lstatSync(out, { bigint: true });
+      const identity = this.readIdentity(process.pid);
+      this.writeRecord(join(run, "run.json"), {
+        v: 1,
+        supervisor_pid: process.pid,
+        supervisor_instance: processInstanceId(),
+        supervisor_identity: typeof identity === "object" ? identity : null,
+        started_at: new Date().toISOString(),
+        scratch_dir: out,
+        scratch_dev: String(scratch.dev),
+        scratch_ino: String(scratch.ino),
+      });
     } catch (err) {
+      if (out) rmSync(out, { recursive: true, force: true });
+      if (run) rmSync(run, { recursive: true, force: true });
       throw new RunRefusal(
-        `run refused: a private run directory could not be created under ${this.stateRoot} (${(err as NodeJS.ErrnoException).code ?? "error"}). Nothing was started; check the temp directory is writable.`,
+        `run refused: private run storage could not be created (${errCode(err)}).`,
       );
     }
-    ensurePrivateDir(run, false);
-    const dirs = { run, jobs: join(run, "jobs"), out: join(run, "out") };
-    mkdirSync(dirs.jobs, { mode: 0o700 });
-    mkdirSync(dirs.out, { mode: 0o700 });
-    // Who supervises this run: the pid, this process's random instance id, and
-    // (where the platform gives one) the process's pinned identity. The boot
-    // sweep of a later bob tells a live supervisor from a reused pid with these.
-    const identity = this.readIdentity(process.pid);
-    this.writeRecord(join(run, "run.json"), {
-      v: 1,
-      supervisor_pid: process.pid,
-      supervisor_instance: processInstanceId(),
-      supervisor_identity: typeof identity === "object" ? identity : null,
-      started_at: new Date().toISOString(),
-    });
+    const dirs = { run, jobs: join(run, "jobs"), out };
     // The heartbeat: the run record's mtime, refreshed while this run lives.
     const record = join(run, "run.json");
     this.heartbeat = setInterval(() => {
@@ -1718,7 +1747,7 @@ export class JobManager {
       if (!Number.isNaN(endedAt)) {
         // An ENDED run is swept by the retention bound alone, whoever holds its
         // supervisor's pid now: captures go at once, records after the bound.
-        rmSync(join(dir, "out"), { recursive: true, force: true });
+        this.removeStaleScratch(meta);
         if (now - endedAt > REGISTRY_RETENTION_MS) rmSync(dir, { recursive: true, force: true });
         continue;
       }
@@ -1740,7 +1769,7 @@ export class JobManager {
       );
       reaped.push(...results);
 
-      rmSync(join(dir, "out"), { recursive: true, force: true });
+      this.removeStaleScratch(meta);
       try {
         this.writeRecord(endedPath, {
           v: 1,
@@ -1752,6 +1781,21 @@ export class JobManager {
       }
     }
     return reaped;
+  }
+
+  private removeStaleScratch(meta: Record<string, unknown>): void {
+    const path = meta.scratch_dir;
+    if (typeof path !== "string" || !isAbsolute(path)) return;
+    if (canonicalPath(dirname(path)) !== canonicalPath(tmpdir())) return;
+    if (!/^bob-run-[A-Za-z0-9]{6}$/.test(basename(path))) return;
+    try {
+      ensurePrivateDir(path, false);
+      const st = lstatSync(path, { bigint: true });
+      if (String(st.dev) !== meta.scratch_dev || String(st.ino) !== meta.scratch_ino) return;
+      rmSync(path, { recursive: true, force: true });
+    } catch (err) {
+      if (errCode(err) !== "ENOENT") this.log(`work: scratch cleanup skipped: ${String(err)}`);
+    }
   }
 
   // Is the recorded supervisor of a run still that process? A pid alone is not

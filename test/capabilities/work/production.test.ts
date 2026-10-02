@@ -1,9 +1,3 @@
-// The PRODUCTION path of the work capability (bob#211): resolved from the
-// blessed catalog through the package's exports map (the BUILT extension, as a
-// published install loads it), loaded by pi's extension loader, with no test
-// seams — production timings, the default state root under the temp directory.
-// TMPDIR points at a scratch dir so nothing shared is swept or written.
-
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,15 +18,20 @@ import { createBobRuntimeFactory } from "../../../src/shell/session.js";
 
 let scratch: string;
 let savedTmpdir: string | undefined;
+let savedState: string | undefined;
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), "bob-work-prod-"));
   savedTmpdir = process.env.TMPDIR;
+  savedState = process.env.BOB_STATE_DIR;
+  process.env.BOB_STATE_DIR = join(scratch, "state");
   process.env.TMPDIR = join(scratch, "tmp");
   mkdirSync(join(scratch, "tmp"));
 });
 afterEach(() => {
   if (savedTmpdir === undefined) delete process.env.TMPDIR;
   else process.env.TMPDIR = savedTmpdir;
+  if (savedState === undefined) delete process.env.BOB_STATE_DIR;
+  else process.env.BOB_STATE_DIR = savedState;
   rmSync(scratch, { recursive: true, force: true });
 });
 
@@ -71,7 +70,7 @@ function oneCallThenDone(args: Record<string, unknown>) {
 }
 
 describe("work — loaded from the blessed catalog, production settings", () => {
-  it("run with no timeout_s gets the 600 s default; output lands in <TMPDIR>/bob-work-<uid>", async () => {
+  it("run with no timeout_s gets the 600 s default; output lands in temporary scratch and records in BOB_STATE_DIR", async () => {
     const { extensionSources, capabilities } = resolveCapabilities({
       yamlText: "capabilities:\n  - work\n",
     });
@@ -156,9 +155,8 @@ describe("work — loaded from the blessed catalog, production settings", () => 
         timeout_source: "default",
       });
       expect(results[0].text).toContain("production-path");
-      const uid = typeof process.getuid === "function" ? process.getuid() : "user";
-      const root = join(scratch, "tmp", `bob-work-${uid}`);
-      expect(String(d.output_ref).startsWith(root)).toBe(true);
+      const root = join(scratch, "state");
+      expect(String(d.output_ref).startsWith(join(scratch, "tmp", "bob-run-"))).toBe(true);
       expect(statSync(root).mode & 0o777).toBe(0o700);
     } finally {
       await runtime.dispose();

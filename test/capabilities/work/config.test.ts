@@ -135,7 +135,6 @@ describe("not a sandbox — stated where a reader meets it", () => {
     };
     const { manager } = wireWork({
       pi: fake,
-      stateRoot: "/nonexistent-bob-work-test",
       log: () => {},
     });
     manager.endRunSync();
