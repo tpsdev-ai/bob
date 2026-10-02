@@ -117,24 +117,21 @@ describe("repository evidence in the completion gate and exploration budget", ()
       sessionFactory: async () => session(calls, finalAction),
     });
 
-  it.each([0o644, 0o755])("preserves regular-file fingerprints for mode %s", (mode) => {
+  it.each([0o644, 0o755])("records regular-file bytes and mode %s", (mode) => {
     const clean = captureRepositoryState(cwd);
     expect(clean.kind).toBe("git");
     if (clean.kind !== "git") throw new Error("missing repository evidence");
-    expect(clean.trackedHash).toBe(createHash("sha256").digest("hex"));
+    expect(clean.tree).toBe(git(cwd, "rev-parse", "HEAD^{tree}"));
     const bytes = Buffer.from([0, 0xff, 10, 13, 0x80]);
     writeFileSync(join(cwd, "tracked"), bytes);
     chmodSync(join(cwd, "tracked"), mode);
-    const changed = captureRepositoryState(cwd);
+    const changed = captureRepositoryState(cwd, clean);
     expect(changed.kind).toBe("git");
     if (changed.kind !== "git") throw new Error("missing repository evidence");
-    expect(changed.trackedHash).toBe(
-      createHash("sha256")
-        .update(`tracked\0${mode === 0o755 ? "100755" : "100644"}\0`)
-        .update(createHash("sha256").update(bytes).digest())
-        .update("\0")
-        .digest("hex"),
-    );
+    expect(changed.tracked.get("tracked")).toEqual({
+      mode: mode === 0o755 ? "100755" : "100644",
+      object: createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex"),
+    });
   });
 
   it("reads the opened file when its path becomes a symlink after fstat", () => {
@@ -162,13 +159,10 @@ describe("repository evidence in the completion gate and exploration budget", ()
     const state = captureRepositoryState(cwd);
     expect(state.kind).toBe("git");
     if (state.kind !== "git") throw new Error("missing repository evidence");
-    expect(state.trackedHash).toBe(
-      createHash("sha256")
-        .update("tracked\0" + "120000\0")
-        .update(createHash("sha256").update("missing-target").digest())
-        .update("\0")
-        .digest("hex"),
-    );
+    expect(state.tracked.get("tracked")).toEqual({
+      mode: "120000",
+      object: createHash("sha1").update("blob 14\0missing-target").digest("hex"),
+    });
   });
 
   function nestedFixture() {
@@ -304,6 +298,214 @@ describe("repository evidence in the completion gate and exploration budget", ()
     },
   );
 
+  it.each(["completion", "exploration"])("rejects HEAD-only moves at %s", async (gate) => {
+    writeFileSync(join(cwd, "tracked"), "second commit\n");
+    const second = commit(cwd, launchHead);
+    const result = await run(
+      [
+        { toolName: "run", action: () => git(cwd, "reset", "--soft", launchHead) },
+        { toolName: "read" },
+        { toolName: "read" },
+        { toolName: "read" },
+      ],
+      undefined,
+      gate === "exploration" ? 2 : 20,
+    );
+    expect(git(cwd, "rev-parse", "HEAD")).not.toBe(second);
+    if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+    else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    expect(result.exitCode).toBe(1);
+  });
+
+  it.each(["completion", "exploration"])("rejects a dirty soft reset at %s", async (gate) => {
+    writeFileSync(join(cwd, "tracked"), "second commit\n");
+    commit(cwd, launchHead);
+    writeFileSync(join(cwd, "tracked"), "original\n");
+    const result = await run(
+      [
+        { toolName: "run", action: () => git(cwd, "reset", "--soft", launchHead) },
+        { toolName: "read" },
+        { toolName: "read" },
+        { toolName: "read" },
+      ],
+      undefined,
+      gate === "exploration" ? 2 : 20,
+    );
+    if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+    else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    expect(result.exitCode).toBe(1);
+  });
+
+  it.each(["completion", "exploration"])(
+    "rejects switching to an existing branch at %s",
+    async (gate) => {
+      writeFileSync(join(cwd, "tracked"), "existing branch\n");
+      const existing = commit(cwd, launchHead);
+      git(cwd, "branch", "existing", existing);
+      git(cwd, "reset", "--hard", launchHead);
+      const result = await run(
+        [
+          { toolName: "run", action: () => git(cwd, "switch", "existing") },
+          { toolName: "read" },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+      else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+      expect(result.exitCode).toBe(1);
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "accepts new bytes with and without a commit at %s",
+    async (gate) => {
+      for (const committed of [false, true]) {
+        const result = await run(
+          [
+            { toolName: "read" },
+            {
+              toolName: "run",
+              action: () => {
+                writeFileSync(join(cwd, "tracked"), `new edit ${committed}\n`);
+                if (committed) commit(cwd, git(cwd, "rev-parse", "HEAD"));
+              },
+            },
+            { toolName: "read" },
+            { toolName: "read" },
+          ],
+          undefined,
+          gate === "exploration" ? 2 : 20,
+        );
+        expect(result.exitCode).toBe(0);
+        expect(result.explorationBudgetExhausted).toBeUndefined();
+      }
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "rejects manually restored historical bytes at %s",
+    async (gate) => {
+      writeFileSync(join(cwd, "tracked"), "second commit\n");
+      commit(cwd, launchHead);
+      const result = await run(
+        [
+          { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "original\n") },
+          { toolName: "read" },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+      else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "rejects amend and identical branch switches at %s",
+    async (gate) => {
+      const tree = git(cwd, "rev-parse", "HEAD^{tree}");
+      const amended = git(cwd, "commit-tree", tree, "-m", "identical");
+      git(cwd, "branch", "identical", amended);
+      const result = await run(
+        [
+          {
+            toolName: "run",
+            action: () => {
+              const head = git(cwd, "commit-tree", tree, "-m", "amend");
+              git(cwd, "reset", "--soft", head);
+              git(cwd, "switch", "identical");
+            },
+          },
+          { toolName: "read" },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+      else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    },
+  );
+
+  it.each(["failure", "overflow"])("fails closed on launch history %s", async (kind) => {
+    const spawn = childProcess.spawnSync;
+    const tree = git(cwd, "rev-parse", "HEAD^{tree}");
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
+        const result = spawn(...args);
+        return {
+          ...result,
+          status: kind === "failure" ? 1 : 0,
+          stdout: Buffer.from(`${tree}\n`.repeat(10_001)),
+        };
+      }
+      return spawn(...args);
+    });
+    try {
+      for (const gate of ["completion", "exploration"]) {
+        const result = await run(
+          [
+            { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "new edit\n") },
+            { toolName: "read" },
+            { toolName: "read" },
+            { toolName: "read" },
+          ],
+          undefined,
+          gate === "exploration" ? 2 : 20,
+        );
+        if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+        else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+      }
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it.each(["sha1", "sha256"])("matches Git trees without touching the index (%s)", (format) => {
+    rmSync(join(cwd, ".git"), { recursive: true });
+    git(cwd, "init", "--quiet", `--object-format=${format}`);
+    for (const path of ["a/x", "a.c", "a0", "quoted\t\n-é", "empty"]) {
+      mkdirSync(join(cwd, path, ".."), { recursive: true });
+      writeFileSync(join(cwd, path), path === "empty" ? "" : path);
+    }
+    chmodSync(join(cwd, "a0"), 0o755);
+    symlinkSync("a/x", join(cwd, "link"));
+    commit(cwd);
+    const indexPath = join(cwd, ".git", "index");
+    const index = readFileSync(indexPath);
+    const before = captureRepositoryState(cwd);
+    expect(before.kind).toBe("git");
+    if (before.kind !== "git") throw new Error("missing repository evidence");
+    expect(before.tree).toBe(git(cwd, "rev-parse", "HEAD^{tree}"));
+    expect(readFileSync(indexPath)).toEqual(index);
+    rmSync(join(cwd, "a", "x"));
+    const after = captureRepositoryState(cwd, before);
+    expect(readFileSync(indexPath)).toEqual(index);
+    expect(after.kind).toBe("git");
+    if (after.kind !== "git") throw new Error("missing repository evidence");
+    git(cwd, "add", "-u");
+    expect(after.tree).toBe(git(cwd, "write-tree"));
+  });
+
+  it("retains launch paths removed from the final index and HEAD", async () => {
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          rmSync(join(cwd, "tracked"));
+          commit(cwd, launchHead);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(0);
+  });
+
   function changePresentation() {
     for (const [key, value] of Object.entries({
       "core.abbrev": "40",
@@ -380,7 +582,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
       ]);
       expect(edited.explorationBudgetExhausted).toBeUndefined();
       expect(edited.exitCode).toBe(0);
-      expect(committed.exitCode).toBe(0);
+      expect(committed.noEditNoBlocked).toBe(true);
       expect(unrelated.noEditNoBlocked).toBe(true);
     } finally {
       for (const key of ["GIT_DIR", "GIT_WORK_TREE"]) {
@@ -619,27 +821,112 @@ describe("repository evidence in the completion gate and exploration budget", ()
     expect(result.noEditNoBlocked).toBe(true);
   });
 
-  it.each(["launch", "end", "history"])("fails closed when git fails at %s", async (stage) => {
+  it("fails closed when launch history is unavailable", async () => {
     const headFile = join(cwd, ".git", "HEAD");
     const saved = readFileSync(headFile);
-    if (stage === "launch") writeFileSync(headFile, "broken HEAD\n");
+    writeFileSync(headFile, "broken HEAD\n");
     const result = await run([
       {
         toolName: "bash",
         action: () => {
-          if (stage === "launch") writeFileSync(headFile, saved);
+          writeFileSync(headFile, saved);
           writeFileSync(join(cwd, "tracked"), "new edit\n");
-          if (stage === "end") writeFileSync(headFile, "broken HEAD\n");
-          if (stage === "history") {
-            commit(cwd);
-            rmSync(join(cwd, ".git", "objects", launchHead.slice(0, 2), launchHead.slice(2)));
-            writeFileSync(join(cwd, "tracked"), "also dirty\n");
-          }
         },
       },
     ]);
     expect(result.noEditNoBlocked).toBe(true);
   });
+
+  it.each(["completion", "exploration"])(
+    "accepts new bytes despite a missing final HEAD object at %s",
+    async (gate) => {
+      const result = await run(
+        [
+          { toolName: "read" },
+          {
+            toolName: "run",
+            action: () => {
+              writeFileSync(join(cwd, "tracked"), "new bytes\n");
+              writeFileSync(join(cwd, ".git", "HEAD"), `${"0".repeat(40)}\n`);
+            },
+          },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.explorationBudgetExhausted).toBeUndefined();
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "rejects a soft reset that restores only HEAD paths at %s",
+    async (gate) => {
+      writeFileSync(join(cwd, "old-only"), "old tracked bytes\n");
+      const older = commit(cwd, launchHead);
+      rmSync(join(cwd, "old-only"));
+      commit(cwd, older);
+      writeFileSync(join(cwd, "old-only"), "unchanged untracked bytes\n");
+      const result = await run(
+        [
+          { toolName: "run", action: () => git(cwd, "reset", "--soft", older) },
+          { toolName: "read" },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+      else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    },
+  );
+
+  it("fails closed when the final index listing fails", () => {
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(cwd, "tracked"), "new edit\n");
+    const spawn = childProcess.spawnSync;
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      const result = spawn(...args);
+      return args[0] === "git" && (args[1] as string[]).includes("ls-files")
+        ? { ...result, status: 1 }
+        : result;
+    });
+    try {
+      const after = captureRepositoryState(cwd, before);
+      expect(after).toEqual({ kind: "unavailable" });
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it.each(["completion", "exploration"])(
+    "ignores removed launch commit objects at %s",
+    async (gate) => {
+      const result = await run(
+        [
+          { toolName: "read" },
+          {
+            toolName: "run",
+            action: () => {
+              writeFileSync(join(cwd, "tracked"), "new edit\n");
+              commit(cwd, launchHead);
+              rmSync(join(cwd, ".git", "objects", launchHead.slice(0, 2), launchHead.slice(2)));
+            },
+          },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.explorationBudgetExhausted).toBeUndefined();
+    },
+  );
 
   it("resets the exploration budget on a repository edit", async () => {
     const result = await run(

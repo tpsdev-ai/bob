@@ -721,9 +721,7 @@ export interface RunOptions {
   // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
   explorationBudget?: number;
-  // bob#283: whether this run must end with a verified edit or an explicit
-  // BLOCKED report. Overrides the role's `require_edit_or_blocked` (tests use
-  // it); undefined leaves the resolved role value in force.
+  // Overrides the role's `require_edit_or_blocked` completion gate.
   requireEditOrBlocked?: boolean;
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.

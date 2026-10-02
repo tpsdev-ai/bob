@@ -346,7 +346,7 @@ change one, the named test is what tells you.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`)*
 
-- **builder-local requires an edit or a BLOCKED report.** `bob run` and prompted
+- **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.
   The exploration budget uses the same edit predicate.
   *(`test/shell/edit-or-blocked.test.ts`, `repository-edit-evidence.test.ts`)*

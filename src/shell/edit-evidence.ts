@@ -86,7 +86,13 @@ interface RepositoryIdentity {
 }
 
 export type RepositoryState =
-  | ({ kind: "git"; head: string; trackedHash: string } & RepositoryIdentity)
+  | ({
+      kind: "git";
+      tracked: Map<string, TrackedEntry>;
+      tree: string;
+      launchTrees: Set<string>;
+      objectFormat: "sha1" | "sha256";
+    } & RepositoryIdentity)
   | { kind: "not a git work tree" | "unavailable" };
 
 export interface RepositoryEditEvidence {
@@ -147,7 +153,7 @@ function sameRepository(left: RepositoryIdentity, right: RepositoryIdentity): bo
 
 type TrackedEntry = { mode: string; object: string };
 
-function trackedEntries(output: Buffer, tree: boolean): Map<string, TrackedEntry> {
+function trackedEntries(output: Buffer): Map<string, TrackedEntry> {
   const entries = new Map<string, TrackedEntry>();
   const records = output.toString("latin1").split("\0");
   if (records.pop() !== "") throw new Error("incomplete tracked listing");
@@ -155,13 +161,13 @@ function trackedEntries(output: Buffer, tree: boolean): Map<string, TrackedEntry
     const tab = record.indexOf("\t");
     const fields = record.slice(0, tab).split(" ");
     const path = record.slice(tab + 1);
-    const [mode, object] = tree ? [fields[0], fields[2]] : fields;
+    const [mode, object] = fields;
     if (
       tab < 0 ||
       fields.length !== 3 ||
       !/^(100644|100755|120000|160000)$/.test(mode) ||
       !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(object) ||
-      (!tree && fields[2] !== "0") ||
+      fields[2] !== "0" ||
       path.split("/").some((part) => !part || part === "." || part === "..")
     )
       throw new Error("unsupported tracked entry");
@@ -204,22 +210,21 @@ function recheckParents(parents: ReturnType<typeof trackedParents>["parents"]): 
   }
 }
 
-function trackedFingerprint(repository: RepositoryIdentity, head: string): string {
+function trackedContent(
+  repository: RepositoryIdentity,
+  objectFormat: "sha1" | "sha256",
+  launch?: Map<string, TrackedEntry>,
+): Map<string, TrackedEntry> {
   const { workTree } = repository;
-  const tree = trackedEntries(
-    readGit(workTree, ["ls-tree", "-r", "-z", "--full-tree", head], repository),
-    true,
-  );
   const index = trackedEntries(
     readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository),
-    false,
   );
-  const hash = createHash("sha256");
-  const paths = [...new Set([...tree.keys(), ...index.keys()])].sort();
+  const content = new Map<string, TrackedEntry>();
+  const paths = [...new Set([...(launch?.keys() ?? []), ...index.keys()])].sort();
   for (const path of paths) {
     const name = Buffer.from(path, "latin1");
     const absolute = Buffer.concat([Buffer.from(`${workTree}/`), name]);
-    const baseline = tree.get(path);
+    const baseline = launch?.get(path);
     let mode = "deleted";
     let bytes = Buffer.alloc(0);
     let object = "";
@@ -261,22 +266,91 @@ function trackedFingerprint(repository: RepositoryIdentity, head: string): strin
       if (fd !== undefined) closeSync(fd);
     }
     if (mode !== "deleted" && mode !== "160000") {
-      object = createHash(head.length === 64 ? "sha256" : "sha1")
+      object = createHash(objectFormat)
         .update(`blob ${bytes.length}\0`)
         .update(bytes)
         .digest("hex");
     }
-    if (baseline?.mode === mode && baseline.object === object) continue;
-    if (!baseline && mode === "deleted") continue;
-    hash
-      .update(name)
-      .update("\0")
-      .update(mode)
-      .update("\0")
-      .update(createHash("sha256").update(bytes).digest())
-      .update("\0");
+    content.set(path, { mode, object });
   }
-  return hash.digest("hex");
+  return content;
+}
+
+const LAUNCH_COMMIT_LIMIT = 10_000;
+
+function launchTrees(repository: RepositoryIdentity): Set<string> {
+  const output = gitLine(
+    repository.workTree,
+    [
+      "rev-list",
+      "--all",
+      `--max-count=${LAUNCH_COMMIT_LIMIT + 1}`,
+      "--format=%T",
+      "--no-commit-header",
+    ],
+    repository,
+  );
+  const trees = output.split("\n");
+  if (
+    trees.length > LAUNCH_COMMIT_LIMIT ||
+    trees.some((tree) => !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(tree))
+  )
+    throw new Error("launch history unavailable or exceeds bound");
+  return new Set(trees);
+}
+
+function contentTree(content: Map<string, TrackedEntry>, objectFormat: "sha1" | "sha256"): string {
+  type Directory = Map<string, TrackedEntry | Directory>;
+  const root: Directory = new Map();
+  for (const [path, entry] of content) {
+    if (entry.mode === "deleted") continue;
+    const parts = path.split("/");
+    const name = parts.pop();
+    if (!name) throw new Error("invalid tracked path");
+    let directory = root;
+    for (const part of parts) {
+      const child = directory.get(part) ?? new Map();
+      if (!(child instanceof Map)) throw new Error("conflicting tracked paths");
+      directory.set(part, child);
+      directory = child;
+    }
+    if (directory.has(name)) throw new Error("conflicting tracked paths");
+    directory.set(name, entry);
+  }
+  const hashDirectory = (directory: Directory): string => {
+    const entries = [...directory].map(([name, entry]) => ({
+      name: Buffer.from(name, "latin1"),
+      sortName: Buffer.from(name + (entry instanceof Map ? "/" : ""), "latin1"),
+      mode: entry instanceof Map ? "40000" : entry.mode,
+      object: entry instanceof Map ? hashDirectory(entry) : entry.object,
+    }));
+    entries.sort((left, right) => Buffer.compare(left.sortName, right.sortName));
+    const bytes = Buffer.concat(
+      entries.map(({ name, mode, object }) =>
+        Buffer.concat([
+          Buffer.from(`${mode} `),
+          name,
+          Buffer.from([0]),
+          Buffer.from(object, "hex"),
+        ]),
+      ),
+    );
+    return createHash(objectFormat).update(`tree ${bytes.length}\0`).update(bytes).digest("hex");
+  };
+  return hashDirectory(root);
+}
+
+function sameContent(left: Map<string, TrackedEntry>, right: Map<string, TrackedEntry>): boolean {
+  for (const path of new Set([...left.keys(), ...right.keys()])) {
+    const before = left.get(path);
+    const after = right.get(path);
+    if (
+      (before?.mode ?? "deleted") !== (after?.mode ?? "deleted") ||
+      (before?.object ?? "") !== (after?.object ?? "")
+    )
+      return false;
+  }
+  return true;
 }
 
 export function captureRepositoryState(cwd: string, launch?: RepositoryState): RepositoryState {
@@ -296,14 +370,21 @@ export function captureRepositoryState(cwd: string, launch?: RepositoryState): R
     const repository = resolveRepository(cwd);
     if (launch?.kind === "git" && !sameRepository(launch, repository))
       return { kind: "unavailable" };
-    const head = gitLine(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], repository);
-    const trackedHash = trackedFingerprint(repository, head);
-    if (
-      gitLine(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], repository) !== head ||
-      !sameRepository(repository, resolveRepository(cwd))
-    )
-      return { kind: "unavailable" };
-    return { kind: "git", ...repository, head, trackedHash };
+    const objectFormat =
+      launch?.kind === "git"
+        ? launch.objectFormat
+        : gitLine(cwd, ["rev-parse", "--show-object-format"], repository);
+    if (objectFormat !== "sha1" && objectFormat !== "sha256")
+      throw new Error("unsupported object format");
+    const trees = launch?.kind === "git" ? launch.launchTrees : launchTrees(repository);
+    const tracked = trackedContent(
+      repository,
+      objectFormat,
+      launch?.kind === "git" ? launch.tracked : undefined,
+    );
+    const tree = contentTree(tracked, objectFormat);
+    if (!sameRepository(repository, resolveRepository(cwd))) return { kind: "unavailable" };
+    return { kind: "git", ...repository, tracked, tree, launchTrees: trees, objectFormat };
   } catch {
     return { kind: "unavailable" };
   }
@@ -323,14 +404,7 @@ export function isVerifiedEdit(
   try {
     if (!sameRepository(before, after) || !sameRepository(before, resolveRepository(cwd)))
       return false;
-    const committedChange =
-      before.head !== after.head &&
-      readGit(cwd, ["rev-list", "--max-count=1", after.head, `^${before.head}`, "--"], before)
-        .length > 0 &&
-      !readGit(cwd, ["rev-parse", "--verify", `${before.head}^{tree}`], before).equals(
-        readGit(cwd, ["rev-parse", "--verify", `${after.head}^{tree}`], before),
-      );
-    return committedChange || before.trackedHash !== after.trackedHash;
+    return !sameContent(before.tracked, after.tracked) && !before.launchTrees.has(after.tree);
   } catch {
     return false;
   }
