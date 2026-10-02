@@ -6,7 +6,7 @@ import { runDoctor } from "../../src/shell/doctor.js";
 import {
   hasEditSuccessEvidence,
   isFileEditTool,
-  isVerifiedFileEdit,
+  isVerifiedEdit,
 } from "../../src/shell/edit-evidence.js";
 import { EXPLORATION_INSTRUCTION } from "../../src/shell/exploration-budget.js";
 import { loadRole } from "../../src/shell/role-loader.js";
@@ -131,12 +131,12 @@ function agentYaml(name: string, role: string, tool: string): string {
 
 describe("the verified-edit predicate", () => {
   it("accepts each file-edit tool's own success evidence", () => {
-    expect(isVerifiedFileEdit("edit_lines", false, EDIT_LINES_OK)).toBe(true);
-    expect(isVerifiedFileEdit("insert_after", false, EDIT_LINES_OK)).toBe(true);
-    expect(isVerifiedFileEdit("write_file", false, WRITE_FILE_OK)).toBe(true);
-    expect(isVerifiedFileEdit("edit", false, PI_EDIT_OK)).toBe(true);
-    expect(isVerifiedFileEdit("write", false, PI_WRITE_OK)).toBe(true);
-    expect(isVerifiedFileEdit("replace_lines", false, REPLACE_LINES_OK)).toBe(true);
+    expect(isVerifiedEdit("edit_lines", false, EDIT_LINES_OK)).toBe(true);
+    expect(isVerifiedEdit("insert_after", false, EDIT_LINES_OK)).toBe(true);
+    expect(isVerifiedEdit("write_file", false, WRITE_FILE_OK)).toBe(true);
+    expect(isVerifiedEdit("edit", false, PI_EDIT_OK)).toBe(true);
+    expect(isVerifiedEdit("write", false, PI_WRITE_OK)).toBe(true);
+    expect(isVerifiedEdit("replace_lines", false, REPLACE_LINES_OK)).toBe(true);
     expect(isFileEditTool("edit_lines")).toBe(true);
   });
 
@@ -150,7 +150,7 @@ describe("the verified-edit predicate", () => {
   ] as const) {
     it(`${tool} rejects missing content`, () => {
       const { content: _content, ...missing } = result;
-      expect(isVerifiedFileEdit(tool, false, missing)).toBe(false);
+      expect(isVerifiedEdit(tool, false, missing)).toBe(false);
     });
 
     it.each([
@@ -168,31 +168,31 @@ describe("the verified-edit predicate", () => {
       ["blank text", [{ type: "text", text: "  " }]],
       ["malformed trailing block", [...result.content, { type: "text", text: 12 }]],
     ])(`${tool} rejects malformed content: %s`, (_label, content) => {
-      expect(isVerifiedFileEdit(tool, false, { ...result, content })).toBe(false);
+      expect(isVerifiedEdit(tool, false, { ...result, content })).toBe(false);
     });
 
     it.each([[null], [false], ["details"], [[]]])(
       `${tool} rejects malformed details: %p`,
       (details) => {
-        expect(isVerifiedFileEdit(tool, false, { ...result, details })).toBe(false);
+        expect(isVerifiedEdit(tool, false, { ...result, details })).toBe(false);
       },
     );
   }
 
   it("does not count an error, a refusal, a command, a read or an unknown name", () => {
-    expect(isVerifiedFileEdit("edit_lines", true, EDIT_LINES_OK)).toBe(false);
+    expect(isVerifiedEdit("edit_lines", true, EDIT_LINES_OK)).toBe(false);
     expect(
-      isVerifiedFileEdit("edit_lines", false, {
+      isVerifiedEdit("edit_lines", false, {
         content: [{ type: "text", text: "refused" }],
         details: { fingerprint: "F#0123456789abcdef", lineDelta: 2, refused: true },
       }),
     ).toBe(false);
-    expect(isVerifiedFileEdit("run", false, PI_WRITE_OK)).toBe(false);
-    expect(isVerifiedFileEdit("bash", false, PI_WRITE_OK)).toBe(false);
-    expect(isVerifiedFileEdit("powershell", false, PI_WRITE_OK)).toBe(false);
-    expect(isVerifiedFileEdit("read_lines", false, READ_LINES_OK)).toBe(false);
-    expect(isVerifiedFileEdit("flair_write", false, PI_WRITE_OK)).toBe(false);
-    expect(isVerifiedFileEdit("not_a_real_tool", false, PI_WRITE_OK)).toBe(false);
+    expect(isVerifiedEdit("run", false, PI_WRITE_OK)).toBe(false);
+    expect(isVerifiedEdit("bash", false, PI_WRITE_OK)).toBe(false);
+    expect(isVerifiedEdit("powershell", false, PI_WRITE_OK)).toBe(false);
+    expect(isVerifiedEdit("read_lines", false, READ_LINES_OK)).toBe(false);
+    expect(isVerifiedEdit("flair_write", false, PI_WRITE_OK)).toBe(false);
+    expect(isVerifiedEdit("not_a_real_tool", false, PI_WRITE_OK)).toBe(false);
     expect(isFileEditTool("run")).toBe(false);
     expect(isFileEditTool("not_a_real_tool")).toBe(false);
   });
@@ -543,6 +543,6 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     expect(lastRun?.detail).toContain("no_edit_no_blocked");
     expect(lastRun?.status).toBe("warn");
     expect(lastRun?.fix).toContain("BLOCKED");
-    expect(lastRun?.fix).toContain("no verified file-edit-tool evidence");
+    expect(lastRun?.fix).toContain("no verified edit evidence");
   }, 15_000);
 });

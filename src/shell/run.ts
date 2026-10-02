@@ -78,7 +78,7 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { gatedNoteInjection } from "./data-class.js";
-import { isVerifiedFileEdit } from "./edit-evidence.js";
+import { captureRepositoryState, isVerifiedEdit } from "./edit-evidence.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -721,7 +721,7 @@ export interface RunOptions {
   // tool calls trip it. Overrides bob.yaml's `run.tool_loop_limit`.
   toolLoopLimit?: number;
   explorationBudget?: number;
-  // bob#283: whether this run must end with a verified file edit or an explicit
+  // bob#283: whether this run must end with a verified edit or an explicit
   // BLOCKED report. Overrides the role's `require_edit_or_blocked` (tests use
   // it); undefined leaves the resolved role value in force.
   requireEditOrBlocked?: boolean;
@@ -789,7 +789,7 @@ export async function attachFlairBootstrap(
 // bob#283 — the line the runtime prints when a run that made no verified edit
 // also did not report BLOCKED, so it is not reported as a success.
 function noEditNoBlockedMessage(name: string): string {
-  return `bob run ${name}: NO EDIT AND NO BLOCKED REPORT — the run made no verified file edit and its final message did not begin with BLOCKED, so it was not reported as a success (exit 1). Make the edit, or end with a message that begins with BLOCKED.\n`;
+  return `bob run ${name}: NO EDIT AND NO BLOCKED REPORT — the run made no verified edit and its final message did not begin with BLOCKED, so it was not reported as a success (exit 1). Make the edit, or end with a message that begins with BLOCKED.\n`;
 }
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
@@ -866,6 +866,8 @@ async function runBoundedSession(
   // Applies to bob run and launch with a prompt; mail turns are exempt.
   const requireEditOrBlocked =
     opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
+  const repositoryAtLaunch = captureRepositoryState(config.cwd);
+  let repositoryAtLastTool = repositoryAtLaunch;
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -1041,8 +1043,6 @@ async function runBoundedSession(
   const loopController = new AbortController();
   let loopBreaker: { toolName: string; count: number } | undefined;
   let explorationExhausted: { limit: number; nonProgressCalls: number } | undefined;
-  // bob#283: the run's verified file edits (edit-evidence.ts) — what the
-  // completion rule below reads to decide whether the run made progress.
   let verifiedEdits = 0;
   let noEditNoBlocked = false;
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
@@ -1156,13 +1156,11 @@ async function runBoundedSession(
         loopController.abort();
       }
     }
-    // bob#283: count the calls that count as an edit — a write-class file-edit
-    // tool that ended without an error and carried its own success evidence.
     if (event.type === "tool_execution_end") {
       const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
       const isError = (event as unknown as { isError?: unknown }).isError;
       const result = (event as unknown as { result?: unknown }).result;
-      if (isVerifiedFileEdit(toolName, isError, result)) verifiedEdits += 1;
+      if (isVerifiedEdit(toolName, isError, result)) verifiedEdits += 1;
     }
     if (
       (event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
@@ -1171,10 +1169,19 @@ async function runBoundedSession(
     ) {
       const call = event as unknown as { toolName?: unknown; isError?: unknown; result?: unknown };
       const toolName = String(call.toolName ?? "");
+      const repository =
+        event.type === "tool_execution_end" && repositoryAtLaunch.kind === "git"
+          ? {
+              cwd: config.cwd,
+              before: repositoryAtLastTool,
+              after: captureRepositoryState(config.cwd),
+            }
+          : undefined;
       const budget =
         event.type === "tool_execution_start"
           ? explorationDetector.observeStart(toolName)
-          : explorationDetector.observeEnd(toolName, call.isError, call.result);
+          : explorationDetector.observeEnd(toolName, call.isError, call.result, repository);
+      if (repository?.after.kind === "git") repositoryAtLastTool = repository.after;
       if (budget.inject) {
         writeRunLog(
           {
@@ -1384,7 +1391,16 @@ async function runBoundedSession(
       reportWorktreeStatus(opts.name, config.cwd, true);
     }
     // Only an accepted completion reaches this gate; outcome logging is best-effort.
-    if (exitCode === 0 && requireEditOrBlocked && verifiedEdits === 0) {
+    if (
+      exitCode === 0 &&
+      requireEditOrBlocked &&
+      verifiedEdits === 0 &&
+      !isVerifiedEdit("", undefined, undefined, {
+        cwd: config.cwd,
+        before: repositoryAtLaunch,
+        after: captureRepositoryState(config.cwd),
+      })
+    ) {
       if (!/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {
         exitCode = 1;
         noEditNoBlocked = true;

@@ -346,6 +346,19 @@ change one, the named test is what tells you.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`)*
 
+- **builder-local requires an edit or a BLOCKED report.** After the completion
+  judge accepts, `bob run` and `bob launch <name> <prompt>` require verified
+  file-edit tool success without error or refusal, a commit reachable from
+  final HEAD but not launch HEAD, a tracked diff hash different from launch,
+  or a final message beginning with the standalone token `BLOCKED`.
+  Bob reads Git state in the run's working-directory repository; submodule
+  gitlinks count, but untracked files and submodule dirt do not.
+  Non-git launches and Git failures supply no repository evidence. Model messages are not edit evidence.
+  The exploration budget uses the same predicate, comparing repository state
+  with the previous successful observation at a tool result.
+  Mail turns, interactive launch and the persistent runtime keep their completion rules.
+  *(`test/shell/edit-or-blocked.test.ts`, `repository-edit-evidence.test.ts`)*
+
 ### Stated exceptions
 
 1. **Onboarding and alignment are privileged local setup commands**, available

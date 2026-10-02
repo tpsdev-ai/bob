@@ -1,4 +1,4 @@
-import { isFileEditTool, isVerifiedFileEdit } from "./edit-evidence.js";
+import { isFileEditTool, isVerifiedEdit, type RepositoryEditEvidence } from "./edit-evidence.js";
 
 export const BUILDER_LOCAL_EXPLORATION_BUDGET = 20;
 
@@ -43,12 +43,16 @@ export class ExplorationBudgetDetector {
     return this.countNonProgress();
   }
 
-  observeEnd(toolName: string, isError: unknown, result: unknown): ExplorationObservation {
-    if (isFileEditTool(toolName)) {
-      if (!isVerifiedFileEdit(toolName, isError, result)) {
-        return this.countNonProgress();
-      }
+  observeEnd(
+    toolName: string,
+    isError: unknown,
+    result: unknown,
+    repository?: RepositoryEditEvidence,
+  ): ExplorationObservation {
+    if (isVerifiedEdit(toolName, isError, result, repository)) {
       this.count = 0;
+    } else if (isFileEditTool(toolName)) {
+      return this.countNonProgress();
     }
     return { nonProgressCalls: this.count, inject: false, exhaust: false };
   }
