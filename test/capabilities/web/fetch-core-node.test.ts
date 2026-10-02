@@ -12,7 +12,7 @@
 // constant is pinned separately. Caps, redirect limit, headers, content types,
 // extraction and text limit use their production values.
 
-import { afterAll, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,12 +26,9 @@ const DIST_CORE = fileURLToPath(
 );
 const HARNESS_TIMEOUT_MS = 120_000;
 
-const tlsDir = mkdtempSync(join(tmpdir(), "bob-web-fetch-"));
-afterAll(() => rmSync(tlsDir, { recursive: true, force: true }));
-
 // A self-signed cert with an IP SAN, generated with openssl (the CI image ships
 // it). The harness gives it to both the HTTPS peer and the fetch core's TLS CA.
-function makeCert(): void {
+function makeCert(tlsDir: string): void {
   writeFileSync(
     join(tlsDir, "openssl.cnf"),
     [
@@ -69,7 +66,9 @@ function makeCert(): void {
   );
 }
 
-function runHarness(): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runHarness(
+  tlsDir: string,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn("node", [HARNESS, tlsDir], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -141,25 +140,30 @@ let report: HarnessReport;
 test(
   "the fetch core's transport, over real loopback peers, under Node",
   async () => {
-    if (!existsSync(DIST_CORE)) {
-      throw new Error(`the harness runs the built core; ${DIST_CORE} is missing — run the build`);
-    }
-    makeCert();
-    const { code, stdout, stderr } = await runHarness();
-    if (code !== 0) {
-      throw new Error(`harness exited ${code}\nstdout: ${stdout}\nstderr: ${stderr}`);
-    }
-    const lines = stdout.trim().split("\n");
-    report = JSON.parse(lines[lines.length - 1]) as HarnessReport;
-
-    // The harness ran exactly the cases this test asserts.
-    expect(report.caseNames).toEqual(CASE_NAMES);
-    for (const name of CASE_NAMES) {
-      const observed = report.cases[name];
-      expect(observed).toBeDefined();
-      if (observed?.ok !== true) {
-        throw new Error(`case ${name} did not run: ${String(observed?.error)}`);
+    const tlsDir = mkdtempSync(join(tmpdir(), "bob-web-fetch-"));
+    try {
+      if (!existsSync(DIST_CORE)) {
+        throw new Error(`the harness runs the built core; ${DIST_CORE} is missing — run the build`);
       }
+      makeCert(tlsDir);
+      const { code, stdout, stderr } = await runHarness(tlsDir);
+      if (code !== 0) {
+        throw new Error(`harness exited ${code}\nstdout: ${stdout}\nstderr: ${stderr}`);
+      }
+      const lines = stdout.trim().split("\n");
+      report = JSON.parse(lines[lines.length - 1]) as HarnessReport;
+
+      // The harness ran exactly the cases this test asserts.
+      expect(report.caseNames).toEqual(CASE_NAMES);
+      for (const name of CASE_NAMES) {
+        const observed = report.cases[name];
+        expect(observed).toBeDefined();
+        if (observed?.ok !== true) {
+          throw new Error(`case ${name} did not run: ${String(observed?.error)}`);
+        }
+      }
+    } finally {
+      rmSync(tlsDir, { recursive: true, force: true });
     }
   },
   HARNESS_TIMEOUT_MS,

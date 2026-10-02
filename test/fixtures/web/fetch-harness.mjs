@@ -62,9 +62,13 @@ function trackPeer(server, port, address) {
     connections: () => connections,
     abortedResponses: () => aborted,
     close: () =>
-      new Promise((resolve) => {
+      new Promise((resolve, reject) => {
         for (const socket of sockets) socket.destroy();
-        server.close(() => resolve());
+        if (!server.listening) {
+          resolve();
+          return;
+        }
+        server.close((error) => (error ? reject(error) : resolve()));
       }),
   };
   peers.push(peer);
@@ -82,6 +86,22 @@ function trackPeer(server, port, address) {
   };
 }
 
+function listen(server, address) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, address);
+  });
+}
+
 async function httpPeer(handler, address = LOOPBACK) {
   let wrap;
   const server = createServer((req, res) => {
@@ -89,7 +109,7 @@ async function httpPeer(handler, address = LOOPBACK) {
     handler(req, res);
   });
   wrap = trackPeer(server, 0, address);
-  await new Promise((resolve) => server.listen(0, address, resolve));
+  await listen(server, address);
   wrap.peer.port = server.address().port;
   return wrap.peer;
 }
@@ -101,7 +121,7 @@ async function httpsPeer(handler, address = LOOPBACK) {
     handler(req, res);
   });
   wrap = trackPeer(server, 0, address);
-  await new Promise((resolve) => server.listen(0, address, resolve));
+  await listen(server, address);
   wrap.peer.port = server.address().port;
   return wrap.peer;
 }
@@ -169,6 +189,15 @@ const record = async (name, fn) => {
     cases[name] = { ok: true, ...(await fn()) };
   } catch (error) {
     cases[name] = { ok: false, error: String(error?.stack ?? error) };
+  } finally {
+    // A case can fail after opening a peer, including during listen. Close all
+    // its peers before starting the next case, even if one teardown fails.
+    const results = await Promise.allSettled(peers.splice(0).map((peer) => peer.close()));
+    for (const result of results) {
+      if (result.status === "rejected") {
+        cases[name] = { ok: false, error: `peer teardown failed: ${String(result.reason)}` };
+      }
+    }
   }
 };
 
@@ -719,6 +748,4 @@ await record("network-failure", async () => {
 
 // ── report ─────────────────────────────────────────────────────────────────
 
-for (const peer of peers) await peer.close();
 process.stdout.write(`${JSON.stringify({ caseNames: Object.keys(cases), cases })}\n`);
-process.exit(0);
