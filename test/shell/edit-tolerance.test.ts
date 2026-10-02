@@ -48,7 +48,7 @@ describe("locateTolerantEdits — whitespace-run normalisation", () => {
     );
   });
 
-  it("ignores trailing whitespace on either side", () => {
+  it("ignores trailing spaces/tabs on either side", () => {
     const content = "value = 1;\nother\n";
     // The oldText carries a trailing space the file does not have.
     const { edits, normalizedCount } = locateTolerantEdits(
@@ -61,7 +61,7 @@ describe("locateTolerantEdits — whitespace-run normalisation", () => {
     expect(content.slice(edits[0].index, edits[0].index + edits[0].length)).toBe("value = 1;");
   });
 
-  it("ignores trailing whitespace before CRLF and maps LF oldText to the original CRLF span", () => {
+  it("ignores trailing spaces/tabs before CRLF and maps LF oldText to the original CRLF span", () => {
     const content = "header\r\nx  y\r\ntail\r\n";
     for (const oldText of ["x y \r\n", "x y \n"]) {
       const { edits, normalizedCount } = locateTolerantEdits(
@@ -80,7 +80,7 @@ describe("locateTolerantEdits — whitespace-run normalisation", () => {
     }
   });
 
-  it("ignores trailing whitespace before CR and maps the original CR span", () => {
+  it("ignores trailing spaces/tabs before CR and maps the original CR span", () => {
     const content = "first\rx  y\rlast\r";
     const { edits, normalizedCount } = locateTolerantEdits(
       content,

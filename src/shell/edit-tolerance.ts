@@ -13,7 +13,7 @@
 // the matcher (pi may still refuse it), and one at more than one exact position
 // fails, naming that count. Only when it occurs nowhere exactly does the
 // whitespace-run-normalised pass run (runs of
-// spaces/tabs → one space, trailing whitespace dropped): it accepts only one
+// spaces/tabs → one space, trailing spaces/tabs dropped): it accepts only one
 // normalised position and otherwise fails, naming the count.
 //
 // The returned edits carry the file's exact substring as `oldText`, so the
@@ -79,7 +79,7 @@ export function canonicalizeWhitespaceRuns(text: string): Canonical {
     if (isBlank(ch)) {
       let j = i;
       while (j < n && isBlank(text[j])) j++;
-      // A run followed by a newline (or EOF) is trailing whitespace: drop it.
+      // A run followed by a newline (or EOF) is trailing spaces/tabs: drop it.
       if (j >= n || text[j] === "\n" || text[j] === "\r") {
         i = j;
         continue;
@@ -148,7 +148,7 @@ function describe(path: string, index: number, total: number): string {
 }
 
 function notFoundMessage(path: string, index: number, total: number): string {
-  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing whitespace (0 matches). The old text must occur at one exact position or, with no exact occurrence, at one position under that normalisation.`;
+  return `Could not find ${describe(path, index, total)}, even after normalising runs of spaces/tabs and ignoring trailing spaces/tabs (0 matches). The old text must occur at one exact position or, with no exact occurrence, at one position under that normalisation.`;
 }
 
 function exactDuplicateMessage(path: string, index: number, total: number, count: number): string {
@@ -157,7 +157,7 @@ function exactDuplicateMessage(path: string, index: number, total: number, count
 }
 
 function duplicateMessage(path: string, index: number, total: number, count: number): string {
-  return `Found ${count} occurrences of ${describe(path, index, total)} after normalising runs of spaces/tabs and ignoring trailing whitespace (overlapping occurrences included). It must match at one place only; add surrounding context.`;
+  return `Found ${count} occurrences of ${describe(path, index, total)} after normalising runs of spaces/tabs and ignoring trailing spaces/tabs (overlapping occurrences included). It must match at one place only; add surrounding context.`;
 }
 
 function emptyMessage(path: string, index: number, total: number): string {

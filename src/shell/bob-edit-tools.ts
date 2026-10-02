@@ -107,7 +107,7 @@ function noteNormalisation(result: unknown, count: number): unknown {
   if (Array.isArray(content)) {
     for (const block of content) {
       if (block?.type === "text" && typeof block.text === "string") {
-        block.text = `${block.text} Matched ${count} edit(s) after normalising runs of spaces/tabs and ignoring trailing whitespace.`;
+        block.text = `${block.text} Matched ${count} edit(s) after normalising runs of spaces/tabs and ignoring trailing spaces/tabs.`;
       }
     }
   }
@@ -238,7 +238,7 @@ export function createReplaceLinesToolDefinition(
         const from = spans[startLine - 1].start;
         const to = spans[endLine - 1].end;
         const oldText = text.slice(from, to);
-        // Keep the selected line's terminator when newText has none.
+        // For nonempty newText without a terminator, keep the final selected line's terminator if present.
         const terminator = oldText.endsWith("\r\n")
           ? "\r\n"
           : oldText.endsWith("\n")

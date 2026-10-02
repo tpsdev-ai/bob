@@ -96,7 +96,7 @@ describe("createTolerantEditToolDefinition", () => {
     expect(resultText(result)).toContain("normalising runs of spaces/tabs");
   });
 
-  it("lands CRLF edits with trailing whitespace in oldText and keeps the file's CRLF endings", async () => {
+  it("lands CRLF edits with trailing spaces/tabs in oldText and keeps the file's CRLF endings", async () => {
     const file = join(cwd, "f.ts");
     const tool = createTolerantEditToolDefinition(cwd);
     for (const oldText of ["x y \r\n", "x y \n"]) {
@@ -110,7 +110,7 @@ describe("createTolerantEditToolDefinition", () => {
     }
   });
 
-  it("lands an edit in a CR-only file when oldText has trailing whitespace before CR", async () => {
+  it("lands an edit in a CR-only file when oldText has trailing spaces/tabs before CR", async () => {
     const file = join(cwd, "f.ts");
     writeFileSync(file, "first\rx  y\rlast\r");
     const tool = createTolerantEditToolDefinition(cwd);
