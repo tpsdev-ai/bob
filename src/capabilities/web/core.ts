@@ -1,8 +1,7 @@
-// The web capability's core (bob#152, spec v3). Slice R1a ships only the
-// settings a later fetch core enforces: the validated config block with its
-// defaults applied. There is NO network code in this slice and the capability
-// registers no tool; the fetch core (address policy, redirects, limits,
-// extraction) lands in R1b and the `web_fetch` tool in R1c.
+// The web capability's core (bob#152, spec v3). Slice R1a ships the validated
+// settings with defaults applied. The fetch core itself — the address policy,
+// redirects, limits and extraction (fetch.ts) — is slice R1b. Slice R1c will
+// register the `web_fetch` tool in this capability.
 
 import {
   FETCH_MAX_CHARS_DEFAULT,
@@ -15,7 +14,7 @@ import {
 export interface WebSettings {
   // Plain-HTTP fetches allowed (otherwise HTTPS only).
   allowHttp: boolean;
-  // The most text one fetch returns, in characters.
+  // The most text one fetch returns, in characters: the fetch core's ceiling.
   fetchMaxChars: number;
   // Fetch attempts per admitted prompt.
   fetchPerTurn: number;

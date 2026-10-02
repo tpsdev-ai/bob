@@ -136,7 +136,6 @@ describe("not a sandbox — stated where a reader meets it", () => {
     };
     const { manager } = wireWork({
       pi: fake,
-      stateRoot: "/nonexistent-bob-work-test",
       log: () => {},
     });
     manager.endRunSync();
@@ -157,6 +156,21 @@ describe("not a sandbox — stated where a reader meets it", () => {
     expect(d).toContain("it does not yet clamp to the run's remaining budget");
     expect(d).toContain("600 s");
     expect(d).toContain("3600 s");
+  });
+
+  it("the run tool description names the remaining cwd window as the capability README does", () => {
+    const d = descriptions().run;
+    // Collapse line wrapping so the phrases can be compared whole.
+    const flat = (s: string) => s.replace(/\s+/g, " ");
+    const readme = flat(readFileSync(join(WORK_SRC, "README.md"), "utf8"));
+    // These two pinned phrases match in both the description and the README.
+    for (const phrase of [
+      "narrows the race between the check and the start; it does not close it",
+      "replaced after the last re-check and before the child has changed directory is not detected",
+    ]) {
+      expect(d).toContain(phrase);
+      expect(readme).toContain(phrase);
+    }
   });
 
   it("run_cancel's description says it cancels only this tool's jobs", () => {

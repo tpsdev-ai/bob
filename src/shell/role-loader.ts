@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ExplorationBudgetError, parseExplorationBudget } from "./exploration-budget.js";
 import type { BobRole } from "./index.js";
 import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
 
@@ -21,6 +22,9 @@ export interface RoleTemplate {
   };
   default_provider?: string;
   default_model?: string;
+  exploration_budget?: number;
+  // Completion gate for bob run and launch with a prompt; mail turns are exempt.
+  require_edit_or_blocked?: boolean;
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think
   // (off | low | high). bob.yaml's `session:` block overrides either key for
@@ -74,7 +78,32 @@ export function loadRole(role: BobRole): RoleTemplate {
         `${configPath} "session"`,
       );
     }
-    return { role, soul, ...config, ...(session !== undefined ? { session } : {}) } as RoleTemplate;
+    let explorationBudget: number | undefined;
+    if (config.exploration_budget !== undefined) {
+      explorationBudget = parseExplorationBudget(config.exploration_budget);
+      if (explorationBudget === undefined) {
+        throw new ExplorationBudgetError(
+          `${configPath}: "exploration_budget" must be a positive whole number.`,
+        );
+      }
+    }
+    let requireEditOrBlocked: boolean | undefined;
+    if (config.require_edit_or_blocked !== undefined) {
+      if (typeof config.require_edit_or_blocked !== "boolean") {
+        throw new Error(`${configPath}: "require_edit_or_blocked" must be true or false.`);
+      }
+      requireEditOrBlocked = config.require_edit_or_blocked;
+    }
+    return {
+      role,
+      soul,
+      ...config,
+      ...(session !== undefined ? { session } : {}),
+      ...(explorationBudget !== undefined ? { exploration_budget: explorationBudget } : {}),
+      ...(requireEditOrBlocked !== undefined
+        ? { require_edit_or_blocked: requireEditOrBlocked }
+        : {}),
+    } as RoleTemplate;
   }
   throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);
 }

@@ -71,6 +71,7 @@ export interface WireWorkOptions extends JobManagerOptions {
 // The two Limits sentences of bob#211, verbatim, plus what else the reader needs.
 const RUN_DESCRIPTION =
   `Run a shell command (bash -c) in the workspace and report an honest outcome. ` +
+  `cwd is checked and pinned before the spawn, but that check narrows the race between the check and the start; it does not close it: a path component replaced after the last re-check and before the child has changed directory is not detected. ` +
   `Every command has a deadline: omit timeout_s for the default of ${DEFAULT_TIMEOUT_S} s; a larger request is capped at the hard maximum of ${MAX_TIMEOUT_S} s. ` +
   `(Slice 1 applies this default and maximum only; it does not yet clamp to the run's remaining budget.) ` +
   `At the deadline the command's process group gets SIGTERM, then SIGKILL after a short grace. ` +

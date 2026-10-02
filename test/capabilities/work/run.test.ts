@@ -372,11 +372,11 @@ describe("run — output", () => {
     live = await workSession({ script: program(call("run", { command: "echo x" })) });
     await live.prompt();
     const ref = String(lastOf(live.results, "run").details.output_ref);
-    expect(ref.startsWith(live.stateRoot)).toBe(true);
+    expect(ref.startsWith(join(tmpdir(), "bob-run-"))).toBe(true);
+    expect(ref.startsWith(live.stateRoot)).toBe(false);
     expect(ref.startsWith(live.cwd)).toBe(false);
     expect(statSync(ref).mode & 0o777).toBe(0o600);
     expect(statSync(join(ref, "..")).mode & 0o777).toBe(0o700);
-    expect(statSync(join(ref, "..", "..")).mode & 0o777).toBe(0o700);
     expect(statSync(live.stateRoot).mode & 0o777).toBe(0o700);
     // No stray file in the workspace.
     expect(readdirSync(live.cwd)).toEqual([]);
@@ -444,14 +444,15 @@ describe("run — private run directory, exclusive capture files", () => {
     expect(basename(runDir)).toMatch(/^run-[A-Za-z0-9]{6}$/);
     expect(basename(runDir)).not.toContain(String(process.pid));
     expect(join(runDir, "..")).toBe(live.stateRoot);
-    for (const dir of [live.stateRoot, runDir, join(runDir, "out"), join(runDir, "jobs")]) {
+    const out = join(String(live.results[0].details.output_ref), "..");
+    for (const dir of [live.stateRoot, runDir, out, join(runDir, "jobs")]) {
       const st = lstatSync(dir);
       expect(st.isDirectory() && !st.isSymbolicLink(), dir).toBe(true);
       expect(st.mode & 0o777, dir).toBe(0o700);
     }
     for (const r of live.results) {
       const ref = String(r.details.output_ref);
-      expect(join(ref, "..")).toBe(join(runDir, "out"));
+      expect(join(ref, "..")).toBe(out);
       expect(lstatSync(ref).isFile()).toBe(true);
       expect(lstatSync(ref).mode & 0o777).toBe(0o600);
     }
@@ -463,7 +464,7 @@ describe("run — private run directory, exclusive capture files", () => {
   it("a symlink or a file already at a capture path is never written through", async () => {
     let victim = "";
     let planted = "";
-    const outDir = () => join(String(live?.work.manager.runDir), "out");
+    const outDir = () => join(String(live?.work.manager.list()[0].capturePath), "..");
     live = await workSession({
       script: program(
         call("run", { command: "echo first" }),
@@ -643,7 +644,7 @@ describe("run — background jobs and owned cancellation", () => {
     }
     expect(live.logs.filter((l) => l.startsWith("work: run end:")).length).toBe(2);
     // The captures are deleted at run end; the small job records stay.
-    expect(existsSync(join(runDir, "out"))).toBe(false);
+    expect(existsSync(join(String(entries[0].output_ref), ".."))).toBe(false);
     expect(existsSync(join(runDir, "ended.json"))).toBe(true);
   }, 20_000);
 
@@ -739,13 +740,42 @@ describe("run — background jobs and owned cancellation", () => {
 });
 
 describe("run — refusals name actor, state and remedy", () => {
-  it("a cwd that does not exist is refused with the resolved path", async () => {
+  it("a cwd that does not exist reports the failed check with its errno, not a cause", async () => {
     live = await workSession({ script: program(call("run", { command: "true", cwd: "nope" })) });
     await live.prompt();
     const r = lastOf(live.results, "run");
     expect(r.isError).toBe(true);
     expect(r.text).toContain('run refused: cwd "nope"');
-    expect(r.text).toContain("is not an existing directory");
+    // The stat failed (ENOENT): the refusal reports THAT, and never claims a
+    // cause it did not observe.
+    expect(r.text).toContain("could not be checked (ENOENT)");
+    expect(r.text).not.toContain("is not an existing directory");
+  }, 20_000);
+
+  it("a cwd through a non-directory reports the failed check with its errno (ENOTDIR)", async () => {
+    live = await workSession({
+      script: program(call("run", { command: "true", cwd: "afile/x" })),
+    });
+    writeFileSync(join(live.cwd, "afile"), "not a directory");
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('run refused: cwd "afile/x"');
+    expect(r.text).toContain("could not be checked (ENOTDIR)");
+    expect(r.text).not.toContain("is not an existing directory");
+  }, 20_000);
+
+  it("a cwd that is a file says so: the stat returned, so the cause is observed", async () => {
+    live = await workSession({
+      script: program(call("run", { command: "true", cwd: "afile" })),
+    });
+    writeFileSync(join(live.cwd, "afile"), "not a directory");
+    await live.prompt();
+    const r = lastOf(live.results, "run");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('run refused: cwd "afile"');
+    expect(r.text).toContain("is not a directory");
+    expect(r.text).not.toContain("could not be checked");
   }, 20_000);
 
   it("more live jobs than the limit are refused, naming the running ones", async () => {
@@ -782,7 +812,10 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     expect(w.work.manager.list()).toEqual([]);
     // The capture file made for the refused job is gone too.
     const runDir = w.work.manager.runDir;
-    if (runDir !== null) expect(readdirSync(join(runDir, "out"))).toEqual([]);
+    if (runDir !== null) {
+      const meta = JSON.parse(readFileSync(join(runDir, "run.json"), "utf8"));
+      expect(readdirSync(meta.scratch_dir)).toEqual([]);
+    }
   }
   async function refusalOf(p: Promise<unknown>): Promise<Error> {
     try {
@@ -925,6 +958,69 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     await expectNothingStarted(m.file);
   }, 20_000);
 
+  it("a component replaced BETWEEN the re-check's realpath and its no-follow stat is refused (the interval, deterministically)", async () => {
+    // One re-check resolves the path and then stats it as two separate calls.
+    // This seam performs the swap INSIDE the realpath call — after it has
+    // resolved, before it returns — so the stat that follows is guaranteed to
+    // see the replacement: no timing, no race. The stat's comparison against
+    // the pin is what refuses. The source documents the same interval next to
+    // the child's chdir window.
+    let armed = false;
+    const dirPinOps: DirPinOps = {
+      ...NODE_DIR_PIN_OPS,
+      realpath: (p) => {
+        const real = NODE_DIR_PIN_OPS.realpath(p);
+        if (armed) {
+          renameSync(real, `${real}-old`);
+          mkdirSync(real);
+        }
+        return real;
+      },
+    };
+    live = await workSession({
+      script: program(),
+      wire: {
+        dirPinOps,
+        beforeSpawn: () => {
+          armed = true;
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain("does not match its pin immediately before the spawn");
+    expect(err.message).toContain("not a directory with the pinned device and inode");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
+  it("refuses when the workspace ROOT is replaced (same canonical path) between resolution and the pin", async () => {
+    live = await workSession({
+      script: program(),
+      wire: {
+        beforePin: () => {
+          const w = live as LiveWork;
+          // Replace the workspace root with ANOTHER directory at the same path,
+          // and recreate the cwd inside it. Every path string is unchanged, so
+          // only the root's pinned device + inode can tell the difference.
+          renameSync(w.cwd, `${w.cwd}-old`);
+          mkdirSync(w.cwd);
+          mkdirSync(join(w.cwd, "sub"));
+        },
+      },
+    });
+    const m = marker();
+    mkdirSync(join(live.cwd, "sub"));
+    const err = await refusalOf(
+      live.work.manager.start({ command: m.command, cwd: "sub" }, live.cwd),
+    );
+    expect(err.message).toContain(`the workspace ${live.cwd} no longer has the device and inode`);
+    expect(err.message).toContain("when it was pinned");
+    await expectNothingStarted(m.file);
+  }, 20_000);
+
   // 64-bit identities: two values that are EQUAL as numbers (2^60 and 2^60 + 1
   // round to the same double) but DIFFERENT as bigints.
   const BIG_PINNED = 2n ** 60n;
@@ -1027,6 +1123,9 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     expect(err.message).toContain("could not be re-resolved immediately before the spawn (EIO)");
     // An EIO establishes neither a removal nor a replacement: no cause is claimed.
     expect(err.message).toContain("resolving it failed");
+    // The wording of the pin: the checked canonical path and the directory pinned
+    // at open, the same phrase the pin's own documentation uses.
+    expect(err.message).toContain("the checked canonical path and the directory pinned at open");
     expect(err.message).not.toMatch(/removed|replaced/);
     await expectNothingStarted(m.file);
   }, 20_000);

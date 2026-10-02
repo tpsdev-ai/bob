@@ -1273,6 +1273,73 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
     }
   };
 
+  function heldOutputLauncher(output: string, exitCode = 0): { launcher: string; pidFile: string } {
+    const pidFile = join(root, "holder.pid");
+    const launcher = join(root, "holding-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        output,
+        // The fake group operations below cannot kill this member. It retains
+        // both output pipes after the launcher exits.
+        `sh -c 'trap "" TERM; exec sleep 60' &`,
+        `echo $! > ${pidFile}`,
+        `echo x >> ${join(root, "holding-launcher.count")}`,
+        `exit ${exitCode}`,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    return { launcher, pidFile };
+  }
+
+  function lateResultLauncher(): {
+    launcher: string;
+    pidFile: string;
+    releaseFile: string;
+    lateResultFile: string;
+    writeStatusFile: string;
+  } {
+    const pidFile = join(root, "late-holder.pid");
+    const releaseFile = join(root, "release-late-result");
+    const lateResultFile = join(root, "late-result");
+    const writeStatusFile = join(root, "late-result-write-status");
+    const launcher = join(root, "late-result-launcher");
+    writeFileSync(
+      launcher,
+      [
+        "#!/bin/sh",
+        "cat > /dev/null",
+        // The timer-expiry hook creates lateResultFile and releaseFile. The
+        // descendant copies that complete result to its inherited stdout, then
+        // records whether the write succeeded while the reader was still held.
+        `sh -c 'trap "" TERM; while [ ! -e "${releaseFile}" ]; do sleep 0.01; done; cat "${lateResultFile}"; status=$?; printf "%s\\n" "$status" > "${writeStatusFile}"; exec sleep 60' &`,
+        `echo $! > ${pidFile}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(launcher, 0o755);
+    return { launcher, pidFile, releaseFile, lateResultFile, writeStatusFile };
+  }
+
+  function exhaustedRunner(): Pick<
+    MailConsumerOptions,
+    "turnRunner" | "turnTimeoutMs" | "runTurn"
+  > {
+    return {
+      runTurn: undefined,
+      turnTimeoutMs: 5000,
+      turnRunner: {
+        killGraceMs: 50,
+        reapLimitMs: 100,
+        groupOps: { exists: () => true, signal: () => {} },
+      },
+    };
+  }
+
   it("(g4) a SIGTERM-resistant descendant that KEEPS stdout neither holds the turn to its timeout nor gets a finished turn retried", async () => {
     deliver("1.json", { messageId: "m-1" });
     const pidFile = join(root, "holder.pid");
@@ -1347,5 +1414,191 @@ describe("round 6, blocker 3 — group cleanup starts when the leader EXITS", ()
     expect(h.logs.join("\n")).toMatch(
       /process group \d+ still has members after SIGKILL and the reap limit; cleanup gave up/,
     );
+  }, 10_000);
+
+  it("a complete result stands after reap exhaustion without waiting for the turn timeout", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"done"}'`,
+    );
+    const h = harness({ launcherPath: launcher, ...exhaustedRunner() });
+
+    const started = Date.now();
+    await h.consumer.poll();
+    const elapsed = Date.now() - started;
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(elapsed).toBeLessThan(2000);
+      expect(h.replies).toEqual([{ to: "flint", inReplyTo: "m-1", body: "done" }]);
+      expect(inDir("new")).toEqual([]);
+      expect(inDir("cur")).toEqual(["1.json"]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 0,
+        timeouts: 0,
+        reapExhausted: 1,
+        resultCollectedAfterReapExhausted: 1,
+      });
+      await h.consumer.poll();
+      expect(readFileSync(join(root, "holding-launcher.count"), "utf8").trim()).toBe("x");
+      expect(h.logs.join("\n")).toMatch(
+        /result collection for process group \d+ ended after reap exhaustion/,
+      );
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("an incomplete result after reap exhaustion fails by the normal no-result rule", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s' '{"bobMailTurn":1,"outcome":"final","text":'`,
+    );
+    const h = harness({ launcherPath: launcher, ...exhaustedRunner() });
+
+    const started = Date.now();
+    await h.consumer.poll();
+    const elapsed = Date.now() - started;
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(elapsed).toBeLessThan(2000);
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(inDir("cur")).toEqual([]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 0,
+        reapExhausted: 1,
+        resultCollectedAfterReapExhausted: 1,
+      });
+      expect(h.logs.join("\n")).toContain("turn FAILED (no-result: launcher wrote no result line)");
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("bytes successfully written after the post-reap timer fires do not change its no-result decision", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile, releaseFile, lateResultFile, writeStatusFile } =
+      lateResultLauncher();
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    const lateResult = '{"bobMailTurn":1,"outcome":"final","text":"too-late"}\n';
+    let timerFired = false;
+    let lateWriteStatus: string | undefined;
+    const h = harness({
+      launcherPath: launcher,
+      runTurn: undefined,
+      turnTimeoutMs: 5000,
+      turnRunner: {
+        killGraceMs: 50,
+        reapLimitMs: 100,
+        groupOps: { exists: () => true, signal: () => {} },
+        onResultWaitExpired: () => {
+          timerFired = true;
+          writeFileSync(lateResultFile, lateResult);
+          writeFileSync(releaseFile, "release\n");
+          const deadline = Date.now() + 2000;
+          while (!existsSync(writeStatusFile) && Date.now() < deadline) {
+            Atomics.wait(sleeper, 0, 0, 10);
+          }
+          if (existsSync(writeStatusFile)) {
+            lateWriteStatus = readFileSync(writeStatusFile, "utf8").trim();
+          }
+        },
+      },
+    });
+
+    await h.consumer.poll();
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(timerFired).toBe(true);
+      expect(lateWriteStatus).toBe("0");
+      expect(JSON.parse(readFileSync(lateResultFile, "utf8"))).toEqual({
+        bobMailTurn: 1,
+        outcome: "final",
+        text: "too-late",
+      });
+      expect(h.logs.join("\n")).toContain("turn FAILED (no-result: launcher wrote no result line)");
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(inDir("cur")).toEqual([]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 0,
+        reapExhausted: 1,
+        resultCollectedAfterReapExhausted: 1,
+      });
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("a timeout during the post-reap result wait does not report result collection", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"too-late"}'`,
+    );
+    const h = harness({
+      launcherPath: launcher,
+      runTurn: undefined,
+      turnTimeoutMs: 300,
+      turnRunner: {
+        killGraceMs: 0,
+        reapLimitMs: 0,
+        groupOps: { exists: () => true, signal: () => {} },
+      },
+    });
+
+    await h.consumer.poll();
+    // poll() returns when the turn timeout wins. Let the still-pending result
+    // timer fire too, so this pins the later collection callback as a no-op.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 1,
+        reapExhausted: 1,
+      });
+      expect({
+        counter: h.consumer.stats.resultCollectedAfterReapExhausted,
+        logs: h.logs.filter((line) =>
+          /result collection .* ended after reap exhaustion/.test(line),
+        ),
+      }).toEqual({ counter: 0, logs: [] });
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("a nonzero launcher exit after reap exhaustion does not report result collection", async () => {
+    deliver("1.json", { messageId: "m-1" });
+    const { launcher, pidFile } = heldOutputLauncher(
+      `printf '%s\\n' '{"bobMailTurn":1,"outcome":"final","text":"ignored"}'`,
+      7,
+    );
+    const h = harness({ launcherPath: launcher, ...exhaustedRunner() });
+
+    await h.consumer.poll();
+    const holder = Number(readFileSync(pidFile, "utf8").trim());
+    try {
+      expect(h.replies).toEqual([]);
+      expect(inDir("new")).toEqual(["1.json"]);
+      expect(h.consumer.stats).toMatchObject({
+        dispatchFailed: 1,
+        timeouts: 0,
+        reapExhausted: 1,
+      });
+      expect(h.logs.join("\n")).toContain("turn FAILED (exit: launcher exited 7)");
+      expect({
+        counter: h.consumer.stats.resultCollectedAfterReapExhausted,
+        logs: h.logs.filter((line) =>
+          /result collection .* ended after reap exhaustion/.test(line),
+        ),
+      }).toEqual({ counter: 0, logs: [] });
+    } finally {
+      if (alive(holder)) process.kill(holder, "SIGKILL");
+    }
   }, 10_000);
 });

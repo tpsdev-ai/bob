@@ -124,8 +124,11 @@ The trust layers, from the top down:
    The grant is stored under the host state root (`~/.bob/host`), outside the
    agent's directory and its session cwd — but that placement is NOT a
    containment boundary. Any same-user writer can edit the grant file, and that
-   includes the agent's own built-in file tools (`write`, `edit`), which resolve
-   paths outside the session cwd; the sandbox work (bob#189) is the real
+   includes the agent's `write` tool, which can reach host state outside the
+   session cwd. Bob's `edit` and `replace_lines` refuse a write outside the
+   workspace root and bind the write to the entry they checked, an in-process
+   guard against model mistakes rather than a boundary a hostile local process
+   is held to. The sandbox work (bob#189) is the real
    boundary, and slice 1 does not ship it. What the grant gives is boot checks,
    not authentication. Boot checks a grant against the packaged position selected by that grant and its role; it refuses a previously bound agent with a missing or unreadable grant, but it does not authenticate the grant or detect every same-user edit. Isolation from same-user writes is deferred to bob#189. Every boot compares the grant's pinned name, version, hash and role against the packaged position, AND compares the grant's frozen agent, tool set, capability set and resident-shell flag against the booted agent, the selected manifest's sets and the packaged role's flag, refusing each mismatch by field (the field, the grant value, the packaged value and the remedy). The PACKAGED role's resident-shell flag — never the grant's — is what tool-policy resolution receives. A
    previously bound agent is pinned by a binding marker in its directory: if the
@@ -722,13 +725,24 @@ consumer. For each file in `new/`, oldest first by filename:
   launcher on stdin, never as an argument. The launcher runs as the leader of
   its own process group, and the group is reaped as soon as the launcher
   process EXITS (or the turn is aborted: past `turnTimeoutMs`, or a shutdown) —
-  not when its output closes, so a descendant holding that output cannot hold
-  up the turn or its result — except a member cleanup cannot kill: one that
-  survives the reap and keeps the output open still delays the result until the
-  turn timeout. Reaping sends SIGTERM, then SIGKILL after a grace, and probes the
-  group on a nominal 50 ms poll interval (with no hard bound under event-loop
-  delay) for up to the grace plus a reap limit (5 s); members still there after
-  that are given up on, logged with the group id and counted (`reapExhausted`).
+  not when its output closes. Once the launcher has exited and process-group
+  reaping is exhausted, if result collection is still pending, Bob starts a
+  result timer set to fire 250 ms later (subject to event-loop delay). If
+  reaping is exhausted and that timer fires
+  before the output closes, Bob ends result collection and then closes its
+  output ends. If the timer fired before the turn timeout or shutdown, the
+  launcher exited zero, and the turn is still active, the normal result parser
+  uses the bytes already read. The bytes read at timer expiry decide the
+  outcome: a complete result stands without rerunning the turn, while an
+  incomplete result fails as `no-result`; bytes written later are not used.
+  Under those conditions, result collection does not wait for the turn timeout.
+  Reaping sends SIGTERM,
+  then SIGKILL after a grace, and probes the group on a nominal 50 ms poll
+  interval (with no hard bound under event-loop delay) for up to the grace plus
+  a reap limit (5 s); members still there afterward are given up on, logged with
+  the group id and counted (`reapExhausted`);
+  parser use after that exhaustion is also logged with the group id and counted
+  (`resultCollectedAfterReapExhausted`).
   Signals go to the numeric group id, and only after a probe found the group;
   once every member has exited, a reused id could only be signalled in the
   window from the group's death to the next probe (a nominal 50 ms poll

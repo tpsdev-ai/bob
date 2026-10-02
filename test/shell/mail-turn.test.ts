@@ -355,6 +355,28 @@ describe("(a9) the mail turn is an ALLOWLIST — a REAL builder-local session (G
       "flair_write",
     ]);
   });
+
+  it("a builder-local mail turn with no edit still returns its reply (bob#283)", async () => {
+    // The edit-or-blocked rule does not judge a mail turn: its session holds only
+    // the mail allowlist's Flair tools, so no file edit is possible there, and a
+    // reply (or silence) is the contract the consumer expects.
+    const { session } = scriptedSession({
+      content: [{ type: "text", text: "SMOKE-OK" }],
+      stopReason: "stop",
+    });
+    const out: string[] = [];
+    const code = await runMailTurnLaunch({
+      name: "builder",
+      input: INPUT,
+      agentsRoot,
+      sessionFactory: async () => session,
+      write: async (t) => {
+        out.push(t);
+      },
+    });
+    expect(code).toBe(0);
+    expect(parseMailTurnResult(out.join(""))).toEqual({ outcome: "final", text: "SMOKE-OK" });
+  }, 15_000);
 });
 
 describe("the mail turn's prompt placement", () => {

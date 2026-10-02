@@ -30,6 +30,7 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   constants as fsc,
   fstatSync,
   lstatSync,
@@ -47,7 +48,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { formatSize, getShellConfig, truncateTail } from "@earendil-works/pi-coding-agent";
 import {
@@ -315,8 +316,6 @@ interface Job {
 }
 
 export interface JobManagerOptions {
-  // Where run directories live. Default: <os tmpdir>/bob-work-<uid>, an
-  // owner-only directory outside any workspace. Tests pass a scratch dir.
   stateRoot?: string;
   defaultTimeoutS?: number;
   maxTimeoutS?: number;
@@ -358,9 +357,24 @@ export interface StartRequest {
 
 // --- helpers -------------------------------------------------------------------
 
-export function defaultStateRoot(): string {
-  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-  return join(tmpdir(), `bob-work-${uid}`);
+export function defaultStateRoot({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+}: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+} = {}): string {
+  if (env.BOB_STATE_DIR !== undefined) {
+    if (!isAbsolute(env.BOB_STATE_DIR)) {
+      throw new RunRefusal("run refused: BOB_STATE_DIR must be an absolute path.");
+    }
+    return resolve(env.BOB_STATE_DIR);
+  }
+  if (platform === "darwin") return join(home, "Library", "Application Support", "bob");
+  const xdg = env.XDG_STATE_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "state"), "bob");
 }
 
 // The canonical form of a path that may not exist yet: the realpath of its
@@ -399,21 +413,31 @@ const errCode = (err: unknown): string =>
 // to hand a child a directory descriptor as its cwd, and the child's own chdir
 // re-resolves that string. So `run` cannot make the directory a command starts in
 // BE the one it checked; it narrows the window in which they can differ:
-//   1. resolve the cwd and the workspace through symlinks (realpath) and confine
-//      the one to the other (resolveCwd);
+//   1. resolve the cwd and the workspace through symlinks (realpath), record the
+//      workspace root's device + inode, and confine the one to the other
+//      (resolveCwd);
 //   2. open the resolved path (O_DIRECTORY | O_NOFOLLOW) and hold it open:
 //      the PIN. While it is held the inode stays allocated (on a local POSIX file
 //      system), so no other directory can take its device + inode;
 //   3. immediately after pinning, and again immediately before the spawn,
 //      re-resolve the cwd (realpath): it must still be the same canonical path,
-//      inside the originally checked canonical workspace, and a no-follow stat of
-//      it must still be a directory with the pin's device + inode;
+//      inside the originally checked canonical workspace, a no-follow stat of
+//      it must still be a directory with the pin's device + inode, and the
+//      workspace root must still match the device + inode recorded in step 1;
 //   4. release the pin, then spawn: no pin step runs after the spawn.
 // Any step that cannot establish its fact (a failed realpath, stat, open, fstat
 // or close) refuses: unknown is never taken as inside.
 //
-// What remains: between the last re-check and the child's own chdir, a path
-// component can still be replaced (see the capability README).
+// Inside one re-check the realpath and no-follow stat are separate calls. If a
+// component is replaced between them so that the no-follow stat no longer finds
+// a directory with the pin's device + inode (or the workspace root no longer
+// matches its recorded device + inode), the comparison refuses it (run.test.ts
+// drives that interval with a different directory at the final component). A
+// swap that still leads the path to the pinned directory, for example a symlink
+// back to it or the pinned directory moved under the replacement, is not
+// detected there; the OS-specific directory-descriptor boundary described in the
+// capability README would cover it. After the last re-check and before the
+// child's own chdir, a component can still be replaced.
 
 // The file-system calls the pin makes, as a seam (like GroupOps) so a test can
 // make one of them fail — a realpath or stat that errors, an fstat that throws
@@ -451,15 +475,25 @@ interface DirPin {
   ino: bigint;
 }
 
+// resolveCwd records the workspace root's device and inode. Each re-check compares
+// them, detecting a replacement while the original inode remains allocated.
+interface WorkspacePin {
+  dev: bigint;
+  ino: bigint;
+}
+
 type PinStage = "when it was pinned" | "immediately before the spawn";
 
-// The cwd must still be the checked canonical path and the directory pinned at open: the same canonical path,
-// inside the checked canonical workspace, and (no-follow) the pinned device +
-// inode. Throws a RunRefusal naming the failed check or mismatch.
+// The cwd must still be the checked canonical path and the directory pinned at
+// open: the same canonical path, inside the checked canonical workspace, and
+// (no-follow) the pinned device + inode; and the workspace root must still match
+// the device + inode recorded when the cwd was resolved. Throws a RunRefusal naming
+// the failed check or mismatch.
 function assertStillPinned(
   ops: DirPinOps,
   dir: string,
   workspace: string,
+  workspacePin: WorkspacePin,
   pin: DirPin,
   stage: PinStage,
 ): void {
@@ -468,7 +502,7 @@ function assertStillPinned(
     real = ops.realpath(dir);
   } catch (err) {
     throw new RunRefusal(
-      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): resolving it failed, so whether it is still the directory that was checked is unknown. Nothing was started.`,
+      `run refused: the working directory ${dir} could not be re-resolved ${stage} (${errCode(err)}): resolving it failed, so whether it is still the checked canonical path and the directory pinned at open is unknown. Nothing was started.`,
     );
   }
   if (!isInsideCanonical(workspace, real)) {
@@ -494,13 +528,31 @@ function assertStillPinned(
       `run refused: the working directory ${dir} does not match its pin ${stage}: a no-follow stat of it is not a directory with the pinned device and inode. Nothing was started; retry once the directory is stable.`,
     );
   }
+  let wst: DirStat;
+  try {
+    wst = ops.lstat(workspace);
+  } catch (err) {
+    throw new RunRefusal(
+      `run refused: the workspace ${workspace} could not be re-checked ${stage} (${errCode(err)}). Nothing was started.`,
+    );
+  }
+  if (!wst.isDirectory() || wst.dev !== workspacePin.dev || wst.ino !== workspacePin.ino) {
+    throw new RunRefusal(
+      `run refused: the workspace ${workspace} no longer has the device and inode it had when the cwd was checked ${stage}, so the workspace root was replaced. Nothing was started; retry once the directory is stable.`,
+    );
+  }
 }
 
 // Open and verify the pin. On a failure after the open, closing the descriptor is
 // ATTEMPTED before the refusal is thrown, and the refusal says how that close
 // went: "closed" only when the close returned, "unknown" when it failed (a failed
 // close may or may not have released the descriptor; this code cannot tell).
-function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
+function pinDirectory(
+  ops: DirPinOps,
+  dir: string,
+  workspace: string,
+  workspacePin: WorkspacePin,
+): DirPin {
   let fd: number;
   try {
     // O_NOFOLLOW: the final component must be the real directory, not a symlink
@@ -530,7 +582,7 @@ function pinDirectory(ops: DirPinOps, dir: string, workspace: string): DirPin {
     }
     const pin: DirPin = { fd, dev: st.dev, ino: st.ino };
     // The pin must be the checked canonical path and the directory pinned at open: re-resolve now it is open.
-    assertStillPinned(ops, dir, workspace, pin, "when it was pinned");
+    assertStillPinned(ops, dir, workspace, workspacePin, pin, "when it was pinned");
     return pin;
   } catch (err) {
     failure =
@@ -590,11 +642,12 @@ function releasePin(
 export function ensurePrivateDir(path: string, create: boolean): void {
   if (create) {
     try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       mkdirSync(path, { mode: 0o700 });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         throw new RunRefusal(
-          `run refused: the job state directory ${path} could not be created (${(err as NodeJS.ErrnoException).code ?? "error"}). The run tool keeps job output there; check the temp directory is writable.`,
+          `run refused: the job state directory ${path} could not be created (${(err as NodeJS.ErrnoException).code ?? "error"}). Check that the parent directory is writable.`,
         );
       }
     }
@@ -613,7 +666,7 @@ export function ensurePrivateDir(path: string, create: boolean): void {
   }
   if ((st.mode & 0o077) !== 0) {
     throw new RunRefusal(
-      `run refused: the job state directory ${path} has mode ${(st.mode & 0o777).toString(8)}, readable by other users. Run chmod 700 on it (or remove it); the run tool keeps job output owner-only.`,
+      `run refused: the job state directory ${path} has mode ${(st.mode & 0o777).toString(8)}, with group or world permissions. Run chmod 700 on it.`,
     );
   }
 }
@@ -769,8 +822,6 @@ export function readExcerpt(
 // their registry records and their output captures.
 export class JobManager {
   readonly stateRoot: string;
-  // The run's own directory, created on the first `run` by mkdtemp under the
-  // state root: a fresh, unpredictable name, mode 0700. Null until then.
   private dirs: { run: string; jobs: string; out: string } | null = null;
   private readonly jobs = new Map<string, Job>();
   private seq = 0;
@@ -831,7 +882,10 @@ export class JobManager {
 
   // The cwd, resolved through symlinks, and the canonical workspace it was
   // confined to (kept: the pin re-checks against THIS root, not a re-resolved one).
-  private resolveCwd(ctxCwd: string | undefined, raw: unknown): { dir: string; workspace: string } {
+  private resolveCwd(
+    ctxCwd: string | undefined,
+    raw: unknown,
+  ): { dir: string; workspace: string; workspacePin: WorkspacePin } {
     if (typeof ctxCwd !== "string" || ctxCwd === "") {
       throw new RunRefusal(
         "run refused: pi supplied no tool execution context cwd, so there is no workspace to run in. This is a wiring fault in the session, not in the command.",
@@ -843,15 +897,20 @@ export class JobManager {
       );
     }
     const dir = raw === undefined || raw === null || raw === "" ? ctxCwd : resolve(ctxCwd, raw);
-    let ok = false;
+    // The existence check reports the FAILED CHECK, never a cause it did not
+    // observe: a stat that cannot run is "could not be checked" with its errno,
+    // and only a stat that returns a non-directory says "is not a directory".
+    let st: ReturnType<typeof statSync>;
     try {
-      ok = statSync(dir).isDirectory();
-    } catch {
-      ok = false;
-    }
-    if (!ok) {
+      st = statSync(dir);
+    } catch (err) {
       throw new RunRefusal(
-        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not an existing directory. Pass an existing directory, relative to the workspace, or omit cwd.`,
+        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) could not be checked (${errCode(err)}). Pass an existing directory, relative to the workspace, or omit cwd.`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new RunRefusal(
+        `run refused: cwd ${JSON.stringify(raw ?? ctxCwd)} (resolved to ${dir}) is not a directory. Pass a directory, relative to the workspace, or omit cwd.`,
       );
     }
     // Containment: the directory must stay inside the workspace. Both paths are
@@ -864,6 +923,23 @@ export class JobManager {
     } catch (err) {
       throw new RunRefusal(
         `run refused: the workspace ${ctxCwd} could not be resolved through its symlinks (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
+      );
+    }
+    // Record the workspace root's identity, not just its string. Each re-check
+    // compares its device and inode with these values.
+    let workspacePin: WorkspacePin;
+    try {
+      const wst = this.dirPinOps.lstat(workspace);
+      if (!wst.isDirectory()) {
+        throw new RunRefusal(
+          `run refused: the workspace ${ctxCwd} (resolved to ${workspace}) is not a directory, so no cwd can be confined to it. Nothing was started.`,
+        );
+      }
+      workspacePin = { dev: wst.dev, ino: wst.ino };
+    } catch (err) {
+      if (err instanceof RunRefusal) throw err;
+      throw new RunRefusal(
+        `run refused: the workspace ${ctxCwd} (resolved to ${workspace}) could not be checked (${errCode(err)}), so no cwd can be confined to it. Nothing was started.`,
       );
     }
     let resolved: string;
@@ -879,46 +955,74 @@ export class JobManager {
         `run refused: cwd resolves outside the workspace ${ctxCwd} (resolved to ${resolved}). Pass a path inside the workspace.`,
       );
     }
-    return { dir: resolved, workspace };
+    return { dir: resolved, workspace, workspacePin };
   }
 
   private ensureRunDir(workspaces: string[]): { run: string; jobs: string; out: string } {
-    for (const w of workspaces) {
-      if (isInside(w, this.stateRoot)) {
-        throw new RunRefusal(
-          `run refused: the job state directory ${this.stateRoot} is inside the workspace ${w}, where captured output would become a committable stray file. Run bob with a temp directory (TMPDIR) outside the workspace.`,
-        );
+    const roots = new Set(workspaces);
+    for (const workspace of workspaces) {
+      let ancestor = canonicalPath(workspace);
+      while (true) {
+        if (existsSync(join(ancestor, ".git"))) roots.add(ancestor);
+        const parent = dirname(ancestor);
+        if (parent === ancestor) break;
+        ancestor = parent;
       }
     }
-    if (this.dirs !== null) return this.dirs;
-    // The tool's own base: owner-only, verified (not a symlink, this user's,
-    // no group/world bits) before anything is created under it.
+    for (const root of roots) {
+      for (const [name, path] of [
+        ["state directory", this.stateRoot],
+        ["TMPDIR", tmpdir()],
+      ]) {
+        if (isInside(root, path)) {
+          throw new RunRefusal(
+            `run refused: ${name} (${path}) is inside the workspace or repository ${root}. Choose a directory outside it.`,
+          );
+        }
+      }
+    }
     ensurePrivateDir(this.stateRoot, true);
-    // The run's directory: mkdtemp picks a fresh, unpredictable name and
-    // creates it 0700 — never a predictable path, never an existing entry.
-    let run: string;
+    if (this.dirs !== null) return this.dirs;
+    let run: string | undefined;
+    let out: string | undefined;
     try {
       run = mkdtempSync(join(this.stateRoot, "run-"));
+      ensurePrivateDir(run, false);
+      const scratchRoot = realpathSync(tmpdir());
+      out = mkdtempSync(join(scratchRoot, "bob-run-"));
+      ensurePrivateDir(out, false);
+      mkdirSync(join(run, "jobs"), { mode: 0o700 });
+      const scratch = lstatSync(out, { bigint: true });
+      const identity = this.readIdentity(process.pid);
+      this.writeRecord(join(run, "run.json"), {
+        v: 1,
+        supervisor_pid: process.pid,
+        supervisor_instance: processInstanceId(),
+        supervisor_identity: typeof identity === "object" ? identity : null,
+        started_at: new Date().toISOString(),
+        scratch_dir: out,
+        scratch_root: scratchRoot,
+        scratch_dev: String(scratch.dev),
+        scratch_ino: String(scratch.ino),
+      });
     } catch (err) {
-      throw new RunRefusal(
-        `run refused: a private run directory could not be created under ${this.stateRoot} (${(err as NodeJS.ErrnoException).code ?? "error"}). Nothing was started; check the temp directory is writable.`,
-      );
+      const refusal =
+        err instanceof RunRefusal
+          ? err
+          : new RunRefusal(
+              `run refused: private run storage could not be created (${errCode(err)}).`,
+            );
+      for (const path of [out, run]) {
+        if (!path) continue;
+        try {
+          rmSync(path, { recursive: true, force: true });
+        } catch (cleanupError) {
+          refusal.message += ` Cleanup could not remove ${path} (${errCode(cleanupError)}).`;
+        }
+      }
+      throw refusal;
     }
-    ensurePrivateDir(run, false);
-    const dirs = { run, jobs: join(run, "jobs"), out: join(run, "out") };
-    mkdirSync(dirs.jobs, { mode: 0o700 });
-    mkdirSync(dirs.out, { mode: 0o700 });
-    // Who supervises this run: the pid, this process's random instance id, and
-    // (where the platform gives one) the process's pinned identity. The boot
-    // sweep of a later bob tells a live supervisor from a reused pid with these.
-    const identity = this.readIdentity(process.pid);
-    this.writeRecord(join(run, "run.json"), {
-      v: 1,
-      supervisor_pid: process.pid,
-      supervisor_instance: processInstanceId(),
-      supervisor_identity: typeof identity === "object" ? identity : null,
-      started_at: new Date().toISOString(),
-    });
+    const dirs = { run, jobs: join(run, "jobs"), out };
     // The heartbeat: the run record's mtime, refreshed while this run lives.
     const record = join(run, "run.json");
     this.heartbeat = setInterval(() => {
@@ -957,7 +1061,7 @@ export class JobManager {
     }
     const command = req.command;
     const timeout = this.resolveTimeout(req.timeout_s);
-    const { dir: cwd, workspace } = this.resolveCwd(ctxCwd, req.cwd);
+    const { dir: cwd, workspace, workspacePin } = this.resolveCwd(ctxCwd, req.cwd);
     // From this live-job limit check to the job's registration (`this.jobs.set`
     // below) NOTHING may await: a yield in between would let a concurrent start
     // pass the same check, and the limit would not hold. The one await on the way
@@ -1011,11 +1115,18 @@ export class JobManager {
     let child: ChildProcess;
     try {
       this.beforePin?.(cwd);
-      const pin = pinDirectory(this.dirPinOps, cwd, workspace);
+      const pin = pinDirectory(this.dirPinOps, cwd, workspace, workspacePin);
       let recheck: { err: unknown } | null = null;
       try {
         this.beforeSpawn?.(cwd);
-        assertStillPinned(this.dirPinOps, cwd, workspace, pin, "immediately before the spawn");
+        assertStillPinned(
+          this.dirPinOps,
+          cwd,
+          workspace,
+          workspacePin,
+          pin,
+          "immediately before the spawn",
+        );
       } catch (err) {
         recheck = { err };
       }
@@ -1646,9 +1757,8 @@ export class JobManager {
       const ended = readJson(endedPath);
       const endedAt = typeof ended?.ended_at === "string" ? Date.parse(ended.ended_at) : Number.NaN;
       if (!Number.isNaN(endedAt)) {
-        // An ENDED run is swept by the retention bound alone, whoever holds its
-        // supervisor's pid now: captures go at once, records after the bound.
-        rmSync(join(dir, "out"), { recursive: true, force: true });
+        // Check scratch before removal; delete ended records after the retention bound.
+        this.removeStaleScratch(meta);
         if (now - endedAt > REGISTRY_RETENTION_MS) rmSync(dir, { recursive: true, force: true });
         continue;
       }
@@ -1670,7 +1780,7 @@ export class JobManager {
       );
       reaped.push(...results);
 
-      rmSync(join(dir, "out"), { recursive: true, force: true });
+      this.removeStaleScratch(meta);
       try {
         this.writeRecord(endedPath, {
           v: 1,
@@ -1682,6 +1792,23 @@ export class JobManager {
       }
     }
     return reaped;
+  }
+
+  private removeStaleScratch(meta: Record<string, unknown>): void {
+    const path = meta.scratch_dir;
+    if (typeof path !== "string" || !isAbsolute(path)) return;
+    const root = meta.scratch_root === undefined ? tmpdir() : meta.scratch_root;
+    if (typeof root !== "string" || !isAbsolute(root)) return;
+    if (canonicalPath(dirname(path)) !== canonicalPath(root)) return;
+    if (!/^bob-run-[A-Za-z0-9]{6}$/.test(basename(path))) return;
+    try {
+      ensurePrivateDir(path, false);
+      const st = lstatSync(path, { bigint: true });
+      if (String(st.dev) !== meta.scratch_dev || String(st.ino) !== meta.scratch_ino) return;
+      rmSync(path, { recursive: true, force: true });
+    } catch (err) {
+      if (errCode(err) !== "ENOENT") this.log(`work: scratch cleanup skipped: ${String(err)}`);
+    }
   }
 
   // Is the recorded supervisor of a run still that process? A pid alone is not
