@@ -39,6 +39,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -254,6 +255,29 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       ? "present"
       : "not present — fine if using a provider without custom routing",
   });
+
+  // bob#279: the LAST run's outcome, so a run that ended without an edit — an
+  // exhausted exploration budget above all — is visible without opening the log.
+  // A past failed run is a WARN, not a FAIL: the agent is healthy, the run is
+  // the thing to look at.
+  const lastRun = readLastRunSummary(join(agentDir, "runs"));
+  if (lastRun === undefined) {
+    checks.push({ name: "last run", status: "skip", detail: "no run log yet" });
+  } else {
+    const reason = lastRunOutcomeReason(lastRun.outcome);
+    const exit = lastRun.exitCode !== undefined ? ` (exit ${lastRun.exitCode})` : "";
+    const ok = lastRun.exitCode === 0;
+    checks.push({
+      name: "last run",
+      status: ok ? "ok" : "warn",
+      detail: `${lastRun.file} — ${reason}${exit}`,
+      ...(reason === "exploration_budget_exhausted"
+        ? {
+            fix: "the last run read past its exploration budget with no edit — give the task an exact edit, or raise run.exploration_budget in bob.yaml (or exploration_budget in the role's role.json)",
+          }
+        : {}),
+    });
+  }
 
   // bob#200: the tps-mail capability. When it is declared its own checks cover
   // the inbox, so the generic inbox check below runs only for an agent without it.
@@ -1122,6 +1146,119 @@ function countFiles(dir: string): number {
   } catch {
     return 0;
   }
+}
+
+// bob#279: the last run log in a runs/ directory (newest by mtime), and the
+// outcome it recorded, for doctor's last-run line. It reads the tail BACKWARD in
+// fixed chunks and stops at the first `outcome` and `done` records, so a huge
+// log is not read whole; the bound is RUN_LOG_SCAN_MAX_BYTES. Returns undefined
+// when there is no runs directory or no log.
+export function readLastRunSummary(
+  runsDir: string,
+): { file: string; outcome?: unknown; exitCode?: number } | undefined {
+  let names: string[];
+  try {
+    names = readdirSync(runsDir).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    return undefined;
+  }
+  if (names.length === 0) return undefined;
+  let newest: { name: string; mtimeMs: number } | undefined;
+  for (const name of names) {
+    try {
+      const mtimeMs = statSync(join(runsDir, name)).mtimeMs;
+      if (newest === undefined || mtimeMs > newest.mtimeMs) newest = { name, mtimeMs };
+    } catch {
+      // A log that vanished or cannot be stat'd is skipped, not guessed at.
+    }
+  }
+  if (newest === undefined) return undefined;
+  const { outcome, exitCode } = scanRunLogTail(join(runsDir, newest.name), {
+    outcome: false,
+    exitCode: false,
+  });
+  return {
+    file: newest.name,
+    ...(outcome !== undefined ? { outcome } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+  };
+}
+
+// How much of a run log the backward scan reads before giving up.
+const RUN_LOG_SCAN_CHUNK_BYTES = 64 * 1024;
+const RUN_LOG_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+
+// Read a JSONL run log from the END in fixed chunks, returning the last
+// `outcome` field and the last `done.exitCode`, or undefined for either not
+// found within the bound. A record is one line (JSON.stringify escapes
+// newlines), so a line is parsed only when it is whole — a line split by a chunk
+// boundary is carried into the next (earlier) chunk.
+function scanRunLogTail(
+  path: string,
+  want: { outcome: boolean; exitCode: boolean },
+): { outcome?: unknown; exitCode?: number } {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return {};
+  }
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return {};
+  }
+  let outcome: unknown;
+  let exitCode: number | undefined;
+  try {
+    let end = size;
+    let scanned = 0;
+    let carry = "";
+    while (end > 0 && scanned < RUN_LOG_SCAN_MAX_BYTES) {
+      const start = Math.max(0, end - RUN_LOG_SCAN_CHUNK_BYTES);
+      const len = end - start;
+      const buf = Buffer.allocUnsafe(len);
+      readSync(fd, buf, 0, len, start);
+      scanned += len;
+      const lines = (buf.toString("utf8") + carry).split("\n");
+      carry = lines.shift() ?? "";
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (line === "") continue;
+        let record: Record<string, unknown>;
+        try {
+          record = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (record === null || typeof record !== "object") continue;
+        if (!want.outcome && "outcome" in record) {
+          outcome = record.outcome;
+          want.outcome = true;
+        }
+        if (!want.exitCode && record.done === true && typeof record.exitCode === "number") {
+          exitCode = record.exitCode;
+          want.exitCode = true;
+        }
+        if (want.outcome && want.exitCode) return { outcome, exitCode };
+      }
+      end = start;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { outcome, exitCode };
+}
+
+// The reason string a run's recorded outcome carries, for display. A missing or
+// malformed reason reads as "no outcome recorded", never as a success.
+export function lastRunOutcomeReason(outcome: unknown): string {
+  if (outcome !== null && typeof outcome === "object" && "reason" in outcome) {
+    const reason = (outcome as { reason?: unknown }).reason;
+    if (typeof reason === "string" && reason.length > 0) return reason;
+  }
+  return "no outcome recorded";
 }
 
 function finalize(name: string, agentDir: string, checks: DoctorCheck[]): DoctorReport {

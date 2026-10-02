@@ -353,6 +353,7 @@ const RUN_KEYS = [
   "no_progress_seconds",
   "turn_timeout_seconds",
   "tool_loop_limit",
+  "exploration_budget",
 ] as const;
 
 function wholeSeconds(value: unknown): number | undefined {
@@ -410,6 +411,7 @@ function refuseDuplicateRunKeys(yamlText: string): void {
 function readRunSettings(yamlText: string): {
   limits: RunLimitsBlock;
   toolLoopLimit?: number;
+  explorationBudget?: number;
 } {
   refuseDuplicateRunKeys(yamlText);
   const inline = /^run[ \t]*:(.*)$/m.exec(yamlText);
@@ -425,6 +427,7 @@ function readRunSettings(yamlText: string): {
   if (raw === undefined) return { limits: {} };
   const out: RunLimitsBlock = {};
   let toolLoopLimit: number | undefined;
+  let explorationBudget: number | undefined;
   for (const [key, value] of Object.entries(raw)) {
     if (!(RUN_KEYS as readonly string[]).includes(key)) {
       throw new BobYamlError(
@@ -444,6 +447,18 @@ function readRunSettings(yamlText: string): {
       toolLoopLimit = value;
       continue;
     }
+    if (key === "exploration_budget") {
+      // bob#279: a positive whole number of read-only calls.
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+        throw new BobYamlError(
+          "run",
+          lineOfKey(yamlText, "run", key),
+          `"exploration_budget" must be a positive whole number.`,
+        );
+      }
+      explorationBudget = value;
+      continue;
+    }
     const n = wholeSeconds(value);
     if (n === undefined) {
       throw new BobYamlError(
@@ -456,11 +471,20 @@ function readRunSettings(yamlText: string): {
     else if (key === "no_progress_seconds") out.noProgressSeconds = n;
     else out.turnTimeoutSeconds = n;
   }
-  return { limits: out, ...(toolLoopLimit !== undefined ? { toolLoopLimit } : {}) };
+  return {
+    limits: out,
+    ...(toolLoopLimit !== undefined ? { toolLoopLimit } : {}),
+    ...(explorationBudget !== undefined ? { explorationBudget } : {}),
+  };
 }
 
 export function readToolLoopLimit(yamlText: string): number | undefined {
   return readRunSettings(yamlText).toolLoopLimit;
+}
+
+// bob#279: the agent's `run.exploration_budget`, or undefined when it sets none.
+export function readExplorationBudget(yamlText: string): number | undefined {
+  return readRunSettings(yamlText).explorationBudget;
 }
 
 export function readRunLimits(yamlText: string): RunLimitsBlock {
