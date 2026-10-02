@@ -1,10 +1,12 @@
 // Bob capability: web — a pi extension (bob#152, spec v3, slice R1a).
 //
 // A Bob capability IS a pi extension: a default-export factory
-// `(pi: ExtensionAPI) => void`. In this slice the extension only validates the
-// resolved config block Bob hands it in BOB_CAP_WEB, against the same schema
-// the catalog validated bob.yaml with, and REGISTERS NO TOOL. There is no
-// network code here: the fetch core is slice R1b, `web_fetch` is R1c.
+// `(pi: ExtensionAPI) => void`. The extension validates the resolved config
+// block Bob hands it in BOB_CAP_WEB, against the same schema the catalog
+// validated bob.yaml with, and REGISTERS NO TOOL. The fetch core (address
+// policy, redirects, limits, extraction) is slice R1b and lives in fetch.ts; it
+// is an internal module, exported here for `web_fetch` (R1c) and its tests, and
+// nothing wires it to a session's config yet.
 //
 // A session that holds this capability (or allows an egress tool) is a WEB
 // session. bob refuses to compose one with anything private beyond its
@@ -23,6 +25,23 @@ export default function (_pi: ExtensionAPI): void {
   loadConfigFromEnv();
 }
 
+// Slice R1b — the fetch core and the pieces it is built from. Internal: no tool
+// is registered from these, and R1c is what will call fetchDocument.
+export {
+  ADDRESS_POLICY_VERSION,
+  type AddressPolicy,
+  type AddressRefusal,
+  type AddressRefusalCode,
+  type AddressVerdict,
+  IPV4_REGISTRY_ROWS,
+  IPV6_REGISTRY_ROWS,
+  ownInterfaceAddresses,
+  parseAddress,
+  parseIpv4Literal,
+  parseIpv6Literal,
+  publicUnicastPolicy,
+  type RegistryRow,
+} from "./address.js";
 export {
   CONFIG_ENV_VAR,
   CONFIG_SCHEMA,
@@ -37,4 +56,36 @@ export {
   type WebConfig,
 } from "./config.js";
 export { resolveWebSettings, type WebSettings } from "./core.js";
+export { isWebFetchError, WebFetchError, type WebFetchRefusalCode } from "./errors.js";
+export {
+  ALLOWED_CONTENT_TYPES,
+  allowedContentType,
+  extractText,
+  mediaTypeOf,
+  type TruncatedText,
+  truncateText,
+} from "./extract.js";
+export {
+  ACCEPT_HEADER,
+  type DnsLookup,
+  type FetchDeps,
+  type FetchOptions,
+  type FetchResult,
+  fetchDocument,
+  MAX_BODY_BYTES,
+  MAX_REDIRECTS,
+  REDIRECT_STATUSES,
+  resolveMaxChars,
+  TOTAL_DEADLINE_MS,
+  USER_AGENT,
+  vettedLookup,
+} from "./fetch.js";
 export { webManifest } from "./manifest.js";
+export {
+  type AdmitOptions,
+  addressRefused,
+  admitUrl,
+  hasZoneIdentifier,
+  type UrlPolicy,
+  WEB_PORTS,
+} from "./url-admission.js";

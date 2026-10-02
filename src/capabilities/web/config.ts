@@ -17,11 +17,11 @@
 //     text_per_turn: 100000
 //
 // Every field is optional; an absent field takes its default (core.ts
-// resolveWebSettings). NO TOOL READS THESE SETTINGS IN THIS SLICE: they are
-// reserved for web_fetch (slice R1c) and web_search (R2), and this slice only
-// validates and bounds them. The bounds are the operator's: the spec lets the
-// model lower a per-fetch character limit (never raise it past
-// fetch_max_chars), and no config can raise any field past its ceiling here.
+// resolveWebSettings). `allow_http` and `fetch_max_chars` are read by the fetch
+// core (slice R1b), which enforces the ceiling: a caller may lower a per-fetch
+// character limit, never raise it past fetch_max_chars. `fetch_per_turn` and
+// `text_per_turn` are still reserved for web_fetch (slice R1c) and web_search
+// (R2), and no config can raise any field past its ceiling here.
 //
 // The block carries settings only. It names no key, token or path, so the
 // credential inventory (confined-read.ts) classifies no field of it. Search
@@ -49,21 +49,20 @@ export const TEXT_PER_TURN_CEILING = 100_000;
 
 export const CONFIG_SCHEMA = Type.Object(
   {
-    // Plain-HTTP fetches. Off by default: HTTPS only.
+    // Plain-HTTP fetches. Off by default: HTTPS only. The fetch core reads it.
     allow_http: Type.Optional(
       Type.Boolean({
         default: false,
-        description:
-          "Reserved for web_fetch (a later slice; no tool reads it yet): allow plain-HTTP fetches (default false: HTTPS only).",
+        description: "Allow plain-HTTP fetches (default false: HTTPS only).",
       }),
     ),
-    // The most text one fetch returns, in characters.
+    // The most text one fetch returns, in characters. The fetch core's ceiling.
     fetch_max_chars: Type.Optional(
       Type.Integer({
         minimum: 1,
         maximum: FETCH_MAX_CHARS_CEILING,
         default: FETCH_MAX_CHARS_DEFAULT,
-        description: `Reserved for web_fetch (a later slice; no tool reads it yet): characters of text one fetch may return (default ${FETCH_MAX_CHARS_DEFAULT}, at most ${FETCH_MAX_CHARS_CEILING}).`,
+        description: `Characters of text one fetch may return (default ${FETCH_MAX_CHARS_DEFAULT}, at most ${FETCH_MAX_CHARS_CEILING}); the fetch core's ceiling for one call, which a caller may only lower.`,
       }),
     ),
     // Fetch attempts per admitted prompt.
