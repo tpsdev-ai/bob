@@ -1,5 +1,5 @@
 // The web fetch core's address policy and URL admission (bob#245 — web spec v3,
-// slice R1b). Pure: no sockets here. Every registry row and every prefix rule
+// slice R1b). Pure: no sockets here. Each policy-table entry and prefix rule
 // is pinned by a sample address and the refusal it must produce; the loopback
 // transport tests live in fetch-core-node.test.ts.
 
@@ -32,9 +32,8 @@ function refusal(
   return verdict;
 }
 
-// One sample address per IANA IPv4 special-purpose row, with the registry line
-// the refusal must name and the code the refusal must carry. Hand-written, so a
-// row edit in address.ts fails here.
+// Samples for each IPv4 policy-table entry, with the stored label and refusal
+// code. Hand-written, so an entry edit in address.ts fails here.
 const IPV4_CASES: ReadonlyArray<[string, string, "ipv4-special" | "transition"]> = [
   ["0.0.0.0", 'iana-ipv4-special-registry 0.0.0.0/8 "This network"', "ipv4-special"],
   ["10.0.0.1", 'iana-ipv4-special-registry 10.0.0.0/8 "Private-Use"', "ipv4-special"],
@@ -91,8 +90,8 @@ const IPV4_CASES: ReadonlyArray<[string, string, "ipv4-special" | "transition"]>
   ],
 ];
 
-// One sample address per IANA IPv6 special-purpose row, plus the transition
-// prefixes, with the registry line and the code the refusal must carry.
+// Samples for each IPv6 policy-table entry, including transition ranges, with
+// the stored label and refusal code.
 const IPV6_CASES: ReadonlyArray<[string, string, "ipv6-special" | "transition"]> = [
   ["::", 'iana-ipv6-special-registry ::/128 "Unspecified"', "ipv6-special"],
   ["::1", 'iana-ipv6-special-registry ::1/128 "Loopback"', "ipv6-special"],
@@ -127,12 +126,12 @@ const IPV6_CASES: ReadonlyArray<[string, string, "ipv6-special" | "transition"]>
 ];
 
 describe("the address policy", () => {
-  it("names the registry revision it was transcribed from", () => {
+  it("names the local policy-table version", () => {
     expect(ADDRESS_POLICY_VERSION).toBe("iana-special-purpose/2026-10-01");
     expect(policy.version).toBe(ADDRESS_POLICY_VERSION);
   });
 
-  it("carries one row per IANA special-purpose row, each a usable prefix", () => {
+  it("carries policy-table entries with usable prefixes", () => {
     expect(IPV4_REGISTRY_ROWS.length).toBe(20);
     expect(IPV6_REGISTRY_ROWS.length).toBe(16);
     for (const row of [...IPV4_REGISTRY_ROWS, ...IPV6_REGISTRY_ROWS]) {
@@ -149,7 +148,14 @@ describe("the address policy", () => {
     );
   });
 
-  it("refuses every IANA IPv4 special-purpose row, naming it", () => {
+  it("has a hand-written sample for each policy-table entry", () => {
+    const samples = new Set([...IPV4_CASES, ...IPV6_CASES].map(([, detail]) => detail));
+    for (const row of [...IPV4_REGISTRY_ROWS, ...IPV6_REGISTRY_ROWS]) {
+      expect(samples.has(`${row.registry} ${row.cidr} "${row.name}"`)).toBe(true);
+    }
+  });
+
+  it("refuses each IPv4 policy-table entry, naming its stored label", () => {
     for (const [address, detail, code] of IPV4_CASES) {
       const verdict = refusal(address);
       expect(verdict.detail).toBe(detail);
@@ -157,7 +163,7 @@ describe("the address policy", () => {
     }
   });
 
-  it("refuses every IANA IPv6 special-purpose row, naming it", () => {
+  it("refuses each IPv6 policy-table entry, naming its stored label", () => {
     for (const [address, detail, code] of IPV6_CASES) {
       const verdict = refusal(address);
       expect(verdict.detail).toBe(detail);
@@ -212,6 +218,12 @@ describe("the address policy", () => {
       "fe80::1%eth0",
       "",
     ]) {
+      expect(refusal(address).code).toBe("unparsable");
+    }
+  });
+
+  it("rejects a leading-zero octet through classify", () => {
+    for (const address of ["012.0.0.1", "1.02.3.4", "1.2.003.4", "1.2.3.04"]) {
       expect(refusal(address).code).toBe("unparsable");
     }
   });

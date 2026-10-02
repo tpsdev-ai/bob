@@ -4,7 +4,9 @@
 // address instead of a name.
 //
 // THE POLICY. An address is accepted only when it is global unicast and not in
-// a row of the IANA IPv4 or IPv6 Special-Purpose Address Registry. Refused:
+// a selected refused range. These ranges are a conservative policy based on
+// the IANA IPv4 and IPv6 Special-Purpose Address Registries; a covering range
+// can include multiple registry entries. Refused:
 // loopback, this-network/unspecified, private-use, link-local, shared address
 // space (CGNAT), benchmarking, documentation, reserved, multicast and the
 // broadcast address; on v6 unique-local, link-local, multicast and site-local,
@@ -18,24 +20,23 @@
 // allowed answer": the caller refuses the whole request when any answer is
 // refused (fetch.ts, vettedLookup).
 //
-// THE VERSION. ADDRESS_POLICY_VERSION names the registry revision this table
-// was transcribed from. Registry rows are data, so a new revision is a
-// reviewed edit to this table; the policy object carries the version it was
-// built with, and the tests pin it.
+// THE VERSION. ADDRESS_POLICY_VERSION identifies this local policy table.
+// Edits to the selected IANA-derived ranges require review and a version
+// update; the policy object carries that version.
 
 import { networkInterfaces } from "node:os";
 
-// The registry revision this table was transcribed from (IANA special-purpose
-// registries, both families). Bump it in the same review as any row edit.
+// Local policy version for ranges based on the IANA special-purpose registries,
+// both families. Bump it in the same review as any table edit.
 export const ADDRESS_POLICY_VERSION = "iana-special-purpose/2026-10-01";
 
 export type AddressRefusalCode =
-  // Outside global unicast (2000::/3 on v6). On IPv4 the registry rows cover
+  // Outside global unicast (2000::/3 on v6). On IPv4 the policy ranges cover
   // every address outside global unicast, so this code is the v6 net's alone.
   | "not-global-unicast"
-  // A row of the IANA IPv4 special-purpose registry.
+  // A selected IPv4 policy range based on the IANA special-purpose registry.
   | "ipv4-special"
-  // A row of the IANA IPv6 special-purpose registry.
+  // A selected IPv6 policy range based on the IANA special-purpose registry.
   | "ipv6-special"
   // A transition/translation prefix (NAT64, 6to4, Teredo, IPv4-compatible).
   | "transition"
@@ -49,28 +50,29 @@ export type AddressRefusalCode =
 export interface AddressRefusal {
   allowed: false;
   code: AddressRefusalCode;
-  // Names the rule and the row, or the address's own form. Never a secret.
+  // Names the rule and policy-table entry, or the address's own form. Never a secret.
   detail: string;
 }
 
 export type AddressVerdict = { allowed: true } | AddressRefusal;
 
 export interface AddressPolicy {
-  // The registry revision, ADDRESS_POLICY_VERSION.
+  // The local policy-table version, ADDRESS_POLICY_VERSION.
   readonly version: string;
-  // Accept only when the address is global unicast and in no registry row.
+  // Accept only when the address is global unicast and in no refused policy range.
   classify(address: string): AddressVerdict;
 }
 
 export type RegistryName = "iana-ipv4-special-registry" | "iana-ipv6-special-registry";
 
 export interface RegistryRow {
-  // The canonical prefix, as the registry writes it.
+  // The prefix this policy matches; it may cover multiple registry entries.
   cidr: string;
-  // The registry's name for the row.
+  // The label this policy reports for the matched range.
   name: string;
+  // The IANA registry family used to derive this range.
   registry: RegistryName;
-  // The refusal code a match reports: the registry's, or "transition".
+  // The refusal code this policy reports, including "transition" when set.
   code: AddressRefusalCode;
 }
 
@@ -140,16 +142,15 @@ interface ParsedAddress {
   bytes: number[];
 }
 
-// A dotted-quad IPv4 literal, or undefined. Only the canonical dotted form:
-// WHATWG URL rewrites every other notation (hex, octal, short, 32-bit integer)
-// into this one before any address is classified, so this is also the form a
-// URL literal arrives in.
+// A dotted-quad IPv4 literal as parsed bytes, or undefined. Accept only the
+// canonical decimal form: no leading-zero octets. WHATWG URL rewrites other
+// URL literal notations before this policy classifies the canonical hostname.
 export function parseIpv4Literal(text: string): ParsedAddress | undefined {
   const parts = text.split(".");
   if (parts.length !== 4) return undefined;
   const bytes: number[] = [];
   for (const part of parts) {
-    if (!/^[0-9]{1,3}$/.test(part)) return undefined;
+    if (!/^[0-9]{1,3}$/.test(part) || (part.length > 1 && part[0] === "0")) return undefined;
     const value = Number(part);
     if (value > 255) return undefined;
     bytes.push(value);
@@ -213,7 +214,7 @@ export function parseIpv6Literal(text: string): ParsedAddress | undefined {
   return { family: 6, bytes };
 }
 
-// The canonical text of an address, or undefined when it cannot be read.
+// Parsed address bytes and family, or undefined when the text cannot be read.
 export function parseAddress(text: string): ParsedAddress | undefined {
   return parseIpv4Literal(text) ?? parseIpv6Literal(text);
 }
@@ -274,9 +275,9 @@ export interface AddressPolicyOptions {
   own?: readonly string[];
 }
 
-// The public-unicast policy. Refusal order: the registry rows (data), then the
+// The public-unicast policy. Refusal order: the selected table ranges, then the
 // host's own interfaces, then the global-unicast net — which is the IPv6 one:
-// on IPv4 the rows cover every address outside global unicast.
+// on IPv4 the selected ranges cover every address outside global unicast.
 export function publicUnicastPolicy(options: AddressPolicyOptions = {}): AddressPolicy {
   const own = new Set(
     (options.own ?? ownInterfaceAddresses())

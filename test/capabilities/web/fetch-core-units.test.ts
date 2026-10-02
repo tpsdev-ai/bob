@@ -5,8 +5,9 @@
 
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
+import { Readable } from "node:stream";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { discard } from "../../../src/capabilities/web/fetch.js";
+import { discard, readEncodedBody } from "../../../src/capabilities/web/fetch.js";
 import {
   ACCEPT_HEADER,
   ADDRESS_POLICY_VERSION,
@@ -37,6 +38,41 @@ it("terminates a skipped body without waiting for or consuming it", () => {
   discard(body);
   expect(destroyed).toBe(true);
   expect(consumed).toBe(false);
+});
+
+it("wraps an in-memory stream reset as a bounded network refusal", async () => {
+  const reset = Object.assign(new Error("untrusted response detail"), { code: "ECONNRESET" });
+  const body = Readable.from(
+    (async function* () {
+      yield Buffer.from("partial");
+      throw reset;
+    })(),
+  );
+  await expect(readEncodedBody(body)).rejects.toMatchObject({
+    name: "WebFetchError",
+    code: "network",
+    detail: "ECONNRESET",
+  });
+});
+
+it("preserves refusals raised while reading the encoded body", async () => {
+  await expect(
+    readEncodedBody(Readable.from([Buffer.alloc(MAX_BODY_BYTES + 1)])),
+  ).rejects.toMatchObject({
+    code: "too-large",
+    detail: `the encoded body is over ${MAX_BODY_BYTES} bytes`,
+  });
+  const refusal = new WebFetchError("address", "existing refusal");
+  await expect(
+    readEncodedBody(
+      Readable.from(
+        (async function* () {
+          yield Buffer.from("partial");
+          throw refusal;
+        })(),
+      ),
+    ),
+  ).rejects.toBe(refusal);
 });
 
 interface Recorded {

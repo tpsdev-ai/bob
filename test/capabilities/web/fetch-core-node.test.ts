@@ -133,6 +133,7 @@ const CASE_NAMES = [
   "proxy-env",
   "global-dispatcher",
   "network-failure",
+  "body-reset",
 ];
 
 let report: HarnessReport;
@@ -410,4 +411,12 @@ test("refuses a network failure as a network failure", () => {
   expect(String(refusal("network-failure", "lookupRefusal").detail)).toBe("ENOTFOUND");
   expect(refusal("network-failure", "closedRefusal").code).toBe("network");
   expect(String(refusal("network-failure", "closedRefusal").detail)).toBe("ECONNREFUSED");
+});
+
+test("reports a peer reset after response headers as a bounded network refusal", () => {
+  const observed = seen("body-reset");
+  expect(refusal("body-reset").code).toBe("network");
+  expect(String(refusal("body-reset").detail)).toMatch(/^(ECONNRESET|UND_ERR_SOCKET|SocketError)$/);
+  expect(observed.requestCount).toBe(1);
+  expect(observed.connections).toBe(1);
 });

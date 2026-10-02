@@ -211,6 +211,18 @@ async function readCapped(
   return Buffer.concat(chunks);
 }
 
+// Keep stream failures inside the fetch refusal type. This also preserves a
+// refusal raised by the byte cap or carried as the stream error's cause.
+export async function readEncodedBody(body: AsyncIterable<Uint8Array>): Promise<Buffer> {
+  try {
+    return await readCapped(body, MAX_BODY_BYTES, "encoded");
+  } catch (error) {
+    const refusal = refusalIn(error);
+    if (refusal !== undefined) throw refusal;
+    throw new WebFetchError("network", boundedDetail(error));
+  }
+}
+
 // Decode a body, capping the DECODED bytes too (a small compressed body can
 // expand past the cap). An encoding this core does not decode is refused.
 async function decodeBody(encoded: Buffer, encoding: string | undefined): Promise<Buffer> {
@@ -355,7 +367,7 @@ async function readResult(
       `content type ${media ?? "(none)"} is not one of ${ALLOWED_CONTENT_TYPES.join(", ")}`,
     );
   }
-  const encoded = await readCapped(response.body, MAX_BODY_BYTES, "encoded");
+  const encoded = await readEncodedBody(response.body);
   const decoded = await decodeBody(encoded, headerValue(response.headers["content-encoding"]));
   const text = extractText(media, decoded.toString("utf8"), url.href);
   const cut = truncateText(text, maxChars);

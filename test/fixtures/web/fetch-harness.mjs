@@ -746,6 +746,17 @@ await record("network-failure", async () => {
   return { lookupRefusal, closedRefusal };
 });
 
+await record("body-reset", async () => {
+  const peer = await httpPeer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/plain", "content-length": "100" });
+    res.write("partial body", () => res.socket?.destroy());
+  });
+  const refusal = await refusalOf(
+    fetchDocument(url(peer), { settings: allowHttp() }, depsFor(peer)),
+  );
+  return { refusal, requestCount: peer.requests.length, connections: peer.connections() };
+});
+
 // ── report ─────────────────────────────────────────────────────────────────
 
 process.stdout.write(`${JSON.stringify({ caseNames: Object.keys(cases), cases })}\n`);
