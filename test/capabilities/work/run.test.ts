@@ -372,11 +372,11 @@ describe("run — output", () => {
     live = await workSession({ script: program(call("run", { command: "echo x" })) });
     await live.prompt();
     const ref = String(lastOf(live.results, "run").details.output_ref);
-    expect(ref.startsWith(live.stateRoot)).toBe(true);
+    expect(ref.startsWith(join(tmpdir(), "bob-run-"))).toBe(true);
+    expect(ref.startsWith(live.stateRoot)).toBe(false);
     expect(ref.startsWith(live.cwd)).toBe(false);
     expect(statSync(ref).mode & 0o777).toBe(0o600);
     expect(statSync(join(ref, "..")).mode & 0o777).toBe(0o700);
-    expect(statSync(join(ref, "..", "..")).mode & 0o777).toBe(0o700);
     expect(statSync(live.stateRoot).mode & 0o777).toBe(0o700);
     // No stray file in the workspace.
     expect(readdirSync(live.cwd)).toEqual([]);
@@ -444,14 +444,15 @@ describe("run — private run directory, exclusive capture files", () => {
     expect(basename(runDir)).toMatch(/^run-[A-Za-z0-9]{6}$/);
     expect(basename(runDir)).not.toContain(String(process.pid));
     expect(join(runDir, "..")).toBe(live.stateRoot);
-    for (const dir of [live.stateRoot, runDir, join(runDir, "out"), join(runDir, "jobs")]) {
+    const out = join(String(live.results[0].details.output_ref), "..");
+    for (const dir of [live.stateRoot, runDir, out, join(runDir, "jobs")]) {
       const st = lstatSync(dir);
       expect(st.isDirectory() && !st.isSymbolicLink(), dir).toBe(true);
       expect(st.mode & 0o777, dir).toBe(0o700);
     }
     for (const r of live.results) {
       const ref = String(r.details.output_ref);
-      expect(join(ref, "..")).toBe(join(runDir, "out"));
+      expect(join(ref, "..")).toBe(out);
       expect(lstatSync(ref).isFile()).toBe(true);
       expect(lstatSync(ref).mode & 0o777).toBe(0o600);
     }
@@ -463,7 +464,7 @@ describe("run — private run directory, exclusive capture files", () => {
   it("a symlink or a file already at a capture path is never written through", async () => {
     let victim = "";
     let planted = "";
-    const outDir = () => join(String(live?.work.manager.runDir), "out");
+    const outDir = () => join(String(live?.work.manager.list()[0].capturePath), "..");
     live = await workSession({
       script: program(
         call("run", { command: "echo first" }),
@@ -643,7 +644,7 @@ describe("run — background jobs and owned cancellation", () => {
     }
     expect(live.logs.filter((l) => l.startsWith("work: run end:")).length).toBe(2);
     // The captures are deleted at run end; the small job records stay.
-    expect(existsSync(join(runDir, "out"))).toBe(false);
+    expect(existsSync(join(String(entries[0].output_ref), ".."))).toBe(false);
     expect(existsSync(join(runDir, "ended.json"))).toBe(true);
   }, 20_000);
 
@@ -811,7 +812,10 @@ describe("run — the cwd is pinned and re-checked before the spawn (bob#224)", 
     expect(w.work.manager.list()).toEqual([]);
     // The capture file made for the refused job is gone too.
     const runDir = w.work.manager.runDir;
-    if (runDir !== null) expect(readdirSync(join(runDir, "out"))).toEqual([]);
+    if (runDir !== null) {
+      const meta = JSON.parse(readFileSync(join(runDir, "run.json"), "utf8"));
+      expect(readdirSync(meta.scratch_dir)).toEqual([]);
+    }
   }
   async function refusalOf(p: Promise<unknown>): Promise<Error> {
     try {

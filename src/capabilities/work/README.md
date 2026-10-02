@@ -151,20 +151,10 @@ named error.
 
 - stdout and stderr are captured, in arrival order and up to a 64 MiB cap, to
   `output_ref`: a file
-  (mode 0600) in the run's own directory under an owner-only state directory,
-  `<temp dir>/bob-work-<uid>/` — outside the git worktree, so it can never be a
-  committable stray file, and never a shared path. `run` refuses to start when
-  that state directory is inside the workspace, is a symlink, belongs to another
-  user, or is readable by group or others.
-- The run's directory is created by `mkdtemp` under the verified state
-  directory: a fresh, unpredictable name (`run-XXXXXX`), mode 0700, never an
-  existing entry. Each capture file is created inside it exclusively
-  (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600): anything already at the path — a
-  file, or a live or dangling symlink — refuses the call by name, nothing is
-  started, and nothing is written through it.
-- **It is same-user readable.** The permissions keep it off the candidate tree
-  and out of shared paths; they are not a confidentiality boundary against code
-  running as the same user.
+  (mode 0600) in a private `bob-run-XXXXXX` directory created with `mkdtemp`
+  under the OS temp directory. `run` refuses scratch inside the workspace or
+  repository. Captures are created exclusively (`O_CREAT|O_EXCL|O_NOFOLLOW`).
+- **It is same-user readable.**
 - The model sees a bounded tail excerpt (16 KiB, 400 lines). Before the cut, the
   window is passed through bob's existing secret redaction (the observatory's
   `redactSecrets`: provider token shapes, `Authorization` / `Proxy-Authorization`
@@ -192,12 +182,20 @@ named error.
   held by a descendant that left the group; the result says
   `output_complete: false` and `cleanup_state: escaped_or_unverified`, and the
   tool does not hang.
-- **Retention.** Captures are deleted when the run ends (or, after a crash, by
-  the next session's boot sweep). The small job records (no output, a SHA-256 of
+- **Retention.** Run end attempts to remove captures; boot sweep removes leftovers
+  only after the checks below pass. The small job records
+  (no output, a SHA-256 of
   the command rather than the command) are kept 24 hours after their run ended,
   then deleted by a later boot sweep.
 
 ## Job state and the sweeps
+
+Persistent work state uses `$XDG_STATE_HOME/bob` on Linux when `XDG_STATE_HOME`
+is absolute (otherwise `~/.local/state/bob`) and `~/Library/Application Support/bob` on macOS.
+`BOB_STATE_DIR` overrides these defaults and must be absolute. The root is
+created with mode 0700; symlinks, other owners, group/world permissions, and
+locations inside the workspace or repository are refused. The old
+`<temp dir>/bob-work-<uid>` root is not selected automatically, and nothing is migrated from it.
 
 - Every job is recorded on disk, keyed by its process group, in the run's own
   state directory: `<state dir>/run-XXXXXX/jobs/pg-<pgid>.<run_id>.json`
@@ -224,15 +222,21 @@ named error.
   disposes its session and exits), an exit hook SIGKILLs every group the run
   still owns, records it and logs it.
 - **Boot sweep.** When the capability loads, it looks at every earlier run:
-  - An **ended** run is swept by the retention bound alone, whoever holds its
-    supervisor's pid now: its captures go at once, its records after 24 hours.
-  - A run whose supervisor is **gone** — its pid is dead; or the pid is this
+  - An **ended** run's records are deleted after 24 hours, regardless of its
+    supervisor's pid.
+  - The sweep attempts to mark a run ended when its supervisor is **gone** —
+    its pid is dead; or the pid is this
     process but the instance id is another's; or the pid is live but no longer
     has the pinned identity; or its identity cannot be compared (none on
     record, or the read could not tell) and the heartbeat is more than 10
-    minutes stale — has its captures deleted, is marked ended, and each job
-    still recorded as running is reported. An identity read that fails for any
+    minutes stale — and reports each job still recorded as running.
+    An identity read that fails for any
     reason other than "no such process" means "cannot tell", never "replaced".
+  - For ended or gone-supervisor runs, captures are deleted only from a
+    non-symlink, same-owner directory with no group/world permissions, named
+    `bob-run-XXXXXX`, whose device/inode match the run record and whose parent
+    matches the recorded temporary root (the current OS temp root for older
+    records without one).
   - Such a job's group is signalled **only while its leader has the identity
     pinned at spawn**, checked again immediately before every signal: SIGTERM,
     then SIGKILL after the grace. If the identity was never pinned (no

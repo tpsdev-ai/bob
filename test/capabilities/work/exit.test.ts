@@ -7,9 +7,17 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { groupAlive, waitFor } from "./helpers.js";
 
 const CAPABILITY = join(
@@ -28,7 +36,7 @@ const CAPABILITY = join(
 const SUPERVISOR_SOURCE = `const { wireWork } = await import(process.env.WORK_TEST_CAPABILITY);
 const tools = new Map();
 const pi = { registerTool(t) { tools.set(t.name, t); } };
-const { bootSweep } = wireWork({ pi, stateRoot: process.env.WORK_TEST_STATE_ROOT });
+const { bootSweep } = wireWork({ pi });
 await bootSweep;
 const res = await tools.get("run").execute("c1", { command: "sleep 30", background: true }, undefined, undefined, { cwd: process.env.WORK_TEST_WORKSPACE });
 process.stdout.write(JSON.stringify({ pgid: res.details.pgid }) + "\\n");
@@ -66,7 +74,7 @@ describe("run end on process exit", () => {
       env: {
         ...process.env,
         WORK_TEST_CAPABILITY: CAPABILITY,
-        WORK_TEST_STATE_ROOT: stateRoot,
+        BOB_STATE_DIR: stateRoot,
         WORK_TEST_WORKSPACE: workspace,
       },
     });
@@ -91,6 +99,6 @@ describe("run end on process exit", () => {
     // the exit sweep checks that with ps and reports the group killed.
     expect(entry.cleanup_state).toBe("group_killed");
     // The capture directory went with the run.
-    expect(readdirSync(join(stateRoot, runDir))).not.toContain("out");
+    expect(existsSync(dirname(String(entry.output_ref)))).toBe(false);
   }, 30_000);
 });

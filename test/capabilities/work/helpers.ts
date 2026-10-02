@@ -171,14 +171,20 @@ async function buildWorkSession(opts: WorkSessionOptions, scratch: string): Prom
   const logs: string[] = [];
   let work: WorkSession | undefined;
   const wire = async (pi: unknown) => {
-    work = wireWork({
-      pi: pi as Parameters<typeof wireWork>[0]["pi"],
-      stateRoot,
-      ...FAST,
-      ...opts.wire,
-      log: (m) => logs.push(m),
-    });
-    await work.bootSweep;
+    const savedState = process.env.BOB_STATE_DIR;
+    process.env.BOB_STATE_DIR = stateRoot;
+    try {
+      work = wireWork({
+        pi: pi as Parameters<typeof wireWork>[0]["pi"],
+        ...FAST,
+        ...opts.wire,
+        log: (m) => logs.push(m),
+      });
+      await work.bootSweep;
+    } finally {
+      if (savedState === undefined) delete process.env.BOB_STATE_DIR;
+      else process.env.BOB_STATE_DIR = savedState;
+    }
   };
 
   const modelRuntime = await ModelRuntime.create({ modelsPath: null });

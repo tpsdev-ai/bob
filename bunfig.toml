@@ -30,3 +30,6 @@ minimumReleaseAge = 604800
 #
 # Do not re-add biome -- or anything else -- without a written reason here.
 minimumReleaseAgeExcludes = ["@types/node", "typescript"]
+
+[test]
+preload = ["./test/state-root.setup.ts"]

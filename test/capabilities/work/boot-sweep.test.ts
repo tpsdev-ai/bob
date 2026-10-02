@@ -44,6 +44,7 @@ import { call, program } from "./program.js";
 const started: ChildProcess[] = [];
 let live: LiveWork | undefined;
 let root: string | undefined;
+const captures: string[] = [];
 
 afterEach(async () => {
   await live?.cleanup();
@@ -56,6 +57,7 @@ afterEach(async () => {
       // gone
     }
   }
+  for (const capture of captures.splice(0)) rmSync(capture, { recursive: true, force: true });
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -140,10 +142,24 @@ function seedRun(
 ): string {
   const dir = join(stateRoot, name);
   mkdirSync(join(dir, "jobs"), { recursive: true, mode: 0o700 });
-  mkdirSync(join(dir, "out"), { recursive: true, mode: 0o700 });
-  writeJson(join(dir, "run.json"), { v: 1, supervisor_pid: supervisor, started_at: "x", ...extra });
-  writeFileSync(join(dir, "out", "run-1.log"), "captured output of an earlier run\n");
+  const out = mkdtempSync(join(tmpdir(), "bob-run-"));
+  captures.push(out);
+  const st = statSync(out, { bigint: true });
+  writeJson(join(dir, "run.json"), {
+    v: 1,
+    supervisor_pid: supervisor,
+    started_at: "x",
+    scratch_dir: out,
+    scratch_dev: String(st.dev),
+    scratch_ino: String(st.ino),
+    ...extra,
+  });
+  writeFileSync(join(out, "run-1.log"), "captured output of an earlier run\n");
   return dir;
+}
+
+function captureDir(run: string): string {
+  return JSON.parse(readFileSync(join(run, "run.json"), "utf8")).scratch_dir;
 }
 
 // A reader that answers from a table (a live pid gets its table entry, a dead
@@ -264,13 +280,13 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
     expect((e4.reaped_by as { note: string }).note).toContain("no sub-second identity");
 
     // The dead run's captures are gone; its records stay (inside retention).
-    expect(existsSync(join(deadRun, "out"))).toBe(false);
+    expect(existsSync(captureDir(deadRun))).toBe(false);
     expect(existsSync(join(deadRun, "ended.json"))).toBe(true);
 
     // The live run is untouched.
     expect(groupAlive(liveRunGroup)).toBe(true);
     expect(readEntry(liveRun, `pg-${liveRunGroup}.run-1.json`).state).toBe("running");
-    expect(existsSync(join(liveRun, "out", "run-1.log"))).toBe(true);
+    expect(existsSync(join(captureDir(liveRun), "run-1.log"))).toBe(true);
 
     // The old ended run is past retention: deleted.
     expect(existsSync(oldRun)).toBe(false);
@@ -346,7 +362,7 @@ describe("boot sweep — jobs left by a dead supervisor", () => {
     await live.prompt();
     const r = live.results[0];
     expect(r.isError).toBe(true);
-    expect(r.text).toContain("has mode 755, readable by other users. Run chmod 700");
+    expect(r.text).toContain("has mode 755, with group or world permissions. Run chmod 700");
   }, 20_000);
 });
 
@@ -390,13 +406,13 @@ describe("boot sweep — a supervisor pid that now belongs to another process", 
     await live.work.bootSweep;
 
     for (const stale of [a, b, c]) {
-      expect(existsSync(join(stale, "out")), stale).toBe(false);
+      expect(existsSync(captureDir(stale)), stale).toBe(false);
       expect(existsSync(join(stale, "ended.json")), stale).toBe(true);
     }
-    expect(existsSync(join(d, "out", "run-1.log"))).toBe(true);
+    expect(existsSync(join(captureDir(d), "run-1.log"))).toBe(true);
     expect(existsSync(join(d, "ended.json"))).toBe(false);
     expect(existsSync(e)).toBe(false);
-    expect(existsSync(join(f, "out"))).toBe(false);
+    expect(existsSync(captureDir(f))).toBe(false);
     expect(existsSync(join(f, "run.json"))).toBe(true);
     // The foreign process was never signalled by any of this.
     expect(groupAlive(foreign)).toBe(true);
@@ -450,7 +466,7 @@ describe("boot sweep — an identity that cannot be read", () => {
     expect(await live.work.bootSweep).toEqual([]);
     expect(signals).toEqual([]);
     expect(groupAlive(job)).toBe(true);
-    expect(existsSync(join(run, "out", "run-1.log"))).toBe(true);
+    expect(existsSync(join(captureDir(run), "run-1.log"))).toBe(true);
     expect(existsSync(join(run, "ended.json"))).toBe(false);
     expect(readEntry(run, `pg-${job}.run-1.json`).state).toBe("running");
   }, 20_000);
