@@ -348,7 +348,11 @@ change one, the named test is what tells you.
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.
-  The exploration budget uses the same edit predicate.
+  The exploration budget uses the same edit predicate. The repository reliability check excludes
+  content equal to trees of commits reachable from refs at launch; it does not
+  exclude content equal to an unreachable or dangling commit's tree (including
+  reflog-only commits). Enumerating every object would deny credit for real edits
+  in large repositories; adversarial containment requires [bob#189](https://github.com/tpsdev-ai/bob/issues/189).
   *(`test/shell/edit-or-blocked.test.ts`, `repository-edit-evidence.test.ts`)*
 
 ### Stated exceptions
