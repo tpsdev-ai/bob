@@ -122,8 +122,8 @@ association, and its Git objects are written into the repository for a later
 publication. **A candidate id is not permission to publish it.**
 
 `apply_patch` builds a candidate; it writes no file the model names and runs no
-command, so its `TOOL_EFFECTS` row is `writer` and a resident agent drops it with
-the other writers.
+command the model writes, so its `TOOL_EFFECTS` row is `writer` and a resident
+agent drops it with the other writers.
 
 ## Enabling it
 

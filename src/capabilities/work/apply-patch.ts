@@ -9,8 +9,11 @@
 // and refs are never used as application input and are left untouched.
 //
 // It never selects paths, drops hunks, repairs whitespace, resolves conflicts
-// or falls back to another base: the whole patch applies to the fresh index or
-// nothing does. A refusal returns a stable reason and leaves no candidate.
+// or falls back to another base: `git apply` runs with no `--reject`, no
+// `--3way`, no fuzz, and `--whitespace=nowarn` (so a repo's own
+// `apply.whitespace=fix` cannot make it repair whitespace). The whole patch
+// applies to the fresh index or nothing does. A refusal returns a stable reason
+// and leaves no candidate.
 //
 // The authority — repository, base, mode, artifact root, authorized digest —
 // comes from the task binding (task-binding.ts), retained by the capability,
@@ -364,7 +367,7 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
       );
     }
 
-    const applied = git(["apply", "--cached", "--binary", "-"], {
+    const applied = git(["apply", "--cached", "--binary", "--whitespace=nowarn", "-"], {
       cwd: binding.repository,
       indexFile,
       input: bytes,

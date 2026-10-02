@@ -168,6 +168,7 @@ function snapshot(repo: string): Record<string, string> {
   return {
     head: git(["rev-parse", "HEAD"], repo),
     tree: git(["rev-parse", "HEAD^{tree}"], repo),
+    refs: git(["show-ref"], repo),
     status: run(["status", "--porcelain"], repo).stdout,
     index: sha256(readFileSync(join(repo, ".git", "index"))),
   };
@@ -192,6 +193,10 @@ describe("apply_patch — success shapes yield the expected tree", () => {
     {
       name: "preserved line endings",
       mutate: (r) => writeFileSync(join(r, "crlf.txt"), "l1\r\nl2\r\nl3\r\n"),
+    },
+    {
+      name: "trailing whitespace is not repaired",
+      mutate: (r) => writeFileSync(join(r, "a.txt"), "hello  \n"),
     },
   ];
 
@@ -581,7 +586,7 @@ describe("apply_patch — the verified bytes are applied, not a reopened path", 
 });
 
 describe("apply_patch — a fake git runner proves the caller's index is never used", () => {
-  it("every git call names a tool-owned GIT_INDEX_FILE, and the caller's index is untouched", async () => {
+  it("the index-touching git calls name a tool-owned GIT_INDEX_FILE, and the caller's index is untouched", async () => {
     const fx = makeFixture();
     const { patch, tree } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
     writeArtifact(fx, "p.patch", patch);
