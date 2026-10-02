@@ -923,10 +923,10 @@ describe("changelog fragments — the migration (bob#236)", () => {
   const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-fff78d6a.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The twenty-three entries the migration changed, each as EXACT edits of main's text
+  // The twenty-four entries the migrated set changes from main's text, each as EXACT edits
   // (applied in order, each `from` found exactly once) plus every word that
   // disappears from the entry (`dropped`). Five were changed to pass `check`
-  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and eighteen more were
+  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and nineteen more were
   // corrected because they no longer matched bob's code or the rendered order,
   // most of them because code merged after they were written changed what they
   // describe.
@@ -1020,6 +1020,18 @@ describe("changelog fragments — the migration (bob#236)", () => {
         ],
       ],
       dropped: [],
+    },
+    {
+      fragment: "added-03-the-tps-mail-capability-a-bob.md",
+      was: "- **The `tps-mail` capability: a bob agent answers TPS mail (#200).**",
+      why: "A reap-exhausted output holder now gets bounded result collection instead of delaying the result until the turn timeout (#208).",
+      edits: [
+        [
+          ", except a member cleanup cannot kill (it still delays the result until the turn timeout): SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`);",
+          ". If a member survives cleanup and keeps the output open, result collection waits one short bounded interval after reaping gives up, closes its output ends, and applies the normal result parser to the bytes already read: a complete result stands, while an incomplete result fails the turn as usual. Reaping sends SIGTERM, then SIGKILL after a grace, probing on a nominal 50 ms poll interval (with no hard bound under event-loop delay) for up to the grace plus a reap limit, after which remaining members are logged with the group id and counted (`reapExhausted`); result collection after that exhaustion is also logged with the group id and counted (`resultCollectedAfterReapExhausted`);",
+        ],
+      ],
+      dropped: ["delays", "except", "kill", "still"],
     },
     {
       fragment: "fixed-04-a-resident-agent-keeps-a-tool.md",

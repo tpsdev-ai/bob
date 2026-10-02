@@ -1225,13 +1225,18 @@ describe("runDoctor — tps-mail", () => {
     mkdirSync(join(home, ".bob"), { recursive: true });
     writeFileSync(
       join(home, ".bob", "testbot.tps-mail-stats.json"),
-      JSON.stringify({ markerReadFailed: 2, reapExhausted: 1 }),
+      JSON.stringify({
+        markerReadFailed: 2,
+        reapExhausted: 1,
+        resultCollectedAfterReapExhausted: 1,
+      }),
     );
     const c = check(doctor(), "tps-mail activity");
     expect(c?.status).toBe("warn");
     expect(c?.detail).toContain("held for inspection=1 (marker-malformed=1)");
     expect(c?.detail).toContain("marker read failures=2");
     expect(c?.detail).toContain("reap exhausted=1");
+    expect(c?.detail).toContain("result collected after reap exhaustion=1");
   });
 
   // The reply contract (tpsdev-ai/cli#431): bob replies with `tps mail send

@@ -122,6 +122,7 @@ export type TurnRunner = (input: MailTurnInput, signal: AbortSignal) => Promise<
 
 const TURN_STDOUT_MAX_BYTES = 1024 * 1024;
 const TURN_KILL_GRACE_MS = 5000;
+const RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS = 250;
 
 // The default runner: spawn the agent's launcher with NO argument, BOB_MAIL_TURN=1,
 // the consumer's pid in BOB_MAIL_TURN_PARENT and the input on stdin, as the
@@ -137,9 +138,10 @@ const TURN_KILL_GRACE_MS = 5000;
 // the reap limit. If members remain after that (unkillable: a process in
 // uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
 // with the group id and counted (`reapExhausted`). `close` is kept only to
-// collect the result, which arrives once the reaping has freed the pipes —
-// except when a member cleanup cannot kill keeps a pipe open: then the result
-// waits for the turn timeout (a stated limit, tracked as a follow-up).
+// collect the result, which arrives once the reaping has freed the pipes.
+// If cleanup gives up after the launcher has exited, result collection waits
+// only RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS longer, closes its side of the
+// output pipes, and applies the normal result parser to the bytes already read.
 // Stated limit: signals go to the numeric group id. POSIX keeps a group id in
 // use while any member lives, so it cannot name another group while a
 // descendant survives. Once every member has exited, the id is free: the window
@@ -165,6 +167,8 @@ export interface LauncherTurnRunnerOptions {
   groupOps?: GroupOps;
   // Called (with the group id) when members remain after the reap limit.
   onReapExhausted?: (pgid: number) => void;
+  // Called when result collection ends after an exhausted reap.
+  onResultCollectedAfterReapExhausted?: (pgid: number) => void;
 }
 
 export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner {
@@ -179,9 +183,11 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
       const grace = opts.killGraceMs ?? TURN_KILL_GRACE_MS;
       const reapLimit = opts.reapLimitMs ?? 5000;
       let settled = false;
+      let resultWait: ReturnType<typeof setTimeout> | undefined;
       const finish = (outcome: TurnOutcome) => {
         if (settled) return;
         settled = true;
+        if (resultWait) clearTimeout(resultWait);
         signal.removeEventListener("abort", onAbort);
         resolve(outcome);
       };
@@ -198,56 +204,20 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
         if (pgid === undefined || !groupExists()) return;
         ops.signal(pgid, sig);
       };
-      let reaping = false;
-      const reap = () => {
-        if (reaping || pgid === undefined) return;
-        reaping = true;
-        if (!groupExists()) return;
-        signalGroup("SIGTERM");
-        const started = Date.now();
-        let killed = false;
-        const tick = setInterval(() => {
-          if (!groupExists()) {
-            clearInterval(tick);
-            return;
-          }
-          const elapsed = Date.now() - started;
-          if (!killed && elapsed >= grace) {
-            killed = true;
-            signalGroup("SIGKILL");
-          }
-          if (elapsed >= grace + reapLimit) {
-            clearInterval(tick);
-            opts.onReapExhausted?.(pgid);
-          }
-        }, 50);
-      };
-      const onAbort = () => reap();
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) onAbort();
-      // Cleanup starts when the LEADER exits — not on `close`, which waits for
-      // every inherited pipe (see the note above).
-      child.on("exit", () => reap());
-
       let stdout = "";
       let stdoutBytes = 0;
       let stderr = "";
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdoutBytes += chunk.length;
-        if (stdoutBytes <= TURN_STDOUT_MAX_BYTES) stdout += chunk.toString("utf8");
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderr = (stderr + chunk.toString("utf8")).slice(-4096);
-      });
-      child.on("error", (err: NodeJS.ErrnoException) => {
-        finish({
-          kind: "failed",
-          reason: err.code === "ENOENT" ? "launcher-missing" : "exit",
-          detail: `${opts.launcherPath}: ${err.message}`,
-        });
-      });
-      child.on("close", (code, sig) => {
-        // Result collection only: the reaping started on `exit`.
+      let launcherExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+      let reapExhausted = false;
+      let reportedResultAfterReapExhausted = false;
+      const reportResultAfterReapExhausted = () => {
+        if (reportedResultAfterReapExhausted || pgid === undefined) return;
+        reportedResultAfterReapExhausted = true;
+        opts.onResultCollectedAfterReapExhausted?.(pgid);
+      };
+      const collectResult = (code: number | null, sig: NodeJS.Signals | null) => {
+        if (settled) return;
+        if (reapExhausted) reportResultAfterReapExhausted();
         if (signal.aborted) {
           const reason = signal.reason === "timeout" ? "timeout" : "stopped";
           finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
@@ -270,6 +240,75 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
         finish(
           result.outcome === "final" ? { kind: "final", text: result.text } : { kind: "silent" },
         );
+      };
+      const boundResultCollectionAfterReapExhausted = () => {
+        if (settled || !reapExhausted || !launcherExit || resultWait) return;
+        const exit = launcherExit;
+        resultWait = setTimeout(() => {
+          resultWait = undefined;
+          if (settled) return;
+          collectResult(exit.code, exit.signal);
+          // An unkillable group member may retain the write ends indefinitely.
+          // We have consumed the bytes available at the bound; close our ends.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }, RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS);
+      };
+      let reaping = false;
+      const reap = () => {
+        if (reaping || pgid === undefined) return;
+        reaping = true;
+        if (!groupExists()) return;
+        signalGroup("SIGTERM");
+        const started = Date.now();
+        let killed = false;
+        const tick = setInterval(() => {
+          if (!groupExists()) {
+            clearInterval(tick);
+            return;
+          }
+          const elapsed = Date.now() - started;
+          if (!killed && elapsed >= grace) {
+            killed = true;
+            signalGroup("SIGKILL");
+          }
+          if (elapsed >= grace + reapLimit) {
+            clearInterval(tick);
+            reapExhausted = true;
+            opts.onReapExhausted?.(pgid);
+            boundResultCollectionAfterReapExhausted();
+          }
+        }, 50);
+      };
+      const onAbort = () => reap();
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      // Cleanup starts when the LEADER exits — not on `close`, which waits for
+      // every inherited pipe (see the note above).
+      child.on("exit", (code, sig) => {
+        launcherExit = { code, signal: sig };
+        reap();
+        boundResultCollectionAfterReapExhausted();
+      });
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes <= TURN_STDOUT_MAX_BYTES) stdout += chunk.toString("utf8");
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr = (stderr + chunk.toString("utf8")).slice(-4096);
+      });
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        finish({
+          kind: "failed",
+          reason: err.code === "ENOENT" ? "launcher-missing" : "exit",
+          detail: `${opts.launcherPath}: ${err.message}`,
+        });
+      });
+      child.on("close", (code, sig) => {
+        // Normal result collection. If the reap exhausted first, this shares
+        // the same parser and outcome rules as the bounded fallback above.
+        collectResult(code, sig);
       });
       child.stdin?.on("error", () => {});
       child.stdin?.end(serializeMailTurnInput(input), "utf8");
@@ -360,6 +399,9 @@ export interface MailConsumerStats {
   // A turn's process group that still had members after SIGKILL and the reap
   // limit: cleanup gave up (logged with the group id).
   reapExhausted: number;
+  // Result collection ended after the launcher exited and its process-group
+  // reap exhausted (logged with the group id).
+  resultCollectedAfterReapExhausted: number;
 }
 
 // Why a mail is held for manual inspection.
@@ -389,6 +431,7 @@ function emptyStats(): MailConsumerStats {
     markerReadFailed: 0,
     held: Object.fromEntries(HOLD_REASONS.map((r) => [r, 0])) as Record<HoldReason, number>,
     reapExhausted: 0,
+    resultCollectedAfterReapExhausted: 0,
   };
 }
 
@@ -641,6 +684,14 @@ export class MailConsumer {
           this.persistStats();
           this.log(
             `tps-mail: a mail turn's process group ${pgid} still has members after SIGKILL and the reap limit; cleanup gave up (a member may be unkillable or owned by another user)`,
+          );
+        },
+        onResultCollectedAfterReapExhausted: (pgid) => {
+          this.stats.resultCollectedAfterReapExhausted += 1;
+          // Like reap exhaustion, this can happen after stop()'s final write.
+          this.persistStats();
+          this.log(
+            `tps-mail: mail turn result collection for process group ${pgid} ended after reap exhaustion; using the launcher output bytes already read`,
           );
         },
       });

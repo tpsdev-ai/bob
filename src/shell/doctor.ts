@@ -1050,6 +1050,7 @@ function tpsMailChecks(o: {
         markerFailed?: number;
         markerReadFailed?: number;
         reapExhausted?: number;
+        resultCollectedAfterReapExhausted?: number;
       }
     | undefined;
   try {
@@ -1071,7 +1072,7 @@ function tpsMailChecks(o: {
   if (stats) {
     const replyFailed = sum(stats.replyFailed);
     parts.push(
-      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0} marker failures=${stats.markerFailed ?? 0} marker read failures=${stats.markerReadFailed ?? 0} reap exhausted=${stats.reapExhausted ?? 0}`,
+      `this run: replied=${stats.replied ?? 0} no-reply=${stats.noReply ?? 0} dispatch failures=${stats.dispatchFailed ?? 0} (timeouts ${stats.timeouts ?? 0}) reply failures=${replyFailed}${summarize(stats.replyFailed ?? {})} verify unavailable=${stats.verifyUnavailable ?? 0} marker failures=${stats.markerFailed ?? 0} marker read failures=${stats.markerReadFailed ?? 0} reap exhausted=${stats.reapExhausted ?? 0} result collected after reap exhaustion=${stats.resultCollectedAfterReapExhausted ?? 0}`,
     );
     failing =
       failing ||
@@ -1080,7 +1081,8 @@ function tpsMailChecks(o: {
       (stats.verifyUnavailable ?? 0) > 0 ||
       (stats.markerFailed ?? 0) > 0 ||
       (stats.markerReadFailed ?? 0) > 0 ||
-      (stats.reapExhausted ?? 0) > 0;
+      (stats.reapExhausted ?? 0) > 0 ||
+      (stats.resultCollectedAfterReapExhausted ?? 0) > 0;
   } else {
     parts.push("no consumer stats yet (the persistent runtime writes them)");
   }
