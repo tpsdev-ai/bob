@@ -97,7 +97,7 @@ const CANCEL_DESCRIPTION =
   "Limits: process-group backend, same user, not a sandbox; a descendant that left the job's group may survive.";
 
 const APPLY_PATCH_DESCRIPTION =
-  "Apply the launcher-authorized patch to a fresh, tool-owned index built from the task's pinned base, and store the resulting candidate. " +
+  "Apply a patch artifact under the task's artifact root to a fresh, tool-owned index built from the task's pinned base, and store the resulting candidate. " +
   "Takes patch_artifact { path, sha256 } (a patch file under the task's artifact root) and expected_base (the task's pinned base commit object ID). " +
   "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply; the caller's worktree, index, HEAD and refs are never used and are left untouched. " +
   "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +

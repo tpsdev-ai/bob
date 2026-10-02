@@ -86,7 +86,7 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze(
   replace_lines: "writer", // bob#143: replaces a line range
   powershell: "writer", // pi (Windows): runs a command
   run: "writer", // work: runs a command
-  apply_patch: "writer", // work: builds a candidate tree from a launcher-authorized patch (bob#275)
+  apply_patch: "writer", // work: builds a candidate tree from a patch artifact (bob#275)
   write_file: "writer", // anchored-edit: writes a file
   edit_lines: "writer", // anchored-edit: edits a file
   insert_after: "writer", // anchored-edit: edits a file

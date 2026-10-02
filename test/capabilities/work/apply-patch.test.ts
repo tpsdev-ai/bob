@@ -1,9 +1,10 @@
 // apply_patch (bob#275, S2a): deterministic patch application against a fresh,
 // tool-owned index.
 //
-// Local git fixtures, no network. Each case drives the tool the capability
-// registers (through wireWork), applies a real patch, and asserts the resulting
-// tree and that the caller's worktree, index and HEAD are byte-identical after.
+// Local git fixtures, no network. Cases drive the tool the capability registers
+// (through wireWork) or applyPatch directly; the success cases apply a real
+// patch and assert the resulting tree, and that the caller's worktree, index and
+// HEAD are byte-identical after.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -73,6 +74,15 @@ function git(args: string[], cwd: string): string {
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+// The candidate id the tool derives, so a test can occupy the record's final
+// name (the fixtures' binding uses task-1 / pub-1).
+function candidateId(fx: Fixture, tree: string, digest: string): string {
+  return createHash("sha256")
+    .update(Buffer.from(["task-1", "pub-1", fx.repo, fx.base, tree, digest].join("\0")))
+    .digest("hex")
+    .slice(0, 40);
 }
 
 interface Fixture {
@@ -699,6 +709,61 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     if (!out.ok) expect(out.reason).toBe("storage_failed");
     expect(readdirSync(stateRoot)).toEqual([]);
     expect(existsSync(candidateRecordPath(stateRoot, "candidate"))).toBe(false);
+  });
+
+  it("a candidates directory that is a symlink into the checkout: storage_failed, the checkout unchanged and nothing written through the link", async () => {
+    const fx = makeFixture();
+    const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const stateRoot = join(scratch, "state");
+    mkdirSync(stateRoot, { mode: 0o700 });
+    // The candidate directory is a symlink into the caller's checkout: a
+    // recursive mkdir accepts it and the record write follows it there.
+    const planted = join(fx.repo, "planted");
+    mkdirSync(planted);
+    symlinkSync(planted, join(stateRoot, "candidates"));
+    const before = snapshot(fx.repo);
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.reason).toBe("storage_failed");
+    // Nothing was written through the link, and the checkout is byte-identical.
+    expect(readdirSync(planted)).toEqual([]);
+    expect(snapshot(fx.repo)).toEqual(before);
+  });
+
+  it("a rename that fails: storage_failed, and no temporary record is left behind", async () => {
+    const fx = makeFixture();
+    const { patch, tree } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
+    writeArtifact(fx, "p.patch", patch);
+    const stateRoot = join(scratch, "state");
+    const dir = join(stateRoot, "candidates");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // The record's final name is occupied by a directory, so the rename fails
+    // after the temporary record was written.
+    const id = candidateId(fx, tree, sha256(patch));
+    mkdirSync(join(dir, `${id}.json`));
+    const out = applyPatch({
+      binding: binding(fx),
+      params: {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: fx.base,
+      },
+      stateRoot,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("storage_failed");
+      expect(out.message).toContain("could not be stored");
+    }
+    // The temporary record was removed: the occupied name is all that is left.
+    expect(readdirSync(dir)).toEqual([`${id}.json`]);
   });
 });
 

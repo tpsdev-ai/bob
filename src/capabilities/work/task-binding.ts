@@ -17,7 +17,8 @@
 // task binding from bob.yaml, so a task binding cannot be written by the agent.
 //
 // This is a narrow session-construction interface, not S4's task manifest or
-// CLI: it carries exactly the fields the S2a operations read.
+// CLI: it carries the fields the S2a operations read, and the fields a later
+// slice reads (S2b).
 
 export const TASK_BINDING_ENV = "BOB_TASK_BINDING";
 

@@ -3,10 +3,10 @@
 //
 // The change a builder publishes must be the change it verified. Applying a
 // patch with shell instructions lets the two differ, so this tool owns the
-// application: it reads the launcher-authorized artifact ONCE, verifies its
-// digest, and applies those VERIFIED BYTES to a fresh, tool-owned index
-// initialized from the task's pinned base. The caller's worktree, index, HEAD
-// and refs are never used as application input and are left untouched.
+// application: it reads the artifact ONCE, verifies its digest, and applies
+// those VERIFIED BYTES to a fresh, tool-owned index initialized from the task's
+// pinned base. The caller's worktree, index, HEAD and refs are never used as
+// application input and are left untouched.
 //
 // It never selects paths, drops hunks, repairs whitespace, resolves conflicts
 // or falls back to another base: `git apply` runs with no `--reject`, no
@@ -15,16 +15,19 @@
 // applies to the fresh index or nothing does. A refusal returns a stable reason
 // and leaves no candidate.
 //
-// The authority — repository, base, mode, artifact root, authorized digest —
-// comes from the task binding (task-binding.ts), retained by the capability,
-// never from a tool argument, a model message, a repository file or bob.yaml.
+// The authority — repository, base, mode and artifact root — comes from the
+// task binding (task-binding.ts), retained by the capability, never from a tool
+// argument, a model message, a repository file or bob.yaml.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants as fsConstants,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -339,12 +342,9 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
 
   // The state root must lie outside the caller's checkout and be owner-only:
   // the two checks `run` makes before it writes under its own state root
-  // (run.ts ensureRunDir). A root inside the workspace or the repository would
-  // leave the candidate record and the scratch index as stray files in the
-  // caller's tree; a root that is a symlink, a file or another account's
-  // directory lets that account choose what the index holds between read-tree
-  // and write-tree; group or world permission bits expose or open the
-  // candidate records to other users.
+  // (run.ts ensurePrivateDir). A root inside the workspace or the repository is
+  // refused, as is one that is a symlink, a file, another account's directory,
+  // or a directory with any group or world permission bit.
   const inside = (
     [
       [binding.workspace, "the workspace"],
@@ -518,31 +518,108 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
   }
 }
 
+// Open and verify the candidate directory — the one pre-existing directory the
+// tool writes records into. It must be a plain directory of this account,
+// owner-only: `mkdirSync` alone accepts a symlink to a directory, and the
+// record write and its rename would then follow it into whatever it points at,
+// including the caller's checkout. The returned descriptor pins the verified
+// directory, so a pathname replaced after this check is not written through.
+function openCandidateDir(dir: string): { ok: true; fd: number } | ApplyPatchRefusal {
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+      return refuse(
+        "storage_failed",
+        `apply_patch refused: the candidate directory ${dir} could not be created (${(err as NodeJS.ErrnoException).code ?? "error"}).`,
+      );
+    }
+  }
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(dir);
+  } catch {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the candidate directory ${dir} cannot be read.`,
+    );
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the candidate directory ${dir} is not a plain directory (a symlink or a file is there). Candidate records are stored there; remove it and apply_patch recreates it owner-only.`,
+    );
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && st.uid !== uid) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the candidate directory ${dir} is owned by uid ${st.uid}, not this user (${uid}).`,
+    );
+  }
+  if ((st.mode & 0o077) !== 0) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the candidate directory ${dir} has mode ${(st.mode & 0o777).toString(8)}, readable by other users.`,
+    );
+  }
+  let fd: number;
+  try {
+    fd = openSync(
+      dir,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | fsConstants.O_NOFOLLOW,
+    );
+  } catch (err) {
+    return refuse(
+      "storage_failed",
+      `apply_patch refused: the candidate directory ${dir} could not be opened without following a link (${(err as NodeJS.ErrnoException).code ?? "error"}).`,
+    );
+  }
+  return { ok: true, fd };
+}
+
 // Store the candidate record atomically under the tool-owned state root. The
 // record is written to a temp file and renamed into place, so a reader never
-// sees a half-written candidate. Failure refuses (storage_failed) — a candidate
-// whose record was not stored is not returned as a success.
+// sees a half-written candidate. Both steps go through the descriptor of the
+// verified candidate directory (openCandidateDir), so neither follows a
+// pathname replaced after that check; a failed rename removes the temporary
+// record. Failure refuses (storage_failed) — a candidate whose record was not
+// stored is not returned as a success.
 function storeCandidate(
   stateRoot: string,
   record: CandidateRecord,
   deps: ApplyPatchDeps,
 ): { ok: true } | ApplyPatchRefusal {
   const dir = join(stateRoot, "candidates");
+  const opened = openCandidateDir(dir);
+  if (!opened.ok) return opened;
+  const via = `/dev/fd/${opened.fd}`;
+  const tmpName = `.tmp-${deps.uniqueSuffix?.() ?? `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+  let wroteTmp = false;
   try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const tmp = join(
-      dir,
-      `.tmp-${deps.uniqueSuffix?.() ?? `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
-    );
-    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-    renameSync(tmp, join(dir, `${record.candidate_id}.json`));
+    writeFileSync(join(via, tmpName), `${JSON.stringify(record, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    wroteTmp = true;
+    renameSync(join(via, tmpName), join(via, `${record.candidate_id}.json`));
+    return { ok: true };
   } catch (err) {
+    let leftover = "";
+    if (wroteTmp) {
+      try {
+        rmSync(join(via, tmpName), { force: true });
+      } catch (rerr) {
+        leftover = `; the temporary record ${tmpName} could not be removed (${rerr instanceof Error ? rerr.message : String(rerr)})`;
+      }
+    }
     return refuse(
       "storage_failed",
-      `apply_patch refused: the candidate could not be stored under ${dir} (${err instanceof Error ? err.message : String(err)}).`,
+      `apply_patch refused: the candidate could not be stored under ${dir} (${err instanceof Error ? err.message : String(err)})${leftover}.`,
     );
+  } finally {
+    closeSync(opened.fd);
   }
-  return { ok: true };
 }
 
 // Where a candidate's record lives, for a later publication to read (S2b).

@@ -16,7 +16,7 @@ It registers four tools through `pi.registerTool`:
 | `run` | `command`, `cwd?`, `timeout_s?`, `background?` | runs `bash -c command`; waits for the outcome, or with `background: true` returns a `run_id` at once |
 | `run_status` | `run_id?` | one job's state, outcome, cleanup and output excerpt; with no `run_id`, every job this run owns |
 | `run_cancel` | `run_id` | cancels one of this run's jobs by its recorded process group |
-| `apply_patch` | `patch_artifact: { path, sha256 }`, `expected_base` | applies a launcher-authorized patch to a fresh tool-owned index built from the task's pinned base and stores the resulting candidate (see below) |
+| `apply_patch` | `patch_artifact: { path, sha256 }`, `expected_base` | applies a patch artifact under the task's artifact root to a fresh tool-owned index built from the task's pinned base and stores the resulting candidate (see below) |
 
 `cwd` is relative to the workspace, or an absolute path inside it; omitted, the
 command starts in the workspace. It must be an existing directory, and after
@@ -77,8 +77,9 @@ command could start in it. That is the safe direction; make it readable
 
 ## apply_patch and the task binding (bob#275, S2a)
 
-`apply_patch` builds a candidate tree from a launcher-authorized patch, so the
-published change is the change that was verified.
+`apply_patch` builds a candidate tree from a patch artifact under the task's
+artifact root; this slice stores the candidate for the checks and the
+publication that a later slice adds (S2b).
 
 **The task binding.** A task binding is the launcher's authority over a builder
 session: the task and publication identities, the repository and workspace, the
