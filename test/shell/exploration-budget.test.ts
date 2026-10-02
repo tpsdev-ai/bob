@@ -5,6 +5,7 @@
 // write-class call resets the count; the outcome is in the run log and doctor's
 // last-run line; and the budget is read from the role/agent config.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -13,6 +14,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,17 +37,23 @@ import {
 
 // A fabricated AgentSession matching the RunSession seam. prompt() emits one
 // tool_execution_start per call, then either ends an assistant message (a clean
-// run) or hangs (so the run is ended by its own stop). steer() records what the
-// runtime injects.
-function makeSession(opts: { calls: string[]; resolve: boolean }): {
+// run) or hangs (so the run is ended by its own stop). `script` replaces that
+// for the nth prompt() call, for the turn scripts the budget needs (a turn that
+// compacts and goes silent, then a continue turn that overruns).
+function makeSession(opts: {
+  calls?: string[];
+  resolve?: boolean;
+  script?: Array<(emit: (event: unknown) => void) => void>;
+}): {
   session: RunSession;
   steers: string[];
-  aborts: number;
+  aborts: () => number;
 } {
   const listeners: Array<(event: unknown) => void> = [];
   const steers: string[] = [];
   let aborts = 0;
   let done = false;
+  let promptCalls = 0;
   const emit = (event: unknown): void => {
     for (const listener of listeners) listener(event);
   };
@@ -58,8 +66,14 @@ function makeSession(opts: { calls: string[]; resolve: boolean }): {
       };
     },
     async prompt() {
+      promptCalls += 1;
+      const scripted = opts.script?.[promptCalls - 1];
+      if (scripted !== undefined) {
+        scripted(emit);
+        return;
+      }
       let i = 0;
-      for (const toolName of opts.calls) {
+      for (const toolName of opts.calls ?? []) {
         if (done) break; // once the run is ended, stop feeding it
         // Varying args keep the loop breaker (identical calls) out of the way;
         // this test is about the exploration budget (varied read-only calls).
@@ -71,7 +85,7 @@ function makeSession(opts: { calls: string[]; resolve: boolean }): {
         });
         i += 1;
       }
-      if (opts.resolve) {
+      if (opts.resolve === true) {
         emit({
           type: "message_end",
           message: {
@@ -269,6 +283,47 @@ describe("runAgent exploration budget", () => {
     expect(res.exitCode).toBe(0);
   }, 15_000);
 
+  it("ends the run when the post-compaction continue turn exhausts the budget (#279)", async () => {
+    // The first turn compacts and goes silent, so the run gets ONE continue
+    // turn. That turn spends twice the budget in read-only calls and THEN ends a
+    // message: the stop must fail the whole run, not be swallowed as a failed
+    // continue turn and judged green by the message that followed it.
+    mkAgent("retrying", "builder-local");
+    const limit = BUILDER_LOCAL_EXPLORATION_BUDGET;
+    const fake = makeSession({
+      script: [
+        (emit) => emit({ type: "compaction_end", reason: "threshold", aborted: false }),
+        (emit) => {
+          for (let i = 0; i < 2 * limit; i += 1) {
+            emit({
+              type: "tool_execution_start",
+              toolCallId: `t${i}`,
+              toolName: "read_lines",
+              args: { path: `f${i}.ts` },
+            });
+          }
+          emit({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+              stopReason: "stop",
+            },
+          });
+        },
+      ],
+    });
+    const res = await runAgent({
+      name: "retrying",
+      prompt: "do the task",
+      agentsRoot,
+      sessionFactory: factoryReturning(fake.session),
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.explorationBudgetExhausted).toEqual({ limit, readOnlyCalls: 2 * limit });
+    expect(fake.aborts()).toBeGreaterThanOrEqual(1);
+  }, 15_000);
+
   it("records the outcome in the run log and shows it in doctor's last-run line", async () => {
     mkAgent("logged", "builder-local", "  exploration_budget: 2");
     const fake = makeSession({
@@ -341,6 +396,29 @@ describe("readLastRunSummary", () => {
     symlinkSync(join(runs, "vanished-target"), join(runs, "vanished.jsonl"));
     expect(readLastRunSummary(runs)).toBeUndefined();
   });
+
+  it("skips a listed log that is not a regular file instead of blocking on it", () => {
+    const runs = join(dir, "runs");
+    mkdirSync(runs, { recursive: true });
+    writeFileSync(
+      join(runs, "a.jsonl"),
+      [
+        JSON.stringify({ t: "1", event: { type: "agent_start" } }),
+        JSON.stringify({ t: "2", outcome: { reason: "tool_loop" } }),
+      ].join("\n"),
+    );
+    // A NEWER entry that is a symlink to a FIFO with no writer: opening it for
+    // reading would block doctor forever, so the last-run line must fall back to
+    // the regular log.
+    const fifo = join(dir, "blocked.fifo");
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    symlinkSync(fifo, join(runs, "b.jsonl"));
+    const future = Date.now() / 1000 + 60;
+    utimesSync(fifo, future, future);
+    const summary = readLastRunSummary(runs);
+    expect(summary?.file).toBe("a.jsonl");
+    expect(lastRunOutcomeReason(summary?.outcome)).toBe("tool_loop");
+  }, 15_000);
 
   it("reports a missing or malformed outcome as 'no outcome recorded', never as success", () => {
     expect(lastRunOutcomeReason(undefined)).toBe("no outcome recorded");

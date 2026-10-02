@@ -33,6 +33,7 @@
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
+  constants,
   existsSync,
   fstatSync,
   fsyncSync,
@@ -1169,11 +1170,15 @@ export function readLastRunSummary(
   for (const name of names) {
     let fd: number | undefined;
     try {
-      fd = openSync(join(runsDir, name), "r");
-      const { mtimeMs, size } = fstatSync(fd);
-      if (newest === undefined || mtimeMs > newest.mtimeMs) {
+      // O_NONBLOCK so the OPEN cannot block: a runs/*.jsonl that is a FIFO, or a
+      // symlink to one, would otherwise hang doctor before it can be inspected.
+      // The type is then read off the OPENED descriptor, so only a regular file
+      // is scanned — reading a FIFO's descriptor would block as well.
+      fd = openSync(join(runsDir, name), constants.O_RDONLY | constants.O_NONBLOCK);
+      const st = fstatSync(fd);
+      if (st.isFile() && (newest === undefined || st.mtimeMs > newest.mtimeMs)) {
         if (newest !== undefined) closeSync(newest.fd);
-        newest = { name, mtimeMs, size, fd };
+        newest = { name, mtimeMs: st.mtimeMs, size: st.size, fd };
         fd = undefined;
       }
     } catch {

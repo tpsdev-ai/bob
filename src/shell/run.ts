@@ -1317,8 +1317,13 @@ async function runBoundedSession(
         await raceLoop(boundedPrompt(session, CONTINUE_TURN, bounds, loopController.signal));
         await raceLoop(bounds.guard(drainReasoningOnly())); // shared re-prompt budget
       } catch (err) {
-        // Either termination mechanism must fail the whole run.
-        if (err instanceof RunAbortedError || err instanceof ToolLoopError) throw err;
+        // Every turn-level stop must fail the whole run.
+        if (
+          err instanceof RunAbortedError ||
+          err instanceof ToolLoopError ||
+          err instanceof ExplorationBudgetExhaustedError
+        )
+          throw err;
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
