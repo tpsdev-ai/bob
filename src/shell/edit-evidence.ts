@@ -279,21 +279,6 @@ function trackedContent(
     let { parents, available } = trackedParents(absolute, observedParents);
     try {
       if (available) {
-        let current: BigIntStats | undefined;
-        try {
-          current = lstatSync(absolute, { bigint: true });
-        } catch (error) {
-          if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? ""))
-            throw error;
-        }
-        const cached = cache.get(path);
-        if (current && cached && sameStat(current, cached.stat)) {
-          content.set(path, cached.entry);
-          continue;
-        }
-        cache.delete(path);
-        ({ parents, available } = trackedParents(absolute));
-        if (!available) throw new Error("tracked parent changed before hashing");
         try {
           fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         } catch (error) {
@@ -302,7 +287,19 @@ function trackedContent(
           else if (!["ENOENT", "ENOTDIR"].includes(code)) throw error;
         }
       }
-      if (fd !== undefined) stat = fstatSync(fd, { bigint: true });
+      if (fd !== undefined) {
+        stat = fstatSync(fd, { bigint: true });
+        const cached = cache.get(path);
+        if (cached && sameStat(stat, cached.stat)) {
+          content.set(path, cached.entry);
+          continue;
+        }
+      }
+      cache.delete(path);
+      if (available) {
+        ({ parents, available } = trackedParents(absolute));
+        if (!available) throw new Error("tracked parent changed before hashing");
+      }
       if (stat?.isSymbolicLink()) {
         mode = "120000";
         bytes = readlinkSync(absolute, { encoding: "buffer" });

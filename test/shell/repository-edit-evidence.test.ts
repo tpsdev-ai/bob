@@ -125,7 +125,12 @@ describe("repository evidence in the completion gate and exploration budget", ()
     writeFileSync(join(cwd, "other"), "other bytes\n");
     writeFileSync(join(cwd, "third"), "third bytes\n");
     commit(cwd, launchHead);
-    const read = spyOn(fs, "readFileSync");
+    const reads: bigint[] = [];
+    const readFile = fs.readFileSync;
+    const read = spyOn(fs, "readFileSync").mockImplementation((...args) => {
+      if (typeof args[0] === "number") reads.push(fs.fstatSync(args[0], { bigint: true }).ino);
+      return readFile(...args);
+    });
     try {
       const result = await run([
         { toolName: "read" },
@@ -134,6 +139,14 @@ describe("repository evidence in the completion gate and exploration budget", ()
       ]);
       expect(result.exitCode).toBe(0);
       expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(4);
+      for (const [name, count] of [
+        ["tracked", 2],
+        ["other", 1],
+        ["third", 1],
+      ] as const) {
+        const ino = fs.statSync(join(cwd, name), { bigint: true }).ino;
+        expect(reads.filter((readIno) => readIno === ino)).toHaveLength(count);
+      }
     } finally {
       read.mockRestore();
     }
@@ -298,14 +311,11 @@ describe("repository evidence in the completion gate and exploration budget", ()
     const external = join(agentsRoot, "external");
     mkdirSync(external);
     writeFileSync(join(external, "file"), "external bytes\n");
-    const canonicalFile = join(fs.realpathSync(cwd), "dir", "file");
-    const lstat = fs.lstatSync;
-    const probe = spyOn(fs, "lstatSync").mockImplementation((...args) => {
-      const stat = lstat(...args);
-      if (Buffer.isBuffer(args[0]) && args[0].toString() === canonicalFile) {
-        renameSync(parent, join(agentsRoot, "saved-parent"));
-        symlinkSync(external, parent);
-      }
+    const fstat = fs.fstatSync;
+    const probe = spyOn(fs, "fstatSync").mockImplementation((fd) => {
+      const stat = fstat(fd, { bigint: true });
+      renameSync(parent, join(agentsRoot, "saved-parent"));
+      symlinkSync(external, parent);
       return stat;
     });
     const read = spyOn(fs, "readFileSync");
