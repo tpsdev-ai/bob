@@ -725,13 +725,24 @@ consumer. For each file in `new/`, oldest first by filename:
   launcher on stdin, never as an argument. The launcher runs as the leader of
   its own process group, and the group is reaped as soon as the launcher
   process EXITS (or the turn is aborted: past `turnTimeoutMs`, or a shutdown) —
-  not when its output closes, so a descendant holding that output cannot hold
-  up the turn or its result — except a member cleanup cannot kill: one that
-  survives the reap and keeps the output open still delays the result until the
-  turn timeout. Reaping sends SIGTERM, then SIGKILL after a grace, and probes the
-  group on a nominal 50 ms poll interval (with no hard bound under event-loop
-  delay) for up to the grace plus a reap limit (5 s); members still there after
-  that are given up on, logged with the group id and counted (`reapExhausted`).
+  not when its output closes. Once the launcher has exited and process-group
+  reaping is exhausted, if result collection is still pending, Bob starts a
+  result timer set to fire 250 ms later (subject to event-loop delay). If
+  reaping is exhausted and that timer fires
+  before the output closes, Bob ends result collection and then closes its
+  output ends. If the timer fired before the turn timeout or shutdown, the
+  launcher exited zero, and the turn is still active, the normal result parser
+  uses the bytes already read. The bytes read at timer expiry decide the
+  outcome: a complete result stands without rerunning the turn, while an
+  incomplete result fails as `no-result`; bytes written later are not used.
+  Under those conditions, result collection does not wait for the turn timeout.
+  Reaping sends SIGTERM,
+  then SIGKILL after a grace, and probes the group on a nominal 50 ms poll
+  interval (with no hard bound under event-loop delay) for up to the grace plus
+  a reap limit (5 s); members still there afterward are given up on, logged with
+  the group id and counted (`reapExhausted`);
+  parser use after that exhaustion is also logged with the group id and counted
+  (`resultCollectedAfterReapExhausted`).
   Signals go to the numeric group id, and only after a probe found the group;
   once every member has exited, a reused id could only be signalled in the
   window from the group's death to the next probe (a nominal 50 ms poll

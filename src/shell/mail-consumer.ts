@@ -122,6 +122,7 @@ export type TurnRunner = (input: MailTurnInput, signal: AbortSignal) => Promise<
 
 const TURN_STDOUT_MAX_BYTES = 1024 * 1024;
 const TURN_KILL_GRACE_MS = 5000;
+const RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS = 250;
 
 // The default runner: spawn the agent's launcher with NO argument, BOB_MAIL_TURN=1,
 // the consumer's pid in BOB_MAIL_TURN_PARENT and the input on stdin, as the
@@ -137,9 +138,13 @@ const TURN_KILL_GRACE_MS = 5000;
 // the reap limit. If members remain after that (unkillable: a process in
 // uninterruptible I/O, or one we may not signal), cleanup GIVES UP — logged
 // with the group id and counted (`reapExhausted`). `close` is kept only to
-// collect the result, which arrives once the reaping has freed the pipes —
-// except when a member cleanup cannot kill keeps a pipe open: then the result
-// waits for the turn timeout (a stated limit, tracked as a follow-up).
+// collect the result, which arrives once the reaping has freed the pipes.
+// Once cleanup has given up and the launcher has exited, if result collection
+// is still pending, Bob starts a timer set to fire
+// RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS later. If that timer fires while the turn
+// is still active, a zero-exit launcher uses the normal result parser on the
+// bytes already read before Bob closes the output pipes. The bytes read at
+// timer expiry decide the outcome; bytes written later are not used.
 // Stated limit: signals go to the numeric group id. POSIX keeps a group id in
 // use while any member lives, so it cannot name another group while a
 // descendant survives. Once every member has exited, the id is free: the window
@@ -165,6 +170,11 @@ export interface LauncherTurnRunnerOptions {
   groupOps?: GroupOps;
   // Called (with the group id) when members remain after the reap limit.
   onReapExhausted?: (pgid: number) => void;
+  // Called when result collection ends after an exhausted reap.
+  onResultCollectedAfterReapExhausted?: (pgid: number) => void;
+  // Seam (tests): called when the bounded wait expires, before the collector
+  // reads the bytes accumulated at that boundary.
+  onResultWaitExpired?: (pgid: number) => void;
 }
 
 export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner {
@@ -179,9 +189,11 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
       const grace = opts.killGraceMs ?? TURN_KILL_GRACE_MS;
       const reapLimit = opts.reapLimitMs ?? 5000;
       let settled = false;
+      let resultWait: ReturnType<typeof setTimeout> | undefined;
       const finish = (outcome: TurnOutcome) => {
         if (settled) return;
         settled = true;
+        if (resultWait) clearTimeout(resultWait);
         signal.removeEventListener("abort", onAbort);
         resolve(outcome);
       };
@@ -197,6 +209,57 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
       const signalGroup = (sig: NodeJS.Signals) => {
         if (pgid === undefined || !groupExists()) return;
         ops.signal(pgid, sig);
+      };
+      let stdout = "";
+      let stdoutBytes = 0;
+      let stderr = "";
+      let launcherExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+      let reapExhausted = false;
+      let reportedResultAfterReapExhausted = false;
+      const reportResultAfterReapExhausted = () => {
+        if (reportedResultAfterReapExhausted || pgid === undefined) return;
+        reportedResultAfterReapExhausted = true;
+        opts.onResultCollectedAfterReapExhausted?.(pgid);
+      };
+      const collectResult = (code: number | null, sig: NodeJS.Signals | null) => {
+        if (settled) return;
+        if (signal.aborted) {
+          const reason = signal.reason === "timeout" ? "timeout" : "stopped";
+          finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
+          return;
+        }
+        if (code !== 0) {
+          const tail = stderr.replace(/\s+/g, " ").trim().slice(-300);
+          finish({
+            kind: "failed",
+            reason: "exit",
+            detail: `launcher exited ${code ?? sig}${tail ? `: ${tail}` : ""}`,
+          });
+          return;
+        }
+        if (reapExhausted) reportResultAfterReapExhausted();
+        const result = parseMailTurnResult(stdout);
+        if (!result) {
+          finish({ kind: "failed", reason: "no-result", detail: "launcher wrote no result line" });
+          return;
+        }
+        finish(
+          result.outcome === "final" ? { kind: "final", text: result.text } : { kind: "silent" },
+        );
+      };
+      const boundResultCollectionAfterReapExhausted = () => {
+        if (settled || !reapExhausted || !launcherExit || resultWait) return;
+        const exit = launcherExit;
+        resultWait = setTimeout(() => {
+          resultWait = undefined;
+          if (settled) return;
+          if (pgid !== undefined) opts.onResultWaitExpired?.(pgid);
+          collectResult(exit.code, exit.signal);
+          // An unkillable group member may retain the write ends indefinitely.
+          // We have consumed the bytes available at the bound; close our ends.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }, RESULT_AFTER_REAP_EXHAUSTED_WAIT_MS);
       };
       let reaping = false;
       const reap = () => {
@@ -218,7 +281,9 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
           }
           if (elapsed >= grace + reapLimit) {
             clearInterval(tick);
+            reapExhausted = true;
             opts.onReapExhausted?.(pgid);
+            boundResultCollectionAfterReapExhausted();
           }
         }, 50);
       };
@@ -227,11 +292,12 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
       if (signal.aborted) onAbort();
       // Cleanup starts when the LEADER exits — not on `close`, which waits for
       // every inherited pipe (see the note above).
-      child.on("exit", () => reap());
+      child.on("exit", (code, sig) => {
+        launcherExit = { code, signal: sig };
+        reap();
+        boundResultCollectionAfterReapExhausted();
+      });
 
-      let stdout = "";
-      let stdoutBytes = 0;
-      let stderr = "";
       child.stdout?.on("data", (chunk: Buffer) => {
         stdoutBytes += chunk.length;
         if (stdoutBytes <= TURN_STDOUT_MAX_BYTES) stdout += chunk.toString("utf8");
@@ -247,29 +313,9 @@ export function launcherTurnRunner(opts: LauncherTurnRunnerOptions): TurnRunner 
         });
       });
       child.on("close", (code, sig) => {
-        // Result collection only: the reaping started on `exit`.
-        if (signal.aborted) {
-          const reason = signal.reason === "timeout" ? "timeout" : "stopped";
-          finish({ kind: "failed", reason, detail: `launcher killed (${reason})` });
-          return;
-        }
-        if (code !== 0) {
-          const tail = stderr.replace(/\s+/g, " ").trim().slice(-300);
-          finish({
-            kind: "failed",
-            reason: "exit",
-            detail: `launcher exited ${code ?? sig}${tail ? `: ${tail}` : ""}`,
-          });
-          return;
-        }
-        const result = parseMailTurnResult(stdout);
-        if (!result) {
-          finish({ kind: "failed", reason: "no-result", detail: "launcher wrote no result line" });
-          return;
-        }
-        finish(
-          result.outcome === "final" ? { kind: "final", text: result.text } : { kind: "silent" },
-        );
+        // Normal result collection. If the reap exhausted first, this shares
+        // the same parser and outcome rules as the bounded fallback above.
+        collectResult(code, sig);
       });
       child.stdin?.on("error", () => {});
       child.stdin?.end(serializeMailTurnInput(input), "utf8");
@@ -328,7 +374,10 @@ export interface MailConsumerOptions {
   lockHooks?: { afterStaleCheck?: () => void };
   lockWaitMs?: number;
   // Seams (tests): options for the DEFAULT launcher runner.
-  turnRunner?: Pick<LauncherTurnRunnerOptions, "killGraceMs" | "reapLimitMs" | "groupOps">;
+  turnRunner?: Pick<
+    LauncherTurnRunnerOptions,
+    "killGraceMs" | "reapLimitMs" | "groupOps" | "onResultWaitExpired"
+  >;
 }
 
 export interface MailConsumerStats {
@@ -360,6 +409,9 @@ export interface MailConsumerStats {
   // A turn's process group that still had members after SIGKILL and the reap
   // limit: cleanup gave up (logged with the group id).
   reapExhausted: number;
+  // Result collection ended after the launcher exited and its process-group
+  // reap exhausted (logged with the group id).
+  resultCollectedAfterReapExhausted: number;
 }
 
 // Why a mail is held for manual inspection.
@@ -389,6 +441,7 @@ function emptyStats(): MailConsumerStats {
     markerReadFailed: 0,
     held: Object.fromEntries(HOLD_REASONS.map((r) => [r, 0])) as Record<HoldReason, number>,
     reapExhausted: 0,
+    resultCollectedAfterReapExhausted: 0,
   };
 }
 
@@ -641,6 +694,14 @@ export class MailConsumer {
           this.persistStats();
           this.log(
             `tps-mail: a mail turn's process group ${pgid} still has members after SIGKILL and the reap limit; cleanup gave up (a member may be unkillable or owned by another user)`,
+          );
+        },
+        onResultCollectedAfterReapExhausted: (pgid) => {
+          this.stats.resultCollectedAfterReapExhausted += 1;
+          // Like reap exhaustion, this can happen after stop()'s final write.
+          this.persistStats();
+          this.log(
+            `tps-mail: mail turn result collection for process group ${pgid} ended after reap exhaustion; using the launcher output bytes already read`,
           );
         },
       });
