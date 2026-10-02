@@ -20,6 +20,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -37,6 +38,29 @@ function run(tool: unknown, input: unknown): Promise<unknown> {
 function resultText(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> }).content ?? [];
   return content.map((block) => block.text ?? "").join("\n");
+}
+
+// Hold the first replace_lines read after taking its snapshot. If the queue is
+// bypassed, a concurrent call can finish against that stale snapshot.
+function holdFirstReplaceRead() {
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => (enter = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let reads = 0;
+  const read = async (path: string): Promise<string> => {
+    const text = await readFile(path, "utf-8");
+    if (++reads === 1) {
+      enter();
+      await gate;
+    }
+    return text;
+  };
+  return { read, entered, release };
+}
+
+async function allowConcurrentCallToRun(call: Promise<unknown>): Promise<void> {
+  await Promise.race([call.then(() => undefined), new Promise<void>((r) => setTimeout(r, 30))]);
 }
 
 describe("createTolerantEditToolDefinition", () => {
@@ -267,6 +291,62 @@ describe("createReplaceLinesToolDefinition", () => {
     const result = await run(tool, { path: "f.ts", startLine: 2, endLine: 2, newText: "L2" });
     expect(readFileSync(join(cwd, "f.ts"), "utf8")).toBe("l1\nL2\nl3\n");
     expect(resultText(result)).toContain("Replaced lines 2-2");
+  });
+
+  it("preserves the selected line's CRLF terminator", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\r\nb\r\nc\r\n");
+    await run(createReplaceLinesToolDefinition(cwd), {
+      path: "f.ts",
+      startLine: 2,
+      endLine: 2,
+      newText: "X",
+    });
+    expect(readFileSync(file, "utf8")).toBe("a\r\nX\r\nc\r\n");
+  });
+
+  it("preserves the selected line's CR-only terminator", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\rb\rc\r");
+    await run(createReplaceLinesToolDefinition(cwd), {
+      path: "f.ts",
+      startLine: 2,
+      endLine: 2,
+      newText: "X",
+    });
+    expect(readFileSync(file, "utf8")).toBe("a\rX\rc\r");
+  });
+
+  it("serialises two replacements of different lines in the same file", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\nb\nc\n");
+    const held = holdFirstReplaceRead();
+    const tool = createReplaceLinesToolDefinition(cwd, held.read);
+    const first = run(tool, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
+    await held.entered;
+    const second = run(tool, { path: "f.ts", startLine: 3, endLine: 3, newText: "C" });
+    await allowConcurrentCallToRun(second);
+    held.release();
+    await Promise.all([first, second]);
+    expect(readFileSync(file, "utf8")).toBe("A\nb\nC\n");
+  });
+
+  it("serialises replace_lines with pi's edit on the same file", async () => {
+    const file = join(cwd, "f.ts");
+    writeFileSync(file, "a\nb\nc\n");
+    const held = holdFirstReplaceRead();
+    const replace = createReplaceLinesToolDefinition(cwd, held.read);
+    const edit = createTolerantEditToolDefinition(cwd);
+    const first = run(replace, { path: "f.ts", startLine: 1, endLine: 1, newText: "A" });
+    await held.entered;
+    const second = run(edit, {
+      path: "f.ts",
+      edits: [{ oldText: "c", newText: "C" }],
+    });
+    await allowConcurrentCallToRun(second);
+    held.release();
+    await Promise.all([first, second]);
+    expect(readFileSync(file, "utf8")).toBe("A\nb\nC\n");
   });
 
   it("deletes a range when newText is empty", async () => {

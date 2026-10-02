@@ -20,8 +20,9 @@
 //   * `replace_lines` — replace an inclusive 1-based line range without
 //                     reproducing the old lines. It reads the file, validates
 //                     the range against that content, then writes the range back
-//                     directly — the LINE NUMBERS decide the range, so a range
-//                     containing a line repeated elsewhere still lands.
+//                     inside pi's per-file mutation queue — the LINE NUMBERS
+//                     decide the range, so a range containing a line repeated
+//                     elsewhere still lands.
 //
 // Neither tool invents a sandbox. The tolerant `edit` resolves and writes
 // through pi's edit tool exactly as pi does (pi resolves absolute paths as
@@ -35,6 +36,7 @@ import {
   createEditToolDefinition,
   type EditOperations,
   type ToolDefinition,
+  withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { checkWriteTarget } from "./confined-read.js";
@@ -159,23 +161,24 @@ export function createTolerantEditToolDefinition(
   } as unknown as ToolDefinition;
 }
 
-// 1-based inclusive line spans, each including its own line terminator.
+// 1-based inclusive line spans, each including its own CRLF, LF, or CR terminator.
 function lineSpans(content: string): Array<{ start: number; end: number }> {
   const spans: Array<{ start: number; end: number }> = [];
   let start = 0;
-  while (start < content.length) {
-    const newline = content.indexOf("\n", start);
-    if (newline === -1) {
-      spans.push({ start, end: content.length });
-      break;
-    }
-    spans.push({ start, end: newline + 1 });
-    start = newline + 1;
+  for (const match of content.matchAll(/\r\n|\r|\n/g)) {
+    const end = match.index + match[0].length;
+    spans.push({ start, end });
+    start = end;
   }
+  if (start < content.length) spans.push({ start, end: content.length });
   return spans;
 }
 
-export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
+export function createReplaceLinesToolDefinition(
+  cwd: string,
+  read: (absolutePath: string) => Promise<string> = (absolutePath) =>
+    readFile(absolutePath, "utf-8"),
+): ToolDefinition {
   return {
     name: "replace_lines",
     label: "replace_lines",
@@ -211,38 +214,47 @@ export function createReplaceLinesToolDefinition(cwd: string): ToolDefinition {
       // path inside the root is accepted.
       const requested = isAbsolute(path) ? path : resolve(cwd, path);
       const target = checkWriteTarget(requested, cwd);
-      // Read the file's real content, then validate the range against it — no
-      // write happens before this check.
-      let text: string;
-      try {
-        text = await readFile(target, "utf-8");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`replace_lines: could not read ${path}: ${message}`);
-      }
-      const spans = lineSpans(text);
-      if (startLine > endLine) {
-        throw new Error(
-          `replace_lines: inverted range in ${path}: startLine ${startLine} > endLine ${endLine}.`,
-        );
-      }
-      if (startLine < 1 || endLine > spans.length) {
-        throw new Error(
-          `replace_lines: out-of-range in ${path}: lines ${startLine}-${endLine}, but the file has ${spans.length} line(s).`,
-        );
-      }
-      const from = spans[startLine - 1].start;
-      const to = spans[endLine - 1].end;
-      const oldText = text.slice(from, to);
-      // Preserve the range's own trailing newline when the replacement omits one.
-      const replacement =
-        newText !== "" && oldText.endsWith("\n") && !newText.endsWith("\n")
-          ? `${newText}\n`
-          : newText;
-      await writeFile(target, text.slice(0, from) + replacement + text.slice(to), "utf-8");
-      return {
-        content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
-      };
+      // Share pi's queue with edit/write. The read, range check, and write must
+      // all see the same turn's preceding mutations before the next one starts.
+      return withFileMutationQueue(target, async () => {
+        let text: string;
+        try {
+          text = await read(target);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`replace_lines: could not read ${path}: ${message}`);
+        }
+        const spans = lineSpans(text);
+        if (startLine > endLine) {
+          throw new Error(
+            `replace_lines: inverted range in ${path}: startLine ${startLine} > endLine ${endLine}.`,
+          );
+        }
+        if (startLine < 1 || endLine > spans.length) {
+          throw new Error(
+            `replace_lines: out-of-range in ${path}: lines ${startLine}-${endLine}, but the file has ${spans.length} line(s).`,
+          );
+        }
+        const from = spans[startLine - 1].start;
+        const to = spans[endLine - 1].end;
+        const oldText = text.slice(from, to);
+        // Keep the selected line's terminator when newText has none.
+        const terminator = oldText.endsWith("\r\n")
+          ? "\r\n"
+          : oldText.endsWith("\n")
+            ? "\n"
+            : oldText.endsWith("\r")
+              ? "\r"
+              : "";
+        const replacement =
+          newText !== "" && terminator && !/[\r\n]$/.test(newText)
+            ? `${newText}${terminator}`
+            : newText;
+        await writeFile(target, text.slice(0, from) + replacement + text.slice(to), "utf-8");
+        return {
+          content: [{ type: "text", text: `Replaced lines ${startLine}-${endLine} in ${path}.` }],
+        };
+      });
     },
   } as unknown as ToolDefinition;
 }
