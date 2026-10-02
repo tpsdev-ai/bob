@@ -16,7 +16,7 @@ It registers four tools through `pi.registerTool`:
 | `run` | `command`, `cwd?`, `timeout_s?`, `background?` | runs `bash -c command`; waits for the outcome, or with `background: true` returns a `run_id` at once |
 | `run_status` | `run_id?` | one job's state, outcome, cleanup and output excerpt; with no `run_id`, every job this run owns |
 | `run_cancel` | `run_id` | cancels one of this run's jobs by its recorded process group |
-| `apply_patch` | `patch_artifact: { path, sha256 }`, `expected_base` | applies a patch artifact under the task's artifact root to a fresh tool-owned index built from the task's pinned base and stores the resulting candidate (see below) |
+| `apply_patch` | `patch_artifact: { path, sha256 }`, `expected_base` | applies a patch artifact under the task's artifact root to a fresh tool-owned index built from the task's pinned base and attempts candidate storage (see below) |
 
 `cwd` is relative to the workspace, or an absolute path inside it; omitted, the
 command starts in the workspace. It must be an existing directory, and after
@@ -80,8 +80,7 @@ command could start in it. That is the safe direction; make it readable
 ## apply_patch and the task binding (bob#275, S2a)
 
 `apply_patch` builds a candidate tree from a patch artifact under the task's
-artifact root; this slice stores the candidate for the checks and the
-publication that a later slice adds (S2b).
+artifact root; candidate checks and publication follow in S2b.
 
 **The task binding.** A task binding is the launcher's authority over a builder
 session: the task and publication identities, the repository and workspace, the
@@ -117,10 +116,11 @@ nothing does (`patch_does_not_apply`).
 `apply_failed`, `storage_failed`. A refusal returns no candidate.
 
 **Success** returns `{ candidate_id, base_oid, patch_sha256, tree_oid,
-changed_paths }`. The candidate is stored under the tool-owned state root
-(`<state dir>/candidates/<candidate_id>.json`) with its task and repository
-association, and its Git objects are written into the repository for a later
-publication. **A candidate id is not permission to publish it.**
+changed_paths }`. Storage targets `<state dir>/candidates/<candidate_id>.json`.
+The tool refuses detected changes to the staging directory, source or destination.
+A concurrent same-user writer can still race rename until builder confinement
+(bob#189); pathname checks cannot close that race.
+**A candidate id is not permission to publish it.**
 
 `apply_patch` builds a candidate; it writes no file the model names and runs no
 command the model writes, so its `TOOL_EFFECTS` row is `writer` and a resident

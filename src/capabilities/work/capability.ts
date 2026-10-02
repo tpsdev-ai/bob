@@ -98,7 +98,7 @@ const CANCEL_DESCRIPTION =
   "Limits: process-group backend, same user, not a sandbox; a descendant that left the job's group may survive.";
 
 const APPLY_PATCH_DESCRIPTION =
-  "Apply a patch artifact under the task's artifact root to a fresh, tool-owned index built from the task's pinned base, and store the resulting candidate. " +
+  "Apply a patch artifact under the task's artifact root to a fresh, tool-owned index built from the task's pinned base, and attempt candidate storage. " +
   "Takes patch_artifact { path, sha256 } (a patch file under the task's artifact root) and expected_base (the task's pinned base commit object ID). " +
   "The artifact is read once, its sha256 verified, and those verified bytes applied with git apply. " +
   "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +
@@ -107,7 +107,8 @@ const APPLY_PATCH_DESCRIPTION =
 
 function applyPatchSuccessText(r: ApplyPatchSuccess): string {
   return [
-    `apply_patch: candidate ${r.candidate_id} stored`,
+    `apply_patch: candidate ${r.candidate_id}`,
+    "Refuses detected changes to the staging directory, source or destination; a concurrent same-user writer can still race rename until builder confinement (bob#189).",
     `base_oid: ${r.base_oid}`,
     `patch_sha256: ${r.patch_sha256}`,
     `tree_oid: ${r.tree_oid}`,

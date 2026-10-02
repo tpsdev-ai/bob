@@ -265,7 +265,7 @@ describe("apply_patch — success shapes yield the expected tree", () => {
     expect(snapshot(fx.repo)).toEqual(before);
   });
 
-  it("concurrent calls use independent indexes and both succeed", async () => {
+  it("successive calls produce distinct candidates", async () => {
     const fx = makeFixture();
     const one = patchFrom(fx, (r) => writeFileSync(join(r, "one.txt"), "1\n"));
     // `patchFrom` resets to base, so build the second patch from the same base.
@@ -274,16 +274,14 @@ describe("apply_patch — success shapes yield the expected tree", () => {
     writeArtifact(fx, "two.patch", two.patch);
     const before = snapshot(fx.repo);
     const w = wire(binding(fx));
-    const [r1, r2] = await Promise.all([
-      w.apply({
-        patch_artifact: { path: "one.patch", sha256: sha256(one.patch) },
-        expected_base: fx.base,
-      }),
-      w.apply({
-        patch_artifact: { path: "two.patch", sha256: sha256(two.patch) },
-        expected_base: fx.base,
-      }),
-    ]);
+    const r1 = await w.apply({
+      patch_artifact: { path: "one.patch", sha256: sha256(one.patch) },
+      expected_base: fx.base,
+    });
+    const r2 = await w.apply({
+      patch_artifact: { path: "two.patch", sha256: sha256(two.patch) },
+      expected_base: fx.base,
+    });
     w.manager.endRunSync();
     expect(r1.details.tree_oid).toBe(one.tree);
     expect(r2.details.tree_oid).toBe(two.tree);
@@ -805,11 +803,11 @@ describe("apply_patch — a fake git runner proves the caller's index is never u
     writeArtifact(fx, "p.patch", patch);
     const before = snapshot(fx.repo);
 
-    const calls: GitInvocation[] = [];
+    const calls: { args: string[]; inv: GitInvocation }[] = [];
     const w = wire(binding(fx), {
       deps: {
         git: (args: string[], inv: GitInvocation): GitResult => {
-          calls.push(inv);
+          calls.push({ args, inv });
           const env: NodeJS.ProcessEnv = { ...gitEnv() };
           if (inv.indexFile !== undefined) env.GIT_INDEX_FILE = inv.indexFile;
           const r = spawnSync("git", args, {
@@ -834,12 +832,14 @@ describe("apply_patch — a fake git runner proves the caller's index is never u
     w.manager.endRunSync();
 
     expect(out.details.tree_oid).toBe(tree);
-    // Every call that touches the index named a fresh index file under the state
-    // root, never the repo's .git/index.
-    for (const inv of calls) {
-      if (inv.indexFile !== undefined) expect(inv.indexFile).toContain(join(scratch, "state"));
+    const indexCalls = calls.filter(({ args }) =>
+      ["read-tree", "apply", "write-tree"].includes(args[0]),
+    );
+    expect(indexCalls.map(({ args }) => args[0])).toEqual(["read-tree", "apply", "write-tree"]);
+    for (const { inv } of indexCalls) {
+      expect(inv.indexFile).toContain(join(scratch, "state"));
+      expect(inv.indexFile).not.toBe(join(fx.repo, ".git", "index"));
     }
-    expect(calls.some((c) => c.indexFile !== undefined)).toBe(true);
     expect(snapshot(fx.repo)).toEqual(before);
   });
 });

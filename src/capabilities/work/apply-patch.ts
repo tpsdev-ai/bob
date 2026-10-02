@@ -38,8 +38,9 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import { ensurePrivateDir, isInside } from "./run.js";
 import type { TaskBinding } from "./task-binding.js";
 
-// The stable refusal reasons. Unknown evidence is never read as success: every
-// failure that cannot establish a fact refuses.
+// Refuses detected changes to the staging directory, source or destination.
+// A concurrent same-user writer can still race rename until builder confinement
+// (bob#189); pathname checks cannot close that race.
 export type ApplyRefusalReason =
   | "unknown_task" // the session holds no task binding
   | "invalid_binding" // the binding is present but malformed
@@ -130,12 +131,14 @@ function sha256hex(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-// Apply the safe git environment: no operator global/system config, and no
-// automatic maintenance or gc behind the call (the same posture overrides.ts
-// takes for its own git calls).
+// Allow only the launcher paths and fixed Git settings.
 function runGit(args: string[], inv: GitInvocation): GitResult {
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    LANG: "C",
+    LC_ALL: "C",
+    GIT_OPTIONAL_LOCKS: "0",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
   };

@@ -30,17 +30,13 @@ export interface TaskBinding {
   // The publication's identity. Distinct from the task: one task may publish
   // more than once.
   publication_id: string;
-  // The git repository the base is read from and the candidate's objects are
-  // written to. Absolute.
   repository: string;
-  // The agent's workspace. Absolute.
   workspace: string;
   // The full Git commit object ID the candidate is built on.
   base_oid: string;
   // build: the builder may produce the patch artifact. apply: only the
   // authorized artifact, unchanged.
   mode: TaskMode;
-  // The directory the patch artifact must lie under. Absolute.
   artifact_root: string;
   // The paths the task authorizes changing. Read by publication (S2b), not by
   // apply_patch, which never selects paths.

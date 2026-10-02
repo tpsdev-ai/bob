@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -82,6 +83,8 @@ function setup() {
     dir,
     stateRoot,
     tree,
+    binding,
+    digest,
     recordPath: candidateRecordPath(stateRoot, id),
     assertUntouched: () => expect(checkout()).toEqual(before),
     apply: (deps: ApplyPatchDeps = {}) =>
@@ -207,6 +210,7 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
   it("stores a complete owner-only record from a private staging directory", () => {
     const fx = setup();
     const out = fx.apply({
+      now: () => new Date("2026-01-01T00:00:00.000Z"),
       writeCandidateRecord: (fd, data) => {
         const stages = readdirSync(fx.dir);
         expect(stages).toHaveLength(1);
@@ -219,7 +223,20 @@ describe("candidate storage with stubbed git and real filesystem operations", ()
       },
     });
     expect(out.ok).toBe(true);
-    expect(JSON.parse(readFileSync(fx.recordPath, "utf8")).tree_oid).toBe(fx.tree);
+    expect(JSON.parse(readFileSync(fx.recordPath, "utf8"))).toEqual({
+      candidate_id: out.ok ? out.candidate_id : "",
+      task_id: fx.binding.task_id,
+      publication_id: fx.binding.publication_id,
+      repository: fx.repo,
+      workspace: fx.binding.workspace,
+      base_oid: fx.binding.base_oid,
+      tree_oid: fx.tree,
+      patch_sha256: fx.digest,
+      mode: fx.binding.mode,
+      artifact_path: realpathSync(join(fx.binding.artifact_root, "p.patch")),
+      changed_paths: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
     expect(lstatSync(fx.recordPath).mode & 0o777).toBe(0o600);
     expect(readdirSync(fx.dir)).toHaveLength(1);
     fx.assertUntouched();
