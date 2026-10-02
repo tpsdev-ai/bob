@@ -235,9 +235,9 @@ const EXPLICIT_KEYLESS_PROVIDERS = new Set(["ollama-newton", "omlx"]);
 /**
  * bob#141: a `provider.base_url` override is allowed ONLY for a keyless local
  * provider — one that ignores its key (a home-lab Ollama, `ollama-newton`,
- *`omlx`). For any provider that carries an API key, the URL is REFUSED: a key
- * must never be sent to an endpoint bob.yaml can redirect. Returns the refusal
- * reason, or undefined when the override is allowed.
+ * `omlx`). For every other provider the URL is REFUSED: a key must never be
+ * sent to an endpoint bob.yaml can redirect. Returns the refusal reason, or
+ * undefined when the override is allowed.
  *
  * `ollama` is local only when the host is not `ollama.com` — that host is the
  * keyed cloud provider.
@@ -259,7 +259,7 @@ export function providerBaseUrlRefusal(provider: string, baseUrl: string): strin
   if (provider === "ollama" && parsed.hostname !== "ollama.com") return undefined;
   return (
     `provider.base_url is only allowed for a keyless local provider (ollama on a non-ollama.com host, ` +
-    `ollama-newton, omlx) — ${provider} carries an API key, and a key must not be sent to a URL bob.yaml can redirect.`
+    `ollama-newton, omlx) — "${provider}" is not one, and a key must not be sent to a URL bob.yaml can redirect.`
   );
 }
 
