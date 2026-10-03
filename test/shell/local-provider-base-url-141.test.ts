@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -192,10 +195,15 @@ describe("provider.base_url containment", () => {
     if (mode === "missing") unlinkSync(path);
     else chmodSync(path, mode);
     applyModelScaffold("newton", tmpRoot);
-    expect(lstatSync(path).mode & 0o777).toBe(mode === "missing" ? 0o600 : mode);
-    expect(JSON.parse(readFileSync(path, "utf8")).providers.ollama.models[0].id).toBe(
-      "qwen3.8:27b-mxfp8",
-    );
+    const fd = openSync(path, "r");
+    try {
+      expect(fstatSync(fd).mode & 0o777).toBe(mode === "missing" ? 0o600 : mode);
+      expect(JSON.parse(readFileSync(fd, "utf8")).providers.ollama.models[0].id).toBe(
+        "qwen3.8:27b-mxfp8",
+      );
+    } finally {
+      closeSync(fd);
+    }
   });
 
   it.each([
