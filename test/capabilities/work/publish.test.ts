@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   fstatSync,
   fsyncSync,
@@ -833,7 +834,7 @@ describe("publish — the remote decides", () => {
     expect(remoteOid(fx)).toBe(fx.base);
   });
 
-  it("an abort while a check runs stops waiting for it and never pushes", async () => {
+  it("an abort while a check runs waits for the cancelled check to settle, then removes the checkout and the lock", async () => {
     const fx = makeFixture();
     seedRemote(fx);
     const b = binding(fx, { check_commands: ["sleep 60"] });
@@ -842,6 +843,7 @@ describe("publish — the remote decides", () => {
     );
     const ac = new AbortController();
     let runnerSignal: AbortSignal | undefined;
+    let settled = false;
     const out = await publish({
       binding: b,
       params: params(fx, built),
@@ -849,19 +851,131 @@ describe("publish — the remote decides", () => {
       signal: ac.signal,
       deps: {
         git: realGit,
-        // A check that never settles on its own.
+        // A check that settles 200 ms after the abort cancels it.
         runCheck: (_command, _cwd, signal) => {
           runnerSignal = signal;
           setTimeout(() => ac.abort(), 10);
-          return new Promise<CheckReport>(() => {});
+          return new Promise<CheckReport>((resolve) => {
+            signal?.addEventListener("abort", () =>
+              setTimeout(() => {
+                settled = true;
+                resolve({
+                  outcome: "cancelled",
+                  exit_code: null,
+                  cleanup_state: "group_killed",
+                  output_complete: true,
+                });
+              }, 200),
+            );
+          });
         },
       },
     });
     expect(runnerSignal).toBe(ac.signal);
+    expect(settled).toBe(true);
     expect(out.status).toBe("refused");
     expect(out.reason).toBe("aborted");
-    expect(out.message).toContain("aborted");
+    expect(readdirSync(fx.stateRoot).filter((n) => n.startsWith("publish-checkout-"))).toEqual([]);
     expect(remoteOid(fx)).toBe(fx.base);
+    const retry = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      deps: { git: realGit, runCheck: okCheck },
+    });
+    expect(retry.status).toBe("published");
+  });
+
+  it("a cancelled check that does not settle in time keeps the lock, so a retry is refused as publication_locked", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["sleep 60"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const ac = new AbortController();
+    let settle!: () => void;
+    const out = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      signal: ac.signal,
+      deps: {
+        git: realGit,
+        checkSettleMs: 50,
+        runCheck: () => {
+          setTimeout(() => ac.abort(), 10);
+          return new Promise<CheckReport>((resolve) => {
+            settle = () =>
+              resolve({
+                outcome: "cancelled",
+                exit_code: null,
+                cleanup_state: "group_killed",
+                output_complete: true,
+              });
+          });
+        },
+      },
+    });
+    expect(out.reason).toBe("aborted");
+    expect(out.message).toContain("publication_locked");
+    let checks = 0;
+    const retry = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      deps: {
+        git: realGit,
+        runCheck: (...a) => {
+          checks++;
+          return okCheck(...a);
+        },
+      },
+    });
+    expect(retry.reason).toBe("publication_locked");
+    expect(checks).toBe(0);
+    settle();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(readdirSync(fx.stateRoot).filter((n) => n.startsWith("publish-checkout-"))).toEqual([]);
+    const after = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      deps: { git: realGit, runCheck: okCheck },
+    });
+    expect(after.status).toBe("published");
+  });
+
+  it("a checkout that cannot be removed is reported in the result", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["true"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    let stuck = "";
+    try {
+      const out = await publish({
+        binding: b,
+        params: params(fx, built),
+        stateRoot: fx.stateRoot,
+        deps: {
+          git: realGit,
+          runCheck: async (command, cwd) => {
+            stuck = join(cwd, ".stuck");
+            mkdirSync(stuck);
+            writeFileSync(join(stuck, "f"), "");
+            chmodSync(stuck, 0o500);
+            return okCheck(command, cwd);
+          },
+        },
+      });
+      expect(out.status).toBe("published");
+      expect(out.detail?.checkout_left).toBe(join(stuck, ".."));
+      expect(out.detail?.checkout_remove_error).toBe("EACCES");
+    } finally {
+      if (stuck !== "") chmodSync(stuck, 0o700);
+    }
   });
 });
 

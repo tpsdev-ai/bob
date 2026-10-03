@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type WorkPiLike, wireWork } from "../../../src/capabilities/work/capability.js";
@@ -62,7 +62,12 @@ interface Tools {
   stateRoot: string;
 }
 
-function wireTools(b: TaskBinding | undefined, stateRoot: string, publishDeps?: unknown): Tools {
+function wireTools(
+  b: TaskBinding | undefined,
+  stateRoot: string,
+  publishDeps?: unknown,
+  maxLiveJobs?: number,
+): Tools {
   const tools: Record<string, { execute: (id: string, p: unknown) => Promise<ToolOut> }> = {};
   const fake: WorkPiLike = {
     registerTool(tool) {
@@ -75,6 +80,7 @@ function wireTools(b: TaskBinding | undefined, stateRoot: string, publishDeps?: 
     pi: fake,
     stateRoot,
     log: () => {},
+    ...(maxLiveJobs !== undefined ? { maxLiveJobs } : {}),
     ...(b !== undefined ? { taskBinding: b } : {}),
     ...(publishDeps !== undefined ? { publishDeps: publishDeps as never } : {}),
   });
@@ -409,6 +415,85 @@ describe("publish end to end — interrupted push, then recovery", () => {
       const [job] = t.manager.list();
       await job.done;
       expect(t.manager.report(job).outcome).toBe("cancelled");
+    } finally {
+      t.manager.endRunSync();
+    }
+  });
+
+  it("an aborted publish returns after the cancelled check has exited, and an immediate retry runs its check", async () => {
+    const repo = join(scratch, "repo");
+    const bare = join(scratch, "remote.git");
+    const artifactRoot = join(scratch, "artifacts");
+    const stateRoot = join(scratch, "state");
+    const go = join(scratch, "go");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    mkdirSync(artifactRoot, { recursive: true });
+    git(["init", "-q"], repo);
+    writeFileSync(join(repo, "src", "widget.ts"), "export const widget = 1;\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-qm", "base"], repo);
+    const base = git(["rev-parse", "HEAD"], repo);
+    git(["init", "-q", "--bare", bare], scratch);
+    git(["push", bare, "HEAD:refs/heads/main"], repo);
+
+    writeFileSync(join(repo, "src", "widget.ts"), "export const widget = 2;\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-qm", "change"], repo);
+    const diff = spawnSync("git", ["diff", "--binary", "-M", "-C", base, "HEAD"], {
+      cwd: repo,
+      env: gitEnv(),
+      encoding: "buffer",
+    });
+    const patch = Buffer.from(diff.stdout);
+    git(["reset", "--hard", "-q", base], repo);
+    writeFileSync(join(artifactRoot, "p.patch"), patch);
+
+    const binding: TaskBinding = {
+      task_id: "task-1",
+      publication_id: "pub-e2e-abort-retry",
+      repository: repo,
+      workspace: repo,
+      base_oid: base,
+      mode: "build",
+      artifact_root: artifactRoot,
+      declared_paths: ["src/widget.ts"],
+      check_commands: [`test -f '${go}' || sleep 60`],
+      destination: { remote: bare, ref: "refs/heads/main", create: true },
+    };
+
+    const t = wireTools(binding, stateRoot, undefined, 1);
+    try {
+      const applied = await t.apply_patch.execute("apply", {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: base,
+      });
+      const ac = new AbortController();
+      const started = setInterval(() => {
+        if (t.manager.list().length > 0) {
+          clearInterval(started);
+          ac.abort();
+        }
+      }, 10);
+      const out = await t.publish.execute(
+        "publish",
+        { candidate_id: applied.details.candidate_id, commit_message: "aborted" },
+        ac.signal,
+      );
+      clearInterval(started);
+      expect(out.details.reason).toBe("aborted");
+      // The check process has exited before publish returned.
+      const [job] = t.manager.list();
+      expect(job.phase).toBe("finished");
+      expect(t.manager.report(job).outcome).toBe("cancelled");
+      expect(readdirSync(stateRoot).filter((n) => n.startsWith("publish-checkout-"))).toEqual([]);
+
+      writeFileSync(go, "");
+      const retry = await t.publish.execute("retry", {
+        candidate_id: applied.details.candidate_id,
+        commit_message: "aborted",
+      });
+      expect(retry.details.reason).toBeUndefined();
+      expect(retry.details.status).toBe("published");
     } finally {
       t.manager.endRunSync();
     }

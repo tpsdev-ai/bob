@@ -16,10 +16,13 @@ import {
 import { isAbsolute, join, resolve } from "node:path";
 import type { GitInvocation, GitResult, GitRunner } from "./apply-patch.js";
 import { type CandidateRecord, candidateIdentity, candidateRecordPath } from "./apply-patch.js";
-import { ensurePrivateDir, isInside } from "./run.js";
+import { DRAIN_GRACE_MS, ensurePrivateDir, isInside, KILL_GRACE_MS, REAP_LIMIT_MS } from "./run.js";
 import { PUBLICATION_ID, parseTaskBinding, type TaskBinding } from "./task-binding.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
+
+// Longer than a cancel's SIGTERM grace, SIGKILL reap limit and output drain.
+const CHECK_SETTLE_MS = KILL_GRACE_MS + REAP_LIMIT_MS + DRAIN_GRACE_MS + 4000;
 
 export type PublishStatus = "published" | "refused" | "indeterminate";
 
@@ -82,6 +85,8 @@ export interface PublishDeps {
   git?: GitRunner;
   // Seam: the S1 executor. Production runs the command through JobManager.
   runCheck?: CheckRunner;
+  // How long an aborted publish waits for the cancelled check to settle.
+  checkSettleMs?: number;
   now?: () => Date;
   // Test seams. `writeJournal`/`readJournal` default to an owner-only atomic
   // write/read under the state root.
@@ -577,6 +582,39 @@ function untilAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<
   });
 }
 
+// True once `p` settles, false if `ms` passes first.
+async function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<boolean>((r) => {
+    timer = setTimeout(() => r(false), ms);
+  });
+  const settled = p.then(
+    () => true,
+    () => true,
+  );
+  try {
+    return await Promise.race([settled, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function removeTree(dir: string): string | null {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return null;
+  } catch (err) {
+    return errCode(err);
+  }
+}
+
+// What outlives publishUnderLock: a checkout that could not be removed, and a
+// cancelled check that had not settled, which keeps the lock until it does.
+interface LockExit {
+  checkoutLeft: { path: string; error: string } | null;
+  holdUntil: Promise<void> | null;
+}
+
 export async function publish(input: PublishInput): Promise<PublishResult> {
   const deps = input.deps ?? {};
   const git = deps.git ?? runGit;
@@ -730,10 +768,21 @@ async function publishLocked(
       `publish refused: publication lock could not be acquired (${errCode(err)}).`,
     );
   }
+  const exit: LockExit = { checkoutLeft: null, holdUntil: null };
   try {
-    return await publishUnderLock(input, git, deps);
+    const result = await publishUnderLock(input, git, deps, exit);
+    if (exit.checkoutLeft === null) return result;
+    return {
+      ...result,
+      detail: {
+        ...result.detail,
+        checkout_left: exit.checkoutLeft.path,
+        checkout_remove_error: exit.checkoutLeft.error,
+      },
+    };
   } finally {
-    rmSync(lock, { recursive: true });
+    if (exit.holdUntil === null) rmSync(lock, { recursive: true });
+    else void exit.holdUntil.then(() => removeTree(lock));
   }
 }
 
@@ -741,6 +790,7 @@ async function publishUnderLock(
   input: PublishInput,
   git: GitRunner,
   deps: PublishDeps,
+  exit: LockExit,
 ): Promise<PublishResult> {
   const binding = input.binding as TaskBinding;
   const stateRoot = input.stateRoot;
@@ -1039,8 +1089,10 @@ async function publishUnderLock(
       for (const command of binding.check_commands) {
         if (signal?.aborted) return abortedFail();
         let report: CheckReport | null;
+        let running: Promise<CheckReport> | undefined;
         try {
-          report = await untilAbort(deps.runCheck(command, dir, signal), signal);
+          running = deps.runCheck(command, dir, signal);
+          report = await untilAbort(running, signal);
         } catch (err) {
           results.push({ command, ok: false, reason: "check_failed" });
           journal.checks = results;
@@ -1053,7 +1105,22 @@ async function publishUnderLock(
             { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
           );
         }
-        if (report === null || signal?.aborted) return abortedFail();
+        if (report === null) {
+          const settleMs = deps.checkSettleMs ?? CHECK_SETTLE_MS;
+          if (!(await settlesWithin(running, settleMs))) {
+            exit.holdUntil = running.then(
+              () => {},
+              () => {},
+            );
+            return fail(
+              "aborted",
+              `publish refused: the publish tool call was aborted before the push, and the cancelled check ${JSON.stringify(command)} had not exited after ${settleMs} ms. The publication lock is held until it exits, so a retry is refused as publication_locked.`,
+              { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
+            );
+          }
+          return abortedFail();
+        }
+        if (signal?.aborted) return abortedFail();
         const after = materializedUnchanged(git, dir, treeOid);
         if (after !== "unchanged") {
           results.push({ command, ok: false, reason: "materialized_tree_changed" });
@@ -1093,10 +1160,13 @@ async function publishUnderLock(
       const checkedFail = persist();
       if (checkedFail !== null) return checkedFail;
     } finally {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // best effort; the checkout is under the tool state root
+      if (exit.holdUntil === null) {
+        const error = removeTree(dir);
+        if (error !== null) exit.checkoutLeft = { path: dir, error };
+      } else {
+        exit.holdUntil = exit.holdUntil.then(() => {
+          removeTree(dir);
+        });
       }
     }
   }
