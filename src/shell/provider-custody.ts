@@ -1,8 +1,7 @@
 // Provider custody: the code-owned names this module defines are the ONLY place
 // bob derives the operator keyed-row variable namespace. Nothing else in `src/`
-// may name it — a source-scanner test fails on any reference outside this file
-// (and the transport/custody code in session.ts), so the namespace cannot be
-// entered or copied from bob's own side by accident.
+// may name it — a source-scanner test fails on any reference outside this file,
+// so the namespace cannot be entered or copied from bob's own side by accident.
 //
 // Three code-owned tables live here:
 //
