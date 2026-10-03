@@ -760,6 +760,12 @@ describe("#145 — the contract survives the paths a resident agent takes", () =
         }
       });
       await runThreeTurns(handle.session);
+      // A compaction may land after the last turn's agent_end, when the run is
+      // complete. Drive one more turn so a request is genuinely made AFTER the
+      // compaction — the request whose system prompt proves the contract
+      // survives it (bob#179: the post-completion compaction no longer queues a
+      // note that would itself make such a request).
+      await handle.session.prompt("a turn after the compaction", { expandPromptTemplates: false });
       expect(
         compactions.length,
         "pi compacted inside the persistent runtime",

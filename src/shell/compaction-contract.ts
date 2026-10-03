@@ -16,13 +16,17 @@
 //     or not (`no_final_message`); a message that exists but misses a declared
 //     shape gets its own reason (`final_shape_mismatch`);
 //   * a BEST-EFFORT "what remains" note, injected once after each non-aborted
-//     compaction: the last thing the agent said, or a generated note about the
-//     worktree (git status --short, the last few tool calls). It is useful and
-//     it is NEVER load-bearing: it is a steer, its failure is logged and
-//     nothing else happens, and no exit code depends on it. (The machinery that
-//     existed only because the contract could be lost — the persistent attach,
-//     the admission gate, failClosed and its exit, the per-compaction failure
-//     records — is gone with the shape change.)
+//     compaction that interrupts a live run: the last thing the agent said, or a
+//     generated note about the worktree (git status --short, the last few tool
+//     calls). A compaction that lands after the agent ENDED with a final message
+//     is post-completion — the run's completion is already recorded — so it
+//     neither clears that final message nor sends the note (bob#179).
+//
+//     The note is useful and it is NEVER load-bearing: it is a steer, its failure
+//     is logged and nothing else happens, and no exit code depends on it. (The
+//     machinery that existed only because the contract could be lost — the
+//     persistent attach, the admission gate, failClosed and its exit, the
+//     per-compaction failure records — is gone with the shape change.)
 //
 // Everything here is pure/injectable so it is unit-testable without pi: the
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
@@ -306,7 +310,9 @@ export interface CompactionObserver {
  * Observe the session event stream: track the compaction count and the final
  * message boundary, capture "what remains" as it goes (the agent's last stated
  * plan and the last few tool calls), and — when an `inject` seam is given —
- * send ONE best-effort note after every non-aborted `compaction_end`.
+ * send ONE best-effort note after every non-aborted `compaction_end` that
+ * interrupts a live run (a compaction after the agent ended with a final
+ * message is post-completion and sends none).
  *
  * A failed note is LOGGED and nothing else happens. There is no verdict, no
  * refusal and no exit code attached to it: the contract it accompanies is in
@@ -326,6 +332,11 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
+  // Whether an `agent_end` has been observed since the boundary: the run has
+  // ended and nothing is running. Set by `agent_end`, cleared by `agent_start`
+  // and `startTurn()`. It is what lets a compaction that lands AFTER the agent
+  // ended be told apart from one that interrupts a live run (bob#179).
+  let agentEnded = false;
 
   const clearCapture = (): void => {
     finalMessage = "";
@@ -333,6 +344,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     lastEndFailed = false;
     lastEnding = undefined;
     deltaBuffer = "";
+    agentEnded = false;
   };
 
   const noteFor = (): string =>
@@ -358,10 +370,23 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
         case "compaction_end": {
           if (e.aborted) return; // an aborted compaction changed nothing to restore
           compactions += 1;
+          log(`bob: context compacted${e.reason ? ` (${e.reason})` : ""}`);
+          // A compaction that lands after the agent ended WITH a final message
+          // is POST-COMPLETION: the run's completion was already recorded, so
+          // this compaction neither invalidates that final message nor warrants
+          // the note. Nothing is cleared and nothing is sent; the run settles on
+          // the completion it already has (bob#179).
+          if (agentEnded && finalMessage.trim().length > 0) {
+            if (opts.inject !== undefined) {
+              log(
+                'bob: the agent had already ended with a final message — not sending the "what remains" note',
+              );
+            }
+            return;
+          }
           // The boundary: everything streamed BEFORE this compaction is not the
           // run's final message.
           clearCapture();
-          log(`bob: context compacted${e.reason ? ` (${e.reason})` : ""}`);
           if (opts.inject === undefined) return;
           const note = noteFor();
           log(`bob: sending the best-effort "what remains" note (${note.length} chars)`);
@@ -378,6 +403,14 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
               `bob: could not send the "what remains" note: ${err instanceof Error ? err.message : String(err)} (this is best-effort; the task is in the system prompt)`,
             );
           }
+          return;
+        }
+        case "agent_start": {
+          agentEnded = false;
+          return;
+        }
+        case "agent_end": {
+          agentEnded = true;
           return;
         }
         case "message_update": {
