@@ -72,7 +72,7 @@ CI runs `check` in its test job, for every pull request that targets `main`
 and every push to `main`, once the build job has succeeded. It fails on a
 malformed fragment (a bad name; a missing, empty or over-long bold lede; a body
 that is not a list item; a continuation line indented by an odd number of spaces
-or not at all; a fragment holding more than one entry), on a fragment entry that
+or not at all; a fragment holding more than one entry; an unclosed code fence), on a fragment entry that
 is not a regular file, on a missing fragment directory, and on a `CHANGELOG.md`
 whose `[Unreleased]` heading is missing, repeated, or anything but the line
 `## [Unreleased]` byte for byte, or that holds anything but the managed note

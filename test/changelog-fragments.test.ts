@@ -335,6 +335,41 @@ describe("changelog fragments — check (bob#236)", () => {
     ).toEqual(beforeFRags);
   });
 
+  it("REFUSES an unclosed fenced block, which would hide the entries that follow, naming the file", () => {
+    const { dir, changelogPath } = project();
+    // A fence that is never closed does not stop at the fragment's end: in the
+    // rendered section it runs on until the next fence marker, so the entries
+    // after it render as code and disappear. (bob#236 review follow-up.)
+    fragment(dir, "fixed-unclosed-fence.md", "- **a fix.** Detail.\n\n  ```\n  $ bob run\n");
+    const beforeBytes = readFileSync(changelogPath);
+    const beforeFNames = readdirSync(dir).sort();
+    const beforeFRags = readdirSync(dir)
+      .map((n) => readFileSync(join(dir, n)))
+      .sort();
+    expect(() => cf.check({ dir, changelogPath })).toThrow(
+      new Error(
+        `.changelog/unreleased/fixed-unclosed-fence.md: unclosed fenced block. Close the fence, or the entries that follow it render inside the code block and are hidden from the section.`,
+      ),
+    );
+    expect(readFileSync(changelogPath)).toEqual(beforeBytes);
+    expect(readdirSync(dir).sort()).toEqual(beforeFNames);
+    expect(
+      readdirSync(dir)
+        .map((n) => readFileSync(join(dir, n)))
+        .sort(),
+    ).toEqual(beforeFRags);
+  });
+
+  it("passes on a fragment with a CLOSED fenced block, and the entry after it still renders", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-closed-fence.md", "- **a fix.** Detail:\n\n  ```\n  $ bob run\n  ```\n");
+    fragment(dir, "added-next.md", "- **the next entry.** It still renders.\n");
+    expect(cf.check({ dir, changelogPath })).toEqual({ fragments: 2, entries: 2 });
+    const rendered = cf.assemble(cf.readFragments(dir));
+    expect(rendered).toContain("- **the next entry.**");
+    expect((rendered.match(/^[ \t]*```/gm) ?? []).length % 2).toBe(0);
+  });
+
   // Each entry is opened once and judged by its descriptor, not by a separate
   // stat of the path. The open does not block on a FIFO (O_NONBLOCK).
   it("REFUSES an entry that is not a regular file (a directory, a FIFO)", () => {

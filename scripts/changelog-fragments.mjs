@@ -162,7 +162,17 @@ export function validateFragmentBody(relPath, body) {
   // terminal output, and a line like `- foo` inside a fence is content, not a
   // second entry. Fence markers are INDENTED in practice (continuation content
   // under the entry's `- `), so the strip anchors on optional leading whitespace.
+  // An unclosed fence is not stripped by the pairing above, and in the rendered
+  // section it runs on until the next fence marker — swallowing the entries that
+  // follow it into a code block, hidden from the section. Refuse it by name,
+  // before the count reads content the fence would hide.
   const withoutFences = body.replace(/^[ \t]*```[\s\S]*?^[ \t]*```/gm, "");
+  if (/^[ \t]*```/m.test(withoutFences)) {
+    throw new FragmentError(
+      `${relPath}: unclosed fenced block. Close the fence, or the entries that follow it render ` +
+        `inside the code block and are hidden from the section.`,
+    );
+  }
   const entries = (withoutFences.match(/^- /gm) ?? []).length;
   if (entries > 1) {
     throw new FragmentError(

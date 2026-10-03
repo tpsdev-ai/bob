@@ -1,0 +1,1 @@
+- **A changelog fragment with an unclosed code fence is refused by name.** An unclosed fence can hide the entries that follow it in the rendered section; close the fence.
