@@ -1,1 +1,1 @@
-- **Repository edit evidence counts a first commit in an unborn repository.** Closes #291. An empty launch-history enumeration is a complete, empty history when HEAD is an unborn ref; a failed enumeration still denies credit.
+- **A first commit in an unborn repository earns repository credit only when tracked content changes.** Closes #291. A failed launch-history enumeration denies repository credit; file-edit-tool credit is separate.

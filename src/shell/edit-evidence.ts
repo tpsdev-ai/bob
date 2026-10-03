@@ -356,13 +356,21 @@ export interface RepositoryCaptureOptions {
   historyTimeoutMs?: number;
 }
 
-/**
- * True when HEAD is a symbolic ref: the state of an unborn repository, which has
- * no commit yet. Anything else leaves an empty enumeration unusable.
- */
+/** True for a symbolic HEAD whose target ref is absent (unborn). */
 function unbornHead(repository: RepositoryIdentity): boolean {
-  const result = git(repository.workTree, ["symbolic-ref", "--quiet", "HEAD"], repository);
-  return !result.error && result.status === 0 && result.stdout.length > 0;
+  const head = git(
+    repository.workTree,
+    ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
+    repository,
+  );
+  if (head.error || head.status !== 0) return false;
+  const output = head.stdout.toString();
+  if (!/^refs\/[^\r\n]+\n$/.test(output)) return false;
+  const target = output.slice(0, -1);
+  const valid = git(repository.workTree, ["check-ref-format", target], repository);
+  if (valid.error || valid.status !== 0) return false;
+  const result = git(repository.workTree, ["show-ref", "--exists", target], repository);
+  return !result.error && result.status === 2;
 }
 
 function launchTrees(
@@ -390,9 +398,7 @@ function launchTrees(
   }
   const output = result.stdout.toString();
   if (output === "") {
-    // A successful enumeration that lists nothing is a complete, empty launch
-    // history for an unborn ref. Any other HEAD leaves the empty listing
-    // meaningless, so the fail-closed denial stands (#288).
+    // Accept empty history only for a symbolic HEAD whose target ref is absent (unborn).
     return unbornHead(repository)
       ? { trees: new Set() }
       : { trees: new Set(), historyCheckSkipped: "unavailable" };
@@ -463,6 +469,11 @@ export function captureRepositoryState(
   launch?: RepositoryState,
   options: RepositoryCaptureOptions = {},
 ): RepositoryState {
+  if (
+    options.launchCommitLimit !== undefined &&
+    (!Number.isSafeInteger(options.launchCommitLimit) || options.launchCommitLimit <= 0)
+  )
+    return { kind: "unavailable" };
   if (launch && launch.kind !== "git") return { kind: "unavailable" };
   try {
     const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
