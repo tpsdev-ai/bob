@@ -393,14 +393,9 @@ export function assertProviderEndpointAllowed(row: ProviderRecord, endpoint: str
   }
 }
 
-/**
- * Validate a row's request timeout/retry policy, by row name. A nonzero total
- * cap below the minimum is refused (that is the short total timeout this change
- * removes); an out-of-bounds or non-integer field refuses rather than clamping.
- */
 function validateRequestPolicy(value: unknown, id: string): void {
   if (value === undefined) return;
-  const policy = asRecord(value, "request");
+  const policy = asRecord(value, `row "${id}" request`);
   for (const field of Object.keys(policy)) {
     if (field !== "idleTimeoutMs" && field !== "totalTimeoutMs" && field !== "maxRetries") {
       throw new ProviderRegistryError(

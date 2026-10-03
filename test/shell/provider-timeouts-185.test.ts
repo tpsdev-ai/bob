@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { installBaseUrlTransport } from "../../src/shell/base-url-transport.js";
 import { initAgent } from "../../src/shell/init.js";
 import {
@@ -12,69 +10,12 @@ import {
   PROVIDER_RECORDS,
   ProviderRegistry,
 } from "../../src/shell/provider-registry.js";
-
-const SSE_CHUNK = (content: string, finish: string | null) =>
-  `data: ${JSON.stringify({
-    id: "1",
-    choices: [{ index: 0, delta: { content }, finish_reason: finish }],
-  })}\n\n`;
-const SSE_DONE = "data: [DONE]\n\n";
-
-interface FakeServer {
-  url: string;
-  requests: number;
-  close: () => Promise<void>;
-}
-
-/** A fake OpenAI-compatible SSE server on loopback. No network leaves the host. */
-async function startFakeServer(
-  handler: (res: import("node:http").ServerResponse, signal: AbortSignal) => void | Promise<void>,
-): Promise<FakeServer> {
-  const sockets = new Set<Socket>();
-  let requests = 0;
-  const server: Server = createServer((req, res) => {
-    requests += 1;
-    const controller = new AbortController();
-    req.on("close", () => controller.abort());
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
-    void handler(res, controller.signal);
-  });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("no server address");
-  return {
-    url: `http://127.0.0.1:${address.port}/v1`,
-    get requests() {
-      return requests;
-    },
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      sockets.clear();
-      server.closeAllConnections?.();
-      await Promise.race([
-        new Promise<void>((resolve) => server.close(() => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-      ]);
-    },
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ── The row owns the policy ──────────────────────────────────────────────────
+import { resolveRunConfig } from "../../src/shell/run.js";
+import { createBobRuntimeFactory } from "../../src/shell/session.js";
+import { memoryServer } from "./provider-timeout-fixture.js";
 
 describe("bob#185 item 1 — the selected provider row carries the policy", () => {
-  it("every local row declares an idle timeout, a generous total cap and no blind retry", () => {
+  it("every local row declares its timeout limits and zero request retries", () => {
     const registry = new ProviderRegistry();
     for (const id of ["ollama", "ollama-newton", "omlx"]) {
       const row = registry.find(id);
@@ -88,7 +29,7 @@ describe("bob#185 item 1 — the selected provider row carries the policy", () =
     }
   });
 
-  it("a cloud row declares no policy, so its timeout and retry behaviour is unchanged", () => {
+  it("cloud rows declare no request policy", () => {
     const registry = new ProviderRegistry();
     for (const id of ["ollama-cloud", "anthropic", "openai", "openrouter"]) {
       expect(registry.find(id)?.request).toBeUndefined();
@@ -103,6 +44,11 @@ describe("bob#185 item 1 — the selected provider row carries the policy", () =
   });
 
   it.each([
+    {
+      name: "a non-mapping request",
+      request: "request: invalid",
+      message: /row "acme" request must be a mapping/,
+    },
     {
       name: "a nonzero total cap below the minimum",
       request: "request: {idleTimeoutMs: 2000, totalTimeoutMs: 60000, maxRetries: 0}",
@@ -182,33 +128,34 @@ describe("bob#185 item 1 — the selected provider row carries the policy", () =
   });
 });
 
-// ── The real request path uses the row's policy ──────────────────────────────
-
-describe("bob#185 item 1 — a keyless session request uses its row's policy", () => {
+describe("bob#185 item 1 — selected-row transport and real sessions", () => {
   let root: string;
   let keysRoot: string;
-  let servers: FakeServer[];
+  const realFetch = globalThis.fetch;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "bob-185t-e2e-"));
     keysRoot = mkdtempSync(join(tmpdir(), "bob-185t-keys-"));
-    servers = [];
   });
-  afterEach(async () => {
-    for (const server of servers) await server.close();
+  afterEach(() => {
+    globalThis.fetch = realFetch;
     rmSync(root, { recursive: true, force: true });
     rmSync(keysRoot, { recursive: true, force: true });
   });
 
-  function scaffold(endpoint: string) {
+  function scaffold(maxRetries: number | undefined) {
     const row = {
       id: "fake-local",
       aliases: [],
       runtime: "fake-local",
       auth: { kind: "none" as const },
-      endpoint,
+      endpoint: "http://fake.local/v1",
       api: "openai-completions" as const,
       override: {},
-      request: { idleTimeoutMs: 1_000, totalTimeoutMs: 1_800_000, maxRetries: 5 },
+      ...(maxRetries !== undefined
+        ? {
+            request: { idleTimeoutMs: 1_000, totalTimeoutMs: 1_800_000, maxRetries },
+          }
+        : {}),
     };
     const registry = new ProviderRegistry([...PROVIDER_RECORDS, row]);
     const result = initAgent({
@@ -222,57 +169,142 @@ describe("bob#185 item 1 — a keyless session request uses its row's policy", (
       skipFlair: true,
       registry,
     });
-    return { registry, row, agentDir: result.agentDir };
+    const selected = registry.find(row.id);
+    if (selected === undefined) throw new Error("no selected row");
+    return { registry, row: selected, agentDir: result.agentDir };
   }
 
-  async function runtimeFor(agentDir: string) {
-    return ModelRuntime.create({
+  async function sessionFor(maxRetries: number | undefined) {
+    const { registry, agentDir } = scaffold(maxRetries);
+    writeFileSync(
+      join(agentDir, ".pi-agent", "auth.json"),
+      JSON.stringify({
+        "fake-local": { type: "api_key", key: "fixture-placeholder" },
+      }),
+    );
+    const { config, policy } = resolveRunConfig({ name: "fakebot", agentsRoot: root, registry });
+    return createBobRuntimeFactory({ config, policy, registry })({
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
+  }
+
+  async function transportFor(maxRetries: number | undefined) {
+    const { row, agentDir } = scaffold(maxRetries);
+    const runtime = await ModelRuntime.create({
       authPath: join(agentDir, ".pi-agent", "auth.json"),
       modelsPath: join(agentDir, ".pi-agent", "models.json"),
     });
+    if (row.endpoint === undefined) throw new Error("no endpoint");
+    installBaseUrlTransport(runtime, row.runtime, row.endpoint, row.request);
+    const model = runtime.getModel(row.runtime, "m");
+    if (model === undefined) throw new Error("no model");
+    return { runtime, model };
   }
 
-  const context = {
-    messages: [{ role: "user" as const, content: "hi", timestamp: 0 }],
-  };
+  const context = { messages: [{ role: "user" as const, content: "hi", timestamp: 0 }] };
 
-  it("a steady stream from a local row is not cut off by the old total timeout", async () => {
-    const server = await startFakeServer(async (res, signal) => {
-      for (let i = 0; i < 8; i++) {
-        if (signal.aborted) return;
-        res.write(SSE_CHUNK(`tok${i}`, null));
-        await sleep(80);
-      }
-      res.write(SSE_CHUNK("", "stop"));
-      res.write(SSE_DONE);
-      res.end();
-    });
-    servers.push(server);
-    const { registry, row, agentDir } = scaffold(server.url);
-    const runtime = await runtimeFor(agentDir);
-    installBaseUrlTransport(runtime, row.runtime, server.url, registry.find(row.id)?.request);
-    const model = runtime.getModel(row.runtime, "m");
-    if (model === undefined) throw new Error("model not found");
-    const reply = await runtime.streamSimple(model, context as never, {} as never).result();
-    expect(reply.stopReason).not.toBe("error");
-    expect(server.requests).toBe(1);
-  }, 15_000);
+  it("a real session without a row policy retains pi's retry settings", async () => {
+    const { session } = await sessionFor(undefined);
+    try {
+      expect(session.settingsManager.getRetrySettings().enabled).toBe(true);
+      expect(session.settingsManager.getProviderRetrySettings().maxRetries).toBeUndefined();
+    } finally {
+      session.dispose();
+    }
+  });
 
-  it("an idle stream from a local row fails by name and is not retried", async () => {
-    const server = await startFakeServer(async (res, signal) => {
-      res.write(SSE_CHUNK("start", null));
-      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve()));
-    });
-    servers.push(server);
-    const { registry, row, agentDir } = scaffold(server.url);
-    const runtime = await runtimeFor(agentDir);
-    installBaseUrlTransport(runtime, row.runtime, server.url, registry.find(row.id)?.request);
-    const model = runtime.getModel(row.runtime, "m");
-    if (model === undefined) throw new Error("model not found");
-    const reply = await runtime.streamSimple(model, context as never, {} as never).result();
+  it("a real session honours the row retry cap on provider errors", async () => {
+    const server = memoryServer({ status: 503 });
+    globalThis.fetch = server.fetch;
+    const { session } = await sessionFor(1);
+    try {
+      await session.prompt("hi");
+      expect(server.requests).toBe(2);
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it.each([false, true])(
+    "preserves no-policy timeoutMs through streamSimple=%s",
+    async (simple) => {
+      const server = memoryServer({ headersDelayMs: 200 });
+      globalThis.fetch = server.fetch;
+      const { runtime, model } = await transportFor(undefined);
+      const stream = simple ? runtime.streamSimple.bind(runtime) : runtime.stream.bind(runtime);
+      const reply = await stream(model, context, { timeoutMs: 50, maxRetries: 0 }).result();
+      expect(reply.stopReason).toBe("error");
+      expect(reply.errorMessage).toContain("timed out");
+      expect(server.requests).toBe(1);
+    },
+  );
+
+  it.each([0, 1, 2])("preserves no-policy maxRetries=%s", async (maxRetries) => {
+    const server = memoryServer({ status: 503 });
+    globalThis.fetch = server.fetch;
+    const { runtime, model } = await transportFor(undefined);
+    const reply = await runtime.streamSimple(model, context, { maxRetries }).result();
     expect(reply.stopReason).toBe("error");
-    expect(String(reply.errorMessage)).toContain("provider stream idle timeout");
-    // maxRetries is 5 on the row, yet a timed-out generation is never retried.
-    expect(server.requests).toBe(1);
-  }, 15_000);
+    expect(server.requests).toBe(1 + maxRetries);
+  });
+
+  it.each([0, 1, 2])("honours row maxRetries=%s without extra SDK attempts", async (maxRetries) => {
+    const server = memoryServer({ status: 503 });
+    globalThis.fetch = server.fetch;
+    const { runtime, model } = await transportFor(maxRetries);
+    const reply = await runtime.streamSimple(model, context, { maxRetries: 5 }).result();
+    expect(reply.stopReason).toBe("error");
+    expect(server.requests).toBe(1 + maxRetries);
+  });
+
+  it.each([0, 1])(
+    "real session leaves a before-headers timeout terminal with row retries=%s",
+    async (maxRetries) => {
+      const server = memoryServer({ headersDelayMs: 2_000 });
+      globalThis.fetch = server.fetch;
+      const { session } = await sessionFor(maxRetries);
+      try {
+        expect(session.settingsManager.getRetrySettings().enabled).toBe(false);
+        const events: string[] = [];
+        session.subscribe((event) => {
+          events.push(event.type);
+        });
+        await session.prompt("hi");
+        const reply = session.messages.at(-1);
+        expect(reply?.role).toBe("assistant");
+        if (reply?.role !== "assistant") throw new Error("no assistant message");
+        expect(reply.stopReason).toBe("error");
+        expect(reply.errorMessage).toContain("ProviderStreamIdleTimeoutError");
+        expect(reply.errorMessage).toContain('provider "fake-local"');
+        expect(reply.errorMessage).toContain("1 s");
+        expect(reply.errorMessage).toContain("Remedy:");
+        expect(events).not.toContain("auto_retry_start");
+        expect(server.requests).toBe(1);
+      } finally {
+        session.dispose();
+      }
+    },
+    10_000,
+  );
+
+  it("real session applies the selected row's idle limit after headers", async () => {
+    const server = memoryServer({ stall: true });
+    globalThis.fetch = server.fetch;
+    const { session } = await sessionFor(0);
+    const deadline = setTimeout(() => {
+      void session.abort();
+    }, 2_500);
+    try {
+      await session.prompt("hi");
+      const reply = session.messages.at(-1);
+      if (reply?.role !== "assistant") throw new Error("no assistant message");
+      expect(reply.stopReason).toBe("error");
+      expect(reply.errorMessage).toContain("ProviderStreamIdleTimeoutError");
+      expect(reply.errorMessage).toContain("Remedy:");
+      expect(server.requests).toBe(1);
+    } finally {
+      clearTimeout(deadline);
+      session.dispose();
+    }
+  }, 10_000);
 });

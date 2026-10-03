@@ -659,13 +659,19 @@ export interface AuditExtensions {
 // package to resolve). projectTrusted:false keeps project discovery off
 // regardless of any trust.json on disk.
 //
-// bob#214: the one setting bob DOES put here is pi's compaction reserve, derived
-// from the session's compaction threshold (model-budget.ts
-// compactionSettingsFor) — configuring pi's own trigger rather than adding one.
-export function isolatedSettings(compaction?: { reserveTokens: number }): SettingsManager {
-  return SettingsManager.inMemory(compaction !== undefined ? { compaction } : {}, {
-    projectTrusted: false,
-  });
+export function isolatedSettings(
+  compaction?: { reserveTokens: number },
+  request?: import("./provider-request-policy.js").ProviderRequestPolicy,
+): SettingsManager {
+  return SettingsManager.inMemory(
+    {
+      ...(compaction !== undefined ? { compaction } : {}),
+      ...(request !== undefined
+        ? { retry: { enabled: false, provider: { maxRetries: request.maxRetries } } }
+        : {}),
+    },
+    { projectTrusted: false },
+  );
 }
 
 /**
@@ -1329,7 +1335,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
-      settingsManager: isolatedSettings(compaction),
+      settingsManager: isolatedSettings(compaction, row?.request),
       modelRuntime,
       resourceLoaderOptions: isolatedLoaderOptions(
         { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
