@@ -4,7 +4,8 @@
 // inference from disk contents, placeholders or missing credentials:
 //
 //   bob/env(<ENV_VAR>)  bob reads the key from the environment at run time
-//   bob/none            keyless: bob sends no credential
+//   bob/none            keyless: no user credential; the transport sends a fixed,
+//                       non-secret placeholder Authorization header
 //   bob/vm              host/VM identity (the exe.dev gateway)
 //   pi/disk             pi-managed key on disk (unmigrated, until its slice)
 //   pi/login            pi-managed subscription (unmigrated, until its slice)
