@@ -64,6 +64,7 @@ const ROUND_BLOCKERS_MAX = 16;
 const ROUND_FILES_MAX = 64;
 const ROUND_EVIDENCE_MAX = 32;
 const ROUND_INCOMPLETE_MAX = 32;
+const ENVELOPE_OMITTED_MAX = 16;
 
 // Request budgets (see FlairHttpClient's signedFetchWithBounds): 2 s each way,
 // 128 KiB response cap, no automatic retries.
@@ -73,7 +74,7 @@ export const PR_MEMORY_MAX_RESPONSE_BYTES = 128 * 1024;
 
 // ─── Stored schema ──────────────────────────────────────────────────────────
 
-export type PrRoundOutcome = "completed" | "blocked" | "failed" | "aborted" | "unknown";
+export type PrRoundOutcome = "completed" | "failed" | "aborted" | "unknown";
 
 export interface PrFinding {
   id?: string;
@@ -119,6 +120,8 @@ export interface PrMemoryEnvelope {
   open_findings: PrFinding[];
   // Newest first.
   rounds: PrRoundRecord[];
+  // Whole rounds and findings dropped by bounding, newest last.
+  omitted: string[];
 }
 
 export interface PrMemoryIdentity {
@@ -130,7 +133,8 @@ export interface PrMemoryIdentity {
 // ─── Outcome (harness-owned) ────────────────────────────────────────────────
 
 // The run result fields the harness knows. A model's "DONE" is not among them:
-// the outcome is the exit code and termination reason, never text.
+// the outcome is the exit code and termination reason, never text. Exit 0 can
+// include a model-declared BLOCKED; it is stored as completed.
 export interface RunOutcomeInput {
   exitCode: number;
   failed?: boolean;
@@ -141,7 +145,7 @@ export interface RunOutcomeInput {
 export function roundOutcomeFromRun(r: RunOutcomeInput): PrRoundOutcome {
   if (r.aborted !== undefined) return "aborted";
   if (r.failed === true) return "failed";
-  if (r.noEditNoBlocked === true) return "blocked";
+  if (r.noEditNoBlocked === true) return "failed";
   if (r.exitCode === 0) return "completed";
   return "failed";
 }
@@ -311,7 +315,6 @@ function parseRound(v: unknown): PrRoundRecord | undefined {
   const outcome = v.outcome;
   if (
     outcome !== "completed" &&
-    outcome !== "blocked" &&
     outcome !== "failed" &&
     outcome !== "aborted" &&
     outcome !== "unknown"
@@ -367,6 +370,7 @@ export function parseEnvelope(
     prNumber: expected.prNumber,
     open_findings: parseFindings(parsed.open_findings, OPEN_FINDINGS_MAX),
     rounds,
+    omitted: asStringArray(parsed.omitted, ENVELOPE_OMITTED_MAX, STRING_MAX),
   };
 }
 
@@ -434,18 +438,19 @@ export interface BoundedEnvelope {
 
 // Serialize an envelope under the byte caps. Rounds are kept newest-first;
 // whole rounds are dropped oldest-first, and unresolved findings are preserved
-// preferentially (they are trimmed last). What was dropped is reported.
+// preferentially (they are trimmed last). What was dropped is reported and
+// appended to the envelope's `omitted` list.
 export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
   const omitted: string[] = [];
   const rounds: PrRoundRecord[] = [];
   for (const round of input.rounds) {
     if (rounds.length >= PR_MEMORY_MAX_ROUNDS) {
-      omitted.push(`older round (${round.endedAt})`);
+      omitted.push(truncate(`older round (${round.endedAt})`, STRING_MAX));
       continue;
     }
     const bounded = boundRound(round);
     if (bounded === undefined) {
-      omitted.push(`oversized round (${round.endedAt})`);
+      omitted.push(truncate(`oversized round (${round.endedAt})`, STRING_MAX));
       continue;
     }
     rounds.push(bounded);
@@ -460,16 +465,25 @@ export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
     prNumber: input.prNumber,
     open_findings: findings,
     rounds,
+    omitted: [...input.omitted, ...omitted].slice(-ENVELOPE_OMITTED_MAX),
+  };
+  const record = (what: string): void => {
+    omitted.push(what);
+    env.omitted = [...env.omitted, what].slice(-ENVELOPE_OMITTED_MAX);
   };
   while (Buffer.byteLength(JSON.stringify(env), "utf8") > PR_MEMORY_ENVELOPE_MAX_BYTES) {
     if (env.rounds.length > 0) {
       const dropped = env.rounds.pop() as PrRoundRecord;
-      omitted.push(`older round (${dropped.endedAt})`);
+      record(truncate(`older round (${dropped.endedAt})`, STRING_MAX));
       continue;
     }
     if (env.open_findings.length > 0) {
       env.open_findings = env.open_findings.slice(0, env.open_findings.length - 1);
-      omitted.push("excess open findings");
+      record("excess open findings");
+      continue;
+    }
+    if (env.omitted.length > 0) {
+      env.omitted = env.omitted.slice(1);
       continue;
     }
     break;
@@ -521,6 +535,8 @@ export function renderPrMemoryPrompt(env: PrMemoryEnvelope): string {
   const sections: string[] = [];
   for (const f of env.open_findings)
     if (f.status === "open") sections.push(`- open finding: ${escapeForPrompt(f.detail)}`);
+  if (env.omitted.length > 0)
+    sections.push(`- omitted: ${env.omitted.map(escapeForPrompt).join(", ")}`);
   for (const round of env.rounds) sections.push(renderRound(round));
   if (sections.length === 0) return "";
   const render = (body: string): string =>
@@ -742,6 +758,7 @@ export async function writePrMemoryRound(opts: {
     prNumber,
     open_findings: mergeFindings(existing?.open_findings ?? [], opts.evidence.findings ?? []),
     rounds: [round, ...(existing?.rounds ?? [])],
+    omitted: existing?.omitted ?? [],
   };
   const { json } = boundEnvelope(envelope);
   try {
