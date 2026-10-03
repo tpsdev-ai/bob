@@ -850,8 +850,8 @@ async function finalizePrMemory(
   config: RunSessionConfig,
   target: FlairBootstrapTarget | undefined,
   evidence: PrRoundEvidence,
-  seams?: PrMemorySeams,
-  log?: (message: string) => void,
+  seams: PrMemorySeams | undefined,
+  log: (message: string) => void,
 ): Promise<void> {
   const ref = config.taskBinding?.pr_ref;
   if (target === undefined || ref === undefined) return;
@@ -862,12 +862,12 @@ async function finalizePrMemory(
       identity: { agentId: target.agentId, repository: ref.repository, prNumber: ref.number },
       evidence,
       ...(seams !== undefined ? { seams } : {}),
-      ...(log !== undefined ? { log } : {}),
+      log,
     });
   } catch (err) {
     // Defensive: the memory layer already reports rather than throws.
     const m = err instanceof Error ? err.message : String(err);
-    (log ?? ((x: string) => process.stderr.write(x)))(
+    log(
       `bob run: PR memory finalization failed (${m}); the round outcome is unchanged.\n`,
     );
   }
