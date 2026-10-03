@@ -53,6 +53,22 @@ function init(cwd: string): string {
   return commit(cwd);
 }
 
+function unborn(cwd: string): void {
+  rmSync(join(cwd, ".git"), { recursive: true });
+  git(cwd, "init", "--quiet");
+}
+
+function firstCommit(cwd: string): void {
+  execFileSync(
+    "bash",
+    [
+      "-c",
+      'git add first && tree=$(git write-tree) && head=$(git commit-tree "$tree" -m first) && git reset --hard "$head"',
+    ],
+    { cwd, env: gitEnv, stdio: "pipe" },
+  );
+}
+
 type Call = { toolName: string; action?: () => void; result?: unknown };
 
 function session(calls: Call[], finalAction?: () => void): RunSession {
@@ -1137,6 +1153,364 @@ describe("repository evidence in the completion gate and exploration budget", ()
       },
     ]);
     expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it.each(["completion", "exploration"])(
+    "accepts a first commit in an unborn repository at %s",
+    async (gate) => {
+      unborn(cwd);
+      writeFileSync(join(cwd, "first"), "first bytes\n");
+      const result = await run(
+        [{ toolName: "run", action: () => firstCommit(cwd) }, { toolName: "read" }],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(git(cwd, "rev-parse", "--verify", "HEAD")).toHaveLength(40);
+      expect(result.exitCode).toBe(0);
+      expect(result.noEditNoBlocked).toBeUndefined();
+      expect(result.explorationBudgetExhausted).toBeUndefined();
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "denies re-attaching hidden pre-launch history at %s",
+    async (gate) => {
+      for (const ref of git(cwd, "for-each-ref", "--format=%(refname)").split("\n")) {
+        git(cwd, "update-ref", "-d", ref);
+      }
+      git(cwd, "read-tree", "--empty");
+      rmSync(join(cwd, "tracked"));
+      git(cwd, "symbolic-ref", "HEAD", "refs/heads/missing");
+      expect(git(cwd, "rev-list", "--all")).toBe("");
+      expect(git(cwd, "cat-file", "-t", launchHead)).toBe("commit");
+      const before = captureRepositoryState(cwd);
+      const result = await run(
+        [
+          { toolName: "read" },
+          { toolName: "run", action: () => git(cwd, "reset", "--hard", launchHead) },
+          { toolName: "read" },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(readFileSync(join(cwd, "tracked"), "utf8")).toBe("original\n");
+      const after = captureRepositoryState(cwd, before);
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+      expect(result.exitCode).toBe(1);
+      if (gate === "completion") expect(result.noEditNoBlocked).toBe(true);
+      else expect(result.explorationBudgetExhausted).toEqual({ limit: 2, nonProgressCalls: 4 });
+    },
+  );
+
+  it.each(["completion", "exploration"])(
+    "accepts changed staged content with pre-launch blobs and trees at %s",
+    async (gate) => {
+      unborn(cwd);
+      writeFileSync(join(cwd, "first"), "staged bytes\n");
+      git(cwd, "add", "first");
+      git(cwd, "write-tree");
+      expect(
+        git(cwd, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)")
+          .split("\n")
+          .sort(),
+      ).toEqual(["blob", "tree"]);
+      const result = await run(
+        [
+          {
+            toolName: "run",
+            action: () => {
+              writeFileSync(join(cwd, "first"), "changed bytes\n");
+              firstCommit(cwd);
+            },
+          },
+          { toolName: "read" },
+        ],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.noEditNoBlocked).toBeUndefined();
+      expect(result.explorationBudgetExhausted).toBeUndefined();
+    },
+  );
+
+  it("denies an unreachable tag object even when it points only to a blob", () => {
+    unborn(cwd);
+    git(cwd, "add", "tracked");
+    const blob = git(cwd, "hash-object", "-w", "tracked");
+    git(cwd, "tag", "-a", "old-blob", blob, "-m", "fixture");
+    const tag = git(cwd, "rev-parse", "refs/tags/old-blob");
+    git(cwd, "update-ref", "-d", "refs/tags/old-blob");
+    expect(git(cwd, "cat-file", "-t", tag)).toBe("tag");
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+    const after = captureRepositoryState(cwd, before);
+    expect(before.kind).toBe("git");
+    if (before.kind !== "git") throw new Error("missing repository evidence");
+    expect(before.historyCheckSkipped).toBe("unavailable");
+    expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+  });
+
+  it("denies object enumeration errors even when Git exits successfully", () => {
+    unborn(cwd);
+    git(cwd, "add", "tracked");
+    writeFileSync(join(cwd, ".git", "objects", "info", "alternates"), `${cwd}/absent-objects\n`);
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+    const after = captureRepositoryState(cwd, before);
+    expect(before.kind).toBe("git");
+    if (before.kind !== "git") throw new Error("missing repository evidence");
+    expect(before.historyCheckSkipped).toBe("unavailable");
+    expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+  });
+
+  it.each(["loose", "packed"])(
+    "never accepts unborn history when another %s blob ref exists",
+    (storage) => {
+      unborn(cwd);
+      git(cwd, "add", "tracked");
+      const blob = git(cwd, "hash-object", "-w", "tracked");
+      git(cwd, "update-ref", "refs/tags/blob", blob);
+      if (storage === "packed") {
+        git(cwd, "pack-refs", "--all");
+        expect(fs.existsSync(join(cwd, ".git", "refs", "tags", "blob"))).toBe(false);
+        expect(readFileSync(join(cwd, ".git", "packed-refs"), "utf8")).toContain(blob);
+      } else expect(fs.existsSync(join(cwd, ".git", "refs", "tags", "blob"))).toBe(true);
+      git(cwd, "symbolic-ref", "HEAD", "refs/heads/missing");
+      expect(git(cwd, "rev-list", "--all")).toBe("");
+      const probe = spyOn(childProcess, "spawnSync");
+      try {
+        const before = captureRepositoryState(cwd);
+        writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+        const after = captureRepositoryState(cwd, before);
+        expect(before.kind).toBe("git");
+        if (before.kind !== "git") throw new Error("missing repository evidence");
+        expect(before.historyCheckSkipped).toBe("unavailable");
+        expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+        expect(
+          probe.mock.calls.some(([, args]) => (args as string[]).includes("--batch-all-objects")),
+        ).toBe(false);
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it.each(["failure", "timeout", "buffer-overflow", "over-limit", "incomplete", "unknown"])(
+    "denies repository credit on object enumeration %s",
+    (failure) => {
+      unborn(cwd);
+      git(cwd, "add", "tracked");
+      const spawn = childProcess.spawnSync;
+      const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+        if (args[0] === "git" && (args[1] as string[]).includes("--batch-all-objects")) {
+          return {
+            pid: 0,
+            output: [],
+            signal: null,
+            stderr: Buffer.alloc(0),
+            stdout: Buffer.from(
+              failure === "over-limit"
+                ? "blob\n".repeat(10_001)
+                : failure === "incomplete"
+                  ? "blob"
+                  : failure === "unknown"
+                    ? "unknown\n"
+                    : "",
+            ),
+            status: failure === "failure" ? 1 : 0,
+            error:
+              failure === "timeout" || failure === "buffer-overflow"
+                ? Object.assign(new Error(failure), {
+                    code: failure === "timeout" ? "ETIMEDOUT" : "ENOBUFS",
+                  })
+                : undefined,
+          };
+        }
+        return spawn(...args);
+      });
+      try {
+        const before = captureRepositoryState(cwd, undefined, { historyTimeoutMs: 2_345 });
+        writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+        const after = captureRepositoryState(cwd, before);
+        expect(before.kind).toBe("git");
+        if (before.kind !== "git") throw new Error("missing repository evidence");
+        expect(before.historyCheckSkipped).toBe(
+          failure === "timeout"
+            ? "timeout"
+            : failure === "over-limit" || failure === "buffer-overflow"
+              ? "limit"
+              : "unavailable",
+        );
+        expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+        const calls = probe.mock.calls.filter(([, args]) =>
+          (args as string[]).includes("--batch-all-objects"),
+        );
+        expect(calls).toHaveLength(1);
+        const options = calls[0][2];
+        expect(options?.timeout).toBe(2_345);
+        expect(options?.maxBuffer).toBe(70_007);
+        expect(Object.keys(options?.env ?? {}).sort()).toEqual([
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_NOSYSTEM",
+          "GIT_NO_LAZY_FETCH",
+          "GIT_OPTIONAL_LOCKS",
+          "HOME",
+          "LANG",
+          "LC_ALL",
+          "PATH",
+        ]);
+        expect(options?.env?.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+        expect(options?.env?.GIT_NO_LAZY_FETCH).toBe("1");
+        expect(calls[0][1] as string[]).toContain("--no-replace-objects");
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it("denies a first commit in an unborn repository when launch enumeration fails", async () => {
+    unborn(cwd);
+    writeFileSync(join(cwd, "first"), "first bytes\n");
+    const spawn = childProcess.spawnSync;
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
+        return { ...spawn(...args), status: 1, stdout: Buffer.alloc(0) };
+      }
+      return spawn(...args);
+    });
+    try {
+      const result = await run([{ toolName: "run", action: () => firstCommit(cwd) }]);
+      expect(result.exitCode).toBe(1);
+      expect(result.noEditNoBlocked).toBe(true);
+      expect(
+        readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+      ).toBe("unavailable");
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("denies repository credit for a first commit of unchanged staged content", async () => {
+    unborn(cwd);
+    writeFileSync(join(cwd, "first"), "first bytes\n");
+    git(cwd, "add", "first");
+    const result = await run([{ toolName: "run", action: () => firstCommit(cwd) }]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it.each([1, 129])(
+    "denies repository credit when the target ref check exits %s",
+    async (status) => {
+      unborn(cwd);
+      writeFileSync(join(cwd, "first"), "first bytes\n");
+      const spawn = childProcess.spawnSync;
+      const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+        const result = spawn(...args);
+        if (args[0] === "git" && (args[1] as string[]).includes("show-ref")) {
+          return { ...result, status };
+        }
+        return result;
+      });
+      try {
+        const result = await run([{ toolName: "run", action: () => firstCommit(cwd) }]);
+        expect(result.exitCode).toBe(1);
+        expect(result.noEditNoBlocked).toBe(true);
+        expect(
+          readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+        ).toBe("unavailable");
+        const checks = probe.mock.calls.filter(([, args]) =>
+          (args as string[]).includes("--exists"),
+        );
+        expect(checks.length).toBeGreaterThan(0);
+        for (const [, args, options] of checks) {
+          expect((args as string[]).slice(-3)).toEqual([
+            "show-ref",
+            "--exists",
+            git(cwd, "symbolic-ref", "HEAD"),
+          ]);
+          expect(Object.keys(options?.env ?? {}).sort()).toEqual([
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_NO_LAZY_FETCH",
+            "GIT_OPTIONAL_LOCKS",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+          ]);
+        }
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it("denies repository credit when HEAD targets an existing symbolic ref", async () => {
+    unborn(cwd);
+    git(cwd, "add", "tracked");
+    git(cwd, "symbolic-ref", "refs/heads/alias", "refs/heads/missing");
+    git(cwd, "symbolic-ref", "HEAD", "refs/heads/alias");
+    expect(git(cwd, "show-ref", "--exists", "refs/heads/alias")).toBe("");
+    const before = captureRepositoryState(cwd);
+    writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+    const after = captureRepositoryState(cwd, before);
+    expect(before.kind).toBe("git");
+    if (before.kind !== "git") throw new Error("missing repository evidence");
+    expect(before.historyCheckSkipped).toBe("unavailable");
+    expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+  });
+
+  it("denies repository credit when symbolic HEAD targets an existing blob ref", async () => {
+    unborn(cwd);
+    git(cwd, "add", "tracked");
+    const blob = git(cwd, "hash-object", "-w", "tracked");
+    const ref = "refs/tags/blob-head";
+    git(cwd, "update-ref", ref, blob);
+    git(cwd, "symbolic-ref", "HEAD", ref);
+    expect(git(cwd, "rev-list", "--all", "--format=%T", "--no-commit-header")).toBe("");
+    expect(git(cwd, "show-ref", "--exists", ref)).toBe("");
+    const result = await run([
+      { toolName: "run", action: () => writeFileSync(join(cwd, "tracked"), "changed bytes\n") },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(
+      readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+    ).toBe("unavailable");
+  });
+
+  it.each([0, -1, -2, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects an invalid launch commit limit %s without enumerating history",
+    (launchCommitLimit) => {
+      const probe = spyOn(childProcess, "spawnSync");
+      try {
+        const before = captureRepositoryState(cwd, undefined, { launchCommitLimit });
+        writeFileSync(join(cwd, "tracked"), "changed bytes\n");
+        const after = captureRepositoryState(cwd, before);
+        expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(false);
+        expect(before.kind).toBe("unavailable");
+        expect(probe.mock.calls.some(([, args]) => (args as string[]).includes("rev-list"))).toBe(
+          false,
+        );
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  it("denies repository credit when HEAD is corrupt rather than unborn", async () => {
+    unborn(cwd);
+    writeFileSync(join(cwd, ".git", "HEAD"), "ref: refs/heads/\n");
+    writeFileSync(join(cwd, "first"), "first bytes\n");
+    const result = await run([{ toolName: "run", action: () => git(cwd, "add", "first") }]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(
+      readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+    ).toBe("unavailable");
   });
 
   it.each(["completion", "exploration"])(

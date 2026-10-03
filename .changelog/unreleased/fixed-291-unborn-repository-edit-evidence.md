@@ -1,0 +1,1 @@
+- **A first commit in an unborn repository earns repository credit only when tracked content changes.** Closes #291. Unborn acceptance requires symbolic HEAD to an absent ref, no refs, and no commit/tag objects. Failed, timed-out or over-limit enumeration denies repository credit; file-edit-tool credit is separate.

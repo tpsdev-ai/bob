@@ -104,7 +104,13 @@ export interface RepositoryEditEvidence {
   after: RepositoryState;
 }
 
-function git(cwd: string, args: string[], repository?: RepositoryIdentity, timeout = 5_000) {
+function git(
+  cwd: string,
+  args: string[],
+  repository?: RepositoryIdentity,
+  timeout = 5_000,
+  maxBuffer = 16 * 1024 * 1024,
+) {
   return spawnSync(
     "git",
     [
@@ -126,7 +132,7 @@ function git(cwd: string, args: string[], repository?: RepositoryIdentity, timeo
       encoding: "buffer",
       stdio: ["ignore", "pipe", "pipe"],
       timeout,
-      maxBuffer: 16 * 1024 * 1024,
+      maxBuffer,
     },
   );
 }
@@ -350,10 +356,28 @@ function trackedContent(
 }
 
 const LAUNCH_COMMIT_LIMIT = 10_000;
+const LAUNCH_OBJECT_LIMIT = 10_000;
 
 export interface RepositoryCaptureOptions {
   launchCommitLimit?: number;
   historyTimeoutMs?: number;
+}
+
+/** True for a symbolic HEAD to an absent ref. */
+function unbornHead(repository: RepositoryIdentity): boolean {
+  const head = git(
+    repository.workTree,
+    ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
+    repository,
+  );
+  if (head.error || head.status !== 0) return false;
+  const output = head.stdout.toString();
+  if (!/^refs\/[^\r\n]+\n$/.test(output)) return false;
+  const target = output.slice(0, -1);
+  const valid = git(repository.workTree, ["check-ref-format", target], repository);
+  if (valid.error || valid.status !== 0) return false;
+  const result = git(repository.workTree, ["show-ref", "--exists", target], repository);
+  return !result.error && result.status === 2;
 }
 
 function launchTrees(
@@ -380,6 +404,42 @@ function launchTrees(
     };
   }
   const output = result.stdout.toString();
+  if (output === "") {
+    // Unborn acceptance requires symbolic HEAD to an absent ref and no commit/tag objects.
+    if (!unbornHead(repository)) return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    const refs = git(repository.workTree, ["show-ref"], repository, options.historyTimeoutMs);
+    if (refs.error || refs.status !== 1 || refs.stdout.length !== 0)
+      return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    const objects = git(
+      repository.workTree,
+      ["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"],
+      repository,
+      options.historyTimeoutMs,
+      (LAUNCH_OBJECT_LIMIT + 1) * "commit\n".length,
+    );
+    if (
+      objects.error ||
+      objects.status !== 0 ||
+      /(?:^|\n)(?:error|fatal):/.test(objects.stderr.toString())
+    ) {
+      const code = (objects.error as NodeJS.ErrnoException | undefined)?.code;
+      return {
+        trees: new Set(),
+        historyCheckSkipped:
+          code === "ETIMEDOUT" ? "timeout" : code === "ENOBUFS" ? "limit" : "unavailable",
+      };
+    }
+    const kinds = objects.stdout.toString();
+    const entries = kinds === "" ? [] : kinds.endsWith("\n") ? kinds.slice(0, -1).split("\n") : [];
+    if (entries.length > LAUNCH_OBJECT_LIMIT)
+      return { trees: new Set(), historyCheckSkipped: "limit" };
+    if (
+      (kinds !== "" && !kinds.endsWith("\n")) ||
+      entries.some((kind) => !/^(blob|tree)$/.test(kind))
+    )
+      return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    return { trees: new Set() };
+  }
   const trees = output.endsWith("\n") ? output.slice(0, -1).split("\n") : [];
   if (trees.length > limit) return { trees: new Set(), historyCheckSkipped: "limit" };
   if (!output.endsWith("\n") || trees.some((tree) => !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(tree)))
@@ -446,6 +506,11 @@ export function captureRepositoryState(
   launch?: RepositoryState,
   options: RepositoryCaptureOptions = {},
 ): RepositoryState {
+  if (
+    options.launchCommitLimit !== undefined &&
+    (!Number.isSafeInteger(options.launchCommitLimit) || options.launchCommitLimit <= 0)
+  )
+    return { kind: "unavailable" };
   if (launch && launch.kind !== "git") return { kind: "unavailable" };
   try {
     const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
