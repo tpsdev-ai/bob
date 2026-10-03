@@ -333,9 +333,10 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
   // Whether an `agent_end` has been observed since the boundary: the run has
-  // ended and nothing is running. Set by `agent_end`, cleared by `agent_start`
-  // and `startTurn()`. It is what lets a compaction that lands AFTER the agent
-  // ended be told apart from one that interrupts a live run (bob#179).
+  // ended and nothing is running. Set by `agent_end`, cleared by `agent_start`,
+  // `startTurn()` and a mid-run compaction's boundary (see `clearCapture`). It is
+  // what lets a compaction that lands AFTER the agent ended be told apart from
+  // one that interrupts a live run (bob#179).
   let agentEnded = false;
 
   const clearCapture = (): void => {

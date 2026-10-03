@@ -37,7 +37,8 @@ describe("createCompactionObserver — a compaction after agent_end (#179)", () 
   it("still sends the note when the interrupted run had no final message (overflow retry)", () => {
     const injected: string[] = [];
     const observer = createCompactionObserver({ inject: (t) => injected.push(t) });
-    // A failed/length-stopped message is not a final message, so the run is unfinished.
+    // An error-ended message is not a final message, so the run it left is
+    // unfinished and the note still fires.
     observer.observe({
       type: "message_end",
       message: { role: "assistant", content: [], stopReason: "error" },
