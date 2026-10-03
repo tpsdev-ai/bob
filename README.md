@@ -963,7 +963,14 @@ deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 explicitly requested missing file, an unreadable file or an invalid document refuses. A row with no
 mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
 loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
-data cannot assert that custody.
+data cannot assert that custody. A row may also declare `request: {idleTimeoutMs, totalTimeoutMs,
+maxRetries}` — the request timeout and retry policy for that row. `idleTimeoutMs` aborts a request
+that has received no data for that long, reset on every streamed chunk; `totalTimeoutMs` (0 disables)
+is a hard cap; `maxRetries` is the provider-level blind-retry count. The built-in keyless rows
+(`ollama`, `ollama-newton`, `omlx`) declare a 120 s idle timeout, a 30 min total cap and no blind
+retry, so a long local generation is not cut off by a single cloud-sized total timeout and a
+timed-out generation is surfaced (with the provider, the limit and the remedy) rather than retried.
+An out-of-bounds, non-integer or incomplete `request` refuses at load by row name.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,

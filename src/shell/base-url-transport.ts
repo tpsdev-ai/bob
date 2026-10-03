@@ -4,6 +4,7 @@ import {
   streamSimple as openaiStreamSimple,
 } from "@earendil-works/pi-ai/api/openai-completions";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { type ProviderRequestPolicy, withStreamTimeouts } from "./provider-request-policy.js";
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -11,6 +12,7 @@ export function installBaseUrlTransport(
   runtime: ModelRuntime,
   provider: string,
   baseUrl: string,
+  request?: ProviderRequestPolicy,
 ): void {
   const originalAuth = runtime.getAuth.bind(runtime);
   runtime.getAuth = (async (selected, options) => {
@@ -42,6 +44,11 @@ export function installBaseUrlTransport(
     }
     return response;
   };
+  // The row's request timeout/retry policy (bob#185 item 1) is enforced on the
+  // request fetch: an idle timer that resets on every chunk and a generous total
+  // cap. A row with no policy keeps the previous behaviour exactly.
+  const requestFetch =
+    request === undefined ? guardedFetch : withStreamTimeouts(guardedFetch, request, provider);
 
   const send = (
     delegate: typeof openaiStreamSimple,
@@ -52,12 +59,21 @@ export function installBaseUrlTransport(
     if (model.baseUrl !== baseUrl || model.api !== "openai-completions") {
       throw new Error("bob: run bob models <agent> to apply provider.base_url");
     }
+    // bob owns the timeouts and retries when the row carries a policy: the
+    // request carries no SDK total timeout, and a timed-out generation is never
+    // retried (maxRetries is the row's, 0 for a local row).
+    const {
+      timeoutMs: _droppedTimeout,
+      maxRetries: _droppedRetries,
+      ...rest
+    } = (options ?? {}) as Record<string, unknown>;
     return delegate({ ...model, headers: undefined } as never, context, {
-      ...options,
+      ...rest,
+      ...(request !== undefined ? { timeoutMs: undefined, maxRetries: request.maxRetries } : {}),
       apiKey: BASE_URL_PLACEHOLDER,
       headers: undefined,
       env: {},
-      fetch: guardedFetch,
+      fetch: requestFetch,
     } as never);
   };
 
