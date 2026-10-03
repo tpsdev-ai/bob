@@ -1246,9 +1246,9 @@ async function runBoundedSession(
   let failed = false;
   let aborted: TerminationReason | undefined;
 
-  // #145: after every non-aborted compaction the observer sends ONE best-effort
-  // "what remains" note (a steer: the last thing the agent said, git status,
-  // recent tool calls).
+  // #145: the observer sends a best-effort compaction note except after
+  // `agent_end` with nonempty text, stopReason "stop", no tool calls, and
+  // compaction willRetry false (or an aborted compaction).
   // It is never load-bearing — the task is in the system prompt — so a failed
   // note is logged and nothing else happens. The observer also owns the
   // final-message boundary the judge reads.
@@ -1265,11 +1265,7 @@ async function runBoundedSession(
   });
   const unsubscribeContract = session.subscribe((event) => observer.observe(event));
 
-  // The FINAL message is the text of the LAST assistant message that ENDED since
-  // the last compaction (or the last startTurn): text streamed before a
-  // compaction can never satisfy the completion contract, streamed deltas are
-  // never substituted for the ended message's own content, and the observer
-  // clears its capture on `compaction_end` and at every `startTurn()`.
+  // The judge reads the observer's final-message boundary.
   const finalTextNow = (): string => {
     const tracked = observer.finalText();
     if (tracked.length > 0) return tracked;
