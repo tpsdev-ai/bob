@@ -49,11 +49,8 @@ export interface RequestUsageRecord {
    *  then not the provider's: its usage never arrived, so the prompt counts are
    *  0 and completionTokens is the cap bob assigned, a lower bound. */
   outputCapped?: true;
-  /** The per-turn output cap the request carried (the selected row's
-   *  budget.maxOutputTokens, bob#185 item 2), present only on a request the
-   *  provider stopped at its length limit. Together with `provider` and
-   *  `completionTokens` this is the run log's evidence that a turn hit the
-   *  row's output cap. */
+  /** The selected row's budget.maxOutputTokens (bob#185 item 2), present only
+   *  on a request whose stopReason is "length". */
   outputCap?: number;
 }
 

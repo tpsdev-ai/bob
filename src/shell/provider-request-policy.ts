@@ -1,38 +1,13 @@
-// Provider-aware REQUEST timeouts and retry policy, carried by the SELECTED
-// provider row (bob#185 item 1).
-//
-// The measured problem: an OpenAI-compatible request carried one total timeout
-// (cloud-sized). On a local model that generates for minutes a single
-// cloud-sized total timeout is the wrong bound, and a timeout must not silently
-// discard the generation and start over. This module turns the row into the
-// source of the policy:
-//
-//   * idleTimeoutMs — abort when no response data has arrived for this long
-//     (queued + prefill + inter-token gaps). Reset on every streamed chunk.
-//   * totalTimeoutMs — a generous hard cap on the whole request; 0 disables it.
-//   * maxRetries — provider-level blind retries; 0 means never, so a timed-out
-//     generation is surfaced (not thrown away and silently retried).
-//
-// A timed-out generation is an ERROR, surfaced with the provider, the elapsed
-// limit and the remedy; the policy itself never retries it. This module
-// owns the timeout mechanism; the row owns the values (validated at load by
-// provider-registry.ts).
-
 /** A row's request timeout and retry policy. Every field is required. */
 export interface ProviderRequestPolicy {
-  /** No-data idle timeout in ms (queued, prefill and inter-chunk gaps). 0 disables. */
+  /** Timeout in ms while awaiting response headers or a body chunk; consumer pauses are excluded. */
   readonly idleTimeoutMs: number;
   /** Hard cap on the whole request in ms. 0 disables. */
   readonly totalTimeoutMs: number;
-  /** Provider-level blind retries. 0 means none. */
+  /** Provider request retries. 0 means none. */
   readonly maxRetries: number;
 }
 
-/**
- * The validated bounds for a policy an operator may declare. `totalTimeoutMs`
- * additionally accepts 0 (disabled); a nonzero value below the minimum is a
- * short total timeout, which is what this change exists to remove.
- */
 export const REQUEST_POLICY_BOUNDS = Object.freeze({
   idleTimeoutMs: Object.freeze({ min: 1_000, max: 600_000 }),
   totalTimeoutMs: Object.freeze({ min: 900_000, max: 86_400_000 }),
@@ -45,13 +20,12 @@ function formatMs(ms: number): string {
   return `${ms} ms`;
 }
 
-/** The named error for a stream that went idle past the row's idle timeout. */
 export class ProviderStreamIdleTimeoutError extends Error {
   readonly provider: string;
   readonly idleTimeoutMs: number;
   constructor(provider: string, idleTimeoutMs: number) {
     super(
-      `bob: provider stream idle timeout — provider "${provider}" sent no data for ${formatMs(idleTimeoutMs)}; the timed-out generation was not retried. Remedy: raise this row's request.idleTimeoutMs, or check the endpoint.`,
+      `bob: provider stream idle timeout — provider "${provider}": waiting for response headers or a body chunk exceeded ${formatMs(idleTimeoutMs)}. Remedy: raise this row's request.idleTimeoutMs, or check the endpoint.`,
     );
     this.name = "ProviderStreamIdleTimeoutError";
     this.provider = provider;
@@ -65,7 +39,7 @@ export class ProviderRequestTimeoutError extends Error {
   readonly totalTimeoutMs: number;
   constructor(provider: string, totalTimeoutMs: number) {
     super(
-      `bob: provider request timeout — provider "${provider}" exceeded its ${formatMs(totalTimeoutMs)} total request cap; the timed-out generation was not retried. Remedy: raise this row's request.totalTimeoutMs, or check the endpoint.`,
+      `bob: provider request timeout — provider "${provider}" exceeded its ${formatMs(totalTimeoutMs)} total request cap. Remedy: raise this row's request.totalTimeoutMs, or check the endpoint.`,
     );
     this.name = "ProviderRequestTimeoutError";
     this.provider = provider;
@@ -80,28 +54,19 @@ interface TimerSeam {
 
 const systemTimers: TimerSeam = { setTimeout, clearTimeout };
 
-/**
- * Wrap a fetch so the request it makes carries the row's idle and total
- * timeouts. The idle timer is armed before the request (covering queue + first
- * token) and re-armed on every streamed chunk; the total timer is armed once.
- * On either firing the underlying request is aborted with the NAMED error, so
- * the caller surfaces it; a timeout is not a provider error, so the request
- * retry policy does not retry it.
- *
- * Headers, method, body and the caller's own AbortSignal are preserved.
- */
 export function withStreamTimeouts(
   baseFetch: typeof globalThis.fetch,
   policy: ProviderRequestPolicy,
   provider: string,
   timers: TimerSeam = systemTimers,
+  onTimeout?: (error: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError) => void,
 ): typeof globalThis.fetch {
   const wrapped = async (
     input: Parameters<typeof globalThis.fetch>[0],
     init?: Parameters<typeof globalThis.fetch>[1],
   ): Promise<Response> => {
     const controller = new AbortController();
-    const callerSignal = init?.signal ?? undefined;
+    const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const onCallerAbort = () => controller.abort(callerSignal?.reason);
     if (callerSignal !== undefined) {
       if (callerSignal.aborted) controller.abort(callerSignal.reason);
@@ -124,17 +89,21 @@ export function withStreamTimeouts(
       }
       callerSignal?.removeEventListener("abort", onCallerAbort);
     };
+    const abortTimeout = (error: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError) => {
+      onTimeout?.(error);
+      controller.abort(error);
+    };
     const armIdle = () => {
       if (policy.idleTimeoutMs <= 0) return;
       disarmIdle();
       idleHandle = timers.setTimeout(() => {
-        controller.abort(new ProviderStreamIdleTimeoutError(provider, policy.idleTimeoutMs));
+        abortTimeout(new ProviderStreamIdleTimeoutError(provider, policy.idleTimeoutMs));
       }, policy.idleTimeoutMs);
     };
 
     if (policy.totalTimeoutMs > 0) {
       totalHandle = timers.setTimeout(() => {
-        controller.abort(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
+        abortTimeout(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
       }, policy.totalTimeoutMs);
     }
     armIdle();
@@ -142,9 +111,10 @@ export function withStreamTimeouts(
     let response: Response;
     try {
       response = await baseFetch(input, { ...init, signal: controller.signal });
+      disarmIdle();
     } catch (err) {
       cleanup();
-      throw err;
+      throw controller.signal.aborted ? controller.signal.reason : err;
     }
 
     const originalBody = response.body;
@@ -153,28 +123,33 @@ export function withStreamTimeouts(
       return response;
     }
 
+    const controllerSignal = controller.signal;
     const reader = originalBody.getReader();
-    const body = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const { done, value } = await reader.read();
-          if (done) {
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            armIdle();
+            const { done, value } = await reader.read();
+            disarmIdle();
+            if (done) {
+              cleanup();
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+          } catch (err) {
             cleanup();
-            controller.close();
-            return;
+            controller.error(controllerSignal.aborted ? controllerSignal.reason : err);
           }
-          armIdle();
-          controller.enqueue(value);
-        } catch (err) {
+        },
+        cancel(reason) {
           cleanup();
-          controller.error(err);
-        }
+          return reader.cancel(reason);
+        },
       },
-      cancel(reason) {
-        cleanup();
-        return reader.cancel(reason);
-      },
-    });
+      { highWaterMark: 0 },
+    );
 
     return new Response(body, {
       status: response.status,

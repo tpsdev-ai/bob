@@ -1,151 +1,140 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { createServer, type Server } from "node:http";
-import type { Socket } from "node:net";
+import { describe, expect, it } from "bun:test";
 import {
-  type ProviderRequestPolicy,
   ProviderRequestTimeoutError,
   ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "../../src/shell/provider-request-policy.js";
-
-const SSE_CHUNK = (content: string, finish: string | null) =>
-  `data: ${JSON.stringify({
-    id: "1",
-    choices: [{ index: 0, delta: { content }, finish_reason: finish }],
-  })}\n\n`;
-const SSE_DONE = "data: [DONE]\n\n";
-
-interface FakeServer {
-  url: string;
-  requests: number;
-  close: () => Promise<void>;
-}
-
-/** A fake OpenAI-compatible SSE server on loopback. No network leaves the host. */
-async function startFakeServer(
-  handler: (res: import("node:http").ServerResponse, signal: AbortSignal) => void | Promise<void>,
-): Promise<FakeServer> {
-  const sockets = new Set<Socket>();
-  let requests = 0;
-  const server: Server = createServer((req, res) => {
-    requests += 1;
-    const controller = new AbortController();
-    req.on("close", () => controller.abort());
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
-    void handler(res, controller.signal);
-  });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("no server address");
-  return {
-    url: `http://127.0.0.1:${address.port}/v1`,
-    get requests() {
-      return requests;
-    },
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      sockets.clear();
-      server.closeAllConnections?.();
-      await Promise.race([
-        new Promise<void>((resolve) => server.close(() => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-      ]);
-    },
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+import { memoryServer, sleep } from "./provider-timeout-fixture.js";
 
 describe("bob#185 item 1 — the request-timeout mechanism", () => {
-  let servers: FakeServer[];
-  beforeEach(() => {
-    servers = [];
-  });
-  afterEach(async () => {
-    for (const server of servers) await server.close();
-  });
-
-  it("a stream that keeps sending is not cut off by the idle timeout", async () => {
-    const server = await startFakeServer(async (res, signal) => {
-      for (let i = 0; i < 8; i++) {
-        if (signal.aborted) return;
-        res.write(SSE_CHUNK(`tok${i}`, null));
-        await sleep(25);
-      }
-      res.write(SSE_CHUNK("", "stop"));
-      res.write(SSE_DONE);
-      res.end();
-    });
-    servers.push(server);
-    const policy: ProviderRequestPolicy = {
-      idleTimeoutMs: 150,
-      totalTimeoutMs: 0,
-      maxRetries: 0,
-    };
-    const guarded = withStreamTimeouts(globalThis.fetch, policy, "fake-local");
-    const response = await guarded(`${server.url}/chat/completions`);
-    const text = await response.text();
-    expect(text).toContain("tok7");
-    expect(text).toContain("[DONE]");
-    expect(server.requests).toBe(1);
-  }, 10_000);
-
-  it("an idle stream fails with the named idle error and makes one request", async () => {
-    const server = await startFakeServer(async (res, signal) => {
-      res.write(SSE_CHUNK("start", null));
-      // Then go silent: the idle timer must fire.
-      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve()));
-    });
-    servers.push(server);
-    const policy: ProviderRequestPolicy = {
-      idleTimeoutMs: 200,
-      totalTimeoutMs: 0,
-      maxRetries: 5,
-    };
-    const guarded = withStreamTimeouts(globalThis.fetch, policy, "fake-local");
-    const response = await guarded(`${server.url}/chat/completions`);
-    const failure = await response.text().then(
-      () => "accepted",
-      (err: Error) => err,
+  it("allows successive body reads shorter than the idle timeout", async () => {
+    const server = memoryServer({ chunks: 8, chunkDelayMs: 25 });
+    const guarded = withStreamTimeouts(
+      server.fetch,
+      {
+        idleTimeoutMs: 150,
+        totalTimeoutMs: 0,
+        maxRetries: 0,
+      },
+      "fake-local",
     );
-    expect(failure).toBeInstanceOf(ProviderStreamIdleTimeoutError);
-    expect((failure as Error).name).toBe("ProviderStreamIdleTimeoutError");
-    expect((failure as Error).message).toContain('provider "fake-local"');
-    expect((failure as Error).message).toContain("idle timeout");
+    const response = await guarded("http://fake.local/v1/chat/completions");
+    expect(await response.text()).toContain("tok7");
     expect(server.requests).toBe(1);
-  }, 10_000);
+  });
 
-  it("a request past the total cap fails with the named total error", async () => {
-    const server = await startFakeServer(async (res, signal) => {
-      while (!signal.aborted) {
-        res.write(SSE_CHUNK("x", null));
-        await sleep(20);
+  it.each([false, true])(
+    "excludes consumer pauses while chunks arrive, with a chunk already read=%s",
+    async (readFirst) => {
+      const server = memoryServer({ chunks: 10, chunkDelayMs: 200 });
+      const timeouts: Error[] = [];
+      const guarded = withStreamTimeouts(
+        server.fetch,
+        { idleTimeoutMs: 1_000, totalTimeoutMs: 0, maxRetries: 0 },
+        "fake-local",
+        undefined,
+        (error) => timeouts.push(error),
+      );
+      const response = await guarded("http://fake.local/v1/chat/completions");
+      const reader = response.body?.getReader();
+      if (reader === undefined) throw new Error("no response body");
+      let text = "";
+      const decoder = new TextDecoder();
+      if (readFirst) {
+        const first = await reader.read();
+        expect(first.done).toBe(false);
+        text += decoder.decode(first.value);
       }
-    });
-    servers.push(server);
-    const policy: ProviderRequestPolicy = {
-      idleTimeoutMs: 0,
-      totalTimeoutMs: 300,
-      maxRetries: 0,
-    };
-    const guarded = withStreamTimeouts(globalThis.fetch, policy, "fake-local");
-    const response = await guarded(`${server.url}/chat/completions`);
-    const failure = await response.text().then(
-      () => "accepted",
-      (err: Error) => err,
+      await sleep(1_500);
+      expect(timeouts).toEqual([]);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value);
+      }
+      expect(text).toContain("tok0");
+      expect(text).toContain("tok9");
+      expect(timeouts).toEqual([]);
+    },
+  );
+
+  it("starts the idle clock when a paused consumer resumes a stalled read", async () => {
+    const server = memoryServer({ stall: true });
+    const timeouts: Error[] = [];
+    const guarded = withStreamTimeouts(
+      server.fetch,
+      { idleTimeoutMs: 50, totalTimeoutMs: 0, maxRetries: 0 },
+      "fake-local",
+      undefined,
+      (error) => timeouts.push(error),
     );
-    expect(failure).toBeInstanceOf(ProviderRequestTimeoutError);
-    expect((failure as Error).name).toBe("ProviderRequestTimeoutError");
-    expect((failure as Error).message).toContain("total request cap");
-  }, 10_000);
+    const response = await guarded("http://fake.local/v1/chat/completions");
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("no response body");
+    expect((await reader.read()).done).toBe(false);
+    await sleep(150);
+    expect(timeouts).toEqual([]);
+    await expect(reader.read()).rejects.toBeInstanceOf(ProviderStreamIdleTimeoutError);
+    expect(timeouts).toHaveLength(1);
+  });
+
+  it("reports an idle stream with the named idle error", async () => {
+    const server = memoryServer({ stall: true });
+    const guarded = withStreamTimeouts(
+      server.fetch,
+      {
+        idleTimeoutMs: 50,
+        totalTimeoutMs: 0,
+        maxRetries: 5,
+      },
+      "fake-local",
+    );
+    const response = await guarded("http://fake.local/v1/chat/completions");
+    const text = response.text();
+    await expect(text).rejects.toBeInstanceOf(ProviderStreamIdleTimeoutError);
+    await expect(text).rejects.toThrow(
+      'provider "fake-local": waiting for response headers or a body chunk exceeded 50 ms',
+    );
+    expect(server.requests).toBe(1);
+  });
+
+  it("reports a request past its total cap with the named total error", async () => {
+    const server = memoryServer({ chunks: 100, chunkDelayMs: 20 });
+    const guarded = withStreamTimeouts(
+      server.fetch,
+      {
+        idleTimeoutMs: 150,
+        totalTimeoutMs: 100,
+        maxRetries: 0,
+      },
+      "fake-local",
+    );
+    const response = await guarded("http://fake.local/v1/chat/completions");
+    await expect(response.text()).rejects.toBeInstanceOf(ProviderRequestTimeoutError);
+  });
+
+  it("preserves a pre-aborted Request signal", async () => {
+    const caller = new AbortController();
+    const reason = new Error("caller cancelled");
+    caller.abort(reason);
+    let seen: AbortSignal | null | undefined;
+    const base = (async (_input: unknown, init?: RequestInit) => {
+      seen = init?.signal;
+      seen?.throwIfAborted();
+      return new Response();
+    }) as typeof globalThis.fetch;
+    const guarded = withStreamTimeouts(
+      base,
+      {
+        idleTimeoutMs: 1000,
+        totalTimeoutMs: 0,
+        maxRetries: 0,
+      },
+      "fake-local",
+    );
+    await expect(
+      guarded(new Request("http://fake.local/", { signal: caller.signal })),
+    ).rejects.toBe(reason);
+    expect(seen?.aborted).toBe(true);
+  });
 });
