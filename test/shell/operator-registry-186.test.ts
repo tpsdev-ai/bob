@@ -9,6 +9,7 @@ import {
   DEFAULT_PROVIDER_REGISTRY,
   defaultProviderName,
   loadProviderRegistry,
+  PI_LOGIN_OWNED,
   PROVIDER_RECORDS,
   ProviderRegistry,
   providerReadsKeyFromEnv,
@@ -82,12 +83,73 @@ describe("T1 — the operator loader validates every row before returning", () =
     expect(() => loadProviderRegistry({ path })).toThrow(/unknown auth mode/);
   });
 
-  it("the obsolete gateway/envKey flags refuse as unknown fields", () => {
-    for (const flag of ["envKey: true", "gateway: true"]) {
+  it.each(["pi/disk", "pi/login", "bob/vm"])(
+    "refuses operator auth %s even for a fresh identity",
+    (auth) => {
       const path = writeRegistry(
-        `version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/none\n    ${flag}\n`,
+        `version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: ${auth}\n`,
       );
-      expect(() => loadProviderRegistry({ path })).toThrow(/unknown field/);
+      expect(() => loadProviderRegistry({ path })).toThrow(
+        `row "acme" auth "${auth}" is reserved for code-owned declarations`,
+      );
+      expect(() => loadProviderRegistry({ path })).toThrow(/Remedy:/);
+    },
+  );
+
+  it.each(PI_LOGIN_OWNED)(
+    "refuses pi-owned identity %s in every operator name field",
+    (identity) => {
+      for (const field of ["id", "aliases", "runtime"]) {
+        const id = field === "id" ? identity : "acme";
+        const aliases = field === "aliases" ? `[${identity}]` : "[]";
+        const runtime = field === "runtime" ? identity : "acme-runtime";
+        const path = writeRegistry(
+          `version: 1\nproviders:\n  - id: ${id}\n    aliases: ${aliases}\n    runtime: ${runtime}\n    auth: bob/none\n`,
+        );
+        expect(() => loadProviderRegistry({ path })).toThrow(
+          `row "${id}" ${field} collides with pi-owned identity "${identity}"`,
+        );
+        expect(() => loadProviderRegistry({ path })).toThrow(/Remedy:/);
+      }
+    },
+  );
+
+  it("refuses a pi/login row using pi-owned runtime xai", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: xai\n    auth: pi/login\n",
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(
+      /row "acme" runtime collides with pi-owned identity "xai".*Remedy:/,
+    );
+  });
+
+  it.each([false, true])("refuses pi-owned remapping with onboard default=%s", (selected) => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: xai\n    aliases: [github-copilot]\n    runtime: attacker-llm\n    auth: pi/login\n" +
+        (selected ? "defaults:\n  onboard: xai\n" : ""),
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(
+      /row "xai" id collides with pi-owned identity "xai".*Remedy:/,
+    );
+  });
+
+  it.each(["disk", "login", "vm"])("refuses a copied builtin with auth %s", (kind) => {
+    const builtin = PROVIDER_RECORDS.find((record) => record.auth.kind === kind);
+    expect(builtin).toBeDefined();
+    expect(() => new ProviderRegistry([builtin!])).not.toThrow();
+    expect(() => new ProviderRegistry([{ ...builtin! }])).toThrow(
+      /reserved for code-owned declarations.*Remedy:/,
+    );
+  });
+
+  it("the obsolete gateway/envKey flags name the explicit auth remedy", () => {
+    for (const flag of ["envKey", "gateway"]) {
+      const path = writeRegistry(
+        `version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/none\n    ${flag}: true\n`,
+      );
+      expect(() => loadProviderRegistry({ path })).toThrow(
+        `row "acme" declares the obsolete "${flag}" flag — use an explicit auth mode.`,
+      );
     }
   });
 
@@ -197,7 +259,9 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
     const path = writeRegistry(
       "version: 1\nproviders:\n  - id: xai-keyed\n    aliases: []\n    runtime: xai\n    auth: bob/env(XAI_KEY)\n    endpoint: https://xai.example/v1\n    api: openai-completions\n",
     );
-    expect(() => loadProviderRegistry({ path })).toThrow(/no implemented custody/);
+    expect(() => loadProviderRegistry({ path })).toThrow(
+      /row "xai-keyed" runtime collides with pi-owned identity "xai".*Remedy:/,
+    );
   });
 
   it("a keyed row may not authorize a base_url override", () => {

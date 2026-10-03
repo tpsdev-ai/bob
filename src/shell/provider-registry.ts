@@ -226,6 +226,16 @@ const ALLOWED_FIELDS = new Set([
   "compatibility",
 ]);
 
+function assertNoLegacyAuthFields(raw: Record<string, unknown>, id: string): void {
+  for (const field of ["gateway", "envKey"]) {
+    if (Object.hasOwn(raw, field)) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${id}" declares the obsolete "${field}" flag — use an explicit auth mode.`,
+      );
+    }
+  }
+}
+
 /**
  * Validate ONE row's non-identity fields against the row contract. Throws on a
  * missing/unknown auth mode, a contradictory `override` on a keyed row, an
@@ -236,13 +246,7 @@ const ALLOWED_FIELDS = new Set([
  */
 function validateRowFields(row: ProviderRecord): void {
   const legacy = row as unknown as Record<string, unknown>;
-  for (const field of ["gateway", "envKey"]) {
-    if (Object.hasOwn(legacy, field)) {
-      throw new ProviderRegistryError(
-        `provider registry: row "${row.id}" declares the obsolete "${field}" flag — use an explicit auth mode.`,
-      );
-    }
-  }
+  assertNoLegacyAuthFields(legacy, row.id);
   for (const field of Object.keys(legacy)) {
     if (!ALLOWED_FIELDS.has(field)) {
       throw new ProviderRegistryError(`provider registry: row "${row.id}" has an unknown field.`);
@@ -290,7 +294,7 @@ function validateRowFields(row: ProviderRecord): void {
     );
   }
   const keyed = auth.kind === "env";
-  if (row.override !== undefined && !(keyed === false && auth.kind === "none")) {
+  if (row.override !== undefined && auth.kind !== "none") {
     throw new ProviderRegistryError(
       `provider registry: row "${row.id}" declares an override policy but a base_url override is only allowed on a bob/none row.`,
     );
@@ -450,6 +454,22 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
         `provider registry: row "${record.id}" has an invalid runtime identity.`,
       );
     }
+    const codeOwned = PROVIDER_RECORDS.some((builtin) => builtin === record);
+    if (!codeOwned) {
+      for (const [field, names] of [
+        ["id", [record.id]],
+        ["aliases", record.aliases],
+        ["runtime", [record.runtime]],
+      ] as const) {
+        for (const name of names) {
+          if (PI_LOGIN_OWNED.some((identity) => identity === name)) {
+            throw new ProviderRegistryError(
+              `provider registry: row "${record.id}" ${field} collides with pi-owned identity "${name}". Remedy: choose an id, aliases and runtime outside the pi-owned namespace.`,
+            );
+          }
+        }
+      }
+    }
     for (const name of [record.id, ...record.aliases]) {
       const previous = owner.get(name);
       if (previous !== undefined) {
@@ -461,6 +481,14 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     }
     runtimes.set(record.runtime, [...(runtimes.get(record.runtime) ?? []), record.id]);
     validateRowFields(record);
+    if (
+      !codeOwned &&
+      (record.auth.kind === "disk" || record.auth.kind === "login" || record.auth.kind === "vm")
+    ) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${record.id}" auth "${authLabel(record.auth)}" is reserved for code-owned declarations. Remedy: use bob/none or bob/env(<VAR>) with implemented custody.`,
+      );
+    }
   }
   const builtinPair = (holders: readonly string[]): boolean =>
     holders.length === 2 &&
@@ -768,6 +796,7 @@ function parseAuth(value: unknown, id: string): ProviderAuth {
 function parseOperatorRow(value: unknown, index: number): ProviderRecord {
   const raw = asRecord(value, `providers[${index}]`);
   const id = typeof raw.id === "string" && SAFE_NAME.test(raw.id) ? raw.id : `providers[${index}]`;
+  assertNoLegacyAuthFields(raw, id);
   for (const key of Object.keys(raw)) {
     if (!ALLOWED_FIELDS.has(key)) {
       throw new ProviderRegistryError(`provider registry: row "${id}" has an unknown field.`);

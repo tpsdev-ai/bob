@@ -252,7 +252,7 @@ describe("provider controls", () => {
     );
     expect(() => loadProviderRegistry({ path })).toThrow(/ambiguous/);
     expect(() => new ProviderRegistry(PROVIDER_RECORDS.map((record) => ({ ...record })))).toThrow(
-      /ambiguous/,
+      /reserved for code-owned declarations/,
     );
   });
 

@@ -9,7 +9,11 @@ import {
   providerEndpoint,
   resolveRuntimeProviderName,
 } from "../../src/shell/provider-registry.js";
-import { mapBobProviderToPi, resolveRunConfig } from "../../src/shell/run.js";
+import {
+  assertProviderRunnable,
+  mapBobProviderToPi,
+  resolveRunConfig,
+} from "../../src/shell/run.js";
 
 // A row that exists only in this test: a new alias ("acme") for a provider
 // whose runtime identity and endpoint no mapper under src/ names.
@@ -68,6 +72,24 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
       registry: registry(),
     });
     expect(provider).toBe("acme-runtime");
+  });
+
+  it("runnability and run resolution use the selected registry auth", () => {
+    const selected = new ProviderRegistry([
+      { ...TEST_ROW, id: "openrouter", aliases: [], runtime: "openrouter" },
+    ]);
+    const savedKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      expect(() => assertProviderRunnable("openrouter", "test", selected)).not.toThrow();
+      initAgent(baseOpts({ provider: "openrouter", registry: selected }));
+      expect(
+        resolveRunConfig({ name: "acmebot", agentsRoot: tmpRoot, registry: selected }).provider,
+      ).toBe("openrouter");
+    } finally {
+      if (savedKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = savedKey;
+    }
   });
 
   it("a duplicate id or alias fails validation, naming the name", () => {

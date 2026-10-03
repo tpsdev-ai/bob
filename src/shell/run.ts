@@ -2530,8 +2530,12 @@ function readBobYaml(agentDir: string, name: string): string {
 // interview) can run it up front and leave nothing behind on a missing key.
 // `provider` is pi's provider id (already mapped by mapBobProviderToPi); `label`
 // names the caller for the message (e.g. "bob run <name>").
-export function assertProviderRunnable(provider: string, label: string): void {
-  if (!providerReadsKeyFromEnv(provider)) return;
+export function assertProviderRunnable(
+  provider: string,
+  label: string,
+  registry?: ProviderRegistry,
+): void {
+  if (!providerReadsKeyFromEnv(provider, registry)) return;
   if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
   if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
   throw new Error(
@@ -2554,7 +2558,7 @@ function resolveProviderAndModel(
   // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
   // request is made (bob#183). The check is shared with `bob hire`'s pre-write
   // validation so both refuse identically.
-  assertProviderRunnable(provider, `bob run ${name}`);
+  assertProviderRunnable(provider, `bob run ${name}`, registry);
   return { provider, providerRecord: providerRecord(bobProvider, registry), model };
 }
 

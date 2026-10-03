@@ -306,7 +306,11 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   const model = opts.model ?? DEFAULT_MODEL;
   // The provider/runtime-key refusal the interview session would otherwise raise
   // AFTER the scaffold exists. Run it up front so a missing key leaves nothing.
-  assertProviderRunnable(mapBobProviderToPi(provider, opts.registry), `bob hire ${opts.name}`);
+  assertProviderRunnable(
+    mapBobProviderToPi(provider, opts.registry),
+    `bob hire ${opts.name}`,
+    opts.registry,
+  );
   // bob#214: likewise the context window. The interview is a session, and every
   // session refuses to start without the model's declared window, so a hire
   // without one would scaffold and then fail its interview. Refuse it here.
