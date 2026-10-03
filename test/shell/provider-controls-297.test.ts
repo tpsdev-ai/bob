@@ -643,8 +643,7 @@ describe("provider controls", () => {
         sessionManager: SessionManager.inMemory(config.cwd),
       });
       session = result.session as unknown as { dispose(): void };
-      // The keyed branch reads OPENROUTER_API_KEY and deletes it; the keyless
-      // branch leaves the environment untouched.
+      // This keyless branch preserves OPENROUTER_API_KEY.
       expect(process.env.OPENROUTER_API_KEY).toBe("keyless-298-sentinel");
     } finally {
       session?.dispose();
