@@ -104,7 +104,13 @@ export interface RepositoryEditEvidence {
   after: RepositoryState;
 }
 
-function git(cwd: string, args: string[], repository?: RepositoryIdentity, timeout = 5_000) {
+function git(
+  cwd: string,
+  args: string[],
+  repository?: RepositoryIdentity,
+  timeout = 5_000,
+  maxBuffer = 16 * 1024 * 1024,
+) {
   return spawnSync(
     "git",
     [
@@ -126,7 +132,7 @@ function git(cwd: string, args: string[], repository?: RepositoryIdentity, timeo
       encoding: "buffer",
       stdio: ["ignore", "pipe", "pipe"],
       timeout,
-      maxBuffer: 16 * 1024 * 1024,
+      maxBuffer,
     },
   );
 }
@@ -350,13 +356,14 @@ function trackedContent(
 }
 
 const LAUNCH_COMMIT_LIMIT = 10_000;
+const LAUNCH_OBJECT_LIMIT = 10_000;
 
 export interface RepositoryCaptureOptions {
   launchCommitLimit?: number;
   historyTimeoutMs?: number;
 }
 
-/** True for a symbolic HEAD whose target ref is absent (unborn). */
+/** True for a symbolic HEAD to an absent ref. */
 function unbornHead(repository: RepositoryIdentity): boolean {
   const head = git(
     repository.workTree,
@@ -398,10 +405,40 @@ function launchTrees(
   }
   const output = result.stdout.toString();
   if (output === "") {
-    // Accept empty history only for a symbolic HEAD whose target ref is absent (unborn).
-    return unbornHead(repository)
-      ? { trees: new Set() }
-      : { trees: new Set(), historyCheckSkipped: "unavailable" };
+    // Unborn acceptance requires symbolic HEAD to an absent ref and no commit/tag objects.
+    if (!unbornHead(repository)) return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    const refs = git(repository.workTree, ["show-ref"], repository, options.historyTimeoutMs);
+    if (refs.error || refs.status !== 1 || refs.stdout.length !== 0)
+      return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    const objects = git(
+      repository.workTree,
+      ["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"],
+      repository,
+      options.historyTimeoutMs,
+      (LAUNCH_OBJECT_LIMIT + 1) * "commit\n".length,
+    );
+    if (
+      objects.error ||
+      objects.status !== 0 ||
+      /(?:^|\n)(?:error|fatal):/.test(objects.stderr.toString())
+    ) {
+      const code = (objects.error as NodeJS.ErrnoException | undefined)?.code;
+      return {
+        trees: new Set(),
+        historyCheckSkipped:
+          code === "ETIMEDOUT" ? "timeout" : code === "ENOBUFS" ? "limit" : "unavailable",
+      };
+    }
+    const kinds = objects.stdout.toString();
+    const entries = kinds === "" ? [] : kinds.endsWith("\n") ? kinds.slice(0, -1).split("\n") : [];
+    if (entries.length > LAUNCH_OBJECT_LIMIT)
+      return { trees: new Set(), historyCheckSkipped: "limit" };
+    if (
+      (kinds !== "" && !kinds.endsWith("\n")) ||
+      entries.some((kind) => !/^(blob|tree)$/.test(kind))
+    )
+      return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    return { trees: new Set() };
   }
   const trees = output.endsWith("\n") ? output.slice(0, -1).split("\n") : [];
   if (trees.length > limit) return { trees: new Set(), historyCheckSkipped: "limit" };
