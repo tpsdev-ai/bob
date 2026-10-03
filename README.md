@@ -961,9 +961,18 @@ deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 `bob/vm` (host/VM identity), or `pi/disk` / `pi/login` (pi-managed). An operator file at
 `~/.config/bob/providers.yaml` may add rows; an absent file uses the built-in rows, while an
 explicitly requested missing file, an unreadable file or an invalid document refuses. A row with no
-mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
-loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
-data cannot assert that custody. A keyless row may declare `request: {idleTimeoutMs, totalTimeoutMs, maxRetries}`;
+mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. **Custody
+implementations are code-owned and keyed by API flavour** — there is one, `openai-completions`, the
+generic keyed OpenAI-compatible transport — and built-in keyed rows are PINNED (runtime, variable,
+endpoint and API): `openrouter` keeps `bob/env(OPENROUTER_API_KEY)`, its
+`https://openrouter.ai/api/v1` endpoint and its model metadata. An operator row writes `auth:
+bob/env` and declares NO variable: it is derived as `BOB_PROVIDER_<ID>_KEY` (the id upper-cased with
+EVERY character outside `[A-Z0-9]` mapped to `_`), so no operator-declared name can reach a variable
+bob, pi or the launcher owns. Such a row loads only when its API has an implementation, its endpoint
+is a canonical HTTPS URL with a non-root path and no trailing slash, it declares no override or
+request policy, its id, aliases and runtime are outside pi's catalog and its login-owned names, and
+its DERIVED variable is unique across rows (`keyed-transport-186-s3a.test.ts` (K8);
+`operator-registry-186.test.ts`). Operator data cannot assert that custody exists. A keyless row may declare `request: {idleTimeoutMs, totalTimeoutMs, maxRetries}`;
 policies on other rows refuse. `idleTimeoutMs` limits waits for response headers or a body chunk, excluding consumer
 pauses; `totalTimeoutMs` caps the request (0 disables it). `maxRetries` caps provider request
 retries; row timeouts are terminal and pi session retries are disabled for policy-bearing rows.
@@ -984,6 +993,25 @@ entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a com
 `openrouter` model resolves from bob's in-memory provider. **bob holds the OpenRouter key; pi does not.** It lives in bob's runtime-factory closure (so `/new` and `/resume` reuse it) and in the transport function built from it, which sends only to `https://openrouter.ai/api/v1`; pi's auth and registered provider config hold a NON-SECRET placeholder, and pi's model data carries no key. The first session the runtime factory builds reads `OPENROUTER_API_KEY` once and DELETES it from `process.env`, after pi's model runtime is created and before capabilities, extensions and tools load (`(r2)`); the transport refuses a model whose `baseUrl`/`api` is not bob's (`(t1, unit)`), refuses the listed credential header names (`authorization`, `proxy-authorization`, `cf-aig-authorization`, `x-api-key`, `api-key`, `x-auth-token`, `cookie`) (`(t4, unit)`, `(r3)`), and its fetch wrapper refuses a non-canonical URL or a `Request` (`(t5, unit)`, `(r4)`); a real session turn carries `Bearer <the real key>` to `<base>/chat/completions` (`(t2, session path)`); the key is in none of pi's auth, registered provider config or model data (`(t3)`); a `ModelRuntime.refresh()` with a tampered `models.json` can install pi's BUILT-IN provider as the effective one — bob's transport is then not on the request path — so what holds instead is key containment: the key is no longer in `process.env` or in pi's data, so the fallback provider that pi's request path prepares has no key to send and `getAuth("openrouter")` resolves none (`(r1)`, whose control phase shows the same path DOES send the key to another host while the environment still holds it). STATED LIMIT: this removes the IN-PROCESS path only — a same-user process can still read a process's initial environment block (`/proc/<pid>/environ` on Linux, `ps eww` on macOS); isolating the agent's own tools from that is bob#189, not this change. The key also lives in the bob process's memory — the runtime-factory and transport closures — so a same-user process that can read another process's memory (a debugger, `/proc/<pid>/mem`, or a core dump) can recover it; isolating that is likewise bob#189. Operator symptom of the refresh fallback: after a `refresh()` that breaks composition, pi's built-in `openrouter` provider is the effective one and has none of bob's key, so a turn fails with an auth error even though the operator's key is valid — check first whether a `.pi-agent/models.json` entry defines `openrouter` (an extension cannot: bob's registration guard refuses it). An
 unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
 path's persisted files (`(c)`).
+
+### Keyed custody, and the writers
+
+For a keyed row the key is read ONCE from its variable, DELETED from `process.env`, held in bob's
+closures and injected only at the transport, which sends only to the row's canonical pinned
+endpoint and refuses a redirect, a credential-bearing header, a non-canonical URL or a `Request`
+object, and refuses deferred requests before pi resolves auth (`keyed-transport-186-s3a.test.ts`
+(K1)–(K3), (K9)). Replacement sessions reuse custody without re-reading the environment (K6). The
+session factory also removes pi's credential env names from the agent environment before a
+capability, extension, tool or child process starts — except the selected row's own runtime
+credentials (a keyed row's variable is read by custody first; a keyless row's transport substitutes
+a placeholder and strips supplied credentials).
+
+**The writers check first.** `bob init` (including `--force`), `bob hire` and `bob models` run the
+reserved-name check over BOTH pi files before their first write, and refuse when a bob-owned keyed
+entry is present or absence cannot be proven; the passing files are left byte-identical (K7). For a
+keyed row, `bob init` creates ONLY the pi files that are absent, each through an exclusive temp file
+and rename with mode 0600 set before the rename; non-keyed rows keep the plain write path, so atomic
+writes apply to keyed rows only.
 
 ### Endpoint scaffold (`provider.base_url`)
 

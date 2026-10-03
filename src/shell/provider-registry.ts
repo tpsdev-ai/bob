@@ -22,7 +22,13 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { type Document, isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
+import {
+  deriveOperatorVariable,
+  OPERATOR_VARIABLE_PREFIX,
+  OPERATOR_VARIABLE_SUFFIX,
+} from "./provider-custody.js";
 import { type ProviderRequestPolicy, REQUEST_POLICY_BOUNDS } from "./provider-request-policy.js";
 
 /** The wire API pi uses for an OpenAI-compatible custom provider. */
@@ -39,7 +45,7 @@ export const SUPPORTED_PROVIDER_APIS: readonly ProviderApi[] = Object.freeze([
  * explicit, and a row with no recognised kind refuses rather than defaulting.
  */
 export type ProviderAuth =
-  | { readonly kind: "env"; readonly variable: string }
+  | { readonly kind: "env"; readonly variable: string; readonly derived?: true }
   | { readonly kind: "none" }
   | { readonly kind: "vm" }
   | { readonly kind: "disk" }
@@ -186,18 +192,26 @@ export type ProviderName = Extract<
 >["id"];
 
 /**
- * A code-owned custody implementation, keyed by runtime identity. A `bob/env`
- * row loads only when one of these matches its declared variable, endpoint and
- * API. Operator data cannot assert that custody exists.
+ * A code-owned custody implementation, keyed by API FLAVOUR. There is one: the
+ * generic OpenAI-compatible keyed transport. A `bob/env` row loads only when
+ * its API has an implementation here. Operator data cannot assert that custody
+ * exists.
  */
-export interface CustodyDescriptor {
+export const CUSTODY_IMPLEMENTATIONS: readonly ProviderApi[] = [PROVIDER_API_OPENAI_COMPLETIONS];
+
+/**
+ * A code-owned keyed row's PINNED custody: runtime, variable, endpoint and API.
+ * A keyed row whose runtime carries a pin must equal it; operator rows declare
+ * no variable and derive theirs, so no pin attaches to them.
+ */
+export interface CustodyPin {
   readonly runtime: string;
   readonly variable: string;
   readonly endpoint: string;
   readonly api: ProviderApi;
 }
 
-export const CUSTODY_IMPLEMENTATIONS: readonly CustodyDescriptor[] = [
+export const CUSTODY_PINS: readonly CustodyPin[] = [
   {
     runtime: "openrouter",
     variable: "OPENROUTER_API_KEY",
@@ -206,8 +220,28 @@ export const CUSTODY_IMPLEMENTATIONS: readonly CustodyDescriptor[] = [
   },
 ];
 
-for (const descriptor of CUSTODY_IMPLEMENTATIONS) Object.freeze(descriptor);
 Object.freeze(CUSTODY_IMPLEMENTATIONS);
+for (const pin of CUSTODY_PINS) Object.freeze(pin);
+Object.freeze(CUSTODY_PINS);
+
+/** The pin for a keyed row's runtime, when one is declared. */
+export function custodyPinFor(runtime: string): CustodyPin | undefined {
+  return CUSTODY_PINS.find((pin) => pin.runtime === runtime);
+}
+
+/** True when an API flavour has a custody implementation. */
+export function custodyImplemented(api: ProviderApi | undefined): api is ProviderApi {
+  return api !== undefined && CUSTODY_IMPLEMENTATIONS.includes(api);
+}
+
+/**
+ * The provider identities pi ships a builtin for, read from the module pi's
+ * runtime itself loads. An operator keyed row whose id, alias or runtime is one
+ * of these (or one of PI_LOGIN_OWNED) refuses at load.
+ */
+export function piCatalogProviders(): readonly string[] {
+  return getBuiltinProviders();
+}
 
 /** Runtime identities pi already owns login/subscription credentials for. */
 export const PI_LOGIN_OWNED = ["openai-codex", "github-copilot", "xai", "kimi-coding"] as const;
@@ -290,7 +324,10 @@ function validateRowFields(row: ProviderRecord): void {
     throw new ProviderRegistryError(`provider registry: row "${row.id}" has unknown auth mode.`);
   }
   for (const field of Object.keys(auth)) {
-    if (field !== "kind" && !(auth.kind === "env" && field === "variable")) {
+    if (
+      field !== "kind" &&
+      !(auth.kind === "env" && (field === "variable" || field === "derived"))
+    ) {
       throw new ProviderRegistryError(
         `provider registry: row "${row.id}" auth has an unknown field.`,
       );
@@ -335,6 +372,11 @@ function validateRowFields(row: ProviderRecord): void {
     );
   }
   validateRequestPolicy(row.request, row.id);
+  if (keyed && row.endpoint === undefined) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" is bob/env, so it must declare an endpoint.`,
+    );
+  }
   if (row.endpoint !== undefined) {
     if (typeof row.endpoint !== "string") {
       throw new ProviderRegistryError(
@@ -374,6 +416,16 @@ function validateRowFields(row: ProviderRecord): void {
       if (url.port !== "") {
         throw new ProviderRegistryError(
           `provider registry: row "${row.id}" is bob/env, so its endpoint must not name an explicit port.`,
+        );
+      }
+      if (url.pathname === "/") {
+        throw new ProviderRegistryError(
+          `provider registry: row "${row.id}" is bob/env, so its endpoint must have a non-root path.`,
+        );
+      }
+      if (url.pathname.endsWith("/")) {
+        throw new ProviderRegistryError(
+          `provider registry: row "${row.id}" is bob/env, so its endpoint must not have a trailing slash.`,
         );
       }
     } else if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -470,24 +522,44 @@ function validExcludedHost(value: unknown): boolean {
  * not implemented refuses at load, before any write or credential read.
  */
 export function assertCustodyImplemented(rows: readonly ProviderRecord[]): void {
+  const derivedOwners = new Map<string, string>();
   for (const row of rows) {
-    if (!authIsKeyed(row.auth)) continue;
     if (row.auth.kind !== "env") continue;
-    const descriptor = CUSTODY_IMPLEMENTATIONS.find((impl) => impl.runtime === row.runtime);
-    if (descriptor === undefined) {
+    const pin = custodyPinFor(row.runtime);
+    if (pin !== undefined) {
+      if (
+        pin.variable !== row.auth.variable ||
+        pin.endpoint !== row.endpoint ||
+        pin.api !== row.api
+      ) {
+        throw new ProviderRegistryError(
+          `provider registry: keyed row "${row.id}" does not match the pinned custody for runtime "${row.runtime}".`,
+        );
+      }
+      continue;
+    }
+    if (row.auth.derived !== true) {
       throw new ProviderRegistryError(
-        `provider registry: row "${row.id}" has no implemented custody for its runtime.`,
+        `provider registry: row "${row.id}" declares its own environment variable in bob/env(...); an operator keyed row declares no variable — it is derived as ${OPERATOR_VARIABLE_PREFIX}<ID>${OPERATOR_VARIABLE_SUFFIX}. Remedy: write "auth: bob/env".`,
       );
     }
-    if (
-      descriptor.variable !== row.auth.variable ||
-      descriptor.endpoint !== row.endpoint ||
-      descriptor.api !== row.api
-    ) {
+    if (row.auth.variable !== deriveOperatorVariable(row.id)) {
       throw new ProviderRegistryError(
-        `provider registry: row "${row.id}" declares custody that does not match the implemented ${row.runtime} descriptor.`,
+        `provider registry: row "${row.id}" keyed variable is not its derived name.`,
       );
     }
+    if (!custodyImplemented(row.api)) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" has no implemented custody for its API flavour.`,
+      );
+    }
+    const previous = derivedOwners.get(row.auth.variable);
+    if (previous !== undefined) {
+      throw new ProviderRegistryError(
+        `provider registry: rows "${previous}" and "${row.id}" derive the same keyed variable "${row.auth.variable}". Remedy: choose ids that derive distinct variable names.`,
+      );
+    }
+    derivedOwners.set(row.auth.variable, row.id);
   }
 }
 
@@ -548,6 +620,21 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     }
     runtimes.set(record.runtime, [...(runtimes.get(record.runtime) ?? []), record.id]);
     validateRowFields(record);
+    if (!codeOwned && record.auth.kind === "env") {
+      for (const [field, names] of [
+        ["id", [record.id]],
+        ["aliases", record.aliases],
+        ["runtime", [record.runtime]],
+      ] as const) {
+        for (const name of names) {
+          if (piCatalogProviders().some((identity) => identity === name)) {
+            throw new ProviderRegistryError(
+              `provider registry: row "${record.id}" ${field} collides with pi provider identity "${name}". Remedy: choose an id, aliases and runtime outside pi's catalog.`,
+            );
+          }
+        }
+      }
+    }
     if (
       !codeOwned &&
       (record.auth.kind === "disk" || record.auth.kind === "login" || record.auth.kind === "vm")
@@ -849,15 +936,22 @@ function assertNoAliases(node: Node | null, source: string): void {
 function parseAuth(value: unknown, id: string): ProviderAuth {
   if (typeof value !== "string") {
     throw new ProviderRegistryError(
-      `provider registry: row "${id}" auth must be one of bob/env(<VAR>), bob/none, bob/vm, pi/disk, pi/login.`,
+      `provider registry: row "${id}" auth must be one of bob/env, bob/none, bob/vm, pi/disk, pi/login.`,
     );
   }
   if (value === "bob/none") return { kind: "none" };
   if (value === "bob/vm") return { kind: "vm" };
   if (value === "pi/disk") return { kind: "disk" };
   if (value === "pi/login") return { kind: "login" };
-  const env = /^bob\/env\(([^()]*)\)$/.exec(value);
-  if (env) return { kind: "env", variable: env[1] };
+  if (value === "bob/env") {
+    // An operator keyed row declares NO variable: it is derived from the row id.
+    return { kind: "env", variable: deriveOperatorVariable(id), derived: true };
+  }
+  if (/^bob\/env\(([^()]*)\)$/.test(value)) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" declares its own environment variable in bob/env(...); an operator keyed row declares no variable — it is derived as ${OPERATOR_VARIABLE_PREFIX}<ID>${OPERATOR_VARIABLE_SUFFIX}. Remedy: write "auth: bob/env".`,
+    );
+  }
   throw new ProviderRegistryError(`provider registry: row "${id}" has unknown auth mode.`);
 }
 

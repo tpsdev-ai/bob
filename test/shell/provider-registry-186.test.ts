@@ -118,8 +118,8 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     expect(providerEndpoint("ollama-cloud")).toBe("https://ollama.com/v1");
   });
 
-  it("a bob/env row whose runtime has no implemented custody fails validation (bob#186 slice 2)", () => {
-    // On main this constructs fine: auth is optional and nothing checks custody.
+  it("an operator keyed row that declares its own variable fails validation (bob#186 3a)", () => {
+    // On main this constructs fine: operator rows could name their own variable.
     expect(
       () =>
         new ProviderRegistry([
@@ -128,9 +128,11 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
             id: "acme-keyed",
             aliases: [],
             runtime: "acme",
+            endpoint: "https://acme.example/v1",
+            api: "openai-completions",
             auth: { kind: "env", variable: "ACME_KEY" },
           },
         ] as never),
-    ).toThrow(/no implemented custody/);
+    ).toThrow(/declares its own environment variable/);
   });
 });
