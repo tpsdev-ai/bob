@@ -236,6 +236,67 @@ describe("repository evidence in the completion gate and exploration budget", ()
     }
   });
 
+  it.each(["mtimeNs", "ctimeNs"] as const)(
+    "re-hashes same-tick same-size rewrites with racy %s",
+    (field) => {
+      const captureMs = Date.now();
+      const captureNs = BigInt(captureMs) * 1_000_000n;
+      const clock = spyOn(Date, "now").mockReturnValue(captureMs);
+      const fstat = fs.fstatSync;
+      const stat = spyOn(fs, "fstatSync").mockImplementation((fd) =>
+        Object.assign(fstat(fd, { bigint: true }), {
+          mtimeNs: captureNs - 1n,
+          ctimeNs: captureNs - 1n,
+          [field]: captureNs,
+        }),
+      );
+      const read = spyOn(fs, "readFileSync");
+      try {
+        const before = captureRepositoryState(cwd);
+        writeFileSync(join(cwd, "tracked"), "replaced\n");
+        const after = captureRepositoryState(cwd, before);
+        expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(true);
+        writeFileSync(join(cwd, "tracked"), "original\n");
+        const restored = captureRepositoryState(cwd, before);
+        expect(isVerifiedEdit("run", false, {}, { cwd, before, after: restored })).toBe(false);
+        expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(3);
+      } finally {
+        read.mockRestore();
+        stat.mockRestore();
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("reuses entries older than capture and re-hashes when the clock reaches their tick", () => {
+    const captureMs = Date.now();
+    const timestampNs = BigInt(captureMs - 1) * 1_000_000n;
+    const clock = spyOn(Date, "now").mockReturnValue(captureMs);
+    const fstat = fs.fstatSync;
+    const stat = spyOn(fs, "fstatSync").mockImplementation((fd) =>
+      Object.assign(fstat(fd, { bigint: true }), {
+        mtimeNs: timestampNs,
+        ctimeNs: timestampNs,
+      }),
+    );
+    const read = spyOn(fs, "readFileSync");
+    try {
+      const before = captureRepositoryState(cwd);
+      const unchanged = captureRepositoryState(cwd, before);
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after: unchanged })).toBe(false);
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(1);
+      clock.mockReturnValue(captureMs - 1);
+      writeFileSync(join(cwd, "tracked"), "replaced\n");
+      const after = captureRepositoryState(cwd, before);
+      expect(isVerifiedEdit("run", false, {}, { cwd, before, after })).toBe(true);
+      expect(read.mock.calls.filter(([path]) => typeof path === "number")).toHaveLength(2);
+    } finally {
+      read.mockRestore();
+      stat.mockRestore();
+      clock.mockRestore();
+    }
+  });
+
   it("invalidates cached bytes after a same-size edit with restored mtime", () => {
     const before = captureRepositoryState(cwd);
     const stat = fs.statSync(join(cwd, "tracked"));

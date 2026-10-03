@@ -260,6 +260,7 @@ function trackedContent(
   launch?: Map<string, TrackedEntry>,
   cache: ContentCache = new Map(),
 ): Map<string, TrackedEntry> {
+  const captureStartNs = BigInt(Date.now()) * 1_000_000n;
   const { workTree } = repository;
   const index = trackedEntries(
     readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository),
@@ -290,7 +291,12 @@ function trackedContent(
       if (fd !== undefined) {
         stat = fstatSync(fd, { bigint: true });
         const cached = cache.get(path);
-        if (cached && sameStat(stat, cached.stat)) {
+        if (
+          cached &&
+          stat.mtimeNs < captureStartNs &&
+          stat.ctimeNs < captureStartNs &&
+          sameStat(stat, cached.stat)
+        ) {
           content.set(path, cached.entry);
           continue;
         }
@@ -331,7 +337,12 @@ function trackedContent(
     }
     const entry = { mode, object };
     content.set(path, entry);
-    if (stat?.isFile() || stat?.isSymbolicLink()) cache.set(path, { stat, entry });
+    if (
+      (stat?.isFile() || stat?.isSymbolicLink()) &&
+      stat.mtimeNs < captureStartNs &&
+      stat.ctimeNs < captureStartNs
+    )
+      cache.set(path, { stat, entry });
     else cache.delete(path);
   }
   recheckParents([...observedParents.values()]);
