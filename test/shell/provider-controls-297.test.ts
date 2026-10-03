@@ -296,6 +296,16 @@ describe("provider controls", () => {
     );
   });
 
+  it.each(["https://ollama.com/v1", "https://ollama.com./v1"])(
+    "names the host policy when an override excludes %s",
+    (endpoint) => {
+      expect(providerBaseUrlRefusal("ollama", endpoint)).toBe(
+        "provider.base_url host is excluded by the provider row’s override.excludeHosts policy.",
+      );
+      expect(providerBaseUrlRefusal("ollama", "http://localhost:11434/v1")).toBeUndefined();
+    },
+  );
+
   it("malformed override policy never authorizes base_url", () => {
     expect(() => {
       const registry = loadProviderRegistry({ path: operator("override: true") });

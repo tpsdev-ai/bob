@@ -90,7 +90,7 @@ describe("T1 — the operator loader validates every row before returning", () =
         `version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: ${auth}\n`,
       );
       expect(() => loadProviderRegistry({ path })).toThrow(
-        `row "acme" auth "${auth}" is reserved for code-owned declarations`,
+        `row "acme" auth "${auth}" is reserved for code-owned declarations. Remedy: use bob/none for a keyless row; other custody modes require a code-owned declaration.`,
       );
       expect(() => loadProviderRegistry({ path })).toThrow(/Remedy:/);
     },
@@ -300,7 +300,7 @@ describe("T3 — the disk-refusal set comes from the registry, by name", () => {
       const auth = join(providerDir, "auth.json");
       writeFileSync(auth, `{"openrouter":${value}}`);
       expect(() => assertNoReservedProviderEntries(providerDir, ["openrouter"])).toThrow(
-        /stored openrouter credential/,
+        /auth\.json entry for openrouter/,
       );
       rmSync(auth, { force: true });
     }
@@ -383,7 +383,7 @@ defaults:
     expect(providerBaseUrlRefusal("acme", "http://127.0.0.1:9999/v1", registry)).toBeUndefined();
     // …ollama keeps its cloud-host exclusion…
     expect(providerBaseUrlRefusal("ollama", "https://ollama.com/v1", registry)).toMatch(
-      /only allowed/,
+      /override\.excludeHosts policy/,
     );
     // …and an undeclared name has no policy at all.
     expect(providerBaseUrlRefusal("acme", "http://x.test/v1", new ProviderRegistry())).toMatch(

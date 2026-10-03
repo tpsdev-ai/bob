@@ -248,6 +248,7 @@ export function providerBaseUrlRefusal(
   if (policy !== undefined) {
     const host = parsed.hostname.replace(/\.+$/, "");
     if (!(policy.excludeHosts ?? []).includes(host)) return undefined;
+    return "provider.base_url host is excluded by the provider row’s override.excludeHosts policy.";
   }
   return "provider.base_url is only allowed for a keyless provider row that authorizes an override.";
 }

@@ -486,7 +486,7 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
       (record.auth.kind === "disk" || record.auth.kind === "login" || record.auth.kind === "vm")
     ) {
       throw new ProviderRegistryError(
-        `provider registry: row "${record.id}" auth "${authLabel(record.auth)}" is reserved for code-owned declarations. Remedy: use bob/none or bob/env(<VAR>) with implemented custody.`,
+        `provider registry: row "${record.id}" auth "${authLabel(record.auth)}" is reserved for code-owned declarations. Remedy: use bob/none for a keyless row; other custody modes require a code-owned declaration.`,
       );
     }
   }

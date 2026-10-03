@@ -120,11 +120,11 @@ describe("provider.base_url containment", () => {
   it.each(["https://ollama.com./v1", "https://ollama.com%2e/v1"])(
     "refuses cloud hostname %s before writes",
     (baseUrl) => {
-      expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/provider.base_url is only allowed/);
+      expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/override\.excludeHosts policy/);
       expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
       expect(() =>
         readProviderLimits(`provider:\n  name: ollama\n  base_url: ${baseUrl}\n`),
-      ).toThrow(/provider.base_url is only allowed/);
+      ).toThrow(/override\.excludeHosts policy/);
     },
   );
 
@@ -660,7 +660,7 @@ describe("bob#141 — provider.base_url", () => {
       "  base_url: https://ollama.com/v1",
       "",
     ].join("\n");
-    expect(() => readProviderLimits(yaml)).toThrow(/provider.base_url is only allowed/);
+    expect(() => readProviderLimits(yaml)).toThrow(/override\.excludeHosts policy/);
   });
 
   it("a URL carrying credentials, or a non-http scheme, is refused", () => {

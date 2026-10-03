@@ -594,15 +594,15 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
     return { agentDir: r.agentDir, piDir: join(r.agentDir, ".pi-agent") };
   }
 
-  it("(a) auth.json = BOM + an openrouter credential → refused, naming the STORED-CREDENTIAL message", () => {
+  it("(a) auth.json with a BOM and an openrouter entry is refused", () => {
     const { piDir } = scaffold("orr4a");
     writeFileSync(
       join(piDir, "auth.json"),
       `\uFEFF${JSON.stringify({ openrouter: { type: "api_key", key: "x" } })}`,
     );
-    // BOM stripped → parses → finds the entry: the STORED-CREDENTIAL refusal, not
-    // a mere parse error that happens to name the file.
-    expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(/carries a stored openrouter credential/);
+    expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(
+      /carries an auth\.json entry for openrouter/,
+    );
     expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(/auth\.json/);
   });
 

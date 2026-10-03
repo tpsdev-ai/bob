@@ -412,15 +412,14 @@ export function assertNoReservedProviderEntries(
   for (const name of reserved) {
     if (Object.hasOwn(auth, name)) {
       throw new Error(
-        `bob: refusing to start a session — ${authPath} carries a stored ${name} credential; bob owns the ${name} provider (in-memory only). Remove this entry.`,
+        `bob: refusing to start a session — ${authPath} carries an auth.json entry for ${name}; bob owns the ${name} provider (in-memory only). Remove this entry.`,
       );
     }
   }
 }
 
 /**
- * The slice-2 entry point: refuse an on-disk entry for every reserved name the
- * DEFAULT registry derives (each bob/env row's id, aliases and runtime).
+ * Refuse on-disk entries for the supplied reserved names.
  */
 export function assertNoOnDiskOpenrouter(
   piAgentDir: string,
