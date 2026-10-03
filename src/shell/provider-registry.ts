@@ -1,8 +1,9 @@
 // Provider records: canonical ID, aliases and runtime identity; endpoints and API flavours are optional.
-// Init writes declared endpoints for disk-backed providers; run resolves the identity.
+// Init writes a disk-backed provider's declared endpoint, unless an allowed provider.base_url
+// overrides it (ollama); run resolves the identity.
 // envKey controls scaffold disk omission; runtime key custody remains OpenRouter-specific.
 
-/** The wire API pi must use for a provider that is not one of pi's built-ins. */
+/** The wire API pi uses for an OpenAI-compatible custom provider. */
 export const PROVIDER_API_OPENAI_COMPLETIONS = "openai-completions";
 export type ProviderApi = typeof PROVIDER_API_OPENAI_COMPLETIONS;
 
@@ -20,7 +21,7 @@ export interface ProviderRecord {
   readonly runtime: string;
   /** The provider's fixed endpoint (base URL), when it has one. */
   readonly endpoint?: string;
-  /** The wire API pi must use, when the provider is not one of pi's built-ins. */
+  /** The wire API pi uses, when the provider is an OpenAI-compatible custom provider. */
   readonly api?: ProviderApi;
   /** The endpoint authenticates by host/VM identity, so it carries no API key. */
   readonly gateway?: boolean;
