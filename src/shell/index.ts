@@ -8,6 +8,8 @@
 // PR-1 ships the type surface + role loader + a stub mail consumer.
 // PR-2 will wire the Discord bridge + cron scheduler.
 
+import type { ProviderName } from "./provider-registry.js";
+
 export type BobRole =
   | "ea"
   | "jarvis"
@@ -19,14 +21,9 @@ export type BobRole =
   | "custom";
 
 export interface ProviderConfig {
-  name:
-    | "ollama-cloud"
-    | "ollama-newton"
-    | "exe-dev-gateway"
-    | "anthropic"
-    | "openai"
-    | "openrouter"
-    | "omlx";
+  // The provider names come from the registry table, so this type cannot drift
+  // from the record init's scaffold and run's resolution actually read.
+  name: ProviderName;
   model: string;
   fallbacks?: string[];
 }

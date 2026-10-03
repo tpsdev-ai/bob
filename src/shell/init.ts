@@ -20,6 +20,16 @@ import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
 import type { BobRole } from "./index.js";
+import {
+  DEFAULT_PROVIDER_REGISTRY,
+  PROVIDER_API_OPENAI_COMPLETIONS,
+  type ProviderRegistry,
+  providerApiFlavour,
+  providerEndpoint,
+  providerReadsKeyFromEnv,
+  providerUsesGatewayIdentity,
+  resolveRuntimeProviderName,
+} from "./provider-registry.js";
 import { loadRole } from "./role-loader.js";
 import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
 
@@ -102,6 +112,9 @@ export interface InitOptions {
   // placeholder and a warning, and must have it set before it runs.
   contextWindow?: number;
   baseUrl?: string;
+  // The provider registry the scaffold reads its identity records from.
+  // Defaults to the built-in table; tests supply one with a row of their own.
+  registry?: ProviderRegistry;
 }
 
 export interface InitResult {
@@ -377,15 +390,11 @@ export FLAIR_KEY_PATH="${keyPath}"
 `;
 }
 
-// Translate bob's conceptual provider names into pi's actual provider IDs.
-// `exe-dev-gateway` is bob's term for "anthropic API shape, routed through
-// the exe.dev VM-authenticated proxy" — pi only knows the underlying
-// provider (`anthropic`), and we configure the baseUrl override via
-// .pi-agent/models.json (see writePiAgentConfig).
-function resolvePiProvider(bobProvider: string): string {
-  if (bobProvider === "exe-dev-gateway") return "anthropic";
-  return bobProvider;
-}
+// A bob provider name resolves to pi's provider id through the provider
+// registry (`runtime`), not a mapper here: `exe-dev-gateway` is bob's term for
+// "anthropic API shape, routed through the exe.dev VM-authenticated proxy", so
+// it shares pi's `anthropic` runtime identity while its baseUrl override lives
+// in .pi-agent/models.json (see writePiAgentConfig).
 
 // pi 0.75+ reads its config from $PI_CODING_AGENT_DIR (the per-agent
 // dir the launcher exports). Without these two files, the launcher
@@ -399,28 +408,18 @@ function resolvePiProvider(bobProvider: string): string {
 // with no declaration). Declaring the model is the core fix here.
 //
 // - models.json: providers.<piProvider>.models = [{ id: opts.model }] always.
-//   baseUrl is added only for providers with a known custom endpoint
-//   (see knownProviderBaseUrl) — built-ins like anthropic/openai use pi's
-//   default endpoint.
+//   baseUrl is added only for providers whose registry row declares an
+//   endpoint — built-ins like anthropic/openai use pi's default endpoint.
 // - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
 //   literal value is never checked — the gateway authenticates via VM
 //   identity). Endpoint overrides get bob's constant placeholder.
-function knownProviderBaseUrl(bobProvider: string): string | undefined {
-  switch (bobProvider) {
-    case "exe-dev-gateway":
-      return "http://169.254.169.254/gateway/llm/anthropic";
-    case "ollama-cloud":
-    case "ollama":
-      return "https://ollama.com/v1";
-    default:
-      return undefined;
-  }
-}
+// The provider's fixed endpoint, VM-identity flag and API flavour come from its
+// registry row (providerEndpoint / providerUsesGatewayIdentity /
+// providerApiFlavour).
 
 // The OpenAI-compatible provider shape for ollama.com/v1 (bob#132): pi drops a
 // custom provider block that has no `api`. bob also writes the model's fields;
 // bob.yaml can override the limits at session creation (bob#214).
-const PI_OPENAI_COMPLETIONS_API = "openai-completions";
 const PI_MODEL_DEFAULT_CONTEXT_WINDOW = 128_000;
 const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
 
@@ -446,16 +445,18 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   // didn't go through the standard path.
   mkdirSync(piDir, { recursive: true });
 
-  const piProvider = resolvePiProvider(opts.provider);
-  const isGateway = opts.provider === "exe-dev-gateway";
+  const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
+  const piProvider = resolveRuntimeProviderName(opts.provider, registry);
+  const isGateway = providerUsesGatewayIdentity(opts.provider, registry);
   // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
   // is NEVER written here (bob#183) — so its auth.json carries no key entry.
-  const isEnvKeyProvider = opts.provider === "openrouter";
+  const isEnvKeyProvider = providerReadsKeyFromEnv(opts.provider, registry);
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
   // entry (bob#132).
   const isOpenAiCompatible =
-    opts.provider === "ollama-cloud" || opts.provider === "ollama" || opts.baseUrl !== undefined;
-  const baseUrl = opts.baseUrl ?? knownProviderBaseUrl(opts.provider);
+    providerApiFlavour(opts.provider, registry) === PROVIDER_API_OPENAI_COMPLETIONS ||
+    opts.baseUrl !== undefined;
+  const baseUrl = opts.baseUrl ?? providerEndpoint(opts.provider, registry);
   const key =
     opts.baseUrl !== undefined
       ? "bob-base-url-placeholder-not-a-secret"
@@ -477,7 +478,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
           ...(baseUrl ? { baseUrl } : {}),
           ...(isOpenAiCompatible
             ? {
-                api: PI_OPENAI_COMPLETIONS_API,
+                api: PROVIDER_API_OPENAI_COMPLETIONS,
                 compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
               }
             : {}),
