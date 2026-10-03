@@ -1027,7 +1027,9 @@ async function publishUnderLock(
         if (storageFail !== null) return storageFail;
         return fail(
           "materialized_tree_changed",
-          `publish refused: the materialized source tree could not be verified after ${JSON.stringify(command)} (${after}).`,
+          after === "changed"
+            ? `publish refused: the required check ${JSON.stringify(command)} changed tracked source in the materialized tree.`
+            : `publish refused: the materialized source tree could not be verified after ${JSON.stringify(command)} (${after}).`,
           { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
         );
       }
