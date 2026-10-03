@@ -1,0 +1,1 @@
+- **`bob doctor` resolves the provider through the selected registry (bob#298).** Subscription checks exclude bob-owned auth modes. The session factory selects its keyed branch by the row's auth mode.

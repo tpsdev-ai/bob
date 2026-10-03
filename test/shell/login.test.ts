@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { runDoctor } from "../../src/shell/doctor.js";
 import { initAgent } from "../../src/shell/init.js";
 import { resolvePiBin, runLogin, runLogout } from "../../src/shell/login.js";
+import { PROVIDER_RECORDS, ProviderRegistry } from "../../src/shell/provider-registry.js";
 import { type SpawnError, spawnNode } from "../cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "..", "dist", "cli.js");
@@ -708,4 +709,47 @@ describe("bob#241 — the store read (absence vs. a failed read) and BOM handlin
     });
     expect(subscriptionCheck("subbot")?.status).toBe("ok");
   });
+
+  it.each([false, true])(
+    "a bob/none row ignores a pi subscription credential (stored=%s)",
+    (stored) => {
+      const registry = new ProviderRegistry([
+        ...PROVIDER_RECORDS,
+        {
+          id: "local-row",
+          aliases: ["local-alias"],
+          runtime: "local-runtime",
+          auth: { kind: "none" as const },
+          endpoint: "http://local.example/v1",
+          api: "openai-completions" as const,
+          override: {},
+        },
+      ]);
+      const { agentDir } = initAgent({
+        name: "localbot",
+        role: "reviewer",
+        provider: "local-alias",
+        model: "local-model",
+        contextWindow: 200_000,
+        agentsRoot,
+        skipFlair: true,
+        registry,
+      });
+      writeFileSync(
+        join(agentDir, ".pi-agent", "auth.json"),
+        stored ? oauthJson("openai-codex") : "{}\n",
+        {
+          mode: 0o600,
+        },
+      );
+      const report = runDoctor({
+        name: "localbot",
+        agentsRoot,
+        homeDir: root,
+        flairKeysDir: join(root, ".flair", "keys"),
+        registry,
+      });
+      expect(report.checks.find((c) => c.name === "subscription auth")).toBeUndefined();
+    },
+  );
 });

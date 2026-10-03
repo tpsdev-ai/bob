@@ -1297,7 +1297,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
     // redirect the endpoint or the key. Runs BEFORE any session exists.
     let openrouterProvider: OpenrouterProviderConfig | undefined;
-    if (config.provider === "openrouter") {
+    // Keyed on the SELECTED ROW's auth mode, not the provider name: a
+    // programmatically constructed registry may hold a keyless row whose
+    // runtime is `openrouter`, and a name test would read OPENROUTER_API_KEY
+    // and register bob's keyed provider for a row that has no key.
+    if (row?.auth.kind === "env") {
       // The on-disk refusal comes FIRST (a config error, before any key read), so a
       // tampered models.json refuses on every entry path without consuming the key.
       // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
@@ -1350,7 +1354,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // the services exist — a capability's own `registerProvider` during load would
     // otherwise move the endpoint or the key without bob noticing. pi must hold
     // only bob's PLACEHOLDER key.
-    if (config.provider === "openrouter" && openrouterProvider !== undefined) {
+    if (openrouterProvider !== undefined) {
       await assertOpenrouterRuntimeUnchanged(modelRuntime as ModelRuntime, {
         model: config.model,
         expected: openrouterProvider,
