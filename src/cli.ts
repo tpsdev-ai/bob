@@ -74,6 +74,7 @@ Commands:
                              --dry-run --force --no-interactive
   models <agent>      Apply provider.base_url: bob models <agent>
                       Updates only .pi-agent/models.json from validated bob.yaml.
+                      Comments in models.json are not preserved.
                       Flags: --agents-root <dir>
   align <name>        Recurring check-in to refine an existing agent. The session
                       runs on the agent's own bob.yaml provider + model (the same

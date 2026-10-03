@@ -250,6 +250,9 @@ export function providerBaseUrlRefusal(provider: string, baseUrl: string): strin
   if (parsed.username !== "" || parsed.password !== "") {
     return `provider.base_url must not carry credentials (a username or password in the URL).`;
   }
+  if (parsed.href.includes("?") || parsed.href.includes("#")) {
+    return "provider.base_url must not contain a query string or fragment.";
+  }
   if (REDIRECTABLE_PROVIDERS.has(provider)) return undefined;
   if (provider === "ollama" && parsed.hostname.replace(/\.+$/, "") !== "ollama.com")
     return undefined;

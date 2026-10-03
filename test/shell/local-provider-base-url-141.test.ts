@@ -35,6 +35,76 @@ beforeEach(() => {
 });
 
 describe("provider.base_url containment", () => {
+  it.each(["?route=chat", "#chat", "?", "#"])(
+    "refuses query or fragment %s before writes and at load",
+    (suffix) => {
+      const baseUrl = `${LOCAL_URL}${suffix}`;
+      expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/query string or fragment/);
+      expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
+      expect(() =>
+        readProviderLimits(`provider:\n  name: ollama\n  base_url: ${baseUrl}\n`),
+      ).toThrow(/query string or fragment/);
+    },
+  );
+
+  it.each([true, false])(
+    "repairs pi-valid trailing commas with comments=%s after a startup mismatch",
+    async (comments) => {
+      const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+      const yamlPath = join(res.agentDir, "bob.yaml");
+      const appliedUrl = "http://other.example/v1";
+      writeFileSync(yamlPath, readFileSync(yamlPath, "utf8").replace(LOCAL_URL, appliedUrl));
+      const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+      const otherModel = {
+        ...models.providers.ollama.models[0],
+        id: "other",
+        name: 'https://kept.example/a//b /* literal */ ",} \\ end',
+      };
+      models.providers.ollama.models.push(otherModel);
+      models.providers.kept = {
+        baseUrl: "https://kept.example/v1",
+        api: "openai-completions",
+        models: [{ ...otherModel, id: "kept" }],
+      };
+      models.custom = { keep: true };
+      const text = JSON.stringify(models, null, 2).replace(/\n(\s*[}\]])/g, ",\n$1");
+      writeFileSync(
+        modelsPath(res.agentDir),
+        `\uFEFF${comments ? "// endpoint configuration\n" : ""}${text}${comments ? "\n// end" : ""}`,
+      );
+      const start = async () => {
+        const { config, policy } = resolveRunConfig({ name: "newton", agentsRoot: tmpRoot });
+        const result = await createBobRuntimeFactory({ config, policy })({
+          sessionManager: SessionManager.inMemory(config.cwd),
+        });
+        result.session.dispose();
+      };
+      await expect(start()).rejects.toThrow(/apply provider.base_url/);
+      const output = spawnModels();
+      expect(output.includes("comments in models.json were not preserved")).toBe(comments);
+      const after = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+      expect(after).toEqual({
+        ...models,
+        providers: {
+          ...models.providers,
+          ollama: {
+            ...models.providers.ollama,
+            baseUrl: appliedUrl,
+            models: [
+              {
+                ...models.providers.ollama.models[0],
+                baseUrl: appliedUrl,
+                api: "openai-completions",
+              },
+              otherModel,
+            ],
+          },
+        },
+      });
+      await start();
+    },
+  );
+
   it.each(["https://ollama.com./v1", "https://ollama.com%2e/v1"])(
     "refuses cloud hostname %s before writes",
     (baseUrl) => {

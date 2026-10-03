@@ -35,6 +35,7 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
   }
   const path = join(piDir, "models.json");
   let document: unknown = {};
+  let hadComments = false;
   let mode = 0o600;
   let readFd: number | undefined;
   try {
@@ -44,7 +45,15 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
       throw new Error(`bob models: refusing non-file, symlink, or hard-linked ${path}`);
     }
     mode = file.mode & 0o777;
-    document = JSON.parse(readFileSync(readFd, "utf8").replace(/^\uFEFF/, ""));
+    const content = readFileSync(readFd, "utf8")
+      .replace(/^\uFEFF/, "")
+      .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => {
+        if (match[0] === '"') return match;
+        hadComments = true;
+        return "";
+      })
+      .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail) => tail ?? match);
+    document = JSON.parse(content);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   } finally {
@@ -93,5 +102,6 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
       rmSync(temp, { force: true });
     }
   }
+  if (hadComments) console.warn("bob models: comments in models.json were not preserved");
   return path;
 }
