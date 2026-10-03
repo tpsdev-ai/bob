@@ -57,7 +57,7 @@ interface Tools {
       ctx?: { cwd: string },
     ) => Promise<ToolOut>;
   };
-  publish: { execute: (id: string, p: unknown) => Promise<ToolOut> };
+  publish: { execute: (id: string, p: unknown, signal?: AbortSignal) => Promise<ToolOut> };
   manager: ReturnType<typeof wireWork>["manager"];
   stateRoot: string;
 }
@@ -339,6 +339,76 @@ describe("publish end to end — interrupted push, then recovery", () => {
       expect(out.details.status).toBe("refused");
       expect(out.details.reason).toBe("check_failed");
       expect(git(["rev-parse", "refs/heads/main"], bare)).toBe(base);
+    } finally {
+      t.manager.endRunSync();
+    }
+  });
+
+  it("an abort of the publish call while a check runs cancels that check and never pushes", async () => {
+    const repo = join(scratch, "repo");
+    const bare = join(scratch, "remote.git");
+    const artifactRoot = join(scratch, "artifacts");
+    const stateRoot = join(scratch, "state");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    mkdirSync(artifactRoot, { recursive: true });
+    git(["init", "-q"], repo);
+    writeFileSync(join(repo, "src", "widget.ts"), "export const widget = 1;\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-qm", "base"], repo);
+    const base = git(["rev-parse", "HEAD"], repo);
+    git(["init", "-q", "--bare", bare], scratch);
+    git(["push", bare, "HEAD:refs/heads/main"], repo);
+
+    writeFileSync(join(repo, "src", "widget.ts"), "export const widget = 2;\n");
+    git(["add", "-A"], repo);
+    git(["commit", "-qm", "change"], repo);
+    const diff = spawnSync("git", ["diff", "--binary", "-M", "-C", base, "HEAD"], {
+      cwd: repo,
+      env: gitEnv(),
+      encoding: "buffer",
+    });
+    const patch = Buffer.from(diff.stdout);
+    git(["reset", "--hard", "-q", base], repo);
+    writeFileSync(join(artifactRoot, "p.patch"), patch);
+
+    const binding: TaskBinding = {
+      task_id: "task-1",
+      publication_id: "pub-e2e-abort",
+      repository: repo,
+      workspace: repo,
+      base_oid: base,
+      mode: "build",
+      artifact_root: artifactRoot,
+      declared_paths: ["src/widget.ts"],
+      check_commands: ["sleep 60"],
+      destination: { remote: bare, ref: "refs/heads/main", create: true },
+    };
+
+    const t = wireTools(binding, stateRoot);
+    try {
+      const applied = await t.apply_patch.execute("apply", {
+        patch_artifact: { path: "p.patch", sha256: sha256(patch) },
+        expected_base: base,
+      });
+      const ac = new AbortController();
+      const started = setInterval(() => {
+        if (t.manager.list().length > 0) {
+          clearInterval(started);
+          ac.abort();
+        }
+      }, 10);
+      const out = await t.publish.execute(
+        "publish",
+        { candidate_id: applied.details.candidate_id, commit_message: "aborted" },
+        ac.signal,
+      );
+      clearInterval(started);
+      expect(out.details.status).toBe("refused");
+      expect(out.details.reason).toBe("aborted");
+      expect(git(["rev-parse", "refs/heads/main"], bare)).toBe(base);
+      const [job] = t.manager.list();
+      await job.done;
+      expect(t.manager.report(job).outcome).toBe("cancelled");
     } finally {
       t.manager.endRunSync();
     }

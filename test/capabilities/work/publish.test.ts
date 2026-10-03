@@ -13,6 +13,7 @@ import {
   fsyncSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -733,6 +734,12 @@ describe("publish — the remote decides", () => {
       deps: { git: realGit, runCheck: okCheck },
     });
     expect(out.reason).toBe("remote_diverged");
+    expect(out.push_state).toBe("confirmed_absent");
+    expect(out.phase).toBe("checked");
+    const journal = JSON.parse(
+      readFileSync(publishJournalPath(fx.stateRoot, b.publication_id), "utf8"),
+    ) as { phase: string };
+    expect(journal.phase).toBe("checked");
     expect(remoteOid(fx)).toBe(intervening);
     expect(remoteCommitCount(fx)).toBe(beforeCount);
   });
@@ -768,7 +775,93 @@ describe("publish — the remote decides", () => {
     expect(raced).toBe(true);
     expect(out.status).toBe("refused");
     expect(out.reason).toBe("push_rejected");
+    expect(out.push_state).toBe("unknown");
+    expect(out.phase).toBe("pushing");
     expect(remoteOid(fx)).toBe(intervening);
+  });
+
+  it("a failing check leaves no publish-checkout-* tree under the state root", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["false"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const out = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      deps: {
+        git: realGit,
+        runCheck: async () => ({
+          outcome: "exited",
+          exit_code: 1,
+          cleanup_state: "group_empty",
+          output_complete: true,
+        }),
+      },
+    });
+    expect(out.reason).toBe("check_failed");
+    expect(readdirSync(fx.stateRoot).filter((n) => n.startsWith("publish-checkout-"))).toEqual([]);
+    expect(remoteOid(fx)).toBe(fx.base);
+  });
+
+  it("an abort before the push refuses by name and never pushes", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx);
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const pushes: string[][] = [];
+    const out = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      signal: AbortSignal.abort(),
+      deps: {
+        git: (args, inv) => {
+          if (args[0] === "push") pushes.push(args);
+          return realGit(args, inv);
+        },
+        runCheck: okCheck,
+      },
+    });
+    expect(out.status).toBe("refused");
+    expect(out.reason).toBe("aborted");
+    expect(pushes).toEqual([]);
+    expect(remoteOid(fx)).toBe(fx.base);
+  });
+
+  it("an abort while a check runs stops waiting for it and never pushes", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["sleep 60"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const ac = new AbortController();
+    let runnerSignal: AbortSignal | undefined;
+    const out = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      signal: ac.signal,
+      deps: {
+        git: realGit,
+        // A check that never settles on its own.
+        runCheck: (_command, _cwd, signal) => {
+          runnerSignal = signal;
+          setTimeout(() => ac.abort(), 10);
+          return new Promise<CheckReport>(() => {});
+        },
+      },
+    });
+    expect(runnerSignal).toBe(ac.signal);
+    expect(out.status).toBe("refused");
+    expect(out.reason).toBe("aborted");
+    expect(out.message).toContain("aborted");
+    expect(remoteOid(fx)).toBe(fx.base);
   });
 });
 

@@ -51,6 +51,7 @@ export type PublishRefusalReason =
   | "pr_unsupported"
   | "publication_locked"
   | "publication_conflict"
+  | "aborted"
   | "storage_failed";
 
 export interface PublishParams {
@@ -69,7 +70,12 @@ export interface CheckReport {
   output_excerpt?: string;
 }
 
-export type CheckRunner = (command: string, cwd: string) => Promise<CheckReport>;
+// On `signal` abort the runner kills the check it started.
+export type CheckRunner = (
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+) => Promise<CheckReport>;
 
 export interface PublishDeps {
   // Seam: the git runner. Production spawns the real `git`.
@@ -107,6 +113,8 @@ export interface PublishInput {
   params: PublishParams;
   stateRoot: string;
   deps?: PublishDeps;
+  // The tool call's signal. An abort before the push refuses and never pushes.
+  signal?: AbortSignal;
 }
 
 interface CommitMeta {
@@ -549,6 +557,26 @@ function checkFailure(report: CheckReport): PublishRefusalReason | null {
   return null;
 }
 
+// `p`'s value, or null as soon as `signal` aborts.
+function untilAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T | null> {
+  if (signal === undefined) return p;
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise<T | null>((resolve, reject) => {
+    const onAbort = () => resolve(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export async function publish(input: PublishInput): Promise<PublishResult> {
   const deps = input.deps ?? {};
   const git = deps.git ?? runGit;
@@ -961,7 +989,13 @@ async function publishUnderLock(
   const checksPassed =
     journal.checks?.length === binding.check_commands.length &&
     journal.checks.every((c, i) => c.ok && c.command === binding.check_commands[i]);
-  let checkoutDir: string | null = null;
+  const signal = input.signal;
+  const abortedFail = () =>
+    fail("aborted", "publish refused: the publish tool call was aborted before the push.", {
+      tree_oid: treeOid,
+      commit_oid: commitOid,
+      phase: journal.phase,
+    });
   if (!checksPassed) {
     if (deps.runCheck === undefined) {
       return fail(
@@ -980,114 +1014,123 @@ async function publishUnderLock(
         { tree_oid: treeOid, commit_oid: commitOid },
       );
     }
-    checkoutDir = dir;
-    const mat = materialize(git, binding.repository, treeOid, dir);
-    if (!mat.ok) {
-      return fail(
-        "materialize_failed",
-        `publish refused: the candidate could not be materialized (${mat.message}).`,
-        {
-          tree_oid: treeOid,
-          commit_oid: commitOid,
-        },
-      );
-    }
-    const before = materializedUnchanged(git, dir, treeOid);
-    if (before !== "unchanged") {
-      return fail(
-        "materialize_failed",
-        `publish refused: the materialized checkout does not match the candidate tree (${before}).`,
-        { tree_oid: treeOid, commit_oid: commitOid },
-      );
-    }
-
-    const results: PublishJournal["checks"] = [];
-    for (const command of binding.check_commands) {
-      let report: CheckReport;
-      try {
-        report = await deps.runCheck(command, dir);
-      } catch (err) {
-        results.push({ command, ok: false, reason: "check_failed" });
-        journal.checks = results;
-        journal.phase = "committed";
-        const storageFail = persist();
-        if (storageFail !== null) return storageFail;
+    try {
+      const mat = materialize(git, binding.repository, treeOid, dir);
+      if (!mat.ok) {
         return fail(
-          "check_failed",
-          `publish refused: the required check ${JSON.stringify(command)} could not be run (${messageOf(err)}).`,
-          { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
-        );
-      }
-      const after = materializedUnchanged(git, dir, treeOid);
-      if (after !== "unchanged") {
-        results.push({ command, ok: false, reason: "materialized_tree_changed" });
-        journal.checks = results;
-        journal.phase = "committed";
-        const storageFail = persist();
-        if (storageFail !== null) return storageFail;
-        return fail(
-          "materialized_tree_changed",
-          after === "changed"
-            ? `publish refused: the required check ${JSON.stringify(command)} changed tracked source in the materialized tree.`
-            : `publish refused: the materialized source tree could not be verified after ${JSON.stringify(command)} (${after}).`,
-          { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
-        );
-      }
-      const reason = checkFailure(report);
-      results.push(reason === null ? { command, ok: true } : { command, ok: false, reason });
-      if (reason !== null) {
-        journal.checks = results;
-        journal.phase = "committed";
-        const storageFail = persist();
-        if (storageFail !== null) return storageFail;
-        return fail(
-          reason,
-          `publish refused: the required check ${JSON.stringify(command)} did not pass (${reason}). A missing check, a nonzero exit, a timeout, a cancellation, a missing exit status, uncertain cleanup or an incomplete capture prevents publication.`,
+          "materialize_failed",
+          `publish refused: the candidate could not be materialized (${mat.message}).`,
           {
             tree_oid: treeOid,
             commit_oid: commitOid,
-            phase: journal.phase,
-            detail: { outcome: report.outcome, exit_code: report.exit_code },
           },
         );
       }
-    }
-    journal.checks = results;
-    journal.phase = "checked";
-    const checkedFail = persist();
-    if (checkedFail !== null) return checkedFail;
-  }
-  if (checkoutDir !== null) {
-    try {
-      rmSync(checkoutDir, { recursive: true, force: true });
-    } catch {
-      // best effort; the checkout is under the tool state root
+      const before = materializedUnchanged(git, dir, treeOid);
+      if (before !== "unchanged") {
+        return fail(
+          "materialize_failed",
+          `publish refused: the materialized checkout does not match the candidate tree (${before}).`,
+          { tree_oid: treeOid, commit_oid: commitOid },
+        );
+      }
+
+      const results: PublishJournal["checks"] = [];
+      for (const command of binding.check_commands) {
+        if (signal?.aborted) return abortedFail();
+        let report: CheckReport | null;
+        try {
+          report = await untilAbort(deps.runCheck(command, dir, signal), signal);
+        } catch (err) {
+          results.push({ command, ok: false, reason: "check_failed" });
+          journal.checks = results;
+          journal.phase = "committed";
+          const storageFail = persist();
+          if (storageFail !== null) return storageFail;
+          return fail(
+            "check_failed",
+            `publish refused: the required check ${JSON.stringify(command)} could not be run (${messageOf(err)}).`,
+            { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
+          );
+        }
+        if (report === null || signal?.aborted) return abortedFail();
+        const after = materializedUnchanged(git, dir, treeOid);
+        if (after !== "unchanged") {
+          results.push({ command, ok: false, reason: "materialized_tree_changed" });
+          journal.checks = results;
+          journal.phase = "committed";
+          const storageFail = persist();
+          if (storageFail !== null) return storageFail;
+          return fail(
+            "materialized_tree_changed",
+            after === "changed"
+              ? `publish refused: the required check ${JSON.stringify(command)} changed tracked source in the materialized tree.`
+              : `publish refused: the materialized source tree could not be verified after ${JSON.stringify(command)} (${after}).`,
+            { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
+          );
+        }
+        const reason = checkFailure(report);
+        results.push(reason === null ? { command, ok: true } : { command, ok: false, reason });
+        if (reason !== null) {
+          journal.checks = results;
+          journal.phase = "committed";
+          const storageFail = persist();
+          if (storageFail !== null) return storageFail;
+          return fail(
+            reason,
+            `publish refused: the required check ${JSON.stringify(command)} did not pass (${reason}). A missing check, a nonzero exit, a timeout, a cancellation, a missing exit status, uncertain cleanup or an incomplete capture prevents publication.`,
+            {
+              tree_oid: treeOid,
+              commit_oid: commitOid,
+              phase: journal.phase,
+              detail: { outcome: report.outcome, exit_code: report.exit_code },
+            },
+          );
+        }
+      }
+      journal.checks = results;
+      journal.phase = "checked";
+      const checkedFail = persist();
+      if (checkedFail !== null) return checkedFail;
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best effort; the checkout is under the tool state root
+      }
     }
   }
 
   let transportDir: string;
   try {
     transportDir = mkdtempSync(join(stateRoot, "publish-transport-"));
-    const init = git(["init", "-q", "--bare", transportDir], { cwd: stateRoot });
-    if (init.status !== 0) throw new Error(init.stderr || "transport init failed");
-    const common = gitCommonDir(git, binding.repository);
-    if (common === null) throw new Error("object directory unavailable");
-    const info = join(transportDir, "objects", "info");
-    mkdirSync(info, { recursive: true });
-    writeFileSync(join(info, "alternates"), `${join(common, "objects")}\n`, { flag: "wx" });
   } catch (err) {
     return fail(
       "storage_failed",
       `publish refused: transport preparation failed (${messageOf(err)}).`,
     );
   }
-  const sourceGit = git;
-  git = (args, inv) =>
-    sourceGit(args, {
-      ...inv,
-      cwd: args[0] === "ls-remote" || args[0] === "push" ? transportDir : inv.cwd,
-    });
   try {
+    try {
+      const init = git(["init", "-q", "--bare", transportDir], { cwd: stateRoot });
+      if (init.status !== 0) throw new Error(init.stderr || "transport init failed");
+      const common = gitCommonDir(git, binding.repository);
+      if (common === null) throw new Error("object directory unavailable");
+      const info = join(transportDir, "objects", "info");
+      mkdirSync(info, { recursive: true });
+      writeFileSync(join(info, "alternates"), `${join(common, "objects")}\n`, { flag: "wx" });
+    } catch (err) {
+      return fail(
+        "storage_failed",
+        `publish refused: transport preparation failed (${messageOf(err)}).`,
+      );
+    }
+    const sourceGit = git;
+    git = (args, inv) =>
+      sourceGit(args, {
+        ...inv,
+        cwd: args[0] === "ls-remote" || args[0] === "push" ? transportDir : inv.cwd,
+      });
     // 4. Inspect the authoritative remote ref and decide the push.
     const remote = journal.endpoint;
     const { ref } = binding.destination;
@@ -1132,17 +1175,14 @@ async function publishUnderLock(
       if (!precedes) {
         // Neither is an ancestor of the other: a conflicting ref. Never rebase,
         // amend or force.
-        journal.phase = "pushing";
-        const storageFail = persist();
-        if (storageFail !== null) return storageFail;
         return fail(
           "remote_diverged",
           `publish refused: the remote ${remote} ${ref} is at ${observed.oid}, which neither contains nor precedes the pinned commit ${commitOid}. Divergence is refused; publication does not rebase, amend, merge or force.`,
           {
             tree_oid: treeOid,
             commit_oid: commitOid,
-            push_state: "confirmed_present",
-            phase: "pushing",
+            push_state: "confirmed_absent",
+            phase: journal.phase,
           },
         );
       }
@@ -1160,6 +1200,7 @@ async function publishUnderLock(
       pushExpected = null;
     }
 
+    if (signal?.aborted) return abortedFail();
     journal.phase = "pushing";
     journal.push_state = "unknown";
     const pushingFail = persist();
@@ -1182,7 +1223,7 @@ async function publishUnderLock(
             tree_oid: treeOid,
             commit_oid: commitOid,
             phase: "pushing",
-            push_state: "confirmed_present",
+            push_state: "unknown",
           },
         );
       }

@@ -260,7 +260,7 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
   // manager, so the outcome, cleanup and capture rules are exactly `run`'s.
   const runCheck: CheckRunner =
     opts.publishDeps?.runCheck ??
-    (async (command, cwd): Promise<CheckReport> => {
+    (async (command, cwd, signal): Promise<CheckReport> => {
       const job = await manager.start({ command }, cwd, {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: cwd,
@@ -268,7 +268,14 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         LANG: "C",
         LC_ALL: "C",
       });
-      await job.done;
+      const onAbort = () => void manager.cancel(job.runId, "abort");
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await job.done;
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
       const r = manager.report(job);
       return {
         outcome: r.outcome,
@@ -463,13 +470,14 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         description: "The commit message for the published change.",
       }),
     }),
-    async execute(_id, params) {
+    async execute(_id, params, signal) {
       const outcome = await publish({
         binding: opts.taskBinding,
         ...(opts.taskBindingError !== undefined ? { bindingError: opts.taskBindingError } : {}),
         params: params as unknown as PublishParams,
         stateRoot: manager.stateRoot,
         deps: publishDeps,
+        ...(signal !== undefined ? { signal } : {}),
       });
       return {
         content: [{ type: "text", text: publishResultText(outcome) }],
