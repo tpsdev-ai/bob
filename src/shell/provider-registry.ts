@@ -4,6 +4,7 @@
 // inference from disk contents, placeholders or missing credentials:
 //
 //   bob/env(<ENV_VAR>)  bob reads the key from the environment at run time
+//   bob/none            keyless: bob sends no credential
 //   bob/vm              host/VM identity (the exe.dev gateway)
 //   pi/disk             pi-managed key on disk (unmigrated, until its slice)
 //   pi/login            pi-managed subscription (unmigrated, until its slice)
@@ -650,9 +651,9 @@ export function providerReadsKeyFromEnv(
 
 /**
  * The disk-refusal set: the union of `{id, aliases, runtime}` over every
- * `bob/env` row. Any own-property with one of these names in `models.json` or
- * `auth.json` refuses, regardless of value — including empty, null or
- * placeholder entries.
+ * `bob/env` row. An own-property with one of these names under `providers` in
+ * `models.json`, or at the top level of `auth.json`, refuses, regardless of
+ * value — including empty, null or placeholder entries.
  */
 export function reservedProviderNames(
   registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
