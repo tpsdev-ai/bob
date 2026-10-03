@@ -1254,13 +1254,12 @@ async function runBoundedSession(
   let failed = false;
   let aborted: TerminationReason | undefined;
 
-  // #145: after every non-aborted compaction the observer sends ONE best-effort
-  // "what remains" note (a steer: the last thing the agent said, git status,
-  // recent tool calls).
-  // It is never load-bearing — the task is in the system prompt — so a failed
-  // note is logged and nothing else happens. The observer also owns the
-  // final-message boundary the judge reads.
+  // #145: Non-aborted compactions attempt a note unless a response after
+  // `agent_end` has stopReason "stop", no tool calls, compaction willRetry false,
+  // and final text satisfying the completion contract.
+  // The observer also owns the final-message boundary the judge reads.
   const observer = createCompactionObserver({
+    isComplete: (text) => judge(text).ok,
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     // bob#244: the note carries workspace data (git status), so a web session
     // refuses it; the observer logs the refusal and the run carries on.
@@ -1273,11 +1272,7 @@ async function runBoundedSession(
   });
   const unsubscribeContract = session.subscribe((event) => observer.observe(event));
 
-  // The FINAL message is the text of the LAST assistant message that ENDED since
-  // the last compaction (or the last startTurn): text streamed before a
-  // compaction can never satisfy the completion contract, streamed deltas are
-  // never substituted for the ended message's own content, and the observer
-  // clears its capture on `compaction_end` and at every `startTurn()`.
+  // The judge reads the observer's final-message boundary.
   const finalTextNow = (): string => {
     const tracked = observer.finalText();
     if (tracked.length > 0) return tracked;
@@ -1290,9 +1285,9 @@ async function runBoundedSession(
 
   // ONE judge: the first evaluation and the one after the continue turn are the
   // same call, so the run cannot be judged by two different rules.
-  const judge = (): { ok: boolean; reason?: SilenceReason } =>
+  const judge = (capturedText = finalTextNow()): { ok: boolean; reason?: SilenceReason } =>
     evaluateCompletion({
-      capturedText: finalTextNow(),
+      capturedText,
       compactions: observer.compactions(),
       expectedFinal: opts.expectedFinal,
     });

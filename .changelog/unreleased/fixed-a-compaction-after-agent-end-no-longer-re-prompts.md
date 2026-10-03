@@ -1,0 +1,1 @@
+- **Compaction preserves a terminal response (bob#179).** After `agent_end` with stopReason "stop", no tool calls, compaction willRetry false, and final text satisfying the completion contract, the observer retains the text and sends no note. (`test/shell/compaction-after-agent-end.test.ts`)

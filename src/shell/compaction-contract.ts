@@ -7,22 +7,18 @@
 // What remains here is the other half of the fix, and it is deliberately small:
 //
 //   * the ONE judge a one-shot run's exit code comes from. `bob run` settles
-//     `exitCode 0` only with a final assistant message — EXACTLY the text of the
-//     last assistant message that ENDED after the last compaction, never rebuilt
-//     from streamed deltas, and an empty or failure-ended message is no final
-//     message. Because the task is still in the system prompt after a
+//     `exitCode 0` only with a final assistant message, never rebuilt
+//     from streamed deltas. Because the task is still in the system prompt after a
 //     compaction, the single retry with an explicit continue turn is meaningful.
 //     Silence names whether a compaction was seen (`settled_after_compaction`)
 //     or not (`no_final_message`); a message that exists but misses a declared
 //     shape gets its own reason (`final_shape_mismatch`);
-//   * a BEST-EFFORT "what remains" note, injected once after each non-aborted
-//     compaction: the last thing the agent said, or a generated note about the
-//     worktree (git status --short, the last few tool calls). It is useful and
-//     it is NEVER load-bearing: it is a steer, its failure is logged and
-//     nothing else happens, and no exit code depends on it. (The machinery that
-//     existed only because the contract could be lost — the persistent attach,
-//     the admission gate, failClosed and its exit, the per-compaction failure
-//     records — is gone with the shape change.)
+//   * an attempt to send a BEST-EFFORT "what remains" note after non-aborted compactions, except
+//     after `agent_end` with stopReason "stop", no tool calls, willRetry false,
+//     and final text satisfying the completion contract: the text survives
+//     and no note is attempted (bob#179).
+//
+//     There is no direct success gate on note delivery.
 //
 // Everything here is pure/injectable so it is unit-testable without pi: the
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
@@ -126,8 +122,7 @@ export function renderWorktreeNote(
 
 /**
  * The best-effort "what remains" note. It says what it is: a note about the
- * state, not the contract (which is in the system prompt and cannot be lost),
- * so nothing about the run depends on it arriving.
+ * state, not the contract (which is in the system prompt and cannot be lost).
  */
 export function buildRemainingNote(state: RemainingState, capChars?: number): string {
   const cap = capChars ?? DEFAULT_REMAINING_NOTE_CAP_CHARS;
@@ -157,6 +152,8 @@ export function buildRemainingNote(state: RemainingState, capChars?: number): st
 export interface SessionEventLike {
   type?: string;
   aborted?: boolean;
+  willRetry?: boolean;
+  result?: unknown;
   reason?: string;
   message?: { role?: string; content?: unknown; stopReason?: string } | null;
   assistantMessageEvent?: { type?: string; delta?: string } | null;
@@ -260,6 +257,8 @@ export function createAssistantEndingTracker(): AssistantEndingTracker {
 }
 
 export interface CompactionObserverOptions {
+  /** The run's completion decision; omitted, nonempty text satisfies the contract. */
+  isComplete?: (text: string) => boolean;
   /** `git status --short` for the agent's worktree; "" outside a repo. */
   worktreeStatus?: () => string;
   /** How to deliver the note (a steer into the live session). Omit for a pure
@@ -282,11 +281,6 @@ export interface CompactionObserver {
   /** Start of a turn: the FINAL message is per-turn, so the capture starts
    *  fresh. Call before every prompt the runtime issues. */
   startTurn(): void;
-  /** The text of the last assistant message that ENDED since the last
-   *  compaction (or the last startTurn) — the completion contract's "final
-   *  message". It is exactly the content of the message that ended, KEPT AS IT
-   *  ENDED: streamed deltas are never substituted for it, and it is never
-   *  trimmed — the judge decides emptiness on `trim()`. */
   finalText(): string;
   /** True when at least one assistant message has ENDED since the boundary, so
    *  an empty `finalText()` means the agent went silent rather than that the
@@ -307,7 +301,9 @@ export interface CompactionObserver {
  * Observe the session event stream: track the compaction count and the final
  * message boundary, capture "what remains" as it goes (the agent's last stated
  * plan and the last few tool calls), and — when an `inject` seam is given —
- * send ONE best-effort note after every non-aborted `compaction_end`.
+ * attempt to send a best-effort note on non-aborted compaction, except after `agent_end`
+ * with stopReason "stop", no tool calls, willRetry false, and final text satisfying
+ * the completion contract.
  *
  * A failed note is LOGGED and nothing else happens. There is no verdict, no
  * refusal and no exit code attached to it: the contract it accompanies is in
@@ -327,13 +323,17 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
+  let lastStopReason: string | undefined;
+  let agentEnded = false;
 
   const clearCapture = (): void => {
     finalMessage = "";
     sawAssistantEnd = false;
     lastEndFailed = false;
     lastEnding = undefined;
+    lastStopReason = undefined;
     deltaBuffer = "";
+    agentEnded = false;
   };
 
   const noteFor = (): string =>
@@ -359,10 +359,27 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
         case "compaction_end": {
           if (e.aborted) return; // an aborted compaction changed nothing to restore
           compactions += 1;
+          log(
+            `bob: ${e.result ? "context compacted" : "context compaction failed"}${e.reason ? ` (${e.reason})` : ""}`,
+          );
+          if (
+            agentEnded &&
+            lastStopReason === "stop" &&
+            lastEnding?.hasToolCall === false &&
+            finalMessage.trim().length > 0 &&
+            e.willRetry === false &&
+            (opts.isComplete?.(finalMessage) ?? true)
+          ) {
+            if (opts.inject !== undefined) {
+              log(
+                'bob: terminal response (stop, no tool calls); compaction willRetry false — not sending the "what remains" note',
+              );
+            }
+            return;
+          }
           // The boundary: everything streamed BEFORE this compaction is not the
           // run's final message.
           clearCapture();
-          log(`bob: context compacted${e.reason ? ` (${e.reason})` : ""}`);
           if (opts.inject === undefined) return;
           const note = noteFor();
           log(`bob: sending the best-effort "what remains" note (${note.length} chars)`);
@@ -379,6 +396,14 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
               `bob: could not send the "what remains" note: ${err instanceof Error ? err.message : String(err)} (this is best-effort; the task is in the system prompt)`,
             );
           }
+          return;
+        }
+        case "agent_start": {
+          agentEnded = false;
+          return;
+        }
+        case "agent_end": {
+          agentEnded = true;
           return;
         }
         case "message_update": {
@@ -404,6 +429,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             finalMessage = failed ? "" : ended;
             sawAssistantEnd = true;
             lastEndFailed = failed;
+            lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
           }
           deltaBuffer = "";
