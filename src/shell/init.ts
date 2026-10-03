@@ -408,8 +408,9 @@ export FLAIR_KEY_PATH="${keyPath}"
 // with no declaration). Declaring the model is the core fix here.
 //
 // - models.json: providers.<piProvider>.models = [{ id: opts.model }] always.
-//   baseUrl is added only for providers whose registry row declares an
-//   endpoint — built-ins like anthropic/openai use pi's default endpoint.
+//   baseUrl is added for a provider whose registry row declares an endpoint,
+//   or when provider.base_url is set; built-ins like anthropic/openai use pi's
+//   default endpoint.
 // - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
 //   literal value is never checked — the gateway authenticates via VM
 //   identity). Endpoint overrides get bob's constant placeholder.
