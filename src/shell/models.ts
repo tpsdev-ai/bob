@@ -1,4 +1,16 @@
-import { lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readProviderLimits } from "./bob-yaml.js";
@@ -23,14 +35,20 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
   }
   const path = join(piDir, "models.json");
   let document: unknown = {};
+  let mode = 0o600;
+  let readFd: number | undefined;
   try {
-    const file = lstatSync(path);
+    readFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const file = fstatSync(readFd);
     if (!file.isFile() || file.nlink !== 1) {
       throw new Error(`bob models: refusing non-file, symlink, or hard-linked ${path}`);
     }
-    document = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
+    mode = file.mode & 0o777;
+    document = JSON.parse(readFileSync(readFd, "utf8").replace(/^\uFEFF/, ""));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  } finally {
+    if (readFd !== undefined) closeSync(readFd);
   }
   if (!object(document) || (document.providers !== undefined && !object(document.providers))) {
     throw new Error(`bob models: invalid providers in ${path}`);
@@ -57,6 +75,23 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
   }
   providers[provider] = { ...entry, ...update, models: updated };
   document.providers = providers;
-  writeFileSync(path, `${JSON.stringify(document, null, 2)}\n`);
+  const content = `${JSON.stringify(document, null, 2)}\n`;
+  const temp = join(piDir, `.models.json-${randomUUID()}.tmp`);
+  const writeFd = openSync(
+    temp,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeFileSync(writeFd, content);
+    fchmodSync(writeFd, mode);
+    renameSync(temp, path);
+  } finally {
+    try {
+      closeSync(writeFd);
+    } finally {
+      rmSync(temp, { force: true });
+    }
+  }
   return path;
 }

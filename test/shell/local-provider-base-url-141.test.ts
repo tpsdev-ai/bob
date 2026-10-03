@@ -1,10 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { readProviderLimits } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
+import { applyModelScaffold } from "../../src/shell/models.js";
 import { resolveRunConfig } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
 import { SpawnError, spawnNode } from "../cli-spawn.js";
@@ -116,6 +130,72 @@ describe("provider.base_url containment", () => {
       baseUrl: LOCAL_URL,
       contextWindow: 262144,
     });
+  });
+
+  it("never follows models.json swapped to a symlink before writing", () => {
+    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const path = modelsPath(res.agentDir);
+    const victim = join(tmpRoot, "victim.json");
+    const original = '{"untouched":true}\n';
+    writeFileSync(victim, original);
+    const stringify = JSON.stringify;
+    let swapped = false;
+    const spy = spyOn(JSON, "stringify").mockImplementation(
+      (...args: Parameters<typeof stringify>) => {
+        if (!swapped && args[2] === 2) {
+          swapped = true;
+          unlinkSync(path);
+          symlinkSync(victim, path);
+        }
+        return stringify(...args);
+      },
+    );
+    try {
+      applyModelScaffold("newton", tmpRoot);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(swapped).toBe(true);
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(lstatSync(path).isFile()).toBe(true);
+    expect(readdirSync(join(res.agentDir, ".pi-agent")).some((name) => name.endsWith(".tmp"))).toBe(
+      false,
+    );
+  });
+
+  it.each(["symlink", "hard link", "directory", "symlinked .pi-agent"])(
+    "bob models refuses %s",
+    (kind) => {
+      const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+      const path = modelsPath(res.agentDir);
+      const victim = join(tmpRoot, "victim.json");
+      const original = readFileSync(path, "utf8");
+      writeFileSync(victim, original);
+      if (kind === "symlinked .pi-agent") {
+        const dir = join(res.agentDir, ".pi-agent");
+        rmSync(dir, { recursive: true });
+        symlinkSync(tmpRoot, dir);
+      } else {
+        unlinkSync(path);
+        if (kind === "symlink") symlinkSync(victim, path);
+        else if (kind === "hard link") linkSync(victim, path);
+        else mkdirSync(path);
+      }
+      expect(() => applyModelScaffold("newton", tmpRoot)).toThrow();
+      expect(readFileSync(victim, "utf8")).toBe(original);
+    },
+  );
+
+  it.each([0o600, 0o640, "missing"])("bob models keeps the mode policy for %s", (mode) => {
+    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const path = modelsPath(res.agentDir);
+    if (mode === "missing") unlinkSync(path);
+    else chmodSync(path, mode);
+    applyModelScaffold("newton", tmpRoot);
+    expect(lstatSync(path).mode & 0o777).toBe(mode === "missing" ? 0o600 : mode);
+    expect(JSON.parse(readFileSync(path, "utf8")).providers.ollama.models[0].id).toBe(
+      "qwen3.8:27b-mxfp8",
+    );
   });
 
   it.each([
