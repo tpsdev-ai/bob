@@ -307,6 +307,11 @@ function validateRowFields(row: ProviderRecord): void {
       `provider registry: row "${row.id}" declares an override policy but a base_url override is only allowed on a bob/none row.`,
     );
   }
+  if (row.request !== undefined && auth.kind !== "none") {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" declares a request policy but bob only enforces it on a bob/none row.`,
+    );
+  }
   if (row.override !== undefined) {
     const policy = asRecord(row.override, "override");
     if (Object.keys(policy).some((field) => field !== "excludeHosts")) {

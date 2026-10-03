@@ -148,6 +148,20 @@ describe("bob#185 item 1 — the selected provider row carries the policy", () =
     }
   });
 
+  it("a policy on a non-keyless row refuses, because bob does not enforce it there", () => {
+    const shipped = new ProviderRegistry().find("openrouter");
+    if (shipped === undefined) throw new Error("no openrouter row");
+    expect(
+      () =>
+        new ProviderRegistry([
+          {
+            ...shipped,
+            request: { idleTimeoutMs: 1_000, totalTimeoutMs: 1_800_000, maxRetries: 0 },
+          } as never,
+        ]),
+    ).toThrow(/request policy but bob only enforces it on a bob\/none row/);
+  });
+
   it("an operator row may declare a policy within bounds", () => {
     const dir = mkdtempSync(join(tmpdir(), "bob-185t-"));
     try {
