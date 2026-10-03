@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { runDoctor } from "../../src/shell/doctor.js";
 import { initAgent } from "../../src/shell/init.js";
 import { resolvePiBin, runLogin, runLogout } from "../../src/shell/login.js";
+import { PROVIDER_RECORDS, ProviderRegistry } from "../../src/shell/provider-registry.js";
 import { type SpawnError, spawnNode } from "../cli-spawn.js";
 
 const CLI = join(import.meta.dir, "..", "..", "dist", "cli.js");
@@ -707,5 +708,44 @@ describe("bob#241 — the store read (absence vs. a failed read) and BOM handlin
       mode: 0o600,
     });
     expect(subscriptionCheck("subbot")?.status).toBe("ok");
+  });
+
+  it("resolves an operator alias for a subscription runtime through the selected registry (bob#298)", () => {
+    // The operator's registry aliases `codex-alias` to pi's subscription runtime
+    // `openai-codex`. On main the doctor maps the name WITHOUT a registry, so the
+    // alias resolves to itself, is outside SUBSCRIPTION_PROVIDERS, and no check
+    // runs; with the selected registry the alias resolves to `openai-codex`.
+    const registry = new ProviderRegistry([
+      ...PROVIDER_RECORDS,
+      {
+        id: "codex-alias-row",
+        aliases: ["codex-alias"],
+        runtime: "openai-codex",
+        auth: { kind: "none" as const },
+        endpoint: "http://codex.example/v1",
+        api: "openai-completions" as const,
+        override: {},
+      },
+    ]);
+    initAgent({
+      name: "subalias",
+      role: "reviewer",
+      provider: "codex-alias",
+      model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+      agentsRoot,
+      skipFlair: true,
+      registry,
+    });
+    const report = runDoctor({
+      name: "subalias",
+      agentsRoot,
+      homeDir: root,
+      flairKeysDir: join(root, ".flair", "keys"),
+      registry,
+    });
+    const check = report.checks.find((c) => c.name === "subscription auth");
+    expect(check?.status).toBe("fail");
+    expect(check?.fix).toBe("bob login subalias openai-codex");
   });
 });

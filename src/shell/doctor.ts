@@ -303,8 +303,10 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   }
 
-  // bob#241: when bob.yaml names a provider in SUBSCRIPTION_PROVIDERS — the
-  // scope of this check (see login.ts) — the agent's own auth store must hold a
+  // bob#241: when bob.yaml's provider name resolves — through the selected
+  // registry, the same table a session uses, so an operator alias maps to the
+  // runtime it points at — to a runtime in SUBSCRIPTION_PROVIDERS (the scope of
+  // this check; see login.ts), the agent's own auth store must hold a
   // credential for it that passes bob's local credential checks. Two different
   // failures have two different remedies: no credential that passes bob's local
   // credential checks is fixed with `bob login <agent> <provider>`; a store
@@ -343,7 +345,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
         fix: `fix the provider block in bob.yaml, then re-run 'bob doctor ${opts.name}'`,
       });
     } else if (providerName !== undefined) {
-      const piProvider = mapBobProviderToPi(providerName);
+      const piProvider = mapBobProviderToPi(providerName, opts.registry);
       if (SUBSCRIPTION_PROVIDERS.has(piProvider)) {
         const sub = subscriptionCredentialCheck({
           name: opts.name,

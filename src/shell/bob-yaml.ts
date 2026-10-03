@@ -653,7 +653,7 @@ export function lineOf(yamlText: string, pattern: RegExp): number {
 }
 
 // 1-based line of a sub-key inside a top-level block, falling back to the
-// block's own line. Same targeted scanning style as run.ts's readProviderField.
+// block's own line.
 function lineOfKey(yamlText: string, blockKey: string, subKey: string): number {
   const lines = yamlText.split(/\r?\n/);
   let inBlock = false;
