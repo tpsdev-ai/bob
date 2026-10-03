@@ -22,9 +22,24 @@ import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { readProviderLimits } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
 import { applyModelScaffold } from "../../src/shell/models.js";
+import { PROVIDER_RECORDS, ProviderRegistry } from "../../src/shell/provider-registry.js";
 import { resolveRunConfig } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
 import { SpawnError, spawnNode } from "../cli-spawn.js";
+
+// A NEW keyless row that exists only in this test: the containment sentinel runs
+// it through the same real factory as the builtins, proving a row's endpoint and
+// adapter reach the scaffold without a name hardcoded under src/.
+const NEW_KEYLESS_ROW = {
+  id: "acme-local",
+  aliases: ["acme"],
+  runtime: "acme-local",
+  auth: { kind: "none" as const },
+  endpoint: "http://acme.internal:11434/v1",
+  api: "openai-completions" as const,
+  override: {},
+};
+const NEW_KEYLESS_REGISTRY = new ProviderRegistry([...PROVIDER_RECORDS, NEW_KEYLESS_ROW]);
 
 let tmpRoot: string;
 let keysRoot: string;
@@ -380,119 +395,154 @@ describe("provider.base_url containment", () => {
     expect(existsSync(join(tmpRoot, "agents", "newton"))).toBe(false);
   });
 
-  it("captures placeholder-only requests with secrets in every credential source, including after refresh", async () => {
-    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
-    const sentinels = [
-      "SENTINEL_AUTH",
-      "SENTINEL_ENV",
-      "SENTINEL_MODELS",
-      "SENTINEL_OVERRIDE",
-      "SENTINEL_REFRESH",
-    ];
-    writeFileSync(
-      join(res.agentDir, ".pi-agent", "auth.json"),
-      JSON.stringify({
-        ollama: { type: "api_key", key: sentinels[0] },
-      }),
-    );
-    const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
-    Object.assign(models.providers.ollama, {
-      apiKey: sentinels[2],
-      headers: { "x-api-key": sentinels[2], cookie: sentinels[2] },
-    });
-    writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
-    const previousEnv = process.env.OLLAMA_API_KEY;
-    process.env.OLLAMA_API_KEY = sentinels[1];
-    const realFetch = globalThis.fetch;
-    const captured: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
-    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-      captured.push({
-        url: String(url),
-        headers: Object.fromEntries(new Headers(init?.headers)),
-        body: String(init?.body),
-      });
-      return new Response(
-        'data: {"id":"1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-        { headers: { "content-type": "text/event-stream" } },
+  // bob#186 slice 2 (T6): the containment sentinel runs over EVERY effective
+  // keyless profile — the three builtins and a new operator row — through the
+  // same real factory, both stream verbs and a refresh, with credentials seeded
+  // in disk, environment, model and caller options. Only the placeholder reaches
+  // the approved endpoint.
+  it.each([
+    { provider: "ollama", runtime: "ollama" },
+    { provider: "ollama-newton", runtime: "ollama-newton" },
+    { provider: "omlx", runtime: "omlx" },
+    { provider: "acme", runtime: "acme-local", registry: NEW_KEYLESS_REGISTRY },
+  ])(
+    "captures placeholder-only requests for keyless profile $provider, including after refresh",
+    async (profile) => {
+      const res = initAgent(
+        baseOpts({
+          provider: profile.provider,
+          baseUrl: LOCAL_URL,
+          ...(profile.registry ? { registry: profile.registry } : {}),
+        }),
       );
-    }) as typeof globalThis.fetch;
-    let session: { dispose(): void } | undefined;
-    try {
-      const { config, policy } = resolveRunConfig({ name: "newton", agentsRoot: tmpRoot });
-      const result = await createBobRuntimeFactory({ config, policy })({
-        sessionManager: SessionManager.inMemory(config.cwd),
-      });
-      session = result.session as unknown as { dispose(): void };
-      await result.session.prompt("hi");
-      expect(captured).toHaveLength(1);
-      expect(captured[0]?.headers.authorization).toBe(
-        "Bearer bob-base-url-placeholder-not-a-secret",
+      const sentinels = [
+        "SENTINEL_AUTH",
+        "SENTINEL_ENV",
+        "SENTINEL_MODELS",
+        "SENTINEL_OVERRIDE",
+        "SENTINEL_REFRESH",
+      ];
+      writeFileSync(
+        join(res.agentDir, ".pi-agent", "auth.json"),
+        JSON.stringify({
+          [profile.runtime]: { type: "api_key", key: sentinels[0] },
+        }),
       );
-      for (const sentinel of sentinels) expect(JSON.stringify(captured[0])).not.toContain(sentinel);
-      const runtime = result.services.modelRuntime as ModelRuntime;
-      const model = runtime.getModel("ollama", config.model)!;
-      const context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as const;
-      const options = {
-        apiKey: sentinels[3],
-        env: { OLLAMA_API_KEY: sentinels[3] },
-        headers: { authorization: sentinels[3], "x-api-key": sentinels[3], cookie: sentinels[3] },
-        transformHeaders: () => ({ authorization: sentinels[3] }),
-      };
-      for (const refreshed of [false, true]) {
-        if (refreshed) {
-          Object.assign(models.providers.ollama, {
-            apiKey: sentinels[4],
-            headers: { authorization: sentinels[4] },
-            oauth: "radius",
-          });
-          writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
-          writeFileSync(
-            join(res.agentDir, ".pi-agent", "auth.json"),
-            JSON.stringify({
-              ollama: { type: "oauth", access: sentinels[4], refresh: sentinels[4], expires: 0 },
-            }),
-          );
-          await runtime.refresh({ allowNetwork: true, providers: ["ollama"] });
-          expect((await runtime.getAuth(model, { apiKey: sentinels[3] }))?.auth.apiKey).toBe(
-            "bob-base-url-placeholder-not-a-secret",
-          );
-          expect(captured).toHaveLength(3);
-          models.providers.ollama.baseUrl = undefined;
-          writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
-          await runtime.refresh({ allowNetwork: true, providers: ["ollama"] });
+      const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+      Object.assign(models.providers[profile.runtime], {
+        apiKey: sentinels[2],
+        headers: { "x-api-key": sentinels[2], cookie: sentinels[2] },
+      });
+      writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+      const previousEnv = process.env.OLLAMA_API_KEY;
+      process.env.OLLAMA_API_KEY = sentinels[1];
+      const realFetch = globalThis.fetch;
+      const captured: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        captured.push({
+          url: String(url),
+          headers: Object.fromEntries(new Headers(init?.headers)),
+          body: String(init?.body),
+        });
+        return new Response(
+          'data: {"id":"1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }) as typeof globalThis.fetch;
+      let session: { dispose(): void } | undefined;
+      try {
+        const { config, policy } = resolveRunConfig({
+          name: "newton",
+          agentsRoot: tmpRoot,
+          ...(profile.registry ? { registry: profile.registry } : {}),
+        });
+        const result = await createBobRuntimeFactory({
+          config,
+          policy,
+          ...(profile.registry ? { registry: profile.registry } : {}),
+        })({
+          sessionManager: SessionManager.inMemory(config.cwd),
+        });
+        session = result.session as unknown as { dispose(): void };
+        await result.session.prompt("hi");
+        expect(captured).toHaveLength(1);
+        expect(captured[0]?.headers.authorization).toBe(
+          "Bearer bob-base-url-placeholder-not-a-secret",
+        );
+        for (const sentinel of sentinels)
+          expect(JSON.stringify(captured[0])).not.toContain(sentinel);
+        const runtime = result.services.modelRuntime as ModelRuntime;
+        const model = runtime.getModel(profile.runtime, config.model)!;
+        const context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as const;
+        const options = {
+          apiKey: sentinels[3],
+          env: { OLLAMA_API_KEY: sentinels[3] },
+          headers: { authorization: sentinels[3], "x-api-key": sentinels[3], cookie: sentinels[3] },
+          transformHeaders: () => ({ authorization: sentinels[3] }),
+        };
+        for (const refreshed of [false, true]) {
+          if (refreshed) {
+            Object.assign(models.providers[profile.runtime], {
+              apiKey: sentinels[4],
+              headers: { authorization: sentinels[4] },
+              oauth: "radius",
+            });
+            writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+            writeFileSync(
+              join(res.agentDir, ".pi-agent", "auth.json"),
+              JSON.stringify({
+                [profile.runtime]: {
+                  type: "oauth",
+                  access: sentinels[4],
+                  refresh: sentinels[4],
+                  expires: 0,
+                },
+              }),
+            );
+            await runtime.refresh({ allowNetwork: true, providers: [profile.runtime] });
+            expect((await runtime.getAuth(model, { apiKey: sentinels[3] }))?.auth.apiKey).toBe(
+              "bob-base-url-placeholder-not-a-secret",
+            );
+            expect(captured).toHaveLength(3);
+            models.providers[profile.runtime].baseUrl = undefined;
+            writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+            await runtime.refresh({ allowNetwork: true, providers: [profile.runtime] });
+          }
+          for (const verb of ["streamSimple", "stream"] as const) {
+            const reply = await runtime[verb](
+              { ...model, headers: { authorization: sentinels[2] } },
+              context as never,
+              options as never,
+            ).result();
+            expect(reply.stopReason).not.toBe("error");
+          }
         }
-        for (const verb of ["streamSimple", "stream"] as const) {
-          const reply = await runtime[verb](
-            { ...model, headers: { authorization: sentinels[2] } },
+        expect(captured).toHaveLength(5);
+        for (const request of captured) {
+          expect(request.url).toBe(`${LOCAL_URL}/chat/completions`);
+          expect(request.headers.authorization).toBe(
+            "Bearer bob-base-url-placeholder-not-a-secret",
+          );
+          for (const sentinel of sentinels) expect(JSON.stringify(request)).not.toContain(sentinel);
+        }
+        const bad = await runtime
+          .streamSimple(
+            { ...model, baseUrl: "http://other.example/v1" },
             context as never,
             options as never,
-          ).result();
-          expect(reply.stopReason).not.toBe("error");
-        }
+          )
+          .result();
+        expect(bad.stopReason).toBe("error");
+        expect(bad.errorMessage).toContain("run bob models <agent> to apply provider.base_url");
+        expect(captured).toHaveLength(5);
+      } finally {
+        session?.dispose();
+        globalThis.fetch = realFetch;
+        if (previousEnv === undefined) delete process.env.OLLAMA_API_KEY;
+        else process.env.OLLAMA_API_KEY = previousEnv;
       }
-      expect(captured).toHaveLength(5);
-      for (const request of captured) {
-        expect(request.url).toBe(`${LOCAL_URL}/chat/completions`);
-        expect(request.headers.authorization).toBe("Bearer bob-base-url-placeholder-not-a-secret");
-        for (const sentinel of sentinels) expect(JSON.stringify(request)).not.toContain(sentinel);
-      }
-      const bad = await runtime
-        .streamSimple(
-          { ...model, baseUrl: "http://other.example/v1" },
-          context as never,
-          options as never,
-        )
-        .result();
-      expect(bad.stopReason).toBe("error");
-      expect(bad.errorMessage).toContain("run bob models <agent> to apply provider.base_url");
-      expect(captured).toHaveLength(5);
-    } finally {
-      session?.dispose();
-      globalThis.fetch = realFetch;
-      if (previousEnv === undefined) delete process.env.OLLAMA_API_KEY;
-      else process.env.OLLAMA_API_KEY = previousEnv;
-    }
-  });
+    },
+  );
 });
 afterEach(() => {
   rmSync(tmpRoot, { recursive: true, force: true });

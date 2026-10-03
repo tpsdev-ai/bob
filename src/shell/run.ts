@@ -51,6 +51,7 @@ import {
 import type { TaskBinding } from "../capabilities/work/task-binding.js";
 import {
   type ProviderLimitsBlock,
+  parseBobYamlBlock,
   readAgentRole,
   readBlock,
   readCapabilities,
@@ -674,6 +675,10 @@ export type RunSessionFactory = (config: RunSessionConfig) => Promise<RunSession
 export interface RunOptions {
   // Agent name. Config lives at ~/agents/<name>/.
   name: string;
+  // The validated provider selection this run resolves against. Loaded ONCE by
+  // the caller (the CLI) and threaded here; it defaults to the built-in table
+  // for tests. Never re-loaded per call.
+  registry?: ProviderRegistry;
   // Optional initial prompt. PR1 covers the non-interactive prompt path; an
   // interactive REPL on the SDK is a later PR. Without a prompt there's
   // nothing to send, so runAgent treats it as an error unless interactive.
@@ -840,6 +845,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.mailTurn ? { mailTurn: true } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
@@ -903,7 +909,9 @@ async function runBoundedSession(
     throw err;
   }
 
-  const factory = opts.sessionFactory ?? createPiRunSession;
+  const factory =
+    opts.sessionFactory ??
+    ((cfg: RunSessionConfig) => createPiRunSession(cfg, undefined, opts.registry));
   // #145: the task is the session's CONTRACT, carried in its system prompt
   // through the factory. (It is ALSO the first user message below, so a provider
   // that shows only messages still sees it; see the README's stated limits.)
@@ -1781,6 +1789,8 @@ export interface LaunchOptions {
   positionsRoot?: string;
   // Test seam for the one-shot path (defaults to the real SDK factory).
   sessionFactory?: RunSessionFactory;
+  // The validated provider selection (loaded once by the CLI).
+  registry?: ProviderRegistry;
   // Test seam for the interactive path (defaults to pi's InteractiveMode in a
   // real terminal).
   interactive?: (input: {
@@ -1854,6 +1864,7 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
       prompt: opts.prompt,
       model: opts.model,
       agentsRoot: opts.agentsRoot,
+      ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
       ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
       captureStdout: true,
@@ -1869,6 +1880,7 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     name: opts.name,
     agentsRoot: opts.agentsRoot ?? join(homedir(), "agents"),
     model: opts.model,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
@@ -1876,7 +1888,12 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
   // the bootstrap before the session is opened.
   await attachFlairBootstrap(flairBootstrapTarget, config);
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
-  return interactive({ config, policy, deps: opts.deps });
+  return interactive({
+    config,
+    policy,
+    deps: opts.deps,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
+  });
 }
 
 // ─── `bob launch` in mail-turn mode (bob#200) ────────────────────────────────
@@ -1968,6 +1985,8 @@ export interface MailTurnLaunchOptions {
   input: string;
   agentsRoot?: string;
   model?: string;
+  // The validated provider selection (loaded once by the CLI).
+  registry?: ProviderRegistry;
   // Host state root for the position grant store (tests). Defaults to ~/.bob/host.
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
@@ -2006,6 +2025,7 @@ async function runMailTurn(
     mailTurn: true,
     model: opts.model,
     agentsRoot: opts.agentsRoot,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
     captureStdout: true,
@@ -2227,7 +2247,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // a per-call override. Bound to the pair it describes; a model with no
   // declared window leaves this undefined, and the factory refuses that session
   // with the remedy.
-  const modelLimits = declaredModelLimits(readProviderLimits(yamlText), provider, yamlModel, model);
+  const modelLimits = declaredModelLimits(
+    readProviderLimits(yamlText, opts.registry),
+    provider,
+    yamlModel,
+    model,
+  );
   const appendSystemPrompt = readSoul(agentDir);
 
   // The ONE effective-config resolver. For an ADOPTED agent (a host grant
@@ -2403,6 +2428,7 @@ export {
 export async function createPiRunSession(
   config: RunSessionConfig,
   sessionManagerFactory?: (cwd: string) => SessionManagerLike,
+  registry?: ProviderRegistry,
 ): Promise<RunSession> {
   assertToolPolicy(config);
   const policy: ToolPolicy = {
@@ -2418,7 +2444,11 @@ export async function createPiRunSession(
   };
   const makeSessionManager =
     sessionManagerFactory ?? ((cwd: string) => SessionManager.inMemory(cwd));
-  const factory = createBobRuntimeFactory({ config, policy });
+  const factory = createBobRuntimeFactory({
+    config,
+    policy,
+    ...(registry !== undefined ? { registry } : {}),
+  });
   const { session } = await factory({
     cwd: config.cwd,
     agentDir: config.piAgentDir,
@@ -2534,28 +2564,19 @@ export function declaredProviderModel(yamlText: string): string | undefined {
 }
 
 // Read a scalar `key: value` field from inside the top-level `provider:` block.
-// Targeted to init.ts's flat output (2-space indented keys under `provider:`);
-// not a general YAML parser.
+// bob#186 slice 2 (T7): the block is read with the REAL YAML parser (see
+// parseBobYamlBlock), not a bespoke line scanner, so nested provider metadata
+// loads and an ambiguous document refuses instead of guessing. A scalar value is
+// returned as text with surrounding quotes stripped; an empty value is undefined.
 function readProviderField(yamlText: string, key: string): string | undefined {
-  const lines = yamlText.split(/\r?\n/);
-  let inProvider = false;
-  for (const line of lines) {
-    // A new top-level (column-0, non-comment) key ends the provider block.
-    if (/^[A-Za-z0-9_-]+\s*:/.test(line)) {
-      inProvider = /^provider\s*:/.test(line);
-      continue;
-    }
-    if (!inProvider) continue;
-    // Trim first, then match without leading/trailing `\s*` — avoids a
-    // polynomial regex (CodeQL js/polynomial-redos). Value is trimmed below.
-    const t = line.trim();
-    const m = t.match(/^([A-Za-z0-9_-]+)\s*:(.*)$/);
-    if (m && m[1] === key) {
-      // Strip surrounding whitespace + quotes if present.
-      return m[2].trim().replace(/^["']|["']$/g, "");
-    }
+  const provider = parseBobYamlBlock(yamlText, "provider");
+  if (provider === null || typeof provider !== "object" || Array.isArray(provider)) {
+    return undefined;
   }
-  return undefined;
+  const value = (provider as Record<string, unknown>)[key];
+  if (value === null || value === undefined) return undefined;
+  const text = typeof value === "string" ? value.trim() : String(value).trim();
+  return text === "" ? undefined : text.replace(/^["']|["']$/g, "");
 }
 
 // Map a bob provider name to pi's provider id, reading the provider registry:

@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { SessionRunner } from "./onboard.js";
+import type { ProviderRegistry } from "./provider-registry.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
 import { bindSetupSoulTarget } from "./write-soul.js";
@@ -38,6 +39,9 @@ export interface AlignOptions {
   // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
   hostRoot?: string;
   positionsRoot?: string;
+  // The validated provider selection (loaded once by the CLI). Threaded to the
+  // config resolution and the session factory; never re-loaded here.
+  registry?: ProviderRegistry;
 }
 
 export interface AlignResult {
@@ -101,6 +105,7 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   const { config: resolved } = resolveRunConfig({
     name: opts.name,
     agentsRoot,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.model !== undefined ? { model: opts.model } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
@@ -110,7 +115,9 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
   // provider is a bob name and is mapped here — once, at the boundary where a
   // bob name enters.
   const provider =
-    opts.provider !== undefined ? mapBobProviderToPi(opts.provider) : resolved.provider;
+    opts.provider !== undefined
+      ? mapBobProviderToPi(opts.provider, opts.registry)
+      : resolved.provider;
   // bob.yaml declares context windows for its OWN provider only, so a
   // --provider naming another one leaves the session with no declared window:
   // the session factory refuses it, naming bob.yaml's provider.
@@ -144,6 +151,7 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     config: sessionConfig,
     policy: SETUP_TOOL_POLICY,
     initialMessage: FIRST_MESSAGE(opts.name, soulPath),
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
   });
 
   const soulHashAfter = hashFile(soulPath);

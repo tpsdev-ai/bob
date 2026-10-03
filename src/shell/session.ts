@@ -78,7 +78,7 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
-import { reservedProviderNames } from "./provider-registry.js";
+import { type ProviderRegistry, reservedProviderNames } from "./provider-registry.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -424,8 +424,11 @@ export function assertNoReservedProviderEntries(
  * The slice-2 entry point: refuse an on-disk entry for every reserved name the
  * DEFAULT registry derives (each bob/env row's id, aliases and runtime).
  */
-export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
-  assertNoReservedProviderEntries(piAgentDir, reservedProviderNames());
+export function assertNoOnDiskOpenrouter(
+  piAgentDir: string,
+  reserved: readonly string[] = reservedProviderNames(),
+): void {
+  assertNoReservedProviderEntries(piAgentDir, reserved);
 }
 
 /**
@@ -1071,6 +1074,9 @@ export interface BobFactoryInput {
   // can substitute one that returns a scripted "built" session so it can drive
   // the factory's dispose-on-refusal catch without a process-global module mock.
   buildSession?: typeof createAgentSessionFromServices;
+  // The validated provider selection this session was resolved from. The factory
+  // derives the on-disk refusal set from ITS rows, never a re-loaded default.
+  registry?: ProviderRegistry;
 }
 
 // Fail the session if bob's OWN guard extension did not load (#145). pi records
@@ -1266,7 +1272,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       }));
     const yamlPath = join(dirname(config.piAgentDir), "bob.yaml");
     const baseUrl = existsSync(yamlPath)
-      ? readProviderLimits(readFileSync(yamlPath, "utf8")).baseUrl
+      ? readProviderLimits(readFileSync(yamlPath, "utf8"), input.registry).baseUrl
       : undefined;
     if (baseUrl !== undefined) {
       const effective = modelRuntime.getModel(config.provider, config.model);
@@ -1282,7 +1288,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     if (config.provider === "openrouter") {
       // The on-disk refusal comes FIRST (a config error, before any key read), so a
       // tampered models.json refuses on every entry path without consuming the key.
-      assertNoOnDiskOpenrouter(agentDir);
+      assertNoOnDiskOpenrouter(agentDir, reservedProviderNames(input.registry));
       // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
       // OPENROUTER_API_KEY once, then DELETE it from process.env before any
       // capability, extension or tool subprocess starts (pi's ModelRuntime is
@@ -1573,6 +1579,9 @@ export interface InteractiveRunInput {
   // Sent as the first message once the TUI is up (onboarding / alignment).
   initialMessage?: string;
   deps?: SessionDeps;
+  // The validated provider selection. Threaded to the factory so the on-disk
+  // refusal set comes from ITS rows.
+  registry?: ProviderRegistry;
   // Test seam: build the mode around the runtime. Defaults to pi's
   // InteractiveMode.
   modeFactory?: (runtime: AgentSessionRuntime) => { run(): Promise<void> };
@@ -1584,7 +1593,12 @@ export interface InteractiveRunInput {
 export async function runInteractiveSession(input: InteractiveRunInput): Promise<number> {
   const { config, policy, deps } = input;
   const runtime = await createAgentSessionRuntime(
-    createBobRuntimeFactory({ config, policy, deps }),
+    createBobRuntimeFactory({
+      config,
+      policy,
+      deps,
+      ...(input.registry !== undefined ? { registry: input.registry } : {}),
+    }),
     {
       cwd: config.cwd,
       agentDir: config.piAgentDir,

@@ -131,6 +131,7 @@ export const PROVIDER_RECORDS = [
     configName: true,
     aliases: [],
     runtime: "ollama-newton",
+    api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: {},
   },
@@ -139,6 +140,7 @@ export const PROVIDER_RECORDS = [
     configName: true,
     aliases: [],
     runtime: "omlx",
+    api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: {},
   },
@@ -404,14 +406,36 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
   assertCustodyImplemented(records);
 }
 
+/**
+ * The selected default provider per setup command. Operator data may name a
+ * different `onboard`/`hire` provider; when it does not, the built-in default
+ * applies. This is resolved ONCE when the registry loads and carried with it,
+ * so a command never re-reads the file to find its own default.
+ */
+export interface ProviderDefaults {
+  readonly onboard?: string;
+  readonly hire?: string;
+}
+
+/** bob's built-in default selection when the operator declares none. */
+export const BUILTIN_PROVIDER_DEFAULTS: Required<ProviderDefaults> = {
+  onboard: "ollama-cloud",
+  hire: "exe-dev-gateway",
+};
+
 /** A validated, indexed set of provider records. */
 export class ProviderRegistry {
   readonly #byName = new Map<string, ProviderRecord>();
   readonly #records: readonly ProviderRecord[];
+  readonly #defaults: ProviderDefaults;
 
-  constructor(records: readonly ProviderRecord[] = PROVIDER_RECORDS) {
+  constructor(
+    records: readonly ProviderRecord[] = PROVIDER_RECORDS,
+    defaults: ProviderDefaults = {},
+  ) {
     validateProviderRecords(records);
     this.#records = [...records];
+    this.#defaults = { ...defaults };
     for (const record of records) {
       this.#byName.set(record.id, record);
       for (const alias of record.aliases) this.#byName.set(alias, record);
@@ -426,6 +450,11 @@ export class ProviderRegistry {
   /** The record whose id or alias is `name`, or undefined when none declares it. */
   find(name: string): ProviderRecord | undefined {
     return this.#byName.get(name);
+  }
+
+  /** The selected default provider names (operator defaults over the builtins). */
+  defaults(): Required<ProviderDefaults> {
+    return { ...BUILTIN_PROVIDER_DEFAULTS, ...this.#defaults };
   }
 }
 
@@ -447,6 +476,30 @@ export function resolveRuntimeProviderName(
   registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
 ): string {
   return registry.find(name)?.runtime ?? name;
+}
+
+/**
+ * The default provider name for a setup command, from the validated selection.
+ * `onboard` is the provider a fresh agent is scaffolded onto; `hire` the one a
+ * position hire defaults to when its caller names none.
+ */
+export function defaultProviderName(
+  kind: "onboard" | "hire",
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): string {
+  return registry.defaults()[kind];
+}
+
+/**
+ * The wire API for the row whose runtime identity is `runtime`, when a row
+ * declares one. The scaffold reads its emitted adapter from HERE rather than a
+ * literal, so a new row's metadata reaches models.json unchanged.
+ */
+export function providerApiForRuntime(
+  runtime: string,
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): ProviderApi | undefined {
+  return registry.records().find((row) => row.runtime === runtime && row.api !== undefined)?.api;
 }
 
 /** The default endpoint for `name`, when its row declares one. */
@@ -699,7 +752,7 @@ export function loadProviderRegistry(opts: LoadProviderRegistryOptions = {}): Pr
   const doc = parseOperatorDocumentValue(parsed, path);
   const builtins = PROVIDER_RECORDS as readonly ProviderRecord[];
   const combined = [...builtins, ...doc.providers];
-  const registry = new ProviderRegistry(combined);
+  const registry = new ProviderRegistry(combined, doc.defaults);
   for (const [key, name] of Object.entries(doc.defaults)) {
     if (registry.find(name) === undefined) {
       throw new ProviderRegistryError(

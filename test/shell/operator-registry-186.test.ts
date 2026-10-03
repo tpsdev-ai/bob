@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { providerBaseUrlRefusal } from "../../src/shell/bob-yaml.js";
@@ -7,6 +7,7 @@ import { initAgent } from "../../src/shell/init.js";
 import {
   CUSTODY_IMPLEMENTATIONS,
   DEFAULT_PROVIDER_REGISTRY,
+  defaultProviderName,
   loadProviderRegistry,
   PROVIDER_RECORDS,
   ProviderRegistry,
@@ -353,5 +354,21 @@ describe("the builtin table carries explicit auth modes", () => {
     for (const row of PROVIDER_RECORDS) {
       expect(["env", "none", "vm", "disk", "login"]).toContain(row.auth.kind);
     }
+  });
+});
+
+// ── T5b: the selected defaults are carried by the registry ───────────────────
+
+describe("the selected defaults are carried by the registry", () => {
+  it("defaultProviderName returns the operator's selection over the builtins", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/none\ndefaults:\n  onboard: acme\n  hire: acme\n",
+    );
+    const reg = loadProviderRegistry({ path });
+    expect(defaultProviderName("onboard", reg)).toBe("acme");
+    expect(defaultProviderName("hire", reg)).toBe("acme");
+    const builtin = new ProviderRegistry();
+    expect(defaultProviderName("onboard", builtin)).toBe("ollama-cloud");
+    expect(defaultProviderName("hire", builtin)).toBe("exe-dev-gateway");
   });
 });

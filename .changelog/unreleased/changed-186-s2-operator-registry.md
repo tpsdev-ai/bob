@@ -7,3 +7,7 @@
   today); operator data cannot assert that custody. The disk-refusal set is derived from the keyed
   rows (each id, alias and runtime), and `provider.base_url` eligibility comes from each keyless
   row's override policy. Refs #186.
+
+  The selected `defaults.onboard`/`defaults.hire` names drive `bob onboard` and `bob hire`, the
+  scaffold's emitted adapter is read from the row instead of a literal, and the `provider:` readers
+  in `bob.yaml` now run on the same real parser, so an ambiguous document refuses. Refs #186.

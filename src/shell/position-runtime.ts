@@ -52,6 +52,7 @@ import { type InitResult, initAgent } from "./init.js";
 import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
 import { initOverrideRepo, overridesDir } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
+import { defaultProviderName, type ProviderRegistry } from "./provider-registry.js";
 import { loadRole } from "./role-loader.js";
 import { assertProviderRunnable, mapBobProviderToPi, resolveAgentToolPolicy } from "./run.js";
 import type { SessionDeps } from "./session.js";
@@ -242,6 +243,10 @@ function soulHashOf(agentDir: string): string {
 export interface HireOptions extends PositionCommonOptions {
   provider?: string;
   model?: string;
+  // The validated provider selection (loaded once by the CLI). Names the default
+  // provider to hire onto and maps a caller's provider name; never re-loaded
+  // here.
+  registry?: ProviderRegistry;
   // bob#214: the model's context window, written to bob.yaml (see initAgent).
   // Required: hireAgent refuses before writing anything without it.
   contextWindow?: number;
@@ -269,7 +274,6 @@ export interface HireResult {
   interview: OnboardResult;
 }
 
-const DEFAULT_PROVIDER = "exe-dev-gateway";
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 // Hire a NEW agent from a packaged position. ASYNC because it runs the existing
@@ -298,11 +302,11 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   assertPositionAgainstRole(position, role.tools.allow);
   assertUnoccupied(hostRoot, agentDir, opts.name);
 
-  const provider = opts.provider ?? DEFAULT_PROVIDER;
+  const provider = opts.provider ?? defaultProviderName("hire", opts.registry);
   const model = opts.model ?? DEFAULT_MODEL;
   // The provider/runtime-key refusal the interview session would otherwise raise
   // AFTER the scaffold exists. Run it up front so a missing key leaves nothing.
-  assertProviderRunnable(mapBobProviderToPi(provider), `bob hire ${opts.name}`);
+  assertProviderRunnable(mapBobProviderToPi(provider, opts.registry), `bob hire ${opts.name}`);
   // bob#214: likewise the context window. The interview is a session, and every
   // session refuses to start without the model's declared window, so a hire
   // without one would scaffold and then fail its interview. Refuse it here.
@@ -345,6 +349,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       provider,
       model,
       agentsRoot: opts.agentsRoot,
+      ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       capabilities: position.manifest.capabilities.default,
       toolAllow: position.manifest.tools,
       skipFlair: opts.skipFlair ?? true,
@@ -366,6 +371,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       model,
       hostRoot,
       positionsRoot,
+      ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       ...(opts.interview !== undefined ? { sessionRunner: opts.interview } : {}),
       ...(opts.deps !== undefined ? { deps: opts.deps } : {}),
     });

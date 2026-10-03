@@ -18,6 +18,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import type { ProviderRegistry } from "./provider-registry.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
@@ -37,6 +38,9 @@ export interface OnboardOptions {
   // over bob's session runtime.
   sessionRunner?: SessionRunner;
   deps?: SessionDeps;
+  // The validated provider selection (loaded once by the CLI). Threaded to the
+  // config resolution and the session factory; never re-loaded here.
+  registry?: ProviderRegistry;
   // The host state root + positions root, for an ADOPTED agent: the setup
   // session runs the agent's grant-resolved config (capabilities, cwd). Its
   // POLICY is still the fixed read + write_soul (bob#204), never the grant's.
@@ -52,6 +56,7 @@ export type SessionRunner = (input: {
   policy: ToolPolicy;
   initialMessage: string;
   deps?: SessionDeps;
+  registry?: ProviderRegistry;
 }) => Promise<number>;
 
 export interface OnboardResult {
@@ -126,13 +131,14 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   const { config } = resolveRunConfig({
     name: opts.name,
     agentsRoot,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
   });
   const soulHashBefore = hashFile(soulPath);
   const sessionConfig: RunSessionConfig = {
     ...config,
-    provider: mapBobProviderToPi(opts.provider),
+    provider: mapBobProviderToPi(opts.provider, opts.registry),
     model: opts.model,
     // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
     // to THIS agent's soul.md. pi's generic `write` is not granted.
@@ -150,6 +156,7 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
     policy: SETUP_TOOL_POLICY,
     initialMessage: FIRST_MESSAGE(opts.name, opts.role, soulPath),
     deps: opts.deps,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
   });
 
   const soulHashAfter = hashFile(soulPath);

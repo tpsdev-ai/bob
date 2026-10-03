@@ -16,6 +16,7 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
+import { isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
 import { DEFAULT_PROVIDER_REGISTRY, type ProviderRegistry } from "./provider-registry.js";
 import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
 import {
@@ -269,6 +270,73 @@ export function providerBaseUrlRefusal(
   return `provider.base_url is only allowed for a keyless provider row that authorizes an override (got "${provider}" on "${parsed.hostname}").`;
 }
 
+// bob#186 slice 2 (T7) — the provider readers run on a REAL YAML parser.
+//
+// `bob.yaml` is hand-emitted by init today, but the provider block's readers must
+// not depend on a bespoke regex grammar once the document may carry nested
+// metadata. This helper parses the WHOLE document once and returns one
+// top-level block. Duplicate mapping keys, unresolved tags, aliases/anchors and
+// merge keys REFUSE: the document is ambiguous and a reader cannot resolve it.
+export function parseBobYamlBlock(yamlText: string, blockKey: string): unknown {
+  let doc: import("yaml").Document;
+  try {
+    doc = parseDocument(yamlText, { uniqueKeys: true, schema: "core", merge: false });
+  } catch (err) {
+    throw new BobYamlError(
+      blockKey,
+      1,
+      `could not parse bob.yaml: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}.`,
+    );
+  }
+  if (doc.errors.length > 0) {
+    throw new BobYamlError(
+      blockKey,
+      1,
+      `could not parse bob.yaml: ${doc.errors[0]?.message.split("\n")[0] ?? "parse error"}.`,
+    );
+  }
+  if (doc.warnings.length > 0) {
+    throw new BobYamlError(
+      blockKey,
+      1,
+      `unsupported YAML tag in bob.yaml: ${doc.warnings[0]?.message.split("\n")[0] ?? "warning"}.`,
+    );
+  }
+  refuseAmbiguousYaml(doc.contents, blockKey);
+  const value = doc.toJS({ maxAliasCount: 0 });
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new BobYamlError(blockKey, 1, "bob.yaml must be a mapping of top-level block keys.");
+  }
+  return (value as Record<string, unknown>)[blockKey];
+}
+
+// Refuse aliases, anchors and merge keys in bob.yaml, mirroring the registry
+// loader: they make the document ambiguous, and the provider block is a flat,
+// explicit declaration.
+function refuseAmbiguousYaml(node: Node | null, blockKey: string): void {
+  if (node === null || node === undefined) return;
+  if (isAlias(node) || (node as { anchor?: unknown }).anchor !== undefined) {
+    throw new BobYamlError(blockKey, 1, "bob.yaml uses a YAML alias/anchor, which is not allowed.");
+  }
+  if (isMap(node)) {
+    for (const pair of node.items) {
+      const key = pair.key as Node | null;
+      if (key !== null && (key as { value?: unknown }).value === "<<") {
+        throw new BobYamlError(
+          blockKey,
+          1,
+          "bob.yaml uses a YAML merge key, which is not allowed.",
+        );
+      }
+      if (pair.key) refuseAmbiguousYaml(pair.key as Node, blockKey);
+      if (pair.value) refuseAmbiguousYaml(pair.value as Node, blockKey);
+    }
+  } else if (isSeq(node)) {
+    for (const item of node.items) refuseAmbiguousYaml(item as Node, blockKey);
+  }
+}
+
 function tokensFor(yamlText: string, key: string, value: unknown): number {
   const tokens = positiveTokens(value);
   if (tokens === undefined) {
@@ -281,10 +349,20 @@ function tokensFor(yamlText: string, key: string, value: unknown): number {
   return tokens;
 }
 
-export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
-  const raw = readBlock(yamlText, "provider");
+export function readProviderLimits(
+  yamlText: string,
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): ProviderLimitsBlock {
+  const raw = parseBobYamlBlock(yamlText, "provider") as Record<string, unknown> | undefined;
   const out: ProviderLimitsBlock = { models: {} };
-  if (raw === undefined) return out;
+  if (raw === undefined || raw === null) return out;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BobYamlError(
+      "provider",
+      lineOf(yamlText, /^provider[ \t]*:/m),
+      `the "provider:" block must be a mapping of name/model/context_window keys.`,
+    );
+  }
   for (const [key, value] of Object.entries(raw)) {
     if (!(PROVIDER_KEYS as readonly string[]).includes(key)) {
       throw new BobYamlError(
@@ -304,7 +382,7 @@ export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
         );
       }
       const name = typeof raw.name === "string" ? raw.name : "";
-      const refusal = providerBaseUrlRefusal(name, value);
+      const refusal = providerBaseUrlRefusal(name, value, registry);
       if (refusal !== undefined) {
         throw new BobYamlError("provider", lineOfKey(yamlText, "provider", key), refusal);
       }

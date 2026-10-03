@@ -206,6 +206,29 @@ change one, the named test is what tells you.
   ceiling intersected with `bob.yaml`, minus `exclude` and the resident
   exclusions, and it is REQUIRED: a config without it is refused, in the type
   and at runtime. *(`test/shell/run-tool-allowlist.test.ts`, `run.test.ts`)*
+- **One provider registry owns identity, ownership and endpoint.** Every row
+  carries an explicit, closed `auth` mode; a missing or unknown mode refuses at
+  load, and the obsolete `gateway`/`envKey` flags refuse as unknown fields. An
+  operator file at `~/.config/bob/providers.yaml` — an absent default uses the
+  builtins; an explicitly requested missing file, an unreadable file, a parse
+  error or an invalid document refuses — is read through a real YAML parser, and
+  every row, selected or not, is validated before the registry is returned.
+  Endpoint eligibility, the emitted scaffold adapter, the disk-refusal set and
+  run resolution are all derived from these rows. A `bob/env` row loads only
+  against a code-owned custody descriptor, so operator data cannot assert that
+  custody exists. Builtin modes: `ollama-cloud` and `openai` are `pi/disk`;
+  `ollama`, `ollama-newton` and `omlx` are keyless `bob/none`;
+  `exe-dev-gateway` is `bob/vm`; `anthropic` is `pi/login`; `openrouter` is
+  `bob/env(OPENROUTER_API_KEY)`. Loader refusals: duplicate ids or aliases, an
+  ambiguous runtime identity, an unsupported adapter, an endpoint that is not a
+  canonical absolute URL or that violates its mode's policy, a contradictory
+  override on a keyed row, an invalid `defaults` reference, and a `bob/env` row
+  whose variable, endpoint or API does not match the implemented custody. bob/env
+  custody is implemented for ONE runtime (OpenRouter); legacy pi-managed
+  credentials (`pi/disk`, `pi/login`) have not yet acquired bob transport custody.
+  *(`test/shell/operator-registry-186.test.ts`, `test/shell/provider-registry-186.test.ts`,
+  `test/shell/bob-yaml-parser-186.test.ts`, `test/shell/provider-defaults-186.test.ts`,
+  `test/shell/local-provider-base-url-141.test.ts`)*
 - **Isolated session resources.** pi's settings and resource sources are built
   by bob: project trust off, no configured package installed, and no global
   `SYSTEM.md` / `APPEND_SYSTEM.md`. pi still enumerates the ambient extension,
