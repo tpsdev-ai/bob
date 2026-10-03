@@ -1,9 +1,15 @@
-import { lazyStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, lazyStream } from "@earendil-works/pi-ai";
 import {
   stream as openaiStream,
   streamSimple as openaiStreamSimple,
 } from "@earendil-works/pi-ai/api/openai-completions";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+  type ProviderRequestPolicy,
+  type ProviderRequestTimeoutError,
+  type ProviderStreamIdleTimeoutError,
+  withStreamTimeouts,
+} from "./provider-request-policy.js";
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -11,6 +17,7 @@ export function installBaseUrlTransport(
   runtime: ModelRuntime,
   provider: string,
   baseUrl: string,
+  request?: ProviderRequestPolicy,
 ): void {
   const originalAuth = runtime.getAuth.bind(runtime);
   runtime.getAuth = (async (selected, options) => {
@@ -42,7 +49,6 @@ export function installBaseUrlTransport(
     }
     return response;
   };
-
   const send = (
     delegate: typeof openaiStreamSimple,
     model: Parameters<ModelRuntime["streamSimple"]>[0],
@@ -52,13 +58,51 @@ export function installBaseUrlTransport(
     if (model.baseUrl !== baseUrl || model.api !== "openai-completions") {
       throw new Error("bob: run bob models <agent> to apply provider.base_url");
     }
-    return delegate({ ...model, headers: undefined } as never, context, {
-      ...options,
+    const controller = new AbortController();
+    const supplied = (options ?? {}) as Record<string, unknown>;
+    const callerSignal = supplied.signal as AbortSignal | undefined;
+    let timeoutError: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError | undefined;
+    const onCallerAbort = () => controller.abort(callerSignal?.reason);
+    if (request !== undefined) {
+      if (callerSignal?.aborted) onCallerAbort();
+      else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+    }
+    const requestFetch =
+      request === undefined
+        ? guardedFetch
+        : withStreamTimeouts(guardedFetch, request, provider, undefined, (error) => {
+            timeoutError = error;
+            controller.abort(error);
+          });
+    const source = delegate({ ...model, headers: undefined } as never, context, {
+      ...supplied,
+      ...(request !== undefined
+        ? { timeoutMs: 2_147_483_647, maxRetries: request.maxRetries, signal: controller.signal }
+        : {}),
       apiKey: BASE_URL_PLACEHOLDER,
       headers: undefined,
       env: {},
-      fetch: guardedFetch,
+      fetch: requestFetch,
     } as never);
+    if (request === undefined) return source;
+    const stream = createAssistantMessageEventStream();
+    void (async () => {
+      try {
+        for await (const event of source) {
+          if (event.type === "error" && timeoutError !== undefined) {
+            event.error.stopReason = "error";
+            event.error.errorMessage = `${timeoutError.name}: ${timeoutError.message}`;
+            stream.push({ ...event, reason: "error" });
+          } else {
+            stream.push(event);
+          }
+        }
+      } finally {
+        callerSignal?.removeEventListener("abort", onCallerAbort);
+        stream.end();
+      }
+    })();
+    return stream;
   };
 
   // These request verbs survive pi's provider recomposition during refresh.
