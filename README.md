@@ -971,7 +971,7 @@ A session refuses to start when `provider.base_url` differs from the effective m
 "run bob models <agent> to apply provider.base_url".
 `bob models` accepts pi's line comments and trailing commas; comments in models.json are not preserved.
 Overrides are accepted for `ollama-newton`, `omlx`, and `ollama` on any host other than
-`ollama.com` (including its terminal-dot forms). bob's transport sends a constant placeholder key and strips request headers.
+`ollama.com` (including its terminal-dot forms). bob's transport replaces caller-supplied headers with fixed Content-Type, Accept and placeholder Authorization headers.
 
 ### Moving an agent to a subscription model
 
