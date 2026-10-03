@@ -968,7 +968,7 @@ bob onboard newton --role ea --provider ollama --model qwen3.8:27b-mxfp8 \
 
 `--base-url` is an init-time scaffold value written to `bob.yaml` and `.pi-agent/models.json`.
 A session refuses to start when `provider.base_url` differs from the effective model's `baseUrl`:
-"run bob init to apply provider.base_url".
+"run bob models <agent> to apply provider.base_url".
 Overrides are accepted for `ollama-newton`, `omlx`, and `ollama` on any host other than
 `ollama.com` (including its terminal-dot forms). bob's transport sends a constant placeholder key and strips request headers.
 

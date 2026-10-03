@@ -53,6 +53,7 @@ import {
   up,
   watchParent,
 } from "./shell/index.js";
+import { applyModelScaffold } from "./shell/models.js";
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
@@ -68,11 +69,12 @@ Commands:
                              --role <r> --provider <p> --model <m>
                              --base-url <url> (init-time models.json scaffold:
                              ollama on a non-ollama.com host, ollama-newton, omlx)
-                             base_url mismatch refuses a session:
-                             run bob init to apply provider.base_url
                              --flair-url <u> --no-flair
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
+  models <agent>      Apply provider.base_url: bob models <agent>
+                      Updates only .pi-agent/models.json from validated bob.yaml.
+                      Flags: --agents-root <dir>
   align <name>        Recurring check-in to refine an existing agent. The session
                       runs on the agent's own bob.yaml provider + model (the same
                       pair 'bob run' uses); --provider / --model override just the
@@ -574,6 +576,19 @@ async function main(): Promise<number> {
   }
   try {
     switch (args.command) {
+      case "models": {
+        if (
+          args.positional.length !== 1 ||
+          Object.keys(args.flags).some((key) => key !== "agents-root")
+        ) {
+          throw new UsageError("bob models <agent> [--agents-root <dir>]");
+        }
+        if (args.flags["agents-root"] !== undefined && !stringFlag(args.flags, "agents-root")) {
+          throw new UsageError("bob models: --agents-root requires a directory");
+        }
+        console.log(applyModelScaffold(args.positional[0], stringFlag(args.flags, "agents-root")));
+        return 0;
+      }
       case "onboard": {
         const name = args.positional[0];
         if (!name) {

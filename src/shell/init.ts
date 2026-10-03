@@ -426,7 +426,9 @@ const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
 
 /** The full model entry for an OpenAI-compatible provider (cost is zero: bob
  *  does not track this provider's pricing, so pi reports $0 for it). */
-function piOpenAiCompletionsModel(opts: InitOptions): Record<string, unknown> {
+export function piOpenAiCompletionsModel(
+  opts: Pick<InitOptions, "model" | "contextWindow">,
+): Record<string, unknown> {
   return {
     id: opts.model,
     name: opts.model,

@@ -230,8 +230,13 @@ export interface ProviderLimitsBlock extends DeclaredModelLimits {
 const REDIRECTABLE_PROVIDERS = new Set(["ollama-newton", "omlx"]);
 
 export function providerBaseUrlRefusal(provider: string, baseUrl: string): string | undefined {
-  if (Array.from(baseUrl).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)) {
-    return "provider.base_url must not contain control characters.";
+  if (
+    Array.from(baseUrl).some((char) => {
+      const code = char.charCodeAt(0);
+      return code < 32 || (code >= 127 && code <= 159);
+    })
+  ) {
+    return "provider.base_url must not contain C0, DEL, or C1 control characters.";
   }
   let parsed: URL;
   try {

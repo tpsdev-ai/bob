@@ -1235,7 +1235,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     if (baseUrl !== undefined) {
       const effective = modelRuntime.getModel(config.provider, config.model);
       if (effective?.baseUrl !== baseUrl) {
-        throw new Error("bob: run bob init to apply provider.base_url");
+        throw new Error("bob: run bob models <agent> to apply provider.base_url");
       }
       installBaseUrlTransport(modelRuntime, config.provider, baseUrl);
     }
@@ -1307,7 +1307,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
 
     const model = services.modelRuntime.getModel(config.provider, config.model);
     if (baseUrl !== undefined && model?.baseUrl !== baseUrl) {
-      throw new Error("bob: run bob init to apply provider.base_url");
+      throw new Error("bob: run bob models <agent> to apply provider.base_url");
     }
     if (!model) {
       throw new Error(

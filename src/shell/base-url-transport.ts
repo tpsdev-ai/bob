@@ -50,7 +50,7 @@ export function installBaseUrlTransport(
     options: object | undefined,
   ) => {
     if (model.baseUrl !== baseUrl || model.api !== "openai-completions") {
-      throw new Error("bob: run bob init to apply provider.base_url");
+      throw new Error("bob: run bob models <agent> to apply provider.base_url");
     }
     return delegate({ ...model, headers: undefined } as never, context, {
       ...options,

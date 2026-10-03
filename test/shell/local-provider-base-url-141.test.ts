@@ -37,6 +37,111 @@ describe("provider.base_url containment", () => {
     },
   );
 
+  it.each(["\u0085", "\u009f"])("refuses C1 control %s at init and load", (control) => {
+    const baseUrl = `http://newton.lan/v1${control}`;
+    expect(() => initAgent(baseOpts({ baseUrl }))).toThrow(/C0, DEL, or C1 control characters/);
+    expect(existsSync(join(tmpRoot, "newton"))).toBe(false);
+    expect(() => readProviderLimits(`provider:\n  name: ollama\n  base_url: ${baseUrl}\n`)).toThrow(
+      /C0, DEL, or C1 control characters/,
+    );
+  });
+
+  it.each(["ollama", "ollama-newton", "omlx"])(
+    "bob models repairs an existing %s scaffold without changing other entries or files",
+    async (provider) => {
+      const res = initAgent(baseOpts({ provider, baseUrl: LOCAL_URL }));
+      const yamlPath = join(res.agentDir, "bob.yaml");
+      const appliedUrl = "http://other.example/v1";
+      writeFileSync(yamlPath, readFileSync(yamlPath, "utf8").replace(LOCAL_URL, appliedUrl));
+      const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+      const otherProvider = {
+        baseUrl: "https://kept.example/v1",
+        models: [{ id: "kept", custom: true }],
+      };
+      const otherModel = { id: "other", baseUrl: LOCAL_URL, contextWindow: 42, custom: "keep" };
+      models.providers.kept = otherProvider;
+      models.providers[provider].models.push(otherModel);
+      Object.assign(models.providers[provider].models[0], { baseUrl: LOCAL_URL, custom: "keep" });
+      writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+      writeFileSync(join(res.agentDir, "soul.md"), "# Custom soul\nKeep my persona.\n");
+      writeFileSync(
+        join(res.agentDir, ".pi-agent", "auth.json"),
+        ' { "ollama": { "type": "api_key", "key": "KEEP_ME" } }\n',
+      );
+      const unchanged = ["soul.md", "bob.yaml", ".pi-agent/auth.json", "bin/newton"];
+      const before = unchanged.map((file) => readFileSync(join(res.agentDir, file)));
+      const start = async () => {
+        const { config, policy } = resolveRunConfig({ name: "newton", agentsRoot: tmpRoot });
+        const result = await createBobRuntimeFactory({ config, policy })({
+          sessionManager: SessionManager.inMemory(config.cwd),
+        });
+        result.session.dispose();
+      };
+      await expect(start()).rejects.toThrow(/apply provider.base_url/);
+      spawnModels();
+      unchanged.forEach((file, index) => {
+        expect(readFileSync(join(res.agentDir, file))).toEqual(before[index]);
+      });
+      const after = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+      expect(after.providers.kept).toEqual(otherProvider);
+      expect(after.providers[provider].models[1]).toEqual(otherModel);
+      expect(after.providers[provider]).toEqual({
+        ...models.providers[provider],
+        baseUrl: appliedUrl,
+        models: [
+          {
+            ...models.providers[provider].models[0],
+            baseUrl: appliedUrl,
+            api: "openai-completions",
+          },
+          otherModel,
+        ],
+      });
+      await start();
+    },
+  );
+
+  it("bob models scaffolds a missing model while preserving existing models", () => {
+    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const models = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+    const otherModel = { id: "other", name: "Other", custom: true };
+    models.providers.ollama.models = [otherModel];
+    writeFileSync(modelsPath(res.agentDir), JSON.stringify(models));
+    spawnModels();
+    const after = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
+    expect(after.providers.ollama.models[0]).toEqual(otherModel);
+    expect(after.providers.ollama.models[1]).toMatchObject({
+      id: "qwen3.8:27b-mxfp8",
+      api: "openai-completions",
+      baseUrl: LOCAL_URL,
+      contextWindow: 262144,
+    });
+  });
+
+  it.each([
+    ["invalid URL", LOCAL_URL, "ftp://newton.lan/v1", "must be http or https"],
+    ["C1 NEL", LOCAL_URL, `${LOCAL_URL}\u0085`, "C0, DEL, or C1 control characters"],
+    ["C1 APC", LOCAL_URL, `${LOCAL_URL}\u009f`, "C0, DEL, or C1 control characters"],
+    ["invalid limits", "context_window: 262144", "context_window: nope", "positive whole number"],
+    ["invalid tools", "  allow:", "  alow:", 'unknown key "alow"'],
+  ])("bob models writes nothing for %s", (_label, from, to, error) => {
+    const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
+    const yamlPath = join(res.agentDir, "bob.yaml");
+    writeFileSync(yamlPath, readFileSync(yamlPath, "utf8").replace(from, to));
+    const files = [
+      "soul.md",
+      "bob.yaml",
+      ".pi-agent/auth.json",
+      ".pi-agent/models.json",
+      "bin/newton",
+    ];
+    const before = files.map((file) => readFileSync(join(res.agentDir, file)));
+    expect(spawnModels).toThrow(error);
+    files.forEach((file, index) => {
+      expect(readFileSync(join(res.agentDir, file))).toEqual(before[index]);
+    });
+  });
+
   it("writes canonical URLs to YAML and models.json", () => {
     const res = initAgent(baseOpts({ baseUrl: "HTTP://NEWTON.LAN:80/a/../v1" }));
     const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
@@ -82,7 +187,7 @@ describe("provider.base_url containment", () => {
           result.session.dispose();
           return result;
         }),
-      ).rejects.toThrow("run bob init to apply provider.base_url");
+      ).rejects.toThrow("run bob models <agent> to apply provider.base_url");
     },
   );
 
@@ -221,7 +326,7 @@ describe("provider.base_url containment", () => {
         )
         .result();
       expect(bad.stopReason).toBe("error");
-      expect(bad.errorMessage).toContain("run bob init to apply provider.base_url");
+      expect(bad.errorMessage).toContain("run bob models <agent> to apply provider.base_url");
       expect(captured).toHaveLength(5);
     } finally {
       session?.dispose();
@@ -377,3 +482,13 @@ describe("bob#141 — provider.base_url", () => {
     expect(() => readProviderLimits(withScheme)).toThrow(/must be http or https/);
   });
 });
+
+function spawnModels(): string {
+  return spawnNode([
+    join(import.meta.dir, "../../dist/cli.js"),
+    "models",
+    "newton",
+    "--agents-root",
+    tmpRoot,
+  ]);
+}
