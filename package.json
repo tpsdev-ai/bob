@@ -34,6 +34,7 @@
     "htmlparser2": "12.0.0",
     "typebox": "1.3.18",
     "undici": "8.10.2",
+    "yaml": "2.9.0",
     "@earendil-works/pi-ai": "0.84.3"
   },
   "devDependencies": {

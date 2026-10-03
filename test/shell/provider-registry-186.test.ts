@@ -17,6 +17,7 @@ const TEST_ROW = {
   id: "acme-gateway",
   aliases: ["acme"],
   runtime: "anthropic",
+  auth: { kind: "none" as const },
   endpoint: "http://acme.test/v1",
   api: "openai-completions" as const,
 };
@@ -93,5 +94,21 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     expect(mapBobProviderToPi("exe-dev-gateway")).toBe("anthropic");
     expect(resolveRuntimeProviderName("exe-dev-gateway")).toBe("anthropic");
     expect(providerEndpoint("ollama-cloud")).toBe("https://ollama.com/v1");
+  });
+
+  it("a bob/env row whose runtime has no implemented custody fails validation (bob#186 slice 2)", () => {
+    // On main this constructs fine: auth is optional and nothing checks custody.
+    expect(
+      () =>
+        new ProviderRegistry([
+          ...PROVIDER_RECORDS,
+          {
+            id: "acme-keyed",
+            aliases: [],
+            runtime: "acme",
+            auth: { kind: "env", variable: "ACME_KEY" },
+          },
+        ] as never),
+    ).toThrow(/no implemented custody/);
   });
 });

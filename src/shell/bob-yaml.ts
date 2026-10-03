@@ -16,6 +16,7 @@
 // silently rendered a list of mappings as a list of strings, so a capability
 // that could never be configured shipped anyway.
 
+import { DEFAULT_PROVIDER_REGISTRY, type ProviderRegistry } from "./provider-registry.js";
 import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
 import {
   ModelBudgetError,
@@ -227,9 +228,16 @@ export interface ProviderLimitsBlock extends DeclaredModelLimits {
   baseUrl?: string;
 }
 
-const REDIRECTABLE_PROVIDERS = new Set(["ollama-newton", "omlx"]);
-
-export function providerBaseUrlRefusal(provider: string, baseUrl: string): string | undefined {
+// Endpoint eligibility is DERIVED FROM THE REGISTRY: a `provider.base_url`
+// override is allowed only when the row declares an explicit override policy
+// (a keyless profile), and not to a host that profile excludes. Disk contents
+// never select a profile. An undeclared provider name has no policy, so it
+// refuses — the same answer the old hardcoded set gave for every other name.
+export function providerBaseUrlRefusal(
+  provider: string,
+  baseUrl: string,
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): string | undefined {
   if (
     Array.from(baseUrl).some((char) => {
       const code = char.charCodeAt(0);
@@ -248,15 +256,17 @@ export function providerBaseUrlRefusal(provider: string, baseUrl: string): strin
     return `provider.base_url must be http or https (got ${JSON.stringify(parsed.protocol)}).`;
   }
   if (parsed.username !== "" || parsed.password !== "") {
-    return `provider.base_url must not carry credentials (a username or password in the URL).`;
+    return "provider.base_url must not carry credentials (a username or password in the URL).";
   }
   if (parsed.href.includes("?") || parsed.href.includes("#")) {
     return "provider.base_url must not contain a query string or fragment.";
   }
-  if (REDIRECTABLE_PROVIDERS.has(provider)) return undefined;
-  if (provider === "ollama" && parsed.hostname.replace(/\.+$/, "") !== "ollama.com")
-    return undefined;
-  return `provider.base_url is only allowed for ollama on a non-ollama.com host, ollama-newton, or omlx (got "${provider}").`;
+  const policy = registry.find(provider)?.override;
+  if (policy !== undefined) {
+    const host = parsed.hostname.replace(/\.+$/, "");
+    if (!(policy.excludeHosts ?? []).includes(host)) return undefined;
+  }
+  return `provider.base_url is only allowed for a keyless provider row that authorizes an override (got "${provider}" on "${parsed.hostname}").`;
 }
 
 function tokensFor(yamlText: string, key: string, value: unknown): number {

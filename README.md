@@ -955,6 +955,16 @@ is an OpenAI-compatible provider: its base URL is `https://openrouter.ai/api/v1`
 passed through verbatim — for example `bob onboard orr --provider openrouter --model
 deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 
+**Providers are one registry, declared as data.** Every row carries an explicit `auth` mode:
+`bob/env(<VAR>)` (bob reads the key from the environment at run time), `bob/none` (keyless),
+`bob/vm` (host/VM identity), or `pi/disk` / `pi/login` (pi-managed). An operator file at
+`~/.config/bob/providers.yaml` may add rows; an absent file uses the built-in rows, while an
+explicitly requested missing file, an unreadable file or an invalid document refuses. A row with no
+mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
+loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
+data cannot assert that custody. The disk-refusal set is the union of every `bob/env` row's id,
+aliases and runtime, refused by name in `models.json` and `auth.json` regardless of value.
+
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,
 a NON-SECRET placeholder key (the real key stays with bob; see below), the `openai-completions` api, and the declared model
@@ -982,7 +992,10 @@ A session refuses to start when `provider.base_url` differs from the effective m
 "run bob models <agent> to apply provider.base_url".
 `bob models` accepts pi's line comments and trailing commas; comments in models.json are not preserved.
 Overrides are accepted for `ollama-newton`, `omlx`, and `ollama` on any host other than
-`ollama.com` (including its terminal-dot forms). bob's transport replaces caller-supplied headers with fixed Content-Type, Accept and placeholder Authorization headers.
+`ollama.com` (including its terminal-dot forms): eligibility is derived from the registry, where
+only a keyless row that declares an override profile authorizes `provider.base_url`, and `ollama`
+keeps its cloud-host exclusion. bob's transport replaces caller-supplied headers with fixed
+Content-Type, Accept and placeholder Authorization headers.
 
 ### Moving an agent to a subscription model
 

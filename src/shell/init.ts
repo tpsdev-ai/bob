@@ -150,7 +150,11 @@ export function initAgent(opts: InitOptions): InitResult {
     );
   }
   if (opts.baseUrl !== undefined) {
-    const refusal = providerBaseUrlRefusal(opts.provider, opts.baseUrl);
+    const refusal = providerBaseUrlRefusal(
+      opts.provider,
+      opts.baseUrl,
+      opts.registry ?? DEFAULT_PROVIDER_REGISTRY,
+    );
     if (refusal !== undefined) throw new Error(`bob: ${refusal}`);
     opts = { ...opts, baseUrl: new URL(opts.baseUrl).href };
   }

@@ -78,6 +78,7 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
+import { reservedProviderNames } from "./provider-registry.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -342,20 +343,26 @@ export function buildOpenrouterProvider(input: {
 }
 
 /**
- * Refuse when the on-disk pi config carries ANY `openrouter` entry: bob owns the
- * provider, and an entry in the editable `models.json` (a provider block, a
- * per-model `baseUrl`, a `providers.openrouter.apiKey`) or a stored credential
- * in `auth.json` is never merged. Names the file. A MISSING file is "absent" (no
- * entry); any OTHER read or parse failure REFUSES — bob cannot prove the file
- * carries no openrouter entry. pi accepts comments in `models.json`, so a
- * commented file is refused here ON PURPOSE as unparseable.
+ * Refuse when the on-disk pi config carries ANY entry for a name in `reserved`:
+ * bob owns those providers, and an entry in the editable `models.json` (a
+ * provider block, a per-model `baseUrl`, a `providers.<name>.apiKey`) or a stored
+ * credential in `auth.json` is never merged. Names the file. A MISSING file is
+ * "absent" (no entry); any OTHER read or parse failure REFUSES — bob cannot prove
+ * the file carries none of the reserved entries. pi accepts comments in
+ * `models.json`, so a commented file is refused here ON PURPOSE as unparseable.
+ *
+ * `reserved` is derived from the registry (the union of every bob/env row's id,
+ * aliases and runtime), never hardcoded.
  */
-export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
+export function assertNoReservedProviderEntries(
+  piAgentDir: string,
+  reserved: readonly string[],
+): void {
   const modelsPath = join(piAgentDir, "models.json");
   const authPath = join(piAgentDir, "auth.json");
   // ENOENT is "absent" (no entry). Any OTHER read or parse failure — unreadable,
   // or JSON that does not parse after stripping a leading UTF-8 BOM — is a
-  // REFUSAL: bob cannot PROVE the file carries no openrouter entry. pi accepts a
+  // REFUSAL: bob cannot PROVE the file carries no reserved entry. pi accepts a
   // BOM in both files and comments in models.json, so we strip the BOM before
   // parsing (a BOM-prefixed file WITH an entry is still caught), and a commented
   // models.json fails the parse and refuses rather than reading as "no entry".
@@ -366,30 +373,59 @@ export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
       throw new Error(
-        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not read it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not read it: ${err instanceof Error ? err.message : String(err)}).`,
       );
     }
     const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+      parsed = JSON.parse(text);
     } catch (err) {
       throw new Error(
-        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not parse it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not parse it: ${err instanceof Error ? err.message : String(err)}).`,
       );
     }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(
+        `bob: refusing to start a session — ${path} is not a JSON object; bob cannot prove it carries no reserved provider entry.`,
+      );
+    }
+    return parsed as Record<string, unknown>;
   };
-  const providers = (load(modelsPath).providers ?? {}) as Record<string, unknown>;
-  if (Object.hasOwn(providers, "openrouter")) {
+  const models = load(modelsPath);
+  const rawProviders = models.providers;
+  if (
+    rawProviders !== undefined &&
+    (rawProviders === null || typeof rawProviders !== "object" || Array.isArray(rawProviders))
+  ) {
     throw new Error(
-      `bob: refusing to start an openrouter session — ${modelsPath} carries a providers.openrouter entry; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
+      `bob: refusing to start a session — ${modelsPath} providers is not a mapping; bob cannot prove it carries no reserved provider entry.`,
     );
   }
-  if (Object.hasOwn(load(authPath), "openrouter")) {
-    throw new Error(
-      `bob: refusing to start an openrouter session — ${authPath} carries a stored openrouter credential; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
-    );
+  const providers = (rawProviders ?? {}) as Record<string, unknown>;
+  for (const name of reserved) {
+    if (Object.hasOwn(providers, name)) {
+      throw new Error(
+        `bob: refusing to start a session — ${modelsPath} carries a providers.${name} entry; bob owns the ${name} provider (in-memory only). Remove this entry.`,
+      );
+    }
   }
+  const auth = load(authPath);
+  for (const name of reserved) {
+    if (Object.hasOwn(auth, name)) {
+      throw new Error(
+        `bob: refusing to start a session — ${authPath} carries a stored ${name} credential; bob owns the ${name} provider (in-memory only). Remove this entry.`,
+      );
+    }
+  }
+}
+
+/**
+ * The slice-2 entry point: refuse an on-disk entry for every reserved name the
+ * DEFAULT registry derives (each bob/env row's id, aliases and runtime).
+ */
+export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
+  assertNoReservedProviderEntries(piAgentDir, reservedProviderNames());
 }
 
 /**
