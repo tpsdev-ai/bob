@@ -29,12 +29,12 @@ function writeKeyFile(dir: string): string {
 
 interface Stub {
   url: string;
-  store: Record<string, string>;
+  store: Map<string, string>;
   close(): Promise<void>;
 }
 
 async function startMemoryStub(): Promise<Stub> {
-  const store: Record<string, string> = {};
+  const store = new Map<string, string>();
   const srv = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => {
@@ -52,12 +52,13 @@ async function startMemoryStub(): Promise<Stub> {
       if (m) {
         const id = decodeURIComponent(m[1] as string);
         if (method === "PUT") {
-          store[id] = raw;
+          store.set(id, raw);
           return send(200, JSON.stringify({ id }));
         }
         if (method === "GET") {
-          return store[id] !== undefined
-            ? send(200, store[id] as string)
+          const found = store.get(id);
+          return found !== undefined
+            ? send(200, found)
             : send(404, JSON.stringify({ error: "not found" }));
         }
       }
@@ -180,8 +181,8 @@ describe("`bob run` with a launcher pr_ref", () => {
     expect(first?.prMemory).toBeUndefined();
 
     // The round-end write landed a private, persistent record.
-    expect(stub.store[ID]).toBeDefined();
-    const record = JSON.parse(stub.store[ID] as string) as Record<string, unknown>;
+    expect(stub.store.get(ID)).toBeDefined();
+    const record = JSON.parse(stub.store.get(ID) as string) as Record<string, unknown>;
     expect(record.visibility).toBe("private");
     expect(record.durability).toBe("persistent");
     expect(record.tags).toEqual(["bob-pr-round"]);
@@ -266,6 +267,6 @@ describe("`bob run` with a launcher pr_ref", () => {
       },
     });
     expect(config?.prMemory).toBeUndefined();
-    expect(Object.keys(stub.store)).toHaveLength(0);
+    expect(stub.store.size).toBe(0);
   });
 });
