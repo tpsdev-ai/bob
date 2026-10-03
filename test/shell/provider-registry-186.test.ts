@@ -77,11 +77,13 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
   it("a duplicate id or alias fails validation, naming the name", () => {
     expect(
       () =>
-        new ProviderRegistry([...PROVIDER_RECORDS, { ...TEST_ROW, id: "ollama-cloud", aliases: [] }]),
+        new ProviderRegistry([
+          ...PROVIDER_RECORDS,
+          { ...TEST_ROW, id: "ollama-cloud", aliases: [] },
+        ]),
     ).toThrow(/duplicate identity "ollama-cloud"/);
     expect(
-      () =>
-        new ProviderRegistry([...PROVIDER_RECORDS, { ...TEST_ROW, aliases: ["ollama-cloud"] }]),
+      () => new ProviderRegistry([...PROVIDER_RECORDS, { ...TEST_ROW, aliases: ["ollama-cloud"] }]),
     ).toThrow(/duplicate identity "ollama-cloud"/);
   });
 
