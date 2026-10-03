@@ -2,7 +2,8 @@
 //
 // The local builder starts each PR round with what earlier rounds on the SAME
 // PR established. The HARNESS owns that memory: it recalls it before the
-// session is built and writes it once at round end. The model never issues a
+// session is built. Only the one-shot run writes it, once at round end; the
+// interactive launch path recalls only. The model never issues a
 // memory call, no summarizer is required, and nothing is pasted into the brief.
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
@@ -13,9 +14,8 @@
 //
 // The stored envelope is bounded (newest few rounds, hard byte caps) and is
 // written as structured, bounded evidence: the outcome comes from the harness
-// exit code / termination reason, files from edit receipts, checks from
-// structured observations where pending/missing/timed-out never become passes.
-// No transcript, reasoning, raw environment or raw stdout/stderr is stored.
+// exit code / termination reason, files from edit receipts. Checks are
+// normalized here but not yet collected; rounds store none. No transcript, reasoning, raw environment or raw stdout/stderr is stored.
 
 import { createHash } from "node:crypto";
 import { FlairHttpClient, type FlairMemory } from "../capabilities/flair/client.js";
@@ -379,7 +379,7 @@ export function validateRecalledRecord(
 ): PrMemoryEnvelope | undefined {
   if (record === null) return undefined;
   if (typeof record.id !== "string" || record.id !== expected.id) return undefined;
-  if (record.agentId !== undefined && record.agentId !== expected.agentId) return undefined;
+  if (record.agentId !== expected.agentId) return undefined;
   if (record.visibility !== "private") return undefined;
   if (record.archived === true) return undefined;
   if (record.expiredAt !== undefined || record.expired === true) return undefined;
@@ -509,7 +509,8 @@ function renderRound(round: PrRoundRecord): string {
       `  addressed: ${escapeForPrompt(f.detail)}${f.evidence ? ` [${escapeForPrompt(f.evidence)}]` : ""}`,
     );
   for (const item of round.incomplete) lines.push(`  incomplete: ${escapeForPrompt(item)}`);
-  if (round.omitted.length > 0) lines.push(`  omitted: ${round.omitted.join(", ")}`);
+  if (round.omitted.length > 0)
+    lines.push(`  omitted: ${round.omitted.map(escapeForPrompt).join(", ")}`);
   return lines.join("\n");
 }
 

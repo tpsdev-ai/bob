@@ -85,7 +85,7 @@ export interface FakeFlair {
   souls: Record<string, string>;
   // bob#185 item 5 — stored Memory records, keyed by id, as PUT. Exposed so a
   // test can read the exact body a write landed.
-  memories: Record<string, Record<string, unknown>>;
+  memories: Map<string, Record<string, unknown>>;
   fetchImpl: (
     url: string,
     init: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
@@ -106,7 +106,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const calls: RecordedCall[] = [];
   const agents: Record<string, FakeAgentRow> = { ...(opts.agents ?? {}) };
   const souls: Record<string, string> = { ...(opts.souls ?? {}) };
-  const memories: Record<string, Record<string, unknown>> = { ...(opts.memories ?? {}) };
+  const memories = new Map<string, Record<string, unknown>>(Object.entries(opts.memories ?? {}));
 
   const errorBodies: string[] = [];
 
@@ -251,14 +251,15 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       if (init.method === "PUT") {
         if (opts.memoryPutStatus && opts.memoryPutStatus >= 400)
           return reply(opts.memoryPutStatus, { error: "memory write refused" });
-        memories[id] = { ...(body ?? {}) };
+        memories.set(id, { ...(body ?? {}) });
         return reply(200, { id });
       }
       if (init.method === "GET") {
         if (opts.memoryGetStatus && opts.memoryGetStatus >= 400)
           return reply(opts.memoryGetStatus, { error: "memory read refused" });
-        if (!(id in memories)) return reply(404, { error: "not found" });
-        return reply(200, memories[id]);
+        const stored = memories.get(id);
+        if (stored === undefined) return reply(404, { error: "not found" });
+        return reply(200, stored);
       }
     }
 
