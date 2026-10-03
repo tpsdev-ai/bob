@@ -553,7 +553,7 @@ src/
     discord/            outbound tools + inbound gateway listener
     flair/              memory search/write/get over the agent's Flair store
     observatory/        team-view producer
-    work/               builder-local's managed command runner (run / run_status / run_cancel)
+    work/               managed commands, patch candidates and publication (see work/README.md)
     fixture/            a no-op capability that proves the loader end to end
 roles/                  ea, jarvis, writer, reviewer, coder, qa, builder-local, custom
 positions/              packaged position presets — builder, reviewer
@@ -963,7 +963,20 @@ deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 explicitly requested missing file, an unreadable file or an invalid document refuses. A row with no
 mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
 loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
-data cannot assert that custody.
+data cannot assert that custody. A keyless row may declare `request: {idleTimeoutMs, totalTimeoutMs, maxRetries}`;
+policies on other rows refuse. `idleTimeoutMs` limits waits for response headers or a body chunk, excluding consumer
+pauses; `totalTimeoutMs` caps the request (0 disables it). `maxRetries` caps provider request
+retries; row timeouts are terminal and pi session retries are disabled for policy-bearing rows.
+The built-in keyless rows (`ollama`, `ollama-newton`, `omlx`) use a 120 s idle timeout,
+a 30 min total cap and zero request retries. Invalid request policies refuse by row name.
+
+A keyless row may also declare `budget: {maxOutputTokens, reasoning}`; budgets on other rows refuse.
+bob hands `maxOutputTokens` to pi as `maxTokens` (a lower per-agent output cap wins), which pi sends
+as `max_tokens`. Ollama's OpenAI-compatible endpoint reads `max_tokens` and `reasoning_effort`; omlx is
+unverified. bob hands `reasoning` (`off`, `low`, `medium` or `high`) to pi as its thinking level, which pi
+sends as `reasoning_effort`; `off` sends none. The built-in keyless rows use a 4096-token cap and the `low`
+level. Invalid budgets refuse by row name. A request that ends with stop reason `length` carries
+`outputCap` in the run log's request-usage record.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,

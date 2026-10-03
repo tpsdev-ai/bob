@@ -704,6 +704,7 @@ describe("runAgent — the role tool allowlist binds the session", () => {
       "powershell",
       "run",
       "apply_patch",
+      "publish",
       "write_file",
       "edit_lines",
       "insert_after",

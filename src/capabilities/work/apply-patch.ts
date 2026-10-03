@@ -493,18 +493,11 @@ export function applyPatch(input: ApplyPatchInput): ApplyPatchOutcome {
     }
 
     const changedPaths = entries.map((e) => e.path);
-    const candidateId = sha256hex(
-      Buffer.from(
-        [
-          binding.task_id,
-          binding.publication_id,
-          binding.repository,
-          binding.base_oid,
-          treeOid,
-          digest,
-        ].join("\0"),
-      ),
-    ).slice(0, 40);
+    const candidateId = candidateIdentity({
+      ...binding,
+      tree_oid: treeOid,
+      patch_sha256: digest,
+    });
 
     const record: CandidateRecord = {
       candidate_id: candidateId,
@@ -705,6 +698,27 @@ function storeCandidate(
 }
 
 // Where a candidate's record lives, for a later publication to read (S2b).
+export function candidateIdentity(
+  record: Pick<
+    CandidateRecord,
+    "task_id" | "publication_id" | "repository" | "base_oid" | "tree_oid" | "patch_sha256"
+  >,
+): string {
+  return sha256hex(
+    Buffer.from(
+      [
+        record.task_id,
+        record.publication_id,
+        record.repository,
+        record.base_oid,
+        record.tree_oid,
+        record.patch_sha256,
+      ].join("\0"),
+    ),
+  ).slice(0, 40);
+}
+
 export function candidateRecordPath(stateRoot: string, candidateId: string): string {
+  if (!HEX40.test(candidateId)) throw new Error("invalid candidate_id");
   return join(stateRoot, "candidates", `${candidateId}.json`);
 }

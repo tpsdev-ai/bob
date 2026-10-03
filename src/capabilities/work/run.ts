@@ -1045,7 +1045,11 @@ export class JobManager {
 
   // --- start -----------------------------------------------------------------
 
-  async start(req: StartRequest, ctxCwd: string | undefined): Promise<Job> {
+  async start(
+    req: StartRequest,
+    ctxCwd: string | undefined,
+    env?: NodeJS.ProcessEnv,
+  ): Promise<Job> {
     if (this.ended) {
       throw new RunRefusal(
         "run refused: this bob run has ended and its jobs were cancelled; no new job can start in it.",
@@ -1133,13 +1137,11 @@ export class JobManager {
       releasePin(this.dirPinOps, cwd, pin, recheck);
       // Detached: the child leads its own session and process group
       // (pgid = its pid), as pi's bash tool starts Unix commands. stdin is
-      // closed, as in pi's bash; the environment is bob's own (pi's bash also
-      // prepends pi's tool bin directory to PATH through a helper it does not
-      // export).
+      // closed, as in pi's bash.
       child = spawn(shell.shell, [...shell.args, command], {
         cwd,
         detached: true,
-        env: { ...process.env },
+        env: { ...(env ?? process.env) },
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {

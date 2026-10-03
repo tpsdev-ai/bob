@@ -615,4 +615,40 @@ describe("provider controls", () => {
       /must be a scalar/,
     );
   });
+
+  it("a keyless row named openrouter never enters the keyed branch (bob#298)", async () => {
+    // A programmatic registry may hold a keyless row whose runtime is
+    // `openrouter`. The factory branch keys on the SELECTED ROW's auth mode, so
+    // it must not read (and delete) OPENROUTER_API_KEY, which only the keyed
+    // branch does.
+    const keylessOpenrouter = {
+      id: "openrouter",
+      aliases: [],
+      runtime: "openrouter",
+      auth: { kind: "none" as const },
+      endpoint: "http://openrouter-keyless.example/v1",
+      api: "openai-completions" as const,
+      override: {},
+    };
+    const registry = new ProviderRegistry([keylessOpenrouter]);
+    initAgent({ ...options(), provider: "openrouter", registry });
+    const { config, policy } = resolveRunConfig({ name: "control", agentsRoot: root, registry });
+    expect(config.provider).toBe("openrouter");
+    expect(config.providerRecord).toBe(registry.find("openrouter"));
+    const saved = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "keyless-298-sentinel";
+    let session: { dispose(): void } | undefined;
+    try {
+      const result = await createBobRuntimeFactory({ config, policy, registry })({
+        sessionManager: SessionManager.inMemory(config.cwd),
+      });
+      session = result.session as unknown as { dispose(): void };
+      // This keyless branch preserves OPENROUTER_API_KEY.
+      expect(process.env.OPENROUTER_API_KEY).toBe("keyless-298-sentinel");
+    } finally {
+      session?.dispose();
+      if (saved === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = saved;
+    }
+  });
 });
