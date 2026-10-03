@@ -106,7 +106,7 @@ describe("createCompactionObserver — a compaction after agent_end (#179)", () 
   });
 });
 
-describe("runAgent — a compaction after agent_end ends the run (#179)", () => {
+describe("runAgent — terminal responses and compaction recovery (#179)", () => {
   let agentsRoot: string;
 
   beforeEach(() => {

@@ -93,6 +93,28 @@ describe("evaluateCompletion — the one judge", () => {
 });
 
 describe("createCompactionObserver", () => {
+  it("logs success only for a compaction result and failure otherwise", () => {
+    const logs: string[] = [];
+    const observer = createCompactionObserver({ log: (m) => logs.push(m) });
+    observer.observe({
+      type: "compaction_end",
+      reason: "threshold",
+      aborted: false,
+      result: { summary: "compacted" },
+    });
+    observer.observe({
+      type: "compaction_end",
+      reason: "overflow",
+      aborted: false,
+      errorMessage: "compaction failed",
+    });
+    observer.observe({ type: "compaction_end", aborted: true });
+    expect(logs).toEqual([
+      "bob: context compacted (threshold)",
+      "bob: context compaction failed (overflow)",
+    ]);
+  });
+
   it("counts non-aborted compactions only", () => {
     const observer = createCompactionObserver();
     observer.observe({ type: "compaction_end", reason: "threshold", aborted: false });

@@ -18,11 +18,7 @@
 //     and compaction willRetry false: then the final text survives and no note
 //     is sent (bob#179).
 //
-//     The note is useful and it is NEVER load-bearing: it is a steer, its failure
-//     is logged and nothing else happens, and no exit code depends on it. (The
-//     machinery that existed only because the contract could be lost — the
-//     persistent attach, the admission gate, failClosed and its exit, the
-//     per-compaction failure records — is gone with the shape change.)
+//     There is no direct success gate on note delivery.
 //
 // Everything here is pure/injectable so it is unit-testable without pi: the
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
@@ -125,8 +121,7 @@ export function renderWorktreeNote(
 
 /**
  * The best-effort "what remains" note. It says what it is: a note about the
- * state, not the contract (which is in the system prompt and cannot be lost),
- * so nothing about the run depends on it arriving.
+ * state, not the contract (which is in the system prompt and cannot be lost).
  */
 export function buildRemainingNote(state: RemainingState, capChars?: number): string {
   const cap = capChars ?? DEFAULT_REMAINING_NOTE_CAP_CHARS;
@@ -157,6 +152,7 @@ export interface SessionEventLike {
   type?: string;
   aborted?: boolean;
   willRetry?: boolean;
+  result?: unknown;
   reason?: string;
   message?: { role?: string; content?: unknown; stopReason?: string } | null;
   assistantMessageEvent?: { type?: string; delta?: string } | null;
@@ -359,7 +355,9 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
         case "compaction_end": {
           if (e.aborted) return; // an aborted compaction changed nothing to restore
           compactions += 1;
-          log(`bob: context compacted${e.reason ? ` (${e.reason})` : ""}`);
+          log(
+            `bob: ${e.result ? "context compacted" : "context compaction failed"}${e.reason ? ` (${e.reason})` : ""}`,
+          );
           if (
             agentEnded &&
             lastStopReason === "stop" &&

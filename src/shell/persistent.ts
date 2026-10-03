@@ -218,7 +218,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
-  // #145: the observer sends a best-effort compaction note except after
+  // #145: the observer attempts to send a best-effort compaction note except after
   // `agent_end` with nonempty text, stopReason "stop", no tool calls, and
   // compaction willRetry false (or an aborted compaction). The standing contract is
   // in the system prompt, so a note that fails to send is logged and the
