@@ -1,1 +1,1 @@
-- **Provider records now come from one registry table.** `bob init` writes each row's endpoint; `bob run` resolves its runtime identity. Refs #186.
+- **Provider records now come from one registry table.** Endpoints and API flavours are optional. `bob init` writes declared endpoints for disk-backed providers and omits disk entries for `envKey` rows; `bob run` resolves runtime identities. OpenRouter's endpoint remains in session creation. Refs #186.

@@ -407,16 +407,12 @@ export FLAIR_KEY_PATH="${keyPath}"
 // models strictly (unlike pi's bare launcher, which tolerates a custom id
 // with no declaration). Declaring the model is the core fix here.
 //
-// - models.json: providers.<piProvider>.models = [{ id: opts.model }] always.
-//   baseUrl is added for a provider whose registry row declares an endpoint,
-//   or when provider.base_url is set; built-ins like anthropic/openai use pi's
-//   default endpoint.
+// - envKey rows omit models.json and auth.json provider entries.
+// - Disk-backed providers declare models = [{ id: opts.model }].
+//   baseUrl uses provider.base_url or the row's optional endpoint.
 // - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
 //   literal value is never checked — the gateway authenticates via VM
 //   identity). Endpoint overrides get bob's constant placeholder.
-// The provider's fixed endpoint, VM-identity flag and API flavour come from its
-// registry row (providerEndpoint / providerUsesGatewayIdentity /
-// providerApiFlavour).
 
 // The OpenAI-compatible provider shape for ollama.com/v1 (bob#132): pi drops a
 // custom provider block that has no `api`. bob also writes the model's fields;

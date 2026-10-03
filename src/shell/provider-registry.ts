@@ -1,5 +1,5 @@
-// Provider records: canonical ID (bob.yaml may declare an alias), runtime identity,
-// endpoint and API flavour. Init writes the endpoint; run resolves the identity.
+// Provider records: canonical ID, aliases and runtime identity; endpoints and API flavours are optional.
+// Init writes declared endpoints for disk-backed providers; run resolves the identity.
 // envKey controls scaffold disk omission; runtime key custody remains OpenRouter-specific.
 
 /** The wire API pi must use for a provider that is not one of pi's built-ins. */
@@ -15,8 +15,7 @@ export interface ProviderRecord {
   readonly configName?: boolean;
   /**
    * The runtime identity: the provider id pi resolves this provider's models
-   * under. `exe-dev-gateway` and `anthropic` both use pi's `anthropic` today;
-   * the transport slices give the gateway its own identity.
+   * under. `exe-dev-gateway` and `anthropic` both use pi's `anthropic`.
    */
   readonly runtime: string;
   /** The provider's fixed endpoint (base URL), when it has one. */

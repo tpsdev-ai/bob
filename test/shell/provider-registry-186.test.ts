@@ -1,4 +1,3 @@
-// Init writes the row's endpoint; run resolves its alias to the runtime identity.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
