@@ -160,7 +160,11 @@ async function runSession(
   const agentDir = join(s.scratch, "workspace");
   mkdirSync(agentDir, { recursive: true });
   const yamlPath = join(agentDir, "bob.yaml");
-  if (!existsSync(yamlPath)) writeFileSync(yamlPath, sessionYaml(toolName));
+  try {
+    writeFileSync(yamlPath, sessionYaml(toolName), { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
   const { config, policy } = resolveRunConfig({
     name: "workspace",
     agentsRoot: s.scratch,
