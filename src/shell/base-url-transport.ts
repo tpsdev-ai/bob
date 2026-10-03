@@ -10,6 +10,7 @@ import {
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
+import type { ProviderTurnBudget } from "./provider-turn-budget.js";
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -18,6 +19,7 @@ export function installBaseUrlTransport(
   provider: string,
   baseUrl: string,
   request?: ProviderRequestPolicy,
+  budget?: ProviderTurnBudget,
 ): void {
   const originalAuth = runtime.getAuth.bind(runtime);
   runtime.getAuth = (async (selected, options) => {
@@ -74,10 +76,42 @@ export function installBaseUrlTransport(
             timeoutError = error;
             controller.abort(error);
           });
-    const source = delegate({ ...model, headers: undefined } as never, context, {
+    // bob#185 item 2: the row's per-turn budget replaces the request's output
+    // cap and thinking level; a lower per-agent output cap (model.maxTokens)
+    // still wins. The row's keyless model is scaffolded non-reasoning, so a
+    // budget marks it reasoning-capable for pi to send the level.
+    const modelCap = (model as { maxTokens?: unknown }).maxTokens;
+    const turnCap =
+      budget === undefined
+        ? undefined
+        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
+          ? Math.min(budget.maxOutputTokens, modelCap)
+          : budget.maxOutputTokens;
+    const delegateModel =
+      budget === undefined
+        ? { ...model, headers: undefined }
+        : {
+            ...model,
+            headers: undefined,
+            reasoning: budget.reasoning !== "off",
+            compat: {
+              ...((model as { compat?: Record<string, unknown> }).compat ?? {}),
+              supportsDeveloperRole: false,
+              supportsReasoningEffort: true,
+              maxTokensField: "max_tokens",
+            },
+          };
+    const source = delegate(delegateModel as never, context, {
       ...supplied,
       ...(request !== undefined
         ? { timeoutMs: 2_147_483_647, maxRetries: request.maxRetries, signal: controller.signal }
+        : {}),
+      ...(budget !== undefined
+        ? {
+            maxTokens: turnCap,
+            reasoning: budget.reasoning,
+            reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
+          }
         : {}),
       apiKey: BASE_URL_PLACEHOLDER,
       headers: undefined,
