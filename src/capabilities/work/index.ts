@@ -61,6 +61,21 @@ export {
 export { CONFIG_ENV_VAR, CONFIG_SCHEMA, loadConfigFromEnv, type WorkConfig } from "./config.js";
 export { workManifest } from "./manifest.js";
 export {
+  type CheckReport,
+  type CheckRunner,
+  type PrService,
+  type PublishDeps,
+  type PublishInput,
+  type PublishParams,
+  type PublishPhase,
+  type PublishRefusalReason,
+  type PublishResult,
+  type PublishStatus,
+  type PushState,
+  publish,
+  publishJournalPath,
+} from "./publish.js";
+export {
   type BootReap,
   CAPTURE_MAX_BYTES,
   type CleanupState,

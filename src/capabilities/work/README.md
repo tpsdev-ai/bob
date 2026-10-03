@@ -80,7 +80,7 @@ command could start in it. That is the safe direction; make it readable
 ## apply_patch and the task binding (bob#275, S2a)
 
 `apply_patch` builds a candidate tree from a patch artifact under the task's
-artifact root; candidate checks and publication follow in S2b.
+artifact root; `publish` (below) turns a stored candidate into a remote commit.
 
 **The task binding.** A task binding is the launcher's authority over a builder
 session: the task and publication identities, the repository and workspace, the
@@ -126,14 +126,74 @@ A concurrent same-user writer can still race rename until builder confinement
 command the model writes, so its `TOOL_EFFECTS` row is `writer` and a resident
 agent drops it unless its role permits resident writers.
 
+## publish and publication recovery (bob#275, S2b)
+
+`publish` is the tool-owned path from a stored candidate to a remote commit. It
+takes `candidate_id`, `commit_message` and an optional `pr: { title, body }`
+(allowed only when the task binding authorizes a PR destination). Repository,
+parent commit, destination, declared paths, required checks, expected tree and
+publication identity all come from the task binding; there is no force,
+skip-check, scope-override or caller-supplied "tested" argument.
+
+**What it checks.** It resolves the candidate from `<state dir>/candidates/` and
+verifies its task, repository, base and publication association
+(`candidate_unknown`, `candidate_mismatch`). It recomputes the complete
+changed-path set between the pinned base and the candidate tree and refuses any
+path outside the task's `declared_paths` (`scope_violation`) — a declared path
+is a literal file or a directory prefix matched at a component boundary, and
+both sides of a rename are checked. In `apply` mode the candidate tree must BE
+the task's `expected_tree_oid` (`expected_tree_mismatch`), not merely an
+equivalent diff.
+
+**What it does.** It pins a commit object (tree, parent, message,
+author/committer metadata) with `git hash-object -t commit -w`, materializes the
+candidate in a fresh tool-owned checkout, and runs every task-declared check
+through the `run` executor, verifying the materialized tree before and after each
+command. A missing check executor, a nonzero exit, a timeout, a cancellation, a
+missing exit status, uncertain cleanup or an incomplete capture refuses
+publication and pushes nothing; a check that changes the materialized source tree
+refuses with `materialized_tree_changed`. It then pushes the pinned commit
+fast-forward to
+the authorized ref only, with the expected old ref enforced atomically
+(`--force-with-lease`); a conflicting or raced ref refuses (`remote_diverged`,
+`push_rejected`) and is never rebased, amended, merged or forced. Creating an
+absent ref requires `destination.create: true` in the binding.
+
+**Publication recovery.** An intent journal (`<state dir>/publications/
+<publication_id>.json`) is written before any external effect, so a retry
+resumes or refuses; reusing a publication identity with different candidate
+content or parameters refuses (`publication_conflict`). After an interrupted
+push it inspects the authoritative remote ref: if it equals the persisted commit
+it records the push as successful; if it is absent and authorized it retries the
+same commit
+under the same fast-forward conditions; a conflicting ref refuses; an
+unavailable or inconclusive remote returns `indeterminate`. A PR create is
+reconciled by a `bob-publication:<publication_id>` marker before another create
+is issued; an inconclusive reconciliation returns `indeterminate`.
+
+**Result.** `{ publication_id, candidate_id, tree_oid, commit_oid, status,
+phase, push_state, pr_url?, reason? }`, where `status` is `published`, `refused`
+or `indeterminate` and `push_state` is `confirmed_present`, `confirmed_absent`
+or `unknown`. `published` is reported only after the remote commit (and any
+requested PR) is confirmed. Refusals are `unknown_task`, `invalid_binding`,
+`invalid_request`, `candidate_unknown`, `candidate_mismatch`, `scope_violation`,
+`expected_tree_mismatch`, `check_*`, `materialize_failed`,
+`materialized_tree_changed`, `remote_diverged`, `remote_absent_unauthorized`,
+`push_rejected`, `push_failed`, `pr_unauthorized`, `pr_service_unavailable`,
+`publication_conflict`, `storage_failed`.
+
+Like `apply_patch`, `publish` refuses detected changes to the staging directory,
+source or destination; a concurrent same-user writer can still race rename until
+builder confinement (bob#189). Its `TOOL_EFFECTS` row is `writer`.
+
 ## Enabling it
 
 The `work` capability is what enables `run`. `roles/builder-local/role.json`
-allows `run`, `run_status`, `run_cancel` and `apply_patch`, and does not allow
-`bash`: in that role, `run` replaces pi's shell, and that is a fact of the config
-(tool availability is a per-role allow-list), not of load order. An agent opts in
-the same way as for `anchored-edit`: `work` under `capabilities:` in `bob.yaml`
-and the four names in `tools.allow:`.
+allows `run`, `run_status`, `run_cancel`, `apply_patch` and `publish`, and does
+not allow `bash`: in that role, `run` replaces pi's shell, and that is a fact of
+the config (tool availability is a per-role allow-list), not of load order. An
+agent opts in the same way as for `anchored-edit`: `work` under `capabilities:`
+in `bob.yaml` and the names in `tools.allow:`.
 
 `run` executes arbitrary commands, so the resident policy treats it as a shell:
 its `TOOL_EFFECTS` row is `writer`, so it is in `RESIDENT_EXCLUDED_TOOLS` with

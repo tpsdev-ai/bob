@@ -43,8 +43,9 @@ export interface TaskBinding {
   declared_paths: string[];
   // The commands publication must run (S2b).
   check_commands: string[];
-  // The one ref publication may push to.
-  destination: { remote: string; ref: string };
+  // The one ref publication may push to. `create` authorizes creating the ref
+  // when it does not yet exist; without it, an absent ref refuses.
+  destination: { remote: string; ref: string; create?: boolean };
   // The optional PR destination, when the task authorizes PR creation.
   pr?: { base: string; head?: string };
   // apply mode pins these; apply_patch requires the artifact and its result to
@@ -79,6 +80,11 @@ function reqStringArray(value: unknown, what: string): string[] {
       fail(`${what} must hold only non-empty strings`);
   }
   return value as string[];
+}
+
+function reqBoolean(value: unknown, what: string): boolean {
+  if (typeof value !== "boolean") fail(`${what} must be a boolean`);
+  return value;
 }
 
 function hex(value: unknown, length: 40 | 64, what: string): string {
@@ -127,6 +133,9 @@ export function parseTaskBinding(raw: string | null | undefined): TaskBinding | 
     destination: {
       remote: reqString(destination.remote, "destination.remote"),
       ref: reqString(destination.ref, "destination.ref"),
+      ...(destination.create !== undefined
+        ? { create: reqBoolean(destination.create, "destination.create") }
+        : {}),
     },
   };
 
