@@ -49,6 +49,9 @@ export interface RequestUsageRecord {
    *  then not the provider's: its usage never arrived, so the prompt counts are
    *  0 and completionTokens is the cap bob assigned, a lower bound. */
   outputCapped?: true;
+  /** The selected row's budget.maxOutputTokens (bob#185 item 2), present only
+   *  on a request whose stopReason is "length". */
+  outputCap?: number;
 }
 
 interface UsageLike {
@@ -77,9 +80,16 @@ export interface RequestUsageTracker {
   observe(event: unknown): RequestUsageRecord | undefined;
 }
 
-export function createRequestUsageTracker(clock: () => number = Date.now): RequestUsageTracker {
+export function createRequestUsageTracker(
+  clock: () => number = Date.now,
+  deps: { outputCap?: number } = {},
+): RequestUsageTracker {
   let firstDeltaAt: number | undefined;
   let thinkingDeltas = 0;
+  const outputCap =
+    typeof deps.outputCap === "number" && Number.isFinite(deps.outputCap) && deps.outputCap > 0
+      ? deps.outputCap
+      : undefined;
 
   const reset = (): void => {
     firstDeltaAt = undefined;
@@ -117,6 +127,7 @@ export function createRequestUsageTracker(clock: () => number = Date.now): Reque
       const endedAt = clock();
       const start = typeof message.timestamp === "number" ? message.timestamp : undefined;
       const reportedThinking = count(usage.reasoning);
+      const stopReason = typeof message.stopReason === "string" ? message.stopReason : "";
       const record: RequestUsageRecord = {
         provider: typeof message.provider === "string" ? message.provider : "",
         model: typeof message.model === "string" ? message.model : "",
@@ -127,7 +138,8 @@ export function createRequestUsageTracker(clock: () => number = Date.now): Reque
         thinkingTokensSource: reportedThinking > 0 ? "provider" : "stream-deltas",
         ttftMs: start !== undefined && firstDeltaAt !== undefined ? firstDeltaAt - start : null,
         durationMs: start !== undefined ? endedAt - start : null,
-        stopReason: typeof message.stopReason === "string" ? message.stopReason : "",
+        stopReason,
+        ...(outputCap !== undefined && stopReason === "length" ? { outputCap } : {}),
         ...((message as Record<string, unknown>)[OUTPUT_CAP_MARK] === true
           ? { outputCapped: true as const }
           : {}),
