@@ -23,6 +23,13 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Document, isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
+import { type ProviderRequestPolicy, REQUEST_POLICY_BOUNDS } from "./provider-request-policy.js";
+import {
+  isTurnReasoningMode,
+  type ProviderTurnBudget,
+  TURN_BUDGET_BOUNDS,
+  TURN_REASONING_MODES,
+} from "./provider-turn-budget.js";
 
 /** The wire API pi uses for an OpenAI-compatible custom provider. */
 export const PROVIDER_API_OPENAI_COMPLETIONS = "openai-completions";
@@ -100,6 +107,10 @@ export interface ProviderRecord {
   readonly api?: ProviderApi;
   /** Present only on keyless rows: authorizes a `provider.base_url` override. */
   readonly override?: ProviderOverridePolicy;
+  /** Request timeout and retry policy, from the selected row (bob#185 item 1). */
+  readonly request?: ProviderRequestPolicy;
+  /** Per-turn reasoning / output budget, from the selected row (bob#185 item 2). */
+  readonly budget?: ProviderTurnBudget;
   readonly compatibility?: readonly string[];
 }
 
@@ -122,6 +133,8 @@ export const PROVIDER_RECORDS = [
     api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: { excludeHosts: ["ollama.com"] },
+    request: { idleTimeoutMs: 120_000, totalTimeoutMs: 1_800_000, maxRetries: 0 },
+    budget: { maxOutputTokens: 4_096, reasoning: "low" },
   },
   {
     id: "ollama-newton",
@@ -131,6 +144,8 @@ export const PROVIDER_RECORDS = [
     api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: {},
+    request: { idleTimeoutMs: 120_000, totalTimeoutMs: 1_800_000, maxRetries: 0 },
+    budget: { maxOutputTokens: 4_096, reasoning: "low" },
   },
   {
     id: "omlx",
@@ -140,6 +155,8 @@ export const PROVIDER_RECORDS = [
     api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: {},
+    request: { idleTimeoutMs: 120_000, totalTimeoutMs: 1_800_000, maxRetries: 0 },
+    budget: { maxOutputTokens: 4_096, reasoning: "low" },
   },
   {
     id: "exe-dev-gateway",
@@ -169,6 +186,8 @@ for (const row of PROVIDER_RECORDS) {
     if ("excludeHosts" in row.override) Object.freeze(row.override.excludeHosts);
     Object.freeze(row.override);
   }
+  if ("request" in row) Object.freeze(row.request);
+  if ("budget" in row) Object.freeze(row.budget);
   Object.freeze(row);
 }
 Object.freeze(PROVIDER_RECORDS);
@@ -223,6 +242,8 @@ const ALLOWED_FIELDS = new Set([
   "endpoint",
   "api",
   "override",
+  "request",
+  "budget",
   "compatibility",
 ]);
 
@@ -299,6 +320,16 @@ function validateRowFields(row: ProviderRecord): void {
       `provider registry: row "${row.id}" declares an override policy but a base_url override is only allowed on a bob/none row.`,
     );
   }
+  if (row.request !== undefined && auth.kind !== "none") {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" declares a request policy but bob only enforces it on a bob/none row.`,
+    );
+  }
+  if (row.budget !== undefined && auth.kind !== "none") {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" declares a turn budget but bob only enforces it on a bob/none row.`,
+    );
+  }
   if (row.override !== undefined) {
     const policy = asRecord(row.override, "override");
     if (Object.keys(policy).some((field) => field !== "excludeHosts")) {
@@ -321,6 +352,8 @@ function validateRowFields(row: ProviderRecord): void {
       `provider registry: row "${row.id}" declares unsupported adapter/API.`,
     );
   }
+  validateRequestPolicy(row.request, row.id);
+  validateTurnBudget(row.budget, row.id);
   if (row.endpoint !== undefined) {
     if (typeof row.endpoint !== "string") {
       throw new ProviderRegistryError(
@@ -375,6 +408,100 @@ export function assertProviderEndpointAllowed(row: ProviderRecord, endpoint: str
   if (row.auth.kind === "none" && (row.override?.excludeHosts ?? []).includes(host)) {
     throw new ProviderRegistryError(
       `provider registry: row "${row.id}" endpoint host is excluded.`,
+    );
+  }
+}
+
+/**
+ * Validate a row's request timeout/retry policy, by row name. A nonzero total
+ * cap below the minimum is refused (that is the short total timeout this change
+ * removes); an out-of-bounds or non-integer field refuses rather than clamping.
+ */
+function validateRequestPolicy(value: unknown, id: string): void {
+  if (value === undefined) return;
+  const policy = asRecord(value, "request");
+  for (const field of Object.keys(policy)) {
+    if (field !== "idleTimeoutMs" && field !== "totalTimeoutMs" && field !== "maxRetries") {
+      throw new ProviderRegistryError(
+        `provider registry: row "${id}" request has an unknown field.`,
+      );
+    }
+  }
+  for (const field of ["idleTimeoutMs", "totalTimeoutMs", "maxRetries"] as const) {
+    if (!Object.hasOwn(policy, field)) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${id}" request must declare idleTimeoutMs, totalTimeoutMs and maxRetries.`,
+      );
+    }
+  }
+  const idle = policy.idleTimeoutMs;
+  const bounds = REQUEST_POLICY_BOUNDS;
+  if (
+    typeof idle !== "number" ||
+    !Number.isInteger(idle) ||
+    idle < bounds.idleTimeoutMs.min ||
+    idle > bounds.idleTimeoutMs.max
+  ) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" request.idleTimeoutMs must be an integer within [${bounds.idleTimeoutMs.min}, ${bounds.idleTimeoutMs.max}].`,
+    );
+  }
+  const total = policy.totalTimeoutMs;
+  if (
+    typeof total !== "number" ||
+    !Number.isInteger(total) ||
+    total < 0 ||
+    (total !== 0 && (total < bounds.totalTimeoutMs.min || total > bounds.totalTimeoutMs.max))
+  ) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" request.totalTimeoutMs must be 0 or an integer within [${bounds.totalTimeoutMs.min}, ${bounds.totalTimeoutMs.max}].`,
+    );
+  }
+  const retries = policy.maxRetries;
+  if (
+    typeof retries !== "number" ||
+    !Number.isInteger(retries) ||
+    retries < bounds.maxRetries.min ||
+    retries > bounds.maxRetries.max
+  ) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" request.maxRetries must be an integer within [${bounds.maxRetries.min}, ${bounds.maxRetries.max}].`,
+    );
+  }
+}
+
+/**
+ * Validate a row's per-turn reasoning / output budget, by row name. A missing
+ * field, an unknown field, an out-of-bounds or non-integer cap, or an unknown
+ * reasoning mode refuses rather than clamping or defaulting.
+ */
+function validateTurnBudget(value: unknown, id: string): void {
+  if (value === undefined) return;
+  const budget = asRecord(value, "budget");
+  for (const field of Object.keys(budget)) {
+    if (field !== "maxOutputTokens" && field !== "reasoning") {
+      throw new ProviderRegistryError(
+        `provider registry: row "${id}" budget has an unknown field.`,
+      );
+    }
+  }
+  for (const field of ["maxOutputTokens", "reasoning"] as const) {
+    if (!Object.hasOwn(budget, field)) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${id}" budget must declare maxOutputTokens and reasoning.`,
+      );
+    }
+  }
+  const cap = budget.maxOutputTokens;
+  const bounds = TURN_BUDGET_BOUNDS.maxOutputTokens;
+  if (typeof cap !== "number" || !Number.isInteger(cap) || cap < bounds.min || cap > bounds.max) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" budget.maxOutputTokens must be an integer within [${bounds.min}, ${bounds.max}].`,
+    );
+  }
+  if (!isTurnReasoningMode(budget.reasoning)) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${id}" budget.reasoning must be one of ${TURN_REASONING_MODES.join(", ")}.`,
     );
   }
 }
@@ -575,6 +702,8 @@ export class ProviderRegistry {
                 }),
               }
             : {}),
+          ...(row.request !== undefined ? { request: Object.freeze({ ...row.request }) } : {}),
+          ...(row.budget !== undefined ? { budget: Object.freeze({ ...row.budget }) } : {}),
         }),
       ),
     );
@@ -821,6 +950,8 @@ function parseOperatorRow(value: unknown, index: number): ProviderRecord {
     ...(raw.endpoint !== undefined ? { endpoint: raw.endpoint as string } : {}),
     ...(raw.api !== undefined ? { api: raw.api as ProviderApi } : {}),
     ...(raw.override !== undefined ? { override: raw.override as ProviderOverridePolicy } : {}),
+    ...(raw.request !== undefined ? { request: raw.request as ProviderRequestPolicy } : {}),
+    ...(raw.budget !== undefined ? { budget: raw.budget as ProviderTurnBudget } : {}),
     ...(raw.compatibility !== undefined ? { compatibility: raw.compatibility as string[] } : {}),
   };
   return row;

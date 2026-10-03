@@ -963,7 +963,27 @@ deepseek/deepseek-v4.1-flash --context-window <tokens>`.
 explicitly requested missing file, an unreadable file or an invalid document refuses. A row with no
 mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
 loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
-data cannot assert that custody.
+data cannot assert that custody. A keyless row may also declare `request: {idleTimeoutMs, totalTimeoutMs,
+maxRetries}` — the request timeout and retry policy for that row (a policy on any other row refuses,
+because bob only enforces it on a `bob/none` row). `idleTimeoutMs` aborts a request
+that has received no data for that long, reset on every streamed chunk; `totalTimeoutMs` (0 disables)
+is a hard cap; `maxRetries` is the provider-level blind-retry count. The built-in keyless rows
+(`ollama`, `ollama-newton`, `omlx`) declare a 120 s idle timeout, a 30 min total cap and no blind
+retry, so a long local generation is not cut off by a single cloud-sized total timeout and a
+timed-out generation is surfaced (with the provider, the limit and the remedy) and is not retried.
+An out-of-bounds, non-integer, incomplete or unknown field in `request` refuses at load by row name.
+
+A keyless row may also declare `budget: {maxOutputTokens, reasoning}` — a per-turn reasoning / output
+budget (a budget on any other row refuses, for the same reason as `request`). `maxOutputTokens` caps
+the turn's output: bob hands it to pi as `maxTokens`, which the OpenAI-compatible adapter sends in the
+provider's own field (`max_completion_tokens`, or `max_tokens` where the model's compat selects it).
+`reasoning` sets the turn's thinking level (`off` is non-thinking; one of `off`, `minimal`, `low`,
+`medium`, `high`), handed to pi as its thinking level, which the adapter sends as `reasoning_effort` —
+a lower level is the reduced reasoning budget, and `off` sends no reasoning directive. The built-in
+keyless rows (`ollama`, `ollama-newton`, `omlx`) declare a 4096-token output cap and the `low` level;
+cloud rows declare none, so their requests are unchanged. An out-of-bounds, non-integer, incomplete or
+unknown field in `budget` refuses at load by row name, and a request the provider stopped at the row's
+output cap carries `outputCap` in the run log's request-usage record.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,

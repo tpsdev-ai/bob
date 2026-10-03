@@ -1259,7 +1259,15 @@ async function runBoundedSession(
   // completion and thinking tokens, time to first token, model), written when
   // the request's assistant message ends. A NON-delta record: the delta cap
   // never drops it.
-  const usageTracker = createRequestUsageTracker(() => now().getTime());
+  // bob#185 item 2: when the selected row declares a per-turn output cap, a
+  // request the provider stopped at its length limit carries that cap in the
+  // record (provider, cap, tokens), so a turn that hit the row's output cap is
+  // visible in the run log rather than only in its token count.
+  const usageTracker = createRequestUsageTracker(() => now().getTime(), {
+    ...(config.providerRecord?.budget !== undefined
+      ? { outputCap: config.providerRecord.budget.maxOutputTokens }
+      : {}),
+  });
   const unsubscribeUsage = session.subscribe((event) => {
     const record = usageTracker.observe(event);
     if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);

@@ -1291,7 +1291,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         );
       }
       assertProviderEndpointAllowed(row, endpoint);
-      installBaseUrlTransport(modelRuntime, config.provider, endpoint);
+      installBaseUrlTransport(modelRuntime, config.provider, endpoint, row.request, row.budget);
     }
     // openrouter is bob's OWN provider (round 3): construct it in memory and
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
