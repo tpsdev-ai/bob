@@ -969,8 +969,8 @@ that has received no data for that long, reset on every streamed chunk; `totalTi
 is a hard cap; `maxRetries` is the provider-level blind-retry count. The built-in keyless rows
 (`ollama`, `ollama-newton`, `omlx`) declare a 120 s idle timeout, a 30 min total cap and no blind
 retry, so a long local generation is not cut off by a single cloud-sized total timeout and a
-timed-out generation is surfaced (with the provider, the limit and the remedy) rather than retried.
-An out-of-bounds, non-integer or incomplete `request` refuses at load by row name.
+timed-out generation is surfaced (with the provider, the limit and the remedy) and is not retried.
+An out-of-bounds, non-integer, incomplete or unknown field in `request` refuses at load by row name.
 
 **bob owns the openrouter provider.** For `openrouter`, bob CONSTRUCTS the provider definition in
 memory inside its one session factory — the fixed `https://openrouter.ai/api/v1` endpoint,

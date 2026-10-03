@@ -60,8 +60,8 @@ export function installBaseUrlTransport(
       throw new Error("bob: run bob models <agent> to apply provider.base_url");
     }
     // bob owns the timeouts and retries when the row carries a policy: the
-    // request carries no SDK total timeout, and a timed-out generation is never
-    // retried (maxRetries is the row's, 0 for a local row).
+    // request carries no SDK total timeout, and the retry count is the row's (the
+    // builtin local rows set 0).
     const {
       timeoutMs: _droppedTimeout,
       maxRetries: _droppedRetries,

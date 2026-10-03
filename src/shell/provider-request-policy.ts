@@ -2,9 +2,10 @@
 // provider row (bob#185 item 1).
 //
 // The measured problem: an OpenAI-compatible request carried one total timeout
-// (cloud-sized). On a local model that generates for minutes the total timeout
-// fired mid-generation, and the request was retried, discarding the tokens
-// already produced. This module turns the row into the source of the policy:
+// (cloud-sized). On a local model that generates for minutes a single
+// cloud-sized total timeout is the wrong bound, and a timeout must not silently
+// discard the generation and start over. This module turns the row into the
+// source of the policy:
 //
 //   * idleTimeoutMs — abort when no response data has arrived for this long
 //     (queued + prefill + inter-token gaps). Reset on every streamed chunk.
@@ -13,7 +14,7 @@
 //     generation is surfaced (not thrown away and silently retried).
 //
 // A timed-out generation is an ERROR, surfaced with the provider, the elapsed
-// time and the remedy; it is never retried by the policy itself. This module
+// limit and the remedy; the policy itself never retries it. This module
 // owns the timeout mechanism; the row owns the values (validated at load by
 // provider-registry.ts).
 
@@ -84,7 +85,8 @@ const systemTimers: TimerSeam = { setTimeout, clearTimeout };
  * timeouts. The idle timer is armed before the request (covering queue + first
  * token) and re-armed on every streamed chunk; the total timer is armed once.
  * On either firing the underlying request is aborted with the NAMED error, so
- * the caller surfaces it (and, with maxRetries 0, does not retry it).
+ * the caller surfaces it; a timeout is not a provider error, so the request
+ * retry policy does not retry it.
  *
  * Headers, method, body and the caller's own AbortSignal are preserved.
  */
