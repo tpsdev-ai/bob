@@ -1246,11 +1246,12 @@ async function runBoundedSession(
   let failed = false;
   let aborted: TerminationReason | undefined;
 
-  // #145: the observer attempts to send a best-effort compaction note except after
-  // `agent_end` with nonempty text, stopReason "stop", no tool calls, and
-  // compaction willRetry false (or an aborted compaction).
+  // #145: Non-aborted compactions attempt a note unless a response after
+  // `agent_end` has stopReason "stop", no tool calls, compaction willRetry false,
+  // and final text satisfying the completion contract.
   // The observer also owns the final-message boundary the judge reads.
   const observer = createCompactionObserver({
+    isComplete: (text) => judge(text).ok,
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     // bob#244: the note carries workspace data (git status), so a web session
     // refuses it; the observer logs the refusal and the run carries on.
@@ -1276,9 +1277,9 @@ async function runBoundedSession(
 
   // ONE judge: the first evaluation and the one after the continue turn are the
   // same call, so the run cannot be judged by two different rules.
-  const judge = (): { ok: boolean; reason?: SilenceReason } =>
+  const judge = (capturedText = finalTextNow()): { ok: boolean; reason?: SilenceReason } =>
     evaluateCompletion({
-      capturedText: finalTextNow(),
+      capturedText,
       compactions: observer.compactions(),
       expectedFinal: opts.expectedFinal,
     });

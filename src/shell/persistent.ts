@@ -219,8 +219,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   log(`[bob] persistent session up for ${opts.name} (${provider}/${model})`);
 
   // #145: the observer attempts to send a best-effort compaction note except after
-  // `agent_end` with nonempty text, stopReason "stop", no tool calls, and
-  // compaction willRetry false (or an aborted compaction). The standing contract is
+  // `agent_end` with stopReason "stop", no tool calls, compaction willRetry false,
+  // and final text satisfying the completion contract (or an aborted compaction).
+  // The standing contract is
   // in the system prompt, so a note that fails to send is logged and the
   // runtime keeps serving. The note uses pi's steer path; it does not
   // submit a new bob admission or supply an origin.
