@@ -1,32 +1,18 @@
-// The provider registry — ONE table of provider identity records.
-//
-// Before this module, a bob provider name was mapped to pi's provider id in
-// two hand-written mappers (init.ts's `resolvePiProvider`, run.ts's
-// `mapBobProviderToPi`), and the same names were special-cased again for
-// endpoints, OpenAI compatibility, OpenRouter ownership and the gateway's
-// VM-identity placeholder. Each of those lists had to be kept in step with the
-// others by hand.
-//
-// Here each provider is ONE row: its stable id (the name bob.yaml declares),
-// its aliases, its runtime identity (the id pi resolves its models under), its
-// default endpoint and its API flavour. init's scaffold and run's resolution
-// both READ this table, so a row's alias and endpoint reach both without an
-// edit to either mapper.
-//
-// This is a behaviour-preserving extraction (bob#186, slice 1): the records
-// below reproduce the behaviour the old mappers and special-cases held.
-// Transport, disk refusal, key custody and endpoint eligibility are NOT decided
-// here — those are later slices.
+// Provider records: canonical ID (bob.yaml may declare an alias), runtime identity,
+// endpoint and API flavour. Init writes the endpoint; run resolves the identity.
+// envKey controls scaffold disk omission; runtime key custody remains OpenRouter-specific.
 
 /** The wire API pi must use for a provider that is not one of pi's built-ins. */
 export const PROVIDER_API_OPENAI_COMPLETIONS = "openai-completions";
 export type ProviderApi = typeof PROVIDER_API_OPENAI_COMPLETIONS;
 
 export interface ProviderRecord {
-  /** The stable id, as written in bob.yaml's `provider.name`. Unique. */
+  /** Canonical ID; bob.yaml may declare an alias. Unique. */
   readonly id: string;
   /** Other names that resolve to this record. Unique, and disjoint from every id. */
   readonly aliases: readonly string[];
+  /** Include the canonical ID in ProviderConfig.name. */
+  readonly configName?: boolean;
   /**
    * The runtime identity: the provider id pi resolves this provider's models
    * under. `exe-dev-gateway` and `anthropic` both use pi's `anthropic` today;
@@ -39,10 +25,7 @@ export interface ProviderRecord {
   readonly api?: ProviderApi;
   /** The endpoint authenticates by host/VM identity, so it carries no API key. */
   readonly gateway?: boolean;
-  /**
-   * The credential is read from the environment at run time and never written
-   * to disk, so the scaffold writes no provider block and no auth entry.
-   */
+  /** Init omits this row's disk entries; run/session retain OpenRouter-specific handling. */
   readonly envKey?: boolean;
 }
 
@@ -53,6 +36,7 @@ export interface ProviderRecord {
 export const PROVIDER_RECORDS = [
   {
     id: "ollama-cloud",
+    configName: true,
     aliases: [],
     runtime: "ollama-cloud",
     endpoint: "https://ollama.com/v1",
@@ -60,27 +44,31 @@ export const PROVIDER_RECORDS = [
   },
   {
     id: "ollama",
+    configName: false,
     aliases: [],
     runtime: "ollama",
     endpoint: "https://ollama.com/v1",
     api: PROVIDER_API_OPENAI_COMPLETIONS,
   },
-  { id: "ollama-newton", aliases: [], runtime: "ollama-newton" },
-  { id: "omlx", aliases: [], runtime: "omlx" },
+  { id: "ollama-newton", configName: true, aliases: [], runtime: "ollama-newton" },
+  { id: "omlx", configName: true, aliases: [], runtime: "omlx" },
   {
     id: "exe-dev-gateway",
+    configName: true,
     aliases: [],
     runtime: "anthropic",
     endpoint: "http://169.254.169.254/gateway/llm/anthropic",
     gateway: true,
   },
-  { id: "anthropic", aliases: [], runtime: "anthropic" },
-  { id: "openai", aliases: [], runtime: "openai" },
-  { id: "openrouter", aliases: [], runtime: "openrouter", envKey: true },
+  { id: "anthropic", configName: true, aliases: [], runtime: "anthropic" },
+  { id: "openai", configName: true, aliases: [], runtime: "openai" },
+  { id: "openrouter", configName: true, aliases: [], runtime: "openrouter", envKey: true },
 ] as const satisfies readonly ProviderRecord[];
 
-/** The provider names the registry declares — derived from the table above. */
-export type ProviderName = (typeof PROVIDER_RECORDS)[number]["id"];
+export type ProviderName = Extract<
+  (typeof PROVIDER_RECORDS)[number],
+  { readonly configName: true }
+>["id"];
 
 export class ProviderRegistryError extends Error {
   constructor(message: string) {
@@ -169,7 +157,7 @@ export function providerUsesGatewayIdentity(
   return registry.find(name)?.gateway === true;
 }
 
-/** True when `name`'s row reads its credential from the environment at run time. */
+/** True when init omits this row's disk entries. */
 export function providerReadsKeyFromEnv(
   name: string,
   registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,

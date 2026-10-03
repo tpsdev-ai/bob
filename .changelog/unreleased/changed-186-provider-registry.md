@@ -1,1 +1,1 @@
-- **Provider identity, endpoints and API flavour now come from one registry table.** `bob init`'s scaffold and `bob run`'s provider resolution read the same records, so a provider's aliases and endpoint reach both from one place. Refs #186.
+- **Provider records now come from one registry table.** `bob init` writes each row's endpoint; `bob run` resolves its runtime identity. Refs #186.

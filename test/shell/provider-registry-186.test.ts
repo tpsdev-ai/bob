@@ -1,8 +1,4 @@
-// bob#186 slice 1 — one provider registry.
-//
-// A row added to the table supplies a NEW alias and endpoint to BOTH the init
-// scaffold and run's resolution, without an edit to either mapper; a duplicate
-// id or alias fails validation by name.
+// Init writes the row's endpoint; run resolves its alias to the runtime identity.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -85,6 +81,13 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     expect(
       () => new ProviderRegistry([...PROVIDER_RECORDS, { ...TEST_ROW, aliases: ["ollama-cloud"] }]),
     ).toThrow(/duplicate identity "ollama-cloud"/);
+  });
+
+  it("an alias shared by two rows fails validation, naming the alias", () => {
+    expect(
+      () =>
+        new ProviderRegistry([TEST_ROW, { ...TEST_ROW, id: "other-gateway", runtime: "openai" }]),
+    ).toThrow(/duplicate identity "acme".*"acme-gateway".*"other-gateway"/);
   });
 
   it("the built-in rows keep their mappings", () => {

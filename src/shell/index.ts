@@ -21,8 +21,6 @@ export type BobRole =
   | "custom";
 
 export interface ProviderConfig {
-  // The provider names come from the registry table, so this type cannot drift
-  // from the record init's scaffold and run's resolution actually read.
   name: ProviderName;
   model: string;
   fallbacks?: string[];
