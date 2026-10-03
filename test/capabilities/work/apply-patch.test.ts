@@ -664,13 +664,13 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     expect(snapshot(fx.repo)).toEqual(before);
     // Nothing was created there, so no candidate record can exist.
     expect(existsSync(stateRoot)).toBe(false);
-    expect(existsSync(candidateRecordPath(stateRoot, "candidate"))).toBe(false);
   });
 
   it("a state root that is a symlink: storage_failed", async () => {
     const fx = makeFixture();
     const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
     writeArtifact(fx, "p.patch", patch);
+    const before = snapshot(fx.repo);
     const target = join(scratch, "real-state");
     mkdirSync(target);
     const stateRoot = join(scratch, "state-link");
@@ -685,15 +685,16 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.reason).toBe("storage_failed");
+    expect(snapshot(fx.repo)).toEqual(before);
     // The link's target was not written through either.
     expect(readdirSync(target)).toEqual([]);
-    expect(existsSync(candidateRecordPath(target, "candidate"))).toBe(false);
   });
 
   it("a state root with mode 0755: storage_failed", async () => {
     const fx = makeFixture();
     const { patch } = patchFrom(fx, (r) => writeFileSync(join(r, "a.txt"), "hello world\n"));
     writeArtifact(fx, "p.patch", patch);
+    const before = snapshot(fx.repo);
     const stateRoot = join(scratch, "state-0755");
     mkdirSync(stateRoot);
     chmodSync(stateRoot, 0o755);
@@ -707,8 +708,8 @@ describe("apply_patch — refusals carry a stable reason and leave the checkout 
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.reason).toBe("storage_failed");
+    expect(snapshot(fx.repo)).toEqual(before);
     expect(readdirSync(stateRoot)).toEqual([]);
-    expect(existsSync(candidateRecordPath(stateRoot, "candidate"))).toBe(false);
   });
 
   it("a candidates directory that is a symlink into the checkout: storage_failed, the checkout unchanged and nothing written through the link", async () => {
