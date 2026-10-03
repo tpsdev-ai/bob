@@ -456,7 +456,7 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
     parameters: Type.Object({
       candidate_id: Type.String({
         minLength: 1,
-        description: "A candidate_id returned by apply_patch, in this run's storage.",
+        description: "A candidate_id stored by apply_patch under the tool state directory.",
       }),
       commit_message: Type.String({
         minLength: 1,

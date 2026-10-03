@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,7 +24,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { TaskBinding } from "../../../src/capabilities/work/task-binding.js";
-import { resolveCapabilities } from "../../../src/shell/capability-loader.js";
+import { resolveRunConfig } from "../../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../../src/shell/session.js";
 
 const STUB_PROVIDER = "bob-apply-patch-stub";
@@ -136,15 +136,39 @@ interface RunResult {
   details: Record<string, unknown>;
 }
 
+function sessionYaml(toolName: string): string {
+  return `agent:
+  role: builder-local
+provider:
+  name: ${STUB_PROVIDER}
+  model: ${STUB_MODEL}
+  context_window: 200000
+capabilities:
+  - work
+tools:
+  allow:
+    - ${toolName}
+`;
+}
+
 async function runSession(
   s: Setup,
   args: Record<string, unknown>,
   binding: TaskBinding | undefined,
   toolName = "apply_patch",
 ): Promise<RunResult> {
-  const { extensionSources } = resolveCapabilities({ yamlText: "capabilities:\n  - work\n" });
-  const cwd = join(s.scratch, "workspace");
-  const piAgentDir = join(s.scratch, "pi-agent");
+  const agentDir = join(s.scratch, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  const yamlPath = join(agentDir, "bob.yaml");
+  if (!existsSync(yamlPath)) writeFileSync(yamlPath, sessionYaml(toolName));
+  const { config, policy } = resolveRunConfig({
+    name: "workspace",
+    agentsRoot: s.scratch,
+    hostRoot: join(s.scratch, "host"),
+    ...(binding !== undefined ? { taskBinding: binding } : {}),
+  });
+  expect(config.taskBinding).toEqual(binding);
+  const { cwd, piAgentDir } = config;
   mkdirSync(cwd, { recursive: true });
   mkdirSync(piAgentDir, { recursive: true });
   const modelRuntime = await ModelRuntime.create({
@@ -170,23 +194,9 @@ async function runSession(
       },
     ],
   });
-  const tools = [toolName];
   const factory = createBobRuntimeFactory({
-    config: {
-      provider: STUB_PROVIDER,
-      model: STUB_MODEL,
-      modelLimits: { provider: STUB_PROVIDER, model: STUB_MODEL, contextWindow: 200_000 },
-      appendSystemPrompt: "",
-      cwd,
-      piAgentDir,
-      extensionSources,
-      capabilityBySource: { [extensionSources[0]]: "work" },
-      capabilityEnv: { BOB_CAP_WORK: "{}" },
-      tools,
-      excludeTools: [],
-      ...(binding !== undefined ? { taskBinding: binding } : {}),
-    },
-    policy: { tools, excludeTools: [], resident: false, allowResidentShell: false },
+    config,
+    policy,
     deps: { log: () => {}, exit: () => {} },
     modelRuntime,
   });
@@ -310,7 +320,7 @@ describe("publish through the production session path", () => {
     mkdirSync(join(s.scratch, "workspace"), { recursive: true });
     writeFileSync(
       join(s.scratch, "workspace", "bob.yaml"),
-      `capabilities:\n  - work\ntaskBinding: ${JSON.stringify(authority)}\n`,
+      `${sessionYaml("publish")}taskBinding: ${JSON.stringify(authority)}\n`,
     );
     const out = await runSession(
       s,

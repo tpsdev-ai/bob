@@ -204,16 +204,18 @@ interface ChangedEntry {
 
 function parseDiffTree(out: string): ChangedEntry[] | null {
   const entries: ChangedEntry[] = [];
-  for (const line of out.split("\n")) {
-    if (line === "") continue;
-    const m = /^:(\d{6}) (\d{6}) [0-9a-f]+ [0-9a-f]+ [A-Z]\t(.*)$/.exec(line);
-    if (!m) return null;
-    entries.push({ oldMode: m[1], newMode: m[2], path: m[3] });
+  if (out === "") return entries;
+  if (!out.endsWith("\0")) return null;
+  const fields = out.slice(0, -1).split("\0");
+  if (fields.length % 2 !== 0) return null;
+  for (let i = 0; i < fields.length; i += 2) {
+    const m = /^:(\d{6}) (\d{6}) [0-9a-f]+ [0-9a-f]+ [A-Z]$/.exec(fields[i]);
+    if (!m || fields[i + 1] === "") return null;
+    entries.push({ oldMode: m[1], newMode: m[2], path: fields[i + 1] });
   }
   return entries;
 }
 
-// The complete changed-path set between the pinned base and the candidate tree.
 // `--no-renames` so both sides of a rename appear; ignored or generated files
 // that are present in the tree are included, not omitted.
 function changedPaths(
@@ -222,16 +224,14 @@ function changedPaths(
   base: string,
   tree: string,
 ): { ok: true; paths: string[] } | { ok: false; stderr: string } {
-  const diff = git(["diff-tree", "-r", "--no-renames", "--raw", base, tree], { cwd: repo });
+  const diff = git(["diff-tree", "-r", "--no-renames", "--raw", "-z", base, tree], { cwd: repo });
   if (diff.status !== 0) return { ok: false, stderr: diff.stderr.trim() };
   const entries = parseDiffTree(diff.stdout);
   if (entries === null) return { ok: false, stderr: "git diff-tree output could not be parsed" };
   return { ok: true, paths: entries.map((e) => e.path) };
 }
 
-// A declared path is a literal repository-relative file or a directory prefix
-// matched at a component boundary. An out-of-scope candidate lists every
-// offending path.
+// Declared paths match literal filenames or directory component boundaries.
 function scopeOffenders(declared: string[], changed: string[]): string[] {
   const norm = declared.map((d) => d.replace(/\/+$/, ""));
   return changed.filter((path) => !norm.some((d) => path === d || path.startsWith(`${d}/`)));
@@ -430,17 +430,12 @@ function materialize(
   return { ok: true };
 }
 
-// Verify the materialized working tree against the candidate tree. The index
-// stat cache is refreshed first, then `diff-index --quiet` compares tracked
-// files and their modes and ignores untracked files, so a generated check output
-// does not count as a source change. Exit 0 means unchanged; exit 1 means
-// changed; anything else is a failed verification.
 function materializedUnchanged(
   git: GitRunner,
   dir: string,
   tree: string,
 ): "unchanged" | "changed" | "verify_failed" {
-  git(["update-index", "-q", "--refresh"], { cwd: dir });
+  if (git(["update-index", "-q", "--refresh"], { cwd: dir }).status !== 0) return "verify_failed";
   const r = git(["diff-index", "--quiet", tree, "--"], { cwd: dir });
   if (r.status === 0) return "unchanged";
   if (r.status === 1) return "changed";
@@ -482,16 +477,22 @@ function inspectRemote(git: GitRunner, repo: string, remote: string, ref: string
   const r = git(["ls-remote", remote, ref], { cwd: repo });
   if (r.status !== 0)
     return { state: "unknown", error: r.stderr.trim() || `git exited ${r.status}` };
-  const lines = r.stdout.split("\n").filter((l) => l.trim() !== "");
-  if (lines.length === 0) return { state: "absent" };
-  // A single ref should yield one line: "<oid>\t<ref>".
-  const first = lines[0].split(/\s+/)[0];
-  if (!HEX40.test(first)) return { state: "unknown", error: `unparsable ls-remote output` };
-  return { state: "present", oid: first };
+  if (r.stdout === "") return { state: "absent" };
+  const lines = r.stdout.replace(/\n$/, "").split("\n");
+  const fields = lines[0].split("\t");
+  if (lines.length !== 1 || fields.length !== 2 || !HEX40.test(fields[0]) || fields[1] !== ref)
+    return { state: "unknown", error: "unexpected ls-remote output" };
+  return { state: "present", oid: fields[0] };
 }
 
-function isAncestor(git: GitRunner, repo: string, ancestor: string, descendant: string): boolean {
-  return git(["merge-base", "--is-ancestor", ancestor, descendant], { cwd: repo }).status === 0;
+function isAncestor(
+  git: GitRunner,
+  repo: string,
+  ancestor: string,
+  descendant: string,
+): boolean | null {
+  const { status } = git(["merge-base", "--is-ancestor", ancestor, descendant], { cwd: repo });
+  return status === 0 ? true : status === 1 ? false : null;
 }
 
 // --- the lock -------------------------------------------------------------------
@@ -731,8 +732,7 @@ async function publishUnderLock(
       ...extra,
     });
 
-  // Load the candidate record from tool-owned storage. A failed read is never
-  // treated as absence.
+  // Only ENOENT means the candidate is absent.
   const recordPath = candidateRecordPath(stateRoot, params.candidate_id);
   let record: CandidateRecord;
   try {
@@ -742,7 +742,7 @@ async function publishUnderLock(
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return fail(
         "candidate_unknown",
-        `publish refused: no stored candidate ${params.candidate_id} exists under this run's state directory. Build the candidate with apply_patch first; a candidate id is not permission to publish.`,
+        `publish refused: no stored candidate ${params.candidate_id} exists under the tool state directory. Build the candidate with apply_patch first; a candidate id is not permission to publish.`,
       );
     }
     return fail(
@@ -780,8 +780,6 @@ async function publishUnderLock(
   const treeOid = record.tree_oid;
   const commitMetaResolved = commitMeta(record, params.commit_message);
 
-  // Scope: the complete changed-path set between the pinned base and the
-  // candidate tree, checked against the declared paths.
   const changed = changedPaths(git, binding.repository, binding.base_oid, treeOid);
   if (!changed.ok) {
     return fail(
@@ -828,7 +826,6 @@ async function publishUnderLock(
       "publish refused: destination must resolve to one endpoint without URL rewrites and a valid branch ref.",
     );
 
-  // Everything from here is journaled and recoverable.
   const journalPath = publishJournalPath(stateRoot, binding.publication_id);
   const readJ = deps.readJournal ?? readJournalFile;
   const writeJ = deps.writeJournal ?? writeJournalAtomic;
@@ -897,11 +894,25 @@ async function publishUnderLock(
       created_at: now().toISOString(),
     } satisfies PublishJournal);
 
+  let pushAttempted = ["pushing", "pushed", "published"].includes(journal.phase);
   const persist = (): PublishResult | null => {
     try {
       writeJ(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
       return null;
     } catch (err) {
+      if (pushAttempted)
+        return indeterminate(
+          "journal_write_failed",
+          `publish indeterminate: the publication journal could not be persisted (${errCode(err)}).`,
+          {
+            publication_id: binding.publication_id,
+            candidate_id: params.candidate_id,
+            tree_oid: treeOid,
+            commit_oid: journal.commit_oid ?? null,
+            phase: journal.phase,
+            push_state: journal.push_state,
+          },
+        );
       return fail(
         "storage_failed",
         `publish refused: the publication intent could not be persisted to ${journalPath} (${errCode(err)}). No external effect was attempted without durable prior intent.`,
@@ -999,7 +1010,8 @@ async function publishUnderLock(
         results.push({ command, ok: false, reason: "check_failed" });
         journal.checks = results;
         journal.phase = "committed";
-        persist();
+        const storageFail = persist();
+        if (storageFail !== null) return storageFail;
         return fail(
           "check_failed",
           `publish refused: the required check ${JSON.stringify(command)} could not be run (${messageOf(err)}).`,
@@ -1011,10 +1023,11 @@ async function publishUnderLock(
         results.push({ command, ok: false, reason: "materialized_tree_changed" });
         journal.checks = results;
         journal.phase = "committed";
-        persist();
+        const storageFail = persist();
+        if (storageFail !== null) return storageFail;
         return fail(
           "materialized_tree_changed",
-          `publish refused: the materialized source tree changed while the required check ${JSON.stringify(command)} ran (${after}). Publication tests only the stored candidate.`,
+          `publish refused: the materialized source tree could not be verified after ${JSON.stringify(command)} (${after}).`,
           { tree_oid: treeOid, commit_oid: commitOid, phase: journal.phase },
         );
       }
@@ -1023,7 +1036,8 @@ async function publishUnderLock(
       if (reason !== null) {
         journal.checks = results;
         journal.phase = "committed";
-        persist();
+        const storageFail = persist();
+        if (storageFail !== null) return storageFail;
         return fail(
           reason,
           `publish refused: the required check ${JSON.stringify(command)} did not pass (${reason}). A missing check, a nonzero exit, a timeout, a cancellation, a missing exit status, uncertain cleanup or an incomplete capture prevents publication.`,
@@ -1093,18 +1107,32 @@ async function publishUnderLock(
 
     let pushExpected: string | null;
     if (observed.state === "present") {
-      if (
-        observed.oid === commitOid ||
-        isAncestor(git, binding.repository, commitOid, observed.oid)
-      ) {
+      const contains =
+        observed.oid === commitOid || isAncestor(git, binding.repository, commitOid, observed.oid);
+      if (contains === true) {
         // The remote already contains the pinned commit: confirmed present.
         return await finishPublished(input, journal, commitOid, treeOid, git, deps, true);
       }
-      if (!isAncestor(git, binding.repository, observed.oid, commitOid)) {
+      const precedes = isAncestor(git, binding.repository, observed.oid, commitOid);
+      if (contains === null || precedes === null)
+        return indeterminate(
+          "ancestry_unknown",
+          "publish indeterminate: remote ancestry could not be compared.",
+          {
+            publication_id: binding.publication_id,
+            candidate_id: params.candidate_id,
+            tree_oid: treeOid,
+            commit_oid: commitOid,
+            phase: journal.phase,
+            push_state: "unknown",
+          },
+        );
+      if (!precedes) {
         // Neither is an ancestor of the other: a conflicting ref. Never rebase,
         // amend or force.
         journal.phase = "pushing";
-        persist();
+        const storageFail = persist();
+        if (storageFail !== null) return storageFail;
         return fail(
           "remote_diverged",
           `publish refused: the remote ${remote} ${ref} is at ${observed.oid}, which neither contains nor precedes the pinned commit ${commitOid}. Divergence is refused; publication does not rebase, amend, merge or force.`,
@@ -1131,6 +1159,7 @@ async function publishUnderLock(
     }
 
     journal.phase = "pushing";
+    journal.push_state = "unknown";
     const pushingFail = persist();
     if (pushingFail !== null) return pushingFail;
 
@@ -1138,11 +1167,11 @@ async function publishUnderLock(
       pushExpected === null
         ? ["push", `--force-with-lease=${ref}:`, remote, `${commitOid}:${ref}`]
         : ["push", `--force-with-lease=${ref}:${pushExpected}`, remote, `${commitOid}:${ref}`];
+    pushAttempted = true;
     const pushed = git(pushArgs, { cwd: binding.repository });
     if (pushed.status !== 0) {
       const stderr = pushed.stderr.trim();
-      // A rejected push (the race moved the ref) is a refusal, never a silent
-      // retry. An unreadable transport is reconciled against the remote.
+      // Reconcile unclassified push failures against the remote.
       if (/\[rejected\]|non-fast-forward|stale info|fetch first|cannot lock ref/i.test(stderr)) {
         return fail(
           "push_rejected",
@@ -1232,7 +1261,8 @@ async function finishPublished(
     );
     if (
       observed.state !== "present" ||
-      (observed.oid !== commitOid && !isAncestor(git, binding.repository, commitOid, observed.oid))
+      (observed.oid !== commitOid &&
+        isAncestor(git, binding.repository, commitOid, observed.oid) !== true)
     ) {
       return indeterminate(
         "remote_unconfirmed",

@@ -18,7 +18,12 @@ import {
   type GitRunner,
 } from "../../../src/capabilities/work/apply-patch.js";
 import { type WorkPiLike, wireWork } from "../../../src/capabilities/work/capability.js";
-import { publish, publishJournalPath } from "../../../src/capabilities/work/publish.js";
+import {
+  type PublishDeps,
+  publish,
+  publishJournalPath,
+  writeJournalAtomic,
+} from "../../../src/capabilities/work/publish.js";
 import type { TaskBinding } from "../../../src/capabilities/work/task-binding.js";
 
 let scratch: string;
@@ -67,7 +72,7 @@ function fixture(command: string) {
     if (args[0] === "config") return { status: 1, stdout, stderr: "" };
     if (args[0] === "remote") return { status: 2, stdout, stderr: "not a remote name" };
     if (args[0] === "diff-tree")
-      stdout = `:100644 100644 ${binding.base_oid} ${record.tree_oid} M\tsource.txt\n`;
+      stdout = `:100644 100644 ${binding.base_oid} ${record.tree_oid} M\0source.txt\0`;
     if (args[0] === "hash-object") stdout = "d".repeat(40);
     if (args[0] === "rev-parse") stdout = join(repo, ".git");
     if (args[0] === "checkout-index") writeFileSync(join(inv.cwd, "source.txt"), "candidate");
@@ -267,6 +272,179 @@ for (const changed of ["checks", "ref", "create", "workspace", "endpoint"]) {
         [],
       );
       expect(f.manager.list()).toHaveLength(1);
+    } finally {
+      await f.manager.endRun();
+    }
+  });
+}
+
+function attempt(f: ReturnType<typeof fixture>, deps: PublishDeps = {}) {
+  return publish({
+    binding: f.binding,
+    params: { candidate_id: f.record.candidate_id, commit_message: "candidate" },
+    stateRoot: f.stateRoot,
+    deps: {
+      git: f.git,
+      runCheck: async () => ({
+        outcome: "exited",
+        exit_code: 0,
+        cleanup_state: "group_empty",
+        output_complete: true,
+      }),
+      ...deps,
+    },
+  });
+}
+
+for (const output of [
+  `${"d".repeat(40)}\trefs/heads/other\n`,
+  `${"d".repeat(40)}\trefs/heads/main\n${"a".repeat(40)}\trefs/heads/other\n`,
+  `${"a".repeat(40)}\trefs/heads/other\n${"d".repeat(40)}\trefs/heads/main\n`,
+  `${"d".repeat(40)}\trefs/heads/main\n${"d".repeat(40)}\trefs/heads/main\n`,
+  `${"d".repeat(40)}\trefs/heads/main\n\n`,
+  `${"d".repeat(40)}\trefs/heads/main\textra\n`,
+  " \n",
+]) {
+  for (const stage of ["inspection", "confirmation"]) {
+    it(`rejects unexpected remote output during ${stage}: ${JSON.stringify(output)}`, async () => {
+      const f = fixture("true");
+      try {
+        const out = await attempt(f, {
+          git: (args, inv) => {
+            if (args[0] === "ls-remote" && (stage === "inspection" || f.pushes() > 0))
+              return { status: 0, stdout: output, stderr: "" };
+            return f.git(args, inv);
+          },
+        });
+        expect(out.status).toBe("indeterminate");
+        expect(out.push_state).toBe("unknown");
+        expect(f.pushes()).toBe(stage === "inspection" ? 0 : 1);
+        const journal = JSON.parse(
+          readFileSync(publishJournalPath(f.stateRoot, f.binding.publication_id), "utf8"),
+        );
+        expect(journal.phase).not.toBe("published");
+      } finally {
+        await f.manager.endRun();
+      }
+    });
+  }
+}
+
+for (const phase of ["pushed", "published"]) {
+  it(`a failed ${phase} journal write returns indeterminate with the accepted push`, async () => {
+    const f = fixture("true");
+    try {
+      let failed = false;
+      const out = await attempt(f, {
+        writeJournal: (path, data) => {
+          if (JSON.parse(data).phase === phase) {
+            failed = true;
+            throw new Error("disk full");
+          }
+          writeJournalAtomic(path, data);
+        },
+      });
+      expect(failed).toBe(true);
+      expect(out.status).toBe("indeterminate");
+      expect(out.reason).toBe("journal_write_failed");
+      expect(out.phase).toBe(phase);
+      expect(out.commit_oid).toBe("d".repeat(40));
+      expect(out.push_state).toBe("confirmed_present");
+      expect(f.pushes()).toBe(1);
+      const retry = await attempt(f);
+      expect(retry.status).toBe("published");
+      expect(retry.commit_oid).toBe(out.commit_oid);
+      expect(f.pushes()).toBe(1);
+    } finally {
+      await f.manager.endRun();
+    }
+  });
+}
+
+for (const phase of ["pushing", "pushed", "published"]) {
+  it(`a failed retry write retains the ${phase} journal's push state`, async () => {
+    const f = fixture("true");
+    try {
+      if (phase === "published") expect((await attempt(f)).status).toBe("published");
+      else {
+        const out = await attempt(f, {
+          writeJournal: (path, data) => {
+            const next = JSON.parse(data).phase;
+            if (next === (phase === "pushing" ? "pushed" : "published"))
+              throw new Error("disk full");
+            writeJournalAtomic(path, data);
+          },
+        });
+        expect(out.status).toBe("indeterminate");
+      }
+      const journal = JSON.parse(
+        readFileSync(publishJournalPath(f.stateRoot, f.binding.publication_id), "utf8"),
+      );
+      expect(journal.phase).toBe(phase);
+      const out = await attempt(f, {
+        writeJournal: () => {
+          throw new Error("still full");
+        },
+      });
+      expect(out.status).toBe("indeterminate");
+      expect(out.reason).toBe("journal_write_failed");
+      expect(out.push_state).toBe(journal.push_state);
+      expect(out.commit_oid).toBe(journal.commit_oid);
+      expect(f.pushes()).toBe(1);
+    } finally {
+      await f.manager.endRun();
+    }
+  });
+}
+
+for (const statuses of [
+  [128, 128],
+  [128, 0],
+  [1, 128],
+  [-1, 1],
+]) {
+  it(`ancestry errors ${statuses.join("/")} are indeterminate`, async () => {
+    const f = fixture("true");
+    let comparisons = 0;
+    try {
+      const out = await attempt(f, {
+        git: (args, inv) => {
+          if (args[0] === "merge-base")
+            return { status: statuses[comparisons++], stdout: "", stderr: "object unavailable" };
+          return f.git(args, inv);
+        },
+      });
+      expect(out.status).toBe("indeterminate");
+      expect(out.reason).toBe("ancestry_unknown");
+      expect(out.push_state).toBe("unknown");
+      expect(f.pushes()).toBe(0);
+    } finally {
+      await f.manager.endRun();
+    }
+  });
+}
+
+for (const stage of ["before", "after"]) {
+  it(`a failed index refresh ${stage} checks stops verification before a clean diff`, async () => {
+    const f = fixture("true");
+    let refreshes = 0;
+    let diffs = 0;
+    try {
+      const out = await attempt(f, {
+        git: (args, inv) => {
+          if (args[0] === "update-index" && ++refreshes === (stage === "before" ? 1 : 2))
+            return { status: 1, stdout: "", stderr: "refresh failed" };
+          if (args[0] === "diff-index") {
+            diffs++;
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return f.git(args, inv);
+        },
+      });
+      expect(out.status).toBe("refused");
+      expect(out.message).toContain("verify_failed");
+      expect(diffs).toBe(stage === "before" ? 0 : 1);
+      expect(f.pushes()).toBe(0);
     } finally {
       await f.manager.endRun();
     }

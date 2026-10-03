@@ -205,7 +205,7 @@ describe("publish end to end — interrupted push, then recovery", () => {
     t.manager.endRunSync();
   });
 
-  it("publication checks receive no Bob credential or shell startup file", async () => {
+  it("publication checks exclude BOB_TEST_CREDENTIAL and BASH_ENV", async () => {
     const repo = join(scratch, "repo");
     const bare = join(scratch, "remote.git");
     const artifactRoot = join(scratch, "artifacts");

@@ -512,7 +512,7 @@ describe("publish — checks gate the push", () => {
     expect(remoteOid(fx)).toBe(before);
   });
 
-  it("maps every non-success check outcome to its reason and never pushes", async () => {
+  it("refuses timeout, cancellation, missing status, unverified cleanup, incomplete output and nonzero exit", async () => {
     const fx = makeFixture();
     seedRemote(fx);
     const cases: Array<{ report: CheckReport; reason: string }> = [

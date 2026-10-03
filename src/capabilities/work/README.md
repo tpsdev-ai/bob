@@ -133,19 +133,21 @@ agent drops it unless its role permits resident writers.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.
 The record must match its content-derived ID and the task binding.
-Publication checks scope and the expected tree, materializes the candidate,
+Publication checks literal paths against scope and checks the expected tree, materializes the candidate,
 and runs the required commands through the executor with an environment allowlist.
 A nonzero exit, timeout, cancellation, missing exit status, uncertain cleanup,
-incomplete capture or changed tracked source refuses publication.
+incomplete capture, failed index refresh or changed tracked source refuses publication.
 
 The journal pins the binding, resolved endpoint and commit before pushing.
 Recovery reuses passing checks only for the same authority and candidate.
 A missing executor refuses when checks still need to run.
+Unexpected inspection output or uncertain ancestry returns indeterminate.
 The resolved endpoint is used for both remote inspection and push; URL rewrites refuse.
 Pushes require a fast-forward and an atomic expected-ref match; creating an absent
 ref requires `destination.create: true`.
 
-Journal writes sync the file, rename it, then sync the directory and state root.
+Journal writes sync the file, rename it, then sync the directory and state root;
+write failures after a push attempt return indeterminate with the known push state.
 In-process retries queue; another process holding the publication lock causes
 `publication_locked`. A crash can leave a lock requiring operator removal after
 confirming the publisher has stopped.
