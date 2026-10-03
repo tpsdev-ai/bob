@@ -491,13 +491,10 @@ describe("K9 — deferred requests are refused before auth resolution", () => {
 // ── K7: writers check first and preserve passing files ───────────────────────
 
 describe("K7 — the writers run the reserved-name check before the first write", () => {
-  const reserved = ["keyed-fixture", "keyed-fixture-alias", "keyed-fixture-runtime"];
-
   it("a reserved name in models.json refuses at init with no byte changed", () => {
     const registry = fixtureRegistry();
-    const { agentDir, piDir } = scaffold("fxk7a", registry);
+    const { piDir } = scaffold("fxk7a", registry);
     const modelsPath = join(piDir, "models.json");
-    const before = readFileSync(modelsPath);
     writeFileSync(modelsPath, JSON.stringify({ providers: { "keyed-fixture-runtime": {} } }));
     const tampered = readFileSync(modelsPath);
     expect(() =>
@@ -515,8 +512,6 @@ describe("K7 — the writers run the reserved-name check before the first write"
       }),
     ).toThrow(/providers\.keyed-fixture-runtime/);
     expect(readFileSync(modelsPath)).toEqual(tampered);
-    void before;
-    void agentDir;
   });
 
   it("a reserved name in auth.json refuses at init with no byte changed", () => {
