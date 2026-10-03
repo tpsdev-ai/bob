@@ -25,7 +25,7 @@
 // Model override is per-call (`opts.model`): it replaces the bob.yaml model
 // for this invocation only.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
@@ -95,6 +95,15 @@ import {
 } from "./flair-bootstrap.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
+import {
+  editToolFilePath,
+  PrMemoryCollector,
+  type PrMemorySeams,
+  type PrRoundEvidence,
+  recallPrMemoryRound,
+  roundOutcomeFromRun,
+  writePrMemoryRound,
+} from "./pr-memory.js";
 import {
   type ProviderRecord,
   type ProviderRegistry,
@@ -561,6 +570,12 @@ export interface RunSessionConfig {
   // block or the one-line "could not be loaded" note; absent when the agent
   // does not configure flair, or the session holds web.
   flairBootstrap?: string;
+  // bob#185 item 5 — the bounded, clearly labelled prior-round memory block for
+  // this PR, when the launcher supplied a task binding with a `pr_ref` and a
+  // prior round exists. Appended to the system prompt after the Flair bootstrap
+  // as its own entry. A signal, not an instruction; absent when there is
+  // nothing to recall.
+  prMemory?: string;
   // The agent's working dir (~/agents/<name>/work) — pi's cwd.
   cwd: string;
   // The agent's pi config dir (~/agents/<name>/.pi-agent) — holds
@@ -706,6 +721,9 @@ export interface RunOptions {
   // bob#275 (S2a): the launcher-supplied task binding for this run, passed
   // through to the session factory. Absent: the session has no task.
   taskBinding?: TaskBinding;
+  // bob#185 item 5 — test seam for the per-PR round memory's Flair calls
+  // (fetch/clock/key/uuid). Production passes none.
+  prMemorySeams?: PrMemorySeams;
   // Inject the pi session factory (tests). Defaults to the real SDK factory.
   sessionFactory?: RunSessionFactory;
   // Per-run run-log DELTA cap in bytes (see DEFAULT_RUNLOG_DELTA_CAP_BYTES). It
@@ -805,6 +823,54 @@ export async function attachFlairBootstrap(
     ...(log !== undefined ? { log } : {}),
   });
   if (text.length > 0) config.flairBootstrap = text;
+}
+
+export async function attachPrMemory(
+  config: RunSessionConfig,
+  target: FlairBootstrapTarget | undefined,
+  seams?: PrMemorySeams,
+  log?: (message: string) => void,
+): Promise<void> {
+  const ref = config.taskBinding?.pr_ref;
+  if (target === undefined || ref === undefined) return;
+  const result = await recallPrMemoryRound({
+    target: { url: target.url, agentId: target.agentId, keyFile: target.keyFile },
+    ref,
+    identity: { agentId: target.agentId, repository: ref.repository, prNumber: ref.number },
+    ...(seams !== undefined ? { seams } : {}),
+    ...(log !== undefined ? { log } : {}),
+  });
+  if (result.status === "recalled" && result.block !== undefined) config.prMemory = result.block;
+}
+
+// bob#185 item 5 — write one round's memory at round end. Never throws into the
+// run: a failed read or write is reported and the round's exit status is
+// unchanged.
+async function finalizePrMemory(
+  config: RunSessionConfig,
+  target: FlairBootstrapTarget | undefined,
+  evidence: PrRoundEvidence,
+  seams?: PrMemorySeams,
+  log?: (message: string) => void,
+): Promise<void> {
+  const ref = config.taskBinding?.pr_ref;
+  if (target === undefined || ref === undefined) return;
+  try {
+    await writePrMemoryRound({
+      target: { url: target.url, agentId: target.agentId, keyFile: target.keyFile },
+      ref,
+      identity: { agentId: target.agentId, repository: ref.repository, prNumber: ref.number },
+      evidence,
+      ...(seams !== undefined ? { seams } : {}),
+      ...(log !== undefined ? { log } : {}),
+    });
+  } catch (err) {
+    // Defensive: the memory layer already reports rather than throws.
+    const m = err instanceof Error ? err.message : String(err);
+    (log ?? ((x: string) => process.stderr.write(x)))(
+      `bob run: PR memory finalization failed (${m}); the round outcome is unchanged.\n`,
+    );
+  }
 }
 
 // bob#143 item 3 — the loop breaker error and its log line live in
@@ -911,6 +977,15 @@ async function runBoundedSession(
     if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
     throw err;
   }
+
+  // bob#185 item 5 — recall the prior-round memory for this PR before the
+  // session is built and the first model request is made. The memory layer
+  // carries its own 2 s deadline and reports rather than throws, so an
+  // unreachable Flair never blocks the round (and is never raced against a
+  // run-level bound: the memory is a signal, not a gate).
+  await attachPrMemory(config, flairBootstrapTarget, opts.prMemorySeams, (m) =>
+    process.stderr.write(`bob run ${opts.name}: ${m}\n`),
+  );
 
   const factory =
     opts.sessionFactory ??
@@ -1075,6 +1150,11 @@ async function runBoundedSession(
   let explorationExhausted: { limit: number; nonProgressCalls: number } | undefined;
   let verifiedEdits = 0;
   let noEditNoBlocked = false;
+  // bob#185 item 5 — the round's bounded evidence, collected in memory from the
+  // event stream, and the run id that makes finalization idempotent. Disk-log
+  // failure never disables collection.
+  const prMemoryCollector = new PrMemoryCollector();
+  const prMemoryRunId = randomUUID();
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
     if (loopBreaker !== undefined) {
       // A synchronous session may emit the breaking event before its prompt
@@ -1191,6 +1271,8 @@ async function runBoundedSession(
       const isError = (event as unknown as { isError?: unknown }).isError;
       const result = (event as unknown as { result?: unknown }).result;
       if (isVerifiedEdit(toolName, isError, result)) verifiedEdits += 1;
+      const args = (event as unknown as { args?: unknown }).args;
+      prMemoryCollector.observeEditPath(editToolFilePath(toolName, isError, result, args));
     }
     if (
       (event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
@@ -1474,6 +1556,37 @@ async function runBoundedSession(
     unsubscribeRunLog();
     unsubscribeUsage();
     unsubscribeContract();
+
+    // bob#185 item 5 — write this round's memory ONCE, after the outcome is
+    // known and before the terminal log record and disposal. A failed read or
+    // write is reported; the round's exit status is unchanged.
+    const prMemoryBinding = config.taskBinding;
+    await finalizePrMemory(
+      config,
+      flairBootstrapTarget,
+      {
+        runId: prMemoryRunId,
+        ...(prMemoryBinding !== undefined
+          ? {
+              taskId: prMemoryBinding.task_id,
+              publicationId: prMemoryBinding.publication_id,
+              baseOid: prMemoryBinding.base_oid,
+            }
+          : {}),
+        endedAt: now().toISOString(),
+        outcome: roundOutcomeFromRun({
+          exitCode,
+          ...(failed ? { failed: true } : {}),
+          ...(noEditNoBlocked ? { noEditNoBlocked: true } : {}),
+          ...(aborted !== undefined ? { aborted } : {}),
+        }),
+        filesTouched: prMemoryCollector.filesTouched(),
+        testEvidence: [],
+        incomplete: [],
+      },
+      opts.prMemorySeams,
+      (m) => process.stderr.write(`bob run ${opts.name}: ${m}\n`),
+    );
 
     // Final record, so a reader can tell a clean completion from a truncated log.
     // A synchronous append is on disk when writeRunLog returns, so a mid-run crash
@@ -1790,6 +1903,10 @@ export interface LaunchOptions {
   hostRoot?: string;
   // Positions root (tests). Defaults to bob's packaged positions/ directory.
   positionsRoot?: string;
+  // bob#185 item 5 — the launcher-supplied task binding, forwarded to the
+  // session through the programmatic `bob launch` path exactly as `bob run`
+  // forwards it. Absent: the session has no task and per-PR memory is off.
+  taskBinding?: TaskBinding;
   // Test seam for the one-shot path (defaults to the real SDK factory).
   sessionFactory?: RunSessionFactory;
   // The validated provider selection (loaded once by the CLI).
@@ -1870,6 +1987,7 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
       ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
       ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+      ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
       captureStdout: true,
       sessionFactory: opts.sessionFactory,
     });
@@ -1886,10 +2004,15 @@ export async function runLaunch(opts: LaunchOptions): Promise<number> {
     ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     ...(opts.hostRoot !== undefined ? { hostRoot: opts.hostRoot } : {}),
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
+    ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
   });
   // bob#254 — the interactive path builds a real system prompt too, so it loads
-  // the bootstrap before the session is opened.
+  // the bootstrap before the session is opened. bob#185 item 5 — same for the
+  // prior-round memory block.
   await attachFlairBootstrap(flairBootstrapTarget, config);
+  await attachPrMemory(config, flairBootstrapTarget, undefined, (m) =>
+    process.stderr.write(`bob launch ${opts.name}: ${m}\n`),
+  );
   const interactive = opts.interactive ?? ((i) => runInteractiveSession({ ...i, deps: opts.deps }));
   return interactive({
     config,

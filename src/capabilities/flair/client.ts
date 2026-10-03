@@ -181,20 +181,36 @@ export type Durability = "ephemeral" | "standard" | "persistent" | "permanent";
 // presence capability depends on this client, not the other way around.
 export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
 
+export interface FlairWriteOptions {
+  id?: string;
+  durability?: Durability;
+  supersedes?: string;
+  visibility?: string;
+  authorId?: string;
+  metadata?: Record<string, unknown>;
+  // bob#185 item 5 — provenance fields Flair's Memory resource accepts but
+  // bob's writer did not expose. `tags` are organization aids (not ownership
+  // proof) and `subject` is singular. Both are additive.
+  tags?: string[];
+  subject?: string;
+  // Per-call request bounds (bob#185 item 5). When set, the request runs under
+  // an abort + a deadline race, and the response is read with a byte bound
+  // (past it the stream is cancelled and the call fails). Omitted → the call's
+  // prior unbounded behavior.
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+}
+
+export interface FlairReadOptions {
+  // Per-call request bounds (bob#185 item 5). See FlairWriteOptions.
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+}
+
 export interface FlairClient {
   search(query: string, limit?: number): Promise<FlairSearchHit[]>;
-  write(
-    content: string,
-    opts?: {
-      id?: string;
-      durability?: Durability;
-      supersedes?: string;
-      visibility?: string;
-      authorId?: string;
-      metadata?: Record<string, unknown>;
-    },
-  ): Promise<{ id: string }>;
-  get(id: string): Promise<FlairMemory | null>;
+  write(content: string, opts?: FlairWriteOptions): Promise<{ id: string }>;
+  get(id: string, opts?: FlairReadOptions): Promise<FlairMemory | null>;
   bootstrap(opts?: FlairBootstrapOptions): Promise<FlairBootstrap>;
 }
 
@@ -380,6 +396,52 @@ export class FlairHttpClient implements FlairClient {
     }
   }
 
+  // bob#185 item 5 — a signed request under optional bounds: an abort + a
+  // deadline race (a host that accepts and never answers cannot hold the
+  // caller past `timeoutMs`), and a byte-bounded response read (past
+  // `maxResponseBytes` the stream is cancelled and the call fails). With no
+  // bounds it is exactly `signedFetch`.
+  private async signedFetchWithBounds(
+    method: string,
+    path: string,
+    body: unknown,
+    bounds: { timeoutMs?: number; maxResponseBytes?: number },
+    nullOnStatus?: readonly number[],
+  ): Promise<unknown> {
+    if (bounds.timeoutMs === undefined) {
+      // No deadline: still honor a byte bound by forwarding it to signedFetch.
+      return this.signedFetch(
+        method,
+        path,
+        body,
+        nullOnStatus,
+        bounds.maxResponseBytes !== undefined
+          ? { maxResponseBytes: bounds.maxResponseBytes }
+          : undefined,
+      );
+    }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("flair request timed out"));
+      }, bounds.timeoutMs);
+    });
+    try {
+      const pending = this.signedFetch(method, path, body, nullOnStatus, {
+        signal: controller.signal,
+        ...(bounds.maxResponseBytes !== undefined
+          ? { maxResponseBytes: bounds.maxResponseBytes }
+          : {}),
+      });
+      pending.catch(() => {}); // the race below owns the rejection
+      return await Promise.race([pending, timedOut]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   async search(query: string, limit = 5): Promise<FlairSearchHit[]> {
     const r = (await this.signedFetch("POST", "/SemanticSearch", {
       agentId: this.agentId,
@@ -395,17 +457,7 @@ export class FlairHttpClient implements FlairClient {
     }));
   }
 
-  async write(
-    content: string,
-    opts: {
-      id?: string;
-      durability?: Durability;
-      supersedes?: string;
-      visibility?: string;
-      authorId?: string;
-      metadata?: Record<string, unknown>;
-    } = {},
-  ): Promise<{ id: string }> {
+  async write(content: string, opts: FlairWriteOptions = {}): Promise<{ id: string }> {
     // A record id is UNIQUE PER WRITE, across PROCESSES too: an explicit `id`,
     // else agent + a random UUID. NEVER a per-process counter and NEVER the
     // wall clock — two processes with the same agentId both started a counter at
@@ -424,14 +476,23 @@ export class FlairHttpClient implements FlairClient {
     // The signature is still over the agent's own key — authorId is a label.
     if (opts.visibility) body.visibility = opts.visibility;
     if (opts.metadata) body.metadata = opts.metadata;
-    await this.signedFetch("PUT", `/Memory/${encodeURIComponent(id)}`, body);
+    if (opts.tags && opts.tags.length > 0) body.tags = opts.tags;
+    if (opts.subject) body.subject = opts.subject;
+    await this.signedFetchWithBounds("PUT", `/Memory/${encodeURIComponent(id)}`, body, opts);
     return { id };
   }
 
-  async get(id: string): Promise<FlairMemory | null> {
-    const r = (await this.signedFetch("GET", `/Memory/${encodeURIComponent(id)}`)) as
-      | FlairMemory
-      | undefined;
+  async get(id: string, opts: FlairReadOptions = {}): Promise<FlairMemory | null> {
+    // A 404 is "this record does not exist yet" — an ordinary answer to a read,
+    // surfaced as null (bob#185 item 5). Never a thrown error the caller has to
+    // string-match.
+    const r = (await this.signedFetchWithBounds(
+      "GET",
+      `/Memory/${encodeURIComponent(id)}`,
+      undefined,
+      opts,
+      [404],
+    )) as FlairMemory | null | undefined;
     return r ?? null;
   }
 

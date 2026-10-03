@@ -47,10 +47,24 @@ export interface TaskBinding {
   destination: { remote: string; ref: string };
   // The optional PR destination, when the task authorizes PR creation.
   pr?: { base: string; head?: string };
+  // bob#185 item 5 — the launcher-owned PR reference, when the task is one
+  // round of a PR. It is the ONLY source of a per-PR round memory's identity:
+  // the key is derived from (agent id, this canonical repository, this number),
+  // never from the brief, model output, branch name or a tool argument. The
+  // `repository` is a canonical `host/owner/repo` identity (lowercase host, no
+  // scheme, no credentials, no trailing slash), and `number` is a positive
+  // safe integer. Optional and additive: it changes no existing field.
+  pr_ref?: PrRef;
   // apply mode pins these; apply_patch requires the artifact and its result to
   // match them.
   patch_sha256?: string;
   expected_tree_oid?: string;
+}
+
+// The launcher-owned PR reference (bob#185 item 5). See TaskBinding.pr_ref.
+export interface PrRef {
+  repository: string;
+  number: number;
 }
 
 // The binding is malformed. Carries the stable refusal reason the capability
@@ -58,6 +72,34 @@ export interface TaskBinding {
 // does not fail to load.
 export class TaskBindingError extends Error {
   readonly reason = "invalid_binding" as const;
+}
+
+// A canonical repository identity: exactly three `/`-separated segments —
+// `host/owner/repo` — with a lowercase host and no scheme, credentials,
+// whitespace, empty segment, `.`/`..` segment or trailing slash. Rejected by
+// name rather than silently normalized, so the caller fixes the source.
+const CANONICAL_REPO = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+
+function canonicalRepository(value: unknown, what: string): string {
+  const s = reqString(value, what);
+  if (s.includes("://") || s.includes("@") || s.includes(" ") || s.trim() !== s)
+    fail(`${what} must be a canonical host/owner/repo identity, not a URL`);
+  if (s.includes("//") || s.endsWith("/")) fail(`${what} must not contain an empty segment`);
+  for (const part of s.split("/")) {
+    if (part === "" || part === "." || part === "..")
+      fail(`${what} must not contain an empty, . or .. segment`);
+  }
+  if (!CANONICAL_REPO.test(s))
+    fail(
+      `${what} must be a canonical host/owner/repo identity (lowercase host, no trailing slash)`,
+    );
+  return s;
+}
+
+function prNumber(value: unknown, what: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)
+    fail(`${what} must be a positive safe integer`);
+  return value;
 }
 
 const HEX40 = /^[0-9a-f]{40}$/;
@@ -137,6 +179,16 @@ export function parseTaskBinding(raw: string | null | undefined): TaskBinding | 
     binding.pr = {
       base: reqString(pr.base, "pr.base"),
       ...(pr.head !== undefined ? { head: reqString(pr.head, "pr.head") } : {}),
+    };
+  }
+
+  if (o.pr_ref !== undefined) {
+    if (typeof o.pr_ref !== "object" || o.pr_ref === null || Array.isArray(o.pr_ref))
+      fail("pr_ref must be an object");
+    const ref = o.pr_ref as Record<string, unknown>;
+    binding.pr_ref = {
+      repository: canonicalRepository(ref.repository, "pr_ref.repository"),
+      number: prNumber(ref.number, "pr_ref.number"),
     };
   }
 

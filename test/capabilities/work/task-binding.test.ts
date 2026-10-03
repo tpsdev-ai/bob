@@ -12,6 +12,7 @@ import {
 const BASE = "a".repeat(40);
 const TREE = "b".repeat(40);
 const DIGEST = "c".repeat(64);
+const REPO = "github.com/tpsdev-ai/bob";
 
 function good(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -82,5 +83,29 @@ describe("parseTaskBinding", () => {
 
   it("names its environment variable", () => {
     expect(TASK_BINDING_ENV).toBe("BOB_TASK_BINDING");
+  });
+
+  it("carries an optional canonical pr_ref", () => {
+    const b = parseTaskBinding(good({ pr_ref: { repository: REPO, number: 185 } }));
+    expect(b?.pr_ref).toEqual({ repository: REPO, number: 185 });
+    // Absent by default and additive: nothing else changes.
+    expect(parseTaskBinding(good())?.pr_ref).toBeUndefined();
+  });
+
+  it("refuses a non-canonical or ill-typed pr_ref, naming it", () => {
+    for (const [ref, what] of [
+      [{ repository: "https://github.com/tpsdev-ai/bob", number: 1 }, "canonical"],
+      [{ repository: "github.com/tpsdev-ai/bob/", number: 1 }, "empty segment"],
+      [{ repository: "github.com/../bob", number: 1 }, ".."],
+      [{ repository: "GitHub.com/tpsdev-ai/bob", number: 1 }, "canonical"],
+      [{ repository: REPO, number: 0 }, "positive safe integer"],
+      [{ repository: REPO, number: -1 }, "positive safe integer"],
+      [{ repository: REPO, number: 1.5 }, "positive safe integer"],
+      [{ repository: REPO }, "pr_ref.number"],
+      ["github.com/tpsdev-ai/bob", "pr_ref must be an object"],
+    ] as Array<[unknown, string]>) {
+      expect(() => parseTaskBinding(good({ pr_ref: ref }))).toThrow(new RegExp(what));
+      expect(() => parseTaskBinding(good({ pr_ref: ref }))).toThrow(TaskBindingError);
+    }
   });
 });

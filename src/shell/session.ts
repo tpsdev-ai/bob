@@ -735,7 +735,7 @@ export function installSessionBudget(
 export function isolatedLoaderOptions(
   config: Pick<
     RunSessionConfig,
-    "appendSystemPrompt" | "flairBootstrap" | "extensionSources" | "piAgentDir"
+    "appendSystemPrompt" | "flairBootstrap" | "prMemory" | "extensionSources" | "piAgentDir"
   > & {
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
@@ -776,6 +776,7 @@ export function isolatedLoaderOptions(
     appendSystemPrompt: [
       ...(config.appendSystemPrompt.length > 0 ? [config.appendSystemPrompt] : []),
       ...((config.flairBootstrap ?? "").length > 0 ? [config.flairBootstrap as string] : []),
+      ...((config.prMemory ?? "").length > 0 ? [config.prMemory as string] : []),
     ],
     ...(contractBlock !== undefined
       ? { appendSystemPromptOverride: appendContractOverride(contractBlock) }
