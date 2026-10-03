@@ -972,9 +972,9 @@ a 30 min total cap and zero request retries. Invalid request policies refuse by 
 
 A keyless row may also declare `budget: {maxOutputTokens, reasoning}`; budgets on other rows refuse.
 bob hands `maxOutputTokens` to pi as `maxTokens` (a lower per-agent output cap wins), which pi sends
-as `max_completion_tokens` (or `max_tokens` where the model's compat selects it). bob hands
-`reasoning` (`off`, `minimal`, `low`, `medium` or `high`) to pi as its thinking level, which pi sends
-as `reasoning_effort`; `off` sends none. The built-in keyless rows use a 4096-token cap and the `low`
+as `max_tokens`. Ollama's OpenAI-compatible endpoint reads `max_tokens` and `reasoning_effort`; omlx is
+unverified. bob hands `reasoning` (`off`, `low`, `medium` or `high`) to pi as its thinking level, which pi
+sends as `reasoning_effort`; `off` sends none. The built-in keyless rows use a 4096-token cap and the `low`
 level. Invalid budgets refuse by row name. A request that ends with stop reason `length` carries
 `outputCap` in the run log's request-usage record.
 

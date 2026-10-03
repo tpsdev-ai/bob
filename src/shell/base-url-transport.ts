@@ -98,6 +98,7 @@ export function installBaseUrlTransport(
               ...((model as { compat?: Record<string, unknown> }).compat ?? {}),
               supportsDeveloperRole: false,
               supportsReasoningEffort: true,
+              maxTokensField: "max_tokens",
             },
           };
     const source = delegate(delegateModel as never, context, {

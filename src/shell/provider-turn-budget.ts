@@ -6,11 +6,8 @@
 // minutes. The harness asked a local model to behave like a cloud one. This
 // module turns the row into the source of a per-turn budget:
 //
-//   * maxOutputTokens — the output cap pi sends on the turn's request. pi
-//     already knows how to shape it for the provider: the OpenAI-compatible
-//     adapter sends it as `max_completion_tokens` (or `max_tokens` where the
-//     model's compat selects that field). This module does not name the wire
-//     field; the provider API pi calls does.
+//   * maxOutputTokens — the output cap pi sends on the turn's request, as
+//     `max_tokens` (the budgeted model's compat selects that field).
 //   * reasoning — the thinking level for the turn: a reduced budget, or "off"
 //     (non-thinking) for tool-heavy turns. The value is one of pi's own
 //     thinking levels, so pi hands each provider the level in that provider's
@@ -27,7 +24,7 @@
  * pi clamps them and a local row has no use for them). The row names the level
  * pi hands the provider; it does not name a wire field.
  */
-export const TURN_REASONING_MODES = ["off", "minimal", "low", "medium", "high"] as const;
+export const TURN_REASONING_MODES = ["off", "low", "medium", "high"] as const;
 export type TurnReasoningMode = (typeof TURN_REASONING_MODES)[number];
 
 /** A row's per-turn reasoning / output budget. Every field is required. */

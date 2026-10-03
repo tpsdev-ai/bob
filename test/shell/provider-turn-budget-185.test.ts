@@ -265,10 +265,12 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
     });
     const plain = await run({ id: "fake-plain" });
     // The local row's request carries the declared setting ...
-    expect(budgeted.max_completion_tokens).toBe(4_096);
+    expect(budgeted.max_tokens).toBe(4_096);
+    expect(budgeted.max_completion_tokens).toBeUndefined();
     expect(budgeted.reasoning_effort).toBe("low");
     // ... while a row without a budget (the cloud shape) is unchanged: no
-    // reasoning directive and no lowered cap.
+    // reasoning directive, no lowered cap, and no field forced.
+    expect(plain.max_tokens).toBeUndefined();
     expect(plain.reasoning_effort).toBeUndefined();
     expect(plain.max_completion_tokens).toBe(16_384);
   });
@@ -280,7 +282,7 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       { id: "fake-small", budget: { maxOutputTokens: 4_096, reasoning: "low" } },
       { modelMaxTokens: 2_048 },
     );
-    expect(budgeted.max_completion_tokens).toBe(2_048);
+    expect(budgeted.max_tokens).toBe(2_048);
   });
 
   it("a non-thinking local row sends no reasoning directive but still caps output", async () => {
@@ -291,7 +293,7 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       budget: { maxOutputTokens: 2_048, reasoning: "off" },
     });
     const plain = await run({ id: "fake-plain-off" });
-    expect(budgeted.max_completion_tokens).toBe(2_048);
+    expect(budgeted.max_tokens).toBe(2_048);
     expect(budgeted.reasoning_effort).toBeUndefined();
     expect(plain.reasoning_effort).toBeUndefined();
   });
