@@ -1,21 +1,3 @@
-// Targeted bob.yaml readers — the monorepo deliberately avoids a YAML dep (see
-// the note in init.ts renderBobYaml and run.ts resolveProviderAndModel). These
-// readers extend that same hand-rolled, format-specific approach to the shapes
-// the capability loader needs: the top-level `capabilities:` string list and a
-// per-capability scalar config block.
-//
-// This is NOT a general YAML parser. It targets the 2-space-indented output
-// `bob init` emits plus the shapes capability config schemas actually need.
-// Anything fancier (anchors, aliases, multi-line scalars, flow mappings, maps
-// nested more than one level under a list item) is out of scope on purpose — if
-// config grows past that we swap in a real YAML emitter+parser repo-wide
-// (already flagged in init.ts).
-//
-// Out-of-scope shapes THROW `BobYamlError` rather than parse to something
-// plausible-but-wrong. That distinction is the whole lesson of #77: `readBlock`
-// silently rendered a list of mappings as a list of strings, so a capability
-// that could never be configured shipped anyway.
-
 import { isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
 import { DEFAULT_PROVIDER_REGISTRY, type ProviderRegistry } from "./provider-registry.js";
 import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
@@ -251,10 +233,10 @@ export function providerBaseUrlRefusal(
   try {
     parsed = new URL(baseUrl);
   } catch {
-    return `provider.base_url must be an absolute http/https URL (got ${JSON.stringify(baseUrl)}).`;
+    return "provider.base_url must be an absolute http/https URL.";
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return `provider.base_url must be http or https (got ${JSON.stringify(parsed.protocol)}).`;
+    return "provider.base_url must be http or https.";
   }
   if (parsed.username !== "" || parsed.password !== "") {
     return "provider.base_url must not carry credentials (a username or password in the URL).";
@@ -267,7 +249,7 @@ export function providerBaseUrlRefusal(
     const host = parsed.hostname.replace(/\.+$/, "");
     if (!(policy.excludeHosts ?? []).includes(host)) return undefined;
   }
-  return `provider.base_url is only allowed for a keyless provider row that authorizes an override (got "${provider}" on "${parsed.hostname}").`;
+  return "provider.base_url is only allowed for a keyless provider row that authorizes an override.";
 }
 
 // bob#186 slice 2 (T7) — the provider readers run on a REAL YAML parser.
@@ -281,26 +263,14 @@ export function parseBobYamlBlock(yamlText: string, blockKey: string): unknown {
   let doc: import("yaml").Document;
   try {
     doc = parseDocument(yamlText, { uniqueKeys: true, schema: "core", merge: false });
-  } catch (err) {
-    throw new BobYamlError(
-      blockKey,
-      1,
-      `could not parse bob.yaml: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}.`,
-    );
+  } catch {
+    throw new BobYamlError(blockKey, 1, "could not parse bob.yaml.");
   }
   if (doc.errors.length > 0) {
-    throw new BobYamlError(
-      blockKey,
-      1,
-      `could not parse bob.yaml: ${doc.errors[0]?.message.split("\n")[0] ?? "parse error"}.`,
-    );
+    throw new BobYamlError(blockKey, 1, "could not parse bob.yaml.");
   }
   if (doc.warnings.length > 0) {
-    throw new BobYamlError(
-      blockKey,
-      1,
-      `unsupported YAML tag in bob.yaml: ${doc.warnings[0]?.message.split("\n")[0] ?? "warning"}.`,
-    );
+    throw new BobYamlError(blockKey, 1, "unsupported YAML tag in bob.yaml.");
   }
   refuseAmbiguousYaml(doc.contents, blockKey);
   const value = doc.toJS({ maxAliasCount: 0 });

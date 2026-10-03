@@ -16,7 +16,7 @@ import { mapBobProviderToPi, resolveRunConfig } from "../../src/shell/run.js";
 const TEST_ROW = {
   id: "acme-gateway",
   aliases: ["acme"],
-  runtime: "anthropic",
+  runtime: "acme-runtime",
   auth: { kind: "none" as const },
   endpoint: "http://acme.test/v1",
   api: "openai-completions" as const,
@@ -54,20 +54,20 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     ) as { providers: Record<string, { baseUrl?: string; models: { id: string }[] }> };
     // The alias resolved to the row's runtime identity, and the row's endpoint
     // was written — neither "acme-gateway" nor the endpoint appears in init.ts.
-    expect(models.providers.anthropic?.baseUrl).toBe("http://acme.test/v1");
-    expect(models.providers.anthropic?.models[0]?.id).toBe("test-model");
+    expect(models.providers["acme-runtime"]?.baseUrl).toBe("http://acme.test/v1");
+    expect(models.providers["acme-runtime"]?.models[0]?.id).toBe("test-model");
     expect(readFileSync(join(res.agentDir, "bob.yaml"), "utf8")).toContain("name: acme");
   });
 
   it("run resolution resolves the same alias to the same runtime identity", () => {
     initAgent(baseOpts({ provider: "acme", registry: registry() }));
-    expect(mapBobProviderToPi("acme", registry())).toBe("anthropic");
+    expect(mapBobProviderToPi("acme", registry())).toBe("acme-runtime");
     const { provider } = resolveRunConfig({
       name: "acmebot",
       agentsRoot: tmpRoot,
       registry: registry(),
     });
-    expect(provider).toBe("anthropic");
+    expect(provider).toBe("acme-runtime");
   });
 
   it("a duplicate id or alias fails validation, naming the name", () => {

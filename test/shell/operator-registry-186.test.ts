@@ -18,11 +18,6 @@ import {
 import { mapBobProviderToPi } from "../../src/shell/run.js";
 import { assertNoReservedProviderEntries } from "../../src/shell/session.js";
 
-// bob#186 slice 2 — the operator registry: a real YAML parser, full validation
-// with an explicit auth mode, the custody gate, and the registry-derived
-// disk-refusal set. Every case here fails on main: the loader, the auth union
-// and the reserved-name derivation do not exist there.
-
 let tmpRoot: string;
 let keysRoot: string;
 let providerDir: string;
@@ -179,12 +174,16 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
   });
 
   it("bob/env with the wrong variable or endpoint refuses", () => {
-    const wrongVar = writeRegistry(
-      "version: 1\nproviders:\n  - id: acme-or\n    aliases: []\n    runtime: openrouter\n    auth: bob/env(ACME_KEY)\n    endpoint: https://openrouter.ai/api/v1\n    api: openai-completions\n",
-    );
-    expect(() => loadProviderRegistry({ path: wrongVar })).toThrow(
-      /ambiguous|implemented custody|descriptor/,
-    );
+    const shipped = PROVIDER_RECORDS.find((row) => row.id === "openrouter")!;
+    for (const mismatch of [
+      { auth: { kind: "env" as const, variable: "ACME_KEY" } },
+      { endpoint: "https://other.example/v1" },
+      { api: undefined },
+    ]) {
+      expect(() => new ProviderRegistry([{ ...shipped, ...mismatch }])).toThrow(
+        /does not match.*descriptor/,
+      );
+    }
   });
 
   it("operator data cannot downgrade the builtin openrouter row to pi/disk", () => {
@@ -213,10 +212,17 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
 
 describe("T3 — the disk-refusal set comes from the registry, by name", () => {
   it("the reserved set is every bob/env row's id, aliases and runtime", () => {
-    // Only keyed rows are reserved; keyless rows and pi-managed rows are not.
     expect(reservedProviderNames()).toEqual(["openrouter"]);
-    expect(reservedProviderNames()).not.toContain("ollama");
-    expect(reservedProviderNames()).not.toContain("anthropic");
+    const shipped = PROVIDER_RECORDS.find((row) => row.id === "openrouter")!;
+    const synthetic = new ProviderRegistry([
+      { ...shipped, id: "custody-row", aliases: ["custody-alias"] },
+      { id: "keyless", aliases: [], runtime: "keyless", auth: { kind: "none" } },
+    ]);
+    expect(reservedProviderNames(synthetic)).toEqual([
+      "custody-row",
+      "custody-alias",
+      "openrouter",
+    ]);
   });
 
   it("refuses each reserved name in either file, for empty, null and placeholder values", () => {

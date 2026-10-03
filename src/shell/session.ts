@@ -78,7 +78,11 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
-import { type ProviderRegistry, reservedProviderNames } from "./provider-registry.js";
+import {
+  DEFAULT_PROVIDER_REGISTRY,
+  type ProviderRegistry,
+  reservedProviderNames,
+} from "./provider-registry.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -201,9 +205,7 @@ export function guardedOpenrouterFetch(
     try {
       parsed = new URL(asString);
     } catch {
-      return Promise.reject(
-        new Error(`bob: refusing an openrouter request to ${asString} — not a valid URL`),
-      );
+      return Promise.reject(new Error("bob: refusing an openrouter request with an invalid URL"));
     }
     if (
       parsed.protocol !== "https:" ||
@@ -215,18 +217,14 @@ export function guardedOpenrouterFetch(
     ) {
       return Promise.reject(
         new Error(
-          `bob: refusing an openrouter request to ${asString} — bob's transport sends only to https://openrouter.ai/api/v1/ (no credentials in the URL, default port, /api/v1/ path)`,
+          "bob: refusing an openrouter request — bob's transport sends only to https://openrouter.ai/api/v1/",
         ),
       );
     }
     // Non-canonical inputs (e.g. a `%2e%2e` path or a missing trailing slash)
     // parse to a href that differs from the input: refuse.
     if (asString !== parsed.href) {
-      return Promise.reject(
-        new Error(
-          `bob: refusing a non-canonical openrouter request URL ${asString} (canonical form: ${parsed.href})`,
-        ),
-      );
+      return Promise.reject(new Error("bob: refusing a non-canonical openrouter request URL"));
     }
     return baseFetch(parsed.href, {
       ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
@@ -240,11 +238,11 @@ export function guardedOpenrouterFetch(
       if (/redirect/i.test(text)) {
         return Promise.reject(
           new Error(
-            `bob: refusing an openrouter redirect from ${parsed.href} — bob's transport does not follow redirects (redirect: "error")`,
+            'bob: refusing an openrouter redirect — bob\'s transport does not follow redirects (redirect: "error")',
           ),
         );
       }
-      return Promise.reject(err);
+      return Promise.reject(new Error("bob: openrouter request failed"));
     });
   }) as typeof globalThis.fetch;
 }
@@ -276,9 +274,7 @@ export function openrouterTransport(input: {
   const transport = (model: unknown, context: unknown, options?: unknown) => {
     const prepared = (model ?? {}) as { baseUrl?: unknown; api?: unknown };
     if (prepared.baseUrl !== input.baseUrl || prepared.api !== input.api) {
-      throw new Error(
-        `bob: refusing an openrouter request to ${JSON.stringify(prepared.baseUrl)} (api ${JSON.stringify(prepared.api)}) — bob's openrouter transport sends only to ${input.baseUrl} (${input.api})`,
-      );
+      throw new Error("bob: refusing an openrouter request with a mismatched endpoint or API");
     }
     const opts = (options ?? {}) as { headers?: Record<string, string | null> };
     // The EFFECTIVE headers the delegate will send: the model's own headers AND
@@ -373,16 +369,16 @@ export function assertNoReservedProviderEntries(
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
       throw new Error(
-        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not read it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not read it).`,
       );
     }
     const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
-    } catch (err) {
+    } catch {
       throw new Error(
-        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not parse it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not parse it).`,
       );
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -450,14 +446,10 @@ export async function assertOpenrouterRuntimeUnchanged(
     problems.push(`no model ${providerId}/${input.model}`);
   } else {
     if (model.baseUrl !== input.expected.baseUrl) {
-      problems.push(
-        `the selected model's baseUrl is ${model.baseUrl}, not ${input.expected.baseUrl}`,
-      );
+      problems.push("the selected model's baseUrl does not match");
     }
     if (model.api !== input.expected.api) {
-      problems.push(
-        `the selected model's api is ${JSON.stringify(model.api)}, not ${JSON.stringify(input.expected.api)}`,
-      );
+      problems.push("the selected model's api does not match");
     }
   }
   const reg = modelRuntime.getRegisteredProviderConfig?.(providerId);
@@ -465,18 +457,14 @@ export async function assertOpenrouterRuntimeUnchanged(
     problems.push("there is no registered openrouter provider config");
   } else {
     if (reg.baseUrl !== input.expected.baseUrl) {
-      problems.push(
-        `the registered baseUrl is ${JSON.stringify(reg.baseUrl)}, not ${input.expected.baseUrl}`,
-      );
+      problems.push("the registered baseUrl does not match");
     }
     if (reg.api !== input.expected.api) {
-      problems.push(
-        `the registered api is ${JSON.stringify(reg.api)}, not ${JSON.stringify(input.expected.api)}`,
-      );
+      problems.push("the registered api does not match");
     }
     const m0 = (reg.models ?? [])[0] as { baseUrl?: string } | undefined;
     if (m0 && m0.baseUrl !== undefined) {
-      problems.push(`the model entry carries a per-model baseUrl (${m0.baseUrl})`);
+      problems.push("the model entry carries a per-model baseUrl");
     }
   }
   // The key pi holds. Round 6: pi holds ONLY the NON-SECRET placeholder; the real
@@ -487,10 +475,10 @@ export async function assertOpenrouterRuntimeUnchanged(
   let caught = false;
   try {
     auth = await modelRuntime.getAuth(providerId);
-  } catch (err) {
+  } catch {
     caught = true;
     problems.push(
-      `the auth resolution for openrouter threw (${err instanceof Error ? err.message : String(err)}) — bob cannot prove pi holds its placeholder`,
+      "the auth resolution for openrouter threw — bob cannot prove pi holds its placeholder",
     );
   }
   if (!caught) {
@@ -599,34 +587,21 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   if (runtime.__bobOpenrouterGuarded) return;
   runtime.__bobOpenrouterGuarded = true;
 
-  const refuse = (verb: string, id: string, attempted?: unknown): never => {
-    const baseUrl =
-      attempted && typeof attempted === "object" && "baseUrl" in attempted
-        ? (attempted as { baseUrl?: unknown }).baseUrl
-        : undefined;
-    const caller =
-      new Error().stack
-        ?.split("\n")
-        .slice(2, 5)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0 && !l.includes("session.ts"))
-        .slice(0, 2)
-        .join(" <- ") ?? "unknown caller";
+  const refuse = (verb: string): never => {
     throw new Error(
-      `bob: refusing a ${verb} of the openrouter provider after bob registered its own — the EFFECTIVE openrouter provider is bob's (fixed ${OPENROUTER_BASE_URL}, OPENROUTER_API_KEY). ` +
-        `Attempted baseUrl ${JSON.stringify(baseUrl)}; caller ${caller}.`,
+      `bob: refusing a ${verb} of the openrouter provider after bob registered its own`,
     );
   };
 
   const originalRegister = runtime.registerProvider.bind(modelRuntime);
   runtime.registerProvider = (id: string, config: OpenrouterProviderConfig) => {
-    if (id === "openrouter") refuse("registerProvider", id, config);
+    if (id === "openrouter") refuse("registerProvider");
     return originalRegister(id, config);
   };
   if (typeof runtime.unregisterProvider === "function") {
     const originalUnregister = runtime.unregisterProvider.bind(modelRuntime);
     runtime.unregisterProvider = (id: string) => {
-      if (id === "openrouter") refuse("unregisterProvider", id);
+      if (id === "openrouter") refuse("unregisterProvider");
       return originalUnregister(id);
     };
   }
@@ -638,7 +613,7 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
       baseUrl?: string;
     }) => {
       const id = provider?.id ?? provider?.name;
-      if (id === "openrouter") refuse("registerNativeProvider", id, provider);
+      if (id === "openrouter") refuse("registerNativeProvider");
       return originalNative(provider);
     };
   }
@@ -1264,6 +1239,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // entry path before a capability, extension, tool or child process starts.
     delete process.env[ADMIN_PASS_ENV];
 
+    assertNoReservedProviderEntries(agentDir, reservedProviderNames(input.registry));
     const modelRuntime =
       (input.modelRuntime as ModelRuntime | undefined) ??
       (await ModelRuntime.create({
@@ -1279,7 +1255,24 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       if (effective?.baseUrl !== baseUrl) {
         throw new Error("bob: run bob models <agent> to apply provider.base_url");
       }
-      installBaseUrlTransport(modelRuntime, config.provider, baseUrl);
+    }
+    const registry = input.registry ?? DEFAULT_PROVIDER_REGISTRY;
+    const row =
+      registry.find(config.provider) ??
+      registry.records().find((candidate) => candidate.runtime === config.provider);
+    if (row?.auth.kind === "none") {
+      const effective = modelRuntime.getModel(config.provider, config.model);
+      const endpoint = baseUrl ?? row.endpoint ?? effective?.baseUrl;
+      if (
+        endpoint === undefined ||
+        effective?.baseUrl !== endpoint ||
+        effective.api !== "openai-completions"
+      ) {
+        throw new Error(
+          "bob: bob/none requires an OpenAI-compatible model with a matching endpoint",
+        );
+      }
+      installBaseUrlTransport(modelRuntime, config.provider, endpoint);
     }
     // openrouter is bob's OWN provider (round 3): construct it in memory and
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
@@ -1288,7 +1281,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     if (config.provider === "openrouter") {
       // The on-disk refusal comes FIRST (a config error, before any key read), so a
       // tampered models.json refuses on every entry path without consuming the key.
-      assertNoOnDiskOpenrouter(agentDir, reservedProviderNames(input.registry));
       // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
       // OPENROUTER_API_KEY once, then DELETE it from process.env before any
       // capability, extension or tool subprocess starts (pi's ModelRuntime is

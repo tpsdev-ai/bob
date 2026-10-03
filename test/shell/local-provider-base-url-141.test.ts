@@ -27,9 +27,6 @@ import { resolveRunConfig } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
 import { SpawnError, spawnNode } from "../cli-spawn.js";
 
-// A NEW keyless row that exists only in this test: the containment sentinel runs
-// it through the same real factory as the builtins, proving a row's endpoint and
-// adapter reach the scaffold without a name hardcoded under src/.
 const NEW_KEYLESS_ROW = {
   id: "acme-local",
   aliases: ["acme"],
@@ -63,7 +60,7 @@ describe("provider.base_url containment", () => {
   );
 
   it.each([true, false])(
-    "repairs pi-valid trailing commas with comments=%s after a startup mismatch",
+    "repairs pi-valid trailing commas with comments=%s after a parse refusal",
     async (comments) => {
       const res = initAgent(baseOpts({ baseUrl: LOCAL_URL }));
       const yamlPath = join(res.agentDir, "bob.yaml");
@@ -94,7 +91,7 @@ describe("provider.base_url containment", () => {
         });
         result.session.dispose();
       };
-      await expect(start()).rejects.toThrow(/apply provider.base_url/);
+      await expect(start()).rejects.toThrow(/could not parse it/);
       const output = spawnModels();
       expect(output.includes("comments in models.json were not preserved")).toBe(comments);
       const after = JSON.parse(readFileSync(modelsPath(res.agentDir), "utf8"));
@@ -395,11 +392,6 @@ describe("provider.base_url containment", () => {
     expect(existsSync(join(tmpRoot, "agents", "newton"))).toBe(false);
   });
 
-  // bob#186 slice 2 (T6): the containment sentinel runs over EVERY effective
-  // keyless profile — the three builtins and a new operator row — through the
-  // same real factory, both stream verbs and a refresh, with credentials seeded
-  // in disk, environment, model and caller options. Only the placeholder reaches
-  // the approved endpoint.
   it.each([
     { provider: "ollama", runtime: "ollama" },
     { provider: "ollama-newton", runtime: "ollama-newton" },
@@ -616,7 +608,7 @@ describe("bob#141 — provider.base_url", () => {
         JSON.parse(readFileSync(join(first.agentDir, ".pi-agent", "auth.json"), "utf8")),
         "ollama",
       ),
-    ).toBe(true);
+    ).toBe(false);
 
     // A second init (--force) keeps the override byte-for-byte.
     const second = initAgent(baseOpts({ baseUrl: LOCAL_URL, noClobber: false }));

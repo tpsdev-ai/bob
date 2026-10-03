@@ -573,12 +573,6 @@ function formatPositionDiff(name: string, diff: import("./shell/index.js").Posit
 }
 
 async function main(): Promise<number> {
-  // The operator password leaves the environment FIRST, before any command
-  // runs: read once, deleted from process.env, and handed explicitly to the
-  // one operator transport that uses it (onboard's registration), so no agent
-  // session this process starts gets it through its environment. What this
-  // does not cover is stated at takeFlairAdminPassFromEnv.
-  const adminPassFromEnv = takeFlairAdminPassFromEnv();
   // parseArgs validates every declared boolean flag, so a bad spelling is a
   // usage error HERE — before any command runs — and never a stack trace.
   let args: Args;
@@ -590,10 +584,8 @@ async function main(): Promise<number> {
     throw err;
   }
   try {
-    // The operator provider registry is loaded ONCE here and threaded through
-    // every command's resolution and session factory. It is never re-read per
-    // call, and its immutable selection carries the onboard/hire defaults.
     const registry = loadProviderRegistry();
+    const adminPassFromEnv = takeFlairAdminPassFromEnv();
     switch (args.command) {
       case "models": {
         if (

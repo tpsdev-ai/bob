@@ -2,14 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { parseBobYamlBlock, readProviderLimits } from "../../src/shell/bob-yaml.js";
 import { declaredProviderModel } from "../../src/shell/run.js";
 
-// bob#186 slice 2 (T7): the `provider:` readers run on a real YAML parser. A
-// document with duplicate mapping keys, an unresolved tag, an alias/anchor or a
-// merge key REFUSES rather than resolving to a plausible-but-wrong value; nested
-// content elsewhere in the document no longer confuses the reader. Every case
-// here is behaviourally red on the targeted line scanner (2ec3324f): it keeps the
-// last duplicate key, treats an anchor line as ordinary text, and only ever reads
-// a scalar next to the provider block.
-
 describe("bob#186 slice 2 (T7) — the provider readers parse real YAML", () => {
   it("reads provider fields through the real parser, with nested siblings present", () => {
     const yaml = [

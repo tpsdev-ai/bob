@@ -2563,11 +2563,6 @@ export function declaredProviderModel(yamlText: string): string | undefined {
   return model ? model : undefined;
 }
 
-// Read a scalar `key: value` field from inside the top-level `provider:` block.
-// bob#186 slice 2 (T7): the block is read with the REAL YAML parser (see
-// parseBobYamlBlock), not a bespoke line scanner, so nested provider metadata
-// loads and an ambiguous document refuses instead of guessing. A scalar value is
-// returned as text with surrounding quotes stripped; an empty value is undefined.
 function readProviderField(yamlText: string, key: string): string | undefined {
   const provider = parseBobYamlBlock(yamlText, "provider");
   if (provider === null || typeof provider !== "object" || Array.isArray(provider)) {
@@ -2575,6 +2570,9 @@ function readProviderField(yamlText: string, key: string): string | undefined {
   }
   const value = (provider as Record<string, unknown>)[key];
   if (value === null || value === undefined) return undefined;
+  if (!["string", "number", "boolean"].includes(typeof value)) {
+    throw new Error(`bob: provider.${key} must be a scalar`);
+  }
   const text = typeof value === "string" ? value.trim() : String(value).trim();
   return text === "" ? undefined : text.replace(/^["']|["']$/g, "");
 }

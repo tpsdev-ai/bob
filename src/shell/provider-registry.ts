@@ -4,7 +4,6 @@
 // inference from disk contents, placeholders or missing credentials:
 //
 //   bob/env(<ENV_VAR>)  bob reads the key from the environment at run time
-//   bob/none            keyless: bob installs a credential-suppressing transport
 //   bob/vm              host/VM identity (the exe.dev gateway)
 //   pi/disk             pi-managed key on disk (unmigrated, until its slice)
 //   pi/login            pi-managed subscription (unmigrated, until its slice)
@@ -28,7 +27,9 @@ export const PROVIDER_API_OPENAI_COMPLETIONS = "openai-completions";
 export type ProviderApi = typeof PROVIDER_API_OPENAI_COMPLETIONS;
 
 /** Every API flavour this slice accepts. An unknown adapter refuses at load. */
-export const SUPPORTED_PROVIDER_APIS: readonly ProviderApi[] = [PROVIDER_API_OPENAI_COMPLETIONS];
+export const SUPPORTED_PROVIDER_APIS: readonly ProviderApi[] = Object.freeze([
+  PROVIDER_API_OPENAI_COMPLETIONS,
+]);
 
 /**
  * The ownership/credential mode of a row. A closed union: every kind is
@@ -97,7 +98,6 @@ export interface ProviderRecord {
   readonly api?: ProviderApi;
   /** Present only on keyless rows: authorizes a `provider.base_url` override. */
   readonly override?: ProviderOverridePolicy;
-  /** Names this row may share a runtime identity with (builtin exceptions only). */
   readonly compatibility?: readonly string[];
 }
 
@@ -165,6 +165,17 @@ export const PROVIDER_RECORDS = [
   },
 ] as const satisfies readonly ProviderRecord[];
 
+for (const row of PROVIDER_RECORDS) {
+  Object.freeze(row.aliases);
+  Object.freeze(row.auth);
+  if ("override" in row) {
+    if ("excludeHosts" in row.override) Object.freeze(row.override.excludeHosts);
+    Object.freeze(row.override);
+  }
+  Object.freeze(row);
+}
+Object.freeze(PROVIDER_RECORDS);
+
 export type ProviderName = Extract<
   (typeof PROVIDER_RECORDS)[number],
   { readonly configName: true }
@@ -191,15 +202,11 @@ export const CUSTODY_IMPLEMENTATIONS: readonly CustodyDescriptor[] = [
   },
 ];
 
+for (const descriptor of CUSTODY_IMPLEMENTATIONS) Object.freeze(descriptor);
+Object.freeze(CUSTODY_IMPLEMENTATIONS);
+
 /** Runtime identities pi already owns login/subscription credentials for. */
 export const PI_LOGIN_OWNED = ["openai-codex", "github-copilot", "xai", "kimi-coding"] as const;
-
-/**
- * Runtime identities a builtin row is allowed to share. The exe.dev gateway and
- * direct Anthropic both resolve to pi's `anthropic` until slice 4 separates
- * them; no other sharing is permitted, and no `bob/env` row may share at all.
- */
-export const BUILTIN_SHARED_RUNTIMES = ["anthropic"] as const;
 
 export class ProviderRegistryError extends Error {
   constructor(message: string) {
@@ -222,14 +229,6 @@ const ALLOWED_FIELDS = new Set([
   "compatibility",
 ]);
 
-function canonicalEndpoint(endpoint: string): string | undefined {
-  try {
-    return new URL(endpoint).href;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * Validate ONE row's non-identity fields against the row contract. Throws on a
  * missing/unknown auth mode, a contradictory `override` on a keyed row, an
@@ -247,18 +246,48 @@ function validateRowFields(row: ProviderRecord): void {
       );
     }
   }
+  for (const field of Object.keys(legacy)) {
+    if (!ALLOWED_FIELDS.has(field)) {
+      throw new ProviderRegistryError(`provider registry: row "${row.id}" has an unknown field.`);
+    }
+  }
+  if (row.configName !== undefined && typeof row.configName !== "boolean") {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" configName must be boolean.`,
+    );
+  }
+  if (row.compatibility !== undefined) {
+    if (
+      !Array.isArray(row.compatibility) ||
+      row.compatibility.some((name) => typeof name !== "string" || !SAFE_NAME.test(name))
+    ) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" compatibility must be a list of names.`,
+      );
+    }
+  }
   const auth = row.auth;
-  if (auth === null || typeof auth !== "object" || typeof auth.kind !== "string") {
+  if (
+    auth === null ||
+    typeof auth !== "object" ||
+    Array.isArray(auth) ||
+    typeof auth.kind !== "string"
+  ) {
     throw new ProviderRegistryError(
       `provider registry: row "${row.id}" has no auth mode — every row requires an explicit auth.`,
     );
   }
   if (!["env", "none", "vm", "disk", "login"].includes(auth.kind)) {
-    throw new ProviderRegistryError(
-      `provider registry: row "${row.id}" has unknown auth mode ${JSON.stringify((auth as { kind: unknown }).kind)}.`,
-    );
+    throw new ProviderRegistryError(`provider registry: row "${row.id}" has unknown auth mode.`);
   }
-  if (auth.kind === "env" && !ENV_VAR.test(auth.variable)) {
+  for (const field of Object.keys(auth)) {
+    if (field !== "kind" && !(auth.kind === "env" && field === "variable")) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" auth has an unknown field.`,
+      );
+    }
+  }
+  if (auth.kind === "env" && (typeof auth.variable !== "string" || !ENV_VAR.test(auth.variable))) {
     throw new ProviderRegistryError(
       `provider registry: row "${row.id}" declares bob/env with an invalid environment variable name.`,
     );
@@ -269,27 +298,50 @@ function validateRowFields(row: ProviderRecord): void {
       `provider registry: row "${row.id}" declares an override policy but a base_url override is only allowed on a bob/none row.`,
     );
   }
+  if (row.override !== undefined) {
+    const policy = asRecord(row.override, "override");
+    if (Object.keys(policy).some((field) => field !== "excludeHosts")) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" override has an unknown field.`,
+      );
+    }
+    if (
+      policy.excludeHosts !== undefined &&
+      (!Array.isArray(policy.excludeHosts) ||
+        policy.excludeHosts.some((host) => !validExcludedHost(host)))
+    ) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" override.excludeHosts must be a list of canonical hosts.`,
+      );
+    }
+  }
   if (row.api !== undefined && !SUPPORTED_PROVIDER_APIS.includes(row.api)) {
     throw new ProviderRegistryError(
-      `provider registry: row "${row.id}" declares unsupported adapter/API ${JSON.stringify(row.api)}.`,
+      `provider registry: row "${row.id}" declares unsupported adapter/API.`,
     );
   }
   if (row.endpoint !== undefined) {
-    const canonical = canonicalEndpoint(row.endpoint);
-    if (canonical === undefined) {
+    if (typeof row.endpoint !== "string") {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" endpoint must be a URL string.`,
+      );
+    }
+    let url: URL;
+    try {
+      url = new URL(row.endpoint);
+    } catch {
       throw new ProviderRegistryError(
         `provider registry: row "${row.id}" has an endpoint that is not an absolute URL.`,
       );
     }
-    if (canonical !== row.endpoint) {
-      throw new ProviderRegistryError(
-        `provider registry: row "${row.id}" endpoint is not canonical (use ${JSON.stringify(canonical)}).`,
-      );
-    }
-    const url = new URL(row.endpoint);
     if (url.username !== "" || url.password !== "") {
       throw new ProviderRegistryError(
         `provider registry: row "${row.id}" endpoint must not carry credentials.`,
+      );
+    }
+    if (url.href !== row.endpoint) {
+      throw new ProviderRegistryError(
+        `provider registry: row "${row.id}" endpoint is not canonical.`,
       );
     }
     if (url.search !== "" || url.hash !== "") {
@@ -316,6 +368,24 @@ function validateRowFields(row: ProviderRecord): void {
   }
 }
 
+function validExcludedHost(value: unknown): boolean {
+  if (typeof value !== "string" || value === "") return false;
+  try {
+    const url = new URL(`http://${value}`);
+    return (
+      url.hostname === value &&
+      url.host === value &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Validate a custody gate: every `bob/env` row must match an implemented custody
  * descriptor on runtime, variable, endpoint and API. A keyed row whose custody is
@@ -328,7 +398,7 @@ export function assertCustodyImplemented(rows: readonly ProviderRecord[]): void 
     const descriptor = CUSTODY_IMPLEMENTATIONS.find((impl) => impl.runtime === row.runtime);
     if (descriptor === undefined) {
       throw new ProviderRegistryError(
-        `provider registry: row "${row.id}" declares bob/env(${row.auth.variable}) but the runtime "${row.runtime}" has no implemented custody — bob cannot guarantee the key reaches only its endpoint.`,
+        `provider registry: row "${row.id}" has no implemented custody for its runtime.`,
       );
     }
     if (
@@ -348,12 +418,15 @@ export function assertCustodyImplemented(rows: readonly ProviderRecord[]): void 
 // declared twice cannot be resolved, so it fails at load, naming the name and
 // both holders — not later, when a lookup silently answers with whichever row won.
 export function validateProviderRecords(records: readonly ProviderRecord[]): void {
+  if (!Array.isArray(records))
+    throw new ProviderRegistryError("provider registry: records must be a list.");
   const owner = new Map<string, string>();
   const runtimes = new Map<string, string[]>();
   for (const record of records) {
+    asRecord(record, "row");
     if (typeof record.id !== "string" || !SAFE_NAME.test(record.id)) {
       throw new ProviderRegistryError(
-        `provider registry: invalid provider id ${JSON.stringify((record as { id: unknown }).id)} — ids must match ${SAFE_NAME}.`,
+        `provider registry: invalid provider id — ids must match ${SAFE_NAME}.`,
       );
     }
     if (!Array.isArray(record.aliases)) {
@@ -364,13 +437,13 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     for (const alias of record.aliases) {
       if (typeof alias !== "string" || !SAFE_NAME.test(alias)) {
         throw new ProviderRegistryError(
-          `provider registry: row "${record.id}" has an invalid alias ${JSON.stringify(alias)}.`,
+          `provider registry: row "${record.id}" has an invalid alias.`,
         );
       }
     }
     if (typeof record.runtime !== "string" || !SAFE_NAME.test(record.runtime)) {
       throw new ProviderRegistryError(
-        `provider registry: row "${record.id}" has an invalid runtime identity ${JSON.stringify((record as { runtime: unknown }).runtime)}.`,
+        `provider registry: row "${record.id}" has an invalid runtime identity.`,
       );
     }
     for (const name of [record.id, ...record.aliases]) {
@@ -385,22 +458,19 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     runtimes.set(record.runtime, [...(runtimes.get(record.runtime) ?? []), record.id]);
     validateRowFields(record);
   }
-  // A runtime identity shared across rows must be an enumerated builtin
-  // compatibility relationship, and no bob/env row may share its runtime.
   for (const [runtime, holders] of runtimes) {
     if (holders.length < 2) continue;
-    if (!(BUILTIN_SHARED_RUNTIMES as readonly string[]).includes(runtime)) {
+    const builtinPair =
+      runtime === "anthropic" &&
+      holders.length === 2 &&
+      ["exe-dev-gateway", "anthropic"].every(
+        (id) =>
+          records.find((row) => row.id === id) === PROVIDER_RECORDS.find((row) => row.id === id),
+      );
+    if (!builtinPair) {
       throw new ProviderRegistryError(
         `provider registry: runtime identity "${runtime}" is ambiguous — declared by ${holders.join(", ")}.`,
       );
-    }
-    for (const holder of holders) {
-      const row = records.find((r) => r.id === holder);
-      if (row !== undefined && authIsKeyed(row.auth)) {
-        throw new ProviderRegistryError(
-          `provider registry: row "${holder}" is bob/env but shares runtime identity "${runtime}".`,
-        );
-      }
     }
   }
   assertCustodyImplemented(records);
@@ -418,28 +488,63 @@ export interface ProviderDefaults {
 }
 
 /** bob's built-in default selection when the operator declares none. */
-export const BUILTIN_PROVIDER_DEFAULTS: Required<ProviderDefaults> = {
+export const BUILTIN_PROVIDER_DEFAULTS: Required<ProviderDefaults> = Object.freeze({
   onboard: "ollama-cloud",
   hire: "exe-dev-gateway",
-};
+});
 
 /** A validated, indexed set of provider records. */
 export class ProviderRegistry {
   readonly #byName = new Map<string, ProviderRecord>();
   readonly #records: readonly ProviderRecord[];
-  readonly #defaults: ProviderDefaults;
+  readonly #defaults: Required<ProviderDefaults>;
 
   constructor(
     records: readonly ProviderRecord[] = PROVIDER_RECORDS,
     defaults: ProviderDefaults = {},
   ) {
     validateProviderRecords(records);
-    this.#records = [...records];
-    this.#defaults = { ...defaults };
-    for (const record of records) {
+    const rawDefaults = asRecord(defaults, "defaults");
+    for (const [key, value] of Object.entries(rawDefaults)) {
+      if (key !== "onboard" && key !== "hire")
+        throw new ProviderRegistryError("provider registry: defaults has an unknown field.");
+      if (
+        typeof value !== "string" ||
+        !SAFE_NAME.test(value) ||
+        !records.some((row) => row.id === value || row.aliases.includes(value))
+      ) {
+        throw new ProviderRegistryError(
+          `provider registry: defaults.${key} must name a declared provider.`,
+        );
+      }
+    }
+    this.#records = Object.freeze(
+      records.map((row) =>
+        Object.freeze({
+          ...row,
+          aliases: Object.freeze([...row.aliases]),
+          auth: Object.freeze({ ...row.auth }),
+          ...(row.compatibility !== undefined
+            ? { compatibility: Object.freeze([...row.compatibility]) }
+            : {}),
+          ...(row.override !== undefined
+            ? {
+                override: Object.freeze({
+                  ...(row.override.excludeHosts !== undefined
+                    ? { excludeHosts: Object.freeze([...row.override.excludeHosts]) }
+                    : {}),
+                }),
+              }
+            : {}),
+        }),
+      ),
+    );
+    this.#defaults = Object.freeze({ ...BUILTIN_PROVIDER_DEFAULTS, ...defaults });
+    for (const record of this.#records) {
       this.#byName.set(record.id, record);
       for (const alias of record.aliases) this.#byName.set(alias, record);
     }
+    Object.freeze(this);
   }
 
   /** Every record, in declaration order. */
@@ -454,7 +559,7 @@ export class ProviderRegistry {
 
   /** The selected default provider names (operator defaults over the builtins). */
   defaults(): Required<ProviderDefaults> {
-    return { ...BUILTIN_PROVIDER_DEFAULTS, ...this.#defaults };
+    return this.#defaults;
   }
 }
 
@@ -577,7 +682,12 @@ interface OperatorDocument {
 }
 
 function asRecord(value: unknown, what: string): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+  ) {
     throw new ProviderRegistryError(`provider registry: ${what} must be a mapping.`);
   }
   return value as Record<string, unknown>;
@@ -590,20 +700,14 @@ function parseOperatorDocument(text: string, source: string): unknown {
   let doc: Document;
   try {
     doc = parseDocument(text, { uniqueKeys: true, schema: "core", merge: false });
-  } catch (err) {
-    throw new ProviderRegistryError(
-      `provider registry: could not parse ${source}: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}.`,
-    );
+  } catch {
+    throw new ProviderRegistryError(`provider registry: could not parse ${source}.`);
   }
   if (doc.errors.length > 0) {
-    throw new ProviderRegistryError(
-      `provider registry: invalid ${source}: ${doc.errors[0]?.message.split("\n")[0] ?? "parse error"}.`,
-    );
+    throw new ProviderRegistryError(`provider registry: invalid ${source}.`);
   }
   if (doc.warnings.length > 0) {
-    throw new ProviderRegistryError(
-      `provider registry: unsupported tag in ${source}: ${doc.warnings[0]?.message.split("\n")[0] ?? "warning"}.`,
-    );
+    throw new ProviderRegistryError(`provider registry: unsupported tag in ${source}.`);
   }
   assertNoAliases(doc.contents, source);
   return doc.toJS({ maxAliasCount: 0 });
@@ -647,17 +751,15 @@ function parseAuth(value: unknown, id: string): ProviderAuth {
   if (value === "pi/login") return { kind: "login" };
   const env = /^bob\/env\(([^()]*)\)$/.exec(value);
   if (env) return { kind: "env", variable: env[1] };
-  throw new ProviderRegistryError(
-    `provider registry: row "${id}" has unknown auth mode ${JSON.stringify(value)}.`,
-  );
+  throw new ProviderRegistryError(`provider registry: row "${id}" has unknown auth mode.`);
 }
 
 function parseOperatorRow(value: unknown, index: number): ProviderRecord {
   const raw = asRecord(value, `providers[${index}]`);
-  const id = typeof raw.id === "string" ? raw.id : `providers[${index}]`;
+  const id = typeof raw.id === "string" && SAFE_NAME.test(raw.id) ? raw.id : `providers[${index}]`;
   for (const key of Object.keys(raw)) {
     if (!ALLOWED_FIELDS.has(key)) {
-      throw new ProviderRegistryError(`provider registry: row "${id}" has unknown field "${key}".`);
+      throw new ProviderRegistryError(`provider registry: row "${id}" has an unknown field.`);
     }
   }
   if (raw.id === undefined || raw.aliases === undefined || raw.runtime === undefined) {
@@ -688,13 +790,11 @@ function parseOperatorDocumentValue(value: unknown, source: string): OperatorDoc
   const raw = asRecord(value, "the registry document");
   for (const key of Object.keys(raw)) {
     if (!["version", "providers", "defaults"].includes(key)) {
-      throw new ProviderRegistryError(`provider registry: ${source} has unknown field "${key}".`);
+      throw new ProviderRegistryError(`provider registry: ${source} has an unknown field.`);
     }
   }
   if (raw.version !== 1) {
-    throw new ProviderRegistryError(
-      `provider registry: ${source} version must be 1 (got ${JSON.stringify(raw.version)}).`,
-    );
+    throw new ProviderRegistryError(`provider registry: ${source} version must be 1.`);
   }
   if (!Array.isArray(raw.providers)) {
     throw new ProviderRegistryError(`provider registry: ${source} providers must be a list.`);
@@ -705,7 +805,9 @@ function parseOperatorDocumentValue(value: unknown, source: string): OperatorDoc
     const d = asRecord(raw.defaults, `${source} defaults`);
     for (const key of Object.keys(d)) {
       if (key !== "onboard" && key !== "hire") {
-        throw new ProviderRegistryError(`provider registry: ${source} defaults.${key} is unknown.`);
+        throw new ProviderRegistryError(
+          `provider registry: ${source} defaults has an unknown field.`,
+        );
       }
     }
     if (d.onboard !== undefined) {
@@ -744,21 +846,12 @@ export function loadProviderRegistry(opts: LoadProviderRegistryOptions = {}): Pr
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT" && opts.explicit !== true) {
       return new ProviderRegistry();
     }
-    throw new ProviderRegistryError(
-      `provider registry: could not read ${path}: ${err instanceof Error ? err.message : String(err)}.`,
-    );
+    throw new ProviderRegistryError(`provider registry: could not read ${path}.`);
   }
   const parsed = parseOperatorDocument(text, path);
   const doc = parseOperatorDocumentValue(parsed, path);
   const builtins = PROVIDER_RECORDS as readonly ProviderRecord[];
   const combined = [...builtins, ...doc.providers];
   const registry = new ProviderRegistry(combined, doc.defaults);
-  for (const [key, name] of Object.entries(doc.defaults)) {
-    if (registry.find(name) === undefined) {
-      throw new ProviderRegistryError(
-        `provider registry: defaults.${key} names "${name}", which no row declares.`,
-      );
-    }
-  }
   return registry;
 }
