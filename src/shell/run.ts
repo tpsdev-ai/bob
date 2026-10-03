@@ -867,9 +867,7 @@ async function finalizePrMemory(
   } catch (err) {
     // Defensive: the memory layer already reports rather than throws.
     const m = err instanceof Error ? err.message : String(err);
-    log(
-      `bob run: PR memory finalization failed (${m}); the round outcome is unchanged.\n`,
-    );
+    log(`bob run: PR memory finalization failed (${m}); the round outcome is unchanged.\n`);
   }
 }
 
