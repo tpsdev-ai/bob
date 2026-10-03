@@ -397,7 +397,7 @@ describe("runAlign — an override cannot change the credential source (#170)", 
     rmSync(dirname(agentDir), { recursive: true, force: true });
   });
 
-  it("keeps every field but provider and model (piAgentDir and capabilityEnv included) under a --provider + --model override", async () => {
+  it("keeps credential paths under a provider/model override", async () => {
     // bob.yaml's own provider is ollama-cloud (a pass-through), but the override
     // names a DIFFERENT bob provider (exe-dev-gateway -> anthropic) and a
     // different model. The provider + model fields must follow the override, while
@@ -432,12 +432,21 @@ describe("runAlign — an override cannot change the credential source (#170)", 
     // But the credential source is still the agent's own .pi-agent dir.
     expect(runs[0].config.piAgentDir).toBe(join(agentDir, ".pi-agent"));
 
-    // And every other field besides provider and model is exactly what an
-    // unflagged check-in resolves: capabilityEnv (which can name a credential
-    // file) included.
     await runAlign({ name: "testbot", agentDir, sessionRunner: runner });
-    const { provider: _p0, model: _m0, ...overridden } = runs[0].fullConfig;
-    const { provider: _p1, model: _m1, ...unflagged } = runs[1].fullConfig;
+    const {
+      provider: _p0,
+      model: _m0,
+      providerRecord: selectedOverride,
+      ...overridden
+    } = runs[0].fullConfig;
+    const {
+      provider: _p1,
+      model: _m1,
+      providerRecord: selectedDefault,
+      ...unflagged
+    } = runs[1].fullConfig;
+    expect(selectedOverride).toMatchObject({ id: "exe-dev-gateway", runtime: "anthropic" });
+    expect(selectedDefault).toMatchObject({ id: "ollama-cloud", runtime: "ollama-cloud" });
     expect(Object.keys(overridden.capabilityEnv as Record<string, string>)).not.toHaveLength(0);
     expect(overridden).toEqual(unflagged);
   });

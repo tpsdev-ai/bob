@@ -413,10 +413,7 @@ export function assertCustodyImplemented(rows: readonly ProviderRecord[]): void 
   }
 }
 
-// Every id and alias names exactly one record, and every runtime identity is
-// unambiguous except the enumerated builtin compatibility relationships. A name
-// declared twice cannot be resolved, so it fails at load, naming the name and
-// both holders — not later, when a lookup silently answers with whichever row won.
+// IDs, aliases and runtimes are unique across rows except the built-in exe-dev-gateway/anthropic pair.
 export function validateProviderRecords(records: readonly ProviderRecord[]): void {
   if (!Array.isArray(records))
     throw new ProviderRegistryError("provider registry: records must be a list.");
@@ -458,16 +455,23 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     runtimes.set(record.runtime, [...(runtimes.get(record.runtime) ?? []), record.id]);
     validateRowFields(record);
   }
+  const builtinPair = (holders: readonly string[]): boolean =>
+    holders.length === 2 &&
+    ["exe-dev-gateway", "anthropic"].every((id) => holders.includes(id)) &&
+    ["exe-dev-gateway", "anthropic"].every(
+      (id) =>
+        records.find((row) => row.id === id) === PROVIDER_RECORDS.find((row) => row.id === id),
+    );
   for (const [runtime, holders] of runtimes) {
-    if (holders.length < 2) continue;
-    const builtinPair =
-      runtime === "anthropic" &&
-      holders.length === 2 &&
-      ["exe-dev-gateway", "anthropic"].every(
-        (id) =>
-          records.find((row) => row.id === id) === PROVIDER_RECORDS.find((row) => row.id === id),
-      );
-    if (!builtinPair) {
+    const nameOwner = owner.get(runtime);
+    for (const holder of holders) {
+      if (nameOwner !== undefined && nameOwner !== holder && !builtinPair([nameOwner, holder])) {
+        throw new ProviderRegistryError(
+          `provider registry: identity "${runtime}" is ambiguous — declared by both "${nameOwner}" and "${holder}".`,
+        );
+      }
+    }
+    if (holders.length > 1 && !builtinPair(holders)) {
       throw new ProviderRegistryError(
         `provider registry: runtime identity "${runtime}" is ambiguous — declared by ${holders.join(", ")}.`,
       );

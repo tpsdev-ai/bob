@@ -96,8 +96,10 @@ import {
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import {
+  type ProviderRecord,
   type ProviderRegistry,
   providerReadsKeyFromEnv,
+  providerRecord,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
 import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
@@ -548,6 +550,7 @@ export interface RunSessionConfig {
   // pi provider id (already mapped from the bob provider, e.g.
   // exe-dev-gateway → anthropic).
   provider: string;
+  readonly providerRecord?: ProviderRecord;
   // Model id to run. Per-call override wins over bob.yaml.
   model: string;
   // Appended system prompt (soul.md contents). Empty string when no soul.
@@ -2234,11 +2237,11 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   }
 
   const yamlText = readBobYaml(agentDir, opts.name);
-  const { provider, model: yamlModel } = resolveProviderAndModel(
-    yamlText,
-    opts.name,
-    opts.registry,
-  );
+  const {
+    provider,
+    providerRecord: selectedRow,
+    model: yamlModel,
+  } = resolveProviderAndModel(yamlText, opts.name, opts.registry);
 
   // Per-call override wins, mirroring the old `--model` flag semantics.
   const model = opts.model ?? yamlModel;
@@ -2359,6 +2362,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
 
   const config: RunSessionConfig = {
     provider,
+    providerRecord: selectedRow,
     model,
     appendSystemPrompt,
     cwd: join(agentDir, "work"),
@@ -2539,7 +2543,7 @@ function resolveProviderAndModel(
   yamlText: string,
   name: string,
   registry?: ProviderRegistry,
-): { provider: string; model: string } {
+): { provider: string; providerRecord?: ProviderRecord; model: string } {
   const bobProvider = readProviderField(yamlText, "name");
   const model = declaredProviderModel(yamlText);
   if (!bobProvider || model === undefined) {
@@ -2551,7 +2555,7 @@ function resolveProviderAndModel(
   // request is made (bob#183). The check is shared with `bob hire`'s pre-write
   // validation so both refuse identically.
   assertProviderRunnable(provider, `bob run ${name}`);
-  return { provider, model };
+  return { provider, providerRecord: providerRecord(bobProvider, registry), model };
 }
 
 // provider.model as the session resolver reads it: the scalar text under

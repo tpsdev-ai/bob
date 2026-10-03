@@ -534,8 +534,8 @@ async function restartCmd(name: string): Promise<number> {
   return 0;
 }
 
-function doctor(name: string): number {
-  const report = runDoctor({ name });
+function doctor(name: string, registry: ProviderRegistry): number {
+  const report = runDoctor({ name, registry });
   console.log(formatReport(report));
   return report.summary.fail > 0 ? 1 : 0;
 }
@@ -712,7 +712,7 @@ async function main(): Promise<number> {
           console.error("bob doctor: missing <name>");
           return 2;
         }
-        return doctor(args.positional[0]);
+        return doctor(args.positional[0], registry);
       case "login": {
         const name = args.positional[0];
         if (!name) {

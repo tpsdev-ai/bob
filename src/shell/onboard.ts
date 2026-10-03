@@ -18,7 +18,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import type { ProviderRegistry } from "./provider-registry.js";
+import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY, type SessionDeps } from "./session.js";
 import type { ToolPolicy } from "./tool-allowlist.js";
@@ -139,6 +139,7 @@ export async function runOnboard(opts: OnboardOptions): Promise<OnboardResult> {
   const sessionConfig: RunSessionConfig = {
     ...config,
     provider: mapBobProviderToPi(opts.provider, opts.registry),
+    providerRecord: providerRecord(opts.provider, opts.registry),
     model: opts.model,
     // bob#204: the setup session's one write is the bob-owned `write_soul`, bound
     // to THIS agent's soul.md. pi's generic `write` is not granted.

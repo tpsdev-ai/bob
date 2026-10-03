@@ -65,6 +65,7 @@ import {
 } from "./bob-yaml.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
+import type { ProviderRegistry } from "./provider-registry.js";
 import {
   declaredProviderModel,
   effectiveCapabilities,
@@ -104,6 +105,7 @@ export interface DoctorReport {
 }
 
 export interface DoctorOptions {
+  registry?: ProviderRegistry;
   name: string;
   agentsRoot?: string;
   flairKeysDir?: string;
@@ -166,7 +168,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   // session for that model refuses to start without one (bob does not guess a
   // window; a guess can disagree with the server), at session creation. Report
   // it here during doctor, with the exact line to add.
-  checks.push(contextWindowCheck(join(agentDir, "bob.yaml")));
+  checks.push(contextWindowCheck(join(agentDir, "bob.yaml"), opts.registry));
 
   // Launcher — exists + executable
   const launcherPath = join(agentDir, "bin", opts.name);
@@ -412,7 +414,7 @@ const INBOUND_CHAT_CAPABILITIES: ReadonlySet<string> = new Set(["discord", "tps-
 // bob.yaml or an unparseable provider: block FAILS first; only a readable file
 // whose provider: block parses reaches the model (SKIP when none) and then the
 // window (FAIL when none, else OK).
-function contextWindowCheck(yamlPath: string): DoctorCheck {
+function contextWindowCheck(yamlPath: string, registry?: ProviderRegistry): DoctorCheck {
   const name = "provider.context_window";
   let yamlText: string;
   try {
@@ -429,7 +431,7 @@ function contextWindowCheck(yamlPath: string): DoctorCheck {
 
   let block: ProviderLimitsBlock;
   try {
-    block = readProviderLimits(yamlText);
+    block = readProviderLimits(yamlText, registry);
   } catch (err) {
     return {
       name,

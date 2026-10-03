@@ -166,6 +166,7 @@ function realProbeFactory(): RunSessionFactory {
       config: {
         ...config,
         provider: STUB_PROVIDER,
+        providerRecord: undefined,
         model: STUB_MODEL,
         modelLimits: { provider: STUB_PROVIDER, model: STUB_MODEL, contextWindow: 200_000 },
         extensionSources: [probePath],

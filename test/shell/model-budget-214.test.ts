@@ -191,6 +191,7 @@ async function liveSession(input: {
       ...base,
       extensionSources: [],
       capabilityBySource: {},
+      providerRecord: input.config.provider === undefined ? base.providerRecord : undefined,
       ...input.config,
     } as RunSessionConfig,
     policy: { tools: ["read"], excludeTools: [], resident: false, allowResidentShell: false },

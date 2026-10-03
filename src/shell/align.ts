@@ -14,7 +14,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { SessionRunner } from "./onboard.js";
-import type { ProviderRegistry } from "./provider-registry.js";
+import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
 import { mapBobProviderToPi, type RunSessionConfig, resolveRunConfig } from "./run.js";
 import { runInteractiveSession, SETUP_TOOL_POLICY } from "./session.js";
 import { bindSetupSoulTarget } from "./write-soul.js";
@@ -137,6 +137,10 @@ export async function runAlign(opts: AlignOptions): Promise<AlignResult> {
     // an agent it was not looking at. An override replaces ONLY the field it
     // names: the model through resolveRunConfig above, the provider here.
     provider,
+    providerRecord:
+      opts.provider !== undefined
+        ? providerRecord(opts.provider, opts.registry)
+        : resolved.providerRecord,
     model: config.model,
     ...(modelLimits !== undefined && provider === resolved.provider ? { modelLimits } : {}),
     // The session's tools are the setup policy — read + write_soul for every

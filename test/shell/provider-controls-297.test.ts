@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { providerBaseUrlRefusal } from "../../src/shell/bob-yaml.js";
+import { runDoctor } from "../../src/shell/doctor.js";
 import { initAgent } from "../../src/shell/init.js";
 import { applyModelScaffold } from "../../src/shell/models.js";
 import { hireAgent } from "../../src/shell/position-runtime.js";
@@ -127,7 +128,12 @@ describe("provider controls", () => {
           agentsRoot: root,
           registry,
         });
+        expect(config.providerRecord).toBe(registry.find("keyless-alias"));
+        expect(Object.isFrozen(config.providerRecord)).toBe(true);
         const factory = createBobRuntimeFactory({ config, policy, registry });
+        Object.defineProperty(config, "providerRecord", {
+          value: registry.find("openai"),
+        });
         const runtimeResult = await factory({
           sessionManager: SessionManager.inMemory(config.cwd),
         });
@@ -164,6 +170,75 @@ describe("provider controls", () => {
       }
     },
   );
+
+  it("refuses a selected row outside the session registry or runtime", () => {
+    const registry = new ProviderRegistry([...PROVIDER_RECORDS, row]);
+    initAgent({ ...options(), registry });
+    const { config, policy } = resolveRunConfig({ name: "control", agentsRoot: root, registry });
+    const otherRow = registry.find("openai");
+    if (otherRow === undefined || config.providerRecord === undefined)
+      throw new Error("missing row");
+    for (const selected of [otherRow, Object.freeze({ ...config.providerRecord })]) {
+      expect(() =>
+        createBobRuntimeFactory({
+          config: { ...config, providerRecord: selected },
+          policy,
+          registry,
+        }),
+      ).toThrow(/selected row/);
+    }
+  });
+
+  it("refuses a runtime that names another row at operator load", () => {
+    const path = join(root, "providers.yaml");
+    writeFileSync(
+      path,
+      "version: 1\nproviders:\n  - id: local\n    aliases: []\n    runtime: exe-dev-gateway\n    auth: bob/none\n",
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(/identity "exe-dev-gateway".*local/);
+  });
+
+  it.each([false, true])(
+    "refuses runtime/name collisions in either row order (alias: %s)",
+    (alias) => {
+      const first = {
+        ...row,
+        id: "first",
+        aliases: alias ? ["shared"] : [],
+        runtime: alias ? "first-runtime" : "shared",
+      };
+      const second = {
+        ...row,
+        id: alias ? "second" : "shared",
+        aliases: [],
+        runtime: alias ? "shared" : "second-runtime",
+      };
+      for (const records of [
+        [first, second],
+        [second, first],
+      ]) {
+        expect(() => new ProviderRegistry(records)).toThrow(/identity "shared".*ambiguous/);
+      }
+    },
+  );
+
+  it("doctor uses the run registry for a keyless endpoint override", () => {
+    const registry = new ProviderRegistry([...PROVIDER_RECORDS, row]);
+    initAgent({ ...options(), registry, baseUrl: row.endpoint });
+    expect(
+      resolveRunConfig({ name: "control", agentsRoot: root, registry }).config.providerRecord,
+    ).toBe(registry.find(row.id));
+    const report = runDoctor({
+      name: "control",
+      agentsRoot: root,
+      homeDir: root,
+      pathEnv: "",
+      registry,
+    });
+    expect(report.checks.find((check) => check.name === "provider.context_window")?.status).toBe(
+      "ok",
+    );
+  });
 
   it("permits only the built-in shared-runtime relationship", () => {
     expect(() => new ProviderRegistry()).not.toThrow();

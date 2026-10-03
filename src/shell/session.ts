@@ -81,6 +81,7 @@ import {
 import {
   DEFAULT_PROVIDER_REGISTRY,
   type ProviderRegistry,
+  ProviderRegistryError,
   reservedProviderNames,
 } from "./provider-registry.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
@@ -1111,6 +1112,27 @@ export function contractBlockFor(
 export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSessionRuntimeFactory {
   const { config, policy } = input;
   const deps = input.deps;
+  const registry = input.registry ?? DEFAULT_PROVIDER_REGISTRY;
+  const runtimeRows = registry
+    .records()
+    .filter((candidate) => candidate.runtime === config.provider);
+  const row =
+    config.providerRecord ??
+    (runtimeRows.length === 1
+      ? runtimeRows[0]
+      : config.provider === "anthropic"
+        ? runtimeRows.find((candidate) => candidate.auth.kind === "login")
+        : undefined);
+  if (row === undefined && runtimeRows.length > 1) {
+    throw new ProviderRegistryError(
+      `provider registry: runtime identity "${config.provider}" needs a selected row.`,
+    );
+  }
+  if (row !== undefined && (row.runtime !== config.provider || !registry.records().includes(row))) {
+    throw new ProviderRegistryError(
+      "provider registry: selected row does not match the session registry and runtime.",
+    );
+  }
   // pi builds the session from the services above, unless a test injects its own
   // builder. Injectable so a test drives the dispose-on-refusal path with a
   // scripted session instead of a process-global module mock; production passes
@@ -1256,10 +1278,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         throw new Error("bob: run bob models <agent> to apply provider.base_url");
       }
     }
-    const registry = input.registry ?? DEFAULT_PROVIDER_REGISTRY;
-    const row =
-      registry.find(config.provider) ??
-      registry.records().find((candidate) => candidate.runtime === config.provider);
     if (row?.auth.kind === "none") {
       const effective = modelRuntime.getModel(config.provider, config.model);
       const endpoint = baseUrl ?? row.endpoint ?? effective?.baseUrl;
