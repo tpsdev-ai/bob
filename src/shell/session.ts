@@ -341,16 +341,16 @@ export function buildOpenrouterProvider(input: {
 }
 
 /**
- * Refuse when the on-disk pi config carries ANY entry for a name in `reserved`:
- * bob owns those providers, and an entry in the editable `models.json` (a
- * provider block, a per-model `baseUrl`, a `providers.<name>.apiKey`) or a stored
- * credential in `auth.json` is never merged. Names the file. A MISSING file is
+ * Refuse when the on-disk pi config carries ANY entry for a name in `reserved`
+ * (the names the caller treats as bob-owned): an entry in the editable
+ * `models.json` (a provider block, a per-model `baseUrl`, a
+ * `providers.<name>.apiKey`) or an `auth.json` entry is never merged. Names the file. A MISSING file is
  * "absent" (no entry); any OTHER read or parse failure REFUSES — bob cannot prove
  * the file carries none of the reserved entries. pi accepts comments in
  * `models.json`, so a commented file is refused here ON PURPOSE as unparseable.
  *
- * `reserved` is derived from the registry (the union of every bob/env row's id,
- * aliases and runtime), never hardcoded.
+ * The caller supplies `reserved`; the session factory passes the set derived from
+ * the selected registry (the union of every bob/env row's id, aliases and runtime).
  */
 export function assertNoReservedProviderEntries(
   piAgentDir: string,
