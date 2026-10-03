@@ -206,7 +206,14 @@ function toToolNames(value: unknown): string[] | undefined {
 // factory as "undeclared", which refuses with the remedy. A key it does not
 // recognize is an error, not an ignored setting — a misspelled limit must not
 // read as "no limit".
-const PROVIDER_KEYS = ["name", "model", "context_window", "max_output_tokens", "models"] as const;
+const PROVIDER_KEYS = [
+  "name",
+  "model",
+  "context_window",
+  "max_output_tokens",
+  "base_url",
+  "models",
+] as const;
 const PROVIDER_MODEL_KEYS = ["id", "context_window", "max_output_tokens"] as const;
 
 export interface DeclaredModelLimits {
@@ -217,6 +224,39 @@ export interface DeclaredModelLimits {
 export interface ProviderLimitsBlock extends DeclaredModelLimits {
   // Other models this agent may run on (a per-call `--model`), by model id.
   models: Record<string, DeclaredModelLimits>;
+  baseUrl?: string;
+}
+
+const REDIRECTABLE_PROVIDERS = new Set(["ollama-newton", "omlx"]);
+
+export function providerBaseUrlRefusal(provider: string, baseUrl: string): string | undefined {
+  if (
+    Array.from(baseUrl).some((char) => {
+      const code = char.charCodeAt(0);
+      return code < 32 || (code >= 127 && code <= 159);
+    })
+  ) {
+    return "provider.base_url must not contain C0, DEL, or C1 control characters.";
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return `provider.base_url must be an absolute http/https URL (got ${JSON.stringify(baseUrl)}).`;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `provider.base_url must be http or https (got ${JSON.stringify(parsed.protocol)}).`;
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    return `provider.base_url must not carry credentials (a username or password in the URL).`;
+  }
+  if (parsed.href.includes("?") || parsed.href.includes("#")) {
+    return "provider.base_url must not contain a query string or fragment.";
+  }
+  if (REDIRECTABLE_PROVIDERS.has(provider)) return undefined;
+  if (provider === "ollama" && parsed.hostname.replace(/\.+$/, "") !== "ollama.com")
+    return undefined;
+  return `provider.base_url is only allowed for ollama on a non-ollama.com host, ollama-newton, or omlx (got "${provider}").`;
 }
 
 function tokensFor(yamlText: string, key: string, value: unknown): number {
@@ -245,7 +285,21 @@ export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
     }
     if (key === "context_window") out.contextWindow = tokensFor(yamlText, key, value);
     else if (key === "max_output_tokens") out.maxOutputTokens = tokensFor(yamlText, key, value);
-    else if (key === "models") {
+    else if (key === "base_url") {
+      if (typeof value !== "string" || value.trim() === "") {
+        throw new BobYamlError(
+          "provider",
+          lineOfKey(yamlText, "provider", key),
+          `"base_url" must be an http/https URL string.`,
+        );
+      }
+      const name = typeof raw.name === "string" ? raw.name : "";
+      const refusal = providerBaseUrlRefusal(name, value);
+      if (refusal !== undefined) {
+        throw new BobYamlError("provider", lineOfKey(yamlText, "provider", key), refusal);
+      }
+      out.baseUrl = new URL(value).href;
+    } else if (key === "models") {
       const line = lineOfKey(yamlText, "provider", key);
       if (!Array.isArray(value)) {
         throw new BobYamlError(

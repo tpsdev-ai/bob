@@ -115,6 +115,12 @@ const SECONDS_VALUE_FLAGS: ReadonlySet<string> = new Set([
  *  bound flags are checked here; every other value flag keeps its own reader's
  *  rule (a bare `--model` is "not given"). */
 function validateValueOccurrence(name: string, value: string | true): void {
+  if (name === "base-url") {
+    if (value === true || value.trim() === "") {
+      throw new UsageError("--base-url needs a non-empty value");
+    }
+    return;
+  }
   if (!SECONDS_VALUE_FLAGS.has(name)) return;
   if (value === true || value === "") {
     throw new UsageError(

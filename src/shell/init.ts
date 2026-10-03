@@ -16,6 +16,7 @@
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
 import type { BobRole } from "./index.js";
@@ -100,6 +101,7 @@ export interface InitOptions {
   // start without one, so an agent scaffolded without it gets a commented
   // placeholder and a warning, and must have it set before it runs.
   contextWindow?: number;
+  baseUrl?: string;
 }
 
 export interface InitResult {
@@ -133,6 +135,11 @@ export function initAgent(opts: InitOptions): InitResult {
     throw new Error(
       `bob: the context window must be a positive whole number of tokens (got ${String(opts.contextWindow)})`,
     );
+  }
+  if (opts.baseUrl !== undefined) {
+    const refusal = providerBaseUrlRefusal(opts.provider, opts.baseUrl);
+    if (refusal !== undefined) throw new Error(`bob: ${refusal}`);
+    opts = { ...opts, baseUrl: new URL(opts.baseUrl).href };
   }
   // Validates the role + loads the template. Throws on unknown / unsafe role.
   const template = loadRole(opts.role);
@@ -251,6 +258,11 @@ ${
     : `  # REQUIRED before this agent runs: the context window (tokens) the server
   # enforces for this model. bob refuses to start a session without it.
   # context_window: <tokens>`
+}${
+  opts.baseUrl !== undefined
+    ? `
+  base_url: ${opts.baseUrl}`
+    : ""
 }
 
 identity:
@@ -392,8 +404,7 @@ function resolvePiProvider(bobProvider: string): string {
 //   default endpoint.
 // - auth.json: exe-dev-gateway gets its VM-identity placeholder key (the
 //   literal value is never checked — the gateway authenticates via VM
-//   identity). Every other provider gets a clearly-labeled placeholder the
-//   human must replace with a real key before the agent can run.
+//   identity). Endpoint overrides get bob's constant placeholder.
 function knownProviderBaseUrl(bobProvider: string): string | undefined {
   switch (bobProvider) {
     case "exe-dev-gateway":
@@ -415,7 +426,9 @@ const PI_MODEL_DEFAULT_MAX_TOKENS = 16_384;
 
 /** The full model entry for an OpenAI-compatible provider (cost is zero: bob
  *  does not track this provider's pricing, so pi reports $0 for it). */
-function piOpenAiCompletionsModel(opts: InitOptions): Record<string, unknown> {
+export function piOpenAiCompletionsModel(
+  opts: Pick<InitOptions, "model" | "contextWindow">,
+): Record<string, unknown> {
   return {
     id: opts.model,
     name: opts.model,
@@ -440,9 +453,15 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const isEnvKeyProvider = opts.provider === "openrouter";
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
   // entry (bob#132).
-  const isOpenAiCompatible = opts.provider === "ollama-cloud" || opts.provider === "ollama";
-  const baseUrl = knownProviderBaseUrl(opts.provider);
-  const key = isGateway ? "exe-gateway-placeholder" : "REPLACE_WITH_YOUR_API_KEY";
+  const isOpenAiCompatible =
+    opts.provider === "ollama-cloud" || opts.provider === "ollama" || opts.baseUrl !== undefined;
+  const baseUrl = opts.baseUrl ?? knownProviderBaseUrl(opts.provider);
+  const key =
+    opts.baseUrl !== undefined
+      ? "bob-base-url-placeholder-not-a-secret"
+      : isGateway
+        ? "exe-gateway-placeholder"
+        : "REPLACE_WITH_YOUR_API_KEY";
 
   const modelsPath = join(piDir, "models.json");
   const authPath = join(piDir, "auth.json");
@@ -478,7 +497,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
 
   if (isEnvKeyProvider) {
     console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
-  } else if (!isGateway) {
+  } else if (!isGateway && opts.baseUrl === undefined) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );

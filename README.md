@@ -970,6 +970,20 @@ entry (`(a)–(d)`). pi ACCEPTS comments in `models.json`, but bob refuses a com
 unset `OPENROUTER_API_KEY` is refused before the initial session is built (the entry paths reject it during config resolution), and the key is never written by the run
 path's persisted files (`(c)`).
 
+### Endpoint scaffold (`provider.base_url`)
+
+```bash
+bob onboard newton --role ea --provider ollama --model qwen3.8:27b-mxfp8 \
+  --context-window 262144 --base-url http://newton.lan:11434/v1
+```
+
+`--base-url` is an init-time scaffold value written to `bob.yaml` and `.pi-agent/models.json`.
+A session refuses to start when `provider.base_url` differs from the effective model's `baseUrl`:
+"run bob models <agent> to apply provider.base_url".
+`bob models` accepts pi's line comments and trailing commas; comments in models.json are not preserved.
+Overrides are accepted for `ollama-newton`, `omlx`, and `ollama` on any host other than
+`ollama.com` (including its terminal-dot forms). bob's transport replaces caller-supplied headers with fixed Content-Type, Accept and placeholder Authorization headers.
+
 ### Moving an agent to a subscription model
 
 Some providers pi authenticates by a subscription OAuth login — pi's `isSubscription` providers:

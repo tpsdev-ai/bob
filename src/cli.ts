@@ -8,6 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { providerBaseUrlRefusal } from "./shell/bob-yaml.js";
 import {
   type Args,
   adoptAgent,
@@ -52,6 +53,7 @@ import {
   up,
   watchParent,
 } from "./shell/index.js";
+import { applyModelScaffold } from "./shell/models.js";
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
@@ -65,9 +67,15 @@ Commands:
                       Flags: --context-window <tokens> (required: the model's
                              context window as the server enforces it)
                              --role <r> --provider <p> --model <m>
+                             --base-url <url> (init-time models.json scaffold:
+                             ollama on a non-ollama.com host, ollama-newton, omlx)
                              --flair-url <u> --no-flair
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
+  models <agent>      Apply provider.base_url: bob models <agent>
+                      Updates only .pi-agent/models.json from validated bob.yaml.
+                      Comments in models.json are not preserved.
+                      Flags: --agents-root <dir>
   align <name>        Recurring check-in to refine an existing agent. The session
                       runs on the agent's own bob.yaml provider + model (the same
                       pair 'bob run' uses); --provider / --model override just the
@@ -193,6 +201,12 @@ async function onboard(
     `bob onboard ${name}`,
     `${provider}/${model}`,
   );
+  let baseUrl = stringFlag(flags, "base-url");
+  if (baseUrl !== undefined) {
+    const refusal = providerBaseUrlRefusal(provider, baseUrl);
+    if (refusal !== undefined) throw new UsageError(refusal);
+    baseUrl = new URL(baseUrl).href;
+  }
 
   if (dryRun) {
     const template = loadRole(role);
@@ -201,7 +215,7 @@ async function onboard(
   agent.role      = ${role}
   provider.name   = ${provider}
   provider.model  = ${model}
-  provider.context_window = ${contextWindow}
+  provider.context_window = ${contextWindow}${baseUrl !== undefined ? `\n  provider.base_url = ${baseUrl}` : ""}
   soul (from template, ${template.soul.length} chars) → ~/agents/${name}/soul.md
   tools.allow     = ${template.tools.allow.join(", ")}
   bin/launcher    → ~/agents/${name}/bin/${name}
@@ -217,6 +231,7 @@ async function onboard(
     provider,
     model,
     contextWindow,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
     noClobber: !force,
     skipFlair: noFlair,
     flairUrl,
@@ -562,6 +577,19 @@ async function main(): Promise<number> {
   }
   try {
     switch (args.command) {
+      case "models": {
+        if (
+          args.positional.length !== 1 ||
+          Object.keys(args.flags).some((key) => key !== "agents-root")
+        ) {
+          throw new UsageError("bob models <agent> [--agents-root <dir>]");
+        }
+        if (args.flags["agents-root"] !== undefined && !stringFlag(args.flags, "agents-root")) {
+          throw new UsageError("bob models: --agents-root requires a directory");
+        }
+        console.log(applyModelScaffold(args.positional[0], stringFlag(args.flags, "agents-root")));
+        return 0;
+      }
       case "onboard": {
         const name = args.positional[0];
         if (!name) {

@@ -35,7 +35,7 @@
 //       audit too — the session may be half-rebuilt, and the mode would
 //       otherwise stay open on a tool state nobody audited.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
@@ -52,7 +52,9 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { TASK_BINDING_ENV } from "../capabilities/work/task-binding.js";
+import { installBaseUrlTransport } from "./base-url-transport.js";
 import { bobEditCustomTools } from "./bob-edit-tools.js";
+import { readProviderLimits } from "./bob-yaml.js";
 import { confinedReadCustomTools } from "./confined-read.js";
 import {
   assertWebComposition,
@@ -1226,6 +1228,17 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         authPath: join(agentDir, "auth.json"),
         modelsPath: join(agentDir, "models.json"),
       }));
+    const yamlPath = join(dirname(config.piAgentDir), "bob.yaml");
+    const baseUrl = existsSync(yamlPath)
+      ? readProviderLimits(readFileSync(yamlPath, "utf8")).baseUrl
+      : undefined;
+    if (baseUrl !== undefined) {
+      const effective = modelRuntime.getModel(config.provider, config.model);
+      if (effective?.baseUrl !== baseUrl) {
+        throw new Error("bob: run bob models <agent> to apply provider.base_url");
+      }
+      installBaseUrlTransport(modelRuntime, config.provider, baseUrl);
+    }
     // openrouter is bob's OWN provider (round 3): construct it in memory and
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
     // redirect the endpoint or the key. Runs BEFORE any session exists.
@@ -1293,6 +1306,9 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     }
 
     const model = services.modelRuntime.getModel(config.provider, config.model);
+    if (baseUrl !== undefined && model?.baseUrl !== baseUrl) {
+      throw new Error("bob: run bob models <agent> to apply provider.base_url");
+    }
     if (!model) {
       throw new Error(
         `model not found: ${config.provider}/${config.model} (check bob.yaml provider/model and ${join(agentDir, "models.json")})`,
