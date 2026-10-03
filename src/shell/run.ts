@@ -94,6 +94,11 @@ import {
 } from "./flair-bootstrap.js";
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
+import {
+  type ProviderRegistry,
+  providerReadsKeyFromEnv,
+  resolveRuntimeProviderName,
+} from "./provider-registry.js";
 import { repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import { createRequestUsageTracker } from "./request-usage.js";
 import { loadRole } from "./role-loader.js";
@@ -1669,6 +1674,9 @@ export interface ResolveRunConfigOptions {
   // bob#275 (S2a): the launcher-supplied task binding, threaded into
   // RunSessionConfig.taskBinding. A launcher supplies it; bob.yaml cannot.
   taskBinding?: TaskBinding;
+  // The provider registry this resolution reads its identity records from.
+  // Defaults to the built-in table; tests supply one with a row of their own.
+  registry?: ProviderRegistry;
 }
 
 export interface ResolvedRunConfig {
@@ -2206,7 +2214,11 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   }
 
   const yamlText = readBobYaml(agentDir, opts.name);
-  const { provider, model: yamlModel } = resolveProviderAndModel(yamlText, opts.name);
+  const { provider, model: yamlModel } = resolveProviderAndModel(
+    yamlText,
+    opts.name,
+    opts.registry,
+  );
 
   // Per-call override wins, mirroring the old `--model` flag semantics.
   const model = opts.model ?? yamlModel;
@@ -2477,14 +2489,15 @@ function readBobYaml(agentDir: string, name: string): string {
 
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
 // block (name + model) — the exact shape init.ts emits. The bob provider is
-// mapped to pi's provider id the same way init.ts's resolvePiProvider does.
+// mapped to pi's provider id through the provider registry, the SAME table
+// init.ts's scaffold reads.
 // The provider/runtime-key refusal the session resolver applies, factored out so
 // callers that write BEFORE a session exists (hire scaffolds and runs the
 // interview) can run it up front and leave nothing behind on a missing key.
 // `provider` is pi's provider id (already mapped by mapBobProviderToPi); `label`
 // names the caller for the message (e.g. "bob run <name>").
 export function assertProviderRunnable(provider: string, label: string): void {
-  if (provider !== "openrouter") return;
+  if (!providerReadsKeyFromEnv(provider)) return;
   if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
   if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
   throw new Error(
@@ -2495,13 +2508,14 @@ export function assertProviderRunnable(provider: string, label: string): void {
 function resolveProviderAndModel(
   yamlText: string,
   name: string,
+  registry?: ProviderRegistry,
 ): { provider: string; model: string } {
   const bobProvider = readProviderField(yamlText, "name");
   const model = declaredProviderModel(yamlText);
   if (!bobProvider || model === undefined) {
     throw new Error(`bob run ${name}: bob.yaml is missing provider.name and/or provider.model`);
   }
-  const provider = mapBobProviderToPi(bobProvider);
+  const provider = mapBobProviderToPi(bobProvider, registry);
   // The openrouter key is read from the environment AT RUN TIME and never written
   // to bob.yaml or the pi config — so a missing key is a REFUSAL here, before any
   // request is made (bob#183). The check is shared with `bob hire`'s pre-write
@@ -2544,13 +2558,14 @@ function readProviderField(yamlText: string, key: string): string | undefined {
   return undefined;
 }
 
-// Map a bob provider name to pi's provider id: `exe-dev-gateway` is bob's term
-// for "anthropic API shape via the exe.dev gateway"; pi only knows `anthropic`
-// (the gateway baseUrl override lives in .pi-agent/models.json). Exported so
-// onboarding/alignment map a caller's provider override the same way.
-export function mapBobProviderToPi(bobProvider: string): string {
-  if (bobProvider === "exe-dev-gateway") return "anthropic";
-  return bobProvider;
+// Map a bob provider name to pi's provider id, reading the provider registry:
+// `exe-dev-gateway` is bob's term for "anthropic API shape via the exe.dev
+// gateway", so its row's runtime identity is pi's `anthropic` (the gateway
+// baseUrl override lives in .pi-agent/models.json). An undeclared name is its
+// own runtime identity. Exported so onboarding/alignment map a caller's
+// provider override through the same table.
+export function mapBobProviderToPi(bobProvider: string, registry?: ProviderRegistry): string {
+  return resolveRuntimeProviderName(bobProvider, registry);
 }
 
 // Read soul.md (the appended persona). Returns "" when absent so the session
