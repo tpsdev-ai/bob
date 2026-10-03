@@ -96,35 +96,30 @@ describe("T1 — the operator loader validates every row before returning", () =
     },
   );
 
-  it.each(PI_LOGIN_OWNED)("refuses pi-owned identity %s as an operator id or alias", (identity) => {
-    for (const field of ["id", "aliases"]) {
-      const id = field === "id" ? identity : "acme";
-      const aliases = field === "aliases" ? `[${identity}]` : "[]";
-      const path = writeRegistry(
-        `version: 1\nproviders:\n  - id: ${id}\n    aliases: ${aliases}\n    runtime: acme-runtime\n    auth: bob/none\n`,
-      );
-      expect(() => loadProviderRegistry({ path })).toThrow(
-        `row "${id}" ${field} collides with pi-owned identity "${identity}"`,
-      );
-      expect(() => loadProviderRegistry({ path })).toThrow(/Remedy:/);
-    }
-  });
+  it.each(PI_LOGIN_OWNED)(
+    "refuses pi-owned identity %s in every operator name field",
+    (identity) => {
+      for (const field of ["id", "aliases", "runtime"]) {
+        const id = field === "id" ? identity : "acme";
+        const aliases = field === "aliases" ? `[${identity}]` : "[]";
+        const runtime = field === "runtime" ? identity : "acme-runtime";
+        const path = writeRegistry(
+          `version: 1\nproviders:\n  - id: ${id}\n    aliases: ${aliases}\n    runtime: ${runtime}\n    auth: bob/none\n`,
+        );
+        expect(() => loadProviderRegistry({ path })).toThrow(
+          `row "${id}" ${field} collides with pi-owned identity "${identity}"`,
+        );
+        expect(() => loadProviderRegistry({ path })).toThrow(/Remedy:/);
+      }
+    },
+  );
 
-  it("an operator row may alias a pi-owned runtime (a subscription alias), which the doctor needs", () => {
+  it("refuses a pi/login row using pi-owned runtime xai", () => {
     const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: codex-alias\n    aliases: [codex]\n    runtime: openai-codex\n    auth: bob/none\n    endpoint: http://codex.example/v1\n    api: openai-completions\n",
-    );
-    const registry = loadProviderRegistry({ path });
-    expect(registry.find("codex-alias")?.runtime).toBe("openai-codex");
-    expect(registry.find("codex")?.runtime).toBe("openai-codex");
-  });
-
-  it("refuses an operator pi/login row outright", () => {
-    const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme-runtime\n    auth: pi/login\n",
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: xai\n    auth: pi/login\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(
-      /row "acme" auth "pi\/login" is reserved for code-owned declarations.*Remedy:/,
+      /row "acme" runtime collides with pi-owned identity "xai".*Remedy:/,
     );
   });
 
@@ -265,7 +260,7 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
       "version: 1\nproviders:\n  - id: xai-keyed\n    aliases: []\n    runtime: xai\n    auth: bob/env(XAI_KEY)\n    endpoint: https://xai.example/v1\n    api: openai-completions\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(
-      /row "xai-keyed" has no implemented custody for its runtime/,
+      /row "xai-keyed" runtime collides with pi-owned identity "xai".*Remedy:/,
     );
   });
 

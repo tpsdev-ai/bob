@@ -456,19 +456,15 @@ export function validateProviderRecords(records: readonly ProviderRecord[]): voi
     }
     const codeOwned = PROVIDER_RECORDS.some((builtin) => builtin === record);
     if (!codeOwned) {
-      // A row's id and aliases are the names `resolveRuntimeProviderName` looks
-      // up, so a pi-owned name there would remap a pi catalog identity and
-      // refuses. The runtime is the identity the row POINTS AT, never a lookup
-      // name, so an operator may alias a pi-owned runtime (e.g. a subscription
-      // provider) while claiming neither of its names.
       for (const [field, names] of [
         ["id", [record.id]],
         ["aliases", record.aliases],
+        ["runtime", [record.runtime]],
       ] as const) {
         for (const name of names) {
           if (PI_LOGIN_OWNED.some((identity) => identity === name)) {
             throw new ProviderRegistryError(
-              `provider registry: row "${record.id}" ${field} collides with pi-owned identity "${name}". Remedy: choose an id and aliases outside the pi-owned namespace.`,
+              `provider registry: row "${record.id}" ${field} collides with pi-owned identity "${name}". Remedy: choose an id, aliases and runtime outside the pi-owned namespace.`,
             );
           }
         }

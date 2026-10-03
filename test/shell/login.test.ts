@@ -710,42 +710,46 @@ describe("bob#241 — the store read (absence vs. a failed read) and BOM handlin
     expect(subscriptionCheck("subbot")?.status).toBe("ok");
   });
 
-  it("resolves an operator alias for a subscription runtime through the selected registry (bob#298)", () => {
-    // The operator's registry aliases `codex-alias` to pi's subscription runtime
-    // `openai-codex`. On main the doctor maps the name WITHOUT a registry, so the
-    // alias resolves to itself, is outside SUBSCRIPTION_PROVIDERS, and no check
-    // runs; with the selected registry the alias resolves to `openai-codex`.
-    const registry = new ProviderRegistry([
-      ...PROVIDER_RECORDS,
-      {
-        id: "codex-alias-row",
-        aliases: ["codex-alias"],
-        runtime: "openai-codex",
-        auth: { kind: "none" as const },
-        endpoint: "http://codex.example/v1",
-        api: "openai-completions" as const,
-        override: {},
-      },
-    ]);
-    initAgent({
-      name: "subalias",
-      role: "reviewer",
-      provider: "codex-alias",
-      model: "claude-sonnet-4-6",
-      contextWindow: 200_000,
-      agentsRoot,
-      skipFlair: true,
-      registry,
-    });
-    const report = runDoctor({
-      name: "subalias",
-      agentsRoot,
-      homeDir: root,
-      flairKeysDir: join(root, ".flair", "keys"),
-      registry,
-    });
-    const check = report.checks.find((c) => c.name === "subscription auth");
-    expect(check?.status).toBe("fail");
-    expect(check?.fix).toBe("bob login subalias openai-codex");
-  });
+  it.each([false, true])(
+    "a bob/none row ignores a pi subscription credential (stored=%s)",
+    (stored) => {
+      const registry = new ProviderRegistry([
+        ...PROVIDER_RECORDS,
+        {
+          id: "local-row",
+          aliases: ["local-alias"],
+          runtime: "local-runtime",
+          auth: { kind: "none" as const },
+          endpoint: "http://local.example/v1",
+          api: "openai-completions" as const,
+          override: {},
+        },
+      ]);
+      const { agentDir } = initAgent({
+        name: "localbot",
+        role: "reviewer",
+        provider: "local-alias",
+        model: "local-model",
+        contextWindow: 200_000,
+        agentsRoot,
+        skipFlair: true,
+        registry,
+      });
+      writeFileSync(
+        join(agentDir, ".pi-agent", "auth.json"),
+        stored ? oauthJson("openai-codex") : "{}\n",
+        {
+          mode: 0o600,
+        },
+      );
+      const report = runDoctor({
+        name: "localbot",
+        agentsRoot,
+        homeDir: root,
+        flairKeysDir: join(root, ".flair", "keys"),
+        registry,
+      });
+      expect(report.checks.find((c) => c.name === "subscription auth")).toBeUndefined();
+    },
+  );
 });

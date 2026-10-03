@@ -65,7 +65,7 @@ import {
 } from "./bob-yaml.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
-import type { ProviderRegistry } from "./provider-registry.js";
+import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
 import {
   declaredProviderModel,
   effectiveCapabilities,
@@ -303,17 +303,6 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   }
 
-  // bob#241: when bob.yaml's provider name resolves — through the selected
-  // registry, the same table a session uses, so an operator alias maps to the
-  // runtime it points at — to a runtime in SUBSCRIPTION_PROVIDERS (the scope of
-  // this check; see login.ts), the agent's own auth store must hold a
-  // credential for it that passes bob's local credential checks. Two different
-  // failures have two different remedies: no credential that passes bob's local
-  // credential checks is fixed with `bob login <agent> <provider>`; a store
-  // that cannot be read or fails bob's conservative validation (auth.json) is
-  // fixed by repairing that store — neither is a pass. A bob.yaml that cannot be
-  // read or whose provider block cannot be parsed is a FAIL too, fixed by restoring
-  // it. A provider outside that set produces no check at all.
   if (bobYamlReadError !== undefined) {
     // A bob.yaml doctor cannot read is a config error, not a pass: the
     // subscription check cannot be evaluated, so FAIL with the remedy rather
@@ -346,7 +335,11 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       });
     } else if (providerName !== undefined) {
       const piProvider = mapBobProviderToPi(providerName, opts.registry);
-      if (SUBSCRIPTION_PROVIDERS.has(piProvider)) {
+      const row = providerRecord(providerName, opts.registry);
+      if (
+        (row === undefined || row.auth.kind === "login") &&
+        SUBSCRIPTION_PROVIDERS.has(piProvider)
+      ) {
         const sub = subscriptionCredentialCheck({
           name: opts.name,
           provider: piProvider,
