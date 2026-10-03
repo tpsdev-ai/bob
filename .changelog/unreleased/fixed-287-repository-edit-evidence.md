@@ -1,0 +1,1 @@
+- **Repository evidence can satisfy the edit-or-BLOCKED gate.** Closes #287.
