@@ -430,8 +430,10 @@ function contextWindowCheck(yamlPath: string, registry?: ProviderRegistry): Doct
   }
 
   let block: ProviderLimitsBlock;
+  let model: string | undefined;
   try {
     block = readProviderLimits(yamlText, registry);
+    model = declaredProviderModel(yamlText);
   } catch (err) {
     return {
       name,
@@ -441,7 +443,6 @@ function contextWindowCheck(yamlPath: string, registry?: ProviderRegistry): Doct
     };
   }
 
-  const model = declaredProviderModel(yamlText);
   if (model === undefined) {
     // No provider.model to key a window to: a session refuses this bob.yaml for
     // THAT reason (missing provider.model) before any window is read.

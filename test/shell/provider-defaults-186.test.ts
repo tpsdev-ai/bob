@@ -27,15 +27,25 @@ defaults:
 `;
 
 describe("bob#186 slice 2 — the registry's default selection drives the CLI", () => {
+  it("keeps subprocess paths out of generated source", () => {
+    const source = readFileSync(import.meta.path, "utf8");
+    const generatedSource = source
+      .split("\n")
+      .find((line) => line.trimStart().startsWith(["const", "script", "="].join(" ")));
+    expect(generatedSource).toBeDefined();
+    expect(generatedSource).not.toContain("${");
+  });
   it("bob hire passes the operator's selected default to the hire path", () => {
     mkdirSync(join(home, ".config", "bob"), { recursive: true });
     writeFileSync(join(home, ".config", "bob", "providers.yaml"), REGISTRY);
     const runtime = join(import.meta.dir, "../../dist/shell/position-runtime.js");
     const cli = join(import.meta.dir, "../../dist/cli.js");
-    const script = `import { mock } from 'bun:test'; const runtime = await import(${JSON.stringify(runtime)}); mock.module(${JSON.stringify(runtime)}, () => ({ ...runtime, hireAgent: async (opts) => { throw new Error('SELECTED_PROVIDER:' + opts.provider); } })); process.argv = [process.execPath, ${JSON.stringify(cli)}, 'hire', 'candidate', '--as', 'builder', '--context-window=262144']; await import(${JSON.stringify(cli)});`;
+    const script = `import { mock } from 'bun:test'; const paths = JSON.parse(process.env.BOB_TEST_PATHS); const runtime = await import(paths.runtime); mock.module(paths.runtime, () => ({ ...runtime, hireAgent: async (opts) => { throw new Error('SELECTED_PROVIDER:' + opts.provider); } })); process.argv = [process.execPath, paths.cli, 'hire', 'candidate', '--as', 'builder', '--context-window=262144']; await import(paths.cli);`;
     let failure: unknown;
     try {
-      spawnNode(["-e", script], { env: { ...process.env, HOME: home } });
+      spawnNode(["-e", script], {
+        env: { ...process.env, HOME: home, BOB_TEST_PATHS: JSON.stringify({ runtime, cli }) },
+      });
     } catch (err) {
       failure = err;
     }

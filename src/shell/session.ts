@@ -79,6 +79,7 @@ import {
   type StreamFunction,
 } from "./model-budget.js";
 import {
+  assertProviderEndpointAllowed,
   DEFAULT_PROVIDER_REGISTRY,
   type ProviderRegistry,
   ProviderRegistryError,
@@ -1290,6 +1291,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
           "bob: bob/none requires an OpenAI-compatible model with a matching endpoint",
         );
       }
+      assertProviderEndpointAllowed(row, endpoint);
       installBaseUrlTransport(modelRuntime, config.provider, endpoint);
     }
     // openrouter is bob's OWN provider (round 3): construct it in memory and

@@ -101,11 +101,6 @@ export interface ProviderRecord {
   readonly compatibility?: readonly string[];
 }
 
-// bob's provider surface. `ollama` is listed because init's scaffold emits the
-// ollama.com endpoint for it, even though it was not one of the names
-// ProviderConfig's union narrowed to. `ollama`, `ollama-newton` and `omlx` are
-// keyless (#290) with an explicit override profile; openrouter is the only row
-// whose custody is implemented this slice.
 export const PROVIDER_RECORDS = [
   {
     id: "ollama-cloud",
@@ -121,7 +116,7 @@ export const PROVIDER_RECORDS = [
     configName: false,
     aliases: [],
     runtime: "ollama",
-    endpoint: "https://ollama.com/v1",
+    endpoint: "http://localhost:11434/v1",
     api: PROVIDER_API_OPENAI_COMPLETIONS,
     auth: { kind: "none" },
     override: { excludeHosts: ["ollama.com"] },
@@ -349,6 +344,7 @@ function validateRowFields(row: ProviderRecord): void {
         `provider registry: row "${row.id}" endpoint must not contain a query or fragment.`,
       );
     }
+    assertProviderEndpointAllowed(row, row.endpoint);
     if (keyed) {
       if (url.protocol !== "https:") {
         throw new ProviderRegistryError(
@@ -365,6 +361,15 @@ function validateRowFields(row: ProviderRecord): void {
         `provider registry: row "${row.id}" endpoint must be HTTP or HTTPS.`,
       );
     }
+  }
+}
+
+export function assertProviderEndpointAllowed(row: ProviderRecord, endpoint: string): void {
+  const host = new URL(endpoint).hostname.replace(/\.+$/, "");
+  if (row.auth.kind === "none" && (row.override?.excludeHosts ?? []).includes(host)) {
+    throw new ProviderRegistryError(
+      `provider registry: row "${row.id}" endpoint host is excluded.`,
+    );
   }
 }
 

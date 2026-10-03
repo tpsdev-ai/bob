@@ -55,6 +55,7 @@ import {
 } from "./shell/index.js";
 import { applyModelScaffold } from "./shell/models.js";
 import {
+  DEFAULT_PROVIDER_REGISTRY,
   defaultProviderName,
   loadProviderRegistry,
   type ProviderRegistry,
@@ -584,7 +585,18 @@ async function main(): Promise<number> {
     throw err;
   }
   try {
-    const registry = loadProviderRegistry();
+    const registry = [
+      "models",
+      "onboard",
+      "align",
+      "init",
+      "run",
+      "launch",
+      "doctor",
+      "hire",
+    ].includes(args.command)
+      ? loadProviderRegistry()
+      : DEFAULT_PROVIDER_REGISTRY;
     const adminPassFromEnv = takeFlairAdminPassFromEnv();
     switch (args.command) {
       case "models": {

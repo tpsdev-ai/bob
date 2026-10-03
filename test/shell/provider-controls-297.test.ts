@@ -484,12 +484,83 @@ describe("provider controls", () => {
       "version: 1\nproviders:\n  - id: invalid\n    aliases: []\n    runtime: invalid\n    auth: unknown\n",
     );
     const cli = join(import.meta.dir, "../../dist/cli.js");
-    const script = `process.env = new Proxy(process.env, { get(target, key) { if (key === 'FLAIR_ADMIN_PASS') throw new Error('CREDENTIAL_READ_297'); return Reflect.get(target, key); } }); process.argv = [process.execPath, ${JSON.stringify(cli)}, 'help']; await import(${JSON.stringify(cli)});`;
+    const script = `process.env = new Proxy(process.env, { get(target, key) { if (key === 'FLAIR_ADMIN_PASS') throw new Error('CREDENTIAL_READ_297'); return Reflect.get(target, key); } }); process.argv = [process.execPath, ${JSON.stringify(cli)}, 'onboard', 'control']; await import(${JSON.stringify(cli)});`;
     const failure = errorText(() =>
       spawnNode(["-e", script], { env: { ...process.env, HOME: home } }),
     );
     expect(failure).toContain("provider registry");
     expect(failure).not.toContain("CREDENTIAL_READ_297");
+  });
+
+  it.each(["help", "down", "restart", "up", "install-service", "login", "logout", "position"])(
+    "%s reaches its command handler with an invalid registry",
+    (command) => {
+      const home = join(root, "home");
+      mkdirSync(join(home, ".config", "bob"), { recursive: true });
+      writeFileSync(join(home, ".config", "bob", "providers.yaml"), "providers: [");
+      let output: string;
+      try {
+        output = spawnNode([join(import.meta.dir, "../../dist/cli.js"), command], {
+          env: { ...process.env, HOME: home },
+        });
+      } catch (err) {
+        output = (err as Error).message;
+      }
+      expect(output).not.toContain("provider registry");
+      expect(output).toContain(command === "help" ? "Usage:" : `bob ${command}:`);
+    },
+  );
+
+  it("keyless ollama defaults to a local endpoint", () => {
+    expect(new ProviderRegistry().find("ollama")?.endpoint).toBe("http://localhost:11434/v1");
+  });
+
+  it.each(["https://ollama.com/v1", "https://ollama.com./v1"])(
+    "rejects an excluded keyless default endpoint %s by row name",
+    (endpoint) => {
+      expect(
+        () =>
+          new ProviderRegistry([{ ...row, endpoint, override: { excludeHosts: ["ollama.com"] } }]),
+      ).toThrow(/keyless-row.*excluded/);
+    },
+  );
+
+  it.each(["https://ollama.com/v1", "https://ollama.com./v1"])(
+    "refuses an excluded keyless endpoint from models.json %s",
+    async (endpoint) => {
+      const registry = new ProviderRegistry([
+        { ...row, endpoint: undefined, override: { excludeHosts: ["ollama.com"] } },
+      ]);
+      initAgent({ ...options(), registry });
+      const { config, policy } = resolveRunConfig({ name: "control", agentsRoot: root, registry });
+      const modelsPath = join(config.piAgentDir, "models.json");
+      const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+      models.providers[row.runtime].baseUrl = endpoint;
+      writeFileSync(modelsPath, JSON.stringify(models));
+      const factory = createBobRuntimeFactory({ config, policy, registry });
+      await expect(
+        factory({ sessionManager: SessionManager.inMemory(config.cwd) }),
+      ).rejects.toThrow(/keyless-row.*excluded/);
+    },
+  );
+
+  it.each(["[one, two]", "{id: one}"])("doctor reports a non-scalar model %s", (model) => {
+    const registry = new ProviderRegistry([...PROVIDER_RECORDS, row]);
+    const result = initAgent({ ...options(), registry });
+    const path = join(result.agentDir, "bob.yaml");
+    writeFileSync(path, readFileSync(path, "utf8").replace("model: m", `model: ${model}`));
+    const report = runDoctor({
+      name: "control",
+      agentsRoot: root,
+      homeDir: root,
+      pathEnv: "",
+      registry,
+    });
+    expect(report.checks.find((check) => check.name === "provider.context_window")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("provider.model must be a scalar"),
+      fix: expect.stringContaining("provider:"),
+    });
   });
 
   it("scaffolds do not invent an adapter when the row declares none", () => {
