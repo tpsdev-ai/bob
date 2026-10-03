@@ -614,6 +614,43 @@ describe("publish — checks gate the push", () => {
       },
     });
     expect(out.reason).toBe("materialized_tree_changed");
+    expect(out.message).toContain("changed tracked source in the materialized tree");
+    expect(out.message).not.toContain("could not be verified");
+    expect(remoteOid(fx)).toBe(before);
+  });
+
+  it("a post-check verification failure refuses with a could-not-be-verified message", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["probe"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const before = remoteOid(fx);
+    let checked = false;
+    const out = await publish({
+      binding: b,
+      params: params(fx, built),
+      stateRoot: fx.stateRoot,
+      deps: {
+        git: (args, inv) =>
+          checked && args[0] === "update-index"
+            ? { status: 128, stdout: "", stderr: "refresh failed" }
+            : realGit(args, inv),
+        runCheck: async () => {
+          checked = true;
+          return {
+            outcome: "exited",
+            exit_code: 0,
+            cleanup_state: "group_empty",
+            output_complete: true,
+          };
+        },
+      },
+    });
+    expect(out.reason).toBe("materialized_tree_changed");
+    expect(out.message).toContain("could not be verified after");
+    expect(out.message).not.toContain("changed tracked source");
     expect(remoteOid(fx)).toBe(before);
   });
 
