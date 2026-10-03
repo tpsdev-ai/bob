@@ -5,6 +5,7 @@ import {
 } from "@earendil-works/pi-ai/api/openai-completions";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { type ProviderRequestPolicy, withStreamTimeouts } from "./provider-request-policy.js";
+import type { ProviderTurnBudget } from "./provider-turn-budget.js";
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -13,6 +14,7 @@ export function installBaseUrlTransport(
   provider: string,
   baseUrl: string,
   request?: ProviderRequestPolicy,
+  budget?: ProviderTurnBudget,
 ): void {
   const originalAuth = runtime.getAuth.bind(runtime);
   runtime.getAuth = (async (selected, options) => {
@@ -65,11 +67,41 @@ export function installBaseUrlTransport(
     const {
       timeoutMs: _droppedTimeout,
       maxRetries: _droppedRetries,
+      maxTokens: _droppedMaxTokens,
+      reasoning: _droppedReasoning,
       ...rest
     } = (options ?? {}) as Record<string, unknown>;
-    return delegate({ ...model, headers: undefined } as never, context, {
+    // bob#185 item 2: the row's per-turn budget replaces the request's output
+    // cap and thinking level. The cap is pi's `maxTokens`, which the OpenAI-
+    // compatible adapter sends in the provider's own field; a lower per-agent
+    // output cap (model.maxTokens) still wins. A reasoning level needs a model
+    // pi treats as reasoning-capable with reasoning effort enabled — the row's
+    // keyless model is otherwise scaffolded non-reasoning — so the level is
+    // handed to pi as its own thinking level and pi shapes it for the provider.
+    const modelCap = (model as { maxTokens?: unknown }).maxTokens;
+    const turnCap =
+      budget === undefined
+        ? undefined
+        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
+          ? Math.min(budget.maxOutputTokens, modelCap)
+          : budget.maxOutputTokens;
+    const delegateModel =
+      budget === undefined
+        ? ({ ...model, headers: undefined } as never)
+        : ({
+            ...model,
+            headers: undefined,
+            reasoning: budget.reasoning !== "off",
+            compat: {
+              ...((model as { compat?: Record<string, unknown> }).compat ?? {}),
+              supportsDeveloperRole: false,
+              supportsReasoningEffort: true,
+            },
+          } as never);
+    return delegate(delegateModel, context, {
       ...rest,
       ...(request !== undefined ? { timeoutMs: undefined, maxRetries: request.maxRetries } : {}),
+      ...(budget !== undefined ? { maxTokens: turnCap, reasoning: budget.reasoning } : {}),
       apiKey: BASE_URL_PLACEHOLDER,
       headers: undefined,
       env: {},
