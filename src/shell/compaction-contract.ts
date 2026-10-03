@@ -13,10 +13,10 @@
 //     Silence names whether a compaction was seen (`settled_after_compaction`)
 //     or not (`no_final_message`); a message that exists but misses a declared
 //     shape gets its own reason (`final_shape_mismatch`);
-//   * a BEST-EFFORT "what remains" note after non-aborted compactions, except
+//   * an attempt to send a BEST-EFFORT "what remains" note after non-aborted compactions, except
 //     after `agent_end` with nonempty text, stopReason "stop", no tool calls,
 //     and compaction willRetry false: then the final text survives and no note
-//     is sent (bob#179).
+//     is attempted (bob#179).
 //
 //     There is no direct success gate on note delivery.
 //
@@ -298,7 +298,7 @@ export interface CompactionObserver {
  * Observe the session event stream: track the compaction count and the final
  * message boundary, capture "what remains" as it goes (the agent's last stated
  * plan and the last few tool calls), and — when an `inject` seam is given —
- * send a best-effort note on non-aborted compaction, except after `agent_end`
+ * attempt to send a best-effort note on non-aborted compaction, except after `agent_end`
  * with nonempty text, stopReason "stop", no tool calls, and willRetry false.
  *
  * A failed note is LOGGED and nothing else happens. There is no verdict, no
