@@ -1,13 +1,22 @@
 // publish (bob#275, S2b): candidate checks and recoverable publication.
 //
 // Local git fixtures, no network: a real builder repository, a real bare remote
-// in the test's temp dir, and a fake PR service. Cases drive `publish` directly
+// in the test's temp dir. Cases drive `publish` directly
 // or through the tool the capability registers.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,11 +27,11 @@ import {
 import {
   type CheckReport,
   type CheckRunner,
-  type PrService,
   type PublishParams,
   publish,
   publishJournalPath,
 } from "../../../src/capabilities/work/index.js";
+import { writeJournalAtomic } from "../../../src/capabilities/work/publish.js";
 import type { TaskBinding } from "../../../src/capabilities/work/task-binding.js";
 
 let scratch: string;
@@ -749,8 +758,7 @@ describe("publish — recovery and identity", () => {
     const pushed = remoteOid(fx);
     expect(pushed).not.toBeNull();
     expect(remoteCommitCount(fx)).toBe(2);
-    // The durable intent pins the exact commit before the push, so recovery has
-    // the identity to reconcile against rather than a regenerated one.
+    // The intent pins the commit before the push.
     const journal = JSON.parse(
       readFileSync(publishJournalPath(fx.stateRoot, b.publication_id), "utf8"),
     ) as { commit_oid?: string; phase?: string };
@@ -795,7 +803,7 @@ describe("publish — recovery and identity", () => {
     expect(remoteCommitCount(fx)).toBe(2);
   });
 
-  it("concurrent retries for one publication identity serialize; one commit lands", async () => {
+  it("in-process retries for one publication identity serialize; one commit lands", async () => {
     const fx = makeFixture();
     seedRemote(fx);
     const b = binding(fx);
@@ -874,154 +882,138 @@ describe("publish — recovery and identity", () => {
   });
 });
 
-describe("publish — PR creation and reconciliation", () => {
-  function fakePr(): {
-    service: PrService;
-    creates: number;
-    finds: number;
-    urls: string[];
-  } {
-    const state = { creates: 0, finds: 0, urls: [] as string[] };
-    let existing: string | null = null;
-    const service: PrService = {
-      async find() {
-        state.finds += 1;
-        return existing === null ? null : { url: existing };
-      },
-      async create(_req) {
-        state.creates += 1;
-        existing = `https://example.test/pr/${state.creates}`;
-        state.urls.push(existing);
-        return { url: existing };
-      },
-    };
-    return {
-      service,
-      get creates() {
-        return state.creates;
-      },
-      get finds() {
-        return state.finds;
-      },
-      urls: state.urls,
-    };
+describe("publish — storage and authority", () => {
+  function candidate() {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { check_commands: ["check"] });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    return { fx, b, built };
   }
 
-  it("creates the authorized PR after the push and reports its URL", async () => {
-    const fx = makeFixture();
-    seedRemote(fx);
-    const b = binding(fx, { pr: { base: "main" } });
-    const built = buildCandidate(fx, b, (r) =>
-      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
-    );
-    const pr = fakePr();
+  it("rejects traversal IDs before Git or storage access", async () => {
+    const fx = {
+      repo: "repo",
+      bare: "bare",
+      artifactRoot: "artifacts",
+      base: "a".repeat(40),
+      stateRoot: join(scratch, "absent"),
+    };
+    const b = binding(fx);
+    let calls = 0;
+    const deps = {
+      git: () => {
+        calls++;
+        throw new Error("unexpected git");
+      },
+    };
+    for (const id of ["../escape", "/absolute", "a/b", "a\\b", ".", "a\0b"]) {
+      const badCandidate = await publish({
+        binding: b,
+        params: { candidate_id: id, commit_message: "x" },
+        stateRoot: fx.stateRoot,
+        deps,
+      });
+      expect(badCandidate.reason).toBe("invalid_request");
+      const badPublication = await publish({
+        binding: { ...b, publication_id: id },
+        params: { candidate_id: "a".repeat(40), commit_message: "x" },
+        stateRoot: fx.stateRoot,
+        deps,
+      });
+      expect(badPublication.reason).toBe("invalid_binding");
+    }
+    expect(calls).toBe(0);
+    expect(existsSync(fx.stateRoot)).toBe(false);
+  });
+
+  it("pins the fetch endpoint even when the named remote has a different pushurl", async () => {
+    const { fx, b, built } = candidate();
+    const other = join(scratch, "other.git");
+    git(["init", "-q", "--bare", other], scratch);
+    git(["remote", "add", "origin", fx.bare], fx.repo);
+    git(["remote", "set-url", "--push", "origin", other], fx.repo);
+    b.destination.remote = "origin";
     const out = await publish({
       binding: b,
-      params: params(fx, built, { pr: { title: "T", body: "B" } }),
+      params: params(fx, built),
       stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: pr.service },
+      deps: {
+        runCheck: async () => {
+          git(["config", `url.${other}.pushInsteadOf`, fx.bare], fx.repo);
+          return okCheck("", "");
+        },
+      },
     });
     expect(out.status).toBe("published");
-    expect(out.pr_url).toBe("https://example.test/pr/1");
-    expect(pr.creates).toBe(1);
+    expect(remoteOid(fx)).toBe(out.commit_oid);
+    expect(git(["ls-remote", other], fx.repo)).toBe("");
   });
 
-  it("a PR request without authorization refuses before any push", async () => {
-    const fx = makeFixture();
-    seedRemote(fx);
-    const b = binding(fx);
-    const built = buildCandidate(fx, b, (r) =>
-      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
-    );
-    const before = remoteOid(fx);
-    const pr = fakePr();
+  it("refuses URL rewrite configuration", async () => {
+    const { fx, b, built } = candidate();
+    git(["config", "url./redirect.pushInsteadOf", fx.bare], fx.repo);
     const out = await publish({
       binding: b,
-      params: params(fx, built, { pr: { title: "T", body: "B" } }),
+      params: params(fx, built),
       stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: pr.service },
+      deps: { runCheck: okCheck },
     });
-    expect(out.reason).toBe("pr_unauthorized");
-    expect(remoteOid(fx)).toBe(before);
-    expect(pr.creates).toBe(0);
+    expect(out.reason).toBe("invalid_binding");
+    expect(remoteOid(fx)).toBe(fx.base);
   });
 
-  it("recovers an existing PR when the create response was lost, without a second create", async () => {
-    const fx = makeFixture();
-    seedRemote(fx);
-    const b = binding(fx, { pr: { base: "main" } });
-    const built = buildCandidate(fx, b, (r) =>
-      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
-    );
-    const state = { creates: 0, finds: 0 };
-    let existing: string | null = null;
-    const service: PrService = {
-      async find() {
-        state.finds += 1;
-        return existing === null ? null : { url: existing };
-      },
-      async create() {
-        state.creates += 1;
-        existing = "https://example.test/pr/lost";
-        throw new Error("response lost");
-      },
-    };
-    const first = await publish({
-      binding: b,
-      params: params(fx, built, { pr: { title: "T", body: "B" } }),
-      stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: service },
-    });
-    expect(first.status).toBe("indeterminate");
-    expect(state.creates).toBe(1);
-    // Retry: find now returns the PR the lost create made.
-    const service2: PrService = {
-      async find() {
-        state.finds += 1;
-        return existing === null ? null : { url: existing };
-      },
-      async create() {
-        state.creates += 1;
-        existing = "https://example.test/pr/lost";
-        return { url: existing };
-      },
-    };
-    const second = await publish({
-      binding: b,
-      params: params(fx, built, { pr: { title: "T", body: "B" } }),
-      stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: service2 },
-    });
-    expect(second.status).toBe("published");
-    expect(second.pr_url).toBe("https://example.test/pr/lost");
-    expect(state.creates).toBe(1);
-  });
-
-  it("an inconclusive reconciliation is indeterminate, with no second create request", async () => {
-    const fx = makeFixture();
-    seedRemote(fx);
-    const b = binding(fx, { pr: { base: "main" } });
-    const built = buildCandidate(fx, b, (r) =>
-      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
-    );
-    let creates = 0;
-    const service: PrService = {
-      async find() {
-        return "unknown";
-      },
-      async create() {
-        creates += 1;
-        return { url: "https://example.test/pr/x" };
-      },
+  it("refuses pr by name before storage or push even with a PR binding", async () => {
+    const fx = {
+      repo: "repo",
+      bare: "bare",
+      artifactRoot: "artifacts",
+      base: "a".repeat(40),
+      stateRoot: join(scratch, "absent"),
     };
     const out = await publish({
-      binding: b,
-      params: params(fx, built, { pr: { title: "T", body: "B" } }),
+      binding: binding(fx, { pr: { base: "main" } }),
+      params: {
+        candidate_id: "a".repeat(40),
+        commit_message: "x",
+        pr: { title: "T", body: "B" },
+      } as PublishParams,
       stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: service },
     });
-    expect(out.status).toBe("indeterminate");
-    expect(out.reason).toBe("pr_reconcile_unknown");
-    expect(creates).toBe(0);
+    expect(out.reason).toBe("pr_unsupported");
+    expect(out.message).toContain("PR creation is a later slice");
+    expect(existsSync(fx.stateRoot)).toBe(false);
+  });
+
+  it("syncs journal bytes before rename and the directory after rename", () => {
+    const root = join(scratch, "state");
+    mkdirSync(root, { mode: 0o700 });
+    mkdirSync(join(root, "publications"), { mode: 0o700 });
+    const path = publishJournalPath(root, "pub");
+    const synced: string[] = [];
+    writeJournalAtomic(path, "intent", (fd) => {
+      const isFile = fstatSync(fd).isFile();
+      synced.push(isFile ? "file" : "directory");
+      if (isFile) expect(existsSync(path)).toBe(false);
+      else expect(readFileSync(path, "utf8")).toBe("intent");
+      fsyncSync(fd);
+    });
+    expect(synced).toEqual(["file", "directory", "directory"]);
+  });
+
+  it("a failed file sync leaves the old journal intact", () => {
+    const root = join(scratch, "state");
+    mkdirSync(root, { mode: 0o700 });
+    mkdirSync(join(root, "publications"), { mode: 0o700 });
+    const path = publishJournalPath(root, "pub");
+    writeFileSync(path, "old");
+    expect(() =>
+      writeJournalAtomic(path, "new", () => {
+        throw new Error("sync failed");
+      }),
+    ).toThrow("sync failed");
+    expect(readFileSync(path, "utf8")).toBe("old");
   });
 });

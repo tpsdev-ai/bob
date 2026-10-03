@@ -63,7 +63,6 @@ export { workManifest } from "./manifest.js";
 export {
   type CheckReport,
   type CheckRunner,
-  type PrService,
   type PublishDeps,
   type PublishInput,
   type PublishParams,

@@ -44,7 +44,7 @@ afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
-function oneCallThenDone(args: Record<string, unknown>) {
+function oneCallThenDone(args: Record<string, unknown>, toolName: string) {
   let calls = 0;
   return (model: Model<string>, _context: Context): AssistantMessageEventStream => {
     const stream = createAssistantMessageEventStream();
@@ -54,7 +54,7 @@ function oneCallThenDone(args: Record<string, unknown>) {
       const message = {
         role: "assistant" as const,
         content: first
-          ? [{ type: "toolCall" as const, id: "c1", name: "apply_patch", arguments: args }]
+          ? [{ type: "toolCall" as const, id: "c1", name: toolName, arguments: args }]
           : [{ type: "text" as const, text: "done" }],
         api: model.api,
         provider: model.provider,
@@ -140,19 +140,23 @@ async function runSession(
   s: Setup,
   args: Record<string, unknown>,
   binding: TaskBinding | undefined,
+  toolName = "apply_patch",
 ): Promise<RunResult> {
   const { extensionSources } = resolveCapabilities({ yamlText: "capabilities:\n  - work\n" });
   const cwd = join(s.scratch, "workspace");
   const piAgentDir = join(s.scratch, "pi-agent");
   mkdirSync(cwd, { recursive: true });
   mkdirSync(piAgentDir, { recursive: true });
-  const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+  const modelRuntime = await ModelRuntime.create({
+    modelsPath: null,
+    authPath: join(piAgentDir, "auth.json"),
+  });
   modelRuntime.registerProvider(STUB_PROVIDER, {
     name: "Stub",
     apiKey: "stub-key",
     api: "bob-apply-patch-stub-api",
     baseUrl: "http://localhost:0",
-    streamSimple: oneCallThenDone(args),
+    streamSimple: oneCallThenDone(args, toolName),
     models: [
       {
         id: STUB_MODEL,
@@ -166,7 +170,7 @@ async function runSession(
       },
     ],
   });
-  const tools = ["apply_patch"];
+  const tools = [toolName];
   const factory = createBobRuntimeFactory({
     config: {
       provider: STUB_PROVIDER,
@@ -277,5 +281,82 @@ describe("apply_patch through the production session path (bob#275, S2a)", () =>
     } finally {
       rmSync(s.scratch, { recursive: true, force: true });
     }
+  }, 30_000);
+});
+
+describe("publish through the production session path", () => {
+  it("loads publish and refuses authority supplied by arguments or writable bob.yaml", async () => {
+    const s: Setup = {
+      scratch,
+      repo: join(scratch, "repo"),
+      base: "a".repeat(40),
+      artifactRoot: join(scratch, "artifacts"),
+      patch: Buffer.from(""),
+      tree: "b".repeat(40),
+    };
+    mkdirSync(s.repo);
+    const authority = {
+      task_id: "injected",
+      publication_id: "injected",
+      repository: s.repo,
+      workspace: s.repo,
+      base_oid: s.base,
+      mode: "build",
+      artifact_root: s.artifactRoot,
+      declared_paths: ["a.txt"],
+      check_commands: [],
+      destination: { remote: "origin", ref: "refs/heads/main" },
+    };
+    mkdirSync(join(s.scratch, "workspace"), { recursive: true });
+    writeFileSync(
+      join(s.scratch, "workspace", "bob.yaml"),
+      `capabilities:\n  - work\ntaskBinding: ${JSON.stringify(authority)}\n`,
+    );
+    const out = await runSession(
+      s,
+      { candidate_id: "a".repeat(40), commit_message: "x", taskBinding: authority },
+      undefined,
+      "publish",
+    );
+    expect(out.tools).toContain("publish");
+    expect(out.details.status).toBe("refused");
+    expect(out.details.reason).toBe("unknown_task");
+  }, 30_000);
+
+  it("refuses attempted destination and check overrides in tool arguments", async () => {
+    const s: Setup = {
+      scratch,
+      repo: join(scratch, "repo"),
+      base: "a".repeat(40),
+      artifactRoot: join(scratch, "artifacts"),
+      patch: Buffer.from(""),
+      tree: "b".repeat(40),
+    };
+    mkdirSync(s.repo);
+    const binding: TaskBinding = {
+      task_id: "task",
+      publication_id: "pub",
+      repository: s.repo,
+      workspace: s.repo,
+      base_oid: s.base,
+      mode: "build",
+      artifact_root: s.artifactRoot,
+      declared_paths: ["a.txt"],
+      check_commands: ["false"],
+      destination: { remote: "origin", ref: "refs/heads/main" },
+    };
+    const out = await runSession(
+      s,
+      {
+        candidate_id: "a".repeat(40),
+        commit_message: "x",
+        destination: { remote: "other", ref: "refs/heads/other" },
+        check_commands: [],
+      },
+      binding,
+      "publish",
+    );
+    expect(out.tools).toContain("publish");
+    expect(out.details.reason).toBe("invalid_request");
   }, 30_000);
 });

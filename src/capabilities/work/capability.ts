@@ -79,7 +79,7 @@ export interface WireWorkOptions extends JobManagerOptions {
   applyPatchDeps?: ApplyPatchDeps;
   // Seams for publish. Production supplies only the executor through
   // `runCheck` (built from the JobManager here); a test may override the git
-  // runner, the check runner, the PR service and the recovery hooks.
+  // runner, the check runner and the recovery hooks.
   publishDeps?: PublishDeps;
 }
 
@@ -121,13 +121,8 @@ const APPLY_PATCH_DESCRIPTION =
   `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
 
 const PUBLISH_DESCRIPTION =
-  "Publish a stored candidate to the task's authorized ref. " +
-  "Takes candidate_id, commit_message and an optional pr { title, body } (allowed only when the task authorizes PR creation). " +
-  'Repository, parent commit, destination, declared paths, required checks, expected tree and publication identity come from the task binding; there is no force, skip-check, scope-override or caller-supplied "tested" argument. ' +
-  "It resolves the candidate from tool-owned storage and checks its task, repository and base association; computes the complete changed-path set and refuses any out-of-scope path; in apply mode requires the candidate tree to BE the task's expected tree; pins a commit object; materializes the candidate in a fresh, tool-owned checkout; runs every task-declared check through the run executor, verifying the materialized tree before and after each command; and pushes the pinned commit fast-forward to the authorized ref only, with the expected old ref enforced atomically. " +
-  "Publication recovery is durable: an intent journal outside the candidate repository is written before any external effect, so a retry resumes or refuses; after an interrupted push it inspects the authoritative remote ref and either records the push as successful, retries the same commit under the same fast-forward conditions, or reports indeterminate. " +
-  "Returns { publication_id, candidate_id, tree_oid, commit_oid, status, phase, push_state, pr_url?, reason? }, where status is published, refused or indeterminate and push_state is confirmed present, confirmed absent or unknown. " +
-  "Refuses detected changes to the staging directory, source or destination; a concurrent same-user writer can still race rename until builder confinement (bob#189).";
+  "Publish a candidate using the launcher's task binding. Takes candidate_id and commit_message. " +
+  "Required checks run on a materialized candidate through the run executor. PR creation is a later slice.";
 
 function publishResultText(r: PublishResult): string {
   const head =
@@ -143,11 +138,7 @@ function publishResultText(r: PublishResult): string {
     `commit_oid: ${r.commit_oid ?? "(none)"}`,
     `status: ${r.status} · phase: ${r.phase} · push_state: ${r.push_state}`,
   ];
-  if (r.pr_url !== undefined) lines.push(`pr_url: ${r.pr_url}`);
   if (r.status !== "published") lines.push(`reason: ${r.reason ?? "(none)"}`);
-  lines.push(
-    "Refuses detected changes to the staging directory, source or destination; a concurrent same-user writer can still race rename until builder confinement (bob#189).",
-  );
   return lines.join("\n");
 }
 
@@ -270,7 +261,13 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
   const runCheck: CheckRunner =
     opts.publishDeps?.runCheck ??
     (async (command, cwd): Promise<CheckReport> => {
-      const job = await manager.start({ command }, cwd);
+      const job = await manager.start({ command }, cwd, {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: cwd,
+        TMPDIR: cwd,
+        LANG: "C",
+        LC_ALL: "C",
+      });
       await job.done;
       const r = manager.report(job);
       return {
@@ -465,12 +462,6 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         minLength: 1,
         description: "The commit message for the published change.",
       }),
-      pr: Type.Optional(
-        Type.Object({
-          title: Type.String({ minLength: 1, description: "The PR title." }),
-          body: Type.String({ description: "The PR body." }),
-        }),
-      ),
     }),
     async execute(_id, params) {
       const outcome = await publish({

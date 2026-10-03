@@ -128,63 +128,31 @@ agent drops it unless its role permits resident writers.
 
 ## publish and publication recovery (bob#275, S2b)
 
-`publish` is the tool-owned path from a stored candidate to a remote commit. It
-takes `candidate_id`, `commit_message` and an optional `pr: { title, body }`
-(allowed only when the task binding authorizes a PR destination). Repository,
-parent commit, destination, declared paths, required checks, expected tree and
-publication identity all come from the task binding; there is no force,
-skip-check, scope-override or caller-supplied "tested" argument.
+`publish` takes `candidate_id` and `commit_message`; `pr` refuses with
+`pr_unsupported` because PR creation is a later slice.
 
-**What it checks.** It resolves the candidate from `<state dir>/candidates/` and
-verifies its task, repository, base and publication association
-(`candidate_unknown`, `candidate_mismatch`). It recomputes the complete
-changed-path set between the pinned base and the candidate tree and refuses any
-path outside the task's `declared_paths` (`scope_violation`) — a declared path
-is a literal file or a directory prefix matched at a component boundary, and
-both sides of a rename are checked. In `apply` mode the candidate tree must BE
-the task's `expected_tree_oid` (`expected_tree_mismatch`), not merely an
-equivalent diff.
+Candidates are read from `<state dir>/candidates/` after ID and directory checks.
+The record must match its content-derived ID and the task binding.
+Publication checks scope and the expected tree, materializes the candidate,
+and runs the required commands through the executor with an environment allowlist.
+A nonzero exit, timeout, cancellation, missing exit status, uncertain cleanup,
+incomplete capture or changed tracked source refuses publication.
 
-**What it does.** It pins a commit object (tree, parent, message,
-author/committer metadata) with `git hash-object -t commit -w`, materializes the
-candidate in a fresh tool-owned checkout, and runs every task-declared check
-through the `run` executor, verifying the materialized tree before and after each
-command. A missing check executor, a nonzero exit, a timeout, a cancellation, a
-missing exit status, uncertain cleanup or an incomplete capture refuses
-publication and pushes nothing; a check that changes the materialized source tree
-refuses with `materialized_tree_changed`. It then pushes the pinned commit
-fast-forward to
-the authorized ref only, with the expected old ref enforced atomically
-(`--force-with-lease`); a conflicting or raced ref refuses (`remote_diverged`,
-`push_rejected`) and is never rebased, amended, merged or forced. Creating an
-absent ref requires `destination.create: true` in the binding.
+The journal pins the binding, resolved endpoint and commit before pushing.
+Recovery reuses passing checks only for the same authority and candidate.
+A missing executor refuses when checks still need to run.
+The resolved endpoint is used for both remote inspection and push; URL rewrites refuse.
+Pushes require a fast-forward and an atomic expected-ref match; creating an absent
+ref requires `destination.create: true`.
 
-**Publication recovery.** An intent journal (`<state dir>/publications/
-<publication_id>.json`) is written before any external effect, so a retry
-resumes or refuses; reusing a publication identity with different candidate
-content or parameters refuses (`publication_conflict`). After an interrupted
-push it inspects the authoritative remote ref: if it equals the persisted commit
-it records the push as successful; if it is absent and authorized it retries the
-same commit
-under the same fast-forward conditions; a conflicting ref refuses; an
-unavailable or inconclusive remote returns `indeterminate`. A PR create is
-reconciled by a `bob-publication:<publication_id>` marker before another create
-is issued; an inconclusive reconciliation returns `indeterminate`.
+Journal writes sync the file, rename it, then sync the directory and state root.
+In-process retries queue; another process holding the publication lock causes
+`publication_locked`. A crash can leave a lock requiring operator removal after
+confirming the publisher has stopped.
+A concurrent same-user writer can still race pathname operations (bob#189).
 
-**Result.** `{ publication_id, candidate_id, tree_oid, commit_oid, status,
-phase, push_state, pr_url?, reason? }`, where `status` is `published`, `refused`
-or `indeterminate` and `push_state` is `confirmed_present`, `confirmed_absent`
-or `unknown`. `published` is reported only after the remote commit (and any
-requested PR) is confirmed. Refusals are `unknown_task`, `invalid_binding`,
-`invalid_request`, `candidate_unknown`, `candidate_mismatch`, `scope_violation`,
-`expected_tree_mismatch`, `check_*`, `materialize_failed`,
-`materialized_tree_changed`, `remote_diverged`, `remote_absent_unauthorized`,
-`push_rejected`, `push_failed`, `pr_unauthorized`, `pr_service_unavailable`,
-`publication_conflict`, `storage_failed`.
-
-Like `apply_patch`, `publish` refuses detected changes to the staging directory,
-source or destination; a concurrent same-user writer can still race rename until
-builder confinement (bob#189). Its `TOOL_EFFECTS` row is `writer`.
+The result includes `status` (`published`, `refused` or `indeterminate`),
+`commit_oid`, `phase`, `push_state` and a refusal `reason` when applicable.
 
 ## Enabling it
 

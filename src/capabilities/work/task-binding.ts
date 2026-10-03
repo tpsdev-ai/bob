@@ -61,6 +61,8 @@ export class TaskBindingError extends Error {
   readonly reason = "invalid_binding" as const;
 }
 
+export const PUBLICATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -112,6 +114,9 @@ export function parseTaskBinding(raw: string | null | undefined): TaskBinding | 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
     fail("it must be a JSON object");
   const o = parsed as Record<string, unknown>;
+
+  if (typeof o.publication_id !== "string" || !PUBLICATION_ID.test(o.publication_id))
+    fail("publication_id must contain only letters, digits, underscores or hyphens");
 
   const mode = o.mode;
   if (mode !== "build" && mode !== "apply") fail('mode must be "build" or "apply"');

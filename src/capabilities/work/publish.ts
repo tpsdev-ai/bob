@@ -1,41 +1,10 @@
-// publish — the tool-owned publication path for a stored candidate (bob#275,
-// slice S2b).
-//
-// The change a builder publishes must be the change it verified. `apply_patch`
-// (S2a) applied a patch to a fresh index and stored a candidate tree; `publish`
-// is the only path that turns a stored candidate into a remote commit:
-//
-//   * it resolves the candidate from tool-owned storage and checks its task,
-//     repository and base association — a candidate id is not permission to
-//     publish it;
-//   * it computes the complete changed-path set between the pinned base and the
-//     candidate tree and refuses any out-of-scope path;
-//   * in apply mode it requires the candidate tree to BE the task's expected
-//     tree, not merely an equivalent diff;
-//   * it pins a commit object (tree, parent, message, author/committer metadata)
-//     and materializes the candidate in a fresh, tool-owned checkout;
-//   * it runs every task-declared check through the S1 executor, verifying the
-//     materialized tree before and after each command;
-//   * it pushes the pinned commit to the authorized ref only, fast-forward, with
-//     the expected old ref enforced atomically.
-//
-// Publication recovery is part of the contract: an intent journal (outside the
-// candidate repository, surviving session and job termination) is written before
-// any external effect, so a retry resumes or refuses rather than publishing a
-// different tree. A push whose acknowledgement was lost is reconciled against
-// the authoritative remote ref instead of being reported as success or retried
-// blindly.
-//
-// THREAT MODEL (from the S2a merge note): candidate publication detects a
-// changed staging directory, source or destination and refuses, but a
-// concurrent same-user writer can still race the rename until the builder is
-// confined (bob#189). Pathname checks cannot close that race; this tool states
-// the model rather than adding pathname re-checks.
-
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
   constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -46,28 +15,17 @@ import {
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import type { GitInvocation, GitResult, GitRunner } from "./apply-patch.js";
-import { type CandidateRecord, candidateRecordPath } from "./apply-patch.js";
+import { type CandidateRecord, candidateIdentity, candidateRecordPath } from "./apply-patch.js";
 import { ensurePrivateDir, isInside } from "./run.js";
-import type { TaskBinding } from "./task-binding.js";
+import { PUBLICATION_ID, parseTaskBinding, type TaskBinding } from "./task-binding.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 
 export type PublishStatus = "published" | "refused" | "indeterminate";
 
-// push_state distinguishes confirmed publication, confirmed absence, and an
-// unknown outcome. `status: "published"` is reported only when the remote
-// commit (and any requested PR) is confirmed.
 export type PushState = "confirmed_present" | "confirmed_absent" | "unknown";
 
-export type PublishPhase =
-  | "intent"
-  | "committed"
-  | "checked"
-  | "pushing"
-  | "pushed"
-  | "pr_creating"
-  | "pr_created"
-  | "published";
+export type PublishPhase = "intent" | "committed" | "checked" | "pushing" | "pushed" | "published";
 
 export type PublishRefusalReason =
   | "unknown_task"
@@ -90,15 +48,14 @@ export type PublishRefusalReason =
   | "remote_absent_unauthorized"
   | "push_rejected"
   | "push_failed"
-  | "pr_unauthorized"
-  | "pr_service_unavailable"
+  | "pr_unsupported"
+  | "publication_locked"
   | "publication_conflict"
   | "storage_failed";
 
 export interface PublishParams {
   candidate_id: string;
   commit_message: string;
-  pr?: { title: string; body: string };
 }
 
 // What a check command must report for publication to proceed. Mirrors the S1
@@ -114,33 +71,11 @@ export interface CheckReport {
 
 export type CheckRunner = (command: string, cwd: string) => Promise<CheckReport>;
 
-// The optional PR destination. `find` returns a URL when one exists, null only
-// when the service CONFIRMS none, and "unknown" when it cannot say — an unknown
-// never licenses another create request.
-export interface PrService {
-  find(req: {
-    repository: string;
-    head: string;
-    base: string;
-    marker: string;
-  }): Promise<{ url: string } | null | "unknown">;
-  create(req: {
-    repository: string;
-    head: string;
-    base: string;
-    title: string;
-    body: string;
-    marker: string;
-  }): Promise<{ url: string }>;
-}
-
 export interface PublishDeps {
   // Seam: the git runner. Production spawns the real `git`.
   git?: GitRunner;
   // Seam: the S1 executor. Production runs the command through JobManager.
   runCheck?: CheckRunner;
-  // Seam: the PR service, required only when a PR is requested.
-  pr?: PrService;
   now?: () => Date;
   // Test seams. `writeJournal`/`readJournal` default to an owner-only atomic
   // write/read under the state root.
@@ -151,8 +86,6 @@ export interface PublishDeps {
   // Runs after a push the remote accepted, before success is persisted. A test
   // throws here to model a terminated publisher with a lost acknowledgement.
   afterPushAccepted?: (commitOid: string) => void;
-  // Runs after a PR the service accepted, before its URL is persisted.
-  afterPrAccepted?: (url: string) => void;
 }
 
 export interface PublishResult {
@@ -163,7 +96,6 @@ export interface PublishResult {
   status: PublishStatus;
   phase: PublishPhase;
   push_state: PushState;
-  pr_url?: string;
   reason?: string;
   message?: string;
   detail?: Record<string, unknown>;
@@ -188,11 +120,13 @@ interface CommitMeta {
 }
 
 interface PublishJournal {
-  v: 1;
+  v: 2;
+  authority: TaskBinding;
+  endpoint: string;
   publication_id: string;
   task_id: string;
   candidate_id: string;
-  request: { commit_message: string; pr?: { title: string; body: string } };
+  request: { commit_message: string };
   base_oid: string;
   tree_oid: string;
   changed_paths: string[];
@@ -201,13 +135,9 @@ interface PublishJournal {
   checks?: Array<{ command: string; ok: boolean; reason?: string }>;
   phase: PublishPhase;
   push_state: PushState;
-  pr_url?: string;
   created_at: string;
 }
 
-// The tool's git runner: fixed environment, no user or system config, no
-// interactive prompts. Kept separate from the caller's environment so a
-// credential helper or a repository's own config cannot change the result.
 function runGit(args: string[], inv: GitInvocation): GitResult {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -242,7 +172,18 @@ function refuse(
   message: string,
   extra: Partial<PublishResult> = {},
 ): PublishResult {
-  return { status: "refused", reason, message, ...extra } as PublishResult;
+  return {
+    publication_id: "",
+    candidate_id: null,
+    tree_oid: null,
+    commit_oid: null,
+    phase: "intent",
+    push_state: "unknown",
+    status: "refused",
+    reason,
+    message,
+    ...extra,
+  };
 }
 
 function indeterminate(
@@ -330,50 +271,116 @@ function commitObject(meta: CommitMeta): Buffer {
 // --- the journal ----------------------------------------------------------------
 
 export function publishJournalPath(stateRoot: string, publicationId: string): string {
+  if (!PUBLICATION_ID.test(publicationId)) throw new Error("invalid publication_id");
   return join(stateRoot, "publications", `${publicationId}.json`);
 }
 
-function writeJournalAtomic(path: string, data: string): void {
+export function writeJournalAtomic(path: string, data: string, sync = fsyncSync): void {
   const dir = join(path, "..");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const fd = openSync(
-    tmp,
-    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
-    0o600,
+  const root = join(dir, "..");
+  ensurePrivateDir(root, false);
+  ensurePrivateDir(dir, false);
+  const rootFd = openSync(
+    root,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
   );
   try {
-    writeFileSync(fd, data);
-    closeSync(fd);
-    renameSync(tmp, path);
-  } catch (err) {
+    const dirFd = openSync(
+      dir,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
     try {
-      closeSync(fd);
-    } catch {
-      // already closed
+      const tmp = join(
+        dir,
+        `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      );
+      try {
+        const fd = openSync(
+          tmp,
+          fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+          0o600,
+        );
+        try {
+          writeFileSync(fd, data);
+          sync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        assertDirectory(root, rootFd);
+        assertDirectory(dir, dirFd);
+        renameSync(tmp, path);
+        sync(dirFd);
+        sync(rootFd);
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+    } finally {
+      closeSync(dirFd);
     }
+  } finally {
+    closeSync(rootFd);
+  }
+}
+
+function assertDirectory(path: string, fd: number): void {
+  ensurePrivateDir(path, false);
+  const before = fstatSync(fd);
+  const after = lstatSync(path);
+  if (before.dev !== after.dev || before.ino !== after.ino)
+    throw new Error("storage directory changed");
+}
+
+function readRecord(path: string): string {
+  const dir = join(path, "..");
+  const root = join(dir, "..");
+  ensurePrivateDir(root, false);
+  ensurePrivateDir(dir, false);
+  const rootFd = openSync(
+    root,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const dirFd = openSync(
+      dir,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
     try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // best effort
+      const fd = openSync(
+        path,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      );
+      try {
+        if (!fstatSync(fd).isFile()) throw new Error("record is not a regular file");
+        assertDirectory(root, rootFd);
+        assertDirectory(dir, dirFd);
+        return readFileSync(fd, "utf8");
+      } finally {
+        closeSync(fd);
+      }
+    } finally {
+      closeSync(dirFd);
     }
-    throw err;
+  } finally {
+    closeSync(rootFd);
   }
 }
 
 function readJournalFile(path: string): string | null {
   try {
-    return readFileSync(path, "utf8");
+    lstatSync(path);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    ensurePrivateDir(join(path, "..", ".."), false);
+    ensurePrivateDir(join(path, ".."), false);
+    return null;
   }
+  return readRecord(path);
 }
 
 function parseJournal(raw: string): PublishJournal {
   const parsed = JSON.parse(raw) as PublishJournal;
-  if (typeof parsed !== "object" || parsed === null || parsed.v !== 1) {
-    throw new Error("publication journal is not a v1 record");
+  if (typeof parsed !== "object" || parsed === null || parsed.v !== 2) {
+    throw new Error("publication journal is not a v2 record");
   }
   return parsed;
 }
@@ -447,6 +454,30 @@ type RemoteRefState =
   | { state: "absent" }
   | { state: "unknown"; error: string };
 
+function resolveEndpoint(git: GitRunner, binding: TaskBinding): string | null {
+  const repo = binding.repository;
+  if (
+    !binding.destination.ref.startsWith("refs/heads/") ||
+    git(["check-ref-format", binding.destination.ref], { cwd: repo }).status !== 0
+  )
+    return null;
+  const rewrites = git(["config", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"], {
+    cwd: repo,
+  });
+  if (rewrites.status !== 1) return null;
+  const named = git(["remote", "get-url", "--all", binding.destination.remote], { cwd: repo });
+  const endpoints =
+    named.status === 0 ? named.stdout.trim().split("\n") : [binding.destination.remote];
+  if (endpoints.length !== 1) return null;
+  const endpoint = endpoints[0];
+  if (!endpoint || /[\s\0]/.test(endpoint) || endpoint.startsWith("-")) return null;
+  if (isAbsolute(endpoint)) return endpoint;
+  if (/^(https?|ssh|git|file):\/\//.test(endpoint) || /^[^/:]+@[^/:]+:/.test(endpoint))
+    return endpoint;
+  if (endpoint.startsWith("./") || endpoint.startsWith("../")) return resolve(repo, endpoint);
+  return null;
+}
+
 function inspectRemote(git: GitRunner, repo: string, remote: string, ref: string): RemoteRefState {
   const r = git(["ls-remote", remote, ref], { cwd: repo });
   if (r.status !== 0)
@@ -473,15 +504,14 @@ async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const gate = new Promise<void>((r) => {
     release = r;
   });
-  locks.set(
-    key,
-    prev.then(() => gate),
-  );
+  const pending = prev.then(() => gate);
+  locks.set(key, pending);
   await prev;
   try {
     return await fn();
   } finally {
     release();
+    if (locks.get(key) === pending) locks.delete(key);
   }
 }
 
@@ -492,12 +522,7 @@ function errCode(err: unknown): string {
 }
 
 function requestOf(params: PublishParams): PublishJournal["request"] {
-  return params.pr === undefined
-    ? { commit_message: params.commit_message }
-    : {
-        commit_message: params.commit_message,
-        pr: { title: params.pr.title, body: params.pr.body },
-      };
+  return { commit_message: params.commit_message };
 }
 
 function requestsEqual(a: PublishJournal["request"], b: PublishJournal["request"]): boolean {
@@ -552,20 +577,30 @@ export async function publish(input: PublishInput): Promise<PublishResult> {
       },
     );
   }
-  const binding = input.binding;
+  let binding: TaskBinding;
+  try {
+    binding = parseTaskBinding(JSON.stringify(input.binding)) as TaskBinding;
+  } catch (err) {
+    return refuse("invalid_binding", messageOf(err));
+  }
+  input = { ...input, binding, params: { ...input.params } };
 
   // Request shape. pi's schema checks this too; these checks make a
   // directly-driven call refuse as well.
   const params = input.params;
-  if (typeof params?.candidate_id !== "string" || params.candidate_id.length === 0) {
-    return refuse("invalid_request", "publish refused: candidate_id is required.", {
-      publication_id: binding.publication_id,
-      candidate_id: null,
-      tree_oid: null,
-      commit_oid: null,
-      phase: "intent",
-      push_state: "unknown",
-    });
+  if (typeof params?.candidate_id !== "string" || !HEX40.test(params.candidate_id)) {
+    return refuse(
+      "invalid_request",
+      "publish refused: candidate_id must be 40 lowercase hex characters.",
+      {
+        publication_id: binding.publication_id,
+        candidate_id: null,
+        tree_oid: null,
+        commit_oid: null,
+        phase: "intent",
+        push_state: "unknown",
+      },
+    );
   }
   if (typeof params.commit_message !== "string" || params.commit_message.trim() === "") {
     return refuse("invalid_request", "publish refused: commit_message is required.", {
@@ -577,10 +612,10 @@ export async function publish(input: PublishInput): Promise<PublishResult> {
       push_state: "unknown",
     });
   }
-  if (params.pr !== undefined && binding.pr === undefined) {
+  if ("pr" in params) {
     return refuse(
-      "pr_unauthorized",
-      "publish refused: a PR was requested but the task binding authorizes no PR destination. Repository files, tool arguments and bob.yaml cannot supply publication authority.",
+      "pr_unsupported",
+      "publish refused: pr is unsupported; PR creation is a later slice. Omit pr.",
       {
         publication_id: binding.publication_id,
         candidate_id: params.candidate_id,
@@ -592,7 +627,17 @@ export async function publish(input: PublishInput): Promise<PublishResult> {
     );
   }
 
-  return withLock(binding.publication_id, () => publishLocked(input, git, deps));
+  const unknown = Object.keys(params).filter(
+    (key) => key !== "candidate_id" && key !== "commit_message",
+  );
+  if (unknown.length)
+    return refuse(
+      "invalid_request",
+      `publish refused: unsupported arguments: ${unknown.join(", ")}`,
+    );
+  return withLock(`${input.stateRoot}/${binding.publication_id}`, () =>
+    publishLocked(input, git, deps),
+  );
 }
 
 async function publishLocked(
@@ -644,12 +689,54 @@ async function publishLocked(
     return fail("storage_failed", `publish refused: ${messageOf(err)}`);
   }
 
+  const dir = join(stateRoot, "publications");
+  let lock: string;
+  try {
+    ensurePrivateDir(dir, true);
+    lock = join(dir, `${binding.publication_id}.lock`);
+    mkdirSync(lock, { mode: 0o700 });
+  } catch (err) {
+    return fail(
+      errCode(err) === "EEXIST" ? "publication_locked" : "storage_failed",
+      `publish refused: publication lock could not be acquired (${errCode(err)}).`,
+    );
+  }
+  try {
+    return await publishUnderLock(input, git, deps);
+  } finally {
+    rmSync(lock, { recursive: true });
+  }
+}
+
+async function publishUnderLock(
+  input: PublishInput,
+  git: GitRunner,
+  deps: PublishDeps,
+): Promise<PublishResult> {
+  const binding = input.binding as TaskBinding;
+  const stateRoot = input.stateRoot;
+  const params = input.params;
+  const fail = (
+    reason: PublishRefusalReason,
+    message: string,
+    extra: Partial<PublishResult> = {},
+  ) =>
+    refuse(reason, message, {
+      publication_id: binding.publication_id,
+      candidate_id: params.candidate_id,
+      tree_oid: null,
+      commit_oid: null,
+      phase: "intent",
+      push_state: "unknown",
+      ...extra,
+    });
+
   // Load the candidate record from tool-owned storage. A failed read is never
   // treated as absence.
   const recordPath = candidateRecordPath(stateRoot, params.candidate_id);
   let record: CandidateRecord;
   try {
-    const raw = readFileSync(recordPath, "utf8");
+    const raw = readRecord(recordPath);
     record = JSON.parse(raw) as CandidateRecord;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
@@ -667,15 +754,19 @@ async function publishLocked(
   // Association: the candidate must belong to this task, repository, base and
   // publication.
   if (
+    record === null ||
+    record.candidate_id !== params.candidate_id ||
+    candidateIdentity(record) !== params.candidate_id ||
     record.task_id !== binding.task_id ||
     record.repository !== binding.repository ||
+    record.workspace !== binding.workspace ||
     record.base_oid !== binding.base_oid ||
     record.publication_id !== binding.publication_id
   ) {
     return fail(
       "candidate_mismatch",
       `publish refused: candidate ${params.candidate_id} is not associated with this task, repository, base or publication. A candidate id is not permission to publish.`,
-      { tree_oid: record.tree_oid },
+      { tree_oid: record?.tree_oid ?? null },
     );
   }
   if (record.mode !== binding.mode) {
@@ -730,6 +821,13 @@ async function publishLocked(
     );
   }
 
+  const endpoint = resolveEndpoint(git, binding);
+  if (endpoint === null)
+    return fail(
+      "invalid_binding",
+      "publish refused: destination must resolve to one endpoint without URL rewrites and a valid branch ref.",
+    );
+
   // Everything from here is journaled and recoverable.
   const journalPath = publishJournalPath(stateRoot, binding.publication_id);
   const readJ = deps.readJournal ?? readJournalFile;
@@ -759,6 +857,9 @@ async function publishLocked(
     // Reusing a publication identity with different candidate content or
     // publication parameters refuses.
     if (
+      existing.publication_id !== binding.publication_id ||
+      JSON.stringify(existing.authority) !== JSON.stringify(binding) ||
+      existing.endpoint !== endpoint ||
       existing.candidate_id !== params.candidate_id ||
       existing.tree_oid !== treeOid ||
       !requestsEqual(existing.request, requestOf(params))
@@ -780,7 +881,9 @@ async function publishLocked(
   const journal: PublishJournal =
     existing ??
     ({
-      v: 1,
+      v: 2,
+      authority: binding,
+      endpoint,
       publication_id: binding.publication_id,
       task_id: binding.task_id,
       candidate_id: params.candidate_id,
@@ -844,7 +947,9 @@ async function publishLocked(
 
   // 3. Materialize the candidate in a fresh, tool-owned checkout and run checks.
   // Skipped on recovery once the checks have passed.
-  const checksPassed = journal.checks?.every((c) => c.ok) ?? false;
+  const checksPassed =
+    journal.checks?.length === binding.check_commands.length &&
+    journal.checks.every((c, i) => c.ok && c.command === binding.check_commands[i]);
   let checkoutDir: string | null = null;
   if (!checksPassed) {
     if (deps.runCheck === undefined) {
@@ -944,118 +1049,145 @@ async function publishLocked(
     }
   }
 
-  // 4. Inspect the authoritative remote ref and decide the push.
-  const { remote, ref } = binding.destination;
-  const observed = inspectRemote(git, binding.repository, remote, ref);
-  if (observed.state === "unknown") {
-    return indeterminate(
-      "remote_unavailable",
-      `publish indeterminate: the authoritative remote ${remote} ${ref} could not be inspected (${observed.error}); whether the commit is published is unknown.`,
-      {
-        publication_id: binding.publication_id,
-        candidate_id: params.candidate_id,
-        tree_oid: treeOid,
-        commit_oid: commitOid,
-        phase: journal.phase,
-        push_state: "unknown",
-      },
+  let transportDir: string;
+  try {
+    transportDir = mkdtempSync(join(stateRoot, "publish-transport-"));
+    const init = git(["init", "-q", "--bare", transportDir], { cwd: stateRoot });
+    if (init.status !== 0) throw new Error(init.stderr || "transport init failed");
+    const common = gitCommonDir(git, binding.repository);
+    if (common === null) throw new Error("object directory unavailable");
+    const info = join(transportDir, "objects", "info");
+    mkdirSync(info, { recursive: true });
+    writeFileSync(join(info, "alternates"), `${join(common, "objects")}\n`, { flag: "wx" });
+  } catch (err) {
+    return fail(
+      "storage_failed",
+      `publish refused: transport preparation failed (${messageOf(err)}).`,
     );
   }
-
-  let pushExpected: string | null;
-  if (observed.state === "present") {
-    if (
-      observed.oid === commitOid ||
-      isAncestor(git, binding.repository, commitOid, observed.oid)
-    ) {
-      // The remote already contains the pinned commit: confirmed present.
-      return finishPublished(input, journal, commitOid, treeOid, git, deps, true);
-    }
-    if (!isAncestor(git, binding.repository, observed.oid, commitOid)) {
-      // Neither is an ancestor of the other: a conflicting ref. Never rebase,
-      // amend or force.
-      journal.phase = "pushing";
-      persist();
-      return fail(
-        "remote_diverged",
-        `publish refused: the remote ${remote} ${ref} is at ${observed.oid}, which neither contains nor precedes the pinned commit ${commitOid}. Divergence is refused; publication does not rebase, amend, merge or force.`,
+  const sourceGit = git;
+  git = (args, inv) =>
+    sourceGit(args, {
+      ...inv,
+      cwd: args[0] === "ls-remote" || args[0] === "push" ? transportDir : inv.cwd,
+    });
+  try {
+    // 4. Inspect the authoritative remote ref and decide the push.
+    const remote = journal.endpoint;
+    const { ref } = binding.destination;
+    const observed = inspectRemote(git, binding.repository, remote, ref);
+    if (observed.state === "unknown") {
+      return indeterminate(
+        "remote_unavailable",
+        `publish indeterminate: the authoritative remote ${remote} ${ref} could not be inspected (${observed.error}); whether the commit is published is unknown.`,
         {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
           tree_oid: treeOid,
           commit_oid: commitOid,
-          push_state: "confirmed_present",
-          phase: "pushing",
+          phase: journal.phase,
+          push_state: "unknown",
         },
       );
     }
-    // The remote is an ancestor of the commit: a fast-forward.
-    pushExpected = observed.oid;
-  } else {
-    // Absent. Creating an absent ref requires explicit authorization.
-    if (binding.destination.create !== true) {
-      return fail(
-        "remote_absent_unauthorized",
-        `publish refused: the remote ${remote} ${ref} does not exist and the task binding does not authorize creating it.`,
-        { tree_oid: treeOid, commit_oid: commitOid, push_state: "confirmed_absent" },
-      );
+
+    let pushExpected: string | null;
+    if (observed.state === "present") {
+      if (
+        observed.oid === commitOid ||
+        isAncestor(git, binding.repository, commitOid, observed.oid)
+      ) {
+        // The remote already contains the pinned commit: confirmed present.
+        return await finishPublished(input, journal, commitOid, treeOid, git, deps, true);
+      }
+      if (!isAncestor(git, binding.repository, observed.oid, commitOid)) {
+        // Neither is an ancestor of the other: a conflicting ref. Never rebase,
+        // amend or force.
+        journal.phase = "pushing";
+        persist();
+        return fail(
+          "remote_diverged",
+          `publish refused: the remote ${remote} ${ref} is at ${observed.oid}, which neither contains nor precedes the pinned commit ${commitOid}. Divergence is refused; publication does not rebase, amend, merge or force.`,
+          {
+            tree_oid: treeOid,
+            commit_oid: commitOid,
+            push_state: "confirmed_present",
+            phase: "pushing",
+          },
+        );
+      }
+      // The remote is an ancestor of the commit: a fast-forward.
+      pushExpected = observed.oid;
+    } else {
+      // Absent. Creating an absent ref requires explicit authorization.
+      if (binding.destination.create !== true) {
+        return fail(
+          "remote_absent_unauthorized",
+          `publish refused: the remote ${remote} ${ref} does not exist and the task binding does not authorize creating it.`,
+          { tree_oid: treeOid, commit_oid: commitOid, push_state: "confirmed_absent" },
+        );
+      }
+      pushExpected = null;
     }
-    pushExpected = null;
-  }
 
-  journal.phase = "pushing";
-  const pushingFail = persist();
-  if (pushingFail !== null) return pushingFail;
+    journal.phase = "pushing";
+    const pushingFail = persist();
+    if (pushingFail !== null) return pushingFail;
 
-  const pushArgs =
-    pushExpected === null
-      ? ["push", `--force-with-lease=${ref}:`, remote, `${commitOid}:${ref}`]
-      : ["push", `--force-with-lease=${ref}:${pushExpected}`, remote, `${commitOid}:${ref}`];
-  const pushed = git(pushArgs, { cwd: binding.repository });
-  if (pushed.status !== 0) {
-    const stderr = pushed.stderr.trim();
-    // A rejected push (the race moved the ref) is a refusal, never a silent
-    // retry. An unreadable transport is reconciled against the remote.
-    if (/\[rejected\]|non-fast-forward|stale info|fetch first|cannot lock ref/i.test(stderr)) {
-      return fail(
-        "push_rejected",
-        `publish refused: the remote ${remote} ${ref} rejected the fast-forward push (${stderr || `git exited ${pushed.status}`}). The remote history is preserved.`,
+    const pushArgs =
+      pushExpected === null
+        ? ["push", `--force-with-lease=${ref}:`, remote, `${commitOid}:${ref}`]
+        : ["push", `--force-with-lease=${ref}:${pushExpected}`, remote, `${commitOid}:${ref}`];
+    const pushed = git(pushArgs, { cwd: binding.repository });
+    if (pushed.status !== 0) {
+      const stderr = pushed.stderr.trim();
+      // A rejected push (the race moved the ref) is a refusal, never a silent
+      // retry. An unreadable transport is reconciled against the remote.
+      if (/\[rejected\]|non-fast-forward|stale info|fetch first|cannot lock ref/i.test(stderr)) {
+        return fail(
+          "push_rejected",
+          `publish refused: the remote ${remote} ${ref} rejected the fast-forward push (${stderr || `git exited ${pushed.status}`}). The remote history is preserved.`,
+          {
+            tree_oid: treeOid,
+            commit_oid: commitOid,
+            phase: "pushing",
+            push_state: "confirmed_present",
+          },
+        );
+      }
+      const after = inspectRemote(git, binding.repository, remote, ref);
+      if (after.state === "present" && after.oid === commitOid) {
+        return await finishPublished(input, journal, commitOid, treeOid, git, deps, true);
+      }
+      return indeterminate(
+        "push_unknown",
+        `publish indeterminate: the push to ${remote} ${ref} reported ${stderr || `git exited ${pushed.status}`} and the remote could not be reconciled. The commit may or may not be published.`,
         {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
           tree_oid: treeOid,
           commit_oid: commitOid,
           phase: "pushing",
-          push_state: "confirmed_present",
+          push_state: "unknown",
         },
       );
     }
-    const after = inspectRemote(git, binding.repository, remote, ref);
-    if (after.state === "present" && after.oid === commitOid) {
-      return finishPublished(input, journal, commitOid, treeOid, git, deps, true);
-    }
-    return indeterminate(
-      "push_unknown",
-      `publish indeterminate: the push to ${remote} ${ref} reported ${stderr || `git exited ${pushed.status}`} and the remote could not be reconciled. The commit may or may not be published.`,
-      {
-        publication_id: binding.publication_id,
-        candidate_id: params.candidate_id,
-        tree_oid: treeOid,
-        commit_oid: commitOid,
-        phase: "pushing",
-        push_state: "unknown",
-      },
-    );
+
+    // The remote accepted the push. Persist success only after the acknowledgement
+    // (a test may terminate here with the acknowledgement lost).
+    deps.afterPushAccepted?.(commitOid);
+    journal.phase = "pushed";
+    journal.push_state = "confirmed_present";
+    const pushedFail = persist();
+    if (pushedFail !== null) return pushedFail;
+
+    return await finishPublished(input, journal, commitOid, treeOid, git, deps, false);
+  } finally {
+    rmSync(transportDir, { recursive: true, force: true });
   }
-
-  // The remote accepted the push. Persist success only after the acknowledgement
-  // (a test may terminate here with the acknowledgement lost).
-  deps.afterPushAccepted?.(commitOid);
-  journal.phase = "pushed";
-  journal.push_state = "confirmed_present";
-  const pushedFail = persist();
-  if (pushedFail !== null) return pushedFail;
-
-  return finishPublished(input, journal, commitOid, treeOid, git, deps, false);
 }
 
-// Confirm the remote (and any requested PR) and report `published`. `remoteConfirmed`
+// Confirm the remote and report `published`. `remoteConfirmed`
 // is true when a prior inspection already established the commit is present.
 async function finishPublished(
   input: PublishInput,
@@ -1095,7 +1227,7 @@ async function finishPublished(
     const observed = inspectRemote(
       git,
       binding.repository,
-      binding.destination.remote,
+      journal.endpoint,
       binding.destination.ref,
     );
     if (
@@ -1120,104 +1252,6 @@ async function finishPublished(
   journal.phase = "pushed";
   journal.push_state = "confirmed_present";
 
-  // The PR destination.
-  if (journal.request.pr !== undefined && binding.pr !== undefined) {
-    const pr = journal.request.pr;
-    const head = binding.pr.head ?? binding.destination.ref.replace(/^refs\/heads\//, "");
-    const marker = `bob-publication:${binding.publication_id}`;
-    const prReq = {
-      repository: binding.repository,
-      head,
-      base: binding.pr.base,
-      title: pr.title,
-      body: pr.body,
-      marker,
-    };
-
-    if (journal.pr_url === undefined) {
-      if (deps.pr === undefined) {
-        return indeterminate(
-          "pr_service_unavailable",
-          "publish indeterminate: the remote commit is published but no PR service is wired to satisfy the requested PR. The commit is on the remote; the PR was not created.",
-          {
-            publication_id: binding.publication_id,
-            candidate_id: journal.candidate_id,
-            tree_oid: treeOid,
-            commit_oid: commitOid,
-            phase: journal.phase,
-            push_state: "confirmed_present",
-          },
-        );
-      }
-      journal.phase = "pr_creating";
-      const prIntentFail = persist();
-      if (prIntentFail !== null) return prIntentFail;
-      let found: { url: string } | null | "unknown";
-      try {
-        found = await deps.pr.find({
-          repository: binding.repository,
-          head,
-          base: binding.pr.base,
-          marker,
-        });
-      } catch (err) {
-        return indeterminate(
-          "pr_reconcile_failed",
-          `publish indeterminate: the PR service could not be queried (${messageOf(err)}). No create request was issued.`,
-          {
-            publication_id: binding.publication_id,
-            candidate_id: journal.candidate_id,
-            tree_oid: treeOid,
-            commit_oid: commitOid,
-            phase: "pr_creating",
-            push_state: "confirmed_present",
-          },
-        );
-      }
-      if (found === "unknown") {
-        return indeterminate(
-          "pr_reconcile_unknown",
-          "publish indeterminate: whether the requested PR already exists could not be established. No second create request was issued.",
-          {
-            publication_id: binding.publication_id,
-            candidate_id: journal.candidate_id,
-            tree_oid: treeOid,
-            commit_oid: commitOid,
-            phase: "pr_creating",
-            push_state: "confirmed_present",
-          },
-        );
-      }
-      let url: string;
-      if (found !== null) {
-        url = found.url;
-      } else {
-        try {
-          const created = await deps.pr.create(prReq);
-          url = created.url;
-          deps.afterPrAccepted?.(url);
-        } catch (err) {
-          return indeterminate(
-            "pr_unknown",
-            `publish indeterminate: the PR create request reported ${messageOf(err)} and cannot be reconciled. No second create request was issued.`,
-            {
-              publication_id: binding.publication_id,
-              candidate_id: journal.candidate_id,
-              tree_oid: treeOid,
-              commit_oid: commitOid,
-              phase: "pr_creating",
-              push_state: "confirmed_present",
-            },
-          );
-        }
-      }
-      journal.pr_url = url;
-      journal.phase = "pr_created";
-      const prFail = persist();
-      if (prFail !== null) return prFail;
-    }
-  }
-
   journal.phase = "published";
   const finalFail = persist();
   if (finalFail !== null) return finalFail;
@@ -1229,7 +1263,6 @@ async function finishPublished(
     status: "published",
     phase: "published",
     push_state: "confirmed_present",
-    ...(journal.pr_url !== undefined ? { pr_url: journal.pr_url } : {}),
   };
 }
 
