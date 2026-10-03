@@ -19,7 +19,7 @@ export interface ProviderRecord {
    * under. `exe-dev-gateway` and `anthropic` both use pi's `anthropic`.
    */
   readonly runtime: string;
-  /** The provider's fixed endpoint (base URL), when it has one. */
+  /** The provider's default endpoint (base URL), when it has one; an allowed provider.base_url can override it. */
   readonly endpoint?: string;
   /** The wire API pi uses, when the provider is an OpenAI-compatible custom provider. */
   readonly api?: ProviderApi;
