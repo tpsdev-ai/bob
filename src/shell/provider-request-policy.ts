@@ -1,6 +1,6 @@
 /** A row's request timeout and retry policy. Every field is required. */
 export interface ProviderRequestPolicy {
-  /** Idle timeout in ms, including queue, prefill and gaps between received chunks. */
+  /** Timeout in ms while awaiting response headers or a body chunk; consumer pauses are excluded. */
   readonly idleTimeoutMs: number;
   /** Hard cap on the whole request in ms. 0 disables. */
   readonly totalTimeoutMs: number;
@@ -20,13 +20,12 @@ function formatMs(ms: number): string {
   return `${ms} ms`;
 }
 
-/** The named error for a stream that went idle past the row's idle timeout. */
 export class ProviderStreamIdleTimeoutError extends Error {
   readonly provider: string;
   readonly idleTimeoutMs: number;
   constructor(provider: string, idleTimeoutMs: number) {
     super(
-      `bob: provider stream idle timeout — provider "${provider}" sent no data for ${formatMs(idleTimeoutMs)}. Remedy: raise this row's request.idleTimeoutMs, or check the endpoint.`,
+      `bob: provider stream idle timeout — provider "${provider}": waiting for response headers or a body chunk exceeded ${formatMs(idleTimeoutMs)}. Remedy: raise this row's request.idleTimeoutMs, or check the endpoint.`,
     );
     this.name = "ProviderStreamIdleTimeoutError";
     this.provider = provider;
@@ -112,6 +111,7 @@ export function withStreamTimeouts(
     let response: Response;
     try {
       response = await baseFetch(input, { ...init, signal: controller.signal });
+      disarmIdle();
     } catch (err) {
       cleanup();
       throw controller.signal.aborted ? controller.signal.reason : err;
@@ -125,27 +125,31 @@ export function withStreamTimeouts(
 
     const controllerSignal = controller.signal;
     const reader = originalBody.getReader();
-    const body = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const { done, value } = await reader.read();
-          if (done) {
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            armIdle();
+            const { done, value } = await reader.read();
+            disarmIdle();
+            if (done) {
+              cleanup();
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+          } catch (err) {
             cleanup();
-            controller.close();
-            return;
+            controller.error(controllerSignal.aborted ? controllerSignal.reason : err);
           }
-          armIdle();
-          controller.enqueue(value);
-        } catch (err) {
+        },
+        cancel(reason) {
           cleanup();
-          controller.error(controllerSignal.aborted ? controllerSignal.reason : err);
-        }
+          return reader.cancel(reason);
+        },
       },
-      cancel(reason) {
-        cleanup();
-        return reader.cancel(reason);
-      },
-    });
+      { highWaterMark: 0 },
+    );
 
     return new Response(body, {
       status: response.status,

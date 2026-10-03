@@ -964,8 +964,8 @@ explicitly requested missing file, an unreadable file or an invalid document ref
 mode, an unknown mode, or the obsolete `gateway`/`envKey` flags refuses at load. A `bob/env` row
 loads only when its runtime has an implemented custody descriptor (`openrouter` today); operator
 data cannot assert that custody. A keyless row may declare `request: {idleTimeoutMs, totalTimeoutMs, maxRetries}`;
-policies on other rows refuse. `idleTimeoutMs` covers queue, prefill and gaps between received
-chunks; `totalTimeoutMs` caps the request (0 disables it). `maxRetries` caps provider request
+policies on other rows refuse. `idleTimeoutMs` limits waits for response headers or a body chunk, excluding consumer
+pauses; `totalTimeoutMs` caps the request (0 disables it). `maxRetries` caps provider request
 retries; row timeouts are terminal and pi session retries are disabled for policy-bearing rows.
 The built-in keyless rows (`ollama`, `ollama-newton`, `omlx`) use a 120 s idle timeout,
 a 30 min total cap and zero request retries. Invalid request policies refuse by row name.
