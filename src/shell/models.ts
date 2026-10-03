@@ -15,15 +15,27 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readProviderLimits } from "./bob-yaml.js";
 import { piOpenAiCompletionsModel } from "./init.js";
+import { type ProviderRegistry, providerApiForRuntime } from "./provider-registry.js";
 import { resolveRunConfig } from "./run.js";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "agents")): string {
-  const { agentDir, provider, model, config } = resolveRunConfig({ name, agentsRoot });
-  const { baseUrl } = readProviderLimits(readFileSync(join(agentDir, "bob.yaml"), "utf8"));
+export function applyModelScaffold(
+  name: string,
+  agentsRoot = join(homedir(), "agents"),
+  registry?: ProviderRegistry,
+): string {
+  const { agentDir, provider, model, config } = resolveRunConfig({
+    name,
+    agentsRoot,
+    ...(registry !== undefined ? { registry } : {}),
+  });
+  const { baseUrl } = readProviderLimits(
+    readFileSync(join(agentDir, "bob.yaml"), "utf8"),
+    registry,
+  );
   if (baseUrl === undefined) throw new Error("bob models: provider.base_url is required");
   if (config.modelLimits === undefined) {
     throw new Error("bob models: provider.context_window is required");
@@ -71,7 +83,16 @@ export function applyModelScaffold(name: string, agentsRoot = join(homedir(), "a
   if (models.some((item) => !object(item) || typeof item.id !== "string")) {
     throw new Error(`bob models: invalid model entry in ${path}`);
   }
-  const update = { baseUrl, api: "openai-completions" };
+  // The emitted adapter is CONSUMED from the row, never a literal: a new keyless
+  // row reaches models.json with its own declared API, and a row that declares
+  // none is refused rather than written as an OpenAI-compatible scaffold.
+  const api = providerApiForRuntime(provider, registry);
+  if (api === undefined) {
+    throw new Error(
+      `bob models: provider "${provider}" declares no supported API — refusing to write a model scaffold for it.`,
+    );
+  }
+  const update = { baseUrl, api };
   const found = models.some((item) => (item as Record<string, unknown>).id === model);
   const updated = models.map((item) =>
     (item as Record<string, unknown>).id === model ? { ...(item as object), ...update } : item,

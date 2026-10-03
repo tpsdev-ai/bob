@@ -1,21 +1,5 @@
-// Targeted bob.yaml readers — the monorepo deliberately avoids a YAML dep (see
-// the note in init.ts renderBobYaml and run.ts resolveProviderAndModel). These
-// readers extend that same hand-rolled, format-specific approach to the shapes
-// the capability loader needs: the top-level `capabilities:` string list and a
-// per-capability scalar config block.
-//
-// This is NOT a general YAML parser. It targets the 2-space-indented output
-// `bob init` emits plus the shapes capability config schemas actually need.
-// Anything fancier (anchors, aliases, multi-line scalars, flow mappings, maps
-// nested more than one level under a list item) is out of scope on purpose — if
-// config grows past that we swap in a real YAML emitter+parser repo-wide
-// (already flagged in init.ts).
-//
-// Out-of-scope shapes THROW `BobYamlError` rather than parse to something
-// plausible-but-wrong. That distinction is the whole lesson of #77: `readBlock`
-// silently rendered a list of mappings as a list of strings, so a capability
-// that could never be configured shipped anyway.
-
+import { isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
+import { DEFAULT_PROVIDER_REGISTRY, type ProviderRegistry } from "./provider-registry.js";
 import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
 import {
   ModelBudgetError,
@@ -227,9 +211,16 @@ export interface ProviderLimitsBlock extends DeclaredModelLimits {
   baseUrl?: string;
 }
 
-const REDIRECTABLE_PROVIDERS = new Set(["ollama-newton", "omlx"]);
-
-export function providerBaseUrlRefusal(provider: string, baseUrl: string): string | undefined {
+// Endpoint eligibility is DERIVED FROM THE REGISTRY: a `provider.base_url`
+// override is allowed only when the row declares an explicit override policy
+// (a keyless profile), and not to a host that profile excludes. Disk contents
+// never select a profile. An undeclared provider name has no policy, so it
+// refuses — the same answer the old hardcoded set gave for every other name.
+export function providerBaseUrlRefusal(
+  provider: string,
+  baseUrl: string,
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): string | undefined {
   if (
     Array.from(baseUrl).some((char) => {
       const code = char.charCodeAt(0);
@@ -242,21 +233,79 @@ export function providerBaseUrlRefusal(provider: string, baseUrl: string): strin
   try {
     parsed = new URL(baseUrl);
   } catch {
-    return `provider.base_url must be an absolute http/https URL (got ${JSON.stringify(baseUrl)}).`;
+    return "provider.base_url must be an absolute http/https URL.";
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return `provider.base_url must be http or https (got ${JSON.stringify(parsed.protocol)}).`;
+    return "provider.base_url must be http or https.";
   }
   if (parsed.username !== "" || parsed.password !== "") {
-    return `provider.base_url must not carry credentials (a username or password in the URL).`;
+    return "provider.base_url must not carry credentials (a username or password in the URL).";
   }
   if (parsed.href.includes("?") || parsed.href.includes("#")) {
     return "provider.base_url must not contain a query string or fragment.";
   }
-  if (REDIRECTABLE_PROVIDERS.has(provider)) return undefined;
-  if (provider === "ollama" && parsed.hostname.replace(/\.+$/, "") !== "ollama.com")
-    return undefined;
-  return `provider.base_url is only allowed for ollama on a non-ollama.com host, ollama-newton, or omlx (got "${provider}").`;
+  const policy = registry.find(provider)?.override;
+  if (policy !== undefined) {
+    const host = parsed.hostname.replace(/\.+$/, "");
+    if (!(policy.excludeHosts ?? []).includes(host)) return undefined;
+    return "provider.base_url host is excluded by the provider row’s override.excludeHosts policy.";
+  }
+  return "provider.base_url is only allowed for a keyless provider row that authorizes an override.";
+}
+
+// bob#186 slice 2 (T7) — the provider readers run on a REAL YAML parser.
+//
+// `bob.yaml` is hand-emitted by init today, but the provider block's readers must
+// not depend on a bespoke regex grammar once the document may carry nested
+// metadata. This helper parses the WHOLE document once and returns one
+// top-level block. Duplicate mapping keys, unresolved tags, aliases/anchors and
+// merge keys REFUSE: the document is ambiguous and a reader cannot resolve it.
+export function parseBobYamlBlock(yamlText: string, blockKey: string): unknown {
+  let doc: import("yaml").Document;
+  try {
+    doc = parseDocument(yamlText, { uniqueKeys: true, schema: "core", merge: false });
+  } catch {
+    throw new BobYamlError(blockKey, 1, "could not parse bob.yaml.");
+  }
+  if (doc.errors.length > 0) {
+    throw new BobYamlError(blockKey, 1, "could not parse bob.yaml.");
+  }
+  if (doc.warnings.length > 0) {
+    throw new BobYamlError(blockKey, 1, "unsupported YAML tag in bob.yaml.");
+  }
+  refuseAmbiguousYaml(doc.contents, blockKey);
+  const value = doc.toJS({ maxAliasCount: 0 });
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new BobYamlError(blockKey, 1, "bob.yaml must be a mapping of top-level block keys.");
+  }
+  return (value as Record<string, unknown>)[blockKey];
+}
+
+// Refuse aliases, anchors and merge keys in bob.yaml, mirroring the registry
+// loader: they make the document ambiguous, and the provider block is a flat,
+// explicit declaration.
+function refuseAmbiguousYaml(node: Node | null, blockKey: string): void {
+  if (node === null || node === undefined) return;
+  if (isAlias(node) || (node as { anchor?: unknown }).anchor !== undefined) {
+    throw new BobYamlError(blockKey, 1, "bob.yaml uses a YAML alias/anchor, which is not allowed.");
+  }
+  if (isMap(node)) {
+    for (const pair of node.items) {
+      const key = pair.key as Node | null;
+      if (key !== null && (key as { value?: unknown }).value === "<<") {
+        throw new BobYamlError(
+          blockKey,
+          1,
+          "bob.yaml uses a YAML merge key, which is not allowed.",
+        );
+      }
+      if (pair.key) refuseAmbiguousYaml(pair.key as Node, blockKey);
+      if (pair.value) refuseAmbiguousYaml(pair.value as Node, blockKey);
+    }
+  } else if (isSeq(node)) {
+    for (const item of node.items) refuseAmbiguousYaml(item as Node, blockKey);
+  }
 }
 
 function tokensFor(yamlText: string, key: string, value: unknown): number {
@@ -271,10 +320,20 @@ function tokensFor(yamlText: string, key: string, value: unknown): number {
   return tokens;
 }
 
-export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
-  const raw = readBlock(yamlText, "provider");
+export function readProviderLimits(
+  yamlText: string,
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
+): ProviderLimitsBlock {
+  const raw = parseBobYamlBlock(yamlText, "provider") as Record<string, unknown> | undefined;
   const out: ProviderLimitsBlock = { models: {} };
-  if (raw === undefined) return out;
+  if (raw === undefined || raw === null) return out;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BobYamlError(
+      "provider",
+      lineOf(yamlText, /^provider[ \t]*:/m),
+      `the "provider:" block must be a mapping of name/model/context_window keys.`,
+    );
+  }
   for (const [key, value] of Object.entries(raw)) {
     if (!(PROVIDER_KEYS as readonly string[]).includes(key)) {
       throw new BobYamlError(
@@ -294,7 +353,7 @@ export function readProviderLimits(yamlText: string): ProviderLimitsBlock {
         );
       }
       const name = typeof raw.name === "string" ? raw.name : "";
-      const refusal = providerBaseUrlRefusal(name, value);
+      const refusal = providerBaseUrlRefusal(name, value, registry);
       if (refusal !== undefined) {
         throw new BobYamlError("provider", lineOfKey(yamlText, "provider", key), refusal);
       }

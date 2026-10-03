@@ -292,6 +292,7 @@ async function bobFactoryFor(opts: {
     config: {
       ...base,
       provider: STUB_PROVIDER,
+      providerRecord: undefined,
       model: STUB_MODEL,
       modelLimits: {
         provider: STUB_PROVIDER,

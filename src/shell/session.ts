@@ -78,6 +78,13 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
+import {
+  assertProviderEndpointAllowed,
+  DEFAULT_PROVIDER_REGISTRY,
+  type ProviderRegistry,
+  ProviderRegistryError,
+  reservedProviderNames,
+} from "./provider-registry.js";
 import type { RunSession, RunSessionConfig } from "./run.js";
 import {
   appendContractOverride,
@@ -200,9 +207,7 @@ export function guardedOpenrouterFetch(
     try {
       parsed = new URL(asString);
     } catch {
-      return Promise.reject(
-        new Error(`bob: refusing an openrouter request to ${asString} — not a valid URL`),
-      );
+      return Promise.reject(new Error("bob: refusing an openrouter request with an invalid URL"));
     }
     if (
       parsed.protocol !== "https:" ||
@@ -214,18 +219,14 @@ export function guardedOpenrouterFetch(
     ) {
       return Promise.reject(
         new Error(
-          `bob: refusing an openrouter request to ${asString} — bob's transport sends only to https://openrouter.ai/api/v1/ (no credentials in the URL, default port, /api/v1/ path)`,
+          "bob: refusing an openrouter request — bob's transport sends only to https://openrouter.ai/api/v1/",
         ),
       );
     }
     // Non-canonical inputs (e.g. a `%2e%2e` path or a missing trailing slash)
     // parse to a href that differs from the input: refuse.
     if (asString !== parsed.href) {
-      return Promise.reject(
-        new Error(
-          `bob: refusing a non-canonical openrouter request URL ${asString} (canonical form: ${parsed.href})`,
-        ),
-      );
+      return Promise.reject(new Error("bob: refusing a non-canonical openrouter request URL"));
     }
     return baseFetch(parsed.href, {
       ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
@@ -239,11 +240,11 @@ export function guardedOpenrouterFetch(
       if (/redirect/i.test(text)) {
         return Promise.reject(
           new Error(
-            `bob: refusing an openrouter redirect from ${parsed.href} — bob's transport does not follow redirects (redirect: "error")`,
+            'bob: refusing an openrouter redirect — bob\'s transport does not follow redirects (redirect: "error")',
           ),
         );
       }
-      return Promise.reject(err);
+      return Promise.reject(new Error("bob: openrouter request failed"));
     });
   }) as typeof globalThis.fetch;
 }
@@ -275,9 +276,7 @@ export function openrouterTransport(input: {
   const transport = (model: unknown, context: unknown, options?: unknown) => {
     const prepared = (model ?? {}) as { baseUrl?: unknown; api?: unknown };
     if (prepared.baseUrl !== input.baseUrl || prepared.api !== input.api) {
-      throw new Error(
-        `bob: refusing an openrouter request to ${JSON.stringify(prepared.baseUrl)} (api ${JSON.stringify(prepared.api)}) — bob's openrouter transport sends only to ${input.baseUrl} (${input.api})`,
-      );
+      throw new Error("bob: refusing an openrouter request with a mismatched endpoint or API");
     }
     const opts = (options ?? {}) as { headers?: Record<string, string | null> };
     // The EFFECTIVE headers the delegate will send: the model's own headers AND
@@ -342,20 +341,26 @@ export function buildOpenrouterProvider(input: {
 }
 
 /**
- * Refuse when the on-disk pi config carries ANY `openrouter` entry: bob owns the
- * provider, and an entry in the editable `models.json` (a provider block, a
- * per-model `baseUrl`, a `providers.openrouter.apiKey`) or a stored credential
- * in `auth.json` is never merged. Names the file. A MISSING file is "absent" (no
- * entry); any OTHER read or parse failure REFUSES — bob cannot prove the file
- * carries no openrouter entry. pi accepts comments in `models.json`, so a
- * commented file is refused here ON PURPOSE as unparseable.
+ * Refuse when the on-disk pi config carries ANY entry for a name in `reserved`
+ * (the names the caller treats as bob-owned): an entry in the editable
+ * `models.json` (a provider block, a per-model `baseUrl`, a
+ * `providers.<name>.apiKey`) or an `auth.json` entry is never merged. Names the file. A MISSING file is
+ * "absent" (no entry); any OTHER read or parse failure REFUSES — bob cannot prove
+ * the file carries none of the reserved entries. pi accepts comments in
+ * `models.json`, so a commented file is refused here ON PURPOSE as unparseable.
+ *
+ * The caller supplies `reserved`; the session factory passes the set derived from
+ * the selected registry (the union of every bob/env row's id, aliases and runtime).
  */
-export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
+export function assertNoReservedProviderEntries(
+  piAgentDir: string,
+  reserved: readonly string[],
+): void {
   const modelsPath = join(piAgentDir, "models.json");
   const authPath = join(piAgentDir, "auth.json");
   // ENOENT is "absent" (no entry). Any OTHER read or parse failure — unreadable,
   // or JSON that does not parse after stripping a leading UTF-8 BOM — is a
-  // REFUSAL: bob cannot PROVE the file carries no openrouter entry. pi accepts a
+  // REFUSAL: bob cannot PROVE the file carries no reserved entry. pi accepts a
   // BOM in both files and comments in models.json, so we strip the BOM before
   // parsing (a BOM-prefixed file WITH an entry is still caught), and a commented
   // models.json fails the parse and refuses rather than reading as "no entry".
@@ -366,30 +371,61 @@ export function assertNoOnDiskOpenrouter(piAgentDir: string): void {
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
       throw new Error(
-        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not read it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not read it).`,
       );
     }
     const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-    } catch (err) {
+      parsed = JSON.parse(text);
+    } catch {
       throw new Error(
-        `bob: refusing to start an openrouter session — bob cannot prove ${path} carries no openrouter entry (could not parse it: ${err instanceof Error ? err.message : String(err)}).`,
+        `bob: refusing to start a session — bob cannot prove ${path} carries no reserved provider entry (could not parse it).`,
       );
     }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(
+        `bob: refusing to start a session — ${path} is not a JSON object; bob cannot prove it carries no reserved provider entry.`,
+      );
+    }
+    return parsed as Record<string, unknown>;
   };
-  const providers = (load(modelsPath).providers ?? {}) as Record<string, unknown>;
-  if (Object.hasOwn(providers, "openrouter")) {
+  const models = load(modelsPath);
+  const rawProviders = models.providers;
+  if (
+    rawProviders !== undefined &&
+    (rawProviders === null || typeof rawProviders !== "object" || Array.isArray(rawProviders))
+  ) {
     throw new Error(
-      `bob: refusing to start an openrouter session — ${modelsPath} carries a providers.openrouter entry; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
+      `bob: refusing to start a session — ${modelsPath} providers is not a mapping; bob cannot prove it carries no reserved provider entry.`,
     );
   }
-  if (Object.hasOwn(load(authPath), "openrouter")) {
-    throw new Error(
-      `bob: refusing to start an openrouter session — ${authPath} carries a stored openrouter credential; bob owns the openrouter provider (fixed endpoint, OPENROUTER_API_KEY). Remove this entry.`,
-    );
+  const providers = (rawProviders ?? {}) as Record<string, unknown>;
+  for (const name of reserved) {
+    if (Object.hasOwn(providers, name)) {
+      throw new Error(
+        `bob: refusing to start a session — ${modelsPath} carries a providers.${name} entry; bob owns the ${name} provider (in-memory only). Remove this entry.`,
+      );
+    }
   }
+  const auth = load(authPath);
+  for (const name of reserved) {
+    if (Object.hasOwn(auth, name)) {
+      throw new Error(
+        `bob: refusing to start a session — ${authPath} carries an auth.json entry for ${name}; bob owns the ${name} provider (in-memory only). Remove this entry.`,
+      );
+    }
+  }
+}
+
+/**
+ * Refuse on-disk entries for the supplied reserved names.
+ */
+export function assertNoOnDiskOpenrouter(
+  piAgentDir: string,
+  reserved: readonly string[] = reservedProviderNames(),
+): void {
+  assertNoReservedProviderEntries(piAgentDir, reserved);
 }
 
 /**
@@ -411,14 +447,10 @@ export async function assertOpenrouterRuntimeUnchanged(
     problems.push(`no model ${providerId}/${input.model}`);
   } else {
     if (model.baseUrl !== input.expected.baseUrl) {
-      problems.push(
-        `the selected model's baseUrl is ${model.baseUrl}, not ${input.expected.baseUrl}`,
-      );
+      problems.push("the selected model's baseUrl does not match");
     }
     if (model.api !== input.expected.api) {
-      problems.push(
-        `the selected model's api is ${JSON.stringify(model.api)}, not ${JSON.stringify(input.expected.api)}`,
-      );
+      problems.push("the selected model's api does not match");
     }
   }
   const reg = modelRuntime.getRegisteredProviderConfig?.(providerId);
@@ -426,18 +458,14 @@ export async function assertOpenrouterRuntimeUnchanged(
     problems.push("there is no registered openrouter provider config");
   } else {
     if (reg.baseUrl !== input.expected.baseUrl) {
-      problems.push(
-        `the registered baseUrl is ${JSON.stringify(reg.baseUrl)}, not ${input.expected.baseUrl}`,
-      );
+      problems.push("the registered baseUrl does not match");
     }
     if (reg.api !== input.expected.api) {
-      problems.push(
-        `the registered api is ${JSON.stringify(reg.api)}, not ${JSON.stringify(input.expected.api)}`,
-      );
+      problems.push("the registered api does not match");
     }
     const m0 = (reg.models ?? [])[0] as { baseUrl?: string } | undefined;
     if (m0 && m0.baseUrl !== undefined) {
-      problems.push(`the model entry carries a per-model baseUrl (${m0.baseUrl})`);
+      problems.push("the model entry carries a per-model baseUrl");
     }
   }
   // The key pi holds. Round 6: pi holds ONLY the NON-SECRET placeholder; the real
@@ -448,10 +476,10 @@ export async function assertOpenrouterRuntimeUnchanged(
   let caught = false;
   try {
     auth = await modelRuntime.getAuth(providerId);
-  } catch (err) {
+  } catch {
     caught = true;
     problems.push(
-      `the auth resolution for openrouter threw (${err instanceof Error ? err.message : String(err)}) — bob cannot prove pi holds its placeholder`,
+      "the auth resolution for openrouter threw — bob cannot prove pi holds its placeholder",
     );
   }
   if (!caught) {
@@ -560,34 +588,21 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   if (runtime.__bobOpenrouterGuarded) return;
   runtime.__bobOpenrouterGuarded = true;
 
-  const refuse = (verb: string, id: string, attempted?: unknown): never => {
-    const baseUrl =
-      attempted && typeof attempted === "object" && "baseUrl" in attempted
-        ? (attempted as { baseUrl?: unknown }).baseUrl
-        : undefined;
-    const caller =
-      new Error().stack
-        ?.split("\n")
-        .slice(2, 5)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0 && !l.includes("session.ts"))
-        .slice(0, 2)
-        .join(" <- ") ?? "unknown caller";
+  const refuse = (verb: string): never => {
     throw new Error(
-      `bob: refusing a ${verb} of the openrouter provider after bob registered its own — the EFFECTIVE openrouter provider is bob's (fixed ${OPENROUTER_BASE_URL}, OPENROUTER_API_KEY). ` +
-        `Attempted baseUrl ${JSON.stringify(baseUrl)}; caller ${caller}.`,
+      `bob: refusing a ${verb} of the openrouter provider after bob registered its own`,
     );
   };
 
   const originalRegister = runtime.registerProvider.bind(modelRuntime);
   runtime.registerProvider = (id: string, config: OpenrouterProviderConfig) => {
-    if (id === "openrouter") refuse("registerProvider", id, config);
+    if (id === "openrouter") refuse("registerProvider");
     return originalRegister(id, config);
   };
   if (typeof runtime.unregisterProvider === "function") {
     const originalUnregister = runtime.unregisterProvider.bind(modelRuntime);
     runtime.unregisterProvider = (id: string) => {
-      if (id === "openrouter") refuse("unregisterProvider", id);
+      if (id === "openrouter") refuse("unregisterProvider");
       return originalUnregister(id);
     };
   }
@@ -599,7 +614,7 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
       baseUrl?: string;
     }) => {
       const id = provider?.id ?? provider?.name;
-      if (id === "openrouter") refuse("registerNativeProvider", id, provider);
+      if (id === "openrouter") refuse("registerNativeProvider");
       return originalNative(provider);
     };
   }
@@ -1035,6 +1050,9 @@ export interface BobFactoryInput {
   // can substitute one that returns a scripted "built" session so it can drive
   // the factory's dispose-on-refusal catch without a process-global module mock.
   buildSession?: typeof createAgentSessionFromServices;
+  // The validated provider selection this session was resolved from. The factory
+  // derives the on-disk refusal set from ITS rows, never a re-loaded default.
+  registry?: ProviderRegistry;
 }
 
 // Fail the session if bob's OWN guard extension did not load (#145). pi records
@@ -1094,6 +1112,27 @@ export function contractBlockFor(
 export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSessionRuntimeFactory {
   const { config, policy } = input;
   const deps = input.deps;
+  const registry = input.registry ?? DEFAULT_PROVIDER_REGISTRY;
+  const runtimeRows = registry
+    .records()
+    .filter((candidate) => candidate.runtime === config.provider);
+  const row =
+    config.providerRecord ??
+    (runtimeRows.length === 1
+      ? runtimeRows[0]
+      : config.provider === "anthropic"
+        ? runtimeRows.find((candidate) => candidate.auth.kind === "login")
+        : undefined);
+  if (row === undefined && runtimeRows.length > 1) {
+    throw new ProviderRegistryError(
+      `provider registry: runtime identity "${config.provider}" needs a selected row.`,
+    );
+  }
+  if (row !== undefined && (row.runtime !== config.provider || !registry.records().includes(row))) {
+    throw new ProviderRegistryError(
+      "provider registry: selected row does not match the session registry and runtime.",
+    );
+  }
   // pi builds the session from the services above, unless a test injects its own
   // builder. Injectable so a test drives the dispose-on-refusal path with a
   // scripted session instead of a process-global module mock; production passes
@@ -1222,6 +1261,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // entry path before a capability, extension, tool or child process starts.
     delete process.env[ADMIN_PASS_ENV];
 
+    assertNoReservedProviderEntries(agentDir, reservedProviderNames(input.registry));
     const modelRuntime =
       (input.modelRuntime as ModelRuntime | undefined) ??
       (await ModelRuntime.create({
@@ -1230,14 +1270,28 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       }));
     const yamlPath = join(dirname(config.piAgentDir), "bob.yaml");
     const baseUrl = existsSync(yamlPath)
-      ? readProviderLimits(readFileSync(yamlPath, "utf8")).baseUrl
+      ? readProviderLimits(readFileSync(yamlPath, "utf8"), input.registry).baseUrl
       : undefined;
     if (baseUrl !== undefined) {
       const effective = modelRuntime.getModel(config.provider, config.model);
       if (effective?.baseUrl !== baseUrl) {
         throw new Error("bob: run bob models <agent> to apply provider.base_url");
       }
-      installBaseUrlTransport(modelRuntime, config.provider, baseUrl);
+    }
+    if (row?.auth.kind === "none") {
+      const effective = modelRuntime.getModel(config.provider, config.model);
+      const endpoint = baseUrl ?? row.endpoint ?? effective?.baseUrl;
+      if (
+        endpoint === undefined ||
+        effective?.baseUrl !== endpoint ||
+        effective.api !== "openai-completions"
+      ) {
+        throw new Error(
+          "bob: bob/none requires an OpenAI-compatible model with a matching endpoint",
+        );
+      }
+      assertProviderEndpointAllowed(row, endpoint);
+      installBaseUrlTransport(modelRuntime, config.provider, endpoint);
     }
     // openrouter is bob's OWN provider (round 3): construct it in memory and
     // refuse any on-disk entry, so no `models.json`/`auth.json` field can
@@ -1246,7 +1300,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     if (config.provider === "openrouter") {
       // The on-disk refusal comes FIRST (a config error, before any key read), so a
       // tampered models.json refuses on every entry path without consuming the key.
-      assertNoOnDiskOpenrouter(agentDir);
       // (1) KEY OUT OF THE ENVIRONMENT. On the FIRST invocation read
       // OPENROUTER_API_KEY once, then DELETE it from process.env before any
       // capability, extension or tool subprocess starts (pi's ModelRuntime is
@@ -1537,6 +1590,9 @@ export interface InteractiveRunInput {
   // Sent as the first message once the TUI is up (onboarding / alignment).
   initialMessage?: string;
   deps?: SessionDeps;
+  // The validated provider selection. Threaded to the factory so the on-disk
+  // refusal set comes from ITS rows.
+  registry?: ProviderRegistry;
   // Test seam: build the mode around the runtime. Defaults to pi's
   // InteractiveMode.
   modeFactory?: (runtime: AgentSessionRuntime) => { run(): Promise<void> };
@@ -1548,7 +1604,12 @@ export interface InteractiveRunInput {
 export async function runInteractiveSession(input: InteractiveRunInput): Promise<number> {
   const { config, policy, deps } = input;
   const runtime = await createAgentSessionRuntime(
-    createBobRuntimeFactory({ config, policy, deps }),
+    createBobRuntimeFactory({
+      config,
+      policy,
+      deps,
+      ...(input.registry !== undefined ? { registry: input.registry } : {}),
+    }),
     {
       cwd: config.cwd,
       agentDir: config.piAgentDir,

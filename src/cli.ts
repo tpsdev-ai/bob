@@ -54,6 +54,12 @@ import {
   watchParent,
 } from "./shell/index.js";
 import { applyModelScaffold } from "./shell/models.js";
+import {
+  DEFAULT_PROVIDER_REGISTRY,
+  defaultProviderName,
+  loadProviderRegistry,
+  type ProviderRegistry,
+} from "./shell/provider-registry.js";
 
 function help(): void {
   console.log(`Bob — moldable office-agent shell.
@@ -179,12 +185,13 @@ async function onboard(
   name: string,
   flags: Record<string, string | boolean>,
   adminPassFromEnv: string | undefined,
+  registry: ProviderRegistry,
 ): Promise<void> {
   // Value flags go through stringFlag: a bare `--model`, or the empty
   // `--model=` form, means "not given" — the default applies — never the
   // literal id "true" or an empty id written into bob.yaml and models.json.
   const role = (stringFlag(flags, "role") ?? "custom") as BobRole;
-  const provider = stringFlag(flags, "provider") ?? "ollama-cloud";
+  const provider = stringFlag(flags, "provider") ?? defaultProviderName("onboard", registry);
   const model = stringFlag(flags, "model") ?? "kimi-k2.6";
   const dryRun = boolFlag(flags, "dry-run");
   const force = boolFlag(flags, "force");
@@ -203,7 +210,7 @@ async function onboard(
   );
   let baseUrl = stringFlag(flags, "base-url");
   if (baseUrl !== undefined) {
-    const refusal = providerBaseUrlRefusal(provider, baseUrl);
+    const refusal = providerBaseUrlRefusal(provider, baseUrl, registry);
     if (refusal !== undefined) throw new UsageError(refusal);
     baseUrl = new URL(baseUrl).href;
   }
@@ -231,6 +238,7 @@ async function onboard(
     provider,
     model,
     contextWindow,
+    registry,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
     noClobber: !force,
     skipFlair: noFlair,
@@ -271,6 +279,7 @@ async function onboard(
     agentDir: result.agentDir,
     provider,
     model,
+    registry,
   });
 
   console.log("─".repeat(60));
@@ -348,7 +357,11 @@ async function provisionOnboard(
   console.log(describeProvisioning(provisioned));
 }
 
-async function align(name: string, flags: Record<string, string | boolean>): Promise<void> {
+async function align(
+  name: string,
+  flags: Record<string, string | boolean>,
+  registry: ProviderRegistry,
+): Promise<void> {
   // #155 — the check-in runs on the agent's OWN provider and model, read from
   // its bob.yaml by runAlign. A flag replaces only the field it names, and it is
   // read the way `bob run` and `bob install-service` read one: a bare flag (no
@@ -368,7 +381,7 @@ async function align(name: string, flags: Record<string, string | boolean>): Pro
   console.log(`Tell ${name} to ship it when the persona update looks right, then exit (Ctrl-D).`);
   console.log("─".repeat(60));
 
-  const outcome = await runAlign({ name, agentDir, provider, model });
+  const outcome = await runAlign({ name, agentDir, provider, model, registry });
 
   console.log("─".repeat(60));
   if (outcome.exitCode !== 0) {
@@ -428,6 +441,7 @@ async function run(
   name: string,
   prompt: string | undefined,
   flags: Record<string, string | boolean>,
+  registry: ProviderRegistry,
 ): Promise<number> {
   const model = stringFlag(flags, "model");
   // The interactive REPL on the SDK lands in a later phase-1 PR.
@@ -445,7 +459,7 @@ async function run(
     // back via them. This is what the service unit invokes. Blocks until
     // SIGTERM/SIGINT — runPersistent disposes the session gracefully (await
     // in-flight turn → dispose → exit 0); KeepAlive/Restart relaunches it.
-    await runPersistent({ name, model });
+    await runPersistent({ name, model, registry });
     return 0;
   }
   // ONE-SHOT TASK (claude -p style) — minimal + ephemeral (no gateway; see
@@ -463,6 +477,7 @@ async function run(
     name,
     prompt,
     model,
+    registry,
     captureStdout: true,
     ...(wallClockMs !== undefined ? { wallClockMs } : {}),
     ...(noProgressMs !== undefined ? { noProgressMs } : {}),
@@ -520,8 +535,8 @@ async function restartCmd(name: string): Promise<number> {
   return 0;
 }
 
-function doctor(name: string): number {
-  const report = runDoctor({ name });
+function doctor(name: string, registry: ProviderRegistry): number {
+  const report = runDoctor({ name, registry });
   console.log(formatReport(report));
   return report.summary.fail > 0 ? 1 : 0;
 }
@@ -559,12 +574,6 @@ function formatPositionDiff(name: string, diff: import("./shell/index.js").Posit
 }
 
 async function main(): Promise<number> {
-  // The operator password leaves the environment FIRST, before any command
-  // runs: read once, deleted from process.env, and handed explicitly to the
-  // one operator transport that uses it (onboard's registration), so no agent
-  // session this process starts gets it through its environment. What this
-  // does not cover is stated at takeFlairAdminPassFromEnv.
-  const adminPassFromEnv = takeFlairAdminPassFromEnv();
   // parseArgs validates every declared boolean flag, so a bad spelling is a
   // usage error HERE — before any command runs — and never a stack trace.
   let args: Args;
@@ -576,6 +585,19 @@ async function main(): Promise<number> {
     throw err;
   }
   try {
+    const registry = [
+      "models",
+      "onboard",
+      "align",
+      "init",
+      "run",
+      "launch",
+      "doctor",
+      "hire",
+    ].includes(args.command)
+      ? loadProviderRegistry()
+      : DEFAULT_PROVIDER_REGISTRY;
+    const adminPassFromEnv = takeFlairAdminPassFromEnv();
     switch (args.command) {
       case "models": {
         if (
@@ -587,7 +609,9 @@ async function main(): Promise<number> {
         if (args.flags["agents-root"] !== undefined && !stringFlag(args.flags, "agents-root")) {
           throw new UsageError("bob models: --agents-root requires a directory");
         }
-        console.log(applyModelScaffold(args.positional[0], stringFlag(args.flags, "agents-root")));
+        console.log(
+          applyModelScaffold(args.positional[0], stringFlag(args.flags, "agents-root"), registry),
+        );
         return 0;
       }
       case "onboard": {
@@ -596,7 +620,7 @@ async function main(): Promise<number> {
           console.error("bob onboard: missing <name>");
           return 2;
         }
-        await onboard(name, args.flags, adminPassFromEnv);
+        await onboard(name, args.flags, adminPassFromEnv, registry);
         return 0;
       }
       case "align": {
@@ -605,7 +629,7 @@ async function main(): Promise<number> {
           console.error("bob align: missing <name>");
           return 2;
         }
-        await align(name, args.flags);
+        await align(name, args.flags, registry);
         return 0;
       }
       case "init": {
@@ -615,7 +639,7 @@ async function main(): Promise<number> {
           return 2;
         }
         console.error("bob init: renamed to `bob onboard`. Forwarding…");
-        await onboard(name, args.flags, adminPassFromEnv);
+        await onboard(name, args.flags, adminPassFromEnv, registry);
         return 0;
       }
       case "run": {
@@ -624,7 +648,7 @@ async function main(): Promise<number> {
           return 2;
         }
         const prompt = args.positional.slice(1).join(" ") || undefined;
-        return await run(args.positional[0], prompt, args.flags);
+        return await run(args.positional[0], prompt, args.flags, registry);
       }
       case "launch": {
         // At most one prompt, and nothing else: the whitelist is enforced in
@@ -657,12 +681,12 @@ async function main(): Promise<number> {
                 );
                 return 2;
               }
-              return await runMailTurnLaunch({ name: launch.name, input });
+              return await runMailTurnLaunch({ name: launch.name, input, registry });
             } finally {
               stopWatching();
             }
           }
-          return await runLaunch(launch);
+          return await runLaunch({ ...launch, registry });
         } catch (err: unknown) {
           if (err instanceof LaunchArgError) {
             console.error(err.message);
@@ -700,7 +724,7 @@ async function main(): Promise<number> {
           console.error("bob doctor: missing <name>");
           return 2;
         }
-        return doctor(args.positional[0]);
+        return doctor(args.positional[0], registry);
       case "login": {
         const name = args.positional[0];
         if (!name) {
@@ -764,7 +788,8 @@ async function main(): Promise<number> {
           console.error("bob hire: missing --as <position>");
           return 2;
         }
-        const provider = stringFlag(args.flags, "provider");
+        const provider =
+          stringFlag(args.flags, "provider") ?? defaultProviderName("hire", registry);
         const model = stringFlag(args.flags, "model");
         // bob#214: refused here as a usage error, before anything is written;
         // hireAgent refuses a missing window too, before its own first write.
@@ -777,6 +802,7 @@ async function main(): Promise<number> {
           name,
           positionName: as,
           agentsRoot: stringFlag(args.flags, "agents-root") ?? `${process.env.HOME}/agents`,
+          registry,
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
           contextWindow,

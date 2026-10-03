@@ -41,6 +41,7 @@ import {
   type MailConsumer,
   type MailConsumerOptions,
 } from "./mail-consumer.js";
+import type { ProviderRegistry } from "./provider-registry.js";
 import {
   attachFlairBootstrap,
   createPiRunSession,
@@ -62,6 +63,8 @@ export interface RunPersistentOptions {
   // Inject the session factory (tests). Defaults to the real SDK factory with a
   // DURABLE SessionManager (persisted under the agent's .pi-agent/sessions).
   sessionFactory?: RunSessionFactory;
+  // The validated provider selection (loaded once by the CLI).
+  registry?: ProviderRegistry;
   // Scheduler seam: tests release a real fire callback during shutdown.
   cronSchedulerFactory?: typeof startCronScheduler;
   // Install OS signal handlers for graceful shutdown. Defaults to true in
@@ -140,6 +143,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     name: opts.name,
     agentsRoot: root,
     model: opts.model,
+    ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
     // The persistent runtime is resident by definition: this process stays up
     // behind the agent's service unit with nobody at the keyboard, which is
     // what the resident tool policy keys off (tool-allowlist.ts). A bob.yaml
@@ -198,7 +202,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     log(`[bob] tps-mail consumer up for ${opts.name}: one fresh-session turn per accepted mail`);
   }
 
-  const factory = opts.sessionFactory ?? defaultPersistentFactory;
+  const factory = opts.sessionFactory ?? defaultPersistentFactory(opts.registry);
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
   // the launcher, so the consumer above neither holds nor submits to it.
@@ -332,15 +336,19 @@ export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
 // AgentSession exposes the idle barrier as `session.agent.waitForIdle()` (SDK
 // docs), not as a top-level method, so we adapt it here. Best-effort — if the
 // shape ever changes, shutdown still proceeds to dispose().
-const defaultPersistentFactory: RunSessionFactory = async (config: RunSessionConfig) => {
-  const session = await createPiRunSession(config, (cwd) =>
-    SessionManager.create(cwd, join(config.piAgentDir, "sessions")),
-  );
-  if (typeof session.waitForIdle !== "function") {
-    const agent = (session as unknown as { agent?: { waitForIdle?: () => Promise<void> } }).agent;
-    if (agent && typeof agent.waitForIdle === "function") {
-      (session as RunSession).waitForIdle = () => agent.waitForIdle?.() ?? Promise.resolve();
+const defaultPersistentFactory =
+  (registry?: ProviderRegistry): RunSessionFactory =>
+  async (config: RunSessionConfig) => {
+    const session = await createPiRunSession(
+      config,
+      (cwd) => SessionManager.create(cwd, join(config.piAgentDir, "sessions")),
+      registry,
+    );
+    if (typeof session.waitForIdle !== "function") {
+      const agent = (session as unknown as { agent?: { waitForIdle?: () => Promise<void> } }).agent;
+      if (agent && typeof agent.waitForIdle === "function") {
+        (session as RunSession).waitForIdle = () => agent.waitForIdle?.() ?? Promise.resolve();
+      }
     }
-  }
-  return session;
-};
+    return session;
+  };

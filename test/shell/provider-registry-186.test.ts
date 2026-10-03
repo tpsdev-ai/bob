@@ -9,14 +9,19 @@ import {
   providerEndpoint,
   resolveRuntimeProviderName,
 } from "../../src/shell/provider-registry.js";
-import { mapBobProviderToPi, resolveRunConfig } from "../../src/shell/run.js";
+import {
+  assertProviderRunnable,
+  mapBobProviderToPi,
+  resolveRunConfig,
+} from "../../src/shell/run.js";
 
 // A row that exists only in this test: a new alias ("acme") for a provider
 // whose runtime identity and endpoint no mapper under src/ names.
 const TEST_ROW = {
   id: "acme-gateway",
   aliases: ["acme"],
-  runtime: "anthropic",
+  runtime: "acme-runtime",
+  auth: { kind: "none" as const },
   endpoint: "http://acme.test/v1",
   api: "openai-completions" as const,
 };
@@ -53,20 +58,38 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     ) as { providers: Record<string, { baseUrl?: string; models: { id: string }[] }> };
     // The alias resolved to the row's runtime identity, and the row's endpoint
     // was written — neither "acme-gateway" nor the endpoint appears in init.ts.
-    expect(models.providers.anthropic?.baseUrl).toBe("http://acme.test/v1");
-    expect(models.providers.anthropic?.models[0]?.id).toBe("test-model");
+    expect(models.providers["acme-runtime"]?.baseUrl).toBe("http://acme.test/v1");
+    expect(models.providers["acme-runtime"]?.models[0]?.id).toBe("test-model");
     expect(readFileSync(join(res.agentDir, "bob.yaml"), "utf8")).toContain("name: acme");
   });
 
   it("run resolution resolves the same alias to the same runtime identity", () => {
     initAgent(baseOpts({ provider: "acme", registry: registry() }));
-    expect(mapBobProviderToPi("acme", registry())).toBe("anthropic");
+    expect(mapBobProviderToPi("acme", registry())).toBe("acme-runtime");
     const { provider } = resolveRunConfig({
       name: "acmebot",
       agentsRoot: tmpRoot,
       registry: registry(),
     });
-    expect(provider).toBe("anthropic");
+    expect(provider).toBe("acme-runtime");
+  });
+
+  it("runnability and run resolution use the selected registry auth", () => {
+    const selected = new ProviderRegistry([
+      { ...TEST_ROW, id: "openrouter", aliases: [], runtime: "openrouter" },
+    ]);
+    const savedKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      expect(() => assertProviderRunnable("openrouter", "test", selected)).not.toThrow();
+      initAgent(baseOpts({ provider: "openrouter", registry: selected }));
+      expect(
+        resolveRunConfig({ name: "acmebot", agentsRoot: tmpRoot, registry: selected }).provider,
+      ).toBe("openrouter");
+    } finally {
+      if (savedKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = savedKey;
+    }
   });
 
   it("a duplicate id or alias fails validation, naming the name", () => {
@@ -93,5 +116,21 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
     expect(mapBobProviderToPi("exe-dev-gateway")).toBe("anthropic");
     expect(resolveRuntimeProviderName("exe-dev-gateway")).toBe("anthropic");
     expect(providerEndpoint("ollama-cloud")).toBe("https://ollama.com/v1");
+  });
+
+  it("a bob/env row whose runtime has no implemented custody fails validation (bob#186 slice 2)", () => {
+    // On main this constructs fine: auth is optional and nothing checks custody.
+    expect(
+      () =>
+        new ProviderRegistry([
+          ...PROVIDER_RECORDS,
+          {
+            id: "acme-keyed",
+            aliases: [],
+            runtime: "acme",
+            auth: { kind: "env", variable: "ACME_KEY" },
+          },
+        ] as never),
+    ).toThrow(/no implemented custody/);
   });
 });

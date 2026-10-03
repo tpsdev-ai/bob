@@ -594,15 +594,15 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
     return { agentDir: r.agentDir, piDir: join(r.agentDir, ".pi-agent") };
   }
 
-  it("(a) auth.json = BOM + an openrouter credential → refused, naming the STORED-CREDENTIAL message", () => {
+  it("(a) auth.json with a BOM and an openrouter entry is refused", () => {
     const { piDir } = scaffold("orr4a");
     writeFileSync(
       join(piDir, "auth.json"),
       `\uFEFF${JSON.stringify({ openrouter: { type: "api_key", key: "x" } })}`,
     );
-    // BOM stripped → parses → finds the entry: the STORED-CREDENTIAL refusal, not
-    // a mere parse error that happens to name the file.
-    expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(/carries a stored openrouter credential/);
+    expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(
+      /carries an auth\.json entry for openrouter/,
+    );
     expect(() => assertNoOnDiskOpenrouter(piDir)).toThrow(/auth\.json/);
   });
 
@@ -653,7 +653,7 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
         baseUrl: "https://evil.example/api/v1",
         api: "openai-completions",
       } as never),
-    ).toThrow(/evil\.example/);
+    ).toThrow(/refusing.*registerProvider/);
     expect(rt.getModel("openrouter", MODEL)?.baseUrl).toBe(OPENROUTER_BASE_URL);
   });
 
@@ -672,7 +672,7 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
     expect(rt.getRegisteredProviderConfig("openrouter")?.api).toBe("openai-completions");
   });
 
-  it('(e) the FACTORY wraps the runtime: a later registerProvider("openrouter") from session_start is REFUSED at the seam, naming the attempted URL', async () => {
+  it('(e) the FACTORY wraps the runtime: a later registerProvider("openrouter") from session_start is REFUSED at the seam, redacting the attempted URL', async () => {
     scaffold("orr4e");
     process.env.OPENROUTER_API_KEY = SENTINEL;
     const spy = spyRegisterProviderCapture();
@@ -689,14 +689,12 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
       // The ModelRuntime the factory used — bob registered on it, then wrapped it.
       const rt = spy.instance;
       expect(rt, "the factory ran on a ModelRuntime").toBeDefined();
-      // A capability's `session_start` handler makes exactly this call; refused
-      // BEFORE it takes effect, naming the attempted URL.
       const sessionStart = () =>
         rt!.registerProvider("openrouter", {
           baseUrl: "https://evil.example/api/v1",
           api: "openai-completions",
         } as never);
-      expect(sessionStart).toThrow(/evil\.example/); // assertion: error names the URL
+      expect(sessionStart).toThrow(/refusing.*registerProvider/);
       expect(rt!.getModel("openrouter", MODEL)?.baseUrl).toBe(OPENROUTER_BASE_URL); // refusal took effect BEFORE the change
     } finally {
       spy.restore();
@@ -724,7 +722,7 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
           baseUrl: "https://evil.example/api/v1",
           api: "openai-completions",
         } as never);
-      expect(beforeAgentStart).toThrow(/evil\.example/); // assertion: error names the URL
+      expect(beforeAgentStart).toThrow(/refusing.*registerProvider/);
       expect(rt!.getModel("openrouter", MODEL)?.baseUrl).toBe(OPENROUTER_BASE_URL);
     } finally {
       spy.restore();
@@ -745,7 +743,7 @@ describe("openrouter round 4 — fail closed on config bob cannot parse, and ass
     }) as typeof rt.getAuth;
     await expect(
       assertOpenrouterRuntimeUnchanged(rt, { model: MODEL, expected, apiKey: SENTINEL }),
-    ).rejects.toThrow(/auth boom/); // assertion: a resolution failure REFUSES
+    ).rejects.toThrow(/auth resolution.*threw/); // assertion: a resolution failure REFUSES
     rt.getAuth = (async () => ({})) as typeof rt.getAuth;
     await expect(
       assertOpenrouterRuntimeUnchanged(rt, { model: MODEL, expected, apiKey: SENTINEL }),
@@ -825,7 +823,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
     return { rt, piDir };
   }
 
-  it("(t1, unit) setModel with an evil baseUrl: the transport REFUSES, zero requests, naming evil.example", async () => {
+  it("(t1, unit) setModel with an evil baseUrl: the transport REFUSES, zero requests, with a redacted error", async () => {
     const stub = stubFetch(); // the stub MUST be installed before the provider is registered
     try {
       const { rt } = await runtimeFor("or6t1");
@@ -840,7 +838,7 @@ describe("openrouter round 6 — the key never enters pi; the transport owns it"
         | { stopReason?: string; errorMessage?: string }
         | undefined;
       expect(result?.stopReason).toBe("error"); // assertion: refused
-      expect(String(result?.errorMessage)).toMatch(/evil\.example/); // assertion: names the attempted URL
+      expect(String(result?.errorMessage)).toMatch(/mismatched endpoint or API/);
       expect(stub.seen).toEqual([]); // assertion: the stub fetch saw ZERO requests
     } finally {
       stub.restore();
