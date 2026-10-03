@@ -115,6 +115,7 @@ describe("blessed catalog", () => {
       "run_status",
       "run_cancel",
       "apply_patch",
+      "publish",
     ]);
     expect(entry?.manifest.provides?.serves).toBe(false);
     expect(entry?.manifest.piPackage).toBe("@tpsdev-ai/bob/capabilities/work");

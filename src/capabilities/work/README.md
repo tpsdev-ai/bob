@@ -80,7 +80,7 @@ command could start in it. That is the safe direction; make it readable
 ## apply_patch and the task binding (bob#275, S2a)
 
 `apply_patch` builds a candidate tree from a patch artifact under the task's
-artifact root; candidate checks and publication follow in S2b.
+artifact root; `publish` (below) turns a stored candidate into a remote commit.
 
 **The task binding.** A task binding is the launcher's authority over a builder
 session: the task and publication identities, the repository and workspace, the
@@ -126,14 +126,44 @@ A concurrent same-user writer can still race rename until builder confinement
 command the model writes, so its `TOOL_EFFECTS` row is `writer` and a resident
 agent drops it unless its role permits resident writers.
 
+## publish and publication recovery (bob#275, S2b)
+
+`publish` takes `candidate_id` and `commit_message`; `pr` refuses with
+`pr_unsupported` because PR creation is a later slice.
+
+Candidates are read from `<state dir>/candidates/` after ID and directory checks.
+The record must match its content-derived ID and the task binding.
+Publication checks literal paths against scope and checks the expected tree, materializes the candidate,
+and runs the required commands through the executor with an environment allowlist.
+A nonzero exit, timeout, cancellation, missing exit status, uncertain cleanup,
+incomplete capture, failed index refresh or changed tracked source refuses publication.
+
+The journal pins the binding, resolved endpoint and commit before pushing.
+Recovery reuses passing checks only for the same authority and candidate.
+A missing executor refuses when checks still need to run.
+Unexpected inspection output or uncertain ancestry returns indeterminate.
+The resolved endpoint is used for both remote inspection and push; URL rewrites refuse.
+Pushes require a fast-forward and an atomic expected-ref match; creating an absent
+ref requires `destination.create: true`.
+
+Journal writes sync the file, rename it, then sync the directory and state root;
+write failures after a push attempt return indeterminate with the known push state.
+In-process retries queue; another process holding the publication lock causes
+`publication_locked`. A crash can leave a lock requiring operator removal after
+confirming the publisher has stopped.
+A concurrent same-user writer can still race pathname operations (bob#189).
+
+The result includes `status` (`published`, `refused` or `indeterminate`),
+`commit_oid`, `phase`, `push_state` and a refusal `reason` when applicable.
+
 ## Enabling it
 
 The `work` capability is what enables `run`. `roles/builder-local/role.json`
-allows `run`, `run_status`, `run_cancel` and `apply_patch`, and does not allow
-`bash`: in that role, `run` replaces pi's shell, and that is a fact of the config
-(tool availability is a per-role allow-list), not of load order. An agent opts in
-the same way as for `anchored-edit`: `work` under `capabilities:` in `bob.yaml`
-and the four names in `tools.allow:`.
+allows `run`, `run_status`, `run_cancel`, `apply_patch` and `publish`, and does
+not allow `bash`: in that role, `run` replaces pi's shell, and that is a fact of
+the config (tool availability is a per-role allow-list), not of load order. An
+agent opts in the same way as for `anchored-edit`: `work` under `capabilities:`
+in `bob.yaml` and the names in `tools.allow:`.
 
 `run` executes arbitrary commands, so the resident policy treats it as a shell:
 its `TOOL_EFFECTS` row is `writer`, so it is in `RESIDENT_EXCLUDED_TOOLS` with

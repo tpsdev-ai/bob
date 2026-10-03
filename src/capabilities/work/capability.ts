@@ -2,12 +2,15 @@
 // drive them through a real pi session (an inline probe extension) or a fake.
 // `index.ts` is the thin pi extension factory.
 //
-// What this wires — three tools via pi.registerTool, plus two lifecycle hooks:
+// What this wires — five tools via pi.registerTool, plus two lifecycle hooks:
 //   run         — start a command with a deadline; foreground (wait for the
 //                 outcome) or background (return a run_id at once)
 //   run_status  — one job's state/outcome and output excerpt, or (no run_id)
 //                 every job this run owns
 //   run_cancel  — cancel one of this run's jobs by its recorded process group
+//   apply_patch — build a candidate tree from a patch artifact (bob#275, S2a)
+//   publish     — turn a stored candidate into a remote commit, with recovery
+//                 (bob#275, S2b)
 //   session_shutdown → cancel every job the run still owns (run.ts endRun)
 //   process exit     → SIGKILL whatever is left (run.ts endRunSync)
 //
@@ -22,6 +25,14 @@ import {
   type ApplyPatchSuccess,
   applyPatch,
 } from "./apply-patch.js";
+import {
+  type CheckReport,
+  type CheckRunner,
+  type PublishDeps,
+  type PublishParams,
+  type PublishResult,
+  publish,
+} from "./publish.js";
 import {
   type BootReap,
   CAPTURE_MAX_BYTES,
@@ -66,6 +77,10 @@ export interface WireWorkOptions extends JobManagerOptions {
   taskBindingError?: string;
   // Seams for apply_patch (a fake git runner, the artifact-swap hook).
   applyPatchDeps?: ApplyPatchDeps;
+  // Seams for publish. Production supplies only the executor through
+  // `runCheck` (built from the JobManager here); a test may override the git
+  // runner, the check runner and the recovery hooks.
+  publishDeps?: PublishDeps;
 }
 
 // The two Limits sentences of bob#211, verbatim, plus what else the reader needs.
@@ -104,6 +119,28 @@ const APPLY_PATCH_DESCRIPTION =
   "It never selects paths, drops hunks, repairs whitespace, resolves conflicts or falls back to another base: the whole patch applies to the fresh index or nothing does. " +
   "It refuses, with a stable reason, when the session holds no valid task binding, the base or the digest does not match, the result is not the tree apply mode pins, the artifact is missing or outside its root, the patch is malformed or does not apply, it changes a symlink or a submodule, or it names an unsafe Git path. " +
   `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
+
+const PUBLISH_DESCRIPTION =
+  "Publish a candidate using the launcher's task binding. Takes candidate_id and commit_message. " +
+  "Required checks run on a materialized candidate through the run executor. PR creation is a later slice.";
+
+function publishResultText(r: PublishResult): string {
+  const head =
+    r.status === "published"
+      ? `publish: PUBLISHED ${r.publication_id} — commit ${r.commit_oid} is on the remote.`
+      : r.status === "indeterminate"
+        ? `publish: INDETERMINATE ${r.publication_id} — ${r.message ?? "the outcome is unknown"}`
+        : `publish: REFUSED ${r.publication_id} — ${r.message ?? r.reason ?? "refused"}`;
+  const lines = [
+    head,
+    `candidate_id: ${r.candidate_id ?? "(none)"}`,
+    `tree_oid: ${r.tree_oid ?? "(none)"}`,
+    `commit_oid: ${r.commit_oid ?? "(none)"}`,
+    `status: ${r.status} · phase: ${r.phase} · push_state: ${r.push_state}`,
+  ];
+  if (r.status !== "published") lines.push(`reason: ${r.reason ?? "(none)"}`);
+  return lines.join("\n");
+}
 
 function applyPatchSuccessText(r: ApplyPatchSuccess): string {
   return [
@@ -218,6 +255,31 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
   const { pi } = opts;
   const log = opts.log ?? ((m: string) => console.error(m));
   const manager = new JobManager({ ...opts, log });
+
+  // The S1 executor: publication runs every task-declared check through the
+  // manager, so the outcome, cleanup and capture rules are exactly `run`'s.
+  const runCheck: CheckRunner =
+    opts.publishDeps?.runCheck ??
+    (async (command, cwd): Promise<CheckReport> => {
+      const job = await manager.start({ command }, cwd, {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: cwd,
+        TMPDIR: cwd,
+        LANG: "C",
+        LC_ALL: "C",
+      });
+      await job.done;
+      const r = manager.report(job);
+      return {
+        outcome: r.outcome,
+        exit_code: r.exit_code,
+        cleanup_state: r.cleanup_state,
+        output_complete: r.output_complete,
+        elapsed_s: r.elapsed_s,
+        output_excerpt: r.output_excerpt,
+      };
+    });
+  const publishDeps: PublishDeps = { ...opts.publishDeps, runCheck };
 
   // Every result goes through here: a RunRefusal becomes a thrown Error, which
   // pi reports to the model as a tool error carrying the message.
@@ -387,6 +449,38 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
     },
   });
 
+  pi.registerTool({
+    name: "publish",
+    label: "Publish",
+    description: PUBLISH_DESCRIPTION,
+    parameters: Type.Object({
+      candidate_id: Type.String({
+        minLength: 1,
+        description: "A candidate_id stored by apply_patch under the tool state directory.",
+      }),
+      commit_message: Type.String({
+        minLength: 1,
+        description: "The commit message for the published change.",
+      }),
+    }),
+    async execute(_id, params) {
+      const outcome = await publish({
+        binding: opts.taskBinding,
+        ...(opts.taskBindingError !== undefined ? { bindingError: opts.taskBindingError } : {}),
+        params: params as unknown as PublishParams,
+        stateRoot: manager.stateRoot,
+        deps: publishDeps,
+      });
+      return {
+        content: [{ type: "text", text: publishResultText(outcome) }],
+        details: {
+          published: outcome.status === "published",
+          ...outcome,
+        },
+      };
+    },
+  });
+
   pi.on?.("session_shutdown", async () => {
     await manager.endRun();
   });
@@ -395,6 +489,6 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
     log(`work: boot sweep failed: ${(err as Error).message}`);
     return [] as BootReap[];
   });
-  log("work capability: registered run / run_status / run_cancel / apply_patch");
+  log("work capability: registered run / run_status / run_cancel / apply_patch / publish");
   return { manager, bootSweep };
 }

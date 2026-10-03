@@ -43,8 +43,9 @@ export interface TaskBinding {
   declared_paths: string[];
   // The commands publication must run (S2b).
   check_commands: string[];
-  // The one ref publication may push to.
-  destination: { remote: string; ref: string };
+  // The one ref publication may push to. `create` authorizes creating the ref
+  // when it does not yet exist; without it, an absent ref refuses.
+  destination: { remote: string; ref: string; create?: boolean };
   // The optional PR destination, when the task authorizes PR creation.
   pr?: { base: string; head?: string };
   // apply mode pins these; apply_patch requires the artifact and its result to
@@ -59,6 +60,8 @@ export interface TaskBinding {
 export class TaskBindingError extends Error {
   readonly reason = "invalid_binding" as const;
 }
+
+export const PUBLICATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -79,6 +82,11 @@ function reqStringArray(value: unknown, what: string): string[] {
       fail(`${what} must hold only non-empty strings`);
   }
   return value as string[];
+}
+
+function reqBoolean(value: unknown, what: string): boolean {
+  if (typeof value !== "boolean") fail(`${what} must be a boolean`);
+  return value;
 }
 
 function hex(value: unknown, length: 40 | 64, what: string): string {
@@ -107,6 +115,9 @@ export function parseTaskBinding(raw: string | null | undefined): TaskBinding | 
     fail("it must be a JSON object");
   const o = parsed as Record<string, unknown>;
 
+  if (typeof o.publication_id !== "string" || !PUBLICATION_ID.test(o.publication_id))
+    fail("publication_id must contain only letters, digits, underscores or hyphens");
+
   const mode = o.mode;
   if (mode !== "build" && mode !== "apply") fail('mode must be "build" or "apply"');
 
@@ -127,6 +138,9 @@ export function parseTaskBinding(raw: string | null | undefined): TaskBinding | 
     destination: {
       remote: reqString(destination.remote, "destination.remote"),
       ref: reqString(destination.ref, "destination.ref"),
+      ...(destination.create !== undefined
+        ? { create: reqBoolean(destination.create, "destination.create") }
+        : {}),
     },
   };
 
