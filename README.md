@@ -553,7 +553,7 @@ src/
     discord/            outbound tools + inbound gateway listener
     flair/              memory search/write/get over the agent's Flair store
     observatory/        team-view producer
-    work/               builder-local's managed command runner (run / run_status / run_cancel)
+    work/               managed commands, patch candidates and publication (see work/README.md)
     fixture/            a no-op capability that proves the loader end to end
 roles/                  ea, jarvis, writer, reviewer, coder, qa, builder-local, custom
 positions/              packaged position presets — builder, reviewer

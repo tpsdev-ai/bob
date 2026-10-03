@@ -14,7 +14,7 @@ export const workManifest: BobCapabilityManifest = {
   piPackage: "@tpsdev-ai/bob/capabilities/work",
   configSchema: CONFIG_SCHEMA,
   provides: {
-    tools: ["run", "run_status", "run_cancel", "apply_patch"],
+    tools: ["run", "run_status", "run_cancel", "apply_patch", "publish"],
     serves: false,
     // Private: a command's output can carry any workspace or host data.
     dataClass: "private",
