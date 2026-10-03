@@ -2,7 +2,7 @@
   implementations are keyed by API flavour (one, `openai-completions`) and the built-in `openrouter`
   row is pinned, while an operator `bob/env` row declares no variable: bob derives
   `BOB_PROVIDER_<ID>_KEY`. The key is read once, deleted from the environment and injected only at
-  the transport, which sends solely to the row's canonical pinned HTTPS endpoint and refuses
+  the transport, which sends solely to the row's canonical HTTPS endpoint and refuses
   redirects, credential-bearing headers and deferred requests.
 
   `bob init` (including `--force`), `bob hire` and `bob models` now run the reserved-name check

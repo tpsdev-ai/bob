@@ -997,8 +997,8 @@ path's persisted files (`(c)`).
 ### Keyed custody, and the writers
 
 For a keyed row the key is read ONCE from its variable, DELETED from `process.env`, held in bob's
-closures and injected only at the transport, which sends only to the row's canonical pinned
-endpoint and refuses a redirect, a credential-bearing header, a non-canonical URL or a `Request`
+closures and injected only at the transport, which sends only to the row's canonical endpoint
+and refuses a redirect, a credential-bearing header, a non-canonical URL or a `Request`
 object, and refuses deferred requests before pi resolves auth (`keyed-transport-186-s3a.test.ts`
 (K1)–(K3), (K9)). Replacement sessions reuse custody without re-reading the environment (K6). The
 session factory also removes pi's credential env names from the agent environment before a
@@ -1008,10 +1008,10 @@ a placeholder and strips supplied credentials).
 
 **The writers check first.** `bob init` (including `--force`), `bob hire` and `bob models` run the
 reserved-name check over BOTH pi files before their first write, and refuse when a bob-owned keyed
-entry is present or absence cannot be proven; the passing files are left byte-identical (K7). For a
-keyed row, `bob init` creates ONLY the pi files that are absent, each through an exclusive temp file
-and rename with mode 0600 set before the rename; non-keyed rows keep the plain write path, so atomic
-writes apply to keyed rows only.
+entry is present or absence cannot be proven; a keyed row's passing files are left byte-identical
+(K7). For a keyed row, `bob init` creates ONLY the pi files that are absent, each through an
+exclusive temp file and rename with mode 0600 set before the rename; the plain write path is
+unchanged for non-keyed rows, so atomic writes apply to keyed rows only.
 
 ### Endpoint scaffold (`provider.base_url`)
 
