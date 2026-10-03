@@ -415,7 +415,7 @@ function boundRound(input: PrRoundRecord): PrRoundRecord | undefined {
     round.omitted.push(what);
     return true;
   };
-  // Trim the largest arrays first, oldest entries first.
+  // Drop entries from the end of each array, in this order.
   while (roundBytes(round) > PR_MEMORY_ROUND_MAX_BYTES) {
     if (drop("test_evidence", round.test_evidence)) continue;
     if (drop("files_touched", round.files_touched)) continue;
@@ -500,9 +500,11 @@ const FRAME_OPEN = "<<<BOB-PR-MEMORY>>>";
 const FRAME_CLOSE = "<<<END-BOB-PR-MEMORY>>>";
 
 // Neutralize text that could impersonate the framing delimiters or the
-// heading, so recalled content cannot break out of its block.
+// heading, so recalled content cannot break out of its block. Line breaks
+// become spaces first, so a recalled value renders as one line.
 function escapeForPrompt(s: string): string {
   return s
+    .replace(/\r\n|[\n\v\f\r\u0085\u2028\u2029]/g, " ")
     .replaceAll(FRAME_OPEN, "[delimiter]")
     .replaceAll(FRAME_CLOSE, "[delimiter]")
     .replaceAll(PR_MEMORY_PROMPT_HEADING, "[heading]");
@@ -551,10 +553,12 @@ export function renderPrMemoryPrompt(env: PrMemoryEnvelope): string {
     text = render(body);
   }
   if (Buffer.byteLength(text, "utf8") > PR_MEMORY_PROMPT_MAX_BYTES) {
-    // Still too large: truncate the body on a byte boundary with a marker.
+    // Still too large: cut the body at a UTF-8 character boundary.
     const overhead = Buffer.byteLength(render(""), "utf8");
-    const budget = Math.max(0, PR_MEMORY_PROMPT_MAX_BYTES - overhead);
-    body = Buffer.from(body, "utf8").subarray(0, budget).toString("utf8");
+    const bytes = Buffer.from(body, "utf8");
+    let budget = Math.max(0, PR_MEMORY_PROMPT_MAX_BYTES - overhead);
+    while (budget > 0 && (bytes[budget] & 0xc0) === 0x80) budget--;
+    body = bytes.subarray(0, budget).toString("utf8");
     text = render(body);
   }
   return text;
