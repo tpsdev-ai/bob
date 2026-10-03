@@ -1,5 +1,5 @@
-// bob#179: preserve nonempty text after `agent_end` only for stopReason "stop",
-// no tool calls, compaction willRetry false, and an accepted completion.
+// bob#179: on a non-aborted compaction, nonempty text after `agent_end` is preserved
+// only for stopReason "stop", no tool calls, willRetry false and an accepted completion.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,7 +38,7 @@ describe("createCompactionObserver — a compaction after agent_end (#179)", () 
       willRetry: false,
     });
     expect(injected).toHaveLength(0);
-    // The completion the run already recorded survives the post-completion compaction.
+    // The captured final text survives the post-completion compaction.
     expect(observer.finalText()).toBe("## DONE — PR #178, head a2a00b6a");
   });
 

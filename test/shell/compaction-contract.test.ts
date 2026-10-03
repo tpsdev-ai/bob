@@ -93,7 +93,7 @@ describe("evaluateCompletion — the one judge", () => {
 });
 
 describe("createCompactionObserver", () => {
-  it("logs success only for a compaction result and failure otherwise", () => {
+  it("logs success for a non-aborted compaction with a result, failure without one, and nothing when aborted", () => {
     const logs: string[] = [];
     const observer = createCompactionObserver({ log: (m) => logs.push(m) });
     observer.observe({
