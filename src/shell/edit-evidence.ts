@@ -356,6 +356,15 @@ export interface RepositoryCaptureOptions {
   historyTimeoutMs?: number;
 }
 
+/**
+ * True when HEAD is a symbolic ref: the state of an unborn repository, which has
+ * no commit yet. Anything else leaves an empty enumeration unusable.
+ */
+function unbornHead(repository: RepositoryIdentity): boolean {
+  const result = git(repository.workTree, ["symbolic-ref", "--quiet", "HEAD"], repository);
+  return !result.error && result.status === 0 && result.stdout.length > 0;
+}
+
 function launchTrees(
   repository: RepositoryIdentity,
   options: RepositoryCaptureOptions,
@@ -380,6 +389,14 @@ function launchTrees(
     };
   }
   const output = result.stdout.toString();
+  if (output === "") {
+    // A successful enumeration that lists nothing is a complete, empty launch
+    // history for an unborn ref. Any other HEAD leaves the empty listing
+    // meaningless, so the fail-closed denial stands (#288).
+    return unbornHead(repository)
+      ? { trees: new Set() }
+      : { trees: new Set(), historyCheckSkipped: "unavailable" };
+  }
   const trees = output.endsWith("\n") ? output.slice(0, -1).split("\n") : [];
   if (trees.length > limit) return { trees: new Set(), historyCheckSkipped: "limit" };
   if (!output.endsWith("\n") || trees.some((tree) => !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(tree)))

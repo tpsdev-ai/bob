@@ -53,6 +53,22 @@ function init(cwd: string): string {
   return commit(cwd);
 }
 
+function unborn(cwd: string): void {
+  rmSync(join(cwd, ".git"), { recursive: true });
+  git(cwd, "init", "--quiet");
+}
+
+function firstCommit(cwd: string): void {
+  execFileSync(
+    "bash",
+    [
+      "-c",
+      'git add first && tree=$(git write-tree) && head=$(git commit-tree "$tree" -m first) && git reset --hard "$head"',
+    ],
+    { cwd, env: gitEnv, stdio: "pipe" },
+  );
+}
+
 type Call = { toolName: string; action?: () => void; result?: unknown };
 
 function session(calls: Call[], finalAction?: () => void): RunSession {
@@ -1137,6 +1153,57 @@ describe("repository evidence in the completion gate and exploration budget", ()
       },
     ]);
     expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it.each(["completion", "exploration"])(
+    "accepts a first commit in an unborn repository at %s",
+    async (gate) => {
+      unborn(cwd);
+      writeFileSync(join(cwd, "first"), "first bytes\n");
+      const result = await run(
+        [{ toolName: "run", action: () => firstCommit(cwd) }, { toolName: "read" }],
+        undefined,
+        gate === "exploration" ? 2 : 20,
+      );
+      expect(git(cwd, "rev-parse", "--verify", "HEAD")).toHaveLength(40);
+      expect(result.exitCode).toBe(0);
+      expect(result.noEditNoBlocked).toBeUndefined();
+      expect(result.explorationBudgetExhausted).toBeUndefined();
+    },
+  );
+
+  it("denies a first commit in an unborn repository when launch enumeration fails", async () => {
+    unborn(cwd);
+    writeFileSync(join(cwd, "first"), "first bytes\n");
+    const spawn = childProcess.spawnSync;
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      if (args[0] === "git" && (args[1] as string[]).includes("--all")) {
+        return { ...spawn(...args), status: 1, stdout: Buffer.alloc(0) };
+      }
+      return spawn(...args);
+    });
+    try {
+      const result = await run([{ toolName: "run", action: () => firstCommit(cwd) }]);
+      expect(result.exitCode).toBe(1);
+      expect(result.noEditNoBlocked).toBe(true);
+      expect(
+        readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+      ).toBe("unavailable");
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("denies repository credit when HEAD is corrupt rather than unborn", async () => {
+    unborn(cwd);
+    writeFileSync(join(cwd, ".git", "HEAD"), "ref: refs/heads/\n");
+    writeFileSync(join(cwd, "first"), "first bytes\n");
+    const result = await run([{ toolName: "run", action: () => git(cwd, "add", "first") }]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(
+      readLastRunSummary(join(agentsRoot, "builder", "runs"))?.repositoryHistoryCheckSkipped,
+    ).toBe("unavailable");
   });
 
   it.each(["completion", "exploration"])(
