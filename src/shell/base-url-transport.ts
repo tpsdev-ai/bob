@@ -29,6 +29,13 @@ export function installBaseUrlTransport(
     }
     return originalAuth(selected as never, options);
   }) as ModelRuntime["getAuth"];
+  // pi's prompt() checks for configured auth before it sends; the keyless
+  // row's auth is supplied here, not by a stored credential.
+  const originalCheckAuth = runtime.checkAuth.bind(runtime);
+  runtime.checkAuth = async (providerId, options) =>
+    providerId === provider
+      ? { type: "api_key", source: "bob" }
+      : originalCheckAuth(providerId, options);
   const originalRefresh = runtime.refresh.bind(runtime);
   runtime.refresh = (options) => originalRefresh({ ...options, allowNetwork: false });
   const baseFetch = globalThis.fetch;
