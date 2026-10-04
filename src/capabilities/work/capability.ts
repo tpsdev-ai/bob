@@ -25,12 +25,14 @@ import {
   type ApplyPatchSuccess,
   applyPatch,
 } from "./apply-patch.js";
+import { publicationEnvironment } from "./publication-environment.js";
 import {
   type CheckReport,
   type CheckRunner,
   type PublishDeps,
   type PublishParams,
   type PublishResult,
+  publicationGit,
   publish,
 } from "./publish.js";
 import { ghPullRequestService } from "./pull-request.js";
@@ -124,7 +126,7 @@ const APPLY_PATCH_DESCRIPTION =
 const PUBLISH_DESCRIPTION =
   "Publish a candidate using the launcher's task binding. Takes candidate_id, commit_message, and an optional pr { title, body }. " +
   "Required checks run on a materialized candidate through the run executor. " +
-  "When the task binding authorizes PR creation, publish creates one pull request in the authorized repository with the authorized head/base and a publication marker, persisting the intent before the request and reusing an existing PR only on a verified repository, head/base and marker match; pr_url is reported only once the PR is confirmed. " +
+  "When pr is requested and the task binding authorizes it, publish creates a pull request and reports pr_url after verification. " +
   "A pr request on a binding that does not authorize it is refused as pr_unsupported.";
 
 function publishResultText(r: PublishResult): string {
@@ -290,8 +292,10 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         output_excerpt: r.output_excerpt,
       };
     });
+  const publicationEnv = publicationEnvironment();
   const publishDeps: PublishDeps = {
-    pr: ghPullRequestService(),
+    git: publicationGit(publicationEnv),
+    pr: ghPullRequestService("gh", publicationEnv),
     ...opts.publishDeps,
     runCheck: opts.publishDeps?.runCheck ?? runCheck,
   };

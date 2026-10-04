@@ -188,6 +188,9 @@ interface FakePr {
   base: string;
   body: string;
   repository?: string;
+  headRepository?: string;
+  commitOid?: string;
+  author?: string;
   state?: string;
 }
 
@@ -199,13 +202,16 @@ interface FakePrService {
   state: { failList: boolean; failCreateBeforeRecord: boolean; failCreateAfterRecord: boolean };
 }
 
-function fakePullRequests(seed: FakePr[] = []): FakePrService {
+function fakePullRequests(fx: Fixture, seed: FakePr[] = []): FakePrService {
   const created: FakePrService["created"] = [];
   const listCalls: FakePrService["listCalls"] = [];
   const store: FakePr[] = seed.slice();
   const state = { failList: false, failCreateBeforeRecord: false, failCreateAfterRecord: false };
   let seq = 0;
   const service: PullRequestService = {
+    async identity() {
+      return "publisher";
+    },
     async create(input) {
       created.push(input);
       if (state.failCreateBeforeRecord) throw new Error("connection reset");
@@ -215,15 +221,19 @@ function fakePullRequests(seed: FakePr[] = []): FakePrService {
         head: input.head,
         base: input.base,
         body: input.body,
+        repository: input.repository,
+        headRepository: input.repository,
+        commitOid: remoteOid(fx) as string,
+        author: "publisher",
       };
       store.push(rec);
       if (state.failCreateAfterRecord) throw new Error("response lost");
-      return rec;
+      return rec as Awaited<ReturnType<PullRequestService["create"]>>;
     },
     async list(input) {
       listCalls.push({ repository: input.repository, head: input.head, base: input.base });
       if (state.failList) throw new Error("the PR service is unavailable");
-      return store.slice();
+      return store.slice() as Awaited<ReturnType<PullRequestService["list"]>>;
     },
   };
   return { service, created, listCalls, store, state };
@@ -237,7 +247,7 @@ describe("publish — PR creation", () => {
     const built = buildCandidate(fx, b, (r) =>
       writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
     );
-    const fake = fakePullRequests();
+    const fake = fakePullRequests(fx);
     const before = remoteOid(fx);
     const out = await publish({
       binding: b,
@@ -258,8 +268,8 @@ describe("publish — PR creation", () => {
     const built = buildCandidate(fx, b, (r) =>
       writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
     );
-    const fake = fakePullRequests();
-    const marker = publicationMarker(b.publication_id);
+    const fake = fakePullRequests(fx);
+    let marker = "";
     let seen: { state?: string; marker?: string; url?: string } | undefined;
     let terminate = true;
     const deps = {
@@ -271,6 +281,7 @@ describe("publish — PR creation", () => {
           pr?: { state?: string; marker?: string; url?: string };
         };
         seen = journal.pr;
+        marker = seen?.marker ?? "";
         if (terminate) {
           terminate = false;
           throw new Error("publisher terminated");
@@ -282,7 +293,7 @@ describe("publish — PR creation", () => {
     ).rejects.toThrow("publisher terminated");
     // The intent is durable before the create request, and no request was sent.
     expect(seen?.state).toBe("intent");
-    expect(seen?.marker).toBe(marker);
+    expect(seen?.marker).toMatch(/^<!-- bob-publication:pub-pr-intent:[0-9a-f]{64} -->$/);
     expect(seen?.url).toBeUndefined();
     expect(fake.created).toHaveLength(0);
 
@@ -307,20 +318,27 @@ describe("publish — PR creation", () => {
       const built = buildCandidate(fx, b, (r) =>
         writeFileSync(join(r, "src", "widget.ts"), `export const widget = "${state}";\n`),
       );
-      const marker = publicationMarker(b.publication_id);
-      const url = `https://pr.example/acme/pull/seed-${state}`;
-      const fake = fakePullRequests([
-        { url, head: "main", base: "main", body: `body\n\n${marker}`, state },
-      ]);
+      const fake = fakePullRequests(fx);
+      fake.state.failCreateAfterRecord = true;
+      const deps = { git: realGit, runCheck: okCheck, pr: fake.service };
+      const first = await publish({
+        binding: b,
+        params: prParams(built),
+        stateRoot: fx.stateRoot,
+        deps,
+      });
+      expect(first.status).toBe("indeterminate");
+      const url = fake.store[0].url;
+      fake.store[0].state = state;
       const out = await publish({
         binding: b,
         params: prParams(built),
         stateRoot: fx.stateRoot,
-        deps: { git: realGit, runCheck: okCheck, pr: fake.service },
+        deps,
       });
       expect(out.status, state).toBe("published");
       expect(out.pr_url, state).toBe(url);
-      expect(fake.created, state).toHaveLength(0);
+      expect(fake.created, state).toHaveLength(1);
       expect(fake.listCalls[0]).toEqual({
         repository: fx.bare,
         head: "main",
@@ -356,14 +374,28 @@ describe("publish — PR creation", () => {
       const built = buildCandidate(fx, b, (r) =>
         writeFileSync(join(r, "src", "widget.ts"), `export const widget = "${c.what}";\n`),
       );
-      const marker = publicationMarker(b.publication_id);
+      const marker = "";
       const seedUrl = `https://pr.example/acme/pull/seed-${c.what}`;
-      const fake = fakePullRequests([c.make({ marker, url: seedUrl })]);
+      const fake = fakePullRequests(fx, [c.make({ marker, url: seedUrl })]);
       const out = await publish({
         binding: b,
         params: prParams(built),
         stateRoot: fx.stateRoot,
-        deps: { git: realGit, runCheck: okCheck, pr: fake.service },
+        deps: {
+          git: realGit,
+          runCheck: okCheck,
+          pr: fake.service,
+          afterPrIntentStored: (id) => {
+            const journal = JSON.parse(readFileSync(publishJournalPath(fx.stateRoot, id), "utf8"));
+            fake.store[0] = {
+              ...c.make({ marker: journal.pr.marker, url: seedUrl }),
+              repository: fx.bare,
+              headRepository: fx.bare,
+              commitOid: journal.commit_oid,
+              author: journal.pr.author,
+            };
+          },
+        },
       });
       expect(out.status, c.what).toBe("published");
       expect(fake.created, c.what).toHaveLength(1);
@@ -379,7 +411,7 @@ describe("publish — PR creation", () => {
     const built = buildCandidate(fx, b, (r) =>
       writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
     );
-    const fake = fakePullRequests();
+    const fake = fakePullRequests(fx);
     fake.state.failCreateAfterRecord = true;
     const first = await publish({
       binding: b,
@@ -416,7 +448,7 @@ describe("publish — PR creation", () => {
     const built = buildCandidate(fx, b, (r) =>
       writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
     );
-    const fake = fakePullRequests();
+    const fake = fakePullRequests(fx);
     fake.state.failList = true;
     const out = await publish({
       binding: b,
@@ -437,7 +469,7 @@ describe("publish — PR creation", () => {
     const built = buildCandidate(fx, b, (r) =>
       writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
     );
-    const fake = fakePullRequests();
+    const fake = fakePullRequests(fx);
     fake.state.failCreateBeforeRecord = true;
     const deps = { git: realGit, runCheck: okCheck, pr: fake.service };
     const first = await publish({
@@ -478,7 +510,7 @@ describe("publish — PR creation", () => {
         pr: { title: "" },
       } as PublishParams,
       stateRoot: fx.stateRoot,
-      deps: { git: realGit, runCheck: okCheck, pr: fakePullRequests().service },
+      deps: { git: realGit, runCheck: okCheck, pr: fakePullRequests(fx).service },
     });
     expect(out.status).toBe("refused");
     expect(out.reason).toBe("invalid_request");
@@ -510,7 +542,8 @@ describe("pull-request helpers", () => {
 
   it("appends the marker as its own paragraph", () => {
     const marker = publicationMarker("pub-1");
-    expect(marker).toBe("<!-- bob-publication:pub-1 -->");
+    expect(marker).toMatch(/^<!-- bob-publication:pub-1:[0-9a-f]{64} -->$/);
+    expect(publicationMarker("pub-1")).not.toBe(marker);
     expect(bodyWithMarker("why", marker)).toBe(`why\n\n${marker}`);
     expect(bodyWithMarker("why\n", marker)).toBe(`why\n\n${marker}`);
     expect(bodyWithMarker("", marker)).toBe(marker);

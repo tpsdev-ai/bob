@@ -1,16 +1,6 @@
-// Pull-request creation for `publish` (bob#275, slice S2b).
-//
-// PR creation reaches the authorized repository through the SAME credential the
-// push uses. On this fleet git's credential helper for github.com is
-// `gh auth git-credential`, so `gh` reads exactly the credential `git push`
-// already used. No token is read from a new environment variable and nothing is
-// added to the agent's environment: the production service runs `gh`, which the
-// agent already has.
-//
-// `publish` never calls this module directly — it drives an injected
-// `PullRequestService` (deps.pr). Tests supply a fake, so no network is used.
-
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { publicationEnvironment } from "./publication-environment.js";
 
 export interface CreatePullRequestInput {
   // The authorized repository: the resolved publication endpoint.
@@ -26,29 +16,32 @@ export interface PullRequestRecord {
   head: string;
   base: string;
   body: string;
-  repository?: string;
+  repository: string;
+  headRepository: string;
+  commitOid: string;
+  author: string;
   number?: number;
   state?: string;
 }
 
 export interface PullRequestService {
+  identity(): Promise<string>;
+  supportsEndpoint?(endpoint: string): boolean;
   create(input: CreatePullRequestInput): Promise<PullRequestRecord>;
   // Every pull request for the repository and branch pair, open, closed and
   // merged. A list that cannot be read throws; an empty list is an answer.
   list(input: { repository: string; head: string; base: string }): Promise<PullRequestRecord[]>;
 }
 
-// The marker persisted in the PR body, so recovery can recognize the PR THIS
-// publication created. It is derived from the publication identity, not from
-// the title or the free-form body the caller supplies.
 export function publicationMarker(publicationId: string): string {
-  return `<!-- bob-publication:${publicationId} -->`;
+  return `<!-- bob-publication:${publicationId}:${randomBytes(32).toString("hex")} -->`;
 }
 
-// The effective PR body: the caller's body, with the marker appended on its own
-// paragraph so a reader never sees it as part of the description.
 export function bodyWithMarker(body: string, marker: string): string {
-  const trimmed = body.replace(/\s+$/, "");
+  const trimmed = body
+    .replace(/<!--\s*bob-publication:[\s\S]*?(?:-->|$)/gi, "")
+    .replace(/bob-publication:[^\s<>]*/gi, "")
+    .replace(/\s+$/, "");
   return trimmed === "" ? marker : `${trimmed}\n\n${marker}`;
 }
 
@@ -95,12 +88,19 @@ function runGh(gh: string, args: string[], env: NodeJS.ProcessEnv): Promise<stri
   });
 }
 
-// The production service: `gh api`, using the credential git's push used.
 export function ghPullRequestService(
   gh = "gh",
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = publicationEnvironment(),
 ): PullRequestService {
   return {
+    supportsEndpoint: (endpoint) =>
+      /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?(?:\.git)?\/?$/.test(endpoint),
+    async identity() {
+      const raw = JSON.parse(await runGh(gh, ["api", "user"], env)) as { login?: unknown };
+      if (typeof raw?.login !== "string" || raw.login === "")
+        throw new Error("gh returned no publishing identity");
+      return raw.login;
+    },
     async create(input: CreatePullRequestInput): Promise<PullRequestRecord> {
       const slug = githubRepositorySlug(input.repository);
       if (slug === null)
@@ -129,9 +129,7 @@ export function ghPullRequestService(
       } catch {
         throw new Error("gh returned no pull request JSON");
       }
-      const url = (parsed as { html_url?: unknown } | null)?.html_url;
-      if (typeof url !== "string" || url === "") throw new Error("gh returned no pull request URL");
-      return { url, head: input.head, base: input.base, body: input.body };
+      return parsePullRequest(parsed);
     },
     async list(input: {
       repository: string;
@@ -155,6 +153,7 @@ export function ghPullRequestService(
           "-f",
           `base=${input.base}`,
           "--paginate",
+          "--slurp",
         ],
         env,
       );
@@ -164,25 +163,34 @@ export function ghPullRequestService(
       } catch {
         throw new Error("gh returned no pull request list");
       }
-      if (!Array.isArray(parsed)) throw new Error("gh returned no pull request list");
-      return parsed.map((raw) => {
-        const r = raw as {
-          html_url?: unknown;
-          body?: unknown;
-          head?: { ref?: unknown };
-          base?: { ref?: unknown };
-          number?: unknown;
-          state?: unknown;
-        };
-        return {
-          url: typeof r.html_url === "string" ? r.html_url : "",
-          head: typeof r.head?.ref === "string" ? r.head.ref : "",
-          base: typeof r.base?.ref === "string" ? r.base.ref : "",
-          body: typeof r.body === "string" ? r.body : "",
-          ...(typeof r.number === "number" ? { number: r.number } : {}),
-          ...(typeof r.state === "string" ? { state: r.state } : {}),
-        };
-      });
+      if (!Array.isArray(parsed) || !parsed.every(Array.isArray))
+        throw new Error("gh returned no pull request pages");
+      return parsed.flatMap((page) => page.map(parsePullRequest));
     },
+  };
+}
+
+function parsePullRequest(raw: unknown): PullRequestRecord {
+  const r = raw as {
+    html_url?: unknown;
+    body?: unknown;
+    head?: { ref?: unknown; sha?: unknown; repo?: { html_url?: unknown } };
+    base?: { ref?: unknown; repo?: { html_url?: unknown } };
+    user?: { login?: unknown };
+    number?: unknown;
+    state?: unknown;
+  } | null;
+  if (r === null || typeof r !== "object") throw new Error("gh returned no pull request");
+  return {
+    url: typeof r.html_url === "string" ? r.html_url : "",
+    head: typeof r.head?.ref === "string" ? r.head.ref : "",
+    base: typeof r.base?.ref === "string" ? r.base.ref : "",
+    body: typeof r.body === "string" ? r.body : "",
+    repository: typeof r.base?.repo?.html_url === "string" ? r.base.repo.html_url : "",
+    headRepository: typeof r.head?.repo?.html_url === "string" ? r.head.repo.html_url : "",
+    commitOid: typeof r.head?.sha === "string" ? r.head.sha : "",
+    author: typeof r.user?.login === "string" ? r.user.login : "",
+    ...(typeof r.number === "number" ? { number: r.number } : {}),
+    ...(typeof r.state === "string" ? { state: r.state } : {}),
   };
 }

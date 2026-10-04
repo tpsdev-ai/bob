@@ -133,14 +133,10 @@ body }`. `pr` is accepted only when the task binding authorizes PR creation (a
 `pr` block naming the base, and optionally the head); otherwise it refuses with
 `pr_unsupported`.
 
-When authorized, the pull request is created in the authorized repository with
-the authorized head/base pair and a publication marker in the body, through the
-same credential the push uses (the GitHub CLI, which git's push credential
-helper already goes through). The intent is journaled before the request. A
-retry or recovery reconciles by repository, head/base and marker — open, closed
-or merged — and reuses a URL only on a verified match; an uncertain create is
-`indeterminate` and is never reissued. `pr_url` is reported only once the PR is
-confirmed.
+When `pr` is requested and authorized, `publish` creates a pull request in the
+authorized repository with the authorized head/base. The intent is journaled
+before creation. Recovery verifies repository, head/base, marker, commit and
+author; an uncertain create is `indeterminate` and is never reissued.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.
 The record must match its content-derived ID and the task binding.
