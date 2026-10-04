@@ -15,8 +15,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readProviderLimits } from "./bob-yaml.js";
 import { piOpenAiCompletionsModel } from "./init.js";
-import { type ProviderRegistry, providerApiForRuntime } from "./provider-registry.js";
+import {
+  type ProviderRegistry,
+  providerApiForRuntime,
+  reservedProviderNames,
+} from "./provider-registry.js";
 import { resolveRunConfig } from "./run.js";
+import { assertNoReservedProviderEntries } from "./session.js";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -75,6 +80,13 @@ export function applyModelScaffold(
     throw new Error(`bob models: invalid providers in ${path}`);
   }
   const providers = (document.providers ?? {}) as Record<string, unknown>;
+  // The reserved-name check runs BEFORE the first write, over the COMPLETE map
+  // the lenient parser above produced (a BOM, a `//` comment and a trailing
+  // comma are all repaired), and over auth.json. A reserved entry present — or a
+  // document bob cannot prove free of one — refuses with nothing written.
+  assertNoReservedProviderEntries(piDir, reservedProviderNames(registry), {
+    modelsProviders: providers,
+  });
   const entry = Object.hasOwn(providers, provider) ? providers[provider] : {};
   if (!object(entry) || (entry.models !== undefined && !Array.isArray(entry.models))) {
     throw new Error(`bob models: invalid provider ${provider} in ${path}`);
