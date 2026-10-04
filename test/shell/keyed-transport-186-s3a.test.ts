@@ -22,7 +22,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
-import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSessionRuntime,
+  ModelRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../src/shell/init.js";
 import { applyModelScaffold } from "../../src/shell/models.js";
 import {
@@ -690,34 +694,60 @@ describe("K5 — registration refusal under each fixture name + the post-service
 });
 
 describe("K6 — replacement sessions reuse custody without re-reading the environment", () => {
-  it("the second factory invocation sends only the FIRST sentinel", async () => {
-    const registry = fixtureRegistry();
-    scaffold("fxk6", registry);
-    process.env[VARIABLE] = SENTINEL;
-    const { config, policy } = resolveRunConfig({ name: "fxk6", agentsRoot: tmpRoot, registry });
-    const stub = stubFetch();
-    const factory = createBobRuntimeFactory({ config, policy, registry });
-    const first = await factory({ sessionManager: SessionManager.inMemory(config.cwd) });
-    (first.session as unknown as { dispose(): void }).dispose();
-    // Between invocations the variable is re-set — the second session must NOT read it.
-    process.env[VARIABLE] = SENTINEL2;
-    const second = await factory({ sessionManager: SessionManager.inMemory(config.cwd) });
-    try {
-      expect(process.env[VARIABLE]).toBe(SENTINEL2); // untouched: the factory never re-read it
-      const rt = second.services.modelRuntime as unknown as ModelRuntime;
-      const model = rt.getModel(RUNTIME, MODEL)!;
-      const stream = rt
-        .getProvider(RUNTIME)!
-        .streamSimple(model as never, CTX as never, {} as never);
-      await stream.result?.().catch(() => undefined);
-      expect(stub.seen.length).toBe(1);
-      expect(stub.seen[0]!.auth).toBe(`Bearer ${SENTINEL}`);
-      expect(stub.seen.some((s) => String(s.auth).includes(SENTINEL2))).toBe(false);
-    } finally {
-      (second.session as unknown as { dispose(): void }).dispose();
-      stub.restore();
+  for (const provider of ["keyed-fixture", "openrouter"]) {
+    for (const path of ["new", "resume"]) {
+      it(`${provider}: pi's /${path} replacement sends only the FIRST sentinel`, async () => {
+        const registry = fixtureRegistry();
+        scaffold("fxk6", registry, provider);
+        const variable = provider === "openrouter" ? "OPENROUTER_API_KEY" : VARIABLE;
+        const endpoint = provider === "openrouter" ? "https://openrouter.ai/api/v1" : ENDPOINT;
+        process.env[variable] = SENTINEL;
+        const { config, policy } = resolveRunConfig({
+          name: "fxk6",
+          agentsRoot: tmpRoot,
+          registry,
+        });
+        const stub = stubFetch();
+        const factory = createBobRuntimeFactory({ config, policy, registry });
+        const runtime = await createAgentSessionRuntime(factory, {
+          cwd: config.cwd,
+          agentDir: config.piAgentDir,
+          sessionManager: SessionManager.create(config.cwd, join(config.piAgentDir, "sessions")),
+        });
+        try {
+          expect(process.env[variable]).toBeUndefined();
+          await runtime.session.prompt("first session");
+          const firstFile = runtime.session.sessionManager.getSessionFile()!;
+          expect(existsSync(firstFile)).toBe(true);
+          expect(stub.seen).toEqual([
+            { url: `${endpoint}/chat/completions`, auth: `Bearer ${SENTINEL}` },
+          ]);
+          if (path === "resume") {
+            process.env[variable] = SENTINEL2;
+            await runtime.newSession();
+          }
+          const previous = runtime.session;
+          const previousModelRuntime = runtime.services.modelRuntime;
+          process.env[variable] = SENTINEL2;
+          const replacement =
+            path === "new" ? await runtime.newSession() : await runtime.switchSession(firstFile);
+          expect(replacement).toEqual({ cancelled: false });
+          expect(runtime.session).not.toBe(previous);
+          expect(runtime.services.modelRuntime).not.toBe(previousModelRuntime);
+          const before = stub.seen.length;
+          await runtime.session.prompt(`after ${path}`);
+          expect(stub.seen.slice(before)).toEqual([
+            { url: `${endpoint}/chat/completions`, auth: `Bearer ${SENTINEL}` },
+          ]);
+          expect(process.env[variable]).toBe(SENTINEL2);
+          expect(stub.seen.some((s) => String(s.auth).includes(SENTINEL2))).toBe(false);
+        } finally {
+          await runtime.dispose();
+          stub.restore();
+        }
+      });
     }
-  });
+  }
 });
 
 describe("K9 — deferred requests are refused before auth resolution", () => {
