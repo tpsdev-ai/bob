@@ -1493,7 +1493,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // bob#214: the output-cap backstop and the between-calls compaction check. A session
     // that cannot carry them is disposed and refused, like a failed audit.
     // bob#306: for a keyless row with a budget, the backstop counts against the
-    // cap the keyless transport sends.
+    // clamped cap the keyless transport holds the request body to.
     try {
       installSessionBudget(result.session, {
         log: deps?.log ?? ((m: string) => console.error(m)),

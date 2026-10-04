@@ -3,6 +3,7 @@ import {
   stream as openaiStream,
   streamSimple as openaiStreamSimple,
 } from "@earendil-works/pi-ai/api/openai-completions";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type ProviderRequestPolicy,
@@ -10,7 +11,13 @@ import {
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
-import { boundedOutputCap, type ProviderTurnBudget } from "./provider-turn-budget.js";
+import {
+  boundedOutputCap,
+  boundPayloadCap,
+  type ProviderTurnBudget,
+} from "./provider-turn-budget.js";
+
+type PayloadHook = (payload: unknown, model: unknown) => unknown;
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -80,12 +87,19 @@ export function installBaseUrlTransport(
     // level and names `max_tokens` as its output-cap field. The row's keyless
     // model is scaffolded non-reasoning, so a budget marks it reasoning-capable
     // for pi to send the level.
-    // bob#306: the request's output cap stays at or below the smaller of the
-    // budget and the model's maxTokens (boundedOutputCap).
+    // bob#306: with a budget, the request body's output cap is at most
+    // boundedOutputCap clamped to the room left in the context window, the cap
+    // bob's backstop counts against. It is applied to the final body, after the
+    // caller's sampling parameters and payload hook (boundPayloadCap).
     const maxTokens =
       budget === undefined
         ? undefined
-        : boundedOutputCap(budget.maxOutputTokens, model.maxTokens, supplied.maxTokens);
+        : clampMaxTokensToContext(
+            model,
+            context,
+            boundedOutputCap(budget.maxOutputTokens, model.maxTokens, supplied.maxTokens),
+          );
+    const callerPayload = supplied.onPayload as PayloadHook | undefined;
     const delegateModel =
       budget === undefined
         ? { ...model, headers: undefined }
@@ -105,9 +119,11 @@ export function installBaseUrlTransport(
       ...(request !== undefined
         ? { timeoutMs: 2_147_483_647, maxRetries: request.maxRetries, signal: controller.signal }
         : {}),
-      ...(budget !== undefined
+      ...(budget !== undefined && maxTokens !== undefined
         ? {
             maxTokens,
+            onPayload: async (payload: unknown, payloadModel: unknown) =>
+              boundPayloadCap((await callerPayload?.(payload, payloadModel)) ?? payload, maxTokens),
             reasoning: budget.reasoning,
             reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
           }

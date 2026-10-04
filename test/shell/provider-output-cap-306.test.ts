@@ -1,6 +1,6 @@
 // bob#306 — a keyless row's budget bounds every output cap in its session. The
-// session factory keeps the model's maxTokens at or below it, and no request or
-// backstop cap exceeds it; pi may request less.
+// session factory keeps the model's maxTokens at or below it, and no request
+// body's output cap or backstop cap exceeds it; pi may request less.
 //
 // Each case runs a real factory session against a fake OpenAI-compatible server
 // on loopback (no network leaves the host).
@@ -103,6 +103,12 @@ interface Setup {
   maxOutputTokens?: number;
   /** models.json maxTokens (the scaffold writes 16384). */
   modelMaxTokens?: number;
+  /** models.json samplingParams. */
+  samplingParams?: Record<string, unknown>;
+  /** The body of a before_provider_request handler, loaded as an extension. */
+  hook?: string;
+  /** bob.yaml provider.context_window (default 262144). */
+  contextWindow?: number;
 }
 
 interface AssistantLike {
@@ -155,7 +161,7 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
       role: "ea",
       provider: "fake-local",
       model: "m",
-      contextWindow: 262_144,
+      contextWindow: setup.contextWindow ?? 262_144,
       agentsRoot,
       flairKeysDir: join(root, "keys"),
       skipFlair: true,
@@ -165,7 +171,7 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
     const yamlPath = join(agentDir, "bob.yaml");
     const yaml = readFileSync(yamlPath, "utf8");
     const tools = yaml.indexOf("\ntools:\n");
-    const window = "  context_window: 262144\n";
+    const window = `  context_window: ${setup.contextWindow ?? 262_144}\n`;
     if (tools < 0 || !yaml.includes(window)) throw new Error("unexpected scaffolded bob.yaml");
     const cap =
       setup.maxOutputTokens !== undefined ? `  max_output_tokens: ${setup.maxOutputTokens}\n` : "";
@@ -173,10 +179,12 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
       yamlPath,
       `${yaml.slice(0, tools).replace(window, `${window}${cap}`)}\ntools:\n  allow: []\n`,
     );
-    if (setup.modelMaxTokens !== undefined) {
+    if (setup.modelMaxTokens !== undefined || setup.samplingParams !== undefined) {
       const modelsPath = join(agentDir, ".pi-agent", "models.json");
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
-      models.providers["fake-local"].models[0].maxTokens = setup.modelMaxTokens;
+      const model = models.providers["fake-local"].models[0];
+      if (setup.modelMaxTokens !== undefined) model.maxTokens = setup.modelMaxTokens;
+      if (setup.samplingParams !== undefined) model.samplingParams = setup.samplingParams;
       writeFileSync(modelsPath, `${JSON.stringify(models)}\n`);
     }
     // As provider-timeouts-185.test.ts does: a placeholder for pi's prompt-time
@@ -191,8 +199,17 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
   async function sessionFor(endpoint: string, setup: Setup) {
     const { registry, agentsRoot } = scaffold(endpoint, setup);
     const { config, policy } = resolveRunConfig({ name: "agent-a", agentsRoot, registry });
+    let extensionSources = config.extensionSources;
+    if (setup.hook !== undefined) {
+      const hookPath = join(root, "hook-extension.mjs");
+      writeFileSync(
+        hookPath,
+        `export default function (pi) { pi.on("before_provider_request", (event) => { ${setup.hook} }); }\n`,
+      );
+      extensionSources = [...extensionSources, hookPath];
+    }
     const { session } = await createBobRuntimeFactory({
-      config,
+      config: { ...config, extensionSources },
       policy,
       registry,
       deps: { log: () => {}, exit: () => {} },
@@ -317,6 +334,69 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
       await session.modelRuntime.stream(model, context, { maxTokens: 2_048 }).result();
       await session.modelRuntime.streamSimple(model, context, { maxTokens: 200 }).result();
       expect(server.bodies.map((body) => body.max_tokens)).toEqual([256, 256, 200]);
+    } finally {
+      session.dispose();
+    }
+  }, 20_000);
+
+  it.each([
+    {
+      name: "a models.json samplingParams max_tokens",
+      setup: { samplingParams: { max_tokens: 2_048 } },
+      wire: 256,
+    },
+    {
+      name: "a payload hook that raises max_tokens",
+      setup: { hook: "return { ...event.payload, max_tokens: 4096 };" },
+      wire: 256,
+    },
+    {
+      name: "a payload hook that adds max_completion_tokens",
+      setup: { hook: "return { ...event.payload, max_completion_tokens: 4096 };" },
+      wire: 256,
+      completion: 256,
+    },
+    {
+      // pi clamps the cap to the room left in the window; a 4100-token window
+      // leaves none, and pi's floor is 1.
+      name: "a payload hook that raises max_tokens near a full context window",
+      setup: { contextWindow: 4_100, hook: "return { ...event.payload, max_tokens: 4096 };" },
+      wire: 1,
+    },
+    {
+      name: "a payload hook that lowers max_tokens",
+      setup: { hook: "return { ...event.payload, max_tokens: 100 };" },
+      wire: 100,
+    },
+  ] as Array<{ name: string; setup: Setup; wire: number; completion?: number }>)(
+    "the final request body holds the budget against $name",
+    async ({ setup, wire, completion }) => {
+      const server = await serve("obey", 3);
+      const { session } = await sessionFor(server.url, { ...budget, ...setup });
+      try {
+        await session.prompt("go");
+        expect(server.bodies.length).toBe(1);
+        expect(server.bodies[0]?.max_tokens).toBe(wire);
+        expect(server.bodies[0]?.max_completion_tokens).toBe(completion);
+      } finally {
+        session.dispose();
+      }
+    },
+    20_000,
+  );
+
+  it("a payload hook that returns a body that is not an object is refused before any request", async () => {
+    const server = await serve("obey", 3);
+    const { session, assistants } = await sessionFor(server.url, {
+      ...budget,
+      hook: 'return "not a body";',
+    });
+    try {
+      await session.prompt("go");
+      expect(server.bodies.length).toBe(0);
+      const reply = assistants().at(-1);
+      expect(reply?.stopReason).toBe("error");
+      expect(String(reply?.errorMessage)).toContain("body is not an object");
     } finally {
       session.dispose();
     }
