@@ -160,8 +160,9 @@ export interface CheckObservation {
 
 export function normalizeCheck(obs: CheckObservation): PrTestEvidence {
   const base: Omit<PrTestEvidence, "outcome"> = { command: truncate(obs.command, STRING_MAX) };
-  if (obs.commandId !== undefined) base.commandId = obs.commandId;
-  if (obs.workspaceRevision !== undefined) base.workspaceRevision = obs.workspaceRevision;
+  if (obs.commandId !== undefined) base.commandId = truncate(obs.commandId, STRING_MAX);
+  if (obs.workspaceRevision !== undefined)
+    base.workspaceRevision = truncate(obs.workspaceRevision, STRING_MAX);
 
   if (obs.state !== undefined && obs.state !== null && obs.state !== "finished")
     return { ...base, outcome: "pending" };
@@ -380,6 +381,26 @@ export function validateRecalledRecord(
 
 // ─── Serialization under the bounds ─────────────────────────────────────────
 
+function boundFinding(finding: PrFinding): PrFinding {
+  return {
+    ...finding,
+    detail: truncate(finding.detail, STRING_MAX),
+    ...(finding.id !== undefined ? { id: truncate(finding.id, STRING_MAX) } : {}),
+    ...(finding.evidence !== undefined ? { evidence: truncate(finding.evidence, STRING_MAX) } : {}),
+  };
+}
+
+function boundCheck(check: PrTestEvidence): PrTestEvidence {
+  return {
+    ...check,
+    command: truncate(check.command, STRING_MAX),
+    ...(check.commandId !== undefined ? { commandId: truncate(check.commandId, STRING_MAX) } : {}),
+    ...(check.workspaceRevision !== undefined
+      ? { workspaceRevision: truncate(check.workspaceRevision, STRING_MAX) }
+      : {}),
+  };
+}
+
 function roundBytes(round: PrRoundRecord): number {
   return Buffer.byteLength(JSON.stringify(round), "utf8");
 }
@@ -389,12 +410,15 @@ function roundBytes(round: PrRoundRecord): number {
 function boundRound(input: PrRoundRecord): PrRoundRecord | undefined {
   const round: PrRoundRecord = {
     ...input,
-    blockers_addressed: [...input.blockers_addressed],
-    files_touched: [...input.files_touched],
-    test_evidence: [...input.test_evidence],
-    incomplete: [...input.incomplete],
-    omitted: [...input.omitted],
+    endedAt: truncate(input.endedAt, STRING_MAX),
+    blockers_addressed: input.blockers_addressed.map(boundFinding),
+    files_touched: input.files_touched.map((s) => truncate(s, STRING_MAX)),
+    test_evidence: input.test_evidence.map(boundCheck),
+    incomplete: input.incomplete.map((s) => truncate(s, STRING_MAX)),
+    omitted: input.omitted.map((s) => truncate(s, STRING_MAX)),
   };
+  for (const field of ["runId", "taskId", "publicationId", "baseOid"] as const)
+    if (round[field] !== undefined) round[field] = truncate(round[field], STRING_MAX);
   const drop = (what: string, arr: unknown[]): boolean => {
     if (arr.length === 0) return false;
     arr.pop();
@@ -440,7 +464,7 @@ export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
     }
     rounds.push(bounded);
   }
-  const findings = input.open_findings.slice(0, OPEN_FINDINGS_MAX);
+  const findings = input.open_findings.slice(0, OPEN_FINDINGS_MAX).map(boundFinding);
   if (input.open_findings.length > OPEN_FINDINGS_MAX) omitted.push("excess open findings");
 
   const env: PrMemoryEnvelope = {
@@ -450,7 +474,9 @@ export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
     prNumber: input.prNumber,
     open_findings: findings,
     rounds,
-    omitted: [...input.omitted, ...omitted].slice(-ENVELOPE_OMITTED_MAX),
+    omitted: [...input.omitted, ...omitted]
+      .slice(-ENVELOPE_OMITTED_MAX)
+      .map((s) => truncate(s, STRING_MAX)),
   };
   const record = (what: string): void => {
     omitted.push(what);
@@ -598,7 +624,7 @@ export interface PrRoundEvidence {
 
 export function roundFromEvidence(evidence: PrRoundEvidence): PrRoundRecord {
   const round: PrRoundRecord = {
-    endedAt: evidence.endedAt,
+    endedAt: truncate(evidence.endedAt, STRING_MAX),
     outcome: evidence.outcome,
     blockers_addressed: (evidence.findings ?? [])
       .filter((f) => f.status === "addressed")
@@ -620,10 +646,11 @@ export function roundFromEvidence(evidence: PrRoundEvidence): PrRoundRecord {
   ] as const) {
     if (count > cap && !round.omitted.includes(field)) round.omitted.push(field);
   }
-  if (evidence.runId !== undefined) round.runId = evidence.runId;
-  if (evidence.taskId !== undefined) round.taskId = evidence.taskId;
-  if (evidence.publicationId !== undefined) round.publicationId = evidence.publicationId;
-  if (evidence.baseOid !== undefined) round.baseOid = evidence.baseOid;
+  if (evidence.runId !== undefined) round.runId = truncate(evidence.runId, STRING_MAX);
+  if (evidence.taskId !== undefined) round.taskId = truncate(evidence.taskId, STRING_MAX);
+  if (evidence.publicationId !== undefined)
+    round.publicationId = truncate(evidence.publicationId, STRING_MAX);
+  if (evidence.baseOid !== undefined) round.baseOid = truncate(evidence.baseOid, STRING_MAX);
   return round;
 }
 
@@ -751,7 +778,8 @@ export async function writePrMemoryRound(opts: {
     return { status: "skipped", reason };
   }
 
-  const runId = opts.evidence.runId;
+  const runId =
+    opts.evidence.runId === undefined ? undefined : truncate(opts.evidence.runId, STRING_MAX);
   if (runId !== undefined && existing?.rounds.some((r) => r.runId === runId)) {
     return { status: "skipped", reason: "this run is already recorded" };
   }
@@ -768,6 +796,8 @@ export async function writePrMemoryRound(opts: {
   };
   try {
     const { json } = boundEnvelope(envelope);
+    if (parseEnvelope(json, opts.identity) === undefined)
+      return { status: "skipped", reason: "the round failed schema validation" };
     await client.write(json, {
       id,
       durability: "persistent",

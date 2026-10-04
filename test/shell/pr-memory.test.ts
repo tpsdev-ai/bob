@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
+import { parseTaskBinding } from "../../src/capabilities/work/task-binding.js";
 import {
   boundEnvelope,
   editToolFilePath,
@@ -842,4 +844,123 @@ describe("regressions from final review", () => {
         ),
       ).toBeUndefined();
   });
+});
+
+it("writes and recalls an overlong launcher task_id", async () => {
+  const binding = parseTaskBinding(
+    JSON.stringify({
+      task_id: "t".repeat(700),
+      publication_id: "p1",
+      repository: REPO,
+      workspace: "/ws",
+      base_oid: "a".repeat(40),
+      mode: "build",
+      artifact_root: "/art",
+      declared_paths: [],
+      check_commands: [],
+      destination: { remote: "origin", ref: "refs/heads/main" },
+      pr_ref: REF,
+    }),
+  );
+  if (!binding) throw new Error("missing binding");
+  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
+  expect(
+    (
+      await writePrMemoryRound({
+        ...options,
+        evidence: {
+          taskId: binding.task_id,
+          endedAt: "now",
+          outcome: "completed",
+          filesTouched: [],
+          testEvidence: [],
+        },
+      })
+    ).status,
+  ).toBe("written");
+  expect((await recallPrMemoryRound(options)).status).toBe("recalled");
+  const stored = parseEnvelope(String(fake.memories.get(ID)?.content), IDENTITY);
+  expect(stored?.rounds[0]?.taskId).toBe(`${"t".repeat(512)}…`);
+});
+
+it.each([
+  "runId",
+  "taskId",
+  "publicationId",
+  "baseOid",
+  "endedAt",
+  "file",
+  "incomplete",
+  "omitted",
+  "command",
+  "commandId",
+  "workspaceRevision",
+  "findingId",
+  "detail",
+  "evidence",
+])("bounds a stored %s string for recall", async (field) => {
+  const long = "x".repeat(700);
+  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
+  const check = normalizeCheck({
+    command: "check",
+    ...(field === "commandId" || field === "workspaceRevision" ? { [field]: long } : {}),
+  });
+  if (field === "command") check.command = long;
+  const finding = {
+    id: field === "findingId" ? long : "f1",
+    detail: field === "detail" ? long : "finding",
+    evidence: field === "evidence" ? long : "evidence",
+    status: "addressed" as const,
+  };
+  expect(
+    (
+      await writePrMemoryRound({
+        ...options,
+        evidence: {
+          endedAt: "now",
+          outcome: "completed",
+          filesTouched: [field === "file" ? long : "file"],
+          incomplete: [field === "incomplete" ? long : "incomplete"],
+          omitted: [field === "omitted" ? long : "omitted"],
+          testEvidence: [check],
+          findings: [finding],
+          ...(["runId", "taskId", "publicationId", "baseOid", "endedAt"].includes(field)
+            ? { [field]: long }
+            : {}),
+        },
+      })
+    ).status,
+  ).toBe("written");
+  expect((await recallPrMemoryRound(options)).status).toBe("recalled");
+  expect(String(fake.memories.get(ID)?.content)).not.toContain(long);
+});
+
+it("skips a hidden foreign PR-memory row after PUT refusal", async () => {
+  const prior = { id: ID, agentId: "kern", visibility: "private", content: "foreign history" };
+  const fake = makeFakeFlair({
+    agents: { [AGENT]: { id: AGENT }, kern: { id: "kern" } },
+    memories: { [ID]: prior },
+  });
+  const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
+  const client = new FlairHttpClient({ ...TARGET, ...seams(fake) });
+  await expect(client.get(ID)).resolves.toBeNull();
+  await expect(client.write("replacement", { id: ID, visibility: "private" })).rejects.toThrow(
+    "403",
+  );
+  expect(
+    (
+      await writePrMemoryRound({
+        ...options,
+        evidence: {
+          endedAt: "now",
+          outcome: "completed",
+          filesTouched: [],
+          testEvidence: [],
+        },
+      })
+    ).status,
+  ).toBe("skipped");
+  expect(fake.memories.get(ID)).toEqual(prior);
 });

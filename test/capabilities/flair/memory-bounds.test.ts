@@ -125,3 +125,27 @@ describe("Memory refusals from the Flair fake", () => {
     await expect(client.get("row")).resolves.toEqual(row);
   });
 });
+
+for (const body of ["", " ", "null"]) {
+  it.each([{}, { timeoutMs: 200, maxResponseBytes: 64 }])(
+    `Memory GET refuses ${JSON.stringify(body)} with bounds %j`,
+    async (bounds) => {
+      const client = new FlairHttpClient({ ...options, fetchImpl: async () => new Response(body) });
+      await expect(client.get("row", bounds)).rejects.toThrow(/flair read returned/);
+    },
+  );
+}
+
+for (const reader of ["soulGet", "agentGet"] as const) {
+  it.each([
+    { body: "", status: 200 },
+    { body: "null", status: 200 },
+    { body: "", status: 404 },
+  ])(`${reader} returns null for %j`, async ({ body, status }) => {
+    const client = new FlairHttpClient({
+      ...options,
+      fetchImpl: async () => new Response(body, { status }),
+    });
+    await expect(client[reader]("role")).resolves.toBeNull();
+  });
+}

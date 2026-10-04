@@ -344,9 +344,8 @@ export class FlairHttpClient implements FlairClient {
     body?: unknown,
     // Reads may surface a bounded 404 response as null.
     nullOnStatus?: readonly number[],
-    // bootstrap-only extras: the abort signal for the timeout, and the response
-    // size bound. Both are optional so every other call is unchanged.
     extra?: { signal?: AbortSignal; maxResponseBytes?: number },
+    strictBody = false,
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       Authorization: tpsEd25519AuthHeader({
@@ -365,9 +364,6 @@ export class FlairHttpClient implements FlairClient {
       body: body !== undefined ? JSON.stringify(body) : undefined,
       ...(extra?.signal !== undefined ? { signal: extra.signal } : {}),
     });
-    // A bootstrap response is bounded by BYTES while it is read: a real fetch
-    // response streams, and the read stops and cancels at the bound. Every
-    // other call reads the whole body.
     const text =
       extra?.maxResponseBytes !== undefined
         ? await readBodyTextBounded(res, extra.maxResponseBytes)
@@ -379,8 +375,7 @@ export class FlairHttpClient implements FlairClient {
       throw new Error(`flair ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
     }
     if (text.trim() === "") {
-      if (method === "GET" && nullOnStatus?.includes(404))
-        throw new Error("flair read returned an empty body");
+      if (strictBody) throw new Error("flair read returned an empty body");
       return undefined;
     }
     let parsed: unknown;
@@ -389,8 +384,7 @@ export class FlairHttpClient implements FlairClient {
     } catch {
       return text;
     }
-    if (parsed === null && method === "GET" && nullOnStatus?.includes(404))
-      throw new Error("flair read returned null");
+    if (parsed === null && strictBody) throw new Error("flair read returned null");
     return parsed;
   }
 
@@ -404,6 +398,7 @@ export class FlairHttpClient implements FlairClient {
     body: unknown,
     bounds: { timeoutMs?: number; maxResponseBytes?: number },
     nullOnStatus?: readonly number[],
+    strictBody = false,
   ): Promise<unknown> {
     if (bounds.timeoutMs === undefined) {
       // No deadline: still honor a byte bound by forwarding it to signedFetch.
@@ -415,6 +410,7 @@ export class FlairHttpClient implements FlairClient {
         bounds.maxResponseBytes !== undefined
           ? { maxResponseBytes: bounds.maxResponseBytes }
           : undefined,
+        strictBody,
       );
     }
     const controller = new AbortController();
@@ -426,12 +422,19 @@ export class FlairHttpClient implements FlairClient {
       }, bounds.timeoutMs);
     });
     try {
-      const pending = this.signedFetch(method, path, body, nullOnStatus, {
-        signal: controller.signal,
-        ...(bounds.maxResponseBytes !== undefined
-          ? { maxResponseBytes: bounds.maxResponseBytes }
-          : {}),
-      });
+      const pending = this.signedFetch(
+        method,
+        path,
+        body,
+        nullOnStatus,
+        {
+          signal: controller.signal,
+          ...(bounds.maxResponseBytes !== undefined
+            ? { maxResponseBytes: bounds.maxResponseBytes }
+            : {}),
+        },
+        strictBody,
+      );
       pending.catch(() => {}); // the race below owns the rejection
       return await Promise.race([pending, timedOut]);
     } finally {
@@ -487,6 +490,7 @@ export class FlairHttpClient implements FlairClient {
       undefined,
       opts,
       [404],
+      true,
     )) as FlairMemory | null | undefined;
     if (r === undefined || (r !== null && (typeof r !== "object" || Array.isArray(r))))
       throw new Error("flair read returned an invalid body");

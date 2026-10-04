@@ -79,7 +79,7 @@ import {
   type SilenceReason,
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
-import { gatedNoteInjection } from "./data-class.js";
+import { configHoldsWeb, gatedNoteInjection } from "./data-class.js";
 import { captureRepositoryState, isVerifiedEdit, type RepositoryState } from "./edit-evidence.js";
 import {
   EXPLORATION_INSTRUCTION,
@@ -831,7 +831,7 @@ export async function attachPrMemory(
   log?: (message: string) => void,
 ): Promise<void> {
   const ref = config.taskBinding?.pr_ref;
-  if (target === undefined || ref === undefined) return;
+  if (target === undefined || ref === undefined || configHoldsWeb(config)) return;
   const result = await recallPrMemoryRound({
     target: { url: target.url, agentId: target.agentId, keyFile: target.keyFile },
     ref,
@@ -1163,6 +1163,7 @@ async function runBoundedSession(
   // event stream. Disk-log
   // failure never disables collection.
   const prMemoryCollector = new PrMemoryCollector();
+  const toolArgsByCallId = new Map<string, unknown>();
   const prMemoryRunId = randomUUID();
   const raceLoop = <T>(work: Promise<T>): Promise<T> => {
     if (loopBreaker !== undefined) {
@@ -1261,6 +1262,8 @@ async function runBoundedSession(
     if (event.type === "tool_execution_start") {
       const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
       const args = (event as unknown as { args?: unknown }).args;
+      const toolCallId = (event as unknown as { toolCallId?: unknown }).toolCallId;
+      if (typeof toolCallId === "string") toolArgsByCallId.set(toolCallId, args);
       const observation = loopDetector.observe(toolName, args);
       if (observation.fire && loopBreaker === undefined) {
         loopBreaker = { toolName, count: observation.count };
@@ -1279,9 +1282,11 @@ async function runBoundedSession(
       const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
       const isError = (event as unknown as { isError?: unknown }).isError;
       const result = (event as unknown as { result?: unknown }).result;
+      const toolCallId = (event as unknown as { toolCallId?: unknown }).toolCallId;
+      const args = typeof toolCallId === "string" ? toolArgsByCallId.get(toolCallId) : undefined;
+      if (typeof toolCallId === "string") toolArgsByCallId.delete(toolCallId);
       if (isVerifiedEdit(toolName, isError, result)) {
         verifiedEdits += 1;
-        const args = (event as unknown as { args?: unknown }).args;
         prMemoryCollector.observeEditPath(editToolFilePath(toolName, isError, result, args));
       }
     }

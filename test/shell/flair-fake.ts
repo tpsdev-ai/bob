@@ -251,6 +251,9 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
           return reply(opts.memoryPutStatus, { error: "memory write refused" });
         if (body?.agentId && body.agentId !== signerId)
           return reply(403, { error: "forbidden: cannot write memory owned by another agent" });
+        const stored = memories.get(id);
+        if (stored !== undefined && stored.agentId !== signerId)
+          return reply(403, { error: "forbidden: cannot write memory owned by another agent" });
         memories.set(id, { ...(body ?? {}) });
         return reply(200, { id });
       }

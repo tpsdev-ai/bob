@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
 import { PR_MEMORY_PROMPT_HEADING, prMemoryKey } from "../../src/shell/pr-memory.js";
 import { type RunSession, runAgent } from "../../src/shell/run.js";
@@ -158,22 +159,29 @@ it("keeps both actual session prompts free of recall and records only verified p
           },
           async prompt(text) {
             prompts.push(text);
-            for (const listener of listeners)
-              listener({
-                type: "tool_execution_end",
-                toolName: "edit",
-                isError: false,
-                result: {},
-                args: { path: "unverified.ts" },
-              });
-            for (const listener of listeners)
-              listener({
-                type: "tool_execution_end",
-                toolName: "edit",
-                isError: false,
-                result: { details: { diff: "+a" }, content: [{ type: "text", text: "edited" }] },
-                args: { path: "verified.ts" },
-              });
+            for (const [id, args] of [
+              ["bad", { path: "unverified.ts" }],
+              ["good", { path: "verified.ts", content: "written" }],
+            ] as const)
+              for (const listener of listeners)
+                listener({ type: "tool_execution_start", toolName: "write", toolCallId: id, args });
+            const result = await createWriteToolDefinition(join(root, AGENT, "work")).execute(
+              "good",
+              { path: "verified.ts", content: "written" },
+            );
+            expect(readFileSync(join(root, AGENT, "work", "verified.ts"), "utf8")).toBe("written");
+            for (const [id, resultValue] of [
+              ["good", result],
+              ["bad", {}],
+            ] as const)
+              for (const listener of listeners)
+                listener({
+                  type: "tool_execution_end",
+                  toolName: "write",
+                  toolCallId: id,
+                  isError: false,
+                  result: resultValue,
+                });
           },
           dispose() {},
         };
