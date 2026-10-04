@@ -128,8 +128,11 @@ agent drops it unless its role permits resident writers.
 
 ## publish and publication recovery (bob#275, S2b)
 
-`publish` takes `candidate_id` and `commit_message`; `pr` refuses with
-`pr_unsupported` because PR creation is a later slice.
+`publish` takes `candidate_id`, `commit_message` and an optional `pr { title,
+body }`.
+
+When `pr` is requested, `publish` may create the authorized PR after a successful
+push.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.
 The record must match its content-derived ID and the task binding.
@@ -152,9 +155,6 @@ In-process retries queue; another process holding the publication lock causes
 `publication_locked`. A crash can leave a lock requiring operator removal after
 confirming the publisher has stopped.
 A concurrent same-user writer can still race pathname operations (bob#189).
-
-The result includes `status` (`published`, `refused` or `indeterminate`),
-`commit_oid`, `phase`, `push_state` and a refusal `reason` when applicable.
 
 ## Enabling it
 

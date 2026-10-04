@@ -16,6 +16,14 @@ import {
 import { isAbsolute, join, resolve } from "node:path";
 import type { GitInvocation, GitResult, GitRunner } from "./apply-patch.js";
 import { type CandidateRecord, candidateIdentity, candidateRecordPath } from "./apply-patch.js";
+import { publicationEnvironment } from "./publication-environment.js";
+import {
+  bodyWithMarker,
+  githubRepositorySlug,
+  type PullRequestRecord,
+  type PullRequestService,
+  publicationMarker,
+} from "./pull-request.js";
 import { DRAIN_GRACE_MS, ensurePrivateDir, isInside, KILL_GRACE_MS, REAP_LIMIT_MS } from "./run.js";
 import { PUBLICATION_ID, parseTaskBinding, type TaskBinding } from "./task-binding.js";
 
@@ -52,14 +60,25 @@ export type PublishRefusalReason =
   | "push_rejected"
   | "push_failed"
   | "pr_unsupported"
+  | "pr_service_unavailable"
+  | "pr_head_mismatch"
+  | "pr_head_moved"
   | "publication_locked"
   | "publication_conflict"
   | "aborted"
   | "storage_failed";
 
+export interface PublishPrRequest {
+  title: string;
+  body?: string;
+}
+
 export interface PublishParams {
   candidate_id: string;
   commit_message: string;
+  // Create a pull request after the push. Allowed only when the task binding
+  // authorizes PR creation.
+  pr?: PublishPrRequest;
 }
 
 // What a check command must report for publication to proceed. Mirrors the S1
@@ -97,6 +116,12 @@ export interface PublishDeps {
   // Runs after a push the remote accepted, before success is persisted. A test
   // throws here to model a terminated publisher with a lost acknowledgement.
   afterPushAccepted?: (commitOid: string) => void;
+  // Seam: the pull-request service. Production uses `gh` (see pull-request.ts);
+  // a test supplies a fake, so no network is used.
+  pr?: PullRequestService;
+  // Runs after the PR-creation intent is persisted and before the create call. A
+  // test throws here to model a publisher terminated with no request sent.
+  afterPrIntentStored?: (publicationId: string) => void;
 }
 
 export interface PublishResult {
@@ -107,6 +132,8 @@ export interface PublishResult {
   status: PublishStatus;
   phase: PublishPhase;
   push_state: PushState;
+  // Present only once a requested pull request is confirmed to exist.
+  pr_url?: string;
   reason?: string;
   message?: string;
   detail?: Record<string, unknown>;
@@ -132,6 +159,19 @@ interface CommitMeta {
   message: string;
 }
 
+interface JournalPr {
+  head: string;
+  base: string;
+  title: string;
+  // The effective body, marker included.
+  body: string;
+  marker: string;
+  author: string;
+  // creating: a request may have been sent; created: a verified URL is recorded.
+  state: "intent" | "creating" | "created";
+  url?: string;
+}
+
 interface PublishJournal {
   v: 2;
   authority: TaskBinding;
@@ -139,29 +179,26 @@ interface PublishJournal {
   publication_id: string;
   task_id: string;
   candidate_id: string;
-  request: { commit_message: string };
+  request: { commit_message: string; pr?: { title: string; body: string } };
   base_oid: string;
   tree_oid: string;
   changed_paths: string[];
   commit_meta: CommitMeta;
   commit_oid?: string;
+  publishing_identity?: string;
   checks?: Array<{ command: string; ok: boolean; reason?: string }>;
+  pr?: JournalPr;
   phase: PublishPhase;
   push_state: PushState;
   created_at: string;
 }
 
-function runGit(args: string[], inv: GitInvocation): GitResult {
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    LANG: "C",
-    LC_ALL: "C",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_TERMINAL_PROMPT: "0",
-  };
+export function publicationGit(env = publicationEnvironment()): GitRunner {
+  return (args, inv) => runGit(args, inv, env);
+}
+
+function runGit(args: string[], inv: GitInvocation, isolatedEnv: NodeJS.ProcessEnv): GitResult {
+  const env = { ...isolatedEnv };
   if (inv.indexFile !== undefined) env.GIT_INDEX_FILE = inv.indexFile;
   const r = spawnSync("git", ["-c", "maintenance.auto=false", "-c", "gc.auto=0", ...args], {
     cwd: inv.cwd,
@@ -536,7 +573,11 @@ function errCode(err: unknown): string {
 }
 
 function requestOf(params: PublishParams): PublishJournal["request"] {
-  return { commit_message: params.commit_message };
+  if (params.pr === undefined) return { commit_message: params.commit_message };
+  return {
+    commit_message: params.commit_message,
+    pr: { title: params.pr.title, body: params.pr.body ?? "" },
+  };
 }
 
 function requestsEqual(a: PublishJournal["request"], b: PublishJournal["request"]): boolean {
@@ -617,7 +658,7 @@ interface LockExit {
 
 export async function publish(input: PublishInput): Promise<PublishResult> {
   const deps = input.deps ?? {};
-  const git = deps.git ?? runGit;
+  const git = deps.git ?? publicationGit();
 
   if (input.bindingError !== undefined) {
     return refuse("invalid_binding", `publish refused: ${input.bindingError}`, {
@@ -679,23 +720,80 @@ export async function publish(input: PublishInput): Promise<PublishResult> {
       push_state: "unknown",
     });
   }
-  if ("pr" in params) {
-    return refuse(
-      "pr_unsupported",
-      "publish refused: pr is unsupported; PR creation is a later slice. Omit pr.",
-      {
+  const rawPr = (params as { pr?: unknown }).pr;
+  if (rawPr !== undefined) {
+    if (binding.pr === undefined) {
+      return refuse(
+        "pr_unsupported",
+        "publish refused: this task binding does not authorize PR creation; omit pr.",
+        {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
+          tree_oid: null,
+          commit_oid: null,
+          phase: "intent",
+          push_state: "unknown",
+        },
+      );
+    }
+    if (typeof rawPr !== "object" || rawPr === null || Array.isArray(rawPr)) {
+      return refuse(
+        "invalid_request",
+        "publish refused: pr must be an object with a title and an optional body.",
+        {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
+          tree_oid: null,
+          commit_oid: null,
+          phase: "intent",
+          push_state: "unknown",
+        },
+      );
+    }
+    const fields = rawPr as Record<string, unknown>;
+    if (typeof fields.title !== "string" || fields.title.trim() === "") {
+      return refuse("invalid_request", "publish refused: pr.title is required.", {
         publication_id: binding.publication_id,
         candidate_id: params.candidate_id,
         tree_oid: null,
         commit_oid: null,
         phase: "intent",
         push_state: "unknown",
-      },
-    );
+      });
+    }
+    if (fields.body !== undefined && typeof fields.body !== "string") {
+      return refuse("invalid_request", "publish refused: pr.body must be a string.", {
+        publication_id: binding.publication_id,
+        candidate_id: params.candidate_id,
+        tree_oid: null,
+        commit_oid: null,
+        phase: "intent",
+        push_state: "unknown",
+      });
+    }
+    const unknownPr = Object.keys(fields).filter((key) => key !== "title" && key !== "body");
+    if (unknownPr.length)
+      return refuse(
+        "invalid_request",
+        `publish refused: unsupported pr arguments: ${unknownPr.join(", ")}`,
+      );
+    if (deps.pr === undefined)
+      return refuse(
+        "pr_service_unavailable",
+        "publish refused: PR creation was requested but no PR service is wired, so no PR can be created. Nothing external was attempted.",
+        {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
+          tree_oid: null,
+          commit_oid: null,
+          phase: "intent",
+          push_state: "unknown",
+        },
+      );
   }
 
   const unknown = Object.keys(params).filter(
-    (key) => key !== "candidate_id" && key !== "commit_message",
+    (key) => key !== "candidate_id" && key !== "commit_message" && key !== "pr",
   );
   if (unknown.length)
     return refuse(
@@ -904,6 +1002,9 @@ async function publishUnderLock(
       "publish refused: destination must resolve to one endpoint without URL rewrites and a valid branch ref.",
     );
 
+  if (params.pr !== undefined && deps.pr?.supportsEndpoint?.(endpoint) === false)
+    return fail("pr_unsupported", "publish refused: PR creation requires a GitHub HTTPS endpoint.");
+
   const journalPath = publishJournalPath(stateRoot, binding.publication_id);
   const readJ = deps.readJournal ?? readJournalFile;
   const writeJ = deps.writeJournal ?? writeJournalAtomic;
@@ -971,6 +1072,28 @@ async function publishUnderLock(
       push_state: "unknown",
       created_at: now().toISOString(),
     } satisfies PublishJournal);
+
+  if (params.pr !== undefined) {
+    try {
+      const author = await (deps.pr as PullRequestService).identity();
+      if (typeof author !== "string" || author === "") throw new Error("no publishing identity");
+      const pinned = journal.publishing_identity ?? journal.pr?.author;
+      if (pinned !== undefined && pinned !== author) throw new Error("publishing identity changed");
+      journal.publishing_identity = author;
+    } catch (err) {
+      const message = `publish: PR authentication is unavailable (${messageOf(err)}).`;
+      if (["pushing", "pushed", "published"].includes(journal.phase))
+        return indeterminate("pr_service_unavailable", message, {
+          publication_id: binding.publication_id,
+          candidate_id: params.candidate_id,
+          tree_oid: treeOid,
+          commit_oid: journal.commit_oid ?? null,
+          phase: journal.phase,
+          push_state: journal.push_state,
+        });
+      return fail("pr_service_unavailable", message);
+    }
+  }
 
   let pushAttempted = ["pushing", "pushed", "published"].includes(journal.phase);
   const persist = (): PublishResult | null => {
@@ -1329,6 +1452,228 @@ async function publishUnderLock(
   }
 }
 
+// The branch the PR is opened from: the task's authorized head, or the pushed
+// branch when the task does not name one.
+function prHead(binding: TaskBinding): string {
+  const pr = binding.pr as { base: string; head?: string };
+  return pr.head ?? binding.destination.ref.replace(/^refs\/heads\//, "");
+}
+
+type PrReconcile =
+  | { kind: "found"; url: string }
+  | { kind: "absent" }
+  | { kind: "unknown"; error: string };
+
+function matchingPr(
+  rec: PullRequestRecord,
+  repository: string,
+  pr: JournalPr,
+  commitOid: string,
+): boolean {
+  if (rec === null || typeof rec !== "object") return false;
+  const slug = githubRepositorySlug(repository);
+  const repoMatches = (actual: string): boolean => {
+    if (slug === null) return actual === repository;
+    const other = githubRepositorySlug(actual);
+    return (
+      other !== null &&
+      other.owner.toLowerCase() === slug.owner.toLowerCase() &&
+      other.name.toLowerCase() === slug.name.toLowerCase()
+    );
+  };
+  if (!repoMatches(rec.repository) || !repoMatches(rec.headRepository)) return false;
+  if (rec.head !== pr.head || rec.base !== pr.base || rec.commitOid !== commitOid) return false;
+  if (rec.author !== pr.author || typeof rec.body !== "string" || !rec.body.includes(pr.marker))
+    return false;
+  if (typeof rec.url !== "string") return false;
+  if (slug === null) return rec.url !== "";
+  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)$/.exec(rec.url);
+  return (
+    match !== null &&
+    match[1].toLowerCase() === slug.owner.toLowerCase() &&
+    match[2].toLowerCase() === slug.name.toLowerCase() &&
+    Number(match[3]) === rec.number
+  );
+}
+
+async function reconcilePr(
+  service: PullRequestService,
+  repository: string,
+  pr: JournalPr,
+  commitOid: string,
+): Promise<PrReconcile> {
+  let records: unknown;
+  try {
+    records = await service.list({ repository, head: pr.head, base: pr.base });
+  } catch (err) {
+    return { kind: "unknown", error: messageOf(err) };
+  }
+  if (!Array.isArray(records)) return { kind: "unknown", error: "the PR service returned no list" };
+  const matches = records.filter((rec) => matchingPr(rec, repository, pr, commitOid));
+  if (matches.length > 1) return { kind: "unknown", error: "multiple matching PRs" };
+  return matches.length === 1 ? { kind: "found", url: matches[0].url } : { kind: "absent" };
+}
+
+type PrOutcome =
+  | { ok: true; url: string }
+  | { ok: false; reason: string; message: string; definite?: false }
+  | { ok: false; reason: PublishRefusalReason; message: string; definite: true };
+
+// Create the requested pull request, or confirm an existing one, after the push
+// is confirmed. The intent is persisted before any create request; a create
+// whose outcome is not confirmed is indeterminate and is never reissued.
+async function ensurePullRequest(
+  input: PublishInput,
+  journal: PublishJournal,
+  deps: PublishDeps,
+  git: GitRunner,
+): Promise<PrOutcome> {
+  const binding = input.binding as TaskBinding;
+  const service = deps.pr as PullRequestService;
+  const params = input.params;
+  const requested = params.pr as PublishPrRequest;
+  const head = prHead(binding);
+  const base = (binding.pr as { base: string }).base;
+  const repository = journal.endpoint;
+  if (head !== binding.destination.ref.replace(/^refs\/heads\//, ""))
+    return {
+      ok: false,
+      definite: true,
+      reason: "pr_head_mismatch",
+      message: `publish refused: actor ${journal.publishing_identity} published commit ${journal.commit_oid} to ${binding.destination.ref}, but the authorized PR head is ${head}; no PR was created. Ask the launcher for a new publication binding whose PR head is the pushed ref.`,
+    };
+
+  const journalPath = publishJournalPath(input.stateRoot, binding.publication_id);
+  const writeJ = deps.writeJournal ?? writeJournalAtomic;
+  const persist = (): unknown | null => {
+    try {
+      writeJ(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
+      return null;
+    } catch (err) {
+      return err;
+    }
+  };
+
+  let pr = journal.pr;
+
+  // 1. The immutable intent is durable before any create request.
+  if (pr === undefined) {
+    const author = journal.publishing_identity as string;
+    const marker = publicationMarker(binding.publication_id);
+    pr = journal.pr = {
+      head,
+      base,
+      title: requested.title,
+      body: bodyWithMarker(requested.body ?? "", marker),
+      marker,
+      author,
+      state: "intent",
+    };
+    const err = persist();
+    if (err !== null)
+      return {
+        ok: false,
+        reason: "journal_write_failed",
+        message: `publish indeterminate: commit ${journal.commit_oid} is published but the PR intent could not be persisted (${errCode(err)}); no PR was created.`,
+      };
+  }
+  if (
+    !/^<!-- bob-publication:[A-Za-z0-9_.-]+:[0-9a-f]{64} -->$/.test(pr.marker) ||
+    typeof pr.author !== "string" ||
+    pr.author === ""
+  )
+    return {
+      ok: false,
+      reason: "pr_unreconciled",
+      message: "publish indeterminate: unbound PR intent.",
+    };
+  deps.afterPrIntentStored?.(binding.publication_id);
+
+  // 2. Reconcile before creating, so a retry or recovery reuses the PR this
+  // publication already created instead of issuing a second one.
+  const found = await reconcilePr(service, repository, pr, journal.commit_oid as string);
+  if (found.kind === "found") {
+    pr.state = "created";
+    pr.url = found.url;
+    const err = persist();
+    return err === null
+      ? { ok: true, url: found.url }
+      : {
+          ok: false,
+          reason: "journal_write_failed",
+          message: `publish indeterminate: the PR ${found.url} exists but the journal could not record it (${errCode(err)}).`,
+        };
+  }
+  if (found.kind === "unknown")
+    return {
+      ok: false,
+      reason: "pr_unreconciled",
+      message: `publish indeterminate: commit ${journal.commit_oid} is published but whether the requested PR exists could not be reconciled (${found.error}). No second create was issued.`,
+    };
+
+  // 3. No matching PR was found. A create that may have been sent is never reissued.
+  if (pr.state !== "intent")
+    return {
+      ok: false,
+      reason: "pr_uncertain",
+      message: `publish indeterminate: a PR create for ${repository} ${head}->${base} may have been issued and no matching PR can be reconciled; no second PR was created.`,
+    };
+  const tip = inspectRemote(git, binding.repository, repository, binding.destination.ref);
+  if (tip.state === "unknown")
+    return {
+      ok: false,
+      reason: "pr_unreconciled",
+      message: `publish indeterminate: actor ${pr.author} could not inspect PR head ${head} (${tip.error}); no PR was created. Retry when the remote is available.`,
+    };
+  if (tip.state !== "present" || tip.oid !== journal.commit_oid)
+    return {
+      ok: false,
+      definite: true,
+      reason: "pr_head_moved",
+      message: `publish refused: actor ${pr.author} published commit ${journal.commit_oid}, but PR head ${head} is now ${tip.state === "present" ? tip.oid : "absent"}; no PR was created. Ask the launcher for a new publication binding and candidate based on the current branch tip.`,
+    };
+  pr.state = "creating";
+  const creatingErr = persist();
+  if (creatingErr !== null)
+    return {
+      ok: false,
+      reason: "journal_write_failed",
+      message: `publish indeterminate: the commit is published but the PR create intent could not be persisted (${errCode(creatingErr)}); no PR was created.`,
+    };
+
+  let url: string;
+  try {
+    const created = await service.create({
+      repository,
+      head,
+      base,
+      title: pr.title,
+      body: pr.body,
+    });
+    if (!matchingPr(created, repository, pr, journal.commit_oid as string))
+      throw new Error("the PR service returned a mismatched pull request");
+    url = created.url;
+  } catch (err) {
+    // The request may have succeeded; the outcome is unknown, so no second
+    // create is issued. A retry reconciles.
+    return {
+      ok: false,
+      reason: "pr_uncertain",
+      message: `publish indeterminate: the PR create for ${repository} ${head}->${base} reported ${messageOf(err)} and its outcome is unknown; no second create was issued.`,
+    };
+  }
+  pr.state = "created";
+  pr.url = url;
+  const err = persist();
+  return err === null
+    ? { ok: true, url }
+    : {
+        ok: false,
+        reason: "journal_write_failed",
+        message: `publish indeterminate: the PR ${url} exists but the journal could not record it (${errCode(err)}).`,
+      };
+}
+
 // Confirm the remote and report `published`. `remoteConfirmed`
 // is true when a prior inspection already established the commit is present.
 async function finishPublished(
@@ -1394,6 +1739,38 @@ async function finishPublished(
 
   journal.phase = "pushed";
   journal.push_state = "confirmed_present";
+
+  if (input.params.pr !== undefined) {
+    const prOutcome = await ensurePullRequest(input, journal, deps, git);
+    if (!prOutcome.ok) {
+      const prFail = persist();
+      if (prFail !== null) return prFail;
+      const details: Partial<PublishResult> = {
+        publication_id: binding.publication_id,
+        candidate_id: journal.candidate_id,
+        tree_oid: treeOid,
+        commit_oid: commitOid,
+        phase: "pushed",
+        push_state: "confirmed_present",
+      };
+      return prOutcome.definite
+        ? refuse(prOutcome.reason, prOutcome.message, details)
+        : indeterminate(prOutcome.reason, prOutcome.message, details);
+    }
+    journal.phase = "published";
+    const prFinalFail = persist();
+    if (prFinalFail !== null) return prFinalFail;
+    return {
+      publication_id: binding.publication_id,
+      candidate_id: journal.candidate_id,
+      tree_oid: treeOid,
+      commit_oid: commitOid,
+      status: "published",
+      phase: "published",
+      push_state: "confirmed_present",
+      pr_url: prOutcome.url,
+    };
+  }
 
   journal.phase = "published";
   const finalFail = persist();
