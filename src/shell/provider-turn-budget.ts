@@ -68,18 +68,22 @@ export function boundedOutputCap(
 }
 
 /**
- * bob#306: the final request body for a row with a budget. Its `max_tokens`, and
- * its `max_completion_tokens` when present, become at most `cap`: a lower
- * positive number is kept, and any other value becomes `cap`. A body that is not
- * an object is refused.
+ * bob#306: the final request body for a row with a budget. An object body is
+ * first copied as plain JSON data (`JSON.parse(JSON.stringify(body))`), so the
+ * returned copy has no `toJSON` or getter left to change what the request
+ * serializes. A copy that is not an object is refused. Its `max_tokens`, and its
+ * `max_completion_tokens` when present, become at most `cap`: a lower positive
+ * number is kept, and any other value becomes `cap`.
  */
 export function boundPayloadCap(payload: unknown, cap: number): Record<string, unknown> {
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+  const plain: unknown =
+    typeof payload === "object" && payload !== null ? JSON.parse(JSON.stringify(payload)) : payload;
+  if (typeof plain !== "object" || plain === null || Array.isArray(plain)) {
     throw new Error(
       "bob: refusing a keyless provider request whose body is not an object, so the row's output cap cannot be applied. Remedy: a payload hook (before_provider_request or onPayload) must return the payload object or undefined.",
     );
   }
-  const body: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  const body = plain as Record<string, unknown>;
   body.max_tokens = Math.min(positiveCap(body.max_tokens) ?? cap, cap);
   if ("max_completion_tokens" in body) {
     body.max_completion_tokens = Math.min(positiveCap(body.max_completion_tokens) ?? cap, cap);

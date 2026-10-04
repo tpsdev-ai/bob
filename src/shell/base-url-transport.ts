@@ -122,8 +122,10 @@ export function installBaseUrlTransport(
       ...(budget !== undefined && maxTokens !== undefined
         ? {
             maxTokens,
-            onPayload: async (payload: unknown, payloadModel: unknown) =>
-              boundPayloadCap((await callerPayload?.(payload, payloadModel)) ?? payload, maxTokens),
+            onPayload: async (payload: unknown, payloadModel: unknown) => {
+              const returned = await callerPayload?.(payload, payloadModel);
+              return boundPayloadCap(returned === undefined ? payload : returned, maxTokens);
+            },
             reasoning: budget.reasoning,
             reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
           }

@@ -364,6 +364,14 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
       wire: 1,
     },
     {
+      // The request's serializer calls the body's own toJSON.
+      name: "a payload hook whose body's toJSON raises max_tokens",
+      setup: {
+        hook: "return { ...event.payload, toJSON() { const { toJSON, ...rest } = this; return { ...rest, max_tokens: 4096 }; } };",
+      },
+      wire: 256,
+    },
+    {
       name: "a payload hook that lowers max_tokens",
       setup: { hook: "return { ...event.payload, max_tokens: 100 };" },
       wire: 100,
@@ -385,20 +393,24 @@ describe("bob#306 — a keyless row's budget bounds every output cap in its sess
     20_000,
   );
 
-  it("a payload hook that returns a body that is not an object is refused before any request", async () => {
-    const server = await serve("obey", 3);
-    const { session, assistants } = await sessionFor(server.url, {
-      ...budget,
-      hook: 'return "not a body";',
-    });
-    try {
-      await session.prompt("go");
-      expect(server.bodies.length).toBe(0);
-      const reply = assistants().at(-1);
-      expect(reply?.stopReason).toBe("error");
-      expect(String(reply?.errorMessage)).toContain("body is not an object");
-    } finally {
-      session.dispose();
-    }
-  }, 20_000);
+  it.each([
+    { name: "a string", hook: 'return "not a body";' },
+    { name: "null", hook: "return null;" },
+  ])(
+    "a payload hook that returns $name is refused before any request",
+    async ({ hook }) => {
+      const server = await serve("obey", 3);
+      const { session, assistants } = await sessionFor(server.url, { ...budget, hook });
+      try {
+        await session.prompt("go");
+        expect(server.bodies.length).toBe(0);
+        const reply = assistants().at(-1);
+        expect(reply?.stopReason).toBe("error");
+        expect(String(reply?.errorMessage)).toContain("body is not an object");
+      } finally {
+        session.dispose();
+      }
+    },
+    20_000,
+  );
 });
