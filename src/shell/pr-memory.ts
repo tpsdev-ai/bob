@@ -361,6 +361,7 @@ export function parseEnvelope(
 export function validateRecalledRecord(
   record: FlairMemory | null,
   expected: PrMemoryIdentity & { id: string },
+  now: () => number = Date.now,
 ): PrMemoryEnvelope | undefined {
   if (record === null) return undefined;
   if (typeof record.id !== "string" || record.id !== expected.id) return undefined;
@@ -368,6 +369,11 @@ export function validateRecalledRecord(
   if (record.visibility !== "private") return undefined;
   if (record.archived === true) return undefined;
   if (record.expiredAt !== undefined || record.expired === true) return undefined;
+  if (record.expiresAt !== undefined && record.expiresAt !== null) {
+    if (typeof record.expiresAt !== "string") return undefined;
+    const expiresAt = Date.parse(record.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now()) return undefined;
+  }
   if (typeof record.content !== "string") return undefined;
   return parseEnvelope(record.content, expected);
 }
@@ -507,9 +513,7 @@ function renderRound(round: PrRoundRecord): string {
   return lines.join("\n");
 }
 
-// Render the recalled envelope as a bounded, clearly labelled prior-round
-// block: a signal, not an instruction. Returns "" when there is nothing to
-// show. Never over PR_MEMORY_PROMPT_MAX_BYTES including the framing.
+// Label and delimit recalled text; supplied values remain untrusted.
 export function renderPrMemoryPrompt(env: PrMemoryEnvelope): string {
   const sections: string[] = [];
   const omissions = [...env.omitted, ...env.rounds.flatMap((r) => r.omitted)];
@@ -702,7 +706,7 @@ export async function recallPrMemoryRound(opts: {
     return { status: "unavailable", reason };
   }
   if (record === null) return { status: "empty" };
-  const envelope = validateRecalledRecord(record, { ...opts.identity, id });
+  const envelope = validateRecalledRecord(record, { ...opts.identity, id }, opts.seams?.now);
   if (envelope === undefined) {
     log("PR memory at start was not a valid record for this PR; ignoring it.");
     return { status: "invalid", reason: "the record failed identity or schema validation" };
@@ -735,7 +739,7 @@ export async function writePrMemoryRound(opts: {
       maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
     });
     if (record !== null) {
-      existing = validateRecalledRecord(record, { ...opts.identity, id });
+      existing = validateRecalledRecord(record, { ...opts.identity, id }, opts.seams?.now);
       if (existing === undefined) {
         log("PR memory write SKIPPED: the existing record is not valid for this PR.");
         return { status: "skipped", reason: "the existing record failed validation" };

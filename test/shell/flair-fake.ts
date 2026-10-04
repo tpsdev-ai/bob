@@ -249,6 +249,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       if (init.method === "PUT") {
         if (opts.memoryPutStatus && opts.memoryPutStatus >= 400)
           return reply(opts.memoryPutStatus, { error: "memory write refused" });
+        if (body?.agentId && body.agentId !== signerId)
+          return reply(403, { error: "forbidden: cannot write memory owned by another agent" });
         memories.set(id, { ...(body ?? {}) });
         return reply(200, { id });
       }
@@ -257,6 +259,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
           return reply(opts.memoryGetStatus, { error: "memory read refused" });
         const stored = memories.get(id);
         if (stored === undefined) return reply(404, { error: "not found" });
+        if (stored.visibility === "private" && stored.agentId !== signerId)
+          return reply(404, { error: "not found" });
         return reply(200, stored);
       }
     }

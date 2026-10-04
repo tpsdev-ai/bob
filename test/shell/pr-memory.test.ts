@@ -1,8 +1,3 @@
-// bob#185 item 5, slice 1 — the per-PR round memory. The HARNESS writes and
-// recalls it; identity is an exact key from the launcher binding; the block is
-// a signal, not an instruction. These tests drive the real signed GET/PUT
-// bodies through the fake Flair instance.
-
 import { describe, expect, it } from "bun:test";
 import {
   boundEnvelope,
@@ -192,6 +187,44 @@ describe("edit receipts — candidate files only from successful edits", () => {
 });
 
 describe("envelope parsing and validation", () => {
+  it.each([
+    ["past", "2023-11-14T22:13:19.999Z", "invalid"],
+    ["present", "2023-11-14T22:13:20.000Z", "invalid"],
+    ["future", "2023-11-14T22:13:20.001Z", "recalled"],
+    ["null", null, "recalled"],
+    ["malformed", "not-a-date", "invalid"],
+  ] as const)("checks the %s expiresAt on a Flair row", async (_label, expiresAt, status) => {
+    const record = {
+      id: ID,
+      agentId: AGENT,
+      visibility: "private",
+      content: JSON.stringify(envelope({ rounds: [round()] })),
+      durability: "standard",
+      createdAt: "2023-11-14T22:12:20.000Z",
+      updatedAt: "2023-11-14T22:12:20.000Z",
+      archived: false,
+      expiresAt,
+    };
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, memories: { [ID]: record } });
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: seams(fake),
+    });
+    expect(recalled.status).toBe(status);
+    if (status === "invalid") expect(recalled.block).toBeUndefined();
+    else expect(recalled.block).toContain(PR_MEMORY_PROMPT_HEADING);
+    const written = await writePrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: seams(fake),
+      evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
+    });
+    expect(written.status).toBe(status === "invalid" ? "skipped" : "written");
+  });
+
   it("accepts the envelope byte cap and rejects one byte over it", () => {
     const content = JSON.stringify(envelope()).padEnd(PR_MEMORY_ENVELOPE_MAX_BYTES, " ");
     expect(Buffer.byteLength(content, "utf8")).toBe(PR_MEMORY_ENVELOPE_MAX_BYTES);
