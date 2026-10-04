@@ -133,9 +133,11 @@ body }`. `pr` is accepted only when the task binding authorizes PR creation (a
 `pr` block naming the base, and optionally the head); otherwise it refuses with
 `pr_unsupported`.
 
-When `pr` is requested and authorized, `publish` creates a pull request in the
-authorized repository with the authorized head/base. The intent is journaled
-before creation. Recovery verifies repository, head/base, marker, commit and
+When `pr` is requested and authorized, and the endpoint is a supported GitHub
+HTTPS endpoint, `publish` attempts to create a pull request after a successful
+push, in the authorized repository with the authorized head/base. Other
+endpoints are refused as `pr_unsupported`. `pr_url` is reported only after the
+PR is confirmed. The intent is journaled before creation. Recovery verifies repository, head/base, marker, commit and
 author; an uncertain create is `indeterminate` and is never reissued.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.

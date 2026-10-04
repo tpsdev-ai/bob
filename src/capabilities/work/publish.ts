@@ -1713,8 +1713,8 @@ async function finishPublished(
   journal.phase = "pushed";
   journal.push_state = "confirmed_present";
 
-  // A requested PR is created after the push is confirmed, and reported only
-  // once it is. An unresolved PR leaves the commit published and the whole
+  // After a confirmed push, a requested PR is attempted; pr_url is reported
+  // only once it is confirmed. An unresolved PR leaves the commit published and the whole
   // result indeterminate.
   if (input.params.pr !== undefined) {
     const prOutcome = await ensurePullRequest(input, journal, deps);

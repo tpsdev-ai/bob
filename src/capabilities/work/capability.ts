@@ -126,7 +126,7 @@ const APPLY_PATCH_DESCRIPTION =
 const PUBLISH_DESCRIPTION =
   "Publish a candidate using the launcher's task binding. Takes candidate_id, commit_message, and an optional pr { title, body }. " +
   "Required checks run on a materialized candidate through the run executor. " +
-  "When pr is requested and the task binding authorizes it, publish creates a pull request and reports pr_url after verification. " +
+  "When pr is requested and the task binding authorizes it, publish attempts to create a pull request after a successful push and reports pr_url only after confirming it. Unsupported endpoints (only GitHub HTTPS is supported) are refused as pr_unsupported. " +
   "A pr request on a binding that does not authorize it is refused as pr_unsupported.";
 
 function publishResultText(r: PublishResult): string {
@@ -494,7 +494,7 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
           },
           {
             description:
-              "Create a pull request after the push. Allowed only when the task binding authorizes PR creation.",
+              "Request a pull request after the push. Allowed only when the task binding authorizes PR creation.",
           },
         ),
       ),
