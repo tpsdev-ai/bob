@@ -1,22 +1,17 @@
 // bob#185 item 5, slice 1 — per-PR round memory.
 //
-// The local builder starts each PR round with what earlier rounds on the SAME
-// PR established. The HARNESS owns that memory: it recalls it before the
-// session is built. The one-shot run writes after a session runs or a run-bound
+// The harness recalls memory before the session is built.
+// The one-shot run writes after a session runs or a run-bound
 // pre-session abort; launch with a prompt uses this path. Interactive launch
 // without a prompt recalls only.
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
-// agent id + canonical repository + PR number (TaskBinding.pr_ref) — and never
-// from the brief, model output, branch name, tool arguments or workspace
-// configuration. Recall and write therefore address one record by id and
+// agent id + canonical repository + PR number (TaskBinding.pr_ref).
+// Recall and write address one record by id and
 // validate the identity embedded in it, rather than searching.
 //
-// The stored envelope is bounded (newest few rounds, hard byte caps) and is
-// written as structured, bounded evidence: the outcome comes from the harness
-// exit code / termination reason, files from edit receipts. Supplied check
-// evidence is stored; the one-shot runner collects none. No transcript,
-// reasoning, raw environment or raw stdout/stderr is stored.
+// The writer stores supplied finding and check strings within byte caps;
+// recall escapes framing delimiters and line breaks.
 
 import { createHash } from "node:crypto";
 import { FlairHttpClient, type FlairMemory } from "../capabilities/flair/client.js";
@@ -31,8 +26,7 @@ export const PR_MEMORY_TAG = "bob-pr-round";
 
 // The record id is deterministic in (agent id, canonical repository, PR
 // number) and nothing else. The digest input is exactly the
-// JSON.stringify of the three-element tuple, so a change to the tuple changes
-// the id and no other field can move it.
+// JSON.stringify of the three-element tuple.
 export function prMemoryKey(
   agentId: string,
   canonicalRepository: string,
@@ -51,7 +45,7 @@ export function prMemorySubject(canonicalRepository: string, prNumber: number): 
 
 // ─── Bounds ─────────────────────────────────────────────────────────────────
 
-// Newest 3 rounds are retained; each round is capped at 4 KiB and the whole
+// Up to 3 rounds are retained from newest-first input; each is capped at 4 KiB and the whole
 // serialized envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
@@ -82,9 +76,7 @@ export interface PrFinding {
   id?: string;
   detail: string;
   status: "open" | "addressed";
-  // Present only for an addressed finding: the observed evidence (e.g. the
-  // same required command subsequently exited successfully). It establishes
-  // command recovery, not semantic correctness.
+  // Optional supplied evidence.
   evidence?: string;
 }
 
@@ -122,7 +114,7 @@ export interface PrMemoryEnvelope {
   open_findings: PrFinding[];
   // Newest first.
   rounds: PrRoundRecord[];
-  // Whole rounds and findings dropped by bounding, newest last.
+  // Omission categories from bounding.
   omitted: string[];
 }
 
@@ -134,9 +126,8 @@ export interface PrMemoryIdentity {
 
 // ─── Outcome (harness-owned) ────────────────────────────────────────────────
 
-// The run result fields the harness knows. A model's "DONE" is not among them:
-// the outcome is the exit code and termination reason, never text. Exit 0 can
-// include a model-declared BLOCKED; it is stored as completed.
+// Outcome uses the harness result. Its no-edit gate reads the final message
+// for BLOCKED.
 export interface RunOutcomeInput {
   exitCode: number;
   failed?: boolean;
@@ -154,8 +145,6 @@ export function roundOutcomeFromRun(r: RunOutcomeInput): PrRoundOutcome {
 
 // ─── Check evidence (structured observation → bounded evidence) ─────────────
 
-// The minimal structured observation a JobReport (or a tool result) yields.
-// Pending, missing and timed-out observations NEVER become passes.
 export interface CheckObservation {
   command: string;
   commandId?: string;
@@ -194,8 +183,6 @@ export function normalizeCheck(obs: CheckObservation): PrTestEvidence {
 
 // ─── Edit receipts (files) ──────────────────────────────────────────────────
 
-// The edit-family tool names whose successful calls are edit receipts for the
-// round. Bounded candidate paths only; a failed observation yields no path.
 export const EDIT_TOOL_NAMES: ReadonlySet<string> = new Set([
   "edit",
   "write",
@@ -215,8 +202,7 @@ function pathFrom(value: unknown): string | undefined {
   return undefined;
 }
 
-// The path a successful edit tool call touched, from its result or its
-// arguments. Undefined when the tool is not an edit tool, when the call was an
+// Undefined when the tool is not an edit tool, when the call was an
 // error, or when no path is observable.
 export function editToolFilePath(
   toolName: string,
@@ -371,7 +357,7 @@ export function parseEnvelope(
 
 // Validate a GET record: its id, owner, private visibility, schema version and
 // embedded repository/PR must all match. Archived, expired, malformed or
-// mismatched records are rejected, so no other agent's memory enters the block.
+// mismatched records are rejected.
 export function validateRecalledRecord(
   record: FlairMemory | null,
   expected: PrMemoryIdentity & { id: string },
@@ -430,10 +416,9 @@ export interface BoundedEnvelope {
   omitted: string[];
 }
 
-// Serialize an envelope under the byte caps. Rounds are kept newest-first;
+// Serialize an envelope under the byte caps. Input rounds are newest-first;
 // whole rounds are dropped oldest-first, and unresolved findings are preserved
-// preferentially (they are trimmed last). What was dropped is reported and
-// appended to the envelope's `omitted` list.
+// preferentially (they are trimmed last).
 export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
   const omitted: string[] = [];
   const rounds: PrRoundRecord[] = [];
@@ -494,9 +479,7 @@ export const PR_MEMORY_PROMPT_HEADING =
 const FRAME_OPEN = "<<<BOB-PR-MEMORY>>>";
 const FRAME_CLOSE = "<<<END-BOB-PR-MEMORY>>>";
 
-// Neutralize text that could impersonate the framing delimiters or the
-// heading, so recalled content cannot break out of its block. Line breaks
-// become spaces first, so a recalled value renders as one line.
+// Escape framing delimiters and the heading. Line breaks become spaces.
 function escapeForPrompt(s: string): string {
   return s
     .replace(/\r\n|[\n\v\f\r\u0085\u2028\u2029]/g, " ")
@@ -567,8 +550,7 @@ export function renderPrMemoryPrompt(env: PrMemoryEnvelope): string {
 
 // ─── Finding merge ──────────────────────────────────────────────────────────
 
-// Carry unresolved findings forward, and fold in this round's findings. An
-// "addressed" finding replaces an open one with the same id or detail.
+// Carry unresolved findings forward, and fold in this round's findings.
 export function mergeFindings(
   existing: readonly PrFinding[],
   round: readonly PrFinding[],
@@ -696,7 +678,7 @@ function safeReason(err: unknown): string {
 }
 
 // Recall the prior-round memory for one PR BEFORE session construction. A
-// missing record is "empty" (a first round). A malformed, mismatched or
+// missing record is "empty". A malformed, mismatched or
 // wrong-owner record is "invalid" and contributes nothing. An unreachable or
 // timed-out Flair is "unavailable"; the round proceeds and the caller says so.
 export async function recallPrMemoryRound(opts: {
@@ -732,7 +714,7 @@ export async function recallPrMemoryRound(opts: {
 
 // Write one round's memory at round end. A failed read first means the write
 // is SKIPPED (never overwrite history we could not read). A record already
-// holding this run id is left alone (finalization is idempotent by run id).
+// holding this run id is left alone.
 export async function writePrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;

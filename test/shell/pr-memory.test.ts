@@ -96,7 +96,7 @@ describe("identity — an exact key, nothing else", () => {
   });
 });
 
-describe("outcome — harness-owned, never a model DONE", () => {
+describe("outcome from the harness result", () => {
   it("reads the exit code and termination reason", () => {
     expect(roundOutcomeFromRun({ exitCode: 0 })).toBe("completed");
     expect(roundOutcomeFromRun({ exitCode: 1, failed: true })).toBe("failed");
@@ -110,7 +110,7 @@ describe("outcome — harness-owned, never a model DONE", () => {
   });
 });
 
-describe("check evidence — pending, missing, timed-out never pass", () => {
+describe("check evidence normalization", () => {
   it("never turns a non-final state into a pass", () => {
     expect(normalizeCheck({ command: "bun test", state: "running", success: true }).outcome).toBe(
       "pending",
@@ -181,7 +181,7 @@ describe("edit receipts — candidate files only from successful edits", () => {
     expect(editToolFilePath("edit", false, {})).toBeUndefined();
   });
 
-  it("dedupes and bounds the collector", () => {
+  it("dedupes collector paths", () => {
     const c = new PrMemoryCollector();
     c.observeEditPath("a");
     c.observeEditPath("a");
@@ -304,12 +304,16 @@ describe("envelope parsing and validation", () => {
 describe("bounds — whole entries only, omissions reported", () => {
   it("keeps the newest rounds and drops the rest", () => {
     const rounds = Array.from({ length: 6 }, (_, i) =>
-      round({ endedAt: `2026-10-0${i + 1}T00:00:00.000Z` }),
+      round({ endedAt: `2026-10-0${6 - i}T00:00:00.000Z` }),
     );
     const { json, omitted } = boundEnvelope(envelope({ rounds }));
     const env = JSON.parse(json) as PrMemoryEnvelope;
     expect(env.rounds.length).toBe(PR_MEMORY_MAX_ROUNDS);
-    expect(env.rounds[0]?.endedAt).toContain("2026-10-01");
+    expect(env.rounds.map((r) => r.endedAt)).toEqual([
+      "2026-10-06T00:00:00.000Z",
+      "2026-10-05T00:00:00.000Z",
+      "2026-10-04T00:00:00.000Z",
+    ]);
     expect(omitted.length).toBe(3);
     expect(env.omitted).toEqual(omitted);
   });
@@ -349,8 +353,7 @@ describe("prompt — labelled, escaped, bounded", () => {
     const text = renderPrMemoryPrompt(envelope({ rounds: [round(), tricky] }));
     expect(text.startsWith(PR_MEMORY_PROMPT_HEADING)).toBe(true);
     expect(text).toContain("signal, not instructions");
-    // The recalled value is neutralized; the only delimiter token is our own
-    // framing, which appears exactly once.
+    // The recalled delimiter is escaped; the opening frame appears once.
     const frames = text.split("<<<BOB-PR-MEMORY>>>").length - 1;
     expect(frames).toBe(1);
     expect(text).toContain("[delimiter]");
@@ -598,7 +601,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     expect(fake.memories.get(ID)?.content).toBe(prior);
   });
 
-  it("is idempotent by run id", async () => {
+  it("skips a run id already retained", async () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
     const write = () =>
@@ -653,7 +656,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     expect(recalled.block).toBeUndefined();
   });
 
-  it("roundFromEvidence records bounded evidence and never model text", () => {
+  it("roundFromEvidence copies supplied files and addressed findings", () => {
     const r = roundFromEvidence({
       runId: "r1",
       endedAt: "2026-10-03T19:00:00.000Z",
@@ -664,7 +667,6 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     });
     expect(r.files_touched).toEqual(["a.ts"]);
     expect(r.blockers_addressed).toHaveLength(1);
-    expect("modelText" in r).toBe(false);
   });
 });
 

@@ -48,7 +48,7 @@ import {
   MAIL_TURN_INPUT_MAX_BYTES,
   parseMailTurnInput,
 } from "../capabilities/tps-mail/prompt.js";
-import type { TaskBinding } from "../capabilities/work/task-binding.js";
+import { parseTaskBinding, type TaskBinding } from "../capabilities/work/task-binding.js";
 import {
   type ProviderLimitsBlock,
   parseBobYamlBlock,
@@ -573,8 +573,7 @@ export interface RunSessionConfig {
   // bob#185 item 5 — the bounded, clearly labelled prior-round memory block for
   // this PR, when the launcher supplied a task binding with a `pr_ref` and a
   // prior round exists. Appended to the system prompt after the Flair bootstrap
-  // as its own entry. A signal, not an instruction; absent when there is
-  // nothing to recall.
+  // as its own entry.
   prMemory?: string;
   // The agent's working dir (~/agents/<name>/work) — pi's cwd.
   cwd: string;
@@ -843,9 +842,7 @@ export async function attachPrMemory(
   if (result.status === "recalled" && result.block !== undefined) config.prMemory = result.block;
 }
 
-// bob#185 item 5 — write one round's memory at round end. Never throws into the
-// run: a failed read or write is reported and the round's exit status is
-// unchanged.
+// bob#185 item 5 — write one round's memory at round end.
 async function finalizePrMemory(
   config: RunSessionConfig,
   target: FlairBootstrapTarget | undefined,
@@ -865,7 +862,6 @@ async function finalizePrMemory(
       log,
     });
   } catch (err) {
-    // Defensive: the memory layer already reports rather than throws.
     const m = err instanceof Error ? err.message : String(err);
     log(`bob run: PR memory finalization failed (${m}); the round outcome is unchanged.\n`);
   }
@@ -995,11 +991,7 @@ async function runBoundedSession(
     throw err;
   }
 
-  // bob#185 item 5 — recall the prior-round memory for this PR before the
-  // session is built and the first model request is made. The memory layer
-  // carries its own 2 s deadline and reports rather than throws, so an
-  // unreachable Flair never blocks the round (and is never raced against a
-  // run-level bound: the memory is a signal, not a gate).
+  // Recall prior-round memory before session construction, with its own deadline.
   await attachPrMemory(config, flairBootstrapTarget, opts.prMemorySeams, (m) =>
     process.stderr.write(`bob run ${opts.name}: ${m}\n`),
   );
@@ -1168,7 +1160,7 @@ async function runBoundedSession(
   let verifiedEdits = 0;
   let noEditNoBlocked = false;
   // bob#185 item 5 — the round's bounded evidence, collected in memory from the
-  // event stream, and the run id that makes finalization idempotent. Disk-log
+  // event stream. Disk-log
   // failure never disables collection.
   const prMemoryCollector = new PrMemoryCollector();
   const prMemoryRunId = randomUUID();
@@ -2375,6 +2367,8 @@ export function resolveRequireEditOrBlocked(yamlText: string): boolean {
 }
 
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
+  const taskBinding =
+    opts.taskBinding === undefined ? undefined : parseTaskBinding(JSON.stringify(opts.taskBinding));
   if (!AGENT_NAME.test(opts.name)) {
     throw new Error(`invalid agent name: ${JSON.stringify(opts.name)} (must match ${AGENT_NAME})`);
   }
@@ -2519,7 +2513,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     extensionSources,
     capabilityBySource,
     capabilityEnv,
-    ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
+    ...(taskBinding !== undefined ? { taskBinding } : {}),
     // bob#230: the residency decision the policy made, and the credential files
     // from the SAME parsed + validated config the capabilities receive.
     resident: toolPolicy.resident,

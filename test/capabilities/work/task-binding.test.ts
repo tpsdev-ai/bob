@@ -88,7 +88,6 @@ describe("parseTaskBinding", () => {
   it("carries an optional canonical pr_ref", () => {
     const b = parseTaskBinding(good({ pr_ref: { repository: REPO, number: 185 } }));
     expect(b?.pr_ref).toEqual({ repository: REPO, number: 185 });
-    // Absent by default and additive: nothing else changes.
     expect(parseTaskBinding(good())?.pr_ref).toBeUndefined();
   });
 

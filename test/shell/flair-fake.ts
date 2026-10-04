@@ -50,9 +50,7 @@ export interface FakeFlairOptions {
   soulPutStatus?: number;
   // bob#185 item 5 — pre-existing Memory rows, keyed by id.
   memories?: Record<string, Record<string, unknown>>;
-  // Force every /Memory PUT to this status (for failure-path tests).
   memoryPutStatus?: number;
-  // Force every /Memory GET to this status instead of the stored row.
   memoryGetStatus?: number;
   // A server or intermediary that reflects request headers into its error
   // bodies. When set, every non-2xx reply appends the request's credential:

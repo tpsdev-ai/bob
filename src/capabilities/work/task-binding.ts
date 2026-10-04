@@ -49,10 +49,7 @@ export interface TaskBinding {
   // The optional PR destination, when the task authorizes PR creation.
   pr?: { base: string; head?: string };
   // bob#185 item 5 — the launcher-owned PR reference, when the task is one
-  // round of a PR. It is the ONLY source of a per-PR round memory's identity:
-  // the key is derived from (agent id, this canonical repository, this number),
-  // never from the brief, model output, branch name or a tool argument. The
-  // `repository` is a canonical `host/owner/repo` identity (lowercase host, no
+  // round of a PR. `repository` is a canonical `host/owner/repo` identity (lowercase host, no
   // scheme, no credentials, no trailing slash), and `number` is a positive
   // safe integer. Optional and additive: it changes no existing field.
   pr_ref?: PrRef;

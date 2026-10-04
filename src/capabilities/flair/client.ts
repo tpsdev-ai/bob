@@ -188,15 +188,8 @@ export interface FlairWriteOptions {
   visibility?: string;
   authorId?: string;
   metadata?: Record<string, unknown>;
-  // bob#185 item 5 — provenance fields Flair's Memory resource accepts but
-  // bob's writer did not expose. `tags` are organization aids (not ownership
-  // proof) and `subject` is singular. Both are additive.
   tags?: string[];
   subject?: string;
-  // Per-call request bounds (bob#185 item 5). When set, the request runs under
-  // an abort + a deadline race, and the response is read with a byte bound
-  // (past it the stream is cancelled and the call fails). Omitted → the call's
-  // prior unbounded behavior.
   timeoutMs?: number;
   maxResponseBytes?: number;
 }
@@ -402,8 +395,7 @@ export class FlairHttpClient implements FlairClient {
   }
 
   // bob#185 item 5 — a signed request under optional bounds: an abort + a
-  // deadline race (a host that accepts and never answers cannot hold the
-  // caller past `timeoutMs`), and a byte-bounded response read (past
+  // deadline race, and a byte-bounded response read (past
   // `maxResponseBytes` the stream is cancelled and the call fails). With no
   // bounds it is exactly `signedFetch`.
   private async signedFetchWithBounds(

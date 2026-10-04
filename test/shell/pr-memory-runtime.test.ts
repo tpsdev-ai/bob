@@ -88,6 +88,35 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+it.each([
+  { repository: "https://github.com/tpsdev-ai/bob", number: PR },
+  { repository: "GitHub.com/tpsdev-ai/bob", number: PR },
+  { repository: REPO, number: 0 },
+  { repository: REPO, number: 1.5 },
+  { repository: REPO, number: Number.MAX_SAFE_INTEGER + 1 },
+])("refuses programmatic pr_ref %j before fetching or constructing a session", async (pr_ref) => {
+  const requests: string[] = [];
+  let constructed = false;
+  globalThis.fetch = (async (url) => {
+    requests.push(String(url));
+    return new Response("{}");
+  }) as typeof fetch;
+  await expect(
+    runAgent({
+      name: AGENT,
+      prompt: "round",
+      agentsRoot: root,
+      taskBinding: { ...binding(PR), pr_ref },
+      sessionFactory: async () => {
+        constructed = true;
+        throw new Error("unexpected session construction");
+      },
+    }),
+  ).rejects.toThrow(/pr_ref/);
+  expect(requests).toEqual([]);
+  expect(constructed).toBe(false);
+});
+
 it.each(["bootstrap", "factory"])("records a pre-session abort during %s", async (stage) => {
   store.clear();
   const normalFetch = globalThis.fetch;

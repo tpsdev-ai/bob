@@ -1,8 +1,6 @@
 // bob#185 item 5 — the ASSEMBLED pi prompt. Builds a REAL pi session through
-// bob's ONE factory and reads the system prompt pi assembled from the loader's
-// append sources, so it fails if the prMemory append in session.ts
-// (isolatedLoaderOptions) is removed. The recalled block must sit after soul.md
-// and be its own entry.
+// bob's factory and reads the system prompt pi assembled from the loader's
+// append sources. The recalled block must sit after soul.md.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
