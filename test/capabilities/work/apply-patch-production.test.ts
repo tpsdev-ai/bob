@@ -146,7 +146,10 @@ async function runSession(
   const piAgentDir = join(s.scratch, "pi-agent");
   mkdirSync(cwd, { recursive: true });
   mkdirSync(piAgentDir, { recursive: true });
-  const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+  const modelRuntime = await ModelRuntime.create({
+    modelsPath: null,
+    authPath: join(piAgentDir, "auth.json"),
+  });
   modelRuntime.registerProvider(STUB_PROVIDER, {
     name: "Stub",
     apiKey: "stub-key",

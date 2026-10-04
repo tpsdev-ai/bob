@@ -1004,22 +1004,18 @@ path's persisted files (`(c)`).
 
 ### Keyed custody, and the writers
 
-For a keyed row the key is read ONCE from its variable, DELETED from `process.env`, held in bob's
-closures and injected only at the transport, which sends only to the row's canonical endpoint
-and refuses a redirect, a credential-bearing header, a non-canonical URL or a `Request`
-object, and refuses deferred requests before pi resolves auth (`keyed-transport-186-s3a.test.ts`
-(K1)–(K3), (K9)). Replacement sessions reuse custody without re-reading the environment (K6). The
-session factory also removes pi's credential env names from the agent environment before a
-capability, extension, tool or child process starts — except the selected row's own runtime
-credentials (a keyed row's variable is read by custody first; a keyless row's transport substitutes
-a placeholder and strips supplied credentials).
+A factory caches a keyed row's key after reading and deleting its variable. The key is held in
+bob's closures and injected at the transport, which sends only to the row's canonical endpoint
+and refuses redirects, supplied Authorization headers, non-canonical URLs, `Request` objects and
+deferred requests before pi resolves auth (`keyed-transport-186-s3a.test.ts` (K1)–(K3), (K9)).
+Replacement sessions reuse custody without re-reading the environment (K6). Before loading agent
+code, the factory deletes pi credential env names other than the selected keyed variable,
+including the selected keyless runtime's credentials, from the agent environment.
 
 **The writers check first.** `bob init` (including `--force`), `bob hire` and `bob models` run the
 reserved-name check over BOTH pi files before their first write, and refuse when a bob-owned keyed
-entry is present or absence cannot be proven; a keyed row's passing files are left byte-identical
-(K7). For a keyed row, `bob init` creates ONLY the pi files that are absent, each through an
-exclusive temp file and rename with mode 0600 set before the rename; the plain write path is
-unchanged for non-keyed rows, so atomic writes apply to keyed rows only.
+entry is present or absence cannot be proven; a keyed-row init skips files present at its existence check (K7). Keyed-row init publishes
+through an exclusive temp file and rename with mode 0600 set before the rename.
 
 ### Endpoint scaffold (`provider.base_url`)
 

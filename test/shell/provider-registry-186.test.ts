@@ -119,7 +119,6 @@ describe("provider registry — a new row reaches both resolutions (bob#186 slic
   });
 
   it("an operator keyed row that declares its own variable fails validation (bob#186 3a)", () => {
-    // On main this constructs fine: operator rows could name their own variable.
     expect(
       () =>
         new ProviderRegistry([

@@ -279,8 +279,7 @@ export function guardedKeyedFetch(
  * and options. This function is where the real key lives; it
  *   (a) refuses, by THROWING before any network call, unless
  *       `prepared.model.baseUrl === row.endpoint` AND `prepared.model.api === row.api`;
- *   (b) refuses if the model's or the caller's headers carry any credential-bearing
- *       header (case-insensitive) — bob sets the Authorization itself;
+ *   (b) refuses non-null model or caller headers whose names match CREDENTIAL_HEADER;
  *   (c) delegates to pi-ai's openai-completions `streamSimple` with `apiKey` set
  *       to the real key and `fetch` set to a wrapper that refuses any request
  *       URL not under `row.endpoint + "/"`.
@@ -516,12 +515,8 @@ export function assertNoOnDiskOpenrouter(
 }
 
 /**
- * After the session services EXIST (capabilities have loaded and may have called
- * pi's `registerProvider`), resolve the row's provider/model the way pi will use
- * it and refuse unless it is still bob's definition (round 4, item 2). bob
- * registers before `createAgentSessionServices`; a later `registerProvider` would
- * silently move the endpoint or the key, so the EFFECTIVE result is asserted, not
- * the registration intent.
+ * After services are built, check the selected model and registered endpoint/API,
+ * the registered transport function and the resolved placeholder key.
  */
 export async function assertKeyedRuntimeUnchanged(
   modelRuntime: ModelRuntime,
@@ -546,6 +541,9 @@ export async function assertKeyedRuntimeUnchanged(
   } else {
     if (reg.baseUrl !== input.expected.baseUrl) {
       problems.push("the registered baseUrl does not match");
+    }
+    if (reg.streamSimple !== input.expected.streamSimple) {
+      problems.push("the registered streamSimple does not match");
     }
     if (reg.api !== input.expected.api) {
       problems.push("the registered api does not match");
@@ -583,7 +581,9 @@ export async function assertKeyedRuntimeUnchanged(
   }
   if (problems.length > 0) {
     throw new Error(
-      `bob: refusing to start a ${providerId} session — after the session services were built, the effective ${providerId} provider is no longer bob's: ${problems.join("; ")}. Something registered ${providerId} during session creation.`,
+      input.row.id === "openrouter"
+        ? `bob: refusing to start a ${providerId} session — after the session services were built, the effective ${providerId} provider is no longer bob's: ${problems.join("; ")}. Something registered ${providerId} during session creation.`
+        : `bob: refusing provider row "${input.row.id}" (${input.row.variable}) after services: ${problems.join("; ")}.`,
     );
   }
 }
@@ -601,21 +601,21 @@ export async function assertOpenrouterRuntimeUnchanged(
 /** The env key for `variable`, or a refusal naming the row and its variable (never read from disk). */
 export function requireProviderKey(
   variable: string,
-  runtime: string,
+  rowId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const key = (env[variable] ?? "").trim();
   if (!key) {
     throw new Error(
-      runtime === "openrouter" && variable === "OPENROUTER_API_KEY"
+      rowId === "openrouter" && variable === "OPENROUTER_API_KEY"
         ? "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk."
-        : `bob: ${variable} is not set for provider row "${runtime}". Remedy: export ${variable}=<key> before running — bob never writes the key to disk.`,
+        : `bob: ${variable} is not set for provider row "${rowId}". Remedy: export ${variable}=<key> before running — bob never writes the key to disk.`,
     );
   }
   return key;
 }
 
-/** The openrouter key, or a refusal naming the row and its variable. */
+/** The openrouter key, or a missing-variable refusal. */
 export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): string {
   return requireProviderKey("OPENROUTER_API_KEY", "openrouter", env);
 }
@@ -639,8 +639,11 @@ export function openrouterKeyWasConsumed(): boolean {
 }
 
 /** The refusal when a variable is empty after an earlier take in this process. */
-export function providerKeyConsumedMessage(variable: string, runtime: string): string {
-  return `bob: ${variable} was already read and deleted from the environment earlier in this process, and is not set now. Remedy: start a new bob process to build another ${runtime} runtime.`;
+export function providerKeyConsumedMessage(variable: string, rowId: string): string {
+  if (rowId === "openrouter" && variable === "OPENROUTER_API_KEY") {
+    return "bob: OPENROUTER_API_KEY was already read and deleted from the environment earlier in this process, and is not set now. Remedy: start a new bob process to build another openrouter runtime.";
+  }
+  return `bob: ${variable} was already read and deleted from the environment earlier in this process, and is not set now for provider row "${rowId}". Remedy: start a new bob process to build another runtime.`;
 }
 
 /** The refusal when OPENROUTER_API_KEY is empty after an earlier take in this process. */
@@ -651,13 +654,13 @@ export const OPENROUTER_KEY_CONSUMED_MESSAGE = providerKeyConsumedMessage(
 
 export function takeProviderKey(
   variable: string,
-  runtime: string,
+  rowId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (consumedProviderVariables.has(variable) && !(env[variable] ?? "").trim()) {
-    throw new Error(providerKeyConsumedMessage(variable, runtime));
+    throw new Error(providerKeyConsumedMessage(variable, rowId));
   }
-  const key = requireProviderKey(variable, runtime, env);
+  const key = requireProviderKey(variable, rowId, env);
   delete env[variable];
   consumedProviderVariables.add(variable);
   return key;
@@ -687,7 +690,7 @@ export function registerKeyedProvider(
   const provider = buildKeyedProvider({
     row: input.row,
     model: input.model,
-    apiKey: input.apiKey ?? takeProviderKey(input.row.variable, input.row.runtime, input.env),
+    apiKey: input.apiKey ?? takeProviderKey(input.row.variable, input.row.id, input.env),
   });
   modelRuntime.registerProvider(input.row.runtime, provider);
   return provider;
@@ -1370,8 +1373,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // `/clone` and `/import` (agent-session-runtime.js). Custody is per VARIABLE:
   // the first invocation that reaches a keyed row reads its variable ONCE into
   // this closure, which outlives a single factory invocation; later invocations
-  // reuse it and never re-read process.env for it (the first read deleted it,
-  // and a re-read would refuse).
+  // reuse it without re-reading process.env.
   const custodyKeys = new Map<string, string>();
   return async ({ sessionManager }) => {
     // PIN the agent's own identity + directory. A resumed or imported session
@@ -1451,7 +1453,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // entry path before a capability, extension, tool or child process starts.
     delete process.env[ADMIN_PASS_ENV];
 
-    // Remove pi credential names before loading agent code; custody takes the selected key below.
+    // Remove pi credential names other than the selected keyed variable.
     const selectedKeyedVariable = row?.auth.kind === "env" ? row.auth.variable : undefined;
     for (const credentialName of piCredentialEnvNames()) {
       if (credentialName === selectedKeyedVariable) continue;
@@ -1511,7 +1513,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       const variable = row.auth.variable;
       let apiKey = custodyKeys.get(variable);
       if (apiKey === undefined) {
-        apiKey = takeProviderKey(variable, row.runtime);
+        apiKey = takeProviderKey(variable, row.id);
         custodyKeys.set(variable, apiKey);
       }
       keyedProvider = registerKeyedProvider(modelRuntime, {
@@ -1556,10 +1558,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
-    // Round 4, item 2 / round 6: assert the EFFECTIVE openrouter provider AFTER
-    // the services exist — a capability's own `registerProvider` during load would
-    // otherwise move the endpoint or the key without bob noticing. pi must hold
-    // only bob's PLACEHOLDER key.
+    // Check the keyed model, registered transport and placeholder after services.
     if (keyedProvider !== undefined && keyedRow !== undefined) {
       await assertKeyedRuntimeUnchanged(modelRuntime as ModelRuntime, {
         row: keyedRow,

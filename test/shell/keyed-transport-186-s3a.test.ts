@@ -1,6 +1,6 @@
 // bob#186 slice 3a — the generic keyed OpenAI-compatible transport, proven on
 // `openrouter` (already bob/env) plus an operator fixture loaded from nested
-// YAML. No network: every request is driven through a stub fetch.
+// YAML.
 //
 // Fixture row (neutral names): id `keyed-fixture`, alias
 // `keyed-fixture-alias`, runtime `keyed-fixture-runtime`, endpoint
@@ -58,6 +58,7 @@ import {
   keyedPlaceholder,
   providerKeyConsumedMessage,
   registerKeyedProvider,
+  requireProviderKey,
   takeProviderKey,
 } from "../../src/shell/session.js";
 
@@ -145,11 +146,11 @@ function writeRegistry(text: string): string {
 function fixtureRegistry(): ProviderRegistry {
   return loadProviderRegistry({ path: writeRegistry(FIXTURE_YAML) });
 }
-function scaffold(name: string, registry: ProviderRegistry) {
+function scaffold(name: string, registry: ProviderRegistry, provider = "keyed-fixture") {
   const r = initAgent({
     name,
     role: "coder",
-    provider: "keyed-fixture",
+    provider,
     model: MODEL,
     contextWindow: 200_000,
     agentsRoot: tmpRoot,
@@ -498,7 +499,7 @@ describe("K4 / K4b — refresh with a tampered models.json", () => {
 });
 
 describe("K5 — registration refusal under each fixture name + the post-services check", () => {
-  it("register/unregister/native under id, alias and runtime refuse; a moved endpoint is caught", async () => {
+  it("register/unregister/native under id, alias and runtime refuse", async () => {
     const registry = fixtureRegistry();
     process.env[VARIABLE] = SENTINEL;
     const stub = stubFetch();
@@ -540,6 +541,47 @@ describe("K5 — registration refusal under each fixture name + the post-service
       stub.restore();
     }
   });
+
+  for (const target of ["model", "registered provider", "registered transport"] as const) {
+    it(`the post-services assertion catches a replaced ${target}`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const { result } = await buildFixtureSession("fxk5state", registry);
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const row = fixtureRow(registry);
+        const expected = { ...rt.getRegisteredProviderConfig(RUNTIME)! } as ReturnType<
+          typeof registerKeyedProvider
+        >;
+        const input = { row, model: MODEL, expected, apiKey: PLACEHOLDER };
+        await assertKeyedRuntimeUnchanged(rt, input);
+        if (target === "model") {
+          const original = rt.getModel.bind(rt);
+          rt.getModel = ((provider: string, model: string) => {
+            const current = original(provider, model);
+            return current ? { ...current, baseUrl: "https://evil.example/v1" } : current;
+          }) as typeof rt.getModel;
+        } else if (target === "registered provider") {
+          const model = { ...rt.getModel(RUNTIME, MODEL)! };
+          rt.getModel = (() => model) as typeof rt.getModel;
+          rt.getRegisteredProviderConfig(RUNTIME)!.baseUrl = "https://evil.example/v1";
+        } else if (target === "registered transport") {
+          rt.getRegisteredProviderConfig(RUNTIME)!.streamSimple = (() => {
+            throw new Error("replaced registered transport");
+          }) as never;
+        }
+        await expect(assertKeyedRuntimeUnchanged(rt, input)).rejects.toThrow(
+          target === "registered transport"
+            ? /registered streamSimple does not match/
+            : target === "model"
+              ? /selected model's baseUrl does not match/
+              : /registered baseUrl does not match/,
+        );
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+      }
+    });
+  }
 
   it("the post-services assertion catches a replaced key", async () => {
     const registry = fixtureRegistry();
@@ -744,7 +786,7 @@ describe("K7 — the writers run the reserved-name check before the first write"
     }
   });
 
-  it("an injected write failure leaves no file and no temp file", () => {
+  it("an unwritable pi directory leaves no models file or temp file", () => {
     if (process.getuid?.() === 0) return;
     const registry = fixtureRegistry();
     const { piDir } = scaffold("fxk7e", registry);
@@ -863,17 +905,64 @@ describe("K8 — the gate refuses each case with its own reason, controls load",
 
 // ── K10: messages name the row and its variable ──────────────────────────────
 
-describe("K10 — messages name the selected row and its variable", () => {
-  it("with the variable unset, run refuses naming the variable", () => {
+describe("K10 — missing and consumed key refusals name the selected row and its variable", () => {
+  it("with the variable unset, refusals name the row and variable", () => {
     const registry = fixtureRegistry();
     scaffold("fxk10a", registry);
     delete process.env[VARIABLE];
-    expect(() => resolveRunConfig({ name: "fxk10a", agentsRoot: tmpRoot, registry })).toThrow(
-      new RegExp(VARIABLE),
+    expect(() => requireProviderKey(VARIABLE, "keyed-fixture", {})).toThrow(
+      `${VARIABLE} is not set for provider row "keyed-fixture"`,
     );
-    expect(() => assertProviderRunnable(RUNTIME, "bob hire fxk10a", registry)).toThrow(
-      new RegExp(VARIABLE),
-    );
+    for (const action of [
+      () => resolveRunConfig({ name: "fxk10a", agentsRoot: tmpRoot, registry }),
+      () => assertProviderRunnable(RUNTIME, "bob hire fxk10a", registry),
+    ]) {
+      expect(action).toThrow(VARIABLE);
+      expect(action).toThrow('provider row "keyed-fixture"');
+    }
+  });
+
+  it("the factory's missing-key refusal names the row and variable", async () => {
+    const registry = loadProviderRegistry({
+      path: writeRegistry(FIXTURE_YAML.replaceAll("keyed-fixture", "keyed-unset")),
+    });
+    const variable = deriveOperatorVariable("keyed-unset");
+    const saved = process.env[variable];
+    try {
+      scaffold("fxk10unset", registry, "keyed-unset");
+      process.env[variable] = SENTINEL;
+      const { config, policy } = resolveRunConfig({
+        name: "fxk10unset",
+        agentsRoot: tmpRoot,
+        registry,
+      });
+      delete process.env[variable];
+      await expect(
+        createBobRuntimeFactory({ config, policy, registry })({
+          sessionManager: SessionManager.inMemory(config.cwd),
+        }),
+      ).rejects.toThrow(`${variable} is not set for provider row "keyed-unset"`);
+    } finally {
+      if (saved === undefined) delete process.env[variable];
+      else process.env[variable] = saved;
+    }
+  });
+
+  it("the factory's consumed-key refusal names the row and variable", async () => {
+    const registry = fixtureRegistry();
+    scaffold("fxk10factory", registry);
+    process.env[VARIABLE] = SENTINEL;
+    const { config, policy } = resolveRunConfig({
+      name: "fxk10factory",
+      agentsRoot: tmpRoot,
+      registry,
+    });
+    takeProviderKey(VARIABLE, "keyed-fixture");
+    await expect(
+      createBobRuntimeFactory({ config, policy, registry })({
+        sessionManager: SessionManager.inMemory(config.cwd),
+      }),
+    ).rejects.toThrow(providerKeyConsumedMessage(VARIABLE, "keyed-fixture"));
   });
 
   it("the init warning names the variable", () => {
@@ -903,20 +992,14 @@ describe("K10 — messages name the selected row and its variable", () => {
 
   it("a take after consumption names the row and variable", () => {
     process.env[VARIABLE] = SENTINEL;
-    takeProviderKey(VARIABLE, RUNTIME);
-    const msg = (() => {
-      try {
-        takeProviderKey(VARIABLE, RUNTIME);
-        return "";
-      } catch (err) {
-        return (err as Error).message;
-      }
-    })();
-    expect(msg).toBe(providerKeyConsumedMessage(VARIABLE, RUNTIME));
-    expect(msg).toContain(VARIABLE);
-    expect(msg).toContain(RUNTIME);
+    takeProviderKey(VARIABLE, "keyed-fixture");
+    const message = providerKeyConsumedMessage(VARIABLE, "keyed-fixture");
+    expect(message).toContain(VARIABLE);
+    expect(message).toContain('provider row "keyed-fixture"');
+    expect(message).not.toContain(RUNTIME);
+    expect(() => takeProviderKey(VARIABLE, "keyed-fixture")).toThrow(message);
     expect(() => assertProviderRunnable(RUNTIME, "bob hire fxk10c", fixtureRegistry())).toThrow(
-      `bob hire fxk10c: ${providerKeyConsumedMessage(VARIABLE, RUNTIME)}`,
+      `bob hire fxk10c: ${message}`,
     );
   });
 });
@@ -952,17 +1035,17 @@ describe("K11 — code-owned tables stay aligned", () => {
     }
   });
 
-  it("the scanner header promises only literal prefix occurrences", () => {
+  it("the scanner header names literal prefixes in src TypeScript files", () => {
     const source = readFileSync(
       new URL("../../src/shell/provider-custody.ts", import.meta.url),
       "utf8",
     );
     expect(source.split("\n")[0]).toBe(
-      "// The source scanner rejects any literal BOB_PROVIDER_ prefix occurrence outside this file.",
+      "// The scanner rejects literal BOB_PROVIDER_ prefixes in other src TypeScript files.",
     );
   });
 
-  it("every launcher export and environment-name constant is in the owned set", () => {
+  it("launcher assignment exports and the declared constants are in the owned set", () => {
     const initSrc = readFileSync(new URL("../../src/shell/init.ts", import.meta.url), "utf8");
     const launcher = initSrc.split("function renderLauncher")[1] ?? "";
     const exports = [...launcher.matchAll(/export ([A-Z][A-Z0-9_]*)=/g)].map((m) => m[1]);
@@ -972,7 +1055,7 @@ describe("K11 — code-owned tables stay aligned", () => {
     for (const name of BOB_ENV_NAME_CONSTANTS) expect(isBobOwnedEnvironmentName(name)).toBe(true);
   });
 
-  it("the factory's removals read the pi credential table", () => {
+  it("the credential-name union contains the table's names", () => {
     expect(piCredentialEnvNames()).toEqual([
       ...new Set(PI_CREDENTIAL_TABLE.flatMap((entry) => entry.variables)),
     ]);
@@ -989,7 +1072,7 @@ describe("K11 — code-owned tables stay aligned", () => {
     expect(deriveOperatorVariable("keyed-fixture")).toBe(VARIABLE);
   });
 
-  it("AMENDMENT 3 — the namespace is referenced only in the derivation/custody module", () => {
+  it("AMENDMENT 3 — literal namespace prefixes occur only in the derivation/custody module", () => {
     const found: string[] = [];
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {

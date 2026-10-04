@@ -467,9 +467,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
   const piProvider = resolveRuntimeProviderName(opts.provider, registry);
   const isGateway = providerUsesGatewayIdentity(opts.provider, registry);
-  // A keyed row's key is read from its variable at run time and is NEVER written
-  // here (bob#183, generalized in bob#186 3a) — so its auth.json carries no key
-  // entry.
+  // A keyed row's key is never written here.
   const isEnvKeyProvider = providerReadsKeyFromEnv(opts.provider, registry);
   const isKeyless = providerRecord(opts.provider, registry)?.auth.kind === "none";
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
@@ -512,10 +510,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const authContent = `${JSON.stringify(isEnvKeyProvider || isKeyless ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`;
 
   if (isEnvKeyProvider) {
-    // A keyed row: init creates only ABSENT files, atomically (exclusive temp
-    // file + rename, mode 0600 set before the rename). Existing passing files
-    // stay byte-identical — the reserved-name check above proved them free of an
-    // entry, so there is nothing bob may rewrite in them.
+    // Skip files present at the existence check; publish with mode 0600.
     const created: string[] = [];
     for (const [path, content] of [
       [modelsPath, modelsContent],
@@ -544,7 +539,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   return [modelsPath, authPath];
 }
 
-/** Create `path` atomically: an exclusive temp file, mode 0600 before the rename. */
+/** Publish via an exclusive temp file with mode 0600 before the rename. */
 function writeFileExclusive(path: string, content: string): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(

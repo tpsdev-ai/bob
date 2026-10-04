@@ -616,7 +616,7 @@ describe("provider controls", () => {
     );
   });
 
-  it("a keyless row named openrouter never enters the keyed branch (bob#298)", async () => {
+  it("a keyless row named openrouter deletes its runtime credential from the agent environment", async () => {
     // A programmatic registry may hold a keyless row whose runtime is
     // `openrouter`. The factory branch keys on the SELECTED ROW's auth mode, so
     // it must not read (and delete) OPENROUTER_API_KEY, which only the keyed

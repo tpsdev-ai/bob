@@ -1,6 +1,6 @@
-// The source scanner rejects any literal BOB_PROVIDER_ prefix occurrence outside this file.
+// The scanner rejects literal BOB_PROVIDER_ prefixes in other src TypeScript files.
 //
-// Three code-owned tables live here:
+// Code-owned credential and environment names:
 //
 //   * the operator variable namespace (`BOB_PROVIDER_<ID>_KEY`), DERIVED from a
 //     row id — an operator keyed row never declares its own variable;
@@ -149,7 +149,7 @@ export function isBobOwnedEnvironmentName(name: string): boolean {
   );
 }
 
-/** Every code-owned bob environment name, for the disjointness drift test. */
+/** Launcher exports and named constants for the disjointness drift test. */
 export function bobOwnedEnvironmentNames(): readonly string[] {
   return [...BOB_LAUNCHER_EXPORTS, ...BOB_ENV_NAME_CONSTANTS];
 }

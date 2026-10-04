@@ -440,7 +440,7 @@ defaults:
     );
   });
 
-  it("an operator row cannot claim bob/env for a runtime whose custody is unimplemented", () => {
+  it("an operator keyed row without an implemented API refuses", () => {
     const path = writeRegistry(
       "version: 1\nproviders:\n  - id: acme-local\n    aliases: [acme]\n    runtime: acme\n    auth: bob/env\n    endpoint: https://acme.example/v1\n",
     );

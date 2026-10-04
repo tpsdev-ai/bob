@@ -2551,7 +2551,7 @@ export function assertProviderRunnable(
   const variable = row.auth.variable;
   if ((process.env[variable] ?? "").trim()) return;
   if (providerKeyWasConsumed(variable)) {
-    throw new Error(`${label}: ${providerKeyConsumedMessage(variable, row.runtime)}`);
+    throw new Error(`${label}: ${providerKeyConsumedMessage(variable, row.id)}`);
   }
   throw new Error(
     row.id === "openrouter"
