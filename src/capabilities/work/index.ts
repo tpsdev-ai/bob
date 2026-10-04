@@ -67,6 +67,7 @@ export {
   type PublishInput,
   type PublishParams,
   type PublishPhase,
+  type PublishPrRequest,
   type PublishRefusalReason,
   type PublishResult,
   type PublishStatus,
@@ -74,6 +75,15 @@ export {
   publish,
   publishJournalPath,
 } from "./publish.js";
+export {
+  bodyWithMarker,
+  type CreatePullRequestInput,
+  ghPullRequestService,
+  githubRepositorySlug,
+  type PullRequestRecord,
+  type PullRequestService,
+  publicationMarker,
+} from "./pull-request.js";
 export {
   type BootReap,
   CAPTURE_MAX_BYTES,

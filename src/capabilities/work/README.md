@@ -128,8 +128,19 @@ agent drops it unless its role permits resident writers.
 
 ## publish and publication recovery (bob#275, S2b)
 
-`publish` takes `candidate_id` and `commit_message`; `pr` refuses with
-`pr_unsupported` because PR creation is a later slice.
+`publish` takes `candidate_id`, `commit_message` and an optional `pr { title,
+body }`. `pr` is accepted only when the task binding authorizes PR creation (a
+`pr` block naming the base, and optionally the head); otherwise it refuses with
+`pr_unsupported`.
+
+When authorized, the pull request is created in the authorized repository with
+the authorized head/base pair and a publication marker in the body, through the
+same credential the push uses (the GitHub CLI, which git's push credential
+helper already goes through). The intent is journaled before the request. A
+retry or recovery reconciles by repository, head/base and marker — open, closed
+or merged — and reuses a URL only on a verified match; an uncertain create is
+`indeterminate` and is never reissued. `pr_url` is reported only once the PR is
+confirmed.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.
 The record must match its content-derived ID and the task binding.
@@ -154,7 +165,8 @@ confirming the publisher has stopped.
 A concurrent same-user writer can still race pathname operations (bob#189).
 
 The result includes `status` (`published`, `refused` or `indeterminate`),
-`commit_oid`, `phase`, `push_state` and a refusal `reason` when applicable.
+`commit_oid`, `phase`, `push_state`, `pr_url` when a requested PR is confirmed,
+and a refusal `reason` when applicable.
 
 ## Enabling it
 

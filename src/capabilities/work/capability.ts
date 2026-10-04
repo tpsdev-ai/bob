@@ -33,6 +33,7 @@ import {
   type PublishResult,
   publish,
 } from "./publish.js";
+import { ghPullRequestService } from "./pull-request.js";
 import {
   type BootReap,
   CAPTURE_MAX_BYTES,
@@ -121,8 +122,10 @@ const APPLY_PATCH_DESCRIPTION =
   `Returns { candidate_id, base_oid, patch_sha256, tree_oid, changed_paths }. A candidate id is not permission to publish it.`;
 
 const PUBLISH_DESCRIPTION =
-  "Publish a candidate using the launcher's task binding. Takes candidate_id and commit_message. " +
-  "Required checks run on a materialized candidate through the run executor. PR creation is a later slice.";
+  "Publish a candidate using the launcher's task binding. Takes candidate_id, commit_message, and an optional pr { title, body }. " +
+  "Required checks run on a materialized candidate through the run executor. " +
+  "When the task binding authorizes PR creation, publish creates one pull request in the authorized repository with the authorized head/base and a publication marker, persisting the intent before the request and reusing an existing PR only on a verified repository, head/base and marker match; pr_url is reported only once the PR is confirmed. " +
+  "A pr request on a binding that does not authorize it is refused as pr_unsupported.";
 
 function publishResultText(r: PublishResult): string {
   const head =
@@ -139,6 +142,7 @@ function publishResultText(r: PublishResult): string {
     `status: ${r.status} · phase: ${r.phase} · push_state: ${r.push_state}`,
   ];
   if (r.status !== "published") lines.push(`reason: ${r.reason ?? "(none)"}`);
+  if (r.pr_url !== undefined) lines.push(`pr_url: ${r.pr_url}`);
   return lines.join("\n");
 }
 
@@ -286,7 +290,11 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         output_excerpt: r.output_excerpt,
       };
     });
-  const publishDeps: PublishDeps = { ...opts.publishDeps, runCheck };
+  const publishDeps: PublishDeps = {
+    pr: ghPullRequestService(),
+    ...opts.publishDeps,
+    runCheck: opts.publishDeps?.runCheck ?? runCheck,
+  };
 
   // Every result goes through here: a RunRefusal becomes a thrown Error, which
   // pi reports to the model as a tool error carrying the message.
@@ -469,6 +477,23 @@ export function wireWork(opts: WireWorkOptions): WorkSession {
         minLength: 1,
         description: "The commit message for the published change.",
       }),
+      pr: Type.Optional(
+        Type.Object(
+          {
+            title: Type.String({ minLength: 1, description: "The pull request title." }),
+            body: Type.Optional(
+              Type.String({
+                description:
+                  "The pull request body; the publication marker is appended. Omit for a marker-only body.",
+              }),
+            ),
+          },
+          {
+            description:
+              "Create a pull request after the push. Allowed only when the task binding authorizes PR creation.",
+          },
+        ),
+      ),
     }),
     async execute(_id, params, signal) {
       const outcome = await publish({
