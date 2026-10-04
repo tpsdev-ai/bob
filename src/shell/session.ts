@@ -702,7 +702,7 @@ export function sessionModelLimits(
  */
 export function installSessionBudget(
   session: unknown,
-  deps?: { log?: (message: string) => void },
+  deps?: { log?: (message: string) => void; outputBudget?: number },
 ): void {
   const s = session as Partial<MidRunCompactionSession> & {
     agent?: { streamFunction?: StreamFunction };
@@ -1332,8 +1332,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     }
     // bob#214: the configured pair resolves with the configured window (and
     // output cap) wherever pi looks it up — here, on a restored session, and when
-    // pi refreshes the session's model. bob#306: a keyless row's budget folds
-    // into that output cap, so every reader of the model's maxTokens uses it.
+    // pi refreshes the session's model. bob#306: a keyless row's budget bounds
+    // that output cap.
     applyModelLimits(
       modelRuntime,
       limits,
@@ -1492,9 +1492,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
 
     // bob#214: the output-cap backstop and the between-calls compaction check. A session
     // that cannot carry them is disposed and refused, like a failed audit.
+    // bob#306: for a keyless row with a budget, the backstop counts against the
+    // cap the keyless transport sends.
     try {
       installSessionBudget(result.session, {
         log: deps?.log ?? ((m: string) => console.error(m)),
+        ...(row?.auth.kind === "none" && row.budget !== undefined
+          ? { outputBudget: row.budget.maxOutputTokens }
+          : {}),
       });
     } catch (err) {
       try {

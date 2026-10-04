@@ -14,9 +14,9 @@
 //     own request shape (for the OpenAI-compatible adapter, `reasoning_effort`).
 //
 // A budget is only valid on a `bob/none` row: bob applies it to that row's
-// session only. The session factory folds the cap into the model's output cap
-// (bob#306); the keyless transport (base-url-transport.ts) sets the cap's wire
-// field and the level. The row owns the values;
+// session only. The session factory keeps the model's output cap at or below it,
+// the keyless transport (base-url-transport.ts) does the same for each request's
+// cap (bob#306), and the transport sends the level. The row owns the values;
 // this module owns the bounds and the mode set (validated at load by
 // provider-registry.ts).
 
@@ -49,4 +49,22 @@ export const TURN_BUDGET_BOUNDS = Object.freeze({
 /** True when `value` is one of the declared reasoning modes. */
 export function isTurnReasoningMode(value: unknown): value is TurnReasoningMode {
   return typeof value === "string" && (TURN_REASONING_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * bob#306: the output cap a request on a row with a budget carries. The ceiling
+ * is the smaller of the budget and the model's `maxTokens`; a lower cap the
+ * caller asks for is kept, and a higher one, or none, becomes the ceiling.
+ */
+export function boundedOutputCap(
+  budget: number,
+  modelMaxTokens: unknown,
+  requested: unknown,
+): number {
+  const ceiling = Math.min(budget, positiveCap(modelMaxTokens) ?? budget);
+  return Math.min(positiveCap(requested) ?? ceiling, ceiling);
+}
+
+function positiveCap(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }

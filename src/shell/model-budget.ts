@@ -44,6 +44,7 @@ import {
 import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { calculateContextTokens, shouldCompact } from "@earendil-works/pi-coding-agent";
+import { boundedOutputCap } from "./provider-turn-budget.js";
 import { ModelBudgetError, type ModelLimits, PI_KEEP_RECENT_TOKENS } from "./session-budget.js";
 
 export {
@@ -440,13 +441,20 @@ function isOutputDelta(
  * pi-ai's own `clampMaxTokensToContext`, applied to the same inputs its
  * providers use. Undefined when no positive cap applies (then pi sends none and
  * bob's backstop does nothing).
+ *
+ * bob#306: with `budget` (a keyless row's), the requested cap is the one the
+ * keyless transport sends, `boundedOutputCap`.
  */
 export function effectiveOutputCap(
   model: Parameters<StreamFunction>[0],
   context: Parameters<StreamFunction>[1],
   options: Parameters<StreamFunction>[2],
+  budget?: number,
 ): number | undefined {
-  const requested = options?.maxTokens ?? model.maxTokens;
+  const requested =
+    budget === undefined
+      ? (options?.maxTokens ?? model.maxTokens)
+      : boundedOutputCap(budget, model.maxTokens, options?.maxTokens);
   if (typeof requested !== "number" || !Number.isFinite(requested) || requested <= 0) {
     return undefined;
   }
@@ -491,7 +499,7 @@ export function effectiveOutputCap(
  */
 export function capOutputStream(
   inner: StreamFunction,
-  deps: { log?: (message: string) => void } = {},
+  deps: { log?: (message: string) => void; outputBudget?: number } = {},
 ): StreamFunction {
   const log = deps.log ?? (() => {});
   const wrapped = async (
@@ -499,7 +507,7 @@ export function capOutputStream(
     context: Parameters<StreamFunction>[1],
     options?: Parameters<StreamFunction>[2],
   ): Promise<AssistantMessageEventStream> => {
-    const cap = effectiveOutputCap(model, context, options);
+    const cap = effectiveOutputCap(model, context, options, deps.outputBudget);
     if (cap === undefined) return await inner(model, context, options);
 
     // bob's own abort, linked to the caller's: the caller aborting still aborts

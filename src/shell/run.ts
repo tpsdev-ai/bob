@@ -1261,7 +1261,7 @@ async function runBoundedSession(
   // never drops it.
   // bob#185 item 2: when the selected row declares a budget, a request whose
   // stopReason is "length" carries the output cap in the record. bob#306: that
-  // is the session model's maxTokens, into which the factory folded the budget.
+  // is the session model's maxTokens, read once here when the run starts.
   const sessionOutputCap = (session as { model?: { maxTokens?: unknown } }).model?.maxTokens;
   const usageTracker = createRequestUsageTracker(() => now().getTime(), {
     ...(config.providerRecord?.budget !== undefined && typeof sessionOutputCap === "number"

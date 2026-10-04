@@ -1,7 +1,6 @@
-// bob#306 — one effective output cap for a keyless row. The session factory
-// folds the row's per-turn budget into the model's maxTokens, so the request's
-// max_tokens, pi's length-stop handling, bob's output backstop and the run
-// log's outputCap read one number.
+// bob#306 — a keyless row's budget bounds every output cap in its session. The
+// session factory keeps the model's maxTokens at or below it, and no request or
+// backstop cap exceeds it; pi may request less.
 //
 // Each case runs a real factory session against a fake OpenAI-compatible server
 // on loopback (no network leaves the host).
@@ -32,11 +31,12 @@ interface CapServer {
 }
 
 /** A fake OpenAI-compatible SSE server on loopback. Each request streams up to
- *  `total` one-token content pieces. "ignore" streams all of them whatever the
- *  request's cap; "obey" stops at the request's cap with finish_reason "length"
- *  and reports that many completion tokens. With `longFirst`, the first request
- *  instead gets 200 long pieces ending "stop", so the session has context that
- *  pi could compact. */
+ *  `total` content pieces. "ignore" streams them whatever the request's cap,
+ *  until the client closes the connection. "obey" streams at most the request's
+ *  cap and reports that many completion tokens, ending with finish_reason
+ *  "length" when the cap stopped it before `total`. With `longFirst`, the first
+ *  request instead gets 200 long pieces ending "stop", so the session has
+ *  context that pi could compact. */
 async function capServer(
   mode: "ignore" | "obey",
   total: number,
@@ -115,7 +115,7 @@ interface AssistantLike {
 const text = (message: AssistantLike | undefined) =>
   (message?.content ?? []).map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
 
-describe("bob#306 — one effective output cap for a keyless row", () => {
+describe("bob#306 — a keyless row's budget bounds every output cap in its session", () => {
   let root: string;
   let servers: CapServer[];
   beforeEach(() => {
@@ -282,4 +282,43 @@ describe("bob#306 — one effective output cap for a keyless row", () => {
     },
     20_000,
   );
+
+  it("a branch summary's explicit cap is bounded by the budget, and the backstop stops at it", async () => {
+    const server = await serve("ignore", 1_000);
+    const { session } = await sessionFor(server.url, budget);
+    try {
+      await session.prompt("first");
+      await session.prompt("second");
+      const firstReply = session.sessionManager
+        .getBranch()
+        .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+      if (firstReply === undefined) throw new Error("no assistant entry");
+      // pi's branch summarizer asks for 2048 output tokens.
+      const result = await session.navigateTree(firstReply.id, { summarize: true });
+      expect(server.bodies.length).toBe(3);
+      expect(server.bodies.at(-1)?.max_tokens).toBe(256);
+      const summary =
+        result.summaryEntry?.type === "branch_summary" ? result.summaryEntry.summary : "";
+      expect(summary).toContain(pieces(256));
+      expect(summary).not.toContain(piece(256));
+    } finally {
+      session.dispose();
+    }
+  }, 30_000);
+
+  it("a raw request carries the budget when it names no cap or a higher one, and keeps a lower one", async () => {
+    const server = await serve("obey", 3);
+    const { session } = await sessionFor(server.url, budget);
+    try {
+      const model = session.model;
+      if (model === undefined) throw new Error("no session model");
+      const context = { messages: [{ role: "user" as const, content: "hi", timestamp: 0 }] };
+      await session.modelRuntime.stream(model, context, {}).result();
+      await session.modelRuntime.stream(model, context, { maxTokens: 2_048 }).result();
+      await session.modelRuntime.streamSimple(model, context, { maxTokens: 200 }).result();
+      expect(server.bodies.map((body) => body.max_tokens)).toEqual([256, 256, 200]);
+    } finally {
+      session.dispose();
+    }
+  }, 20_000);
 });

@@ -10,7 +10,7 @@ import {
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
-import type { ProviderTurnBudget } from "./provider-turn-budget.js";
+import { boundedOutputCap, type ProviderTurnBudget } from "./provider-turn-budget.js";
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -77,11 +77,15 @@ export function installBaseUrlTransport(
             controller.abort(error);
           });
     // bob#185 item 2: the row's per-turn budget sets the request's thinking
-    // level and names `max_tokens` as its output-cap field. This transport
-    // leaves the cap to pi; the session factory folds the budget into the
-    // model's maxTokens (bob#306). The row's keyless model is scaffolded
-    // non-reasoning, so a budget marks it reasoning-capable for pi to send the
-    // level.
+    // level and names `max_tokens` as its output-cap field. The row's keyless
+    // model is scaffolded non-reasoning, so a budget marks it reasoning-capable
+    // for pi to send the level.
+    // bob#306: the request's output cap stays at or below the smaller of the
+    // budget and the model's maxTokens (boundedOutputCap).
+    const maxTokens =
+      budget === undefined
+        ? undefined
+        : boundedOutputCap(budget.maxOutputTokens, model.maxTokens, supplied.maxTokens);
     const delegateModel =
       budget === undefined
         ? { ...model, headers: undefined }
@@ -103,6 +107,7 @@ export function installBaseUrlTransport(
         : {}),
       ...(budget !== undefined
         ? {
+            maxTokens,
             reasoning: budget.reasoning,
             reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
           }
