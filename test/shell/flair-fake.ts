@@ -48,6 +48,10 @@ export interface FakeFlairOptions {
   adminUser?: string;
   // Force every Soul PUT to this status (for failure-path tests).
   soulPutStatus?: number;
+  // bob#185 item 5 — pre-existing Memory rows, keyed by id.
+  memories?: Record<string, Record<string, unknown>>;
+  memoryPutStatus?: number;
+  memoryGetStatus?: number;
   // A server or intermediary that reflects request headers into its error
   // bodies. When set, every non-2xx reply appends the request's credential:
   // "authorization" echoes the Authorization header verbatim; "decoded-basic"
@@ -77,6 +81,9 @@ export interface FakeFlair {
   errorBodies: string[];
   agents: Record<string, FakeAgentRow>;
   souls: Record<string, string>;
+  // bob#185 item 5 — stored Memory records, keyed by id, as PUT. Exposed so a
+  // test can read the exact body a write landed.
+  memories: Map<string, Record<string, unknown>>;
   fetchImpl: (
     url: string,
     init: { method: string; headers: Record<string, string>; body?: string; redirect?: "error" },
@@ -97,6 +104,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const calls: RecordedCall[] = [];
   const agents: Record<string, FakeAgentRow> = { ...(opts.agents ?? {}) };
   const souls: Record<string, string> = { ...(opts.souls ?? {}) };
+  const memories = new Map<string, Record<string, unknown>>(Object.entries(opts.memories ?? {}));
 
   const errorBodies: string[] = [];
 
@@ -233,6 +241,33 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       }
     }
 
+    const memoryMatch = /^\/Memory\/(.+)$/.exec(path);
+    if (memoryMatch) {
+      const id = decodeURIComponent(memoryMatch[1]);
+      const signerId = signingAgentId(init.headers);
+      if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
+      if (init.method === "PUT") {
+        if (opts.memoryPutStatus && opts.memoryPutStatus >= 400)
+          return reply(opts.memoryPutStatus, { error: "memory write refused" });
+        if (body?.agentId && body.agentId !== signerId)
+          return reply(403, { error: "forbidden: cannot write memory owned by another agent" });
+        const stored = memories.get(id);
+        if (stored !== undefined && stored.agentId !== signerId)
+          return reply(403, { error: "forbidden: cannot write memory owned by another agent" });
+        memories.set(id, { ...(body ?? {}) });
+        return reply(200, { id });
+      }
+      if (init.method === "GET") {
+        if (opts.memoryGetStatus && opts.memoryGetStatus >= 400)
+          return reply(opts.memoryGetStatus, { error: "memory read refused" });
+        const stored = memories.get(id);
+        if (stored === undefined) return reply(404, { error: "not found" });
+        if (stored.visibility === "private" && stored.agentId !== signerId)
+          return reply(404, { error: "not found" });
+        return reply(200, stored);
+      }
+    }
+
     return reply(404, { error: `fake flair: no route for ${init.method} ${path}` });
   };
 
@@ -241,6 +276,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     errorBodies,
     agents,
     souls,
+    memories,
     fetchImpl,
     sequence: () =>
       calls.map((c) => (c.op ? `ops:${c.op}:${c.table}` : `rest:${c.method}:${c.path}`)),
