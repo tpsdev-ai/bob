@@ -132,8 +132,7 @@ agent drops it unless its role permits resident writers.
 body }`.
 
 When `pr` is requested, `publish` may create the authorized PR after a successful
-push; it reports `pr_url` only after confirmation, otherwise a refusal or
-indeterminate result names the reason.
+push.
 
 Candidates are read from `<state dir>/candidates/` after ID and directory checks.
 The record must match its content-derived ID and the task binding.
@@ -156,10 +155,6 @@ In-process retries queue; another process holding the publication lock causes
 `publication_locked`. A crash can leave a lock requiring operator removal after
 confirming the publisher has stopped.
 A concurrent same-user writer can still race pathname operations (bob#189).
-
-The result includes `status` (`published`, `refused` or `indeterminate`),
-`commit_oid`, `phase`, `push_state`, `pr_url` when a requested PR is confirmed,
-and a refusal `reason` when applicable.
 
 ## Enabling it
 

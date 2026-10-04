@@ -126,7 +126,7 @@ const APPLY_PATCH_DESCRIPTION =
 const PUBLISH_DESCRIPTION =
   "Publish a candidate using the launcher's task binding. Takes candidate_id, commit_message, and an optional pr { title, body }. " +
   "Required checks run on a materialized candidate through the run executor. " +
-  "When pr is requested, publish may create the authorized PR after a successful push; it reports pr_url only after confirmation, otherwise a refusal or indeterminate result names the reason.";
+  "When pr is requested, publish may create the authorized PR after a successful push.";
 
 function publishResultText(r: PublishResult): string {
   const head =

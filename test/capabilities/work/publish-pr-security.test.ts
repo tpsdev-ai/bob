@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import {
   candidateRecordPath,
   type GitRunner,
 } from "../../../src/capabilities/work/apply-patch.js";
+import { publicationEnvironment } from "../../../src/capabilities/work/publication-environment.js";
 import * as publisher from "../../../src/capabilities/work/publish.js";
 import {
   bodyWithMarker,
@@ -383,6 +385,74 @@ else {
 }
 
 describe("production PR transport", () => {
+  it("real Git loads only the injected GitHub helper and reset, ignoring a global helper", () => {
+    const home = join(scratch, "home");
+    const xdg = join(scratch, "xdg");
+    mkdirSync(home);
+    mkdirSync(xdg);
+    const globalConfig = join(scratch, "global.gitconfig");
+    writeFileSync(
+      globalConfig,
+      '[credential]\n\thelper = ambient-helper\n[credential "https://github.com"]\n\thelper = ambient-github-helper\n',
+    );
+    const gh = join(scratch, "gh");
+    const ghLog = join(scratch, "credential-args.json");
+    writeFileSync(
+      gh,
+      `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(ghLog)}, JSON.stringify(process.argv.slice(2)));\nconsole.log("username=publisher\\npassword=test-credential");\n`,
+    );
+    chmodSync(gh, 0o755);
+    const poison = {
+      PATH: `${scratch}:${process.env.PATH}`,
+      HOME: home,
+      XDG_CONFIG_HOME: xdg,
+      GIT_CONFIG_GLOBAL: globalConfig,
+    };
+    const saved = Object.fromEntries(Object.keys(poison).map((key) => [key, process.env[key]]));
+    try {
+      Object.assign(process.env, poison);
+      const ambientEnv = {
+        ...poison,
+        GIT_CONFIG_NOSYSTEM: "1",
+      };
+      expect(
+        execFileSync("git", ["config", "--get-all", "credential.helper"], {
+          cwd: scratch,
+          env: ambientEnv,
+          encoding: "utf8",
+        }),
+      ).toBe("ambient-helper\n");
+      const git = publisher.publicationGit(publicationEnvironment());
+      for (const origin of [false, true]) {
+        const args = ["config", ...(origin ? ["--show-origin"] : []), "--get-all"];
+        const generic = git([...args, "credential.helper"], { cwd: scratch });
+        expect(generic.status, generic.stderr).toBe(1);
+        expect(generic.stdout).toBe("");
+        const github = git([...args, "credential.https://github.com.helper"], { cwd: scratch });
+        expect(github.status, github.stderr).toBe(0);
+        expect(github.stdout).toBe(
+          origin
+            ? "command line:\t\ncommand line:\t!gh auth git-credential\n"
+            : "\n!gh auth git-credential\n",
+        );
+      }
+      const credential = git(["credential", "fill"], {
+        cwd: scratch,
+        input: Buffer.from("protocol=https\nhost=github.com\n\n"),
+      });
+      expect(credential.status, credential.stderr).toBe(0);
+      expect(credential.stdout).toBe(
+        "protocol=https\nhost=github.com\nusername=publisher\npassword=test-credential\n",
+      );
+      expect(JSON.parse(readFileSync(ghLog, "utf8"))).toEqual(["auth", "git-credential", "get"]);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("parses every slurped page, including closed and merged PRs", async () => {
     const fake = fakeGh();
     const service = ghPullRequestService(fake.path);
