@@ -181,7 +181,6 @@ export const OPENROUTER_API_KEY_PLACEHOLDER = "bob-openrouter-placeholder-not-a-
 /** pi's extension provider-definition shape (not exported by pi at the root). */
 export type OpenrouterProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
 
-/** Header names bob refuses to let a caller supply on a keyed request. */
 const CREDENTIAL_HEADER =
   /^(authorization|proxy-authorization|cf-aig-authorization|x-api-key|api-key|x-auth-token|cookie)$/i;
 
@@ -207,7 +206,7 @@ export function keyedPlaceholder(id: string): string {
  * The fetch wrapper the generic keyed transport delegates through: it refuses,
  * BEFORE calling `baseFetch`, any request URL that does not start with
  * `endpoint + "/"`, or that is not a canonical HTTPS URL on the row's host with
- * no userinfo or port. Errors name the row id, never supplied URLs or keys.
+ * no userinfo or port.
  */
 export function guardedKeyedFetch(
   row: Pick<KeyedRow, "id" | "endpoint">,
@@ -215,7 +214,7 @@ export function guardedKeyedFetch(
 ): typeof globalThis.fetch {
   const endpointUrl = new URL(row.endpoint);
   const prefix = `${endpointUrl.pathname}/`;
-  return ((url: unknown, init?: unknown) => {
+  return (async (url: unknown, init?: unknown) => {
     // Canonical URL check: accept ONLY a string or a URL — never a Request.
     if (typeof url !== "string" && !(url instanceof URL)) {
       return Promise.reject(
@@ -247,20 +246,21 @@ export function guardedKeyedFetch(
         ),
       );
     }
-    // Non-canonical inputs (e.g. a `%2e%2e` path or a missing trailing slash)
-    // parse to a href that differs from the input: refuse.
     if (asString !== parsed.href) {
       return Promise.reject(new Error(`bob: refusing a non-canonical ${row.id} request URL`));
     }
-    return baseFetch(parsed.href, {
-      ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
-      redirect: "error",
-    } as never).catch((err: unknown) => {
-      // Refuse to FOLLOW a redirect with the key. `redirect: "error"` (set
-      // above, overriding any caller value) makes the runtime reject a 3xx
-      // instead of following it. Re-throw that as a bob error that NAMES the
-      // refused redirect and never the credentials.
-      const text = `${(err as { message?: unknown })?.message ?? ""} ${(err as { cause?: { message?: unknown } })?.cause?.message ?? ""}`;
+    try {
+      return await baseFetch(parsed.href, {
+        ...(init && typeof init === "object" ? (init as Record<string, unknown>) : {}),
+        redirect: "error",
+      } as never);
+    } catch (err: unknown) {
+      let text = "";
+      try {
+        text = `${(err as { message?: unknown })?.message ?? ""} ${(err as { cause?: { message?: unknown } })?.cause?.message ?? ""}`;
+      } catch {
+        text = "";
+      }
       if (/redirect/i.test(text)) {
         return Promise.reject(
           new Error(
@@ -269,21 +269,10 @@ export function guardedKeyedFetch(
         );
       }
       return Promise.reject(new Error(`bob: ${row.id} request failed`));
-    });
+    }
   }) as typeof globalThis.fetch;
 }
 
-/**
- * bob's generic keyed TRANSPORT. pi calls the registered `streamSimple` as
- * `streamSimple(prepared.model, context, prepared.options)` with the FINAL model
- * and options. This function is where the real key lives; it
- *   (a) refuses, by THROWING before any network call, unless
- *       `prepared.model.baseUrl === row.endpoint` AND `prepared.model.api === row.api`;
- *   (b) refuses non-null model or caller headers whose names match CREDENTIAL_HEADER;
- *   (c) delegates to pi-ai's openai-completions `streamSimple` with `apiKey` set
- *       to the real key and `fetch` set to a wrapper that refuses any request
- *       URL not under `row.endpoint + "/"`.
- */
 export function keyedTransport(input: {
   row: KeyedRow;
   apiKey: string;
@@ -550,7 +539,6 @@ function captureKeyedRuntimeTransport(
   });
 }
 
-/** Check the keyed model, registration, effective transport and placeholder after services. */
 export async function assertKeyedRuntimeUnchanged(
   modelRuntime: ModelRuntime,
   input: { row: KeyedRow; model: string; expected: OpenrouterProviderConfig; apiKey: string },
@@ -741,11 +729,6 @@ export function registerKeyedProvider(
   return provider;
 }
 
-/**
- * The openrouter step, pinned to the openrouter row. Refuses an on-disk
- * openrouter entry, requires the env key, then registers bob's in-memory
- * provider so pi resolves openrouter from bob, not the file.
- */
 export function registerOpenrouterProvider(
   modelRuntime: ModelRuntime,
   input: { model: string; piAgentDir: string; env?: NodeJS.ProcessEnv; apiKey?: string },
@@ -812,17 +795,6 @@ export function guardProviderRegistration(
       return originalNative(provider);
     };
   }
-  // REFRESH IS NOT WRAPPED (round 8). `ModelRuntime.refresh()` re-reads models.json
-  // and CAN replace the effective openrouter provider: on a composition failure pi
-  // falls back to its BUILT-IN openrouter provider (`model-runtime.js`
-  // recomposeProvider installs the `base` provider on the catch path). bob's
-  // transport is then NOT on the request path, and NO wrapper around `refresh()`
-  // can intercept the request that follows. The guarantee bob holds is KEY
-  // CONTAINMENT: the key is not in process.env (round 7 deletes it) and not in
-  // pi's auth, provider config or model data (pi holds only the NON-SECRET
-  // placeholder); bob keeps it in its factory and transport closures, so a
-  // provider pi installs in its place has no key to send. The registration seam above
-  // (register / unregister / native) is still a real layer and stays.
 }
 
 /** The openrouter-specific registration guard, pinned to the openrouter runtime. */
@@ -830,12 +802,6 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   guardProviderRegistration(modelRuntime, ["openrouter"]);
 }
 
-/**
- * A keyed row refuses deferred requests: in pi 0.84.3 deferred support comes
- * only from a base provider, and bob's transport has none for a keyed row.
- * Refuse explicitly, before pi resolves auth, so a pi upgrade cannot open the
- * path.
- */
 export function installKeyedDeferredRefusal(modelRuntime: ModelRuntime, row: KeyedRow): void {
   const runtime = modelRuntime as unknown as {
     fetchDeferred?: (...args: unknown[]) => Promise<unknown>;
@@ -1616,7 +1582,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
-    // Check the keyed model, effective transport and placeholder after services.
     if (keyedProvider !== undefined && keyedRow !== undefined) {
       await assertKeyedRuntimeUnchanged(modelRuntime as ModelRuntime, {
         row: keyedRow,

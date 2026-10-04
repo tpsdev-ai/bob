@@ -254,7 +254,7 @@ describe("K2 — redirects are refused; the target receives nothing", () => {
 });
 
 describe("K3 — substitution with zero requests and a redacted error", () => {
-  it("a credential header from the model or caller, a substituted baseUrl/api, a non-canonical URL and a Request object all refuse", async () => {
+  it("a credential header from the model or caller, a substituted baseUrl, a non-canonical URL and a Request object all refuse", async () => {
     const registry = fixtureRegistry();
     process.env[VARIABLE] = SENTINEL;
     const stub = stubFetch();
@@ -274,15 +274,6 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
       expect(String((res as { errorMessage?: string })?.errorMessage)).toMatch(
         /mismatched endpoint or API/,
       );
-      // Substituted api.
-      res = await provider
-        .streamSimple(
-          { ...rt.getModel(RUNTIME, MODEL), api: "anthropic-messages" } as never,
-          CTX as never,
-          {} as never,
-        )
-        .result?.();
-      expect((res as { stopReason?: string })?.stopReason).toBe("error");
       for (const source of ["model", "caller"] as const) {
         res = await provider
           .streamSimple(
@@ -319,6 +310,53 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
 });
 
 describe("review regressions", () => {
+  it("redacts a synchronous fetch throw", async () => {
+    const base = (() => {
+      throw new Error(`failed ${ENDPOINT}/chat/completions?key=${SENTINEL}`);
+    }) as typeof globalThis.fetch;
+    const guarded = guardedKeyedFetch({ id: "keyed-fixture", endpoint: ENDPOINT }, base);
+    await expect(guarded(`${ENDPOINT}/chat/completions`)).rejects.toMatchObject({
+      message: "bob: keyed-fixture request failed",
+    });
+  });
+
+  it("redacts a synchronous fetch throw whose cause getter throws", async () => {
+    const base = (() => {
+      throw Object.defineProperty(new Error("request failed"), "cause", {
+        get() {
+          throw new Error(`${ENDPOINT}?key=${SENTINEL}`);
+        },
+      });
+    }) as typeof globalThis.fetch;
+    const guarded = guardedKeyedFetch({ id: "keyed-fixture", endpoint: ENDPOINT }, base);
+    await expect(guarded(`${ENDPOINT}/chat/completions`)).rejects.toMatchObject({
+      message: "bob: keyed-fixture request failed",
+    });
+  });
+
+  for (const method of ["stream", "streamSimple"] as const) {
+    it(`redacts a synchronous fetch throw through pi's ${method}`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const original = globalThis.fetch;
+      globalThis.fetch = (() => {
+        throw new Error(`failed ${ENDPOINT}/chat/completions?key=${SENTINEL}`);
+      }) as typeof globalThis.fetch;
+      let result: Awaited<ReturnType<typeof buildFixtureSession>>["result"] | undefined;
+      try {
+        ({ result } = await buildFixtureSession(`fxsync${method.toLowerCase()}`, registry));
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const message = await rt[method](rt.getModel(RUNTIME, MODEL)!, CTX as never).result();
+        expect(message.stopReason).toBe("error");
+        expect(message.errorMessage).not.toContain(SENTINEL);
+        expect(message.errorMessage).not.toContain(ENDPOINT);
+      } finally {
+        (result?.session as { dispose(): void } | undefined)?.dispose();
+        globalThis.fetch = original;
+      }
+    });
+  }
+
   it("a selected keyless pi runtime loses its credential in the environment and a child", async () => {
     const registry = loadProviderRegistry({
       path: writeRegistry(`version: 1

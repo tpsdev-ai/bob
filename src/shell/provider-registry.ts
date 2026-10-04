@@ -571,11 +571,6 @@ function validExcludedHost(value: unknown): boolean {
   }
 }
 
-/**
- * Validate a custody gate: every `bob/env` row must match an implemented custody
- * descriptor on runtime, variable, endpoint and API. A keyed row whose custody is
- * not implemented refuses at load, before any write or credential read.
- */
 export function assertCustodyImplemented(rows: readonly ProviderRecord[]): void {
   const derivedOwners = new Map<string, string>();
   for (const row of rows) {
