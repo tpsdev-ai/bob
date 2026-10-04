@@ -120,7 +120,7 @@ interface AssistantLike {
 const text = (message: AssistantLike | undefined) =>
   (message?.content ?? []).map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
 
-describe("bob#306 — a keyless row's budget bounds every output cap in its session", () => {
+describe("bob#306 — a keyless row's budget bounds the configured model's maxTokens and the output cap of requests sent to that row", () => {
   let root: string;
   let servers: CapServer[];
   beforeEach(() => {
