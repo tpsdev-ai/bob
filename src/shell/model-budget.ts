@@ -44,6 +44,7 @@ import {
 import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { calculateContextTokens, shouldCompact } from "@earendil-works/pi-coding-agent";
+import { boundedOutputCap } from "./provider-turn-budget.js";
 import { ModelBudgetError, type ModelLimits, PI_KEEP_RECENT_TOKENS } from "./session-budget.js";
 
 export {
@@ -143,15 +144,27 @@ const LIMITS_MARK = Symbol.for("bob.modelLimits");
  * everywhere pi looks it up: session creation, a restored session, and pi's
  * refresh after an extension registers a provider. Wraps the runtime's
  * `getModel` once; a second call replaces the limits it applies.
+ *
+ * bob#306: `turnOutputCap` is a keyless row's per-turn budget. The model's
+ * `maxTokens` becomes the smaller of it and the output cap the model has
+ * without it, when it has one (`provider.max_output_tokens`, else the model's
+ * own `maxTokens`).
  */
-export function applyModelLimits(runtime: object, limits: ModelLimits): void {
-  const target = runtime as ModelLookup & { [LIMITS_MARK]?: { limits: ModelLimits } };
+export function applyModelLimits(
+  runtime: object,
+  limits: ModelLimits,
+  turnOutputCap?: number,
+): void {
+  const target = runtime as ModelLookup & {
+    [LIMITS_MARK]?: { limits: ModelLimits; turnOutputCap: number | undefined };
+  };
   const existing = target[LIMITS_MARK];
   if (existing) {
     existing.limits = limits;
+    existing.turnOutputCap = turnOutputCap;
     return;
   }
-  const state = { limits };
+  const state = { limits, turnOutputCap };
   target[LIMITS_MARK] = state;
   const original = target.getModel.bind(target);
   target.getModel = (provider: string, modelId: string) => {
@@ -160,10 +173,17 @@ export function applyModelLimits(runtime: object, limits: ModelLimits): void {
     if (model === undefined || model === null || provider !== l.provider || modelId !== l.model) {
       return model;
     }
+    const modelCap = l.maxOutputTokens ?? (model as { maxTokens?: unknown }).maxTokens;
+    const maxTokens =
+      state.turnOutputCap === undefined
+        ? l.maxOutputTokens
+        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
+          ? Math.min(state.turnOutputCap, modelCap)
+          : state.turnOutputCap;
     return {
       ...(model as object),
       contextWindow: l.contextWindow,
-      ...(l.maxOutputTokens !== undefined ? { maxTokens: l.maxOutputTokens } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
     };
   };
 }
@@ -421,13 +441,21 @@ function isOutputDelta(
  * pi-ai's own `clampMaxTokensToContext`, applied to the same inputs its
  * providers use. Undefined when no positive cap applies (then pi sends none and
  * bob's backstop does nothing).
+ *
+ * bob#306: with `budget` (a keyless row's), the requested cap is
+ * `boundedOutputCap`; the keyless transport holds the request bodies it sends
+ * to the row to the same clamped cap.
  */
 export function effectiveOutputCap(
   model: Parameters<StreamFunction>[0],
   context: Parameters<StreamFunction>[1],
   options: Parameters<StreamFunction>[2],
+  budget?: number,
 ): number | undefined {
-  const requested = options?.maxTokens ?? model.maxTokens;
+  const requested =
+    budget === undefined
+      ? (options?.maxTokens ?? model.maxTokens)
+      : boundedOutputCap(budget, model.maxTokens, options?.maxTokens);
   if (typeof requested !== "number" || !Number.isFinite(requested) || requested <= 0) {
     return undefined;
   }
@@ -472,7 +500,7 @@ export function effectiveOutputCap(
  */
 export function capOutputStream(
   inner: StreamFunction,
-  deps: { log?: (message: string) => void } = {},
+  deps: { log?: (message: string) => void; outputBudget?: number } = {},
 ): StreamFunction {
   const log = deps.log ?? (() => {});
   const wrapped = async (
@@ -480,7 +508,7 @@ export function capOutputStream(
     context: Parameters<StreamFunction>[1],
     options?: Parameters<StreamFunction>[2],
   ): Promise<AssistantMessageEventStream> => {
-    const cap = effectiveOutputCap(model, context, options);
+    const cap = effectiveOutputCap(model, context, options, deps.outputBudget);
     if (cap === undefined) return await inner(model, context, options);
 
     // bob's own abort, linked to the caller's: the caller aborting still aborts
