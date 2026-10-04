@@ -2554,7 +2554,9 @@ export function assertProviderRunnable(
     throw new Error(`${label}: ${providerKeyConsumedMessage(variable, row.runtime)}`);
   }
   throw new Error(
-    `${label}: ${variable} is not set for provider row "${row.runtime}". Remedy: export ${variable}=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+    row.id === "openrouter"
+      ? `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`
+      : `${label}: ${variable} is not set for provider row "${row.id}". Remedy: export ${variable}=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
   );
 }
 

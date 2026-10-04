@@ -1,7 +1,4 @@
-// Provider custody: the code-owned names this module defines are the ONLY place
-// bob derives the operator keyed-row variable namespace. Nothing else in `src/`
-// may name it — a source-scanner test fails on any reference outside this file,
-// so the namespace cannot be entered or copied from bob's own side by accident.
+// The source scanner rejects any literal BOB_PROVIDER_ prefix occurrence outside this file.
 //
 // Three code-owned tables live here:
 //
@@ -9,9 +6,9 @@
 //     row id — an operator keyed row never declares its own variable;
 //   * pi's credential env table, classified for EVERY provider in pi's catalog.
 //     pi 0.84.3 does not export its credential-name list, so bob carries it and
-//     a drift test keeps it aligned with `getBuiltinProviders()`. Its one
+//     K11 checks catalog coverage and credential names against pi. Its one
 //     remaining role is the session factory's defensive removal of those names
-//     from the agent environment — agents do not hold provider keys;
+//     from the agent environment;
 //   * bob's OWN environment names (launcher exports and named constants). No
 //     operator variable may collide with one, and the namespace above is
 //     disjoint from this set by construction.
@@ -102,12 +99,7 @@ export const PI_CREDENTIAL_TABLE: readonly PiCredentialClass[] = [
   { provider: "zai-coding-cn", variables: ["ZAI_CODING_CN_API_KEY"] },
 ];
 
-/**
- * The union of every pi credential env name, from the table. The session factory
- * removes these from the agent environment before a session's capabilities,
- * extensions, tools or child processes start: an agent does not hold a provider
- * key, and the one that needs the provider reaches it through bob's transport.
- */
+/** The union of every pi credential env name in the table. */
 export function piCredentialEnvNames(): readonly string[] {
   const names = new Set<string>();
   for (const entry of PI_CREDENTIAL_TABLE) {
@@ -145,7 +137,7 @@ export const BOB_ENV_NAME_CONSTANTS: readonly string[] = [
 export const BOB_CAPABILITY_ENV_PREFIX = "BOB_CAP_";
 
 /**
- * True when `name` is a bob/pi/launcher-owned environment name: a launcher
+ * True when `name` is a bob/launcher-owned environment name: a launcher
  * export, a named constant, or a capability-config variable. No operator
  * keyed-row variable may collide with one.
  */

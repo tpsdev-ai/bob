@@ -57,6 +57,7 @@ import {
   keyedPlaceholder,
   providerKeyConsumedMessage,
   registerKeyedProvider,
+  requireOpenrouterApiKey,
   takeProviderKey,
 } from "../../src/shell/session.js";
 
@@ -281,18 +282,21 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
         )
         .result?.();
       expect((res as { stopReason?: string })?.stopReason).toBe("error");
-      // Caller credential header.
-      res = await provider
-        .streamSimple(
-          rt.getModel(RUNTIME, MODEL) as never,
-          CTX as never,
-          {
-            headers: { Authorization: "Bearer attacker" },
-          } as never,
-        )
-        .result?.();
-      expect(String((res as { errorMessage?: string })?.errorMessage)).toMatch(/Authorization/);
-      expect(stub.seen).toEqual([]);
+      for (const source of ["model", "caller"] as const) {
+        res = await provider
+          .streamSimple(
+            {
+              ...rt.getModel(RUNTIME, MODEL),
+              ...(source === "model" ? { headers: { Authorization: "Bearer attacker" } } : {}),
+            } as never,
+            CTX as never,
+            (source === "caller" ? { headers: { Authorization: "Bearer attacker" } } : {}) as never,
+          )
+          .result?.();
+        expect((res as { stopReason?: string })?.stopReason).toBe("error");
+        expect(String((res as { errorMessage?: string })?.errorMessage)).toMatch(/Authorization/);
+        expect(stub.seen).toEqual([]);
+      }
     } finally {
       (result.session as unknown as { dispose(): void }).dispose();
       stub.restore();
@@ -310,6 +314,134 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
       /sends only to/,
     );
     expect(called).toBe(0);
+  });
+});
+
+describe("review regressions", () => {
+  it("a selected keyless pi runtime loses its credential in the environment and a child", async () => {
+    const registry = loadProviderRegistry({
+      path: writeRegistry(`version: 1
+providers:
+  - id: keyless-fixture
+    aliases: []
+    runtime: groq
+    auth: bob/none
+    endpoint: https://keyless-fixture.example/v1
+    api: openai-completions
+`),
+    });
+    initAgent({
+      name: "fxkeyless",
+      role: "coder",
+      provider: "keyless-fixture",
+      model: MODEL,
+      contextWindow: 200_000,
+      agentsRoot: tmpRoot,
+      flairKeysDir: keysRoot,
+      skipFlair: true,
+      registry,
+    });
+    const { config, policy } = resolveRunConfig({
+      name: "fxkeyless",
+      agentsRoot: tmpRoot,
+      registry,
+    });
+    process.env.GROQ_API_KEY = SENTINEL;
+    const factory = createBobRuntimeFactory({ config, policy, registry });
+    const result = await factory({ sessionManager: SessionManager.inMemory(config.cwd) });
+    try {
+      expect(process.env.GROQ_API_KEY).toBeUndefined();
+      const child = spawnSync("printenv", ["GROQ_API_KEY"], { env: process.env, encoding: "utf8" });
+      expect(child.error).toBeUndefined();
+      expect(child.status).toBe(1);
+      expect(child.stdout).toBe("");
+    } finally {
+      (result.session as unknown as { dispose(): void }).dispose();
+    }
+  });
+
+  it("operator fetch refusals never echo the configured or supplied URL", async () => {
+    const endpoint = "https://distinctive-review-endpoint.example/private-configured-path";
+    const supplied = "https://distinctive-review-request.example/private-request-path";
+    const messages: string[] = [];
+    let calls = 0;
+    const base = (async () => {
+      calls++;
+      throw new Error(endpoint + supplied);
+    }) as typeof globalThis.fetch;
+    const fetch = guardedKeyedFetch({ id: "keyed-fixture", endpoint }, base);
+    for (const url of [
+      supplied,
+      "bad URL",
+      `${endpoint}/%2e%2e/evil`,
+      new Request(`${endpoint}/chat/completions`),
+      `${endpoint}/chat/completions`,
+    ]) {
+      try {
+        await fetch(url);
+      } catch (err) {
+        messages.push((err as Error).message);
+      }
+    }
+    expect(messages).toHaveLength(5);
+    for (const message of messages) {
+      expect(message).toContain("keyed-fixture");
+      expect(message).not.toContain(endpoint);
+      expect(message).not.toContain(supplied);
+      expect(message).not.toMatch(/https?:\/\//);
+    }
+    expect(calls).toBe(1);
+  });
+
+  it("OpenRouter missing-key and registration refusals retain main's literals; operator refusals name the row", () => {
+    const refusalMessage = (action: () => unknown): string => {
+      try {
+        action();
+      } catch (error) {
+        return (error as Error).message;
+      }
+      return "";
+    };
+    expect(refusalMessage(() => requireOpenrouterApiKey({}))).toBe(
+      "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk.",
+    );
+    delete process.env.OPENROUTER_API_KEY;
+    expect(refusalMessage(() => assertProviderRunnable("openrouter", "bob hire review"))).toBe(
+      "bob hire review: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.",
+    );
+    const registry = fixtureRegistry();
+    const runtime = {
+      registerProvider: (_id: string, _config: unknown) => {},
+      unregisterProvider: (_id: string) => {},
+      registerNativeProvider: (_provider: unknown) => {},
+    };
+    guardProviderRegistration(
+      runtime as unknown as ModelRuntime,
+      reservedProviderNames(registry),
+      registry,
+    );
+    for (const id of ["openrouter", "keyed-fixture", "keyed-fixture-alias", RUNTIME]) {
+      const row = id === "openrouter" ? "openrouter" : "keyed-fixture";
+      for (const verb of [
+        "registerProvider",
+        "unregisterProvider",
+        "registerNativeProvider",
+      ] as const) {
+        const action = () => {
+          if (verb === "registerProvider")
+            runtime.registerProvider(id, { baseUrl: "https://distinctive-review-request.example" });
+          else if (verb === "unregisterProvider") runtime.unregisterProvider(id);
+          else
+            runtime.registerNativeProvider({
+              id,
+              baseUrl: "https://distinctive-review-request.example",
+            });
+        };
+        expect(refusalMessage(action)).toBe(
+          `bob: refusing a ${verb} of the ${row} provider after bob registered its own`,
+        );
+      }
+    }
   });
 });
 
@@ -780,6 +912,32 @@ describe("K11 — code-owned tables stay aligned", () => {
     // bob's table also carries names this catalog build omits (meta, radius).
     expect(classified.has("meta")).toBe(true);
     expect(classified.has("radius")).toBe(true);
+  });
+
+  it("credential variable names match pi's independent env discovery", async () => {
+    const piPath = new URL("./env-api-keys.js", import.meta.resolve("@earendil-works/pi-ai"));
+    const piSource = readFileSync(piPath, "utf8");
+    const names = [...piSource.matchAll(/"([A-Z][A-Z0-9_]+)"/g)].map((match) => match[1]);
+    const env = Object.fromEntries(names.map((name) => [name, "review-sentinel"]));
+    const pi = (await import(piPath.href)) as {
+      findEnvKeys(provider: string, env: NodeJS.ProcessEnv): string[] | undefined;
+    };
+    for (const entry of PI_CREDENTIAL_TABLE) {
+      expect({ provider: entry.provider, variables: entry.variables }).toEqual({
+        provider: entry.provider,
+        variables: pi.findEnvKeys(entry.provider, env) ?? [],
+      });
+    }
+  });
+
+  it("the scanner header promises only literal prefix occurrences", () => {
+    const source = readFileSync(
+      new URL("../../src/shell/provider-custody.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source.split("\n")[0]).toBe(
+      "// The source scanner rejects any literal BOB_PROVIDER_ prefix occurrence outside this file.",
+    );
   });
 
   it("every launcher export and environment-name constant is in the owned set", () => {

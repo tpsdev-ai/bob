@@ -78,7 +78,7 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
-import { PI_CREDENTIAL_TABLE, piCredentialEnvNames } from "./provider-custody.js";
+import { piCredentialEnvNames } from "./provider-custody.js";
 import {
   assertProviderEndpointAllowed,
   DEFAULT_PROVIDER_REGISTRY,
@@ -241,7 +241,9 @@ export function guardedKeyedFetch(
     ) {
       return Promise.reject(
         new Error(
-          `bob: refusing an ${row.id} request — bob's transport sends only to ${row.endpoint}/`,
+          row.id === "openrouter"
+            ? "bob: refusing an openrouter request — bob's transport sends only to https://openrouter.ai/api/v1/"
+            : `bob: refusing an ${row.id} request — bob's transport sends only to the configured endpoint`,
         ),
       );
     }
@@ -605,7 +607,9 @@ export function requireProviderKey(
   const key = (env[variable] ?? "").trim();
   if (!key) {
     throw new Error(
-      `bob: ${variable} is not set for provider row "${runtime}". Remedy: export ${variable}=<key> before running — bob never writes the key to disk.`,
+      runtime === "openrouter" && variable === "OPENROUTER_API_KEY"
+        ? "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk."
+        : `bob: ${variable} is not set for provider row "${runtime}". Remedy: export ${variable}=<key> before running — bob never writes the key to disk.`,
     );
   }
   return key;
@@ -616,15 +620,7 @@ export function requireOpenrouterApiKey(env: NodeJS.ProcessEnv = process.env): s
   return requireProviderKey("OPENROUTER_API_KEY", "openrouter", env);
 }
 
-/**
- * Read the key, then DELETE it from the environment so pi's built-in provider
- * for the row's runtime (which reads the variable from process.env) has nothing
- * to send. Custody is per VARIABLE: the runtime factory calls this once and keeps
- * the value in its closure and in the transport closure built from it. Callers
- * that can be invoked more than once (the session factory, for /new and /resume)
- * must cache the result themselves rather than call this again — the environment
- * no longer carries it.
- */
+/** Read and delete the variable; callers cache the key for replacement sessions. */
 // Whether each variable has already been read and deleted in this process (a set
 // of NAMES and a boolean per variable, never the keys). A later call that finds
 // the variable empty gets a precise refusal instead of the misleading "not set".
@@ -716,29 +712,10 @@ export function registerOpenrouterProvider(
   });
 }
 
-/**
- * GUARD THE VERB (round 5, item 1). pi makes a LATER `registerProvider("openrouter",
- * …)` effective IMMEDIATELY — from a capability's `session_start`, from
- * `before_agent_start`, and from a print-mode bind that loads extensions AFTER the
- * factory returns. bob registers its own provider FIRST, then wraps the runtime's
- * registration verbs ONCE, so any later call naming `openrouter` is REFUSED
- * (throwing, before it takes effect) with an error naming the caller path and the
- * attempted `baseUrl` — every hook path goes through this seam. Wrapped idempotently:
- * a second call is a no-op.
- */
-/**
- * GUARD THE VERB (round 5, item 1). pi makes a LATER `registerProvider(id, …)`
- * effective IMMEDIATELY — from a capability's `session_start`, from
- * `before_agent_start`, and from a print-mode bind that loads extensions AFTER
- * the factory returns. bob registers its own provider FIRST, then wraps the
- * runtime's registration verbs ONCE per runtime, so any later call naming that
- * runtime is REFUSED (throwing, before it takes effect) with an error naming the
- * caller path — every hook path goes through this seam. Wrapped idempotently: a
- * second call is a no-op.
- */
 export function guardProviderRegistration(
   modelRuntime: ModelRuntime,
   reservedNames: readonly string[],
+  registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
 ): void {
   const runtime = modelRuntime as unknown as {
     registerProvider: (id: string, config: OpenrouterProviderConfig) => void;
@@ -756,19 +733,22 @@ export function guardProviderRegistration(
   if (reservedNames.includes("openrouter")) runtime.__bobOpenrouterGuarded = true;
   const reserved = new Set(reservedNames);
 
-  const refuse = (verb: string): never => {
-    throw new Error(`bob: refusing a ${verb} of a bob-owned provider after bob registered its own`);
+  const refuse = (verb: string, id: string): never => {
+    const row =
+      registry.find(id) ?? registry.records().find((candidate) => candidate.runtime === id);
+    const name = row?.id ?? id;
+    throw new Error(`bob: refusing a ${verb} of the ${name} provider after bob registered its own`);
   };
 
   const originalRegister = runtime.registerProvider.bind(modelRuntime);
   runtime.registerProvider = (id: string, config: OpenrouterProviderConfig) => {
-    if (reserved.has(id)) refuse("registerProvider");
+    if (reserved.has(id)) refuse("registerProvider", id);
     return originalRegister(id, config);
   };
   if (typeof runtime.unregisterProvider === "function") {
     const originalUnregister = runtime.unregisterProvider.bind(modelRuntime);
     runtime.unregisterProvider = (id: string) => {
-      if (reserved.has(id)) refuse("unregisterProvider");
+      if (reserved.has(id)) refuse("unregisterProvider", id);
       return originalUnregister(id);
     };
   }
@@ -780,7 +760,7 @@ export function guardProviderRegistration(
       baseUrl?: string;
     }) => {
       const id = provider?.id ?? provider?.name;
-      if (id !== undefined && reserved.has(id)) refuse("registerNativeProvider");
+      if (id !== undefined && reserved.has(id)) refuse("registerNativeProvider", id);
       return originalNative(provider);
     };
   }
@@ -1471,23 +1451,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // entry path before a capability, extension, tool or child process starts.
     delete process.env[ADMIN_PASS_ENV];
 
-    // The pi credential table's one remaining role: remove pi credential names
-    // from the agent environment before any capability, extension, tool or child
-    // process starts. An agent does not hold a provider key; the row it runs
-    // reaches its provider through bob's transport. Two exceptions: the SELECTED
-    // keyed row's variable (left for the custody take below, which reads then
-    // deletes it) and the session's own runtime identity (a keyless row of that
-    // runtime substitutes a placeholder and its transport strips supplied
-    // credentials, so the name is not bob's to remove here).
-    const selectedRuntimeCredentials = new Set(
-      PI_CREDENTIAL_TABLE.filter((entry) => entry.provider === config.provider).flatMap(
-        (entry) => entry.variables,
-      ),
-    );
+    // Remove pi credential names before loading agent code; custody takes the selected key below.
     const selectedKeyedVariable = row?.auth.kind === "env" ? row.auth.variable : undefined;
     for (const credentialName of piCredentialEnvNames()) {
       if (credentialName === selectedKeyedVariable) continue;
-      if (selectedRuntimeCredentials.has(credentialName)) continue;
       delete process.env[credentialName];
     }
 
@@ -1541,16 +1508,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         api: row.api,
         variable: row.auth.variable,
       };
-      // The on-disk refusal already ran above (a config error, before any key
-      // read), so a tampered models.json refuses on every entry path without
-      // consuming the key. (1) KEY OUT OF THE ENVIRONMENT: on the FIRST
-      // invocation read the row's variable once, then DELETE it from process.env
-      // before any capability, extension or tool subprocess starts (pi's
-      // ModelRuntime is already created by then) — so pi's built-in provider for
-      // the runtime (which reads the variable from process.env) has nothing to
-      // send, and this factory never reads it from process.env again. Later
-      // invocations (replacement sessions: /new, /resume) reuse the value read
-      // here and NEVER re-read the environment. Custody is keyed by VARIABLE.
       const variable = row.auth.variable;
       let apiKey = custodyKeys.get(variable);
       if (apiKey === undefined) {
@@ -1569,7 +1526,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // — from session_start, before_agent_start, or a print-mode bind — is
       // refused BEFORE it takes effect. (Refresh is deliberately NOT wrapped;
       // see guardProviderRegistration.)
-      guardProviderRegistration(modelRuntime, reservedProviderNames(input.registry));
+      guardProviderRegistration(
+        modelRuntime,
+        reservedProviderNames(input.registry),
+        input.registry,
+      );
     }
     // bob#214: the configured pair resolves with the configured window (and
     // output cap) wherever pi looks it up — here, on a restored session, and when
