@@ -14,10 +14,10 @@
 //     own request shape (for the OpenAI-compatible adapter, `reasoning_effort`).
 //
 // A budget is only valid on a `bob/none` row: bob applies it to that row's
-// session only. The session factory keeps the model's output cap at or below it,
-// the keyless transport (base-url-transport.ts) does the same for each request
-// body's output cap (bob#306), and the transport sends the level. The row owns
-// the values;
+// session only. The session factory keeps the configured model's output cap at
+// or below it, the keyless transport (base-url-transport.ts) does the same for
+// each request body it sends to the row (bob#306), and the transport sends the
+// level. The row owns the values;
 // this module owns the bounds and the mode set (validated at load by
 // provider-registry.ts).
 

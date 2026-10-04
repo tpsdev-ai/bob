@@ -443,8 +443,8 @@ function isOutputDelta(
  * bob's backstop does nothing).
  *
  * bob#306: with `budget` (a keyless row's), the requested cap is
- * `boundedOutputCap`; the keyless transport holds the request body to the same
- * clamped cap.
+ * `boundedOutputCap`; the keyless transport holds the request bodies it sends
+ * to the row to the same clamped cap.
  */
 export function effectiveOutputCap(
   model: Parameters<StreamFunction>[0],

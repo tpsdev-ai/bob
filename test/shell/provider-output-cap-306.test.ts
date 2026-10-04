@@ -1,6 +1,5 @@
-// bob#306 — a keyless row's budget bounds every output cap in its session. The
-// session factory keeps the model's maxTokens at or below it, and no request
-// body's output cap or backstop cap exceeds it; pi may request less.
+// bob#306 — a keyless row's budget bounds the configured model's maxTokens and
+// the output cap of requests sent to that row; pi may request less.
 //
 // Each case runs a real factory session against a fake OpenAI-compatible server
 // on loopback (no network leaves the host).
