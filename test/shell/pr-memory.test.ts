@@ -192,6 +192,77 @@ describe("edit receipts — candidate files only from successful edits", () => {
 });
 
 describe("envelope parsing and validation", () => {
+  it("accepts the envelope byte cap and rejects one byte over it", () => {
+    const content = JSON.stringify(envelope()).padEnd(PR_MEMORY_ENVELOPE_MAX_BYTES, " ");
+    expect(Buffer.byteLength(content, "utf8")).toBe(PR_MEMORY_ENVELOPE_MAX_BYTES);
+    expect(parseEnvelope(content, IDENTITY)).toBeDefined();
+    expect(parseEnvelope(`${content}\n`, IDENTITY)).toBeUndefined();
+  });
+
+  it("accepts the round byte cap and rejects one byte over it", () => {
+    const r = round({ files_touched: [...Array<string>(7).fill("€".repeat(170)), "x"] });
+    r.files_touched[7] += "x".repeat(
+      PR_MEMORY_ROUND_MAX_BYTES - Buffer.byteLength(JSON.stringify(r), "utf8"),
+    );
+    expect(Buffer.byteLength(JSON.stringify(r), "utf8")).toBe(PR_MEMORY_ROUND_MAX_BYTES);
+    expect(parseEnvelope(JSON.stringify(envelope({ rounds: [r] })), IDENTITY)).toBeDefined();
+    r.files_touched[7] += "x";
+    expect(parseEnvelope(JSON.stringify(envelope({ rounds: [r] })), IDENTITY)).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "17809-byte envelope",
+      envelope({
+        open_findings: Array.from({ length: 32 }, (_, i) => ({
+          id: `f${i}`,
+          detail: "x".repeat(512),
+          status: "open" as const,
+        })),
+      }),
+    ],
+    [
+      "oversized UTF-8 round",
+      envelope({ rounds: [round({ files_touched: Array<string>(8).fill("€".repeat(170)) })] }),
+    ],
+  ] as const)("rejects recall and skips writing over an existing %s", async (label, probe) => {
+    const content = JSON.stringify(probe);
+    if (label === "17809-byte envelope") {
+      expect(Buffer.byteLength(content, "utf8")).toBe(17809);
+    } else {
+      const serialized = JSON.stringify(probe.rounds[0]);
+      expect(serialized.length).toBeLessThan(PR_MEMORY_ROUND_MAX_BYTES);
+      expect(Buffer.byteLength(serialized, "utf8")).toBeGreaterThan(PR_MEMORY_ROUND_MAX_BYTES);
+      expect(Buffer.byteLength(content, "utf8")).toBeLessThan(PR_MEMORY_ENVELOPE_MAX_BYTES);
+    }
+    const record = { id: ID, agentId: AGENT, visibility: "private", content };
+    expect(parseEnvelope(content, IDENTITY)).toBeUndefined();
+    expect(validateRecalledRecord(record, { ...IDENTITY, id: ID })).toBeUndefined();
+    const fake = makeFakeFlair({
+      agents: { [AGENT]: { id: AGENT } },
+      memories: { [ID]: record },
+    });
+    const s = seams(fake);
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: s,
+    });
+    expect(recalled.status).toBe("invalid");
+    expect(recalled.block).toBeUndefined();
+    const written = await writePrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
+      seams: s,
+    });
+    expect(written.status).toBe("skipped");
+    expect(fake.calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+    expect(fake.memories.get(ID)?.content).toBe(content);
+  });
+
   it("rejects a mismatch in every embedded identity field", () => {
     const good = JSON.stringify(envelope());
     expect(parseEnvelope(good, IDENTITY)?.prNumber).toBe(PR);

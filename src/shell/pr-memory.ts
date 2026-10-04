@@ -3,8 +3,8 @@
 // The local builder starts each PR round with what earlier rounds on the SAME
 // PR established. The HARNESS owns that memory: it recalls it before the
 // session is built. The one-shot run writes after a session runs or a run-bound
-// pre-session abort; interactive launch recalls only. The model never issues a
-// memory call, no summarizer is required, and nothing is pasted into the brief.
+// pre-session abort; launch with a prompt uses this path. Interactive launch
+// without a prompt recalls only.
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
 // agent id + canonical repository + PR number (TaskBinding.pr_ref) — and never
@@ -14,8 +14,9 @@
 //
 // The stored envelope is bounded (newest few rounds, hard byte caps) and is
 // written as structured, bounded evidence: the outcome comes from the harness
-// exit code / termination reason, files from edit receipts. Checks are
-// normalized here but not yet collected; rounds store none. No transcript, reasoning, raw environment or raw stdout/stderr is stored.
+// exit code / termination reason, files from edit receipts. Supplied check
+// evidence is stored; the one-shot runner collects none. No transcript,
+// reasoning, raw environment or raw stdout/stderr is stored.
 
 import { createHash } from "node:crypto";
 import { FlairHttpClient, type FlairMemory } from "../capabilities/flair/client.js";
@@ -307,6 +308,7 @@ function validEvidence(v: unknown): v is PrTestEvidence[] {
 function parseRound(v: unknown): PrRoundRecord | undefined {
   if (
     !isObject(v) ||
+    Buffer.byteLength(JSON.stringify(v), "utf8") > PR_MEMORY_ROUND_MAX_BYTES ||
     !validString(v.endedAt) ||
     typeof v.outcome !== "string" ||
     !["completed", "failed", "aborted", "unknown"].includes(v.outcome) ||
@@ -330,6 +332,7 @@ export function parseEnvelope(
   content: string,
   expected: PrMemoryIdentity,
 ): PrMemoryEnvelope | undefined {
+  if (Buffer.byteLength(content, "utf8") > PR_MEMORY_ENVELOPE_MAX_BYTES) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
