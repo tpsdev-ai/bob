@@ -13,9 +13,21 @@
 //     ├── memory/             # local memory cache (empty)
 //     └── .pi-agent/          # pi-coding-agent state (empty; populated on first run)
 
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
@@ -29,9 +41,11 @@ import {
   providerReadsKeyFromEnv,
   providerRecord,
   providerUsesGatewayIdentity,
+  reservedProviderNames,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
 import { loadRole } from "./role-loader.js";
+import { assertNoReservedProviderEntries } from "./session.js";
 import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
 
 // Same character class loadRole uses — agent names are filesystem paths,
@@ -168,6 +182,12 @@ export function initAgent(opts: InitOptions): InitResult {
   if (existsSync(agentDir) && noClobber) {
     throw new Error(`agent dir already exists: ${agentDir} (pass --force to overwrite)`);
   }
+
+  // The reserved-name check runs BEFORE the first write (init --force and hire
+  // included): a pi file that carries a bob-owned keyed entry, or that cannot be
+  // proven free of one, refuses with nothing written.
+  const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
+  assertNoReservedProviderEntries(join(agentDir, ".pi-agent"), reservedProviderNames(registry));
 
   const written: string[] = [];
 
@@ -447,8 +467,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
   const piProvider = resolveRuntimeProviderName(opts.provider, registry);
   const isGateway = providerUsesGatewayIdentity(opts.provider, registry);
-  // `openrouter`'s key is read from the OPENROUTER_API_KEY env var AT RUN TIME and
-  // is NEVER written here (bob#183) — so its auth.json carries no key entry.
+  // A keyed row's key is never written here.
   const isEnvKeyProvider = providerReadsKeyFromEnv(opts.provider, registry);
   const isKeyless = providerRecord(opts.provider, registry)?.auth.kind === "none";
   // OpenAI-compatible providers also get `api`, `compat` and an explicit model
@@ -466,10 +485,9 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const modelsPath = join(piDir, "models.json");
   const authPath = join(piDir, "auth.json");
 
-  // openrouter is bob's OWN provider (bob#183 round 3): its endpoint and its
-  // model declaration are constructed IN MEMORY at session creation, and an
-  // on-disk openrouter entry is REFUSED — so bob writes NO openrouter provider
-  // block here. Every other provider still declares its model on disk.
+  // A keyed row has no on-disk provider block: its endpoint and model
+  // declaration are constructed IN MEMORY at session creation, and an on-disk
+  // entry is REFUSED. Every other provider still declares its model on disk.
   const providers = isEnvKeyProvider
     ? {}
     : {
@@ -488,22 +506,58 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
           ],
         },
       };
-  writeFileSync(modelsPath, `${JSON.stringify({ providers }, null, 2)}\n`);
-  writeFileSync(
-    authPath,
-    `${JSON.stringify(isEnvKeyProvider || isKeyless ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`,
-  );
-  chmodSync(authPath, 0o600);
+  const modelsContent = `${JSON.stringify({ providers }, null, 2)}\n`;
+  const authContent = `${JSON.stringify(isEnvKeyProvider || isKeyless ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`;
 
   if (isEnvKeyProvider) {
-    console.error(`⚠ Export OPENROUTER_API_KEY before running — bob never writes the key to disk.`);
-  } else if (!isGateway && !isKeyless && opts.baseUrl === undefined) {
+    // Skip files present at the existence check; publish with mode 0600.
+    const created: string[] = [];
+    for (const [path, content] of [
+      [modelsPath, modelsContent],
+      [authPath, authContent],
+    ] as const) {
+      if (existsSync(path)) continue;
+      writeFileExclusive(path, content);
+      created.push(path);
+    }
+    const row = providerRecord(opts.provider, registry);
+    const variable = row?.auth.kind === "env" ? row.auth.variable : "the provider key";
+    console.error(`⚠ Export ${variable} before running — bob never writes the key to disk.`);
+    return created;
+  }
+
+  writeFileSync(modelsPath, modelsContent);
+  writeFileSync(authPath, authContent);
+  chmodSync(authPath, 0o600);
+
+  if (!isGateway && !isKeyless && opts.baseUrl === undefined) {
     console.error(
       `⚠ Set your ${opts.provider} API key in ${join(agentDir, ".pi-agent", "auth.json")} before running.`,
     );
   }
 
   return [modelsPath, authPath];
+}
+
+/** Publish via an exclusive temp file with mode 0600 before the rename. */
+function writeFileExclusive(path: string, content: string): void {
+  const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
+  const fd = openSync(
+    temp,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeFileSync(fd, content);
+    fchmodSync(fd, 0o600);
+    renameSync(temp, path);
+  } finally {
+    try {
+      closeSync(fd);
+    } finally {
+      rmSync(temp, { force: true });
+    }
+  }
 }
 
 function capitalize(s: string): string {

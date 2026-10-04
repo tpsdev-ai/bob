@@ -616,11 +616,7 @@ describe("provider controls", () => {
     );
   });
 
-  it("a keyless row named openrouter never enters the keyed branch (bob#298)", async () => {
-    // A programmatic registry may hold a keyless row whose runtime is
-    // `openrouter`. The factory branch keys on the SELECTED ROW's auth mode, so
-    // it must not read (and delete) OPENROUTER_API_KEY, which only the keyed
-    // branch does.
+  it("a keyless row named openrouter deletes its runtime credential from the agent environment", async () => {
     const keylessOpenrouter = {
       id: "openrouter",
       aliases: [],
@@ -643,8 +639,7 @@ describe("provider controls", () => {
         sessionManager: SessionManager.inMemory(config.cwd),
       });
       session = result.session as unknown as { dispose(): void };
-      // This keyless branch preserves OPENROUTER_API_KEY.
-      expect(process.env.OPENROUTER_API_KEY).toBe("keyless-298-sentinel");
+      expect(process.env.OPENROUTER_API_KEY).toBeUndefined();
     } finally {
       session?.dispose();
       if (saved === undefined) delete process.env.OPENROUTER_API_KEY;

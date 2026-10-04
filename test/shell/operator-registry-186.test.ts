@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { providerBaseUrlRefusal } from "../../src/shell/bob-yaml.js";
 import { initAgent } from "../../src/shell/init.js";
+import { deriveOperatorVariable } from "../../src/shell/provider-custody.js";
 import {
+  assertCustodyImplemented,
   CUSTODY_IMPLEMENTATIONS,
+  CUSTODY_PINS,
   DEFAULT_PROVIDER_REGISTRY,
   defaultProviderName,
   loadProviderRegistry,
@@ -220,32 +223,70 @@ describe("T1 — the operator loader validates every row before returning", () =
 // ── T2: custody is implemented, not asserted ─────────────────────────────────
 
 describe("T2 — a bob/env row loads only against an implemented custody descriptor", () => {
-  it("the shipped openrouter row matches the one implementation", () => {
-    expect(CUSTODY_IMPLEMENTATIONS.map((d) => d.runtime)).toEqual(["openrouter"]);
+  it("the shipped openrouter row is pinned to the one implementation", () => {
+    expect(CUSTODY_IMPLEMENTATIONS).toEqual(["openai-completions"]);
+    expect(CUSTODY_PINS.map((pin) => pin.runtime)).toEqual(["openrouter"]);
     const row = DEFAULT_PROVIDER_REGISTRY.find("openrouter");
     expect(row?.auth).toEqual({ kind: "env", variable: "OPENROUTER_API_KEY" });
-    expect(row?.endpoint).toBe(CUSTODY_IMPLEMENTATIONS[0]?.endpoint);
+    expect(row?.endpoint).toBe(CUSTODY_PINS[0]?.endpoint);
     expect(providerReadsKeyFromEnv("openrouter")).toBe(true);
   });
 
-  it("bob/env for a runtime with no implementation refuses", () => {
+  it("an operator keyed row with an implemented API and a proper endpoint loads", () => {
     const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env(ACME_KEY)\n    endpoint: https://acme.example/v1\n    api: openai-completions\n",
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env\n    endpoint: https://acme.example/v1\n    api: openai-completions\n",
+    );
+    const reg = loadProviderRegistry({ path });
+    expect(reg.find("acme")?.auth).toEqual({
+      kind: "env",
+      variable: deriveOperatorVariable("acme"),
+      derived: true,
+    });
+  });
+
+  it("a keyed row whose API has no implementation refuses", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env\n    endpoint: https://acme.example/v1\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(/no implemented custody/);
   });
 
-  it("bob/env with the wrong variable or endpoint refuses", () => {
+  it("an operator row that declares its own variable refuses", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env(ACME_KEY)\n    endpoint: https://acme.example/v1\n    api: openai-completions\n",
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(/declares its own environment variable/);
+  });
+
+  it("a keyed row whose runtime carries a pin must match it", () => {
     const shipped = PROVIDER_RECORDS.find((row) => row.id === "openrouter")!;
     for (const mismatch of [
       { auth: { kind: "env" as const, variable: "ACME_KEY" } },
       { endpoint: "https://other.example/v1" },
       { api: undefined },
     ]) {
-      expect(() => new ProviderRegistry([{ ...shipped, ...mismatch }])).toThrow(
-        /does not match.*descriptor/,
+      expect(() => assertCustodyImplemented([{ ...shipped, ...mismatch }])).toThrow(
+        /pinned custody/,
       );
     }
+  });
+
+  it("an operator keyed row whose runtime is in pi's catalog refuses", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n  - id: acme-keyed\n    aliases: []\n    runtime: groq\n    auth: bob/env\n    endpoint: https://groq.example/v1\n    api: openai-completions\n",
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(
+      /runtime collides with pi provider identity "groq".*Remedy:/,
+    );
+  });
+
+  it("two ids that derive the same variable refuse (keyed-fixture and keyed_fixture)", () => {
+    const path = writeRegistry(
+      "version: 1\nproviders:\n" +
+        "  - id: keyed-fixture\n    aliases: []\n    runtime: keyed-fixture-runtime\n    auth: bob/env\n    endpoint: https://keyed-fixture.example/v1\n    api: openai-completions\n" +
+        "  - id: keyed_fixture\n    aliases: []\n    runtime: keyed-fixture-runtime-2\n    auth: bob/env\n    endpoint: https://keyed-fixture.example/v2\n    api: openai-completions\n",
+    );
+    expect(() => loadProviderRegistry({ path })).toThrow(/derive the same keyed variable/);
   });
 
   it("operator data cannot downgrade the builtin openrouter row to pi/disk", () => {
@@ -257,7 +298,7 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
 
   it("bob/env sharing a pi-login runtime refuses (no custody attaches to it)", () => {
     const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: xai-keyed\n    aliases: []\n    runtime: xai\n    auth: bob/env(XAI_KEY)\n    endpoint: https://xai.example/v1\n    api: openai-completions\n",
+      "version: 1\nproviders:\n  - id: xai-keyed\n    aliases: []\n    runtime: xai\n    auth: bob/env\n    endpoint: https://xai.example/v1\n    api: openai-completions\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(
       /row "xai-keyed" runtime collides with pi-owned identity "xai".*Remedy:/,
@@ -266,7 +307,7 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
 
   it("a keyed row may not authorize a base_url override", () => {
     const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env(ACME_KEY)\n    override: {}\n",
+      "version: 1\nproviders:\n  - id: acme\n    aliases: []\n    runtime: acme\n    auth: bob/env\n    override: {}\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(/override policy/);
   });
@@ -277,15 +318,23 @@ describe("T2 — a bob/env row loads only against an implemented custody descrip
 describe("T3 — the disk-refusal set comes from the registry, by name", () => {
   it("the reserved set is every bob/env row's id, aliases and runtime", () => {
     expect(reservedProviderNames()).toEqual(["openrouter"]);
-    const shipped = PROVIDER_RECORDS.find((row) => row.id === "openrouter")!;
     const synthetic = new ProviderRegistry([
-      { ...shipped, id: "custody-row", aliases: ["custody-alias"] },
-      { id: "keyless", aliases: [], runtime: "keyless", auth: { kind: "none" } },
+      ...PROVIDER_RECORDS,
+      {
+        id: "custody-row",
+        aliases: ["custody-alias"],
+        runtime: "custody-runtime",
+        auth: { kind: "env", variable: deriveOperatorVariable("custody-row"), derived: true },
+        endpoint: "https://custody.example/v1",
+        api: "openai-completions",
+      },
+      { id: "keyless", aliases: [], runtime: "keyless-runtime", auth: { kind: "none" } },
     ]);
     expect(reservedProviderNames(synthetic)).toEqual([
+      "openrouter",
       "custody-row",
       "custody-alias",
-      "openrouter",
+      "custody-runtime",
     ]);
   });
 
@@ -391,9 +440,9 @@ defaults:
     );
   });
 
-  it("an operator row cannot claim bob/env for a runtime whose custody is unimplemented", () => {
+  it("an operator keyed row without an implemented API refuses", () => {
     const path = writeRegistry(
-      "version: 1\nproviders:\n  - id: acme-local\n    aliases: [acme]\n    runtime: acme\n    auth: bob/env(ACME_KEY)\n    endpoint: https://acme.example/v1\n    api: openai-completions\n",
+      "version: 1\nproviders:\n  - id: acme-local\n    aliases: [acme]\n    runtime: acme\n    auth: bob/env\n    endpoint: https://acme.example/v1\n",
     );
     expect(() => loadProviderRegistry({ path })).toThrow(/no implemented custody/);
   });

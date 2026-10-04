@@ -96,9 +96,9 @@ import {
 import type { BobRole, CronEntry } from "./index.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import {
+  DEFAULT_PROVIDER_REGISTRY,
   type ProviderRecord,
   type ProviderRegistry,
-  providerReadsKeyFromEnv,
   providerRecord,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
@@ -119,9 +119,9 @@ import {
 } from "./run-bounds.js";
 import {
   createBobRuntimeFactory,
-  OPENROUTER_KEY_CONSUMED_MESSAGE,
-  openrouterKeyWasConsumed,
   promptSession,
+  providerKeyConsumedMessage,
+  providerKeyWasConsumed,
   runInteractiveSession,
   type SessionDeps,
 } from "./session.js";
@@ -2541,11 +2541,22 @@ export function assertProviderRunnable(
   label: string,
   registry?: ProviderRegistry,
 ): void {
-  if (!providerReadsKeyFromEnv(provider, registry)) return;
-  if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
-  if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
+  // Resolve the SELECTED row (by its runtime identity, then by name), never the
+  // runtime string alone: a keyed row's runtime need not be its id, so a name
+  // lookup would miss it.
+  const reg = registry ?? DEFAULT_PROVIDER_REGISTRY;
+  const row =
+    reg.records().find((candidate) => candidate.runtime === provider) ?? reg.find(provider);
+  if (row === undefined || row.auth.kind !== "env") return;
+  const variable = row.auth.variable;
+  if ((process.env[variable] ?? "").trim()) return;
+  if (providerKeyWasConsumed(variable)) {
+    throw new Error(`${label}: ${providerKeyConsumedMessage(variable, row.id)}`);
+  }
   throw new Error(
-    `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+    row.id === "openrouter"
+      ? `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`
+      : `${label}: ${variable} is not set for provider row "${row.id}". Remedy: export ${variable}=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
   );
 }
 
