@@ -1,7 +1,8 @@
 // bob#185 item 5 — the runtime entry path. Stands up a REAL local HTTP stub as
 // Flair (so the real HTTP + Ed25519 signing path runs) and runs `bob run`
 // twice: round N writes the memory, round N+1 recalls it into the factory's
-// config BEFORE the first request, with nothing pasted into either brief.
+// config before the first model request (recall is a Flair bootstrap request
+// and a memory GET), with nothing pasted into either brief.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -161,7 +162,7 @@ afterEach(async () => {
 });
 
 describe("`bob run` with a launcher pr_ref", () => {
-  it("round N writes, round N+1 recalls before the first request", async () => {
+  it("round N writes, round N+1 recalls", async () => {
     const stub = await startMemoryStub();
     stubs.push(stub);
     scaffold(root, stub.url, keyFile);
