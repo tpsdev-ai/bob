@@ -583,6 +583,42 @@ describe("K5 — registration refusal under each fixture name + the post-service
     });
   }
 
+  for (const target of ["provider", "stream", "streamSimple"] as const) {
+    it(`the post-services assertion catches a replaced effective ${target}`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const { result } = await buildFixtureSession("fxk5effective", registry);
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const registered = rt.getRegisteredProviderConfig(RUNTIME)!;
+        const expected = { ...registered } as ReturnType<typeof registerKeyedProvider>;
+        const input = { row: fixtureRow(registry), model: MODEL, expected, apiKey: PLACEHOLDER };
+        await assertKeyedRuntimeUnchanged(rt, input);
+        const effective = rt.getProvider(RUNTIME)!;
+        if (target === "provider") {
+          (
+            rt as unknown as { models: { setProvider(p: typeof effective): void } }
+          ).models.setProvider({
+            ...effective,
+          });
+        } else {
+          effective[target] = (() => {
+            throw new Error(`replaced effective ${target}`);
+          }) as never;
+          const message = await rt[target](rt.getModel(RUNTIME, MODEL)!, CTX as never).result();
+          expect(message.errorMessage).toContain(`replaced effective ${target}`);
+        }
+        expect(rt.getRegisteredProviderConfig(RUNTIME)).toBe(registered);
+        expect(registered).toEqual(expected);
+        await expect(assertKeyedRuntimeUnchanged(rt, input)).rejects.toThrow(
+          `the effective ${target} does not match`,
+        );
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+      }
+    });
+  }
+
   it("the post-services assertion catches a replaced key", async () => {
     const registry = fixtureRegistry();
     const { piDir } = scaffold("fxk5b", registry);

@@ -1009,8 +1009,8 @@ bob's closures and injected at the transport, which sends only to the row's cano
 and refuses redirects, supplied Authorization headers, non-canonical URLs, `Request` objects and
 deferred requests before pi resolves auth (`keyed-transport-186-s3a.test.ts` (K1)–(K3), (K9)).
 Replacement sessions reuse custody without re-reading the environment (K6). Before loading agent
-code, the factory deletes pi credential env names other than the selected keyed variable,
-including the selected keyless runtime's credentials, from the agent environment.
+code, the factory deletes the environment names in `PI_CREDENTIAL_TABLE`, including those
+listed for the selected keyless runtime, except the selected keyed variable.
 
 **The writers check first.** `bob init` (including `--force`), `bob hire` and `bob models` run the
 reserved-name check over BOTH pi files before their first write, and refuse when a bob-owned keyed

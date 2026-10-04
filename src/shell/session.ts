@@ -514,10 +514,43 @@ export function assertNoOnDiskOpenrouter(
   assertNoReservedProviderEntries(piAgentDir, reserved);
 }
 
-/**
- * After services are built, check the selected model and registered endpoint/API,
- * the registered transport function and the resolved placeholder key.
- */
+type EffectiveKeyedProvider = NonNullable<ReturnType<ModelRuntime["getProvider"]>>;
+const keyedRuntimeTransports = new WeakMap<
+  ModelRuntime,
+  Map<
+    string,
+    {
+      provider: EffectiveKeyedProvider;
+      stream: EffectiveKeyedProvider["stream"];
+      streamSimple: EffectiveKeyedProvider["streamSimple"];
+    }
+  >
+>();
+
+function captureKeyedRuntimeTransport(
+  modelRuntime: ModelRuntime,
+  providerId: string,
+  rowId: string,
+): void {
+  const effective = modelRuntime.getProvider(providerId);
+  if (!effective) {
+    throw new Error(
+      `bob: refusing provider row "${rowId}" — no effective provider after registration.`,
+    );
+  }
+  let transports = keyedRuntimeTransports.get(modelRuntime);
+  if (!transports) {
+    transports = new Map();
+    keyedRuntimeTransports.set(modelRuntime, transports);
+  }
+  transports.set(providerId, {
+    provider: effective,
+    stream: effective.stream,
+    streamSimple: effective.streamSimple,
+  });
+}
+
+/** Check the keyed model, registration, effective transport and placeholder after services. */
 export async function assertKeyedRuntimeUnchanged(
   modelRuntime: ModelRuntime,
   input: { row: KeyedRow; model: string; expected: OpenrouterProviderConfig; apiKey: string },
@@ -552,6 +585,17 @@ export async function assertKeyedRuntimeUnchanged(
     if (m0 && m0.baseUrl !== undefined) {
       problems.push("the model entry carries a per-model baseUrl");
     }
+  }
+  const effective = modelRuntime.getProvider?.(providerId);
+  const captured = keyedRuntimeTransports.get(modelRuntime)?.get(providerId);
+  if (!effective || !captured || effective !== captured.provider) {
+    problems.push("the effective provider does not match");
+  }
+  if (!effective || !captured || effective.stream !== captured.stream) {
+    problems.push("the effective stream does not match");
+  }
+  if (!effective || !captured || effective.streamSimple !== captured.streamSimple) {
+    problems.push("the effective streamSimple does not match");
   }
   // The key pi holds: pi holds ONLY the NON-SECRET placeholder; the real key
   // lives in the transport. STRICT: a resolution that throws ANY value —
@@ -693,6 +737,7 @@ export function registerKeyedProvider(
     apiKey: input.apiKey ?? takeProviderKey(input.row.variable, input.row.id, input.env),
   });
   modelRuntime.registerProvider(input.row.runtime, provider);
+  captureKeyedRuntimeTransport(modelRuntime, input.row.runtime, input.row.id);
   return provider;
 }
 
@@ -1526,8 +1571,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
       // the runtime's registration verbs so a LATER registerProvider(runtime)
       // — from session_start, before_agent_start, or a print-mode bind — is
-      // refused BEFORE it takes effect. (Refresh is deliberately NOT wrapped;
-      // see guardProviderRegistration.)
+      // refused BEFORE it takes effect.
       guardProviderRegistration(
         modelRuntime,
         reservedProviderNames(input.registry),
@@ -1538,27 +1582,41 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // output cap) wherever pi looks it up — here, on a restored session, and when
     // pi refreshes the session's model.
     applyModelLimits(modelRuntime, limits);
-    const services = await createAgentSessionServices({
-      cwd,
-      agentDir,
-      settingsManager: isolatedSettings(compaction, row?.request),
-      modelRuntime,
-      resourceLoaderOptions: isolatedLoaderOptions(
-        { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
-        {
-          ...(guard !== undefined ? { guard } : {}),
-          ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
-          ...(webSession ? { webSession: true } : {}),
-        },
-      ),
-    });
+    const originalRefresh = modelRuntime.refresh;
+    if (keyedRow !== undefined) {
+      const selected = keyedRow;
+      modelRuntime.refresh = async (options) => {
+        const refreshed = await originalRefresh.call(modelRuntime, options);
+        captureKeyedRuntimeTransport(modelRuntime, selected.runtime, selected.id);
+        return refreshed;
+      };
+    }
+    let services: Awaited<ReturnType<typeof createAgentSessionServices>>;
+    try {
+      services = await createAgentSessionServices({
+        cwd,
+        agentDir,
+        settingsManager: isolatedSettings(compaction, row?.request),
+        modelRuntime,
+        resourceLoaderOptions: isolatedLoaderOptions(
+          { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
+          {
+            ...(guard !== undefined ? { guard } : {}),
+            ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
+            ...(webSession ? { webSession: true } : {}),
+          },
+        ),
+      });
+    } finally {
+      modelRuntime.refresh = originalRefresh;
+    }
     // bob asked for these extensions explicitly: a declared capability whose
     // extension did not load is not an optional nicety.
     assertCapabilitiesLoaded(services.resourceLoader, config);
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
-    // Check the keyed model, registered transport and placeholder after services.
+    // Check the keyed model, effective transport and placeholder after services.
     if (keyedProvider !== undefined && keyedRow !== undefined) {
       await assertKeyedRuntimeUnchanged(modelRuntime as ModelRuntime, {
         row: keyedRow,
