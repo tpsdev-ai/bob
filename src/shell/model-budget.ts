@@ -143,15 +143,27 @@ const LIMITS_MARK = Symbol.for("bob.modelLimits");
  * everywhere pi looks it up: session creation, a restored session, and pi's
  * refresh after an extension registers a provider. Wraps the runtime's
  * `getModel` once; a second call replaces the limits it applies.
+ *
+ * bob#306: `turnOutputCap` is a keyless row's per-turn budget. The model's
+ * `maxTokens` becomes the smaller of it and the output cap the model has
+ * without it, when it has one (`provider.max_output_tokens`, else the model's
+ * own `maxTokens`).
  */
-export function applyModelLimits(runtime: object, limits: ModelLimits): void {
-  const target = runtime as ModelLookup & { [LIMITS_MARK]?: { limits: ModelLimits } };
+export function applyModelLimits(
+  runtime: object,
+  limits: ModelLimits,
+  turnOutputCap?: number,
+): void {
+  const target = runtime as ModelLookup & {
+    [LIMITS_MARK]?: { limits: ModelLimits; turnOutputCap: number | undefined };
+  };
   const existing = target[LIMITS_MARK];
   if (existing) {
     existing.limits = limits;
+    existing.turnOutputCap = turnOutputCap;
     return;
   }
-  const state = { limits };
+  const state = { limits, turnOutputCap };
   target[LIMITS_MARK] = state;
   const original = target.getModel.bind(target);
   target.getModel = (provider: string, modelId: string) => {
@@ -160,10 +172,17 @@ export function applyModelLimits(runtime: object, limits: ModelLimits): void {
     if (model === undefined || model === null || provider !== l.provider || modelId !== l.model) {
       return model;
     }
+    const modelCap = l.maxOutputTokens ?? (model as { maxTokens?: unknown }).maxTokens;
+    const maxTokens =
+      state.turnOutputCap === undefined
+        ? l.maxOutputTokens
+        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
+          ? Math.min(state.turnOutputCap, modelCap)
+          : state.turnOutputCap;
     return {
       ...(model as object),
       contextWindow: l.contextWindow,
-      ...(l.maxOutputTokens !== undefined ? { maxTokens: l.maxOutputTokens } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
     };
   };
 }

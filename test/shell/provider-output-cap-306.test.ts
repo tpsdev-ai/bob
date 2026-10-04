@@ -1,0 +1,285 @@
+// bob#306 — one effective output cap for a keyless row. The session factory
+// folds the row's per-turn budget into the model's maxTokens, so the request's
+// max_tokens, pi's length-stop handling, bob's output backstop and the run
+// log's outputCap read one number.
+//
+// Each case runs a real factory session against a fake OpenAI-compatible server
+// on loopback (no network leaves the host).
+
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { initAgent } from "../../src/shell/init.js";
+import { OUTPUT_CAP_MARK } from "../../src/shell/model-budget.js";
+import { PROVIDER_RECORDS, ProviderRegistry } from "../../src/shell/provider-registry.js";
+import type { ProviderTurnBudget } from "../../src/shell/provider-turn-budget.js";
+import { resolveRunConfig, runAgent } from "../../src/shell/run.js";
+import { createBobRuntimeFactory } from "../../src/shell/session.js";
+
+const piece = (i: number) => `t${i} `;
+const pieces = (n: number) => Array.from({ length: n }, (_, i) => piece(i)).join("");
+const sse = (payload: unknown) =>
+  `data: ${JSON.stringify({ id: "1", ...(payload as object) })}\n\n`;
+
+interface CapServer {
+  url: string;
+  bodies: Record<string, unknown>[];
+  close(): Promise<void>;
+}
+
+/** A fake OpenAI-compatible SSE server on loopback. Each request streams up to
+ *  `total` one-token content pieces. "ignore" streams all of them whatever the
+ *  request's cap; "obey" stops at the request's cap with finish_reason "length"
+ *  and reports that many completion tokens. With `longFirst`, the first request
+ *  instead gets 200 long pieces ending "stop", so the session has context that
+ *  pi could compact. */
+async function capServer(
+  mode: "ignore" | "obey",
+  total: number,
+  opts: { longFirst?: boolean } = {},
+): Promise<CapServer> {
+  const sockets = new Set<Socket>();
+  const bodies: Record<string, unknown>[] = [];
+  const server: Server = createServer((req, res) => {
+    res.on("error", () => {});
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      bodies.push(body);
+      const long = opts.longFirst === true && bodies.length === 1;
+      const requested = body.max_tokens ?? body.max_completion_tokens;
+      const cap = typeof requested === "number" ? requested : total;
+      const n = long ? 200 : mode === "obey" ? Math.min(total, cap) : total;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      for (let i = 0; i < n; i++) {
+        if (res.destroyed) return;
+        const content = long ? `${piece(i)}${"x".repeat(600)} ` : piece(i);
+        res.write(sse({ choices: [{ index: 0, delta: { content }, finish_reason: null }] }));
+        if (i % 50 === 49) await new Promise((r) => setTimeout(r, 1));
+      }
+      if (res.destroyed) return;
+      res.write(
+        sse({
+          choices: [
+            { index: 0, delta: {}, finish_reason: long || n === total ? "stop" : "length" },
+          ],
+          usage: { prompt_tokens: 7, completion_tokens: n, total_tokens: n + 7 },
+        }),
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no server address");
+  return {
+    url: `http://127.0.0.1:${address.port}/v1`,
+    bodies,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      sockets.clear();
+      server.closeAllConnections?.();
+      await Promise.race([
+        new Promise<void>((resolve) => server.close(() => resolve())),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    },
+  };
+}
+
+interface Setup {
+  budget?: ProviderTurnBudget;
+  /** bob.yaml provider.max_output_tokens. */
+  maxOutputTokens?: number;
+  /** models.json maxTokens (the scaffold writes 16384). */
+  modelMaxTokens?: number;
+}
+
+interface AssistantLike {
+  role: string;
+  stopReason?: string;
+  content?: Array<{ type: string; text?: string }>;
+  [key: string]: unknown;
+}
+
+const text = (message: AssistantLike | undefined) =>
+  (message?.content ?? []).map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("");
+
+describe("bob#306 — one effective output cap for a keyless row", () => {
+  let root: string;
+  let servers: CapServer[];
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bob-306-"));
+    servers = [];
+  });
+  afterEach(async () => {
+    for (const server of servers) await server.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  async function serve(
+    mode: "ignore" | "obey",
+    total: number,
+    opts: { longFirst?: boolean } = {},
+  ): Promise<CapServer> {
+    const server = await capServer(mode, total, opts);
+    servers.push(server);
+    return server;
+  }
+
+  function scaffold(endpoint: string, setup: Setup) {
+    const row = {
+      id: "fake-local",
+      aliases: [],
+      runtime: "fake-local",
+      auth: { kind: "none" as const },
+      endpoint,
+      api: "openai-completions" as const,
+      override: {},
+      ...(setup.budget !== undefined ? { budget: setup.budget } : {}),
+    };
+    const registry = new ProviderRegistry([...PROVIDER_RECORDS, row]);
+    const agentsRoot = join(root, "agents");
+    const { agentDir } = initAgent({
+      name: "agent-a",
+      role: "ea",
+      provider: "fake-local",
+      model: "m",
+      contextWindow: 262_144,
+      agentsRoot,
+      flairKeysDir: join(root, "keys"),
+      skipFlair: true,
+      registry,
+    });
+    // No capabilities (so no Flair call), no tools, and the output cap under test.
+    const yamlPath = join(agentDir, "bob.yaml");
+    const yaml = readFileSync(yamlPath, "utf8");
+    const tools = yaml.indexOf("\ntools:\n");
+    const window = "  context_window: 262144\n";
+    if (tools < 0 || !yaml.includes(window)) throw new Error("unexpected scaffolded bob.yaml");
+    const cap =
+      setup.maxOutputTokens !== undefined ? `  max_output_tokens: ${setup.maxOutputTokens}\n` : "";
+    writeFileSync(
+      yamlPath,
+      `${yaml.slice(0, tools).replace(window, `${window}${cap}`)}\ntools:\n  allow: []\n`,
+    );
+    if (setup.modelMaxTokens !== undefined) {
+      const modelsPath = join(agentDir, ".pi-agent", "models.json");
+      const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+      models.providers["fake-local"].models[0].maxTokens = setup.modelMaxTokens;
+      writeFileSync(modelsPath, `${JSON.stringify(models)}\n`);
+    }
+    // As provider-timeouts-185.test.ts does: a placeholder for pi's prompt-time
+    // auth check. The keyless transport never sends it.
+    writeFileSync(
+      join(agentDir, ".pi-agent", "auth.json"),
+      JSON.stringify({ "fake-local": { type: "api_key", key: "fixture-placeholder" } }),
+    );
+    return { registry, agentsRoot, agentDir };
+  }
+
+  async function sessionFor(endpoint: string, setup: Setup) {
+    const { registry, agentsRoot } = scaffold(endpoint, setup);
+    const { config, policy } = resolveRunConfig({ name: "agent-a", agentsRoot, registry });
+    const { session } = await createBobRuntimeFactory({
+      config,
+      policy,
+      registry,
+      deps: { log: () => {}, exit: () => {} },
+    })({ sessionManager: SessionManager.inMemory(config.cwd) });
+    const events: string[] = [];
+    session.subscribe((event) => {
+      events.push(event.type);
+    });
+    const assistants = () =>
+      (session.messages as unknown as AssistantLike[]).filter((m) => m.role === "assistant");
+    return { session, events, assistants };
+  }
+
+  it("a server that ignores the cap: the request carries the budget and bob ends the stream after that many pieces", async () => {
+    const server = await serve("ignore", 1_000);
+    const { session, assistants } = await sessionFor(server.url, {
+      budget: { maxOutputTokens: 256, reasoning: "off" },
+    });
+    try {
+      await session.prompt("go");
+      expect(server.bodies.map((body) => body.max_tokens)).toEqual([256]);
+      const reply = assistants().at(-1);
+      expect(reply?.stopReason).toBe("length");
+      expect(reply?.[OUTPUT_CAP_MARK]).toBe(true);
+      expect(text(reply)).toBe(pieces(256));
+      expect(session.model?.maxTokens).toBe(256);
+    } finally {
+      session.dispose();
+    }
+  }, 20_000);
+
+  it("a lower provider max_output_tokens wins in the request, the backstop and the run log", async () => {
+    const server = await serve("ignore", 1_000);
+    const { registry, agentsRoot, agentDir } = scaffold(server.url, {
+      budget: { maxOutputTokens: 512, reasoning: "off" },
+      maxOutputTokens: 300,
+    });
+    const result = await runAgent({
+      name: "agent-a",
+      prompt: "go",
+      agentsRoot,
+      registry,
+      captureStdout: true,
+    });
+    expect(server.bodies.length).toBeGreaterThan(0);
+    for (const body of server.bodies) expect(body.max_tokens).toBe(300);
+    const runsDir = join(agentDir, "runs");
+    const file = readdirSync(runsDir).find((f) => f.endsWith(".jsonl"));
+    if (file === undefined) throw new Error("no run log");
+    const usage = readFileSync(join(runsDir, file), "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => (JSON.parse(line) as { requestUsage?: Record<string, unknown> }).requestUsage)
+      .find((record) => record !== undefined);
+    expect(usage?.stopReason).toBe("length");
+    expect(usage?.outputCapped).toBe(true);
+    expect(usage?.completionTokens).toBe(300);
+    expect(usage?.outputCap).toBe(300);
+    expect(result.stdout?.startsWith(pieces(300))).toBe(true);
+    expect(result.stdout?.includes(piece(300))).toBe(false);
+  }, 30_000);
+
+  const budget: Setup = { budget: { maxOutputTokens: 256, reasoning: "off" } };
+  const control: Setup = { modelMaxTokens: 256 };
+  it.each([
+    { cap: "the row's budget", setup: budget, long: false },
+    { cap: "the row's budget", setup: budget, long: true },
+    { cap: "the model's own maxTokens (control)", setup: control, long: false },
+    { cap: "the model's own maxTokens (control)", setup: control, long: true },
+  ])(
+    "a server that obeys the cap from $cap (long session: $long): the length stop stays in agent state, one request per prompt, no compaction",
+    async ({ setup, long }) => {
+      const server = await serve("obey", 1_000, { longFirst: long });
+      const { session, events, assistants } = await sessionFor(server.url, setup);
+      try {
+        if (long) await session.prompt("first");
+        await session.prompt("go");
+        expect(server.bodies.length).toBe(long ? 2 : 1);
+        expect(events.filter((type) => type.startsWith("compaction"))).toEqual([]);
+        expect(assistants().map((m) => m.stopReason)).toEqual(
+          long ? ["stop", "length"] : ["length"],
+        );
+        expect(text(assistants().at(-1))).toBe(pieces(256));
+      } finally {
+        session.dispose();
+      }
+    },
+    20_000,
+  );
+});

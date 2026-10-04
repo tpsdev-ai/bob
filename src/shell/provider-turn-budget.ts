@@ -13,8 +13,10 @@
 //     thinking levels, so pi hands each provider the level in that provider's
 //     own request shape (for the OpenAI-compatible adapter, `reasoning_effort`).
 //
-// A budget is only valid on a `bob/none` row: bob applies it on the keyless
-// transport (base-url-transport.ts), and nowhere else. The row owns the values;
+// A budget is only valid on a `bob/none` row: bob applies it to that row's
+// session only. The session factory folds the cap into the model's output cap
+// (bob#306); the keyless transport (base-url-transport.ts) sets the cap's wire
+// field and the level. The row owns the values;
 // this module owns the bounds and the mode set (validated at load by
 // provider-registry.ts).
 

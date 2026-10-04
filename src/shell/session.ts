@@ -1332,8 +1332,13 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     }
     // bob#214: the configured pair resolves with the configured window (and
     // output cap) wherever pi looks it up — here, on a restored session, and when
-    // pi refreshes the session's model.
-    applyModelLimits(modelRuntime, limits);
+    // pi refreshes the session's model. bob#306: a keyless row's budget folds
+    // into that output cap, so every reader of the model's maxTokens uses it.
+    applyModelLimits(
+      modelRuntime,
+      limits,
+      row?.auth.kind === "none" ? row.budget?.maxOutputTokens : undefined,
+    );
     const services = await createAgentSessionServices({
       cwd,
       agentDir,

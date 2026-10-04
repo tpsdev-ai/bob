@@ -1,0 +1,1 @@
+- **A keyless row's budget folds into the session model's output cap (bob#306).** The session factory sets the model's `maxTokens` to the smaller of the row's `maxOutputTokens` and `provider.max_output_tokens` (or the model's own `maxTokens`), so a turn's `max_tokens`, bob's output backstop, pi's length-stop check and the run log's `outputCap` all read it.

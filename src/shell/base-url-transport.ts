@@ -76,17 +76,12 @@ export function installBaseUrlTransport(
             timeoutError = error;
             controller.abort(error);
           });
-    // bob#185 item 2: the row's per-turn budget replaces the request's output
-    // cap and thinking level; a lower per-agent output cap (model.maxTokens)
-    // still wins. The row's keyless model is scaffolded non-reasoning, so a
-    // budget marks it reasoning-capable for pi to send the level.
-    const modelCap = (model as { maxTokens?: unknown }).maxTokens;
-    const turnCap =
-      budget === undefined
-        ? undefined
-        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
-          ? Math.min(budget.maxOutputTokens, modelCap)
-          : budget.maxOutputTokens;
+    // bob#185 item 2: the row's per-turn budget sets the request's thinking
+    // level and names `max_tokens` as its output-cap field. This transport
+    // leaves the cap to pi; the session factory folds the budget into the
+    // model's maxTokens (bob#306). The row's keyless model is scaffolded
+    // non-reasoning, so a budget marks it reasoning-capable for pi to send the
+    // level.
     const delegateModel =
       budget === undefined
         ? { ...model, headers: undefined }
@@ -108,7 +103,6 @@ export function installBaseUrlTransport(
         : {}),
       ...(budget !== undefined
         ? {
-            maxTokens: turnCap,
             reasoning: budget.reasoning,
             reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
           }

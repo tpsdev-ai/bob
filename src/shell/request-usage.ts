@@ -49,8 +49,9 @@ export interface RequestUsageRecord {
    *  then not the provider's: its usage never arrived, so the prompt counts are
    *  0 and completionTokens is the cap bob assigned, a lower bound. */
   outputCapped?: true;
-  /** The selected row's budget.maxOutputTokens (bob#185 item 2), present only
-   *  on a request whose stopReason is "length". */
+  /** The session model's output cap when the selected row declares a budget
+   *  (bob#185 item 2, bob#306), present only on a request whose stopReason is
+   *  "length". */
   outputCap?: number;
 }
 
