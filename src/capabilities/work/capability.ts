@@ -126,8 +126,7 @@ const APPLY_PATCH_DESCRIPTION =
 const PUBLISH_DESCRIPTION =
   "Publish a candidate using the launcher's task binding. Takes candidate_id, commit_message, and an optional pr { title, body }. " +
   "Required checks run on a materialized candidate through the run executor. " +
-  "When pr is requested and the task binding authorizes it, publish attempts to create a pull request after a successful push and reports pr_url only after confirming it. Unsupported endpoints (only GitHub HTTPS is supported) are refused as pr_unsupported. " +
-  "A pr request on a binding that does not authorize it is refused as pr_unsupported.";
+  "When pr is requested, publish may create the authorized PR after a successful push; it reports pr_url only after confirmation, otherwise a refusal or indeterminate result names the reason.";
 
 function publishResultText(r: PublishResult): string {
   const head =

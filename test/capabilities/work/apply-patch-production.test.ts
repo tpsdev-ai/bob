@@ -134,6 +134,8 @@ function setup(): Setup {
 interface RunResult {
   tools: string[];
   details: Record<string, unknown>;
+  executedArgs?: Record<string, unknown>;
+  parameters?: unknown;
 }
 
 function sessionYaml(toolName: string): string {
@@ -209,6 +211,15 @@ async function runSession(
     agentDir: piAgentDir,
     sessionManager: SessionManager.inMemory(cwd),
   });
+  const tool = runtime.session.agent.state.tools.find((tool) => tool.name === toolName);
+  let executedArgs: Record<string, unknown> | undefined;
+  if (tool) {
+    const execute = tool.execute;
+    tool.execute = async (...input) => {
+      executedArgs = input[1];
+      return execute(...input);
+    };
+  }
   let details: Record<string, unknown> = {};
   runtime.session.subscribe((event: unknown) => {
     const e = event as { type?: string; result?: { details?: Record<string, unknown> } };
@@ -217,7 +228,7 @@ async function runSession(
   try {
     const active = runtime.session.getActiveToolNames().slice().sort();
     await runtime.session.prompt("go", { expandPromptTemplates: false });
-    return { tools: active, details };
+    return { tools: active, details, executedArgs, parameters: tool?.parameters };
   } finally {
     await runtime.dispose();
   }
@@ -299,6 +310,48 @@ describe("apply_patch through the production session path (bob#275, S2a)", () =>
 });
 
 describe("publish through the production session path", () => {
+  it("carries authorized pr fields through pi validation and refuses unauthorized pr requests", async () => {
+    const s: Setup = {
+      scratch,
+      repo: join(scratch, "repo"),
+      base: "a".repeat(40),
+      artifactRoot: join(scratch, "artifacts"),
+      patch: Buffer.from(""),
+      tree: "b".repeat(40),
+    };
+    mkdirSync(s.repo);
+    const binding: TaskBinding = {
+      task_id: "task-pr",
+      publication_id: "pub-pr",
+      repository: s.repo,
+      workspace: s.repo,
+      base_oid: s.base,
+      mode: "build",
+      artifact_root: s.artifactRoot,
+      declared_paths: ["a.txt"],
+      check_commands: [],
+      destination: { remote: "origin", ref: "refs/heads/topic" },
+      pr: { base: "main", head: "topic" },
+    };
+    const args = {
+      candidate_id: "a".repeat(40),
+      commit_message: "publish from pi",
+      pr: { title: "PR title from pi", body: "PR body from pi" },
+    };
+    const authorized = await runSession(s, args, binding, "publish");
+    expect(authorized.tools).toContain("publish");
+    expect(authorized.parameters).toHaveProperty("properties.pr.properties.title");
+    expect(authorized.parameters).toHaveProperty("properties.pr.properties.body");
+    expect(authorized.executedArgs).toEqual(args);
+    expect(authorized.details.reason).toBe("candidate_unknown");
+
+    const { pr: _pr, ...unauthorizedBinding } = binding;
+    const unauthorized = await runSession(s, args, unauthorizedBinding, "publish");
+    expect(unauthorized.executedArgs?.pr).toEqual(args.pr);
+    expect(unauthorized.details.status).toBe("refused");
+    expect(unauthorized.details.reason).toBe("pr_unsupported");
+  }, 30_000);
+
   it("loads publish and refuses authority supplied by arguments or writable bob.yaml", async () => {
     const s: Setup = {
       scratch,

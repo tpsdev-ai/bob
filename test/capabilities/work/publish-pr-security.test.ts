@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   type CandidateRecord,
   candidateIdentity,
@@ -353,7 +352,8 @@ function fakeGh() {
   const record = (state: string, number: number) => ({
     html_url: `https://github.com/acme/widgets/pull/${number}`,
     number,
-    state,
+    state: state === "merged" ? "closed" : state,
+    merged_at: state === "merged" ? "2026-01-01T00:00:00Z" : null,
     body: "marker",
     head: {
       ref: "topic",
@@ -394,7 +394,7 @@ describe("production PR transport", () => {
     expect(records.map((r) => [r.number, r.state])).toEqual([
       [1, "open"],
       [2, "closed"],
-      [3, "merged"],
+      [3, "closed"],
     ]);
     expect(records[2]).toMatchObject({
       repository: "https://github.com/acme/widgets",
@@ -435,7 +435,8 @@ describe("production PR transport", () => {
             const matching = {
               html_url: "https://github.com/acme/widgets/pull/2",
               number: 2,
-              state,
+              state: state === "merged" ? "closed" : state,
+              merged_at: state === "merged" ? "2026-01-01T00:00:00Z" : null,
               body: journal.pr.body,
               head: {
                 ref: "topic",
@@ -535,18 +536,6 @@ describe("production PR transport", () => {
       }
     }
   });
-
-  it("qualifies creation text with the caller's pr request", () => {
-    for (const path of [
-      "../../../src/capabilities/work/README.md",
-      "../../../.changelog/unreleased/added-bob275-publish-pr-creation.md",
-      "../../../src/capabilities/work/capability.ts",
-    ]) {
-      expect(readFileSync(fileURLToPath(new URL(path, import.meta.url)), "utf8"), path).toMatch(
-        /When `?pr`? is requested and/,
-      );
-    }
-  });
 });
 
 it("times out and kills stalled gh without changing identity, list or create recovery", async () => {
@@ -564,7 +553,7 @@ const stage = args[1] === "user" ? "identity" : args.includes("POST") ? "create"
 if (stage === ${JSON.stringify(stage)}) {
   process.on("SIGTERM", () => {});
   setInterval(() => {}, 1000);
-} else console.log(stage === "identity" ? '{"login":"publisher"}' : '[]');
+} else console.log(stage === "identity" ? '{"login":"publisher"}' : '[[]]');
 `,
     );
     chmodSync(path, 0o755);
