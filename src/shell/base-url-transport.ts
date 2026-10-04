@@ -3,6 +3,7 @@ import {
   stream as openaiStream,
   streamSimple as openaiStreamSimple,
 } from "@earendil-works/pi-ai/api/openai-completions";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type ProviderRequestPolicy,
@@ -10,7 +11,13 @@ import {
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
-import type { ProviderTurnBudget } from "./provider-turn-budget.js";
+import {
+  boundedOutputCap,
+  boundPayloadCap,
+  type ProviderTurnBudget,
+} from "./provider-turn-budget.js";
+
+type PayloadHook = (payload: unknown, model: unknown) => unknown;
 
 export const BASE_URL_PLACEHOLDER = "bob-base-url-placeholder-not-a-secret";
 
@@ -29,6 +36,13 @@ export function installBaseUrlTransport(
     }
     return originalAuth(selected as never, options);
   }) as ModelRuntime["getAuth"];
+  // pi's prompt() checks for configured auth before it sends; the keyless
+  // row's auth is supplied here, not by a stored credential.
+  const originalCheckAuth = runtime.checkAuth.bind(runtime);
+  runtime.checkAuth = async (providerId, options) =>
+    providerId === provider
+      ? { type: "api_key", source: "bob" }
+      : originalCheckAuth(providerId, options);
   const originalRefresh = runtime.refresh.bind(runtime);
   runtime.refresh = (options) => originalRefresh({ ...options, allowNetwork: false });
   const baseFetch = globalThis.fetch;
@@ -76,17 +90,23 @@ export function installBaseUrlTransport(
             timeoutError = error;
             controller.abort(error);
           });
-    // bob#185 item 2: the row's per-turn budget replaces the request's output
-    // cap and thinking level; a lower per-agent output cap (model.maxTokens)
-    // still wins. The row's keyless model is scaffolded non-reasoning, so a
-    // budget marks it reasoning-capable for pi to send the level.
-    const modelCap = (model as { maxTokens?: unknown }).maxTokens;
-    const turnCap =
+    // bob#185 item 2: the row's per-turn budget sets the request's thinking
+    // level and names `max_tokens` as its output-cap field. The row's keyless
+    // model is scaffolded non-reasoning, so a budget marks it reasoning-capable
+    // for pi to send the level.
+    // bob#306: with a budget, the request body's output cap is at most
+    // boundedOutputCap clamped to the room left in the context window, the cap
+    // bob's backstop counts against. It is applied to the final body, after the
+    // caller's sampling parameters and payload hook (boundPayloadCap).
+    const maxTokens =
       budget === undefined
         ? undefined
-        : typeof modelCap === "number" && Number.isFinite(modelCap) && modelCap > 0
-          ? Math.min(budget.maxOutputTokens, modelCap)
-          : budget.maxOutputTokens;
+        : clampMaxTokensToContext(
+            model,
+            context,
+            boundedOutputCap(budget.maxOutputTokens, model.maxTokens, supplied.maxTokens),
+          );
+    const callerPayload = supplied.onPayload as PayloadHook | undefined;
     const delegateModel =
       budget === undefined
         ? { ...model, headers: undefined }
@@ -106,9 +126,13 @@ export function installBaseUrlTransport(
       ...(request !== undefined
         ? { timeoutMs: 2_147_483_647, maxRetries: request.maxRetries, signal: controller.signal }
         : {}),
-      ...(budget !== undefined
+      ...(budget !== undefined && maxTokens !== undefined
         ? {
-            maxTokens: turnCap,
+            maxTokens,
+            onPayload: async (payload: unknown, payloadModel: unknown) => {
+              const returned = await callerPayload?.(payload, payloadModel);
+              return boundPayloadCap(returned === undefined ? payload : returned, maxTokens);
+            },
             reasoning: budget.reasoning,
             reasoningEffort: budget.reasoning === "off" ? undefined : budget.reasoning,
           }

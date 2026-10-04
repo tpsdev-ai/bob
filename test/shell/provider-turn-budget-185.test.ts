@@ -15,8 +15,7 @@ import { createServer, type Server } from "node:http";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { installBaseUrlTransport } from "../../src/shell/base-url-transport.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../src/shell/init.js";
 import {
   loadProviderRegistry,
@@ -24,7 +23,13 @@ import {
   ProviderRegistry,
 } from "../../src/shell/provider-registry.js";
 import { createRequestUsageTracker } from "../../src/shell/request-usage.js";
-import { type RunSession, type RunSessionFactory, runAgent } from "../../src/shell/run.js";
+import {
+  type RunSession,
+  type RunSessionFactory,
+  resolveRunConfig,
+  runAgent,
+} from "../../src/shell/run.js";
+import { createBobRuntimeFactory } from "../../src/shell/session.js";
 
 const SSE_CHUNK = (content: string, finish: string | null) =>
   `data: ${JSON.stringify({
@@ -200,17 +205,15 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
     rmSync(keysRoot, { recursive: true, force: true });
   });
 
-  const context = {
-    messages: [{ role: "user" as const, content: "hi", timestamp: 0 }],
-  };
-
+  // bob#306: through the session factory, as `bob run` builds a session, so the
+  // factory's wiring of the row is what these assertions cover.
   async function run(
     keyless: {
       id: string;
       budget?: { maxOutputTokens: number; reasoning: string };
     },
     opts: { modelMaxTokens?: number } = {},
-  ): Promise<Record<string, unknown>> {
+  ): Promise<{ body: Record<string, unknown>; modelMaxTokens: unknown }> {
     const row = {
       id: keyless.id,
       aliases: [],
@@ -222,8 +225,9 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       ...(keyless.budget !== undefined ? { budget: keyless.budget as never } : {}),
     };
     const registry = new ProviderRegistry([...PROVIDER_RECORDS, row as never]);
+    const name = `bot-${keyless.id}`;
     const result = initAgent({
-      name: `bot-${keyless.id}`,
+      name,
       role: "ea",
       provider: keyless.id,
       model: "m",
@@ -233,27 +237,32 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       skipFlair: true,
       registry,
     });
-    const modelsPath = join(result.agentDir, ".pi-agent", "models.json");
+    const piDir = join(result.agentDir, ".pi-agent");
     if (opts.modelMaxTokens !== undefined) {
+      const modelsPath = join(piDir, "models.json");
       const models = JSON.parse(readFileSync(modelsPath, "utf8"));
       models.providers[row.runtime].models[0].maxTokens = opts.modelMaxTokens;
       writeFileSync(modelsPath, `${JSON.stringify(models)}\n`);
     }
-    const runtime = await ModelRuntime.create({
-      authPath: join(result.agentDir, ".pi-agent", "auth.json"),
-      modelsPath,
-    });
-    installBaseUrlTransport(
-      runtime,
-      row.runtime,
-      servers[0].url,
-      registry.find(row.id)?.request,
-      registry.find(row.id)?.budget,
+    // As provider-timeouts-185.test.ts does: a placeholder for pi's prompt-time
+    // auth check. The keyless transport never sends it.
+    writeFileSync(
+      join(piDir, "auth.json"),
+      JSON.stringify({ [row.runtime]: { type: "api_key", key: "fixture-placeholder" } }),
     );
-    const model = runtime.getModel(row.runtime, "m");
-    if (model === undefined) throw new Error("model not found");
-    await runtime.streamSimple(model, context as never, {} as never).result();
-    return servers[0].bodies[servers[0].bodies.length - 1];
+    const { config, policy } = resolveRunConfig({ name, agentsRoot: root, registry });
+    const { session } = await createBobRuntimeFactory({ config, policy, registry })({
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
+    try {
+      await session.prompt("hi");
+      return {
+        body: servers[0].bodies[servers[0].bodies.length - 1],
+        modelMaxTokens: session.model?.maxTokens,
+      };
+    } finally {
+      session.dispose();
+    }
   }
 
   it("a local row's request carries the declared cap and level; a row with no budget is unchanged", async () => {
@@ -264,15 +273,18 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       budget: { maxOutputTokens: 4_096, reasoning: "low" },
     });
     const plain = await run({ id: "fake-plain" });
-    // The local row's request carries the declared setting ...
-    expect(budgeted.max_tokens).toBe(4_096);
-    expect(budgeted.max_completion_tokens).toBeUndefined();
-    expect(budgeted.reasoning_effort).toBe("low");
+    // The local row's request carries the declared setting, and the session's
+    // model carries the same cap ...
+    expect(budgeted.body.max_tokens).toBe(4_096);
+    expect(budgeted.body.max_completion_tokens).toBeUndefined();
+    expect(budgeted.body.reasoning_effort).toBe("low");
+    expect(budgeted.modelMaxTokens).toBe(4_096);
     // ... while a row without a budget (the cloud shape) is unchanged: no
     // reasoning directive, no lowered cap, and no field forced.
-    expect(plain.max_tokens).toBeUndefined();
-    expect(plain.reasoning_effort).toBeUndefined();
-    expect(plain.max_completion_tokens).toBe(16_384);
+    expect(plain.body.max_tokens).toBeUndefined();
+    expect(plain.body.reasoning_effort).toBeUndefined();
+    expect(plain.body.max_completion_tokens).toBe(16_384);
+    expect(plain.modelMaxTokens).toBe(16_384);
   });
 
   it("a lower per-agent output cap still wins over the row's cap", async () => {
@@ -282,7 +294,8 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       { id: "fake-small", budget: { maxOutputTokens: 4_096, reasoning: "low" } },
       { modelMaxTokens: 2_048 },
     );
-    expect(budgeted.max_tokens).toBe(2_048);
+    expect(budgeted.body.max_tokens).toBe(2_048);
+    expect(budgeted.modelMaxTokens).toBe(2_048);
   });
 
   it("a non-thinking local row sends no reasoning directive but still caps output", async () => {
@@ -293,9 +306,10 @@ describe("bob#185 item 2 — a keyless session request carries its row's budget"
       budget: { maxOutputTokens: 2_048, reasoning: "off" },
     });
     const plain = await run({ id: "fake-plain-off" });
-    expect(budgeted.max_tokens).toBe(2_048);
-    expect(budgeted.reasoning_effort).toBeUndefined();
-    expect(plain.reasoning_effort).toBeUndefined();
+    expect(budgeted.body.max_tokens).toBe(2_048);
+    expect(budgeted.body.reasoning_effort).toBeUndefined();
+    expect(budgeted.modelMaxTokens).toBe(2_048);
+    expect(plain.body.reasoning_effort).toBeUndefined();
   });
 });
 
@@ -385,6 +399,8 @@ describe("bob#185 item 2 — a capped turn is logged", () => {
         get messages() {
           return [];
         },
+        // bob#306: the run log reads the cap from the session's model.
+        model: { maxTokens: 4_096 },
         dispose() {},
       } as unknown as RunSession;
       const factory: RunSessionFactory = async () => session;

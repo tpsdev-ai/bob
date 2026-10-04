@@ -105,9 +105,9 @@ import {
   writePrMemoryRound,
 } from "./pr-memory.js";
 import {
+  DEFAULT_PROVIDER_REGISTRY,
   type ProviderRecord,
   type ProviderRegistry,
-  providerReadsKeyFromEnv,
   providerRecord,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
@@ -128,9 +128,9 @@ import {
 } from "./run-bounds.js";
 import {
   createBobRuntimeFactory,
-  OPENROUTER_KEY_CONSUMED_MESSAGE,
-  openrouterKeyWasConsumed,
   promptSession,
+  providerKeyConsumedMessage,
+  providerKeyWasConsumed,
   runInteractiveSession,
   type SessionDeps,
 } from "./session.js";
@@ -1353,10 +1353,12 @@ async function runBoundedSession(
   // the request's assistant message ends. A NON-delta record: the delta cap
   // never drops it.
   // bob#185 item 2: when the selected row declares a budget, a request whose
-  // stopReason is "length" carries the row's output cap in the record.
+  // stopReason is "length" carries the output cap in the record. bob#306: that
+  // is the session model's maxTokens, read once here when the run starts.
+  const sessionOutputCap = (session as { model?: { maxTokens?: unknown } }).model?.maxTokens;
   const usageTracker = createRequestUsageTracker(() => now().getTime(), {
-    ...(config.providerRecord?.budget !== undefined
-      ? { outputCap: config.providerRecord.budget.maxOutputTokens }
+    ...(config.providerRecord?.budget !== undefined && typeof sessionOutputCap === "number"
+      ? { outputCap: sessionOutputCap }
       : {}),
   });
   const unsubscribeUsage = session.subscribe((event) => {
@@ -2678,11 +2680,22 @@ export function assertProviderRunnable(
   label: string,
   registry?: ProviderRegistry,
 ): void {
-  if (!providerReadsKeyFromEnv(provider, registry)) return;
-  if ((process.env.OPENROUTER_API_KEY ?? "").trim()) return;
-  if (openrouterKeyWasConsumed()) throw new Error(`${label}: ${OPENROUTER_KEY_CONSUMED_MESSAGE}`);
+  // Resolve the SELECTED row (by its runtime identity, then by name), never the
+  // runtime string alone: a keyed row's runtime need not be its id, so a name
+  // lookup would miss it.
+  const reg = registry ?? DEFAULT_PROVIDER_REGISTRY;
+  const row =
+    reg.records().find((candidate) => candidate.runtime === provider) ?? reg.find(provider);
+  if (row === undefined || row.auth.kind !== "env") return;
+  const variable = row.auth.variable;
+  if ((process.env[variable] ?? "").trim()) return;
+  if (providerKeyWasConsumed(variable)) {
+    throw new Error(`${label}: ${providerKeyConsumedMessage(variable, row.id)}`);
+  }
   throw new Error(
-    `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
+    row.id === "openrouter"
+      ? `${label}: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.`
+      : `${label}: ${variable} is not set for provider row "${row.id}". Remedy: export ${variable}=<key> before running — bob never writes the key to bob.yaml or the pi config.`,
   );
 }
 

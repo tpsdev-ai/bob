@@ -1209,7 +1209,7 @@ describe("publish — storage and authority", () => {
     expect(remoteOid(fx)).toBe(fx.base);
   });
 
-  it("refuses pr by name before storage or push even with a PR binding", async () => {
+  it("refuses pr by name before storage or push when the binding does not authorize it", async () => {
     const fx = {
       repo: "repo",
       bare: "bare",
@@ -1218,7 +1218,7 @@ describe("publish — storage and authority", () => {
       stateRoot: join(scratch, "absent"),
     };
     const out = await publish({
-      binding: binding(fx, { pr: { base: "main" } }),
+      binding: binding(fx),
       params: {
         candidate_id: "a".repeat(40),
         commit_message: "x",
@@ -1227,7 +1227,7 @@ describe("publish — storage and authority", () => {
       stateRoot: fx.stateRoot,
     });
     expect(out.reason).toBe("pr_unsupported");
-    expect(out.message).toContain("PR creation is a later slice");
+    expect(out.message).toContain("does not authorize PR creation");
     expect(existsSync(fx.stateRoot)).toBe(false);
   });
 
