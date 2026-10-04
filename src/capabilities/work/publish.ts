@@ -61,6 +61,8 @@ export type PublishRefusalReason =
   | "push_failed"
   | "pr_unsupported"
   | "pr_service_unavailable"
+  | "pr_head_mismatch"
+  | "pr_head_moved"
   | "publication_locked"
   | "publication_conflict"
   | "aborted"
@@ -1512,7 +1514,10 @@ async function reconcilePr(
   return matches.length === 1 ? { kind: "found", url: matches[0].url } : { kind: "absent" };
 }
 
-type PrOutcome = { ok: true; url: string } | { ok: false; reason: string; message: string };
+type PrOutcome =
+  | { ok: true; url: string }
+  | { ok: false; reason: string; message: string; definite?: false }
+  | { ok: false; reason: PublishRefusalReason; message: string; definite: true };
 
 // Create the requested pull request, or confirm an existing one, after the push
 // is confirmed. The intent is persisted before any create request; a create
@@ -1521,6 +1526,7 @@ async function ensurePullRequest(
   input: PublishInput,
   journal: PublishJournal,
   deps: PublishDeps,
+  git: GitRunner,
 ): Promise<PrOutcome> {
   const binding = input.binding as TaskBinding;
   const service = deps.pr as PullRequestService;
@@ -1529,6 +1535,13 @@ async function ensurePullRequest(
   const head = prHead(binding);
   const base = (binding.pr as { base: string }).base;
   const repository = journal.endpoint;
+  if (head !== binding.destination.ref.replace(/^refs\/heads\//, ""))
+    return {
+      ok: false,
+      definite: true,
+      reason: "pr_head_mismatch",
+      message: `publish refused: actor ${journal.publishing_identity} published commit ${journal.commit_oid} to ${binding.destination.ref}, but the authorized PR head is ${head}; no PR was created. Ask the launcher for a new publication binding whose PR head is the pushed ref.`,
+    };
 
   const journalPath = publishJournalPath(input.stateRoot, binding.publication_id);
   const writeJ = deps.writeJournal ?? writeJournalAtomic;
@@ -1604,6 +1617,20 @@ async function ensurePullRequest(
       ok: false,
       reason: "pr_uncertain",
       message: `publish indeterminate: a PR create for ${repository} ${head}->${base} may have been issued and no matching PR can be reconciled; no second PR was created.`,
+    };
+  const tip = inspectRemote(git, binding.repository, repository, binding.destination.ref);
+  if (tip.state === "unknown")
+    return {
+      ok: false,
+      reason: "pr_unreconciled",
+      message: `publish indeterminate: actor ${pr.author} could not inspect PR head ${head} (${tip.error}); no PR was created. Retry when the remote is available.`,
+    };
+  if (tip.state !== "present" || tip.oid !== journal.commit_oid)
+    return {
+      ok: false,
+      definite: true,
+      reason: "pr_head_moved",
+      message: `publish refused: actor ${pr.author} published commit ${journal.commit_oid}, but PR head ${head} is now ${tip.state === "present" ? tip.oid : "absent"}; no PR was created. Ask the launcher for a new publication binding and candidate based on the current branch tip.`,
     };
   pr.state = "creating";
   const creatingErr = persist();
@@ -1713,22 +1740,22 @@ async function finishPublished(
   journal.phase = "pushed";
   journal.push_state = "confirmed_present";
 
-  // After a confirmed push, a requested PR is attempted; pr_url is reported
-  // only once it is confirmed. An unresolved PR leaves the commit published and the whole
-  // result indeterminate.
   if (input.params.pr !== undefined) {
-    const prOutcome = await ensurePullRequest(input, journal, deps);
+    const prOutcome = await ensurePullRequest(input, journal, deps, git);
     if (!prOutcome.ok) {
       const prFail = persist();
       if (prFail !== null) return prFail;
-      return indeterminate(prOutcome.reason, prOutcome.message, {
+      const details: Partial<PublishResult> = {
         publication_id: binding.publication_id,
         candidate_id: journal.candidate_id,
         tree_oid: treeOid,
         commit_oid: commitOid,
         phase: "pushed",
         push_state: "confirmed_present",
-      });
+      };
+      return prOutcome.definite
+        ? refuse(prOutcome.reason, prOutcome.message, details)
+        : indeterminate(prOutcome.reason, prOutcome.message, details);
     }
     journal.phase = "published";
     const prFinalFail = persist();

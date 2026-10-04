@@ -261,6 +261,88 @@ describe("publish — PR creation", () => {
     expect(remoteOid(fx)).toBe(before);
   });
 
+  it("refuses an authorized PR head different from the pushed ref", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { pr: { base: "main", head: "other" } });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const fake = fakePullRequests(fx);
+    const input = {
+      binding: b,
+      params: prParams(built),
+      stateRoot: fx.stateRoot,
+      deps: { git: realGit, runCheck: okCheck, pr: fake.service },
+    };
+    for (const out of [await publish(input), await publish(input)]) {
+      expect(out.status, JSON.stringify(out)).toBe("refused");
+      expect(out.reason).toBe("pr_head_mismatch");
+      expect(out.message).toContain("publisher");
+      expect(out.message).toContain("no PR was created");
+      expect(out.message).toContain("launcher");
+      expect(out.commit_oid).toBe(remoteOid(fx));
+      expect(out.pr_url).toBeUndefined();
+    }
+    expect(fake.created).toHaveLength(0);
+    const journal = JSON.parse(
+      readFileSync(publishJournalPath(fx.stateRoot, b.publication_id), "utf8"),
+    );
+    expect(journal.pr).toBeUndefined();
+  });
+
+  it("refuses PR creation after the remote branch advances past the journaled commit", async () => {
+    const fx = makeFixture();
+    seedRemote(fx);
+    const b = binding(fx, { pr: { base: "main", head: "main" } });
+    const built = buildCandidate(fx, b, (r) =>
+      writeFileSync(join(r, "src", "widget.ts"), "export const widget = 2;\n"),
+    );
+    const fake = fakePullRequests(fx);
+    let terminate = true;
+    const input = {
+      binding: b,
+      params: prParams(built),
+      stateRoot: fx.stateRoot,
+      deps: {
+        git: realGit,
+        runCheck: okCheck,
+        pr: fake.service,
+        afterPrIntentStored: () => {
+          if (terminate) {
+            terminate = false;
+            throw new Error("publisher terminated");
+          }
+        },
+      },
+    };
+    await expect(publish(input)).rejects.toThrow("publisher terminated");
+    const commit = remoteOid(fx) as string;
+    const tip = git(["commit-tree", built.tree_oid, "-p", commit, "-m", "another writer"], fx.repo);
+    git(["push", fx.bare, `${tip}:refs/heads/main`], fx.repo);
+    const ancestry: string[][] = [];
+    input.deps.git = (args, inv) => {
+      if (args[0] === "merge-base") ancestry.push(args);
+      return realGit(args, inv);
+    };
+    for (const out of [await publish(input), await publish(input)]) {
+      expect(out.status, JSON.stringify(out)).toBe("refused");
+      expect(out.reason).toBe("pr_head_moved");
+      expect(out.message).toContain("publisher");
+      expect(out.message).toContain("no PR was created");
+      expect(out.message).toContain("launcher");
+      expect(out.commit_oid).toBe(commit);
+      expect(out.pr_url).toBeUndefined();
+    }
+    expect(ancestry).toContainEqual(["merge-base", "--is-ancestor", commit, tip]);
+    expect(fake.created).toHaveLength(0);
+    expect(remoteOid(fx)).toBe(tip);
+    const journal = JSON.parse(
+      readFileSync(publishJournalPath(fx.stateRoot, b.publication_id), "utf8"),
+    );
+    expect(journal.pr.state).toBe("intent");
+  });
+
   it("persists the PR intent before the create call: a termination after persist recovers with one PR", async () => {
     const fx = makeFixture();
     seedRemote(fx);

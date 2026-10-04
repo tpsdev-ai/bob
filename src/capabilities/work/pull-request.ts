@@ -59,15 +59,25 @@ export function githubRepositorySlug(endpoint: string): { owner: string; name: s
   return null;
 }
 
-function runGh(gh: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+function runGh(
+  gh: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(gh, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
     let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(() => reject(new Error(`gh timed out after ${timeoutMs} ms`)));
+    }, timeoutMs);
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       fn();
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -91,12 +101,15 @@ function runGh(gh: string, args: string[], env: NodeJS.ProcessEnv): Promise<stri
 export function ghPullRequestService(
   gh = "gh",
   env: NodeJS.ProcessEnv = publicationEnvironment(),
+  timeoutMs = 120_000,
 ): PullRequestService {
   return {
     supportsEndpoint: (endpoint) =>
       /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?(?:\.git)?\/?$/.test(endpoint),
     async identity() {
-      const raw = JSON.parse(await runGh(gh, ["api", "user"], env)) as { login?: unknown };
+      const raw = JSON.parse(await runGh(gh, ["api", "user"], env, timeoutMs)) as {
+        login?: unknown;
+      };
       if (typeof raw?.login !== "string" || raw.login === "")
         throw new Error("gh returned no publishing identity");
       return raw.login;
@@ -122,6 +135,7 @@ export function ghPullRequestService(
           `body=${input.body}`,
         ],
         env,
+        timeoutMs,
       );
       let parsed: unknown;
       try {
@@ -156,6 +170,7 @@ export function ghPullRequestService(
           "--slurp",
         ],
         env,
+        timeoutMs,
       );
       let parsed: unknown;
       try {

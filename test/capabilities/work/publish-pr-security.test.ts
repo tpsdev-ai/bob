@@ -548,3 +548,160 @@ describe("production PR transport", () => {
     }
   });
 });
+
+it("times out and kills stalled gh without changing identity, list or create recovery", async () => {
+  for (const stage of ["identity", "list", "create"]) {
+    const f = fixture(`timeout-${stage}`);
+    const path = join(scratch, `gh-${stage}`);
+    const log = join(scratch, `gh-${stage}.jsonl`);
+    writeFileSync(
+      path,
+      `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, pid: process.pid }) + "\\n");
+const stage = args[1] === "user" ? "identity" : args.includes("POST") ? "create" : "list";
+if (stage === ${JSON.stringify(stage)}) {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+} else console.log(stage === "identity" ? '{"login":"publisher"}' : '[]');
+`,
+    );
+    chmodSync(path, 0o755);
+    const service = ghPullRequestService(path, process.env, 200);
+    let pushed = false;
+    const git: GitRunner = (args, inv) => {
+      if (args[0] === "push") pushed = true;
+      return f.git(args, inv);
+    };
+    const input = {
+      ...f,
+      deps: {
+        git,
+        pr: service,
+        runCheck: async () => ({
+          outcome: "exited",
+          exit_code: 0,
+          cleanup_state: "group_empty",
+          output_complete: true,
+        }),
+      },
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("test deadline exceeded")), 2000);
+      });
+      const first = await Promise.race([publisher.publish(input), deadline]);
+      expect(first.reason, JSON.stringify(first)).toBe(
+        stage === "identity"
+          ? "pr_service_unavailable"
+          : stage === "list"
+            ? "pr_unreconciled"
+            : "pr_uncertain",
+      );
+      expect(first.status).toBe(stage === "identity" ? "refused" : "indeterminate");
+      expect(first.message).toContain("gh timed out after 200 ms");
+      expect(pushed).toBe(stage !== "identity");
+      expect(first.pr_url).toBeUndefined();
+      if (stage === "create") {
+        const retry = await Promise.race([publisher.publish(input), deadline]);
+        expect(retry.reason).toBe("pr_uncertain");
+        const journal = JSON.parse(
+          readFileSync(publisher.publishJournalPath(f.stateRoot, f.binding.publication_id), "utf8"),
+        );
+        expect(journal.pr.state).toBe("creating");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const calls = readFileSync(log, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(calls.filter((call) => call.args.includes("POST"))).toHaveLength(
+        stage === "create" ? 1 : 0,
+      );
+      for (const call of calls) expect(() => process.kill(call.pid, 0)).toThrow();
+    } finally {
+      clearTimeout(timer);
+      for (const line of readFileSync(log, "utf8").trim().split("\n")) {
+        try {
+          process.kill(JSON.parse(line).pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  }
+}, 10_000);
+
+it("refuses a different authorized PR head without recording PR intent", async () => {
+  const f = fixture("head-mismatch");
+  f.binding.pr = { base: "main", head: "other" };
+  const fake = fakeService();
+  const runCheck = async () => ({
+    outcome: "exited",
+    exit_code: 0,
+    cleanup_state: "group_empty",
+    output_complete: true,
+  });
+  const input = { ...f, deps: { git: f.git, pr: fake.service, runCheck } };
+  for (const out of [await publisher.publish(input), await publisher.publish(input)]) {
+    expect(out.status, JSON.stringify(out)).toBe("refused");
+    expect(out.reason).toBe("pr_head_mismatch");
+    expect(out.message).toContain("publisher");
+    expect(out.message).toContain("no PR was created");
+    expect(out.message).toContain("launcher");
+    expect(out.push_state).toBe("confirmed_present");
+    expect(out.pr_url).toBeUndefined();
+  }
+  expect(fake.creates()).toBe(0);
+  const journal = JSON.parse(
+    readFileSync(publisher.publishJournalPath(f.stateRoot, f.binding.publication_id), "utf8"),
+  );
+  expect(journal.pr).toBeUndefined();
+});
+
+it("refuses a moved PR head before recording creating", async () => {
+  for (const observed of ["advanced", "absent", "unknown"]) {
+    const f = fixture(`head-${observed}`);
+    const fake = fakeService();
+    let moved = false;
+    const git: GitRunner = (args, inv) => {
+      if (moved && args[0] === "ls-remote")
+        return {
+          status: observed === "unknown" ? 1 : 0,
+          stdout: observed === "advanced" ? `${"e".repeat(40)}\trefs/heads/topic\n` : "",
+          stderr: observed === "unknown" ? "remote unavailable" : "",
+        };
+      return f.git(args, inv);
+    };
+    fake.service.list = async () => {
+      moved = true;
+      return [];
+    };
+    const out = await publisher.publish({
+      ...f,
+      deps: {
+        git,
+        pr: fake.service,
+        runCheck: async () => ({
+          outcome: "exited",
+          exit_code: 0,
+          cleanup_state: "group_empty",
+          output_complete: true,
+        }),
+      },
+    });
+    expect(out.status, JSON.stringify(out)).toBe(
+      observed === "unknown" ? "indeterminate" : "refused",
+    );
+    expect(out.reason).toBe(observed === "unknown" ? "pr_unreconciled" : "pr_head_moved");
+    expect(out.message).toContain("publisher");
+    expect(out.message).toContain("no PR was created");
+    expect(out.message).toContain(observed === "unknown" ? "Retry" : "launcher");
+    expect(out.pr_url).toBeUndefined();
+    expect(fake.creates()).toBe(0);
+    const journal = JSON.parse(
+      readFileSync(publisher.publishJournalPath(f.stateRoot, f.binding.publication_id), "utf8"),
+    );
+    expect(journal.pr.state).toBe("intent");
+  }
+});
