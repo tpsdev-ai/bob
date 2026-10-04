@@ -960,6 +960,25 @@ async function runBoundedSession(
       ? captureRepositoryState(config.cwd)
       : { kind: "unavailable" };
   let repositoryAtLastTool = repositoryAtLaunch;
+  const finalizeAbort = async (reason: TerminationReason): Promise<RunResult> => {
+    await finalizePrMemory(
+      config,
+      flairBootstrapTarget,
+      {
+        runId: randomUUID(),
+        taskId: config.taskBinding?.task_id,
+        publicationId: config.taskBinding?.publication_id,
+        baseOid: config.taskBinding?.base_oid,
+        endedAt: (opts.now ?? (() => new Date()))().toISOString(),
+        outcome: "aborted",
+        filesTouched: [],
+        testEvidence: [],
+      },
+      opts.prMemorySeams,
+      (m) => process.stderr.write(`bob run ${opts.name}: ${m}\n`),
+    );
+    return abortedRunResult(opts, resolved, bounds, reason);
+  };
 
   // bob#254 — the agent runtime sessions that build a system prompt load the
   // Flair bootstrap first. This covers `bob run` one-shot and the mail turn
@@ -972,7 +991,7 @@ async function runBoundedSession(
   try {
     await bounds.guard(attachFlairBootstrap(flairBootstrapTarget, config));
   } catch (err) {
-    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    if (err instanceof RunAbortedError) return finalizeAbort(err.reason);
     throw err;
   }
 
@@ -1004,7 +1023,7 @@ async function runBoundedSession(
       }),
     );
   } catch (err) {
-    if (err instanceof RunAbortedError) return abortedRunResult(opts, resolved, bounds, err.reason);
+    if (err instanceof RunAbortedError) return finalizeAbort(err.reason);
     throw err;
   }
 
@@ -1268,9 +1287,11 @@ async function runBoundedSession(
       const toolName = String((event as unknown as { toolName?: unknown }).toolName ?? "");
       const isError = (event as unknown as { isError?: unknown }).isError;
       const result = (event as unknown as { result?: unknown }).result;
-      if (isVerifiedEdit(toolName, isError, result)) verifiedEdits += 1;
-      const args = (event as unknown as { args?: unknown }).args;
-      prMemoryCollector.observeEditPath(editToolFilePath(toolName, isError, result, args));
+      if (isVerifiedEdit(toolName, isError, result)) {
+        verifiedEdits += 1;
+        const args = (event as unknown as { args?: unknown }).args;
+        prMemoryCollector.observeEditPath(editToolFilePath(toolName, isError, result, args));
+      }
     }
     if (
       (event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
@@ -1585,6 +1606,7 @@ async function runBoundedSession(
           ...(aborted !== undefined ? { aborted } : {}),
         }),
         filesTouched: prMemoryCollector.filesTouched(),
+        omitted: prMemoryCollector.omitted(),
         testEvidence: [],
         incomplete: [],
       },

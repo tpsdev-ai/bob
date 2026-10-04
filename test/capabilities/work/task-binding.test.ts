@@ -109,3 +109,16 @@ describe("parseTaskBinding", () => {
     }
   });
 });
+
+it("refuses unbounded repositories and malformed host labels", () => {
+  for (const repository of [
+    `github.com/o/${"r".repeat(17000)}`,
+    "github..com/o/r",
+    "github.-com/o/r",
+    "github.com-/o/r",
+    `${"a".repeat(64)}.com/o/r`,
+  ])
+    expect(() => parseTaskBinding(good({ pr_ref: { repository, number: 1 } }))).toThrow(
+      TaskBindingError,
+    );
+});

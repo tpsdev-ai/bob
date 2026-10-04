@@ -2,8 +2,8 @@
 //
 // The local builder starts each PR round with what earlier rounds on the SAME
 // PR established. The HARNESS owns that memory: it recalls it before the
-// session is built. Only the one-shot run writes it, once at round end; the
-// interactive launch path recalls only. The model never issues a
+// session is built. The one-shot run writes after a session runs or a run-bound
+// pre-session abort; interactive launch recalls only. The model never issues a
 // memory call, no summarizer is required, and nothing is pasted into the brief.
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { FlairHttpClient, type FlairMemory } from "../capabilities/flair/client.js";
 import type { PrRef } from "../capabilities/work/task-binding.js";
+import { isVerifiedEdit } from "./edit-evidence.js";
 
 // ─── Identity ───────────────────────────────────────────────────────────────
 
@@ -51,7 +52,7 @@ export function prMemorySubject(canonicalRepository: string, prNumber: number): 
 
 // Newest 3 rounds are retained; each round is capped at 4 KiB and the whole
 // serialized envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
-// in the middle of serialized JSON) and records what was dropped.
+// in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
@@ -178,14 +179,15 @@ export function normalizeCheck(obs: CheckObservation): PrTestEvidence {
   if (obs.outcome === "timeout" || obs.outcome === "timed_out")
     return { ...base, outcome: "timed_out" };
   if (obs.exitCode !== undefined) base.exitCode = obs.exitCode;
-  if (obs.cleanupState !== undefined) base.cleanupOk = obs.cleanupState !== "failed";
+  if (obs.cleanupState !== undefined) base.cleanupOk = obs.cleanupState === "clean";
   if (obs.outputComplete !== undefined) base.outputComplete = obs.outputComplete;
 
   const passed =
+    obs.state === "finished" &&
     obs.success === true &&
     obs.exitCode === 0 &&
-    obs.outputComplete !== false &&
-    obs.cleanupState !== "failed";
+    obs.outputComplete === true &&
+    obs.cleanupState === "clean";
   return { ...base, outcome: passed ? "pass" : "fail" };
 }
 
@@ -221,7 +223,7 @@ export function editToolFilePath(
   result: unknown,
   args?: unknown,
 ): string | undefined {
-  if (isError !== false) return undefined;
+  if (!isVerifiedEdit(toolName, isError, result)) return undefined;
   if (!EDIT_TOOL_NAMES.has(toolName)) return undefined;
   return pathFrom(result) ?? pathFrom(args);
 }
@@ -230,11 +232,19 @@ export function editToolFilePath(
 // Disk-log failure never disables collection: this is in-memory only.
 export class PrMemoryCollector {
   private readonly files = new Set<string>();
+  private droppedFiles = false;
 
   observeEditPath(path: string | undefined): void {
     if (path === undefined) return;
-    if (this.files.size >= ROUND_FILES_MAX) return;
+    if (this.files.size >= ROUND_FILES_MAX && !this.files.has(truncate(path, STRING_MAX))) {
+      this.droppedFiles = true;
+      return;
+    }
     this.files.add(truncate(path, STRING_MAX));
+  }
+
+  omitted(): string[] {
+    return this.droppedFiles ? ["files_touched"] : [];
   }
 
   filesTouched(): string[] {
@@ -252,89 +262,65 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
 }
 
-function asStringArray(v: unknown, max: number, stringMax: number): string[] {
-  if (!Array.isArray(v)) return [];
-  return v
-    .filter((x): x is string => typeof x === "string")
-    .slice(0, max)
-    .map((x) => truncate(x, stringMax));
+function validString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= STRING_MAX + 1;
 }
 
-function parseFindings(v: unknown, cap: number): PrFinding[] {
-  if (!Array.isArray(v)) return [];
-  const out: PrFinding[] = [];
-  for (const raw of v) {
-    if (!isObject(raw)) continue;
-    if (typeof raw.detail !== "string" || raw.detail.length === 0) continue;
-    const finding: PrFinding = {
-      detail: truncate(raw.detail, STRING_MAX),
-      status: raw.status === "addressed" ? "addressed" : "open",
-    };
-    if (typeof raw.id === "string" && raw.id.length > 0) finding.id = truncate(raw.id, STRING_MAX);
-    if (typeof raw.evidence === "string" && raw.evidence.length > 0)
-      finding.evidence = truncate(raw.evidence, STRING_MAX);
-    out.push(finding);
-    if (out.length >= cap) break;
-  }
-  return out;
+function validStrings(v: unknown, cap: number): v is string[] {
+  return Array.isArray(v) && v.length <= cap && v.every(validString);
 }
 
-function parseEvidence(v: unknown, cap: number): PrTestEvidence[] {
-  if (!Array.isArray(v)) return [];
-  const out: PrTestEvidence[] = [];
-  for (const raw of v) {
-    if (!isObject(raw)) continue;
-    if (typeof raw.command !== "string" || raw.command.length === 0) continue;
-    const outcome = raw.outcome;
-    if (
-      outcome !== "pass" &&
-      outcome !== "fail" &&
-      outcome !== "pending" &&
-      outcome !== "missing" &&
-      outcome !== "timed_out" &&
-      outcome !== "unknown"
+function validFindings(v: unknown, cap: number): v is PrFinding[] {
+  return (
+    Array.isArray(v) &&
+    v.length <= cap &&
+    v.every(
+      (f) =>
+        isObject(f) &&
+        validString(f.detail) &&
+        (f.status === "open" || f.status === "addressed") &&
+        (f.id === undefined || validString(f.id)) &&
+        (f.evidence === undefined || validString(f.evidence)),
     )
-      continue;
-    const ev: PrTestEvidence = { command: truncate(raw.command, STRING_MAX), outcome };
-    if (typeof raw.commandId === "string") ev.commandId = truncate(raw.commandId, STRING_MAX);
-    if (typeof raw.workspaceRevision === "string")
-      ev.workspaceRevision = truncate(raw.workspaceRevision, STRING_MAX);
-    if (raw.exitCode === null || typeof raw.exitCode === "number")
-      ev.exitCode = raw.exitCode as number | null;
-    if (typeof raw.cleanupOk === "boolean") ev.cleanupOk = raw.cleanupOk;
-    if (typeof raw.outputComplete === "boolean") ev.outputComplete = raw.outputComplete;
-    out.push(ev);
-    if (out.length >= cap) break;
-  }
-  return out;
+  );
+}
+
+function validEvidence(v: unknown): v is PrTestEvidence[] {
+  return (
+    Array.isArray(v) &&
+    v.length <= ROUND_EVIDENCE_MAX &&
+    v.every(
+      (e) =>
+        isObject(e) &&
+        validString(e.command) &&
+        typeof e.outcome === "string" &&
+        ["pass", "fail", "pending", "missing", "timed_out", "unknown"].includes(e.outcome) &&
+        (e.commandId === undefined || validString(e.commandId)) &&
+        (e.workspaceRevision === undefined || validString(e.workspaceRevision)) &&
+        (e.exitCode === undefined || e.exitCode === null || Number.isSafeInteger(e.exitCode)) &&
+        (e.cleanupOk === undefined || typeof e.cleanupOk === "boolean") &&
+        (e.outputComplete === undefined || typeof e.outputComplete === "boolean"),
+    )
+  );
 }
 
 function parseRound(v: unknown): PrRoundRecord | undefined {
-  if (!isObject(v)) return undefined;
-  if (typeof v.endedAt !== "string" || v.endedAt.length === 0) return undefined;
-  const outcome = v.outcome;
   if (
-    outcome !== "completed" &&
-    outcome !== "failed" &&
-    outcome !== "aborted" &&
-    outcome !== "unknown"
+    !isObject(v) ||
+    !validString(v.endedAt) ||
+    typeof v.outcome !== "string" ||
+    !["completed", "failed", "aborted", "unknown"].includes(v.outcome) ||
+    !validFindings(v.blockers_addressed, ROUND_BLOCKERS_MAX) ||
+    !validStrings(v.files_touched, ROUND_FILES_MAX) ||
+    !validEvidence(v.test_evidence) ||
+    !validStrings(v.incomplete, ROUND_INCOMPLETE_MAX) ||
+    !validStrings(v.omitted, ROUND_INCOMPLETE_MAX) ||
+    ["runId", "taskId", "publicationId", "baseOid"].some(
+      (key) => v[key] !== undefined && !validString(v[key]),
+    )
   )
     return undefined;
-  const round: PrRoundRecord = {
-    endedAt: truncate(v.endedAt, STRING_MAX),
-    outcome,
-    blockers_addressed: parseFindings(v.blockers_addressed, ROUND_BLOCKERS_MAX),
-    files_touched: asStringArray(v.files_touched, ROUND_FILES_MAX, STRING_MAX),
-    test_evidence: parseEvidence(v.test_evidence, ROUND_EVIDENCE_MAX),
-    incomplete: asStringArray(v.incomplete, ROUND_INCOMPLETE_MAX, STRING_MAX),
-    omitted: asStringArray(v.omitted, ROUND_INCOMPLETE_MAX, STRING_MAX),
-  };
-  if (typeof v.runId === "string") round.runId = truncate(v.runId, STRING_MAX);
-  if (typeof v.taskId === "string") round.taskId = truncate(v.taskId, STRING_MAX);
-  if (typeof v.publicationId === "string")
-    round.publicationId = truncate(v.publicationId, STRING_MAX);
-  if (typeof v.baseOid === "string") round.baseOid = truncate(v.baseOid, STRING_MAX);
-  return round;
+  return v as unknown as PrRoundRecord;
 }
 
 // Parse a stored envelope embedded in `content`, and require that it matches
@@ -355,11 +341,17 @@ export function parseEnvelope(
   if (parsed.agentId !== expected.agentId) return undefined;
   if (parsed.repository !== expected.repository) return undefined;
   if (parsed.prNumber !== expected.prNumber) return undefined;
-  if (!Array.isArray(parsed.rounds)) return undefined;
+  if (
+    !Array.isArray(parsed.rounds) ||
+    parsed.rounds.length > PR_MEMORY_MAX_ROUNDS ||
+    !validFindings(parsed.open_findings, OPEN_FINDINGS_MAX) ||
+    !validStrings(parsed.omitted, ENVELOPE_OMITTED_MAX)
+  )
+    return undefined;
   const rounds: PrRoundRecord[] = [];
   for (const raw of parsed.rounds) {
     const round = parseRound(raw);
-    if (round === undefined) continue; // drop a malformed round, keep the rest
+    if (round === undefined) return undefined;
     rounds.push(round);
     if (rounds.length >= PR_MEMORY_MAX_ROUNDS) break;
   }
@@ -368,9 +360,9 @@ export function parseEnvelope(
     agentId: expected.agentId,
     repository: expected.repository,
     prNumber: expected.prNumber,
-    open_findings: parseFindings(parsed.open_findings, OPEN_FINDINGS_MAX),
+    open_findings: parsed.open_findings,
     rounds,
-    omitted: asStringArray(parsed.omitted, ENVELOPE_OMITTED_MAX, STRING_MAX),
+    omitted: parsed.omitted,
   };
 }
 
@@ -397,9 +389,8 @@ function roundBytes(round: PrRoundRecord): number {
   return Buffer.byteLength(JSON.stringify(round), "utf8");
 }
 
-// Trim one round until it fits PR_MEMORY_ROUND_MAX_BYTES, recording each
-// dropped entry in the round's own `omitted` list. Returns undefined when even
-// an empty round exceeds the cap (impossible in practice, but fail closed).
+// Trim a round to the byte cap, recording omission categories.
+// Refuse a round whose remaining fields exceed the cap.
 function boundRound(input: PrRoundRecord): PrRoundRecord | undefined {
   const round: PrRoundRecord = {
     ...input,
@@ -412,7 +403,7 @@ function boundRound(input: PrRoundRecord): PrRoundRecord | undefined {
   const drop = (what: string, arr: unknown[]): boolean => {
     if (arr.length === 0) return false;
     arr.pop();
-    round.omitted.push(what);
+    if (!round.omitted.includes(what)) round.omitted.push(what);
     return true;
   };
   // Drop entries from the end of each array, in this order.
@@ -475,6 +466,7 @@ export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
     if (env.rounds.length > 0) {
       const dropped = env.rounds.pop() as PrRoundRecord;
       record(truncate(`older round (${dropped.endedAt})`, STRING_MAX));
+      for (const item of dropped.omitted) record(item);
       continue;
     }
     if (env.open_findings.length > 0) {
@@ -486,7 +478,7 @@ export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
       env.omitted = env.omitted.slice(1);
       continue;
     }
-    break;
+    throw new Error("PR memory envelope exceeds the size bound");
   }
   return { json: JSON.stringify(env), omitted };
 }
@@ -525,8 +517,7 @@ function renderRound(round: PrRoundRecord): string {
       `  addressed: ${escapeForPrompt(f.detail)}${f.evidence ? ` [${escapeForPrompt(f.evidence)}]` : ""}`,
     );
   for (const item of round.incomplete) lines.push(`  incomplete: ${escapeForPrompt(item)}`);
-  if (round.omitted.length > 0)
-    lines.push(`  omitted: ${round.omitted.map(escapeForPrompt).join(", ")}`);
+
   return lines.join("\n");
 }
 
@@ -535,17 +526,24 @@ function renderRound(round: PrRoundRecord): string {
 // show. Never over PR_MEMORY_PROMPT_MAX_BYTES including the framing.
 export function renderPrMemoryPrompt(env: PrMemoryEnvelope): string {
   const sections: string[] = [];
+  const omissions = [...env.omitted, ...env.rounds.flatMap((r) => r.omitted)];
+  if (omissions.length > 0)
+    sections.push(
+      `- omitted: ${[...new Set(omissions)]
+        .map((s) => escapeForPrompt(truncate(s, 64)))
+        .slice(-16)
+        .join(", ")}`,
+    );
   for (const f of env.open_findings)
     if (f.status === "open") sections.push(`- open finding: ${escapeForPrompt(f.detail)}`);
-  if (env.omitted.length > 0)
-    sections.push(`- omitted: ${env.omitted.map(escapeForPrompt).join(", ")}`);
+
   for (const round of env.rounds) sections.push(renderRound(round));
   if (sections.length === 0) return "";
   const render = (body: string): string =>
     `${PR_MEMORY_PROMPT_HEADING}\n${FRAME_OPEN}\n${body}\n${FRAME_CLOSE}`;
   let body = sections.join("\n");
   let text = render(body);
-  // Drop oldest rounds first if the block is over the cap.
+  // Drop trailing sections to fit the cap.
   const parts = [...sections];
   while (Buffer.byteLength(text, "utf8") > PR_MEMORY_PROMPT_MAX_BYTES && parts.length > 1) {
     parts.pop();
@@ -587,10 +585,10 @@ export function mergeFindings(
   };
   for (const f of existing) push(f);
   for (const f of round) push(f);
-  // Keep open findings preferentially; drop resolved ones when over the cap.
+  // Keep open findings first for envelope bounding.
   const open = out.filter((f) => f.status === "open");
   const addressed = out.filter((f) => f.status !== "open");
-  return [...open, ...addressed].slice(0, OPEN_FINDINGS_MAX);
+  return [...open, ...addressed];
 }
 
 // ─── Evidence assembled by the harness ──────────────────────────────────────
@@ -606,18 +604,33 @@ export interface PrRoundEvidence {
   testEvidence: PrTestEvidence[];
   findings?: PrFinding[];
   incomplete?: string[];
+  omitted?: string[];
 }
 
 export function roundFromEvidence(evidence: PrRoundEvidence): PrRoundRecord {
   const round: PrRoundRecord = {
     endedAt: evidence.endedAt,
     outcome: evidence.outcome,
-    blockers_addressed: (evidence.findings ?? []).filter((f) => f.status === "addressed"),
+    blockers_addressed: (evidence.findings ?? [])
+      .filter((f) => f.status === "addressed")
+      .slice(0, ROUND_BLOCKERS_MAX),
     files_touched: evidence.filesTouched.slice(0, ROUND_FILES_MAX),
     test_evidence: evidence.testEvidence.slice(0, ROUND_EVIDENCE_MAX),
     incomplete: (evidence.incomplete ?? []).slice(0, ROUND_INCOMPLETE_MAX),
-    omitted: [],
+    omitted: [...(evidence.omitted ?? [])],
   };
+  for (const [field, count, cap] of [
+    ["files_touched", evidence.filesTouched.length, ROUND_FILES_MAX],
+    ["test_evidence", evidence.testEvidence.length, ROUND_EVIDENCE_MAX],
+    [
+      "blockers_addressed",
+      (evidence.findings ?? []).filter((f) => f.status === "addressed").length,
+      ROUND_BLOCKERS_MAX,
+    ],
+    ["incomplete", (evidence.incomplete ?? []).length, ROUND_INCOMPLETE_MAX],
+  ] as const) {
+    if (count > cap && !round.omitted.includes(field)) round.omitted.push(field);
+  }
   if (evidence.runId !== undefined) round.runId = evidence.runId;
   if (evidence.taskId !== undefined) round.taskId = evidence.taskId;
   if (evidence.publicationId !== undefined) round.publicationId = evidence.publicationId;
@@ -764,8 +777,8 @@ export async function writePrMemoryRound(opts: {
     rounds: [round, ...(existing?.rounds ?? [])],
     omitted: existing?.omitted ?? [],
   };
-  const { json } = boundEnvelope(envelope);
   try {
+    const { json } = boundEnvelope(envelope);
     await client.write(json, {
       id,
       durability: "persistent",

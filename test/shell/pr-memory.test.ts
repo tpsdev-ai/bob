@@ -125,8 +125,14 @@ describe("check evidence — pending, missing, timed-out never pass", () => {
 
   it("passes only on explicit success with a zero exit and complete output", () => {
     expect(
-      normalizeCheck({ command: "bun test", state: "finished", success: true, exitCode: 0 })
-        .outcome,
+      normalizeCheck({
+        command: "bun test",
+        state: "finished",
+        success: true,
+        exitCode: 0,
+        outputComplete: true,
+        cleanupState: "clean",
+      }).outcome,
     ).toBe("pass");
     expect(
       normalizeCheck({
@@ -155,8 +161,21 @@ describe("check evidence — pending, missing, timed-out never pass", () => {
 
 describe("edit receipts — candidate files only from successful edits", () => {
   it("collects a path from a successful edit and ignores failures", () => {
-    expect(editToolFilePath("edit", false, { path: "src/a.ts" })).toBe("src/a.ts");
-    expect(editToolFilePath("write", false, undefined, { file_path: "src/b.ts" })).toBe("src/b.ts");
+    expect(
+      editToolFilePath("edit", false, {
+        path: "src/a.ts",
+        details: { diff: "+a" },
+        content: [{ type: "text", text: "edited" }],
+      }),
+    ).toBe("src/a.ts");
+    expect(
+      editToolFilePath(
+        "write",
+        false,
+        { content: [{ type: "text", text: "Successfully wrote 1 bytes to src/b.ts" }] },
+        { file_path: "src/b.ts" },
+      ),
+    ).toBe("src/b.ts");
     expect(editToolFilePath("edit", true, { path: "src/a.ts" })).toBeUndefined();
     expect(editToolFilePath("read", false, { path: "src/a.ts" })).toBeUndefined();
     expect(editToolFilePath("edit", false, {})).toBeUndefined();
@@ -575,5 +594,146 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     expect(r.files_touched).toEqual(["a.ts"]);
     expect(r.blockers_addressed).toHaveLength(1);
     expect("modelText" in r).toBe(false);
+  });
+});
+
+describe("regressions from final review", () => {
+  it.each(["", " ", "null", "not json", "{}"])(
+    "refuses a 200 body %j without a PUT",
+    async (body) => {
+      const methods: string[] = [];
+      const result = await writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
+        seams: {
+          ...seams(makeFakeFlair()),
+          fetchImpl: async (_url, init) => {
+            methods.push(init?.method ?? "");
+            return new Response(body, { status: 200 });
+          },
+        },
+      });
+      expect(result.status).toBe("skipped");
+      expect(methods).toEqual(["GET"]);
+    },
+  );
+
+  it("never collects an empty edit result using an argument path", () => {
+    expect(editToolFilePath("edit", false, {}, { path: "unverified.ts" })).toBeUndefined();
+  });
+
+  it("refuses the 17107-byte identity probe and skips its write", async () => {
+    const probe = envelope({ repository: "github.com/o/" });
+    probe.repository += "r".repeat(17107 - Buffer.byteLength(JSON.stringify(probe)));
+    expect(Buffer.byteLength(JSON.stringify(probe))).toBe(17107);
+    expect(() => boundEnvelope(probe)).toThrow(/size bound/);
+    let puts = 0;
+    const result = await writePrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: { ...IDENTITY, repository: probe.repository },
+      evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
+      seams: {
+        ...seams(makeFakeFlair()),
+        fetchImpl: async (_url, init) => {
+          if (init?.method === "PUT") puts++;
+          return new Response("{}", { status: 404 });
+        },
+      },
+    });
+    expect(result.status).toBe("skipped");
+    expect(puts).toBe(0);
+  });
+
+  it("records the 33rd finding as an omission and recalls it under pressure", () => {
+    const findings = Array.from({ length: 33 }, (_, i) => ({
+      id: `f${i}`,
+      detail: `finding-${i}`,
+      status: "open" as const,
+    }));
+    const stored = JSON.parse(
+      boundEnvelope(envelope({ open_findings: mergeFindings([], findings) })).json,
+    ) as PrMemoryEnvelope;
+    expect(stored.open_findings).toHaveLength(32);
+    expect(stored.omitted).toContain("excess open findings");
+    const prompt = renderPrMemoryPrompt({
+      ...stored,
+      open_findings: stored.open_findings.map((f) => ({ ...f, detail: "x".repeat(512) })),
+    });
+    expect(prompt).toContain("excess open findings");
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(PR_MEMORY_PROMPT_MAX_BYTES);
+  });
+
+  it("records the 65th file as an omission and recalls it under pressure", () => {
+    const collector = new PrMemoryCollector();
+    for (let i = 0; i < 65; i++) collector.observeEditPath(`f${i}`);
+    expect(collector.filesTouched()).toHaveLength(64);
+    expect(collector.omitted()).toContain("files_touched");
+    const r = roundFromEvidence({
+      endedAt: "now",
+      outcome: "completed",
+      filesTouched: Array.from({ length: 65 }, (_, i) => `f${i}`),
+      testEvidence: [],
+    });
+    expect(r.files_touched).toHaveLength(64);
+    expect(r.omitted).toContain("files_touched");
+    const prompt = renderPrMemoryPrompt(
+      envelope({
+        rounds: [r],
+        open_findings: Array.from({ length: 32 }, () => ({
+          detail: "x".repeat(512),
+          status: "open",
+        })),
+      }),
+    );
+    expect(prompt).toContain("files_touched");
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(PR_MEMORY_PROMPT_MAX_BYTES);
+  });
+
+  it("requires finished state, complete output and clean cleanup for pass", () => {
+    const complete = {
+      command: "test",
+      state: "finished",
+      success: true,
+      exitCode: 0,
+      outputComplete: true,
+      cleanupState: "clean",
+    };
+    expect(normalizeCheck(complete).outcome).toBe("pass");
+    for (const over of [
+      { state: undefined },
+      { outputComplete: undefined },
+      { cleanupState: undefined },
+      { cleanupState: "unknown" },
+      { cleanupState: "pending" },
+    ])
+      expect(normalizeCheck({ ...complete, ...over }).outcome).not.toBe("pass");
+  });
+
+  it("rejects malformed required arrays and entries instead of salvaging", () => {
+    const malformed = [
+      envelope({ rounds: [null as unknown as PrRoundRecord] }),
+      envelope({ open_findings: [{ detail: "x", status: "bogus" } as never] }),
+      envelope({ omitted: "bad" as never }),
+      envelope({ rounds: [round({ files_touched: [1] as never })] }),
+      envelope({
+        rounds: [
+          round({
+            test_evidence: [{ command: "test", outcome: "pass", outputComplete: "yes" } as never],
+          }),
+        ],
+      }),
+      envelope({ rounds: [round({ runId: 42 as never })] }),
+      envelope({ rounds: [round({ incomplete: undefined as never })] }),
+    ];
+    for (const env of malformed)
+      expect(
+        validateRecalledRecord(
+          { id: ID, agentId: AGENT, visibility: "private", content: JSON.stringify(env) },
+          { ...IDENTITY, id: ID },
+        ),
+      ).toBeUndefined();
   });
 });

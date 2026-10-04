@@ -85,6 +85,7 @@ const CANONICAL_REPO = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\/[a-zA-Z0-9._-]+\/[a-zA-
 
 function canonicalRepository(value: unknown, what: string): string {
   const s = reqString(value, what);
+  if (Buffer.byteLength(s, "utf8") > 512) fail(`${what} exceeds the size bound`);
   if (s.includes("://") || s.includes("@") || s.includes(" ") || s.trim() !== s)
     fail(`${what} must be a canonical host/owner/repo identity, not a URL`);
   if (s.includes("//") || s.endsWith("/")) fail(`${what} must not contain an empty segment`);
@@ -96,6 +97,12 @@ function canonicalRepository(value: unknown, what: string): string {
     fail(
       `${what} must be a canonical host/owner/repo identity (lowercase host, no trailing slash)`,
     );
+  const host = s.split("/")[0];
+  if (
+    host.length > 253 ||
+    host.split(".").some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+  )
+    fail(`${what} must have valid lowercase host labels`);
   return s;
 }
 

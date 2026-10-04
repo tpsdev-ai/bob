@@ -349,10 +349,7 @@ export class FlairHttpClient implements FlairClient {
     method: string,
     path: string,
     body?: unknown,
-    // Statuses to surface as `null` instead of throwing. Only ever passed
-    // `[404]`, by soulGet — "this entry does not exist yet" is an ordinary
-    // answer to a read, not a failure, and string-matching a thrown message
-    // for "404" is the fragile alternative.
+    // Reads may surface a bounded 404 response as null.
     nullOnStatus?: readonly number[],
     // bootstrap-only extras: the abort signal for the timeout, and the response
     // size bound. Both are optional so every other call is unchanged.
@@ -388,12 +385,20 @@ export class FlairHttpClient implements FlairClient {
       // server-provided reason (which names no secret).
       throw new Error(`flair ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
     }
-    if (text.trim() === "") return undefined;
+    if (text.trim() === "") {
+      if (method === "GET" && nullOnStatus?.includes(404))
+        throw new Error("flair read returned an empty body");
+      return undefined;
+    }
+    let parsed: unknown;
     try {
-      return JSON.parse(text);
+      parsed = JSON.parse(text);
     } catch {
       return text;
     }
+    if (parsed === null && method === "GET" && nullOnStatus?.includes(404))
+      throw new Error("flair read returned null");
+    return parsed;
   }
 
   // bob#185 item 5 — a signed request under optional bounds: an abort + a
@@ -483,9 +488,7 @@ export class FlairHttpClient implements FlairClient {
   }
 
   async get(id: string, opts: FlairReadOptions = {}): Promise<FlairMemory | null> {
-    // A 404 is "this record does not exist yet" — an ordinary answer to a read,
-    // surfaced as null (bob#185 item 5). Never a thrown error the caller has to
-    // string-match.
+    // A 404 within the response bound is absent history.
     const r = (await this.signedFetchWithBounds(
       "GET",
       `/Memory/${encodeURIComponent(id)}`,
@@ -493,7 +496,9 @@ export class FlairHttpClient implements FlairClient {
       opts,
       [404],
     )) as FlairMemory | null | undefined;
-    return r ?? null;
+    if (r === undefined || (r !== null && (typeof r !== "object" || Array.isArray(r))))
+      throw new Error("flair read returned an invalid body");
+    return r;
   }
 
   // ── Session bootstrap (POST /BootstrapMemories) ───────────────────────────

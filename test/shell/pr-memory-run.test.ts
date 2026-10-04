@@ -74,14 +74,15 @@ async function startMemoryStub(): Promise<Stub> {
   };
 }
 
-function scriptedSession(): RunSession {
+function scriptedSession(prompts?: string[]): RunSession {
   const listeners: Array<(e: unknown) => void> = [];
   return {
     subscribe(l) {
       listeners.push(l as (e: unknown) => void);
       return () => {};
     },
-    async prompt() {
+    async prompt(text) {
+      prompts?.push(text);
       for (const l of listeners) {
         l({
           type: "message_end",
@@ -166,6 +167,7 @@ describe("`bob run` with a launcher pr_ref", () => {
     scaffold(root, stub.url, keyFile);
 
     // Round N — no memory yet.
+    const prompts: string[] = [];
     let first: RunSessionConfig | undefined;
     const r1 = await runAgent({
       name: AGENT,
@@ -174,7 +176,7 @@ describe("`bob run` with a launcher pr_ref", () => {
       taskBinding: binding(PR),
       sessionFactory: async (c) => {
         first = c;
-        return scriptedSession();
+        return scriptedSession(prompts);
       },
     });
     expect(r1.exitCode).toBe(0);
@@ -198,13 +200,19 @@ describe("`bob run` with a launcher pr_ref", () => {
       taskBinding: binding(PR),
       sessionFactory: async (c) => {
         second = c;
-        return scriptedSession();
+        return scriptedSession(prompts);
       },
     });
     expect(r2.exitCode).toBe(0);
     expect(second?.prMemory).toContain(PR_MEMORY_PROMPT_HEADING);
     expect(second?.prMemory).toContain("completed");
-    expect("round N+1").not.toContain("Prior-round memory");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("round N");
+    expect(prompts[1]).toContain("round N+1");
+    for (const prompt of prompts) {
+      expect(prompt).not.toContain(PR_MEMORY_PROMPT_HEADING);
+      expect(prompt).not.toContain("<<<BOB-PR-MEMORY>>>");
+    }
   });
 
   it("a different PR recalls nothing", async () => {
