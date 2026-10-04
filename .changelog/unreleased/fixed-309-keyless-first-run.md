@@ -1,0 +1,1 @@
+- **A freshly onboarded keyless agent (`ollama`, `omlx`) runs its first prompt (#309).** The first `bob run` failed with `No API key found` before sending a request; the keyless transport now satisfies pi's auth check before a prompt. Onboarding still writes no credential for a keyless row.
