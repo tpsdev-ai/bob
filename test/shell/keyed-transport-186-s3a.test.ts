@@ -20,6 +20,7 @@ import {
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../src/shell/init.js";
@@ -57,7 +58,6 @@ import {
   keyedPlaceholder,
   providerKeyConsumedMessage,
   registerKeyedProvider,
-  requireOpenrouterApiKey,
   takeProviderKey,
 } from "../../src/shell/session.js";
 
@@ -402,13 +402,31 @@ providers:
       }
       return "";
     };
-    expect(refusalMessage(() => requireOpenrouterApiKey({}))).toBe(
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--eval",
+        `import { requireOpenrouterApiKey } from ${JSON.stringify(new URL("../../src/shell/session.ts", import.meta.url).href)};
+         import { assertProviderRunnable } from ${JSON.stringify(new URL("../../src/shell/run.ts", import.meta.url).href)};
+         delete process.env.OPENROUTER_API_KEY;
+         const messages = [];
+         for (const action of [
+           () => requireOpenrouterApiKey({}),
+           () => assertProviderRunnable("openrouter", "bob hire review"),
+         ]) {
+           try { action(); messages.push(""); }
+           catch (error) { messages.push(error.message); }
+         }
+         console.log(JSON.stringify(messages));`,
+      ],
+      { env: process.env, encoding: "utf8", timeout: 10_000 },
+    );
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual([
       "bob: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to disk.",
-    );
-    delete process.env.OPENROUTER_API_KEY;
-    expect(refusalMessage(() => assertProviderRunnable("openrouter", "bob hire review"))).toBe(
       "bob hire review: OPENROUTER_API_KEY is not set. Remedy: export OPENROUTER_API_KEY=<key> before running — bob never writes the key to bob.yaml or the pi config.",
-    );
+    ]);
     const registry = fixtureRegistry();
     const runtime = {
       registerProvider: (_id: string, _config: unknown) => {},
@@ -527,7 +545,8 @@ describe("K5 — registration refusal under each fixture name + the post-service
     const registry = fixtureRegistry();
     const { piDir } = scaffold("fxk5b", registry);
     const rt = await ModelRuntime.create({
-      authPath: join(piDir, "auth.json"),
+      credentials: new InMemoryCredentialStore(),
+      modelsStore: new InMemoryModelsStore(),
       modelsPath: join(piDir, "models.json"),
     });
     const row = fixtureRow(registry);
@@ -896,6 +915,9 @@ describe("K10 — messages name the selected row and its variable", () => {
     expect(msg).toBe(providerKeyConsumedMessage(VARIABLE, RUNTIME));
     expect(msg).toContain(VARIABLE);
     expect(msg).toContain(RUNTIME);
+    expect(() => assertProviderRunnable(RUNTIME, "bob hire fxk10c", fixtureRegistry())).toThrow(
+      `bob hire fxk10c: ${providerKeyConsumedMessage(VARIABLE, RUNTIME)}`,
+    );
   });
 });
 
