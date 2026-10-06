@@ -22,6 +22,7 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -572,21 +573,12 @@ function fileExists(path: string): boolean {
 /** Writes `content` to `path`, with `mode` set exactly when given. */
 type Publish = (path: string, content: string, mode?: number) => void;
 
-/** Write `content` over `path`, creating it with `mode` (or 0o666, masked by the
- *  process umask, when none is given) at the open(2) that creates it, so a file
- *  published with a restrictive mode is never observable with a wider one. */
 function writeFileReplacing(path: string, content: string, mode?: number): void {
-  const fd = openSync(
-    path,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
-    mode ?? 0o666,
-  );
-  try {
-    writeFileSync(fd, content);
-    if (mode !== undefined) fchmodSync(fd, mode);
-  } finally {
-    closeSync(fd);
+  if (mode === undefined) {
+    writeFileSync(path, content);
+    return;
   }
+  withTempFile(path, content, mode, (temp) => renameSync(temp, path));
 }
 
 /** Write an exclusive temp file, then publish it with link(2), which fails with
@@ -597,6 +589,25 @@ function writeFileExclusive(
   content: string,
   beforePublish?: (path: string) => void,
   mode?: number,
+): void {
+  withTempFile(path, content, mode, (temp) => {
+    beforePublish?.(path);
+    try {
+      linkSync(temp, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      throw new Error(
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+      );
+    }
+  });
+}
+
+function withTempFile(
+  path: string,
+  content: string,
+  mode: number | undefined,
+  publish: (temp: string) => void,
 ): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(
@@ -612,15 +623,7 @@ function writeFileExclusive(
     } finally {
       closeSync(fd);
     }
-    beforePublish?.(path);
-    try {
-      linkSync(temp, path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      throw new Error(
-        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
-      );
-    }
+    publish(temp);
   } finally {
     rmSync(temp, { force: true });
   }

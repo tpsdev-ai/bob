@@ -1,2 +1,2 @@
-- **`bob init --force` creates `auth.json` at 0600 from the open that creates it, rather than at the process umask with a later `chmod` (bob#328).**
-  Under a permissive umask, the previous path left `auth.json` readable by group and other until the `chmod` ran. `bob models` replaces `.pi-agent/models.json` with the merged document; its help says so.
+- **`bob init --force` publishes non-env-provider `auth.json` with no group/other bits from creation and mode 0600 after publication (bob#328).**
+  The launcher's final mode is 0755. Existing env-provider pi files are skipped. `bob models` replaces `.pi-agent/models.json` with the merged document; its help says so.
