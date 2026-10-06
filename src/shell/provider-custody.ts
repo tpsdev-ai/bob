@@ -13,6 +13,8 @@
 //     operator variable may collide with one, and the namespace above is
 //     disjoint from this set by construction.
 
+import { parsePiConfigValueReference } from "./pi-config-value.js";
+
 /** The reserved namespace prefix for an operator keyed row's derived variable. */
 export const OPERATOR_VARIABLE_PREFIX = "BOB_PROVIDER_";
 
@@ -108,43 +110,18 @@ export function piCredentialEnvNames(): readonly string[] {
   return [...names];
 }
 
-const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const ENV_VAR_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
-
 /**
  * Names referenced by a pi config value; mirrors pi's private extractor.
  * Stored-key scrub exemptions require an absent or empty stored env override.
+ * A value that is not a string (a malformed stored `key`) references nothing.
  */
-export function piConfigValueEnvVarNames(config: string | undefined): readonly string[] {
-  if (config === undefined || config.startsWith("!")) return [];
+export function piConfigValueEnvVarNames(config: unknown): readonly string[] {
+  const reference = parsePiConfigValueReference(config);
+  if (reference === undefined || reference.type !== "template") return [];
   const names: string[] = [];
-  let index = 0;
-  while (index < config.length) {
-    const dollar = config.indexOf("$", index);
-    if (dollar < 0) break;
-    const next = config[dollar + 1];
-    if (next === "$" || next === "!") {
-      index = dollar + 2;
-      continue;
-    }
-    if (next === "{") {
-      const end = config.indexOf("}", dollar + 2);
-      if (end < 0) {
-        index = dollar + 1;
-        continue;
-      }
-      const name = config.slice(dollar + 2, end);
-      if (ENV_VAR_NAME_RE.test(name) && !names.includes(name)) names.push(name);
-      index = end + 1;
-      continue;
-    }
-    const match = config.slice(dollar + 1).match(ENV_VAR_NAME_PREFIX_RE);
-    if (match !== null) {
-      if (!names.includes(match[0])) names.push(match[0]);
-      index = dollar + 1 + match[0].length;
-      continue;
-    }
-    index = dollar + 1;
+  for (const part of reference.parts) {
+    if (part.type !== "env" || names.includes(part.name)) continue;
+    names.push(part.name);
   }
   return names;
 }
