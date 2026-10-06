@@ -18,12 +18,13 @@ import {
   chmodSync,
   closeSync,
   constants,
-  existsSync,
   fchmodSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
-  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -130,6 +131,10 @@ export interface InitOptions {
   // The provider registry the scaffold reads its identity records from.
   // Defaults to the built-in table; tests supply one with a row of their own.
   registry?: ProviderRegistry;
+  // Test seam: called with the agent directory before its non-recursive mkdir,
+  // and with the path of each file published with link(2), after its temp
+  // write.
+  beforePublish?: (path: string) => void;
 }
 
 export interface InitResult {
@@ -179,9 +184,8 @@ export function initAgent(opts: InitOptions): InitResult {
   const agentDir = join(root, opts.name);
   const noClobber = opts.noClobber !== false;
 
-  if (existsSync(agentDir) && noClobber) {
-    throw new Error(`agent dir already exists: ${agentDir} (pass --force to overwrite)`);
-  }
+  const exists = `agent dir already exists: ${agentDir} (pass --force to overwrite)`;
+  if (noClobber && fileExists(agentDir)) throw new Error(exists);
 
   // The reserved-name check runs BEFORE the first write (init --force and hire
   // included): a pi file that carries a bob-owned keyed entry, or that cannot be
@@ -190,6 +194,26 @@ export function initAgent(opts: InitOptions): InitResult {
   assertNoReservedProviderEntries(join(agentDir, ".pi-agent"), reservedProviderNames(registry));
 
   const written: string[] = [];
+
+  // Without --force, the agent directory is created here with a non-recursive
+  // mkdir, and `publish` does not replace an existing entry. With --force,
+  // `publish` writes over.
+  const publish: Publish = noClobber
+    ? (path, content, mode) => writeFileExclusive(path, content, opts.beforePublish, mode)
+    : (path, content, mode) => {
+        writeFileSync(path, content);
+        if (mode !== undefined) chmodSync(path, mode);
+      };
+  if (noClobber) {
+    mkdirSync(root, { recursive: true });
+    opts.beforePublish?.(agentDir);
+    try {
+      mkdirSync(agentDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
+      throw err;
+    }
+  }
 
   // Top-level + subdirs
   mkdirSync(join(agentDir, "bin"), { recursive: true });
@@ -203,7 +227,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // own identity (#89). The hiring interview overwrites the file with a
   // refined persona; this header is the floor, not the ceiling.
   const soulPath = join(agentDir, "soul.md");
-  writeFileSync(soulPath, renderSoulIdentityHeader(opts) + (opts.soulBody ?? template.soul));
+  publish(soulPath, renderSoulIdentityHeader(opts) + (opts.soulBody ?? template.soul));
   written.push(soulPath);
 
   // bob.yaml — canonical config. The tools: allowlist is the role's ceiling
@@ -211,7 +235,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // the stamped capabilities' tools), so a freshly initialised agent of EVERY
   // role loads with a policy that holds.
   const yamlPath = join(agentDir, "bob.yaml");
-  writeFileSync(
+  publish(
     yamlPath,
     renderBobYaml(
       opts,
@@ -228,7 +252,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // (launcher exports it). Written for every provider — see
   // writePiAgentConfig's doc comment for why bare baseUrl configs aren't
   // enough for `bob run`.
-  written.push(...writePiAgentConfig(opts, agentDir));
+  written.push(...writePiAgentConfig(opts, agentDir, publish));
   if (opts.contextWindow === undefined) {
     console.error(
       `⚠ Set provider.context_window in ${yamlPath} before running — bob refuses to start a session without the model's context window.`,
@@ -237,8 +261,7 @@ export function initAgent(opts: InitOptions): InitResult {
 
   // bin/<name> launcher
   const binPath = join(agentDir, "bin", opts.name);
-  writeFileSync(binPath, renderLauncher(opts));
-  chmodSync(binPath, 0o755);
+  publish(binPath, renderLauncher(opts), 0o755);
   written.push(binPath);
 
   // Flair Ed25519 keypair. Registration is a separate ASYNC step — initAgent
@@ -458,7 +481,7 @@ export function piOpenAiCompletionsModel(
   };
 }
 
-function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
+function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publish): string[] {
   const piDir = join(agentDir, ".pi-agent");
   // mkdirSync above already created it; defensive recreate in case caller
   // didn't go through the standard path.
@@ -510,14 +533,15 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const authContent = `${JSON.stringify(isEnvKeyProvider || isKeyless ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`;
 
   if (isEnvKeyProvider) {
-    // Skip files present at the existence check; publish with mode 0600.
+    // With --force, skip files present at the existence check. Publish the
+    // others with mode 0600 without replacing an existing entry.
     const created: string[] = [];
     for (const [path, content] of [
       [modelsPath, modelsContent],
       [authPath, authContent],
     ] as const) {
-      if (existsSync(path)) continue;
-      writeFileExclusive(path, content);
+      if (opts.noClobber === false && fileExists(path)) continue;
+      writeFileExclusive(path, content, opts.beforePublish, 0o600);
       created.push(path);
     }
     const row = providerRecord(opts.provider, registry);
@@ -526,9 +550,8 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
     return created;
   }
 
-  writeFileSync(modelsPath, modelsContent);
-  writeFileSync(authPath, authContent);
-  chmodSync(authPath, 0o600);
+  publish(modelsPath, modelsContent);
+  publish(authPath, authContent, 0o600);
 
   if (!isGateway && !isKeyless && opts.baseUrl === undefined) {
     console.error(
@@ -539,24 +562,54 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   return [modelsPath, authPath];
 }
 
-/** Publish via an exclusive temp file with mode 0600 before the rename. */
-function writeFileExclusive(path: string, content: string): void {
+/** False only when stat reports ENOENT; any other failure is thrown. */
+function fileExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+/** Writes `content` to `path`, with `mode` set exactly when given. */
+type Publish = (path: string, content: string, mode?: number) => void;
+
+/** Write an exclusive temp file, then publish it with link(2), which fails with
+ *  EEXIST instead of replacing an existing entry. `mode` is set exactly when
+ *  given; otherwise the process umask applies, as with writeFileSync. */
+function writeFileExclusive(
+  path: string,
+  content: string,
+  beforePublish?: (path: string) => void,
+  mode?: number,
+): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(
     temp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    0o600,
+    mode ?? 0o666,
   );
   try {
-    writeFileSync(fd, content);
-    fchmodSync(fd, 0o600);
-    renameSync(temp, path);
-  } finally {
     try {
-      closeSync(fd);
+      writeFileSync(fd, content);
+      if (mode !== undefined) fchmodSync(fd, mode);
+      fsyncSync(fd);
     } finally {
-      rmSync(temp, { force: true });
+      closeSync(fd);
     }
+    beforePublish?.(path);
+    try {
+      linkSync(temp, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      throw new Error(
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+      );
+    }
+  } finally {
+    rmSync(temp, { force: true });
   }
 }
 
