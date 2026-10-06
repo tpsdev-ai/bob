@@ -11,7 +11,7 @@ import {
   PR_MEMORY_MAX_ROUNDS,
   PR_MEMORY_PROMPT_HEADING,
   PR_MEMORY_PROMPT_MAX_BYTES,
-  PR_MEMORY_RETAINED_ROUNDS,
+  PR_MEMORY_PRUNE_PAGE,
   PR_MEMORY_ROUND_MAX_BYTES,
   PR_MEMORY_TAG,
   PrMemoryCollector,
@@ -37,13 +37,38 @@ const ID = prMemoryKey(AGENT, REPO, PR);
 const IDENTITY = { agentId: AGENT, repository: REPO, prNumber: PR };
 
 const KEY = Buffer.alloc(32, 7);
-function seams(fake: ReturnType<typeof makeFakeFlair>) {
+// A constant clock by default, so every record written through it carries the
+// same createdAt.
+function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000_000) {
   return {
     fetchImpl: fake.fetchImpl,
     readFile: () => KEY,
-    now: () => 1_700_000_000_000,
+    now,
     uuid: () => "nonce-0000",
   };
+}
+
+// A clock that moves forward one second on every read, so each write carries a
+// later createdAt than the one before.
+function writeClock(): () => number {
+  let t = 1_800_000_000_000;
+  return () => {
+    t += 1000;
+    return t;
+  };
+}
+
+// The day numbers of the round records stored for this PR, ascending.
+function storedDays(fake: ReturnType<typeof makeFakeFlair>): number[] {
+  return roundRecords(fake)
+    .map((r) => Number(/day-(\d+)\.ts/.exec(String(r.content))?.[1]))
+    .filter((day) => Number.isFinite(day))
+    .sort((a, b) => a - b);
+}
+
+// The day numbers in a recalled block, in the order the block shows them.
+function recalledDays(block: string | undefined): number[] {
+  return [...String(block).matchAll(/day-(\d+)\.ts/g)].map((m) => Number(m[1]));
 }
 const TARGET = { url: "http://flair.test", agentId: AGENT, keyFile: "/keys/anvil.key" };
 const REF = { repository: REPO, number: PR };
@@ -548,32 +573,43 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     expect(recalled.block).toContain("addressed");
   });
 
-  it("records a dropped older round and recalls it once", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
-    const s = seams(fake);
-    for (let i = 1; i <= 4; i++) {
-      const written = await writePrMemoryRound({
+  it("names the previous writer's rounds that do not fit as older rounds", async () => {
+    const prior = JSON.stringify(
+      envelope({
+        rounds: [
+          round({ endedAt: "2026-10-02T00:00:00.000Z", files_touched: ["earlier-2.ts"] }),
+          round({ endedAt: "2026-10-01T00:00:00.000Z", files_touched: ["earlier-1.ts"] }),
+        ],
+      }),
+    );
+    const fake = makeFakeFlair({
+      agents: { [AGENT]: { id: AGENT } },
+      memories: { [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior } },
+    });
+    const clock = writeClock();
+    for (const day of [3, 4])
+      await writePrMemoryRound({
         target: TARGET,
         ref: REF,
         identity: IDENTITY,
         evidence: {
-          runId: `run-${i}`,
-          endedAt: `2026-10-0${i}T00:00:00.000Z`,
+          endedAt: `2026-10-0${day}T00:00:00.000Z`,
           outcome: "completed",
-          filesTouched: [],
+          filesTouched: [`day-${day}.ts`],
           testEvidence: [],
         },
-        seams: s,
+        seams: seams(fake, clock),
       });
-      expect(written.status).toBe("written");
-    }
     const recalled = await recallPrMemoryRound({
       target: TARGET,
       ref: REF,
       identity: IDENTITY,
-      seams: s,
+      seams: seams(fake),
     });
     const block = String(recalled.block);
+    expect(recalledDays(block)).toEqual([4, 3]);
+    expect(block.indexOf("day-3.ts")).toBeLessThan(block.indexOf("earlier-2.ts"));
+    expect(block).not.toContain("earlier-1.ts");
     expect(block.split("older round (2026-10-01T00:00:00.000Z)").length - 1).toBe(1);
   });
 
@@ -790,61 +826,88 @@ describe("concurrent rounds (bob#318)", () => {
 
   const evidenceAt = (day: number) => ({
     runId: `run-${day}`,
-    endedAt: `2026-10-0${day}T00:00:00.000Z`,
+    endedAt: `2026-10-${String(day).padStart(2, "0")}T00:00:00.000Z`,
     outcome: "completed" as const,
     filesTouched: [`day-${day}.ts`],
     testEvidence: [],
   });
-
-  it("keeps the newest rounds after a write and recalls the newest three", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
-    // Written out of order: the prune ranks by endedAt, not by write order.
-    for (const day of [2, 6, 1, 5, 3, 4]) {
-      const written = await writePrMemoryRound({
-        target: TARGET,
-        ref: REF,
-        identity: IDENTITY,
-        evidence: evidenceAt(day),
-        seams: seams(fake),
-      });
-      expect(written.status).toBe("written");
-    }
-    const kept = roundRecords(fake).map((r) => String(r.content));
-    expect(kept).toHaveLength(PR_MEMORY_RETAINED_ROUNDS);
-    for (const day of [3, 4, 5, 6])
-      expect(kept.some((c) => c.includes(`day-${day}.ts`))).toBe(true);
-    const recalled = await recallPrMemoryRound({
+  const writeDay = (
+    fake: ReturnType<typeof makeFakeFlair>,
+    day: number,
+    now?: () => number,
+    log?: (m: string) => void,
+  ) =>
+    writePrMemoryRound({
       target: TARGET,
       ref: REF,
       identity: IDENTITY,
-      seams: seams(fake),
+      evidence: evidenceAt(day),
+      seams: seams(fake, now),
+      ...(log !== undefined ? { log } : {}),
     });
-    const block = String(recalled.block);
-    expect(block.indexOf("day-6.ts")).toBeGreaterThan(-1);
-    expect(block.indexOf("day-6.ts")).toBeLessThan(block.indexOf("day-5.ts"));
-    expect(block.indexOf("day-5.ts")).toBeLessThan(block.indexOf("day-4.ts"));
-    expect(block).not.toContain("day-3.ts");
-    expect(block).toContain("older round (2026-10-03T00:00:00.000Z)");
-  });
-
-  it("concurrent prunes over a full history keep the newest rounds", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
-    for (const day of [1, 2, 3, 4])
-      await writePrMemoryRound({
+  const recallBlock = async (fake: ReturnType<typeof makeFakeFlair>) =>
+    (
+      await recallPrMemoryRound({
         target: TARGET,
         ref: REF,
         identity: IDENTITY,
-        evidence: evidenceAt(day),
         seams: seams(fake),
-      });
+      })
+    ).block;
+
+  it("keeps and recalls a late round whose endedAt is older than a full history", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const clock = writeClock();
+    for (const day of [4, 5, 6]) await writeDay(fake, day, clock);
+    // Ends before every stored round, but is written last.
+    expect((await writeDay(fake, 1, clock)).status).toBe("written");
+    expect(storedDays(fake)).toEqual([1, 5, 6]);
+    expect(recalledDays(await recallBlock(fake))).toEqual([1, 6, 5]);
+  });
+
+  it("recalls the latest writes over a backlog from failed prunes, then prunes it in pages", async () => {
+    const options: Parameters<typeof makeFakeFlair>[0] = {
+      agents: { [AGENT]: { id: AGENT } },
+      memoryDeleteStatus: 500,
+    };
+    const fake = makeFakeFlair(options);
+    const clock = writeClock();
+    const backlog = PR_MEMORY_MAX_ROUNDS + PR_MEMORY_PRUNE_PAGE + 3; // 14
+    for (let day = 1; day <= backlog; day++) await writeDay(fake, day, clock);
+    expect(roundRecords(fake)).toHaveLength(backlog);
+    expect(recalledDays(await recallBlock(fake))).toEqual([14, 13, 12]);
+
+    options.memoryDeleteStatus = undefined;
+    await writeDay(fake, 15, clock);
+    // One page of 8 after the first 3: days 12..5 go; 15, 14, 13 and 4..1 stay.
+    expect(storedDays(fake)).toEqual([1, 2, 3, 4, 13, 14, 15]);
+    await writeDay(fake, 16, clock);
+    expect(storedDays(fake)).toEqual([14, 15, 16]);
+    expect(recalledDays(await recallBlock(fake))).toEqual([16, 15, 14]);
+  });
+
+  it("breaks a createdAt tie by id", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    // One constant clock: every record carries the same createdAt, and the
+    // round ids (key, endedAt, random suffix) order by endedAt.
+    for (const day of [3, 1, 4, 2]) await writeDay(fake, day);
+    expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
+    expect(storedDays(fake)).toEqual([2, 3, 4]);
+    expect(recalledDays(await recallBlock(fake))).toEqual([4, 3, 2]);
+  });
+
+  it("concurrent prunes over a full history leave the latest writes", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const clock = writeClock();
+    for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
     // Both writers list before either deletes, so both delete round 1.
     const s = {
-      ...seams(fake),
+      ...seams(fake, clock),
       fetchImpl: barrier(fake.fetchImpl, 2, (method) => method === "DELETE"),
     };
     const logs: string[] = [];
     const results = await Promise.all(
-      [5, 6].map((day) =>
+      [4, 5].map((day) =>
         writePrMemoryRound({
           target: TARGET,
           ref: REF,
@@ -857,73 +920,55 @@ describe("concurrent rounds (bob#318)", () => {
     );
     expect(results.map((r) => r.status)).toEqual(["written", "written"]);
     expect(logs).toEqual([]);
-    const kept = roundRecords(fake).map((r) => String(r.content));
-    expect(kept).toHaveLength(PR_MEMORY_RETAINED_ROUNDS);
-    for (const day of [3, 4, 5, 6])
-      expect(kept.some((c) => c.includes(`day-${day}.ts`))).toBe(true);
+    expect(storedDays(fake)).toEqual([3, 4, 5]);
   }, 10_000);
 
   it.each([
     ["list", { memoryListStatus: 500 }, "prune skipped"],
     ["delete", { memoryDeleteStatus: 500 }, "a delete failed"],
-  ] as const)("a failed prune %s leaves the round written", async (_stage, failure, logged) => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
-    for (const day of [1, 2, 3, 4])
-      await writePrMemoryRound({
-        target: TARGET,
-        ref: REF,
-        identity: IDENTITY,
-        evidence: evidenceAt(day),
-        seams: seams(fake),
-      });
-    const failing = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
-    for (const [id, record] of fake.memories) failing.memories.set(id, record);
-    const logs: string[] = [];
-    const written = await writePrMemoryRound({
-      target: TARGET,
-      ref: REF,
-      identity: IDENTITY,
-      evidence: evidenceAt(5),
-      seams: seams(failing),
-      log: (m) => logs.push(m),
-    });
-    expect(written.status).toBe("written");
-    expect(roundRecords(failing)).toHaveLength(5);
-    expect(logs.some((m) => m.includes(logged))).toBe(true);
-  });
+  ] as const)(
+    "a failed prune %s is logged and the write still returns written",
+    async (_stage, failure, logged) => {
+      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const clock = writeClock();
+      for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
+      const failing = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
+      for (const [id, record] of fake.memories) failing.memories.set(id, record);
+      const logs: string[] = [];
+      expect((await writeDay(failing, 4, clock, (m) => logs.push(m))).status).toBe("written");
+      expect(storedDays(failing)).toEqual([1, 2, 3, 4]);
+      expect(logs.some((m) => m.includes(logged))).toBe(true);
+    },
+  );
 
   it("prunes only this agent's validated round records", async () => {
     const other = "agent-b";
-    const stray = { id: `${ID}-note`, agentId: AGENT, visibility: "private", subject: ID };
+    const old = "2020-01-01T00:00:00.000Z";
+    const stray = {
+      id: `${ID}-note`,
+      agentId: AGENT,
+      visibility: "private",
+      subject: ID,
+      createdAt: old,
+    };
     const malformed = { ...stray, id: `${ID}-r0-bad`, content: "not json" };
     const foreign = {
       id: `${ID}-r0-foreign`,
       agentId: other,
       visibility: "shared",
       subject: ID,
-      content: JSON.stringify(
-        envelope({ rounds: [round({ endedAt: "2020-01-01T00:00:00.000Z" })] }),
-      ),
+      createdAt: old,
+      content: JSON.stringify(envelope({ rounds: [round()] })),
     };
     const fake = makeFakeFlair({
       agents: { [AGENT]: { id: AGENT }, [other]: { id: other } },
       memories: { [stray.id]: stray, [malformed.id]: malformed, [foreign.id]: foreign },
     });
-    for (const day of [1, 2, 3, 4, 5])
-      await writePrMemoryRound({
-        target: TARGET,
-        ref: REF,
-        identity: IDENTITY,
-        evidence: evidenceAt(day),
-        seams: seams(fake),
-      });
-    const days = [...fake.memories.values()]
-      .map((r) => /day-(\d)\.ts/.exec(String(r.content))?.[1])
-      .filter((d) => d !== undefined)
-      .sort();
-    expect(days).toEqual(["2", "3", "4", "5"]);
+    const clock = writeClock();
+    for (const day of [1, 2, 3, 4, 5]) await writeDay(fake, day, clock);
+    expect(storedDays(fake)).toEqual([3, 4, 5]);
     for (const row of [stray, malformed, foreign]) expect(fake.memories.get(row.id)).toEqual(row);
-    expect(fake.calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
+    expect(fake.calls.filter((c) => c.method === "DELETE")).toHaveLength(2);
   });
 });
 

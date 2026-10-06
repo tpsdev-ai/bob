@@ -246,10 +246,13 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
 
     // bob#318 — the Memory collection read, as a real Flair serves it (measured
     // against Flair on Harper 5.2.8): `attr=value` is strict equality (an array
-    // attribute matches one of its elements), `sort(attr)` / `sort(-attr)`,
-    // `limit(n)` / `limit(start,end)`. A reader sees its own rows at any
-    // visibility and other agents' non-private rows. The fake answers any other
-    // query part with 400.
+    // attribute matches one of its elements); `sort(k1,k2,…)` orders by each key
+    // in turn, `-` for descending, comparing stored values (createdAt is whatever
+    // the writer sent); `limit(n)` returns the first n rows and `limit(start,end)`
+    // rows [start, end). A reader sees its own rows at any visibility and other
+    // agents' non-private rows. Rows still tied after every sort key keep
+    // insertion order here; Harper does not document an order for them. The fake
+    // answers any other query part with 400.
     if (path === "/Memory/" && init.method === "GET") {
       const signerId = signingAgentId(init.headers);
       if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
@@ -265,12 +268,13 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
             return Array.isArray(field) ? field.includes(value) : field === value;
           }),
         );
-      const sort = query.sort;
-      if (sort !== undefined)
-        rows.sort((a, b) => {
-          const [x, y] = [String(a[sort.attr] ?? ""), String(b[sort.attr] ?? "")];
-          return (x < y ? -1 : x > y ? 1 : 0) * (sort.descending ? -1 : 1);
-        });
+      rows.sort((a, b) => {
+        for (const key of query.sort) {
+          const [x, y] = [String(a[key.attr] ?? ""), String(b[key.attr] ?? "")];
+          if (x !== y) return (x < y ? -1 : 1) * (key.descending ? -1 : 1);
+        }
+        return 0;
+      });
       return reply(200, rows.slice(query.start, query.end));
     }
 
@@ -330,7 +334,7 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
 
 interface MemoryQuery {
   conditions: Array<[string, string]>;
-  sort?: { attr: string; descending: boolean };
+  sort: Array<{ attr: string; descending: boolean }>;
   start: number;
   end?: number;
 }
@@ -338,12 +342,16 @@ interface MemoryQuery {
 // The subset of Harper's REST query syntax the Memory listing uses. Returns an
 // error string for anything else.
 function parseMemoryQuery(search: string): MemoryQuery | string {
-  const query: MemoryQuery = { conditions: [], start: 0 };
+  const query: MemoryQuery = { conditions: [], sort: [], start: 0 };
   for (const part of search.split("&")) {
-    const sort = /^sort\(([-+]?)(\w+)\)$/.exec(part);
+    const sort = /^sort\(([-+]?\w+(?:,[-+]?\w+)*)\)$/.exec(part);
     const limit = /^limit\((\d+)(?:,(\d+))?\)$/.exec(part);
     const condition = /^(\w+)=([^&|=[\]{}]+)$/.exec(part);
-    if (sort) query.sort = { attr: sort[2] as string, descending: sort[1] === "-" };
+    if (sort)
+      query.sort = (sort[1] as string).split(",").map((key) => ({
+        attr: key.replace(/^[-+]/, ""),
+        descending: key.startsWith("-"),
+      }));
     else if (limit) {
       if (limit[2] === undefined) query.end = Number(limit[1]);
       else [query.start, query.end] = [Number(limit[1]), Number(limit[2])];

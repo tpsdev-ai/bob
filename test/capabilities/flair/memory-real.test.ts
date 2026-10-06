@@ -2,7 +2,6 @@ import { expect, it } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { FlairHttpClient } from "../../../src/capabilities/flair/client.js";
 import {
-  PR_MEMORY_RETAINED_ROUNDS,
   prMemoryKey,
   recallPrMemoryRound,
   writePrMemoryRound,
@@ -87,51 +86,64 @@ it.skipIf(!configured)(
   30_000,
 );
 
+// bob#318 — the round records of one fresh PR, written with the given clock.
+function roundsFor(readerId: string, readerKey: string, url: string, now?: () => number) {
+  const repository = `github.com/bob-contract/${randomUUID()}`;
+  const options = {
+    target: { url, agentId: readerId, keyFile: readerKey },
+    ref: { repository, number: 1 },
+    identity: { agentId: readerId, repository, prNumber: 1 },
+    ...(now !== undefined ? { seams: { now } } : {}),
+  };
+  const write = (day: number) =>
+    writePrMemoryRound({
+      ...options,
+      evidence: {
+        runId: `run-${day}`,
+        endedAt: `2026-10-0${day}T00:00:00.000Z`,
+        outcome: "completed",
+        filesTouched: [`day-${day}.ts`],
+        testEvidence: [],
+      },
+    });
+  const recalledDays = async () =>
+    [...String((await recallPrMemoryRound(options)).block).matchAll(/day-(\d+)\.ts/g)].map((m) =>
+      Number(m[1]),
+    );
+  const stored = async () =>
+    (
+      await new FlairHttpClient({ url, agentId: readerId, keyFile: readerKey }).listOwnBySubject(
+        prMemoryKey(readerId, repository, 1),
+        { limit: 8, timeoutMs: 2_000, maxResponseBytes: 512 * 1024 },
+      )
+    ).map((row) => Number(/day-(\d+)\.ts/.exec(String(row.content))?.[1]));
+  return { options, write, recalledDays, stored };
+}
+
 it.skipIf(!configured)(
-  "records and recalls two concurrent rounds and keeps the newest after a prune (bob#318)",
+  "records and recalls two concurrent rounds, and a prune leaves the latest 3 writes (bob#318)",
   async () => {
     if (!url || !readerId || !readerKey) throw new Error("missing Flair test configuration");
-    const repository = `github.com/bob-contract/${randomUUID()}`;
-    const target = { url, agentId: readerId, keyFile: readerKey };
-    const options = {
-      target,
-      ref: { repository, number: 1 },
-      identity: { agentId: readerId, repository, prNumber: 1 },
-    };
-    const write = (day: number) =>
-      writePrMemoryRound({
-        ...options,
-        evidence: {
-          runId: `run-${day}`,
-          endedAt: `2026-10-0${day}T00:00:00.000Z`,
-          outcome: "completed",
-          filesTouched: [`day-${day}.ts`],
-          testEvidence: [],
-        },
-      });
-    const both = await Promise.all([write(1), write(2)]);
+    const pr = roundsFor(readerId, readerKey, url);
+    const both = await Promise.all([pr.write(1), pr.write(2)]);
     expect(both.map((r) => r.status)).toEqual(["written", "written"]);
-    const recalled = await recallPrMemoryRound(options);
-    expect(recalled.status).toBe("recalled");
-    expect(recalled.block).toContain("day-1.ts");
-    expect(recalled.block).toContain("day-2.ts");
+    expect((await pr.recalledDays()).sort()).toEqual([1, 2]);
+    for (const day of [3, 4, 5, 6]) expect((await pr.write(day)).status).toBe("written");
+    expect(await pr.stored()).toEqual([6, 5, 4]);
+    expect(await pr.recalledDays()).toEqual([6, 5, 4]);
+  },
+  60_000,
+);
 
-    for (const day of [3, 4, 5, 6]) expect((await write(day)).status).toBe("written");
-    const reader = new FlairHttpClient({ url, agentId: readerId, keyFile: readerKey });
-    const key = prMemoryKey(readerId, repository, 1);
-    const kept = await reader.listOwnBySubject(key, {
-      limit: 6,
-      timeoutMs: 2_000,
-      maxResponseBytes: 512 * 1024,
-    });
-    expect(kept).toHaveLength(PR_MEMORY_RETAINED_ROUNDS);
-    const contents = kept.map((row) => String(row.content));
-    for (const day of [3, 4, 5, 6])
-      expect(contents.some((c) => c.includes(`day-${day}.ts`))).toBe(true);
-    const latest = String((await recallPrMemoryRound(options)).block);
-    expect(latest.indexOf("day-6.ts")).toBeGreaterThan(-1);
-    expect(latest.indexOf("day-6.ts")).toBeLessThan(latest.indexOf("day-4.ts"));
-    expect(latest).not.toContain("day-3.ts");
+it.skipIf(!configured)(
+  "breaks a createdAt tie by id on a real Flair (bob#318)",
+  async () => {
+    if (!url || !readerId || !readerKey) throw new Error("missing Flair test configuration");
+    const at = Date.now();
+    const pr = roundsFor(readerId, readerKey, url, () => at);
+    for (const day of [3, 1, 4, 2]) expect((await pr.write(day)).status).toBe("written");
+    expect(await pr.stored()).toEqual([4, 3, 2]);
+    expect(await pr.recalledDays()).toEqual([4, 3, 2]);
   },
   60_000,
 );

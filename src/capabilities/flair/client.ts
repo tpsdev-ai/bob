@@ -201,7 +201,8 @@ export interface FlairReadOptions {
 }
 
 export interface FlairListOptions extends FlairReadOptions {
-  // The most rows one listing returns (Harper `limit(n)`).
+  // Rows to skip (default 0), then the most rows one listing returns.
+  offset?: number;
   limit: number;
 }
 
@@ -503,15 +504,20 @@ export class FlairHttpClient implements FlairClient {
   }
 
   // bob#318 — this agent's own Memory rows whose `subject` equals `subject`,
-  // newest `createdAt` first, at most `opts.limit` rows. Harper REST query:
-  // `attr=value` is a strict-equality condition on an indexed attribute; the
-  // signature covers the path and the query string.
+  // ordered by `createdAt` descending with ties by `id` descending, skipping
+  // `opts.offset` rows and returning at most `opts.limit`. Harper REST query:
+  // `attr=value` is a strict-equality condition; `limit(start,end)` returns
+  // rows [start, end). The signature covers the path and the query string.
   async listOwnBySubject(subject: string, opts: FlairListOptions): Promise<FlairMemory[]> {
+    const offset = opts.offset ?? 0;
     if (!Number.isSafeInteger(opts.limit) || opts.limit < 1)
       throw new Error("flair list limit must be a positive integer");
+    if (!Number.isSafeInteger(offset) || offset < 0)
+      throw new Error("flair list offset must be a non-negative integer");
+    const page = offset === 0 ? `limit(${opts.limit})` : `limit(${offset},${offset + opts.limit})`;
     const path =
       `/Memory/?agentId=${encodeURIComponent(this.agentId)}` +
-      `&subject=${encodeURIComponent(subject)}&sort(-createdAt)&limit(${opts.limit})`;
+      `&subject=${encodeURIComponent(subject)}&sort(-createdAt,-id)&${page}`;
     const r = await this.signedFetchWithBounds("GET", path, undefined, opts, undefined, true);
     if (
       !Array.isArray(r) ||

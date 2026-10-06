@@ -8,10 +8,12 @@
 // IDENTITY is an exact key derived from the launcher-owned task binding —
 // agent id + canonical repository + PR number (TaskBinding.pr_ref).
 // bob#318: each round writes its own record (id: key + endedAt + a random
-// suffix; subject: key), so two rounds write two records.
-// Recall lists this agent's records whose subject equals the key (an exact,
-// bounded Flair query, not a search), reads the single record the previous
-// writer kept under the key itself, and validates the identity embedded in each.
+// suffix; subject: key; createdAt: the client's write time), so two rounds
+// write two records. Recall and the prune both page through one order, Flair's
+// `sort(-createdAt,-id)` over this agent's records whose subject equals the
+// key (an exact Flair query, not a search). Recall also reads the single record
+// the previous writer kept under the key itself, and validates the identity
+// embedded in each record.
 //
 // The writer stores supplied finding and check strings within byte caps;
 // recall escapes framing delimiters and line breaks.
@@ -55,11 +57,10 @@ export function prMemoryRoundId(key: string, endedAt: string, now: () => number)
 // envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
-// After a write, listed round records beyond the newest 4 are deleted; the 4th
-// lets recall name an older round it does not show.
-export const PR_MEMORY_RETAINED_ROUNDS = PR_MEMORY_MAX_ROUNDS + 1;
-// Rows one listing returns.
-export const PR_MEMORY_LIST_LIMIT = 2 * PR_MEMORY_MAX_ROUNDS;
+// After a write, the prune lists up to 8 records after the first 3 in that
+// order and requests a delete of each one that validates as this PR's round
+// record.
+export const PR_MEMORY_PRUNE_PAGE = 8;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
 // The recalled prompt block, framing included.
@@ -78,8 +79,8 @@ const ENVELOPE_OMITTED_MAX = 16;
 export const PR_MEMORY_START_TIMEOUT_MS = 2000;
 export const PR_MEMORY_END_TIMEOUT_MS = 2000;
 export const PR_MEMORY_MAX_RESPONSE_BYTES = 128 * 1024;
-// A listed row carries its stored embedding as well as its content.
-export const PR_MEMORY_LIST_MAX_RESPONSE_BYTES = PR_MEMORY_LIST_LIMIT * 64 * 1024;
+// Per listed row: a row carries its stored embedding as well as its content.
+export const PR_MEMORY_LISTED_ROW_MAX_BYTES = 64 * 1024;
 
 // ─── Stored schema ──────────────────────────────────────────────────────────
 
@@ -745,25 +746,26 @@ function validRoundRecord(
   return { id: row.id, round, envelope };
 }
 
-// Newest endedAt first (the harness writes ISO 8601 UTC); ties by id.
-function newestFirst(a: RoundEntry, b: RoundEntry): number {
-  if (a.round.endedAt !== b.round.endedAt) return a.round.endedAt < b.round.endedAt ? 1 : -1;
-  return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
-}
-
-function listRounds(client: FlairHttpClient, key: string, timeoutMs: number) {
+// This PR's records in Flair's `sort(-createdAt,-id)` order.
+function listRounds(
+  client: FlairHttpClient,
+  key: string,
+  page: { offset?: number; limit: number },
+  timeoutMs: number,
+) {
   return client.listOwnBySubject(key, {
-    limit: PR_MEMORY_LIST_LIMIT,
+    ...page,
     timeoutMs,
-    maxResponseBytes: PR_MEMORY_LIST_MAX_RESPONSE_BYTES,
+    maxResponseBytes: page.limit * PR_MEMORY_LISTED_ROW_MAX_BYTES,
   });
 }
 
-// Recall the prior-round memory for one PR BEFORE session construction. With
-// no record the result is "empty". A malformed, mismatched or wrong-owner record
-// contributes nothing; when nothing else is recalled the result is "invalid". An
-// unreachable or timed-out Flair is "unavailable"; the round proceeds and the
-// caller says so.
+// Recall the prior-round memory for one PR BEFORE session construction: the
+// records among the first 3 in `sort(-createdAt,-id)` order that validate, then
+// the previous writer's rounds in any slots left. With no record the result is
+// "empty". A malformed, mismatched or wrong-owner record contributes nothing;
+// when nothing else is recalled the result is "invalid". An unreachable or
+// timed-out Flair is "unavailable"; the round proceeds and the caller says so.
 export async function recallPrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;
@@ -782,7 +784,7 @@ export async function recallPrMemoryRound(opts: {
         timeoutMs: PR_MEMORY_START_TIMEOUT_MS,
         maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
       }),
-      listRounds(client, key, PR_MEMORY_START_TIMEOUT_MS),
+      listRounds(client, key, { limit: PR_MEMORY_MAX_ROUNDS }, PR_MEMORY_START_TIMEOUT_MS),
     ]);
   } catch (err) {
     const reason = safeReason(err);
@@ -791,26 +793,24 @@ export async function recallPrMemoryRound(opts: {
   }
   let invalid = 0;
   const entries: RoundEntry[] = [];
+  for (const row of rows) {
+    const entry = validRoundRecord(row, key, opts.identity, opts.seams?.now);
+    if (entry === undefined) invalid++;
+    else entries.push(entry);
+  }
   // The single record the previous writer kept under the key itself.
   let earlier: PrMemoryEnvelope | undefined;
   if (earlierRecord !== null) {
     earlier = validateRecalledRecord(earlierRecord, { ...opts.identity, id: key }, opts.seams?.now);
     if (earlier === undefined) invalid++;
-    earlier?.rounds.forEach((round, i) => {
-      entries.push({ id: `${key}#${i}`, round });
-    });
-  }
-  for (const row of rows) {
-    const entry = validRoundRecord(row, key, opts.identity, opts.seams?.now);
-    if (entry === undefined) invalid++;
-    else entries.push(entry);
+    for (const round of earlier?.rounds ?? []) entries.push({ id: key, round });
   }
   if (invalid > 0)
     log("PR memory at start held a record that is not valid for this PR; ignoring it.");
 
   // A run recorded twice is recalled once.
   const runIds = new Set<string>();
-  const ordered = entries.sort(newestFirst).filter((e) => {
+  const ordered = entries.filter((e) => {
     if (e.round.runId === undefined) return true;
     if (runIds.has(e.round.runId)) return false;
     runIds.add(e.round.runId);
@@ -843,7 +843,9 @@ export async function recallPrMemoryRound(opts: {
 }
 
 // Write one round's memory at round end, as a new record of its own, then
-// prune. Nothing is read before the write.
+// prune. Nothing is read before the write. FlairHttpClient.write sets the
+// record's createdAt to the client clock at the write; endedAt stays in the
+// content. "written" means the write succeeded.
 export async function writePrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;
@@ -888,10 +890,11 @@ export async function writePrMemoryRound(opts: {
   return { status: "written" };
 }
 
-// Delete this PR's round records beyond the newest PR_MEMORY_RETAINED_ROUNDS
-// in one listing. Flair answers a delete of an absent record with `false`, so
-// concurrent prunes do not fail each other; a failed list or delete is logged
-// and the round stays written.
+// List up to PR_MEMORY_PRUNE_PAGE records after the first PR_MEMORY_MAX_ROUNDS
+// in this PR's listing order, and request a delete of each one that validates
+// as this PR's round record. Flair answers a delete of an absent record with
+// `false`, which is not a failure. A failed list or delete is logged and does
+// not change the write's result.
 async function pruneRounds(
   client: FlairHttpClient,
   key: string,
@@ -901,22 +904,28 @@ async function pruneRounds(
 ): Promise<void> {
   let rows: FlairMemory[];
   try {
-    rows = await listRounds(client, key, PR_MEMORY_END_TIMEOUT_MS);
+    rows = await listRounds(
+      client,
+      key,
+      { offset: PR_MEMORY_MAX_ROUNDS, limit: PR_MEMORY_PRUNE_PAGE },
+      PR_MEMORY_END_TIMEOUT_MS,
+    );
   } catch (err) {
     log(`PR memory prune skipped: the round list could not be read (${safeReason(err)}).`);
     return;
   }
-  const rounds = rows
-    .flatMap((row) => validRoundRecord(row, key, identity, now) ?? [])
-    .sort(newestFirst);
-  for (const old of rounds.slice(PR_MEMORY_RETAINED_ROUNDS)) {
+  for (const row of rows) {
+    const old = validRoundRecord(row, key, identity, now);
+    if (old === undefined) continue;
     try {
       await client.deleteMemory(old.id, {
         timeoutMs: PR_MEMORY_END_TIMEOUT_MS,
         maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
       });
     } catch (err) {
-      log(`PR memory prune: a delete failed (${safeReason(err)}); the round stays written.`);
+      log(
+        `PR memory prune: a delete failed (${safeReason(err)}); the write's result is unchanged.`,
+      );
     }
   }
 }
