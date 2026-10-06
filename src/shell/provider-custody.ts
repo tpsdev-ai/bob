@@ -112,13 +112,8 @@ const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENV_VAR_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
 
 /**
- * The environment variables a pi config value references, in pi's interpolation
- * grammar: `$NAME` and `${NAME}` (with `$$` and `$!` escapes), de-duplicated in
- * order; a `!command` value references none. pi 0.84.3 does not export this
- * extractor, so bob mirrors pi's `getConfigValueEnvVarNames`; the mirror is
- * pinned by the conformance test against pi's real function. A stored
- * credential's `key` is such a value; an operator who writes
- * `{"type":"api_key","key":"$NAME"}` references `NAME`.
+ * Names referenced by a pi config value; mirrors pi's private extractor.
+ * Stored-key scrub exemptions require an absent or empty stored env override.
  */
 export function piConfigValueEnvVarNames(config: string | undefined): readonly string[] {
   if (config === undefined || config.startsWith("!")) return [];

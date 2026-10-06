@@ -1,11 +1,4 @@
-// bob#323 — the session factory's environment scrub keeps the environment
-// variables the SELECTED provider's stored credential references.
-//
-// A pi-managed row (pi/disk) stores its credential in the agent's auth.json,
-// and `key` may be a reference such as "$NAME". pi resolves that reference when
-// the session's runtime reads the credential, which is AFTER the scrub, so the
-// scrub must not remove NAME. The fixture uses neutral names and disposable
-// values only: no real key is ever written.
+// bob#323 — real provider variable names with disposable fixture values.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +17,7 @@ const REFERENCED = "DEEPSEEK_API_KEY";
 const UNRELATED = "GROQ_API_KEY";
 const DISPOSABLE = "disposable-not-a-real-key";
 
-describe("bob#323 — the scrub keeps a stored credential's environment references", () => {
+describe("bob#323 — stored credential references during the scrub", () => {
   let tmpRoot: string;
   let keysRoot: string;
   const saved = new Map<string, string | undefined>();
@@ -46,7 +39,12 @@ describe("bob#323 — the scrub keeps a stored credential's environment referenc
     rmSync(keysRoot, { recursive: true, force: true });
   });
 
-  it("a stored credential that references an env var still resolves; an unrelated credential variable is removed", async () => {
+  async function checkCredential(
+    env: Record<string, string> | undefined,
+    expectedKey: string,
+    expectedAmbient: string | undefined,
+    otherCredential?: { type: "api_key"; key: string },
+  ) {
     const name = "credref";
     const { agentDir } = initAgent({
       name,
@@ -60,7 +58,10 @@ describe("bob#323 — the scrub keeps a stored credential's environment referenc
     });
     writeFileSync(
       join(agentDir, ".pi-agent", "auth.json"),
-      JSON.stringify({ [PROVIDER]: { type: "api_key", key: `$${REFERENCED}` } }),
+      JSON.stringify({
+        [PROVIDER]: { type: "api_key", key: `$${REFERENCED}`, env },
+        ...(otherCredential ? { groq: otherCredential } : {}),
+      }),
     );
     process.env[REFERENCED] = DISPOSABLE;
     process.env[UNRELATED] = DISPOSABLE;
@@ -70,14 +71,40 @@ describe("bob#323 — the scrub keeps a stored credential's environment referenc
     const result = await factory({ sessionManager: SessionManager.inMemory(config.cwd) });
     try {
       const runtime = result.services.modelRuntime as unknown as ModelRuntime;
-      // The REAL pi resolver reads auth.json and interpolates the reference.
       const auth = await runtime.getAuth(PROVIDER);
-      expect(auth?.auth.apiKey).toBe(DISPOSABLE);
-      // A pi credential variable the stored credential does not reference is
-      // still removed.
+      expect(auth?.auth.apiKey).toBe(expectedKey);
+      expect(process.env[REFERENCED]).toBe(expectedAmbient);
       expect(process.env[UNRELATED]).toBeUndefined();
     } finally {
       (result.session as unknown as { dispose(): void }).dispose();
     }
+  }
+
+  it("resolves the stored override and removes the referenced ambient variable", async () => {
+    const override = "disposable-stored-override";
+    await checkCredential({ [REFERENCED]: override }, override, undefined);
+  });
+
+  it("keeps and resolves the ambient variable when credential.env is absent", async () => {
+    await checkCredential(undefined, DISPOSABLE, DISPOSABLE);
+  });
+
+  it("keeps and resolves the ambient variable when the named override is absent", async () => {
+    await checkCredential({}, DISPOSABLE, DISPOSABLE);
+  });
+
+  it("keeps and resolves the ambient variable when the named override is empty", async () => {
+    await checkCredential({ [REFERENCED]: "" }, DISPOSABLE, DISPOSABLE);
+  });
+
+  it("uses a whitespace override and removes the referenced ambient variable", async () => {
+    await checkCredential({ [REFERENCED]: " " }, " ", undefined);
+  });
+
+  it("removes the variable referenced only by another provider's stored credential", async () => {
+    await checkCredential(undefined, DISPOSABLE, DISPOSABLE, {
+      type: "api_key",
+      key: `$${UNRELATED}`,
+    });
   });
 });
