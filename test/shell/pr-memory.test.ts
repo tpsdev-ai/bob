@@ -865,6 +865,24 @@ describe("concurrent rounds (bob#318)", () => {
     expect(recalledDays(await recallBlock(fake))).toEqual([1, 6, 5]);
   });
 
+  it("keeps its own write under a createdAt tie, then prunes on the next write", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    for (const day of [4, 5, 6]) await writeDay(fake, day);
+    const start = fake.calls.length;
+    expect((await writeDay(fake, 1)).status).toBe("written");
+    const calls = fake.calls.slice(start);
+    const writtenId = String(calls.find((c) => c.method === "PUT")?.body?.id);
+    expect(calls.filter((c) => c.method === "DELETE").map((c) => c.path)).not.toContain(
+      `/Memory/${writtenId}`,
+    );
+    expect(fake.memories.has(writtenId)).toBe(true);
+    expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
+    expect(storedDays(fake)).toEqual([1, 4, 5, 6]);
+    expect((await writeDay(fake, 7)).status).toBe("written");
+    expect(roundRecords(fake)).toHaveLength(PR_MEMORY_MAX_ROUNDS);
+    expect(storedDays(fake)).toEqual([5, 6, 7]);
+  });
+
   it("recalls the latest writes over a backlog from failed prunes, then prunes it in pages", async () => {
     const options: Parameters<typeof makeFakeFlair>[0] = {
       agents: { [AGENT]: { id: AGENT } },
@@ -888,8 +906,6 @@ describe("concurrent rounds (bob#318)", () => {
 
   it("breaks a createdAt tie by id", async () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
-    // One constant clock: every record carries the same createdAt, and the
-    // round ids (key, endedAt, random suffix) order by endedAt.
     for (const day of [3, 1, 4, 2]) await writeDay(fake, day);
     expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
     expect(storedDays(fake)).toEqual([2, 3, 4]);

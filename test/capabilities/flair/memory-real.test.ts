@@ -147,3 +147,18 @@ it.skipIf(!configured)(
   },
   60_000,
 );
+
+it.skipIf(!configured)(
+  "keeps its own write under a createdAt tie on real Flair, then prunes on the next write",
+  async () => {
+    if (!url || !readerId || !readerKey) throw new Error("missing Flair test configuration");
+    const at = Date.now();
+    const pr = roundsFor(readerId, readerKey, url, () => at);
+    for (const day of [4, 5, 6]) expect((await pr.write(day)).status).toBe("written");
+    expect((await pr.write(1)).status).toBe("written");
+    expect(await pr.stored()).toEqual([6, 5, 4, 1]);
+    expect((await pr.write(7)).status).toBe("written");
+    expect(await pr.stored()).toEqual([7, 6, 5]);
+  },
+  60_000,
+);

@@ -244,15 +244,6 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       }
     }
 
-    // bob#318 — the Memory collection read, as a real Flair serves it (measured
-    // against Flair on Harper 5.2.8): `attr=value` is strict equality (an array
-    // attribute matches one of its elements); `sort(k1,k2,…)` orders by each key
-    // in turn, `-` for descending, comparing stored values (createdAt is whatever
-    // the writer sent); `limit(n)` returns the first n rows and `limit(start,end)`
-    // rows [start, end). A reader sees its own rows at any visibility and other
-    // agents' non-private rows. Rows still tied after every sort key keep
-    // insertion order here; Harper does not document an order for them. The fake
-    // answers any other query part with 400.
     if (path === "/Memory/" && init.method === "GET") {
       const signerId = signingAgentId(init.headers);
       if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });

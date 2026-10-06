@@ -7,13 +7,7 @@
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
 // agent id + canonical repository + PR number (TaskBinding.pr_ref).
-// bob#318: each round writes its own record (id: key + endedAt + a random
-// suffix; subject: key; createdAt: the client's write time), so two rounds
-// write two records. Recall and the prune both page through one order, Flair's
-// `sort(-createdAt,-id)` over this agent's records whose subject equals the
-// key (an exact Flair query, not a search). Recall also reads the single record
-// the previous writer kept under the key itself, and validates the identity
-// embedded in each record.
+// Round ids append a timestamp and UUID; subject is the PR key.
 //
 // The writer stores supplied finding and check strings within byte caps;
 // recall escapes framing delimiters and line breaks.
@@ -58,8 +52,7 @@ export function prMemoryRoundId(key: string, endedAt: string, now: () => number)
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
 // After a successful write, the prune lists up to 8 records after the first 3
-// in `sort(-createdAt,-id)` order and requests a delete of each one that
-// validates as this PR's round record.
+// in `sort(-createdAt,-id)` order; the written id is excluded from deletion.
 export const PR_MEMORY_PRUNE_PAGE = 8;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
@@ -74,12 +67,11 @@ const ROUND_EVIDENCE_MAX = 32;
 const ROUND_INCOMPLETE_MAX = 32;
 const ENVELOPE_OMITTED_MAX = 16;
 
-// Request budgets (see FlairHttpClient's signedFetchWithBounds): 2 s each way,
-// 128 KiB response cap, no automatic retries.
+// Request timeout: 2 s. Recall requests run in parallel; round-end requests
+// run sequentially (write, list, up to 8 deletes): up to 20 s.
 export const PR_MEMORY_START_TIMEOUT_MS = 2000;
 export const PR_MEMORY_END_TIMEOUT_MS = 2000;
 export const PR_MEMORY_MAX_RESPONSE_BYTES = 128 * 1024;
-// Per listed row: a row carries its stored embedding as well as its content.
 export const PR_MEMORY_LISTED_ROW_MAX_BYTES = 64 * 1024;
 
 // ─── Stored schema ──────────────────────────────────────────────────────────
@@ -808,7 +800,6 @@ export async function recallPrMemoryRound(opts: {
   if (invalid > 0)
     log("PR memory at start held a record that is not valid for this PR; ignoring it.");
 
-  // A run recorded twice is recalled once.
   const runIds = new Set<string>();
   const ordered = entries.filter((e) => {
     if (e.round.runId === undefined) return true;
@@ -869,12 +860,14 @@ export async function writePrMemoryRound(opts: {
     rounds: [round],
     omitted: [],
   };
+  let id: string;
   try {
     const { json } = boundEnvelope(envelope);
     if (parseEnvelope(json, opts.identity)?.rounds.length !== 1)
       return { status: "skipped", reason: "the round failed schema validation" };
+    id = prMemoryRoundId(key, round.endedAt, opts.seams?.now ?? Date.now);
     await client.write(json, {
-      id: prMemoryRoundId(key, round.endedAt, opts.seams?.now ?? Date.now),
+      id,
       durability: "persistent",
       visibility: "private",
       tags: [PR_MEMORY_TAG],
@@ -887,18 +880,14 @@ export async function writePrMemoryRound(opts: {
     log(`PR memory write failed (${reason}); the round outcome is unchanged.`);
     return { status: "skipped", reason };
   }
-  await pruneRounds(client, key, opts.identity, log, opts.seams?.now);
+  await pruneRounds(client, key, id, opts.identity, log, opts.seams?.now);
   return { status: "written" };
 }
 
-// List up to PR_MEMORY_PRUNE_PAGE records after the first PR_MEMORY_MAX_ROUNDS
-// in this PR's listing order, and request a delete of each one that validates
-// as this PR's round record. Flair answers a delete of an absent record with
-// `false`, which is not a failure. A failed list or delete is logged and does
-// not change the write's result.
 async function pruneRounds(
   client: FlairHttpClient,
   key: string,
+  writtenId: string,
   identity: PrMemoryIdentity,
   log: (message: string) => void,
   now?: () => number,
@@ -916,6 +905,7 @@ async function pruneRounds(
     return;
   }
   for (const row of rows) {
+    if (row.id === writtenId) continue;
     const old = validRoundRecord(row, key, identity, now);
     if (old === undefined) continue;
     try {
