@@ -1,0 +1,1 @@
+- **A replacement session no longer leaves the selected provider's credential variable in the environment (bob#321).** The session factory clears the selected keyed row's variable at the start of a replacement invocation. Custody holds the credential the first invocation read; each session's newly built transport sends it.
