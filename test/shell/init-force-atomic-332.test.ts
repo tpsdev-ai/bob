@@ -65,9 +65,9 @@ describe("bob#332 — a --force publish replaces the destination by rename", () 
 
     // The destination is the regular file the rename installed, not the symlink
     // the mode-less write used to follow.
-    expect(lstatSync(soulPath).isSymbolicLink()).toBe(false);
-    expect(readFileSync(target, "utf8")).toBe("the link target\n");
     expect(readFileSync(soulPath, "utf8")).toContain("You are Agent-a");
+    expect(readFileSync(target, "utf8")).toBe("the link target\n");
+    expect(lstatSync(soulPath).isSymbolicLink()).toBe(false);
     expect(tempFilesUnder(agentDir)).toEqual([]);
   });
 });
