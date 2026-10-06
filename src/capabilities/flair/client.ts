@@ -200,6 +200,11 @@ export interface FlairReadOptions {
   maxResponseBytes?: number;
 }
 
+export interface FlairListOptions extends FlairReadOptions {
+  // The most rows one listing returns (Harper `limit(n)`).
+  limit: number;
+}
+
 export interface FlairClient {
   search(query: string, limit?: number): Promise<FlairSearchHit[]>;
   write(content: string, opts?: FlairWriteOptions): Promise<{ id: string }>;
@@ -494,6 +499,41 @@ export class FlairHttpClient implements FlairClient {
     )) as FlairMemory | null | undefined;
     if (r === undefined || (r !== null && (typeof r !== "object" || Array.isArray(r))))
       throw new Error("flair read returned an invalid body");
+    return r;
+  }
+
+  // bob#318 — this agent's own Memory rows whose `subject` equals `subject`,
+  // newest `createdAt` first, at most `opts.limit` rows. Harper REST query:
+  // `attr=value` is a strict-equality condition on an indexed attribute; the
+  // signature covers the path and the query string.
+  async listOwnBySubject(subject: string, opts: FlairListOptions): Promise<FlairMemory[]> {
+    if (!Number.isSafeInteger(opts.limit) || opts.limit < 1)
+      throw new Error("flair list limit must be a positive integer");
+    const path =
+      `/Memory/?agentId=${encodeURIComponent(this.agentId)}` +
+      `&subject=${encodeURIComponent(subject)}&sort(-createdAt)&limit(${opts.limit})`;
+    const r = await this.signedFetchWithBounds("GET", path, undefined, opts, undefined, true);
+    if (
+      !Array.isArray(r) ||
+      r.length > opts.limit ||
+      r.some((row) => typeof row !== "object" || row === null || Array.isArray(row))
+    )
+      throw new Error("flair list returned an invalid body");
+    return r as FlairMemory[];
+  }
+
+  // bob#318 — delete one Memory row. Flair answers `true` when it deleted the
+  // row and `false` when no such row exists.
+  async deleteMemory(id: string, opts: FlairReadOptions = {}): Promise<boolean> {
+    const r = await this.signedFetchWithBounds(
+      "DELETE",
+      `/Memory/${encodeURIComponent(id)}`,
+      undefined,
+      opts,
+      undefined,
+      true,
+    );
+    if (typeof r !== "boolean") throw new Error("flair delete returned an invalid body");
     return r;
   }
 

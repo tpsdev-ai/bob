@@ -7,13 +7,16 @@
 //
 // IDENTITY is an exact key derived from the launcher-owned task binding —
 // agent id + canonical repository + PR number (TaskBinding.pr_ref).
-// Recall and write address one record by id and
-// validate the identity embedded in it, rather than searching.
+// bob#318: each round writes its own record (id: key + endedAt + a random
+// suffix; subject: key), so two rounds write two records.
+// Recall lists this agent's records whose subject equals the key (an exact,
+// bounded Flair query, not a search), reads the single record the previous
+// writer kept under the key itself, and validates the identity embedded in each.
 //
 // The writer stores supplied finding and check strings within byte caps;
 // recall escapes framing delimiters and line breaks.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { FlairHttpClient, type FlairMemory } from "../capabilities/flair/client.js";
 import type { PrRef } from "../capabilities/work/task-binding.js";
 import { isVerifiedEdit } from "./edit-evidence.js";
@@ -38,17 +41,25 @@ export function prMemoryKey(
   return `${PR_MEMORY_KEY_PREFIX}${digest}`;
 }
 
-// The singular provenance label for the record: <repository>#pr-<number>.
-export function prMemorySubject(canonicalRepository: string, prNumber: number): string {
-  return `${canonicalRepository}#pr-${prNumber}`;
+// One round's record id: the key, the round's end time and a random suffix.
+// The end time is the parsed endedAt, or the write clock when it does not parse.
+export function prMemoryRoundId(key: string, endedAt: string, now: () => number): string {
+  const parsed = Date.parse(endedAt);
+  const stamp = Number.isFinite(parsed) ? parsed : now();
+  return `${key}-r${stamp}-${randomUUID()}`;
 }
 
 // ─── Bounds ─────────────────────────────────────────────────────────────────
 
-// Up to 3 rounds are retained from newest-first input; each is capped at 4 KiB and the whole
-// serialized envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
+// Recall shows up to 3 rounds; each is capped at 4 KiB and each stored
+// envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
+// After a write, listed round records beyond the newest 4 are deleted; the 4th
+// lets recall name an older round it does not show.
+export const PR_MEMORY_RETAINED_ROUNDS = PR_MEMORY_MAX_ROUNDS + 1;
+// Rows one listing returns.
+export const PR_MEMORY_LIST_LIMIT = 2 * PR_MEMORY_MAX_ROUNDS;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
 // The recalled prompt block, framing included.
@@ -67,6 +78,8 @@ const ENVELOPE_OMITTED_MAX = 16;
 export const PR_MEMORY_START_TIMEOUT_MS = 2000;
 export const PR_MEMORY_END_TIMEOUT_MS = 2000;
 export const PR_MEMORY_MAX_RESPONSE_BYTES = 128 * 1024;
+// A listed row carries its stored embedding as well as its content.
+export const PR_MEMORY_LIST_MAX_RESPONSE_BYTES = PR_MEMORY_LIST_LIMIT * 64 * 1024;
 
 // ─── Stored schema ──────────────────────────────────────────────────────────
 
@@ -708,10 +721,49 @@ function safeReason(err: unknown): string {
   return "the request failed";
 }
 
-// Recall the prior-round memory for one PR BEFORE session construction. A
-// missing record is "empty". A malformed, mismatched or
-// wrong-owner record is "invalid" and contributes nothing. An unreachable or
-// timed-out Flair is "unavailable"; the round proceeds and the caller says so.
+// A listed row that is one of this agent's round records for this PR: its id
+// carries the key's round prefix, its subject is the key, and it holds one
+// round under the expected identity.
+interface RoundEntry {
+  id: string;
+  round: PrRoundRecord;
+  envelope?: PrMemoryEnvelope;
+}
+
+function validRoundRecord(
+  row: FlairMemory,
+  key: string,
+  identity: PrMemoryIdentity,
+  now?: () => number,
+): RoundEntry | undefined {
+  if (typeof row.id !== "string" || !row.id.startsWith(`${key}-r`) || row.subject !== key)
+    return undefined;
+  const envelope = validateRecalledRecord(row, { ...identity, id: row.id }, now);
+  const round = envelope?.rounds[0];
+  if (envelope === undefined || round === undefined || envelope.rounds.length !== 1)
+    return undefined;
+  return { id: row.id, round, envelope };
+}
+
+// Newest endedAt first (the harness writes ISO 8601 UTC); ties by id.
+function newestFirst(a: RoundEntry, b: RoundEntry): number {
+  if (a.round.endedAt !== b.round.endedAt) return a.round.endedAt < b.round.endedAt ? 1 : -1;
+  return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+}
+
+function listRounds(client: FlairHttpClient, key: string, timeoutMs: number) {
+  return client.listOwnBySubject(key, {
+    limit: PR_MEMORY_LIST_LIMIT,
+    timeoutMs,
+    maxResponseBytes: PR_MEMORY_LIST_MAX_RESPONSE_BYTES,
+  });
+}
+
+// Recall the prior-round memory for one PR BEFORE session construction. With
+// no record the result is "empty". A malformed, mismatched or wrong-owner record
+// contributes nothing; when nothing else is recalled the result is "invalid". An
+// unreachable or timed-out Flair is "unavailable"; the round proceeds and the
+// caller says so.
 export async function recallPrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;
@@ -720,32 +772,78 @@ export async function recallPrMemoryRound(opts: {
   log?: (message: string) => void;
 }): Promise<PrMemoryRecallResult> {
   const log = opts.log ?? (() => {});
-  const id = prMemoryKey(opts.identity.agentId, opts.identity.repository, opts.identity.prNumber);
-  let record: FlairMemory | null;
+  const key = prMemoryKey(opts.identity.agentId, opts.identity.repository, opts.identity.prNumber);
+  const client = clientFor(opts.target, opts.seams);
+  let earlierRecord: FlairMemory | null;
+  let rows: FlairMemory[];
   try {
-    record = await clientFor(opts.target, opts.seams).get(id, {
-      timeoutMs: PR_MEMORY_START_TIMEOUT_MS,
-      maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
-    });
+    [earlierRecord, rows] = await Promise.all([
+      client.get(key, {
+        timeoutMs: PR_MEMORY_START_TIMEOUT_MS,
+        maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
+      }),
+      listRounds(client, key, PR_MEMORY_START_TIMEOUT_MS),
+    ]);
   } catch (err) {
     const reason = safeReason(err);
     log(`PR memory unavailable at start (${reason}).`);
     return { status: "unavailable", reason };
   }
-  if (record === null) return { status: "empty" };
-  const envelope = validateRecalledRecord(record, { ...opts.identity, id }, opts.seams?.now);
-  if (envelope === undefined) {
-    log("PR memory at start was not a valid record for this PR; ignoring it.");
-    return { status: "invalid", reason: "the record failed identity or schema validation" };
+  let invalid = 0;
+  const entries: RoundEntry[] = [];
+  // The single record the previous writer kept under the key itself.
+  let earlier: PrMemoryEnvelope | undefined;
+  if (earlierRecord !== null) {
+    earlier = validateRecalledRecord(earlierRecord, { ...opts.identity, id: key }, opts.seams?.now);
+    if (earlier === undefined) invalid++;
+    earlier?.rounds.forEach((round, i) => {
+      entries.push({ id: `${key}#${i}`, round });
+    });
   }
-  const block = renderPrMemoryPrompt(envelope);
-  if (block === "") return { status: "empty" };
-  return { status: "recalled", block };
+  for (const row of rows) {
+    const entry = validRoundRecord(row, key, opts.identity, opts.seams?.now);
+    if (entry === undefined) invalid++;
+    else entries.push(entry);
+  }
+  if (invalid > 0)
+    log("PR memory at start held a record that is not valid for this PR; ignoring it.");
+
+  // A run recorded twice is recalled once.
+  const runIds = new Set<string>();
+  const ordered = entries.sort(newestFirst).filter((e) => {
+    if (e.round.runId === undefined) return true;
+    if (runIds.has(e.round.runId)) return false;
+    runIds.add(e.round.runId);
+    return true;
+  });
+  const shown = ordered.slice(0, PR_MEMORY_MAX_ROUNDS);
+  // Findings fold oldest to newest, so a later status replaces an earlier one.
+  let findings = earlier?.open_findings ?? [];
+  for (const e of [...shown].reverse())
+    if (e.envelope) findings = mergeFindings(findings, e.envelope.open_findings);
+  const block = renderPrMemoryPrompt({
+    v: PR_MEMORY_SCHEMA_VERSION,
+    agentId: opts.identity.agentId,
+    repository: opts.identity.repository,
+    prNumber: opts.identity.prNumber,
+    open_findings: findings,
+    rounds: shown.map((e) => e.round),
+    omitted: [
+      ...(earlier?.omitted ?? []),
+      ...shown.flatMap((e) => e.envelope?.omitted ?? []),
+      ...ordered
+        .slice(PR_MEMORY_MAX_ROUNDS)
+        .map((e) => truncate(`older round (${e.round.endedAt})`, STRING_MAX)),
+    ],
+  });
+  if (block !== "") return { status: "recalled", block };
+  if (invalid > 0)
+    return { status: "invalid", reason: "the record failed identity or schema validation" };
+  return { status: "empty" };
 }
 
-// Write one round's memory at round end. A failed read first means the write
-// is SKIPPED (never overwrite history we could not read). A record already
-// holding this run id is left alone.
+// Write one round's memory at round end, as a new record of its own, then
+// prune. Nothing is read before the write.
 export async function writePrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;
@@ -756,54 +854,28 @@ export async function writePrMemoryRound(opts: {
 }): Promise<PrMemoryWriteResult> {
   const log = opts.log ?? (() => {});
   const { agentId, repository, prNumber } = opts.identity;
-  const id = prMemoryKey(agentId, repository, prNumber);
+  const key = prMemoryKey(agentId, repository, prNumber);
   const client = clientFor(opts.target, opts.seams);
-
-  let existing: PrMemoryEnvelope | undefined;
-  try {
-    const record = await client.get(id, {
-      timeoutMs: PR_MEMORY_END_TIMEOUT_MS,
-      maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
-    });
-    if (record !== null) {
-      existing = validateRecalledRecord(record, { ...opts.identity, id }, opts.seams?.now);
-      if (existing === undefined) {
-        log("PR memory write SKIPPED: the existing record is not valid for this PR.");
-        return { status: "skipped", reason: "the existing record failed validation" };
-      }
-    }
-  } catch (err) {
-    const reason = safeReason(err);
-    log(`PR memory write SKIPPED: the existing history could not be read (${reason}).`);
-    return { status: "skipped", reason };
-  }
-
-  const runId =
-    opts.evidence.runId === undefined ? undefined : truncate(opts.evidence.runId, STRING_MAX);
-  if (runId !== undefined && existing?.rounds.some((r) => r.runId === runId)) {
-    return { status: "skipped", reason: "this run is already recorded" };
-  }
-
   const round = roundFromEvidence(opts.evidence);
   const envelope: PrMemoryEnvelope = {
     v: PR_MEMORY_SCHEMA_VERSION,
     agentId,
     repository,
     prNumber,
-    open_findings: mergeFindings(existing?.open_findings ?? [], opts.evidence.findings ?? []),
-    rounds: [round, ...(existing?.rounds ?? [])],
-    omitted: existing?.omitted ?? [],
+    open_findings: mergeFindings([], opts.evidence.findings ?? []),
+    rounds: [round],
+    omitted: [],
   };
   try {
     const { json } = boundEnvelope(envelope);
-    if (parseEnvelope(json, opts.identity) === undefined)
+    if (parseEnvelope(json, opts.identity)?.rounds.length !== 1)
       return { status: "skipped", reason: "the round failed schema validation" };
     await client.write(json, {
-      id,
+      id: prMemoryRoundId(key, round.endedAt, opts.seams?.now ?? Date.now),
       durability: "persistent",
       visibility: "private",
       tags: [PR_MEMORY_TAG],
-      subject: prMemorySubject(repository, prNumber),
+      subject: key,
       timeoutMs: PR_MEMORY_END_TIMEOUT_MS,
       maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
     });
@@ -812,5 +884,39 @@ export async function writePrMemoryRound(opts: {
     log(`PR memory write failed (${reason}); the round outcome is unchanged.`);
     return { status: "skipped", reason };
   }
+  await pruneRounds(client, key, opts.identity, log, opts.seams?.now);
   return { status: "written" };
+}
+
+// Delete this PR's round records beyond the newest PR_MEMORY_RETAINED_ROUNDS
+// in one listing. Flair answers a delete of an absent record with `false`, so
+// concurrent prunes do not fail each other; a failed list or delete is logged
+// and the round stays written.
+async function pruneRounds(
+  client: FlairHttpClient,
+  key: string,
+  identity: PrMemoryIdentity,
+  log: (message: string) => void,
+  now?: () => number,
+): Promise<void> {
+  let rows: FlairMemory[];
+  try {
+    rows = await listRounds(client, key, PR_MEMORY_END_TIMEOUT_MS);
+  } catch (err) {
+    log(`PR memory prune skipped: the round list could not be read (${safeReason(err)}).`);
+    return;
+  }
+  const rounds = rows
+    .flatMap((row) => validRoundRecord(row, key, identity, now) ?? [])
+    .sort(newestFirst);
+  for (const old of rounds.slice(PR_MEMORY_RETAINED_ROUNDS)) {
+    try {
+      await client.deleteMemory(old.id, {
+        timeoutMs: PR_MEMORY_END_TIMEOUT_MS,
+        maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
+      });
+    } catch (err) {
+      log(`PR memory prune: a delete failed (${safeReason(err)}); the round stays written.`);
+    }
+  }
 }

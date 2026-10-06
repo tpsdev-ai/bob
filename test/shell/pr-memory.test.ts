@@ -11,6 +11,7 @@ import {
   PR_MEMORY_MAX_ROUNDS,
   PR_MEMORY_PROMPT_HEADING,
   PR_MEMORY_PROMPT_MAX_BYTES,
+  PR_MEMORY_RETAINED_ROUNDS,
   PR_MEMORY_ROUND_MAX_BYTES,
   PR_MEMORY_TAG,
   PrMemoryCollector,
@@ -19,7 +20,7 @@ import {
   type PrTestEvidence,
   parseEnvelope,
   prMemoryKey,
-  prMemorySubject,
+  prMemoryRoundId,
   recallPrMemoryRound,
   renderPrMemoryPrompt,
   roundFromEvidence,
@@ -60,6 +61,31 @@ function envelope(over: Partial<PrMemoryEnvelope> = {}): PrMemoryEnvelope {
   };
 }
 
+// The round records stored for this PR (bob#318: one record per round).
+function roundRecords(fake: ReturnType<typeof makeFakeFlair>): Record<string, unknown>[] {
+  return [...fake.memories.values()].filter((r) => String(r.id).startsWith(`${ID}-r`));
+}
+
+// Holds each matching request until `count` are pending, then releases them
+// together; later requests pass straight through. A held request that is never
+// released fails at the client's own request deadline.
+function barrier(
+  fetchImpl: ReturnType<typeof makeFakeFlair>["fetchImpl"],
+  count: number,
+  match: (method: string, path: string) => boolean = () => true,
+): ReturnType<typeof makeFakeFlair>["fetchImpl"] {
+  const held: Array<() => void> = [];
+  return async (url, init) => {
+    if (held.length < count && match(init.method, new URL(url).pathname)) {
+      await new Promise<void>((resolve) => {
+        held.push(resolve);
+        if (held.length === count) for (const release of held) release();
+      });
+    }
+    return fetchImpl(url, init);
+  };
+}
+
 function round(over: Partial<PrRoundRecord> = {}): PrRoundRecord {
   return {
     endedAt: "2026-10-03T19:00:00.000Z",
@@ -88,8 +114,12 @@ describe("identity — an exact key, nothing else", () => {
     expect(prMemoryKey(AGENT, REPO, PR + 1)).not.toBe(base);
   });
 
-  it("labels the record with a singular subject", () => {
-    expect(prMemorySubject(REPO, PR)).toBe(`${REPO}#pr-${PR}`);
+  it("gives each round record the key, its end time and a random suffix", () => {
+    const now = () => 1_700_000_000_000;
+    const a = prMemoryRoundId(ID, "2026-10-03T19:00:00.000Z", now);
+    expect(a.startsWith(`${ID}-r${Date.parse("2026-10-03T19:00:00.000Z")}-`)).toBe(true);
+    expect(prMemoryRoundId(ID, "2026-10-03T19:00:00.000Z", now)).not.toBe(a);
+    expect(prMemoryRoundId(ID, "now", now).startsWith(`${ID}-r1700000000000-`)).toBe(true);
   });
 });
 
@@ -217,14 +247,6 @@ describe("envelope parsing and validation", () => {
     expect(recalled.status).toBe(status);
     if (status === "invalid") expect(recalled.block).toBeUndefined();
     else expect(recalled.block).toContain(PR_MEMORY_PROMPT_HEADING);
-    const written = await writePrMemoryRound({
-      target: TARGET,
-      ref: REF,
-      identity: IDENTITY,
-      seams: seams(fake),
-      evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
-    });
-    expect(written.status).toBe(status === "invalid" ? "skipped" : "written");
   });
 
   it("accepts the envelope byte cap and rejects one byte over it", () => {
@@ -260,7 +282,7 @@ describe("envelope parsing and validation", () => {
       "oversized UTF-8 round",
       envelope({ rounds: [round({ files_touched: Array<string>(8).fill("€".repeat(170)) })] }),
     ],
-  ] as const)("rejects recall and skips writing over an existing %s", async (label, probe) => {
+  ] as const)("rejects recall of an existing %s and writes beside it", async (label, probe) => {
     const content = JSON.stringify(probe);
     if (label === "17809-byte envelope") {
       expect(Buffer.byteLength(content, "utf8")).toBe(17809);
@@ -293,8 +315,13 @@ describe("envelope parsing and validation", () => {
       evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
       seams: s,
     });
-    expect(written.status).toBe("skipped");
-    expect(fake.calls.map((call) => call.method)).toEqual(["GET", "GET"]);
+    expect(written.status).toBe("written");
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      `GET /Memory/${ID}`,
+      "GET /Memory/",
+      `PUT /Memory/${String(roundRecords(fake)[0]?.id)}`,
+      "GET /Memory/",
+    ]);
     expect(fake.memories.get(ID)?.content).toBe(content);
   });
 
@@ -500,11 +527,13 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     });
     expect(written.status).toBe("written");
 
-    const stored = fake.memories.get(ID);
+    expect(fake.memories.has(ID)).toBe(false);
+    const [stored, ...rest] = roundRecords(fake);
+    expect(rest).toHaveLength(0);
     expect(stored?.visibility).toBe("private");
     expect(stored?.durability).toBe("persistent");
     expect(stored?.tags).toEqual([PR_MEMORY_TAG]);
-    expect(stored?.subject).toBe(prMemorySubject(REPO, PR));
+    expect(stored?.subject).toBe(ID);
     expect(String(stored?.content)).toContain("bun run lint");
 
     const recalled = await recallPrMemoryRound({
@@ -610,14 +639,15 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     expect(recalled.status).toBe("empty");
   });
 
-  it("never overwrites history after an unsuccessful read", async () => {
-    const prior = JSON.stringify(envelope({ rounds: [round({ runId: "old" })] }));
+  it("recalls the record the previous writer kept under the key and leaves it unchanged", async () => {
+    const prior = JSON.stringify(
+      envelope({ rounds: [round({ runId: "old", files_touched: ["earlier.ts"] })] }),
+    );
     const fake = makeFakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: {
         [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior },
       },
-      memoryGetStatus: 500,
     });
     const result = await writePrMemoryRound({
       target: TARGET,
@@ -627,16 +657,28 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
         runId: "new",
         endedAt: "2026-10-03T20:00:00.000Z",
         outcome: "completed",
-        filesTouched: [],
+        filesTouched: ["later.ts"],
         testEvidence: [],
       },
       seams: seams(fake),
     });
-    expect(result.status).toBe("skipped");
+    expect(result.status).toBe("written");
     expect(fake.memories.get(ID)?.content).toBe(prior);
+    expect(fake.calls.filter((c) => c.method === "PUT").map((c) => c.path)).toEqual([
+      `/Memory/${String(roundRecords(fake)[0]?.id)}`,
+    ]);
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: seams(fake),
+    });
+    const block = String(recalled.block);
+    expect(block.indexOf("later.ts")).toBeGreaterThan(-1);
+    expect(block.indexOf("later.ts")).toBeLessThan(block.indexOf("earlier.ts"));
   });
 
-  it("skips a run id already retained", async () => {
+  it("recalls a run id written twice once", async () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
     const write = () =>
@@ -654,9 +696,15 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
         seams: s,
       });
     expect((await write()).status).toBe("written");
-    expect((await write()).status).toBe("skipped");
-    const env = JSON.parse(String(fake.memories.get(ID)?.content)) as PrMemoryEnvelope;
-    expect(env.rounds.filter((r) => r.runId === "same-run")).toHaveLength(1);
+    expect((await write()).status).toBe("written");
+    expect(roundRecords(fake)).toHaveLength(2);
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: s,
+    });
+    expect(String(recalled.block).split("- round ending").length - 1).toBe(1);
   });
 
   it("rejects a stored record whose embedded identity does not match", async () => {
@@ -705,9 +753,183 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 });
 
+describe("concurrent rounds (bob#318)", () => {
+  it("records and recalls both of two rounds written concurrently", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    // Neither writer's first request completes until both have sent one.
+    const s = { ...seams(fake), fetchImpl: barrier(fake.fetchImpl, 2) };
+    const write = (runId: string, endedAt: string) =>
+      writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: {
+          runId,
+          endedAt,
+          outcome: "completed",
+          filesTouched: [`${runId}.ts`],
+          testEvidence: [],
+        },
+        seams: s,
+      });
+    const results = await Promise.all([
+      write("run-a", "2026-10-03T19:00:00.000Z"),
+      write("run-b", "2026-10-03T19:00:01.000Z"),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["written", "written"]);
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: seams(fake),
+    });
+    expect(recalled.status).toBe("recalled");
+    expect(recalled.block).toContain("run-a.ts");
+    expect(recalled.block).toContain("run-b.ts");
+  }, 10_000);
+
+  const evidenceAt = (day: number) => ({
+    runId: `run-${day}`,
+    endedAt: `2026-10-0${day}T00:00:00.000Z`,
+    outcome: "completed" as const,
+    filesTouched: [`day-${day}.ts`],
+    testEvidence: [],
+  });
+
+  it("keeps the newest rounds after a write and recalls the newest three", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    // Written out of order: the prune ranks by endedAt, not by write order.
+    for (const day of [2, 6, 1, 5, 3, 4]) {
+      const written = await writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: evidenceAt(day),
+        seams: seams(fake),
+      });
+      expect(written.status).toBe("written");
+    }
+    const kept = roundRecords(fake).map((r) => String(r.content));
+    expect(kept).toHaveLength(PR_MEMORY_RETAINED_ROUNDS);
+    for (const day of [3, 4, 5, 6])
+      expect(kept.some((c) => c.includes(`day-${day}.ts`))).toBe(true);
+    const recalled = await recallPrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      seams: seams(fake),
+    });
+    const block = String(recalled.block);
+    expect(block.indexOf("day-6.ts")).toBeGreaterThan(-1);
+    expect(block.indexOf("day-6.ts")).toBeLessThan(block.indexOf("day-5.ts"));
+    expect(block.indexOf("day-5.ts")).toBeLessThan(block.indexOf("day-4.ts"));
+    expect(block).not.toContain("day-3.ts");
+    expect(block).toContain("older round (2026-10-03T00:00:00.000Z)");
+  });
+
+  it("concurrent prunes over a full history keep the newest rounds", async () => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    for (const day of [1, 2, 3, 4])
+      await writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: evidenceAt(day),
+        seams: seams(fake),
+      });
+    // Both writers list before either deletes, so both delete round 1.
+    const s = {
+      ...seams(fake),
+      fetchImpl: barrier(fake.fetchImpl, 2, (method) => method === "DELETE"),
+    };
+    const logs: string[] = [];
+    const results = await Promise.all(
+      [5, 6].map((day) =>
+        writePrMemoryRound({
+          target: TARGET,
+          ref: REF,
+          identity: IDENTITY,
+          evidence: evidenceAt(day),
+          seams: s,
+          log: (m) => logs.push(m),
+        }),
+      ),
+    );
+    expect(results.map((r) => r.status)).toEqual(["written", "written"]);
+    expect(logs).toEqual([]);
+    const kept = roundRecords(fake).map((r) => String(r.content));
+    expect(kept).toHaveLength(PR_MEMORY_RETAINED_ROUNDS);
+    for (const day of [3, 4, 5, 6])
+      expect(kept.some((c) => c.includes(`day-${day}.ts`))).toBe(true);
+  }, 10_000);
+
+  it.each([
+    ["list", { memoryListStatus: 500 }, "prune skipped"],
+    ["delete", { memoryDeleteStatus: 500 }, "a delete failed"],
+  ] as const)("a failed prune %s leaves the round written", async (_stage, failure, logged) => {
+    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    for (const day of [1, 2, 3, 4])
+      await writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: evidenceAt(day),
+        seams: seams(fake),
+      });
+    const failing = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
+    for (const [id, record] of fake.memories) failing.memories.set(id, record);
+    const logs: string[] = [];
+    const written = await writePrMemoryRound({
+      target: TARGET,
+      ref: REF,
+      identity: IDENTITY,
+      evidence: evidenceAt(5),
+      seams: seams(failing),
+      log: (m) => logs.push(m),
+    });
+    expect(written.status).toBe("written");
+    expect(roundRecords(failing)).toHaveLength(5);
+    expect(logs.some((m) => m.includes(logged))).toBe(true);
+  });
+
+  it("prunes only this agent's validated round records", async () => {
+    const other = "agent-b";
+    const stray = { id: `${ID}-note`, agentId: AGENT, visibility: "private", subject: ID };
+    const malformed = { ...stray, id: `${ID}-r0-bad`, content: "not json" };
+    const foreign = {
+      id: `${ID}-r0-foreign`,
+      agentId: other,
+      visibility: "shared",
+      subject: ID,
+      content: JSON.stringify(
+        envelope({ rounds: [round({ endedAt: "2020-01-01T00:00:00.000Z" })] }),
+      ),
+    };
+    const fake = makeFakeFlair({
+      agents: { [AGENT]: { id: AGENT }, [other]: { id: other } },
+      memories: { [stray.id]: stray, [malformed.id]: malformed, [foreign.id]: foreign },
+    });
+    for (const day of [1, 2, 3, 4, 5])
+      await writePrMemoryRound({
+        target: TARGET,
+        ref: REF,
+        identity: IDENTITY,
+        evidence: evidenceAt(day),
+        seams: seams(fake),
+      });
+    const days = [...fake.memories.values()]
+      .map((r) => /day-(\d)\.ts/.exec(String(r.content))?.[1])
+      .filter((d) => d !== undefined)
+      .sort();
+    expect(days).toEqual(["2", "3", "4", "5"]);
+    for (const row of [stray, malformed, foreign]) expect(fake.memories.get(row.id)).toEqual(row);
+    expect(fake.calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
+  });
+});
+
 describe("regressions from final review", () => {
   it.each(["", " ", "null", "not json", "{}"])(
-    "refuses a 200 body %j without a PUT",
+    "deletes nothing after a 200 list body %j",
     async (body) => {
       const methods: string[] = [];
       const result = await writePrMemoryRound({
@@ -723,8 +945,8 @@ describe("regressions from final review", () => {
           },
         },
       });
-      expect(result.status).toBe("skipped");
-      expect(methods).toEqual(["GET"]);
+      expect(result.status).toBe("written");
+      expect(methods).toEqual(["PUT", "GET"]);
     },
   );
 
@@ -880,7 +1102,7 @@ it("writes and recalls an overlong launcher task_id", async () => {
     ).status,
   ).toBe("written");
   expect((await recallPrMemoryRound(options)).status).toBe("recalled");
-  const stored = parseEnvelope(String(fake.memories.get(ID)?.content), IDENTITY);
+  const stored = parseEnvelope(String(roundRecords(fake)[0]?.content), IDENTITY);
   expect(stored?.rounds[0]?.taskId).toBe(`${"t".repeat(512)}…`);
 });
 
@@ -934,10 +1156,10 @@ it.each([
     ).status,
   ).toBe("written");
   expect((await recallPrMemoryRound(options)).status).toBe("recalled");
-  expect(String(fake.memories.get(ID)?.content)).not.toContain(long);
+  expect(String(roundRecords(fake)[0]?.content)).not.toContain(long);
 });
 
-it("skips a hidden foreign PR-memory row after PUT refusal", async () => {
+it("writes beside a hidden foreign row at the key, leaving it unchanged", async () => {
   const prior = { id: ID, agentId: "kern", visibility: "private", content: "foreign history" };
   const fake = makeFakeFlair({
     agents: { [AGENT]: { id: AGENT }, kern: { id: "kern" } },
@@ -961,6 +1183,7 @@ it("skips a hidden foreign PR-memory row after PUT refusal", async () => {
         },
       })
     ).status,
-  ).toBe("skipped");
+  ).toBe("written");
+  expect(roundRecords(fake)).toHaveLength(1);
   expect(fake.memories.get(ID)).toEqual(prior);
 });

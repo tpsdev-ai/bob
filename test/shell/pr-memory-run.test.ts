@@ -1,8 +1,8 @@
 // bob#185 item 5 — the runtime entry path. Stands up a REAL local HTTP stub as
 // Flair (so the real HTTP + Ed25519 signing path runs) and runs `bob run`
 // twice: round N writes the memory, round N+1 recalls it into the factory's
-// config before the first model request (recall is a Flair bootstrap request
-// and a memory GET), with nothing pasted into either brief.
+// config before the first model request (recall is a Flair bootstrap request,
+// a memory GET and a memory listing), with nothing pasted into either brief.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
 import { PR_MEMORY_PROMPT_HEADING, prMemoryKey } from "../../src/shell/pr-memory.js";
 import { type RunSession, type RunSessionConfig, runAgent } from "../../src/shell/run.js";
+import { makeFakeFlair } from "./flair-fake.js";
 
 const AGENT = "testbot";
 const REPO = "github.com/tpsdev-ai/bob";
@@ -30,47 +31,40 @@ function writeKeyFile(dir: string): string {
 
 interface Stub {
   url: string;
-  store: Map<string, string>;
+  memories: Map<string, Record<string, unknown>>;
   close(): Promise<void>;
 }
 
+// Serves the shared fake Flair (by-id GET/PUT, the Memory listing, DELETE)
+// over real HTTP, plus an empty bootstrap.
 async function startMemoryStub(): Promise<Stub> {
-  const store = new Map<string, string>();
+  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   const srv = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => {
       raw += c;
     });
-    req.on("end", () => {
-      const method = req.method ?? "";
-      const path = req.url ?? "";
+    req.on("end", async () => {
       const send = (status: number, body: string): void => {
         res.writeHead(status, { "content-type": "application/json" });
         res.end(body);
       };
-      if (path === "/BootstrapMemories") return send(200, JSON.stringify({ context: "" }));
-      const m = /^\/Memory\/(.+)$/.exec(path);
-      if (m) {
-        const id = decodeURIComponent(m[1] as string);
-        if (method === "PUT") {
-          store.set(id, raw);
-          return send(200, JSON.stringify({ id }));
-        }
-        if (method === "GET") {
-          const found = store.get(id);
-          return found !== undefined
-            ? send(200, found)
-            : send(404, JSON.stringify({ error: "not found" }));
-        }
-      }
-      return send(404, JSON.stringify({ error: "no route" }));
+      if (req.url === "/BootstrapMemories") return send(200, JSON.stringify({ context: "" }));
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string") headers[k] = v;
+      const r = await fake.fetchImpl(`http://stub${req.url ?? ""}`, {
+        method: req.method ?? "",
+        headers,
+        ...(raw !== "" ? { body: raw } : {}),
+      });
+      send(r.status, await r.text());
     });
   });
   await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", () => resolve()));
   const port = (srv.address() as { port: number }).port;
   return {
     url: `http://127.0.0.1:${port}`,
-    store,
+    memories: fake.memories,
     close: () => new Promise<void>((resolve) => srv.close(() => resolve())),
   };
 }
@@ -183,13 +177,15 @@ describe("`bob run` with a launcher pr_ref", () => {
     expect(r1.exitCode).toBe(0);
     expect(first?.prMemory).toBeUndefined();
 
-    // The round-end write landed a private, persistent record.
-    expect(stub.store.get(ID)).toBeDefined();
-    const record = JSON.parse(stub.store.get(ID) as string) as Record<string, unknown>;
+    // The round-end write landed a private, persistent record of its own.
+    const records = [...stub.memories.values()];
+    expect(records).toHaveLength(1);
+    const record = records[0] as Record<string, unknown>;
+    expect(String(record.id).startsWith(`${ID}-r`)).toBe(true);
     expect(record.visibility).toBe("private");
     expect(record.durability).toBe("persistent");
     expect(record.tags).toEqual(["bob-pr-round"]);
-    expect(record.subject).toBe(`${REPO}#pr-${PR}`);
+    expect(record.subject).toBe(ID);
 
     // Round N+1 — the recall is attached to the factory config BEFORE the
     // session is built, and neither brief carried it.
@@ -276,6 +272,6 @@ describe("`bob run` with a launcher pr_ref", () => {
       },
     });
     expect(config?.prMemory).toBeUndefined();
-    expect(stub.store.size).toBe(0);
+    expect(stub.memories.size).toBe(0);
   });
 });
