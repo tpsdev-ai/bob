@@ -1,0 +1,2 @@
+- **`bob init --force` creates `auth.json` at 0600 from the open that creates it, rather than at the process umask with a later `chmod` (bob#328).**
+  Under a permissive umask, the previous path left `auth.json` readable by group and other until the `chmod` ran. `bob models` replaces `.pi-agent/models.json`: it merges the existing document and writes the result over the file at that path, and its help now says so.
