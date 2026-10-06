@@ -1,0 +1,1 @@
+- **Keep ambient variables referenced by the selected provider's stored key when pi needs them (bob#323).** References resolve when values are available. Nonempty stored `env` overrides take precedence; absent or empty overrides fall back to `process.env`. Referenced ambient pi credential variables with a nonempty stored override are scrubbed unless selected by the keyed row.

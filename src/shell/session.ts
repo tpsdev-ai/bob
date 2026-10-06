@@ -48,6 +48,7 @@ import {
   type InlineExtension,
   InteractiveMode,
   ModelRuntime,
+  readStoredCredential,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -78,7 +79,7 @@ import {
   requireModelLimits,
   type StreamFunction,
 } from "./model-budget.js";
-import { piCredentialEnvNames } from "./provider-custody.js";
+import { piConfigValueEnvVarNames, piCredentialEnvNames } from "./provider-custody.js";
 import {
   assertProviderEndpointAllowed,
   DEFAULT_PROVIDER_REGISTRY,
@@ -1472,10 +1473,17 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // entry path before a capability, extension, tool or child process starts.
     delete process.env[ADMIN_PASS_ENV];
 
-    // Remove pi credential names other than the selected keyed variable.
+    // Keep the selected keyed variable and stored-key references that pi reads
+    // from process.env: credential.env[name] wins when truthy; absent or empty
+    // overrides fall back to process.env[name]. Use the same unresolved read.
     const selectedKeyedVariable = row?.auth.kind === "env" ? row.auth.variable : undefined;
+    const stored = readStoredCredential(config.provider, join(agentDir, "auth.json"));
+    const referenced =
+      stored?.type === "api_key" ? piConfigValueEnvVarNames(stored.key) : ([] as readonly string[]);
+    const overrides = stored?.type === "api_key" ? stored.env : undefined;
     for (const credentialName of piCredentialEnvNames()) {
       if (credentialName === selectedKeyedVariable) continue;
+      if (referenced.includes(credentialName) && !overrides?.[credentialName]) continue;
       delete process.env[credentialName];
     }
 
