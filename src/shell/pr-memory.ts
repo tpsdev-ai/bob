@@ -817,7 +817,8 @@ export async function recallPrMemoryRound(opts: {
     return true;
   });
   const shown = ordered.slice(0, PR_MEMORY_MAX_ROUNDS);
-  // Findings fold oldest to newest, so a later status replaces an earlier one.
+  // Findings fold in reverse shown order, so a status in an earlier-shown round
+  // replaces one from a later-shown round.
   let findings = earlier?.open_findings ?? [];
   for (const e of [...shown].reverse())
     if (e.envelope) findings = mergeFindings(findings, e.envelope.open_findings);
