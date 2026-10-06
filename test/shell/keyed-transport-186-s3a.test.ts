@@ -739,7 +739,8 @@ describe("K6 — replacement sessions reuse custody without re-reading the envir
           expect(stub.seen.slice(before)).toEqual([
             { url: `${endpoint}/chat/completions`, auth: `Bearer ${SENTINEL}` },
           ]);
-          expect(process.env[variable]).toBe(SENTINEL2);
+          // Audit bob#304: a replacement session does not carry the variable.
+          expect(process.env[variable]).toBeUndefined();
           expect(stub.seen.some((s) => String(s.auth).includes(SENTINEL2))).toBe(false);
         } finally {
           await runtime.dispose();

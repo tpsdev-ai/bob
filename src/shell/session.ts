@@ -1527,6 +1527,11 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       if (apiKey === undefined) {
         apiKey = takeProviderKey(variable, row.id);
         custodyKeys.set(variable, apiKey);
+      } else {
+        // bob#321: a replacement reuses custody, so the read-and-delete in
+        // takeProviderKey is skipped and the variable carries into the new
+        // session. Clear it, as the first invocation does.
+        delete process.env[variable];
       }
       keyedProvider = registerKeyedProvider(modelRuntime, {
         row: keyedRow,
