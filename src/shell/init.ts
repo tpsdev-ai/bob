@@ -20,8 +20,10 @@ import {
   fchmodSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -217,6 +219,14 @@ export function initAgent(opts: InitOptions): InitResult {
   mkdirSync(join(agentDir, "work"), { recursive: true });
   mkdirSync(join(agentDir, "memory"), { recursive: true });
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+
+  // A process killed between a temp write and its rename/link leaves the temp
+  // file behind. Sweep the directories init publishes into, so a later run in
+  // the same directory does not accumulate them. Only names matching init's
+  // own temp shape are removed; every other entry is left in place.
+  for (const dir of [agentDir, join(agentDir, "bin"), join(agentDir, ".pi-agent")]) {
+    removeStaleTempFiles(dir);
+  }
 
   // soul.md (identity header + role template; user editable). The role
   // template only describes the ROLE — the header stamps WHO the agent is
@@ -574,10 +584,6 @@ function fileExists(path: string): boolean {
 type Publish = (path: string, content: string, mode?: number) => void;
 
 function writeFileReplacing(path: string, content: string, mode?: number): void {
-  if (mode === undefined) {
-    writeFileSync(path, content);
-    return;
-  }
   withTempFile(path, content, mode, (temp) => renameSync(temp, path));
 }
 
@@ -609,7 +615,7 @@ function withTempFile(
   mode: number | undefined,
   publish: (temp: string) => void,
 ): void {
-  const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
+  const temp = tempFilePath(path);
   const fd = openSync(
     temp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -626,6 +632,29 @@ function withTempFile(
     publish(temp);
   } finally {
     rmSync(temp, { force: true });
+  }
+}
+
+/** The sibling temp file `withTempFile` writes for `path`. */
+function tempFilePath(path: string): string {
+  return join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
+}
+
+/** `tempFilePath`'s name shape: a dot, the destination's basename, a dash, a v4
+ *  UUID, and `.tmp`. A later `init` uses it to find a temp file a killed
+ *  process left behind. */
+const STALE_TEMP_NAME =
+  /^\..+?-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/;
+
+/** Removes a temp file a killed `init` left in `dir`: an entry whose name
+ *  matches `STALE_TEMP_NAME` and that is a regular file. Any other entry is
+ *  left in place. */
+function removeStaleTempFiles(dir: string): void {
+  for (const name of readdirSync(dir)) {
+    if (!STALE_TEMP_NAME.test(name)) continue;
+    const path = join(dir, name);
+    if (!lstatSync(path).isFile()) continue;
+    rmSync(path, { force: true });
   }
 }
 
