@@ -463,19 +463,23 @@ export class FlairHttpClient implements FlairClient {
     }));
   }
 
-  async write(content: string, opts: FlairWriteOptions = {}): Promise<{ id: string }> {
+  async write(
+    content: string,
+    opts: FlairWriteOptions = {},
+  ): Promise<{ id: string; createdAt: string }> {
     // A record id is UNIQUE PER WRITE, across PROCESSES too: an explicit `id`,
     // else agent + a random UUID. NEVER a per-process counter and NEVER the
     // wall clock — two processes with the same agentId both started a counter at
     // 0, so their first records deterministically collided and overwrote each
     // other (bob#180 round 4).
     const id = opts.id ?? `${this.agentId}-${this.uuid()}`;
+    const createdAt = new Date(this.now()).toISOString();
     const body: Record<string, unknown> = {
       id,
       agentId: opts.authorId ?? this.agentId,
       content,
       durability: opts.durability ?? "standard",
-      createdAt: new Date(this.now()).toISOString(),
+      createdAt,
     };
     if (opts.supersedes) body.supersedes = opts.supersedes;
     // Optional provenance (reachy S3): visibility / author label / metadata.
@@ -485,7 +489,7 @@ export class FlairHttpClient implements FlairClient {
     if (opts.tags && opts.tags.length > 0) body.tags = opts.tags;
     if (opts.subject) body.subject = opts.subject;
     await this.signedFetchWithBounds("PUT", `/Memory/${encodeURIComponent(id)}`, body, opts);
-    return { id };
+    return { id, createdAt };
   }
 
   async get(id: string, opts: FlairReadOptions = {}): Promise<FlairMemory | null> {
@@ -504,8 +508,9 @@ export class FlairHttpClient implements FlairClient {
   }
 
   // bob#318 — this agent's own Memory rows whose `subject` equals `subject`,
-  // ordered by `createdAt` descending with ties by `id` descending, skipping
-  // `opts.offset` rows and returning at most `opts.limit`. Harper REST query:
+  // ordered by client-supplied `createdAt`, then id, descending; ties need not
+  // follow write order. Skips `opts.offset` rows and returns at most
+  // `opts.limit`. Harper REST query:
   // `attr=value` is a strict-equality condition; `limit(start,end)` returns
   // rows [start, end). The signature covers the path and the query string.
   async listOwnBySubject(subject: string, opts: FlairListOptions): Promise<FlairMemory[]> {

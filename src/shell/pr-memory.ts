@@ -52,8 +52,12 @@ export function prMemoryRoundId(key: string, endedAt: string, now: () => number)
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
 // After a successful write, the prune lists up to 8 records after the first 3
-// in `sort(-createdAt,-id)` order; the written id is excluded from deletion.
+// in `sort(-createdAt,-id)` order.
 export const PR_MEMORY_PRUNE_PAGE = 8;
+// Ten minutes exceeds the 20 s write + prune request timeout budgets.
+// Skip rows newer than this write's createdAt minus this window.
+// Retention can exceed the count until rows age past it and a later write prunes.
+export const PR_MEMORY_PRUNE_PROTECTION_MS = 10 * 60 * 1000;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
 // The recalled prompt block, framing included.
@@ -67,8 +71,8 @@ const ROUND_EVIDENCE_MAX = 32;
 const ROUND_INCOMPLETE_MAX = 32;
 const ENVELOPE_OMITTED_MAX = 16;
 
-// Request timeout: 2 s. Recall requests run in parallel; round-end requests
-// run sequentially (write, list, up to 8 deletes): up to 20 s.
+// Round-end request timeout budgets total 20 s: write, list and up to 8 deletes
+// at 2 s each. Recall requests run in parallel.
 export const PR_MEMORY_START_TIMEOUT_MS = 2000;
 export const PR_MEMORY_END_TIMEOUT_MS = 2000;
 export const PR_MEMORY_MAX_RESPONSE_BYTES = 128 * 1024;
@@ -118,7 +122,8 @@ export interface PrMemoryEnvelope {
   repository: string;
   prNumber: number;
   open_findings: PrFinding[];
-  // Newest first.
+  // Recalled rows: client-supplied createdAt, then id, descending; ties need not
+  // follow write order. Earlier single-record rounds fill remaining slots.
   rounds: PrRoundRecord[];
   // Omission categories from bounding.
   omitted: string[];
@@ -452,9 +457,7 @@ export interface BoundedEnvelope {
   omitted: string[];
 }
 
-// Serialize an envelope under the byte caps. Input rounds are newest-first;
-// whole rounds are dropped oldest-first, and unresolved findings are preserved
-// preferentially (they are trimmed last).
+// Serialize under byte caps, dropping trailing rounds before envelope findings.
 export function boundEnvelope(input: PrMemoryEnvelope): BoundedEnvelope {
   const omitted: string[] = [];
   const rounds: PrRoundRecord[] = [];
@@ -738,7 +741,8 @@ function validRoundRecord(
   return { id: row.id, round, envelope };
 }
 
-// This PR's records in Flair's `sort(-createdAt,-id)` order.
+// Ordered by client-supplied createdAt, then id, descending; ties need not
+// follow write order.
 function listRounds(
   client: FlairHttpClient,
   key: string,
@@ -861,12 +865,13 @@ export async function writePrMemoryRound(opts: {
     omitted: [],
   };
   let id: string;
+  let createdAt: string;
   try {
     const { json } = boundEnvelope(envelope);
     if (parseEnvelope(json, opts.identity)?.rounds.length !== 1)
       return { status: "skipped", reason: "the round failed schema validation" };
     id = prMemoryRoundId(key, round.endedAt, opts.seams?.now ?? Date.now);
-    await client.write(json, {
+    ({ createdAt } = await client.write(json, {
       id,
       durability: "persistent",
       visibility: "private",
@@ -874,13 +879,13 @@ export async function writePrMemoryRound(opts: {
       subject: key,
       timeoutMs: PR_MEMORY_END_TIMEOUT_MS,
       maxResponseBytes: PR_MEMORY_MAX_RESPONSE_BYTES,
-    });
+    }));
   } catch (err) {
     const reason = safeReason(err);
     log(`PR memory write failed (${reason}); the round outcome is unchanged.`);
     return { status: "skipped", reason };
   }
-  await pruneRounds(client, key, id, opts.identity, log, opts.seams?.now);
+  await pruneRounds(client, key, id, createdAt, opts.identity, log, opts.seams?.now);
   return { status: "written" };
 }
 
@@ -888,6 +893,7 @@ async function pruneRounds(
   client: FlairHttpClient,
   key: string,
   writtenId: string,
+  writtenCreatedAt: string,
   identity: PrMemoryIdentity,
   log: (message: string) => void,
   now?: () => number,
@@ -904,8 +910,11 @@ async function pruneRounds(
     log(`PR memory prune skipped: the round list could not be read (${safeReason(err)}).`);
     return;
   }
+  const cutoff = Date.parse(writtenCreatedAt) - PR_MEMORY_PRUNE_PROTECTION_MS;
   for (const row of rows) {
     if (row.id === writtenId) continue;
+    const createdAt = typeof row.createdAt === "string" ? Date.parse(row.createdAt) : NaN;
+    if (!Number.isFinite(createdAt) || createdAt > cutoff) continue;
     const old = validRoundRecord(row, key, identity, now);
     if (old === undefined) continue;
     try {

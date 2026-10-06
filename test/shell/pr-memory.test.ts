@@ -12,6 +12,7 @@ import {
   PR_MEMORY_PROMPT_HEADING,
   PR_MEMORY_PROMPT_MAX_BYTES,
   PR_MEMORY_PRUNE_PAGE,
+  PR_MEMORY_PRUNE_PROTECTION_MS,
   PR_MEMORY_ROUND_MAX_BYTES,
   PR_MEMORY_TAG,
   PrMemoryCollector,
@@ -48,12 +49,11 @@ function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000
   };
 }
 
-// A clock that moves forward one second on every read, so each write carries a
-// later createdAt than the one before.
+// Advance past the protection window on every read.
 function writeClock(): () => number {
   let t = 1_800_000_000_000;
   return () => {
-    t += 1000;
+    t += PR_MEMORY_PRUNE_PROTECTION_MS + 1;
     return t;
   };
 }
@@ -389,7 +389,7 @@ describe("envelope parsing and validation", () => {
 });
 
 describe("bounds — whole entries only, omissions reported", () => {
-  it("keeps the newest rounds and drops the rest", () => {
+  it("keeps the leading rounds and drops the rest", () => {
     const rounds = Array.from({ length: 6 }, (_, i) =>
       round({ endedAt: `2026-10-0${6 - i}T00:00:00.000Z` }),
     );
@@ -855,6 +855,64 @@ describe("concurrent rounds (bob#318)", () => {
       })
     ).block;
 
+  it.each([
+    ["older existing createdAt", true, [1, 2, 6], [1, 2, 7]],
+    ["full history and both PUTs with tied createdAt", false, [1, 2, 4, 5, 6], [5, 6, 7]],
+  ] as const)(
+    "protects both PUTs before either prune lists: %s",
+    async (_case, aged, retained, laterRetained) => {
+      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const at = 1_800_000_000_000;
+      for (const day of [4, 5, 6])
+        await writeDay(fake, day, () => at - (aged ? PR_MEMORY_PRUNE_PROTECTION_MS + 1 : 0));
+      let completedPuts = 0;
+      let release: () => void = () => {};
+      const putsComplete = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const start = fake.calls.length;
+      const s = {
+        ...seams(fake, () => at),
+        fetchImpl: async (...args: Parameters<typeof fake.fetchImpl>) => {
+          const [, init] = args;
+          if (init.method === "GET") {
+            await putsComplete;
+            expect(completedPuts).toBe(2);
+          }
+          const result = await fake.fetchImpl(...args);
+          if (init.method === "PUT" && ++completedPuts === 2) release();
+          return result;
+        },
+      };
+      const results = await Promise.all(
+        [1, 2].map((day) =>
+          writePrMemoryRound({
+            target: TARGET,
+            ref: REF,
+            identity: IDENTITY,
+            evidence: evidenceAt(day),
+            seams: s,
+          }),
+        ),
+      );
+      expect(results.map((r) => r.status)).toEqual(["written", "written"]);
+      const calls = fake.calls.slice(start);
+      const newIds = calls.filter((c) => c.method === "PUT").map((c) => String(c.body?.id));
+      const deleted = calls.filter((c) => c.method === "DELETE").map((c) => c.path);
+      for (const id of newIds) {
+        expect(deleted).not.toContain(`/Memory/${id}`);
+        expect(fake.memories.has(id)).toBe(true);
+      }
+      expect(new Set(newIds.map((id) => fake.memories.get(id)?.createdAt)).size).toBe(1);
+      expect(storedDays(fake)).toEqual(retained);
+      expect((await writeDay(fake, 7, () => at + PR_MEMORY_PRUNE_PROTECTION_MS + 1)).status).toBe(
+        "written",
+      );
+      expect(roundRecords(fake)).toHaveLength(PR_MEMORY_MAX_ROUNDS);
+      expect(storedDays(fake)).toEqual(laterRetained);
+    },
+  );
+
   it("keeps and recalls a late round whose endedAt is older than a full history", async () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
@@ -878,12 +936,14 @@ describe("concurrent rounds (bob#318)", () => {
     expect(fake.memories.has(writtenId)).toBe(true);
     expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
     expect(storedDays(fake)).toEqual([1, 4, 5, 6]);
-    expect((await writeDay(fake, 7)).status).toBe("written");
+    expect(
+      (await writeDay(fake, 7, () => 1_700_000_000_000 + PR_MEMORY_PRUNE_PROTECTION_MS + 1)).status,
+    ).toBe("written");
     expect(roundRecords(fake)).toHaveLength(PR_MEMORY_MAX_ROUNDS);
     expect(storedDays(fake)).toEqual([5, 6, 7]);
   });
 
-  it("recalls the latest writes over a backlog from failed prunes, then prunes it in pages", async () => {
+  it("recalls leading createdAt rows over a backlog, then prunes it in pages", async () => {
     const options: Parameters<typeof makeFakeFlair>[0] = {
       agents: { [AGENT]: { id: AGENT } },
       memoryDeleteStatus: 500,
@@ -908,11 +968,11 @@ describe("concurrent rounds (bob#318)", () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     for (const day of [3, 1, 4, 2]) await writeDay(fake, day);
     expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
-    expect(storedDays(fake)).toEqual([2, 3, 4]);
+    expect(storedDays(fake)).toEqual([1, 2, 3, 4]);
     expect(recalledDays(await recallBlock(fake))).toEqual([4, 3, 2]);
   });
 
-  it("concurrent prunes over a full history leave the latest writes", async () => {
+  it("concurrent prunes over a full history retain the leading createdAt rows", async () => {
     const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
     for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
