@@ -5,5 +5,7 @@
 
   `bob init` (including `--force`), `bob hire` and `bob models` now run the reserved-name check
   over both pi files before their first write and refuse a file that carries a bob-owned keyed
-  entry or cannot be proven free of one. A keyed-row init skips pi files present at its existence check and publishes through
-  an exclusive temp file and rename with mode 0600 set before the rename. Refs #186.
+  entry or cannot be proven free of one. A keyed-row init skips pi files present at its existence check
+  (a check that fails with anything but ENOENT stops the init) and publishes the others from an exclusive
+  temp file with mode 0600 through `link(2)`: an entry that appears at the path between the check and
+  the publication is left unchanged and the init refuses (#322). Refs #186.

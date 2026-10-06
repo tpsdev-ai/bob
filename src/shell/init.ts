@@ -20,10 +20,12 @@ import {
   constants,
   existsSync,
   fchmodSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
-  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -130,6 +132,9 @@ export interface InitOptions {
   // The provider registry the scaffold reads its identity records from.
   // Defaults to the built-in table; tests supply one with a row of their own.
   registry?: ProviderRegistry;
+  // Test seam: called with the path of each keyed-row pi file the init is about
+  // to publish, after its existence check and temp write.
+  beforePublish?: (path: string) => void;
 }
 
 export interface InitResult {
@@ -510,14 +515,15 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   const authContent = `${JSON.stringify(isEnvKeyProvider || isKeyless ? {} : { [piProvider]: { type: "api_key", key } }, null, 2)}\n`;
 
   if (isEnvKeyProvider) {
-    // Skip files present at the existence check; publish with mode 0600.
+    // Skip files present at the existence check; publish the others with mode
+    // 0600 without replacing an entry that appeared since the check.
     const created: string[] = [];
     for (const [path, content] of [
       [modelsPath, modelsContent],
       [authPath, authContent],
     ] as const) {
-      if (existsSync(path)) continue;
-      writeFileExclusive(path, content);
+      if (fileExists(path)) continue;
+      writeFileExclusive(path, content, opts.beforePublish);
       created.push(path);
     }
     const row = providerRecord(opts.provider, registry);
@@ -539,8 +545,24 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string): string[] {
   return [modelsPath, authPath];
 }
 
-/** Publish via an exclusive temp file with mode 0600 before the rename. */
-function writeFileExclusive(path: string, content: string): void {
+/** False only when stat reports ENOENT; any other failure is thrown. */
+function fileExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+/** Write an exclusive temp file with mode 0600, then publish it with link(2),
+ *  which fails with EEXIST instead of replacing an existing entry. */
+function writeFileExclusive(
+  path: string,
+  content: string,
+  beforePublish?: (path: string) => void,
+): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(
     temp,
@@ -548,15 +570,24 @@ function writeFileExclusive(path: string, content: string): void {
     0o600,
   );
   try {
-    writeFileSync(fd, content);
-    fchmodSync(fd, 0o600);
-    renameSync(temp, path);
-  } finally {
     try {
-      closeSync(fd);
+      writeFileSync(fd, content);
+      fchmodSync(fd, 0o600);
+      fsyncSync(fd);
     } finally {
-      rmSync(temp, { force: true });
+      closeSync(fd);
     }
+    beforePublish?.(path);
+    try {
+      linkSync(temp, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      throw new Error(
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it; it was left unchanged. Inspect it, then re-run.`,
+      );
+    }
+  } finally {
+    rmSync(temp, { force: true });
   }
 }
 
