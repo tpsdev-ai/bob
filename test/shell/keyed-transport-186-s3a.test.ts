@@ -748,6 +748,35 @@ describe("K6 — replacement sessions reuse custody without re-reading the envir
         }
       });
     }
+    it(`${provider}: a /new refused by an unparsable models.json leaves the variable unset`, async () => {
+      const registry = fixtureRegistry();
+      scaffold("fxk6r", registry, provider);
+      const variable = provider === "openrouter" ? "OPENROUTER_API_KEY" : VARIABLE;
+      process.env[variable] = SENTINEL;
+      const { config, policy } = resolveRunConfig({
+        name: "fxk6r",
+        agentsRoot: tmpRoot,
+        registry,
+      });
+      const stub = stubFetch();
+      const factory = createBobRuntimeFactory({ config, policy, registry });
+      const runtime = await createAgentSessionRuntime(factory, {
+        cwd: config.cwd,
+        agentDir: config.piAgentDir,
+        sessionManager: SessionManager.inMemory(config.cwd),
+      });
+      try {
+        expect(process.env[variable]).toBeUndefined();
+        writeFileSync(join(config.piAgentDir, "models.json"), "{ not json");
+        process.env[variable] = SENTINEL2;
+        await expect(runtime.newSession()).rejects.toThrow(/could not parse it/);
+        expect(process.env[variable]).toBeUndefined();
+        expect(stub.seen).toEqual([]);
+      } finally {
+        await runtime.dispose();
+        stub.restore();
+      }
+    });
   }
 });
 

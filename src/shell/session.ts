@@ -1388,6 +1388,13 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // reuse it without re-reading process.env.
   const custodyKeys = new Map<string, string>();
   return async ({ sessionManager }) => {
+    // bob#321: once custody holds the selected keyed variable's credential,
+    // takeProviderKey's read-and-delete is skipped; without this deletion the
+    // variable would carry into the session. It runs first, before any check
+    // that can refuse this invocation.
+    if (row?.auth.kind === "env" && custodyKeys.has(row.auth.variable)) {
+      delete process.env[row.auth.variable];
+    }
     // PIN the agent's own identity + directory. A resumed or imported session
     // records its own cwd and agent dir; bob's agent is bob's agent. (A web
     // session's directory is pinned too: to "/", below.)
@@ -1527,11 +1534,6 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       if (apiKey === undefined) {
         apiKey = takeProviderKey(variable, row.id);
         custodyKeys.set(variable, apiKey);
-      } else {
-        // bob#321: a replacement reuses custody, so the read-and-delete in
-        // takeProviderKey is skipped and the variable carries into the new
-        // session. Clear it, as the first invocation does.
-        delete process.env[variable];
       }
       keyedProvider = registerKeyedProvider(modelRuntime, {
         row: keyedRow,
