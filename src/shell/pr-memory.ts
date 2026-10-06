@@ -57,9 +57,9 @@ export function prMemoryRoundId(key: string, endedAt: string, now: () => number)
 // envelope at 16 KiB. Bounding removes WHOLE entries (never a cut
 // in the middle of serialized JSON) and records omission categories.
 export const PR_MEMORY_MAX_ROUNDS = 3;
-// After a write, the prune lists up to 8 records after the first 3 in that
-// order and requests a delete of each one that validates as this PR's round
-// record.
+// After a successful write, the prune lists up to 8 records after the first 3
+// in `sort(-createdAt,-id)` order and requests a delete of each one that
+// validates as this PR's round record.
 export const PR_MEMORY_PRUNE_PAGE = 8;
 export const PR_MEMORY_ROUND_MAX_BYTES = 4096;
 export const PR_MEMORY_ENVELOPE_MAX_BYTES = 16384;
