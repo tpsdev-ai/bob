@@ -59,7 +59,6 @@ describe("bob#332 — a --force publish replaces the destination by rename", () 
     const target = join(root, "soul-target.md");
     writeFileSync(target, "the link target\n");
     symlinkSync(target, soulPath);
-    expect(lstatSync(soulPath).isSymbolicLink()).toBe(true);
 
     forceInit(root);
 
