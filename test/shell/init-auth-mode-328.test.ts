@@ -170,17 +170,17 @@ describe("bob#328 — auth.json under a --force init", () => {
       expect(dirname(temp)).toBe(dirname(authPath));
       expect(realFs.readFileSync(destination)).toEqual(original);
       expect(realStatSync(destination).mode & 0o777).toBe(0o644);
-      expect(realStatSync(temp).mode & 0o777).toBe(0o600);
       expect(JSON.parse(realFs.readFileSync(temp, "utf8"))).toEqual({
         anthropic: { type: "api_key", key: "exe-gateway-placeholder" },
       });
+      expect(realStatSync(temp).mode & 0o777).toBe(0o600);
     };
     run();
     expect(renameCount).toBe(1);
     expect(observedModes.length).toBeGreaterThan(0);
     for (const mode of observedModes) expect(mode & 0o077).toBe(0);
-    expect(realStatSync(authPath).mode & 0o777).toBe(0o600);
     expect(realFs.readFileSync(authPath)).not.toEqual(original);
+    expect(realStatSync(authPath).mode & 0o777).toBe(0o600);
     expect(temps()).toEqual([]);
   });
 
