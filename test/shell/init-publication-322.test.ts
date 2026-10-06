@@ -1,10 +1,10 @@
-// bob#322: a keyed-row init does not replace a pi file entry that appeared
-// between its existence check and the publication.
-// The competing write is injected through `beforePublish`, which runs after the
-// check and the temp write, immediately before publication.
+// bob#322: what init publishes with link(2) does not replace an existing entry.
+// The competing write is injected through `beforePublish`, which runs before the
+// agent directory's mkdir and before each link(2) publication.
 import { afterEach, describe, expect, it } from "bun:test";
 import {
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -66,7 +66,7 @@ describe("bob#322 — keyed-row pi file publication", () => {
           },
         }),
       ).toThrow(
-        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it; it was left unchanged. Inspect it, then re-run.`,
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
       );
       expect(seen).toEqual([path]);
       expect(readFileSync(path)).toEqual(competitor);
@@ -112,5 +112,135 @@ describe("bob#322 — keyed-row pi file publication", () => {
     });
     expect(JSON.parse(readFileSync(join(piDir, "auth.json"), "utf8"))).toEqual({});
     expect(tempFiles(piDir)).toEqual([]);
+  });
+});
+
+function newRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "bob-322-"));
+  roots.push(root);
+  return root;
+}
+
+/** A non-keyed scaffold without --force. */
+function scaffold(root: string, extra: Partial<InitOptions> = {}) {
+  return initAgent({
+    name: "agent-a",
+    role: "coder",
+    provider: "ollama-cloud",
+    model: "fixture-model",
+    contextWindow: 200_000,
+    agentsRoot: root,
+    skipFlair: true,
+    ...extra,
+  });
+}
+
+function tempFilesUnder(dir: string): string[] {
+  return readdirSync(dir, { recursive: true })
+    .map(String)
+    .filter((name) => name.endsWith(".tmp"));
+}
+
+describe("bob#322 — agent scaffold without --force", () => {
+  it("an agent directory created between the check and the mkdir is refused and its contents are untouched", () => {
+    const root = newRoot();
+    const agentDir = join(root, "agent-a");
+    const competitor = Buffer.from("competitor\n");
+    expect(() =>
+      scaffold(root, {
+        beforePublish: (target) => {
+          if (target !== agentDir) return;
+          mkdirSync(agentDir);
+          writeFileSync(join(agentDir, "bob.yaml"), competitor);
+        },
+      }),
+    ).toThrow(`agent dir already exists: ${agentDir} (pass --force to overwrite)`);
+    expect(readdirSync(agentDir)).toEqual(["bob.yaml"]);
+    expect(readFileSync(join(agentDir, "bob.yaml"))).toEqual(competitor);
+  });
+
+  for (const rel of [
+    "soul.md",
+    "bob.yaml",
+    join(".pi-agent", "models.json"),
+    join(".pi-agent", "auth.json"),
+    join("bin", "agent-a"),
+  ]) {
+    it(`a competing ${rel} written before its publication is preserved and the init refuses`, () => {
+      const root = newRoot();
+      const agentDir = join(root, "agent-a");
+      const path = join(agentDir, rel);
+      const competitor = Buffer.from("competitor\n");
+      let injected = false;
+      expect(() =>
+        scaffold(root, {
+          beforePublish: (target) => {
+            if (target !== path) return;
+            injected = true;
+            writeFileSync(path, competitor);
+          },
+        }),
+      ).toThrow(
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+      );
+      expect(injected).toBe(true);
+      expect(readFileSync(path)).toEqual(competitor);
+      expect(tempFilesUnder(agentDir)).toEqual([]);
+    });
+  }
+
+  it("a keyed-row models.json that appears before its publication is refused, not skipped", () => {
+    const root = newRoot();
+    const agentDir = join(root, "agent-a");
+    const modelsPath = join(agentDir, ".pi-agent", "models.json");
+    const competitor = Buffer.from("competitor\n");
+    expect(() =>
+      keyedInit(root, {
+        beforePublish: (target) => {
+          if (target === join(agentDir, "bob.yaml")) writeFileSync(modelsPath, competitor);
+        },
+      }),
+    ).toThrow(
+      `bob: refusing to write ${modelsPath}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+    );
+    expect(readFileSync(modelsPath)).toEqual(competitor);
+    expect(tempFilesUnder(agentDir)).toEqual([]);
+  });
+
+  it("an agent directory whose existence check fails is refused and left in place", () => {
+    const root = newRoot();
+    const agentDir = join(root, "agent-a");
+    symlinkSync(agentDir, agentDir);
+    let caught: unknown;
+    try {
+      scaffold(root);
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as NodeJS.ErrnoException | undefined)?.code).toBe("ELOOP");
+    expect(lstatSync(agentDir).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentDir)).toBe(agentDir);
+  });
+
+  it("a fresh scaffold sets each file's mode and leaves no temp file", () => {
+    const root = newRoot();
+    // The mode writeFileSync gives a new file under this process's umask.
+    const probe = join(root, "probe");
+    writeFileSync(probe, "");
+    const umaskMode = statSync(probe).mode & 0o777;
+    const r = scaffold(root);
+    const modes = Object.fromEntries(
+      ["soul.md", "bob.yaml", ".pi-agent/models.json", ".pi-agent/auth.json", "bin/agent-a"].map(
+        (rel) => [rel, statSync(join(r.agentDir, rel)).mode & 0o777],
+      ),
+    );
+    expect(modes).toEqual({
+      "soul.md": umaskMode,
+      "bob.yaml": umaskMode,
+      ".pi-agent/models.json": umaskMode,
+      ".pi-agent/auth.json": 0o600,
+      "bin/agent-a": 0o755,
+    });
+    expect(tempFilesUnder(r.agentDir)).toEqual([]);
   });
 });

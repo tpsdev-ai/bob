@@ -1010,10 +1010,10 @@ listed for the selected keyless runtime, except the selected keyed variable.
 
 **The writers check first.** `bob init` (including `--force`), `bob hire` and `bob models` run the
 reserved-name check over BOTH pi files before their first write, and refuse when a bob-owned keyed
-entry is present or absence cannot be proven; a keyed-row init skips files present at its existence check (K7),
-and a check that fails with anything but ENOENT stops the init. It publishes the others from an exclusive temp
-file with mode 0600 through `link(2)`: an entry that appears at the path between the check and the publication
-is left unchanged and the init refuses (#322).
+entry is present or absence cannot be proven; a keyed-row `--force` init skips files present at its existence
+check (K7), and a check that fails with anything but ENOENT stops the init. A keyed-row init publishes each pi
+file it does not skip from an exclusive temp file with mode 0600 through `link(2)`, and refuses without replacing
+an entry already at the path (#322).
 
 ### Endpoint scaffold (`provider.base_url`)
 
