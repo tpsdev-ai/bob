@@ -108,6 +108,51 @@ export function piCredentialEnvNames(): readonly string[] {
   return [...names];
 }
 
+const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_VAR_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+/**
+ * The environment variables a pi config value references, in pi's interpolation
+ * grammar: `$NAME` and `${NAME}` (with `$$` and `$!` escapes), de-duplicated in
+ * order; a `!command` value references none. pi 0.84.3 does not export this
+ * extractor, so bob mirrors pi's `getConfigValueEnvVarNames`. A stored
+ * credential's `key` is such a value; an operator who writes
+ * `{"type":"api_key","key":"$NAME"}` references `NAME`.
+ */
+export function piConfigValueEnvVarNames(config: string | undefined): readonly string[] {
+  if (config === undefined || config.startsWith("!")) return [];
+  const names: string[] = [];
+  let index = 0;
+  while (index < config.length) {
+    const dollar = config.indexOf("$", index);
+    if (dollar < 0) break;
+    const next = config[dollar + 1];
+    if (next === "$" || next === "!") {
+      index = dollar + 2;
+      continue;
+    }
+    if (next === "{") {
+      const end = config.indexOf("}", dollar + 2);
+      if (end < 0) {
+        index = dollar + 1;
+        continue;
+      }
+      const name = config.slice(dollar + 2, end);
+      if (ENV_VAR_NAME_RE.test(name) && !names.includes(name)) names.push(name);
+      index = end + 1;
+      continue;
+    }
+    const match = config.slice(dollar + 1).match(ENV_VAR_NAME_PREFIX_RE);
+    if (match !== null) {
+      if (!names.includes(match[0])) names.push(match[0]);
+      index = dollar + 1 + match[0].length;
+      continue;
+    }
+    index = dollar + 1;
+  }
+  return names;
+}
+
 // ── bob's own environment names ──────────────────────────────────────────────
 
 /** The environment names the generated launcher exports. */
