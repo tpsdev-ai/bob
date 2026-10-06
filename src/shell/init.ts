@@ -15,7 +15,6 @@
 
 import { randomUUID } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
   constants,
   fchmodSync,
@@ -23,6 +22,7 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -200,10 +200,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // `publish` writes over.
   const publish: Publish = noClobber
     ? (path, content, mode) => writeFileExclusive(path, content, opts.beforePublish, mode)
-    : (path, content, mode) => {
-        writeFileSync(path, content);
-        if (mode !== undefined) chmodSync(path, mode);
-      };
+    : (path, content, mode) => writeFileReplacing(path, content, mode);
   if (noClobber) {
     mkdirSync(root, { recursive: true });
     opts.beforePublish?.(agentDir);
@@ -576,6 +573,14 @@ function fileExists(path: string): boolean {
 /** Writes `content` to `path`, with `mode` set exactly when given. */
 type Publish = (path: string, content: string, mode?: number) => void;
 
+function writeFileReplacing(path: string, content: string, mode?: number): void {
+  if (mode === undefined) {
+    writeFileSync(path, content);
+    return;
+  }
+  withTempFile(path, content, mode, (temp) => renameSync(temp, path));
+}
+
 /** Write an exclusive temp file, then publish it with link(2), which fails with
  *  EEXIST instead of replacing an existing entry. `mode` is set exactly when
  *  given; otherwise the process umask applies, as with writeFileSync. */
@@ -584,6 +589,25 @@ function writeFileExclusive(
   content: string,
   beforePublish?: (path: string) => void,
   mode?: number,
+): void {
+  withTempFile(path, content, mode, (temp) => {
+    beforePublish?.(path);
+    try {
+      linkSync(temp, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      throw new Error(
+        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+      );
+    }
+  });
+}
+
+function withTempFile(
+  path: string,
+  content: string,
+  mode: number | undefined,
+  publish: (temp: string) => void,
 ): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(
@@ -599,15 +623,7 @@ function writeFileExclusive(
     } finally {
       closeSync(fd);
     }
-    beforePublish?.(path);
-    try {
-      linkSync(temp, path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      throw new Error(
-        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
-      );
-    }
+    publish(temp);
   } finally {
     rmSync(temp, { force: true });
   }

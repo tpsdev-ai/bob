@@ -79,7 +79,8 @@ Commands:
                              --admin-pass-file <path> --admin-user <user>
                              --dry-run --force --no-interactive
   models <agent>      Apply provider.base_url: bob models <agent>
-                      Updates only .pi-agent/models.json from validated bob.yaml.
+                      Updates only .pi-agent/models.json from validated bob.yaml,
+                      replacing it with the merged document.
                       Comments in models.json are not preserved.
                       Flags: --agents-root <dir>
   align <name>        Recurring check-in to refine an existing agent. The session
