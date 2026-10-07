@@ -1,1 +1,1 @@
-- **The exploration budget credits an edit made by the command that reaches the budget.** Closes #314.
+- **The exploration budget credits a command’s observed during-call change when paired repository evidence verifies it; unavailable history gets no repository credit.** Closes #314.

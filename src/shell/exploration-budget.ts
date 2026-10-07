@@ -46,9 +46,7 @@ export class ExplorationBudgetDetector {
       return { nonProgressCalls: this.count, inject: false, exhaust: false };
     }
     if (isCommandRunnerTool(toolName)) {
-      // Count the command now so an instruction can fire at the limit, but defer
-      // the exhaust decision to its end: a command that makes and commits an edit
-      // on this very call must credit that edit instead of ending the run.
+      // Count at start; check exhaustion at end after repository verification.
       this.count += 1;
       return { nonProgressCalls: this.count, inject: this.count === this.limit, exhaust: false };
     }
@@ -66,8 +64,7 @@ export class ExplorationBudgetDetector {
     } else if (isFileEditTool(toolName)) {
       return this.countNonProgress();
     } else if (isCommandRunnerTool(toolName)) {
-      // The command produced no edit. Its start already counted it, so the
-      // exhaust threshold is reached here.
+      // No verified edit was observed. Check the exhaust threshold here.
       return {
         nonProgressCalls: this.count,
         inject: false,

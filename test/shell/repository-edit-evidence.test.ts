@@ -36,7 +36,13 @@ const gitEnv = {
 };
 
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8", stdio: "pipe" }).trim();
+  return execFileSync("git", args, {
+    cwd,
+    env: gitEnv,
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 5_000,
+  }).trim();
 }
 
 function commit(cwd: string, parent?: string): string {
@@ -65,11 +71,20 @@ function firstCommit(cwd: string): void {
       "-c",
       'git add first && tree=$(git write-tree) && head=$(git commit-tree "$tree" -m first) && git reset --hard "$head"',
     ],
-    { cwd, env: gitEnv, stdio: "pipe" },
+    { cwd, env: gitEnv, stdio: "pipe", timeout: 5_000 },
   );
 }
 
-type Call = { toolName: string; action?: () => void; result?: unknown };
+type Call = {
+  toolName: string;
+  beforeStart?: () => void;
+  action?: () => void;
+  result?: unknown;
+  callId?: string | null;
+  endId?: string | null;
+  endToolName?: string;
+  duplicateStart?: boolean;
+};
 
 function session(calls: Call[], finalAction?: () => void): RunSession {
   const listeners = new Set<(event: never) => void>();
@@ -83,11 +98,21 @@ function session(calls: Call[], finalAction?: () => void): RunSession {
     },
     async prompt() {
       for (const [i, call] of calls.entries()) {
-        emit({ type: "tool_execution_start", toolName: call.toolName, args: { i } });
+        call.beforeStart?.();
+        const toolCallId = call.callId === null ? undefined : (call.callId ?? `call-${i}`);
+        const start = {
+          type: "tool_execution_start",
+          toolName: call.toolName,
+          toolCallId,
+          args: { i },
+        };
+        emit(start);
+        if (call.duplicateStart) emit(start);
         call.action?.();
         emit({
           type: "tool_execution_end",
-          toolName: call.toolName,
+          toolName: call.endToolName ?? call.toolName,
+          toolCallId: call.endId === null ? undefined : (call.endId ?? toolCallId),
           isError: false,
           result: call.result ?? {
             content: [{ type: "text", text: "DONE: edited and committed everything." }],
@@ -510,7 +535,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
               "-c",
               'printf "changed\\n" > tracked && git add tracked && tree=$(git write-tree) && head=$(git commit-tree "$tree" -p HEAD -m edit) && git reset --hard "$head"',
             ],
-            { cwd, env: gitEnv, stdio: "pipe" },
+            { cwd, env: gitEnv, stdio: "pipe", timeout: 5_000 },
           );
         },
       },
@@ -1619,10 +1644,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
     expect(result.exitCode).toBe(0);
   });
 
-  it("credits the edit a command commits on the call that reaches the budget", async () => {
-    // The fourth call's start reaches twice the budget (the exhaust threshold).
-    // The command commits an edit as it runs, so its evidence must credit the run
-    // rather than leave it ended as exhausted.
+  it("credits a verified repository change on the limiting command", async () => {
     const result = await run(
       [
         { toolName: "read" },
@@ -1642,6 +1664,57 @@ describe("repository evidence in the completion gate and exploration budget", ()
     expect(result.explorationBudgetExhausted).toBeUndefined();
     expect(result.exitCode).toBe(0);
   });
+
+  it("does not credit a pre-start commit to a no-op limiting command", async () => {
+    const result = await run(
+      [
+        { toolName: "read" },
+        {
+          toolName: "run",
+          beforeStart: () => {
+            writeFileSync(join(cwd, "tracked"), "pre-start edit\n");
+            commit(cwd, launchHead);
+          },
+          action: () => git(cwd, "status", "--porcelain"),
+        },
+      ],
+      undefined,
+      1,
+    );
+    expect(result.explorationBudgetExhausted).toEqual({ limit: 1, nonProgressCalls: 2 });
+    expect(result.exitCode).toBe(1);
+  }, 15_000);
+
+  it.each([
+    { callId: null },
+    { callId: "" },
+    { endId: null },
+    { endId: "other-call" },
+    { endToolName: "bash" },
+    { duplicateStart: true },
+  ])(
+    "refuses command credit for an invalid event pair %j",
+    async (pair) => {
+      const result = await run(
+        [
+          { toolName: "read" },
+          {
+            toolName: "run",
+            ...pair,
+            action: () => {
+              writeFileSync(join(cwd, "tracked"), "during-call edit\n");
+              commit(cwd, launchHead);
+            },
+          },
+        ],
+        undefined,
+        1,
+      );
+      expect(result.explorationBudgetExhausted?.limit).toBe(1);
+      expect(result.exitCode).toBe(1);
+    },
+    15_000,
+  );
 
   it("does not credit the same repository edit on later reads", async () => {
     const result = await run(
