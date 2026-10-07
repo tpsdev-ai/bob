@@ -50,7 +50,7 @@ const KEY = Buffer.alloc(32, 7);
 // same seed the client signs with, so a correctly signed request verifies.
 const PUB = deriveEd25519PublicKeyBase64(normalizeEd25519PrivateKey(KEY, "test-private-key"));
 // The fake signs off the WALL clock (signedAt), so signed requests verify;
-// `now` is pinned only to make stored createdAt deterministic.
+// `now` is pinned to keep stored-record ordering deterministic.
 function fakeFlair(opts: FakeFlairOptions = {}): ReturnType<typeof makeFakeFlair> {
   // Register the test public key on each agent row in place (a test may mutate
   // this same options object after construction).

@@ -39,7 +39,7 @@ export interface FakeFlairOptions {
   // Pre-existing Soul rows, keyed by "<agentId>:<key>".
   souls?: Record<string, string>;
   // The clock the signed-auth check reads for its timestamp window. Defaults
-  // to Date.now; tests that pin the client's clock pass the same value here.
+  // to Date.now.
   now?: () => number;
   // Force every ops-API call to this status (for failure-path tests).
   opsStatus?: number;
@@ -217,8 +217,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       const id = decodeURIComponent(agentMatch[1]);
       // Flair's signed-auth middleware verifies the Ed25519 header and rejects
       // an unauthenticated caller BEFORE the Agent resource is reached, so an
-      // unsigned, stale or wrongly signed request is 401 unknown_agent, never
-      // a 404 (flair checkAgentRegistered).
+      // unsigned, stale or wrongly signed request is 401 unknown_agent (which
+      // checkFlairRegistration decodes as "not registered").
       if (!verifiedAgentId(init.headers, init.method, target, agents, now))
         return reply(401, { error: "unknown_agent" });
       return agents[id] ? reply(200, agents[id]) : reply(404, { error: "not found" });
@@ -361,8 +361,8 @@ function parseMemoryQuery(search: string): MemoryQuery | string {
 // Verify a TPS-Ed25519 header the way Flair's signed-auth middleware does —
 // the scheme, the agent id, the timestamp window, and an Ed25519 signature
 // over `${agentId}:${ts}:${nonce}:${METHOD}:${path}` against the agent's stored
-// public key. Returns the authenticated agent id, or undefined (which every
-// caller answers with 401 and no side effect). Mirrors resources/agent-auth.ts
+// public key. Returns the authenticated agent id, or undefined (callers answer
+// with 401 and take no side effect). Mirrors resources/agent-auth.ts
 // and resources/ed25519-auth.ts: same header grammar and length cap, same 30s
 // window, same signed payload — so an unsigned, wrongly signed, stale,
 // wrong-agent or wrong-path request is refused as the real server refuses it.
