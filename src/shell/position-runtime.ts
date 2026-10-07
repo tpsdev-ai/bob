@@ -55,6 +55,7 @@ import { initOverrideRepo } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
 import { defaultProviderName, type ProviderRegistry } from "./provider-registry.js";
 import {
+  mkdirOwned,
   type PublishedEntry,
   type RollbackReport,
   rollbackPublished,
@@ -607,16 +608,12 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     );
   }
 
-  // --- The file commit, under a rollback. The agent directory PRE-EXISTS (it was
-  // scaffolded by bob init), so on a later failure only the entries this
-  // operation published inside it (the marker, and the override repository
-  // entries it created) are rolled back, with the host grant/baseline. The
-  // existing bob.yaml, soul.md and every other entry are untouched. ---
   const tx: BindTxn = { agentDir, base: agentDir, published: [] };
   const onPublished = (entry: PublishedEntry) => {
     tx.published.push(entry);
   };
   try {
+    mkdirOwned(agentDir, onPublished);
     const soulHashBefore = soulHashOf(agentDir);
     writeGrant(hostRoot, grant);
     tx.grantPath = grantPath(hostRoot, opts.name);

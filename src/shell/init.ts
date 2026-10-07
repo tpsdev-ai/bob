@@ -16,14 +16,10 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
-  constants,
   fchmodSync,
-  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
-  mkdirSync,
-  openSync,
   renameSync,
   rmSync,
   statSync,
@@ -47,7 +43,14 @@ import {
   reservedProviderNames,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
-import { mkdirOwned, type OnPublished } from "./publication-ledger.js";
+import {
+  mkdirOwned,
+  mkdirParentsOwned,
+  type OnPublished,
+  openOwned,
+  type PublishedEntry,
+  pendingEntry,
+} from "./publication-ledger.js";
 import { loadRole } from "./role-loader.js";
 import { assertNoReservedProviderEntries } from "./session.js";
 import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
@@ -140,8 +143,6 @@ export interface InitOptions {
   // and with the path of each file published with link(2), after its temp
   // write.
   beforePublish?: (path: string) => void;
-  // Publication ledger (bob#326): created directories are reported before
-  // their identity read; files use descriptor identity before publication.
   // Flair keys outside the agent directory are not covered. Path substitution
   // after a directory check remains possible.
   onPublished?: OnPublished;
@@ -215,14 +216,10 @@ export function initAgent(opts: InitOptions): InitResult {
     ? (path, content, mode) =>
         writeFileExclusive(path, content, opts.beforePublish, mode, onPublished)
     : (path, content, mode) => writeFileReplacing(path, content, mode, onPublished);
-  mkdirSync(root, { recursive: true });
+  mkdirParentsOwned(root, onPublished);
   if (noClobber) opts.beforePublish?.(agentDir);
-  // One level at a time: a directory is reported only when this mkdir created
-  // it. Without --force an existing agent directory is refused; with --force it
-  // is used, but it is not this call's, so it is not reported.
   if (mkdirOwned(agentDir, onPublished) === undefined && noClobber) throw new Error(exists);
 
-  // Top-level + subdirs. An existing one (EEXIST) is used and not reported.
   for (const sub of ["bin", "work", "memory", ".pi-agent"]) {
     mkdirOwned(join(agentDir, sub), onPublished);
   }
@@ -628,11 +625,6 @@ function writeFileExclusive(
   );
 }
 
-// The temp file is created exclusively, and its identity is read from ITS
-// descriptor before it is published, so what onPublished records for `path` is
-// this call's file even if another writer replaces `path` afterwards. `path` is
-// reported as soon as `publish` returns, BEFORE the temp name is cleaned up; if
-// that cleanup fails, the temp name (still this call's file) is reported too.
 function withTempFile(
   path: string,
   content: string,
@@ -641,24 +633,23 @@ function withTempFile(
   onPublished?: OnPublished,
 ): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
-  const fd = openSync(
-    temp,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    mode ?? 0o666,
-  );
-  let identity: { dev: bigint; ino: bigint } | undefined;
+  let entry: PublishedEntry | undefined;
+  const fd = openOwned(temp, mode ?? 0o666, (created) => {
+    entry = created;
+    onPublished?.(created);
+  });
   const cleanUp = (): void => {
+    if (entry?.unresolved !== undefined) return;
     try {
-      rmSync(temp, { force: true });
+      const st = lstatSync(temp, { bigint: true });
+      if (st.isFile() && st.dev === entry?.dev && st.ino === entry?.ino)
+        rmSync(temp, { force: true });
     } catch (err) {
-      if (identity !== undefined) onPublished?.({ path: temp, ...identity, kind: "file" });
-      throw err;
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   };
   try {
     try {
-      const st = fstatSync(fd, { bigint: true });
-      identity = { dev: st.dev, ino: st.ino };
       writeFileSync(fd, content);
       if (mode !== undefined) fchmodSync(fd, mode);
       fsyncSync(fd);
@@ -666,7 +657,10 @@ function withTempFile(
       closeSync(fd);
     }
     publish(temp);
-    if (identity !== undefined) onPublished?.({ path, ...identity, kind: "file" });
+    const destination = pendingEntry(path, "file", onPublished);
+    destination.dev = entry?.dev;
+    destination.ino = entry?.ino;
+    delete destination.unresolved;
   } finally {
     cleanUp();
   }

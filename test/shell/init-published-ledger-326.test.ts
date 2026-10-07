@@ -87,9 +87,15 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
       join(agentDir, ".pi-agent", "auth.json"),
       join(agentDir, "bin", name),
     ];
-    expect(ledger.map((e) => e.path).sort()).toEqual(expected.slice().sort());
-    // Every recorded entry is on disk as recorded: same inode, same kind.
-    for (const e of ledger) {
+    expect(
+      ledger
+        .filter((e) => e.created !== false && !basename(e.path).endsWith(".tmp"))
+        .map((e) => e.path)
+        .sort(),
+    ).toEqual(expected.slice().sort());
+    for (const e of ledger.filter(
+      (e) => e.created !== false && !basename(e.path).endsWith(".tmp"),
+    )) {
       const st = lstatSync(e.path, { bigint: true });
       expect(st.isDirectory() ? "dir" : "file").toBe(e.kind);
       expect(st.ino).toBe(e.ino);
@@ -110,7 +116,7 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
       }),
     ).toThrow(/refusing to write/);
 
-    const paths = ledger.map((e) => e.path);
+    const paths = ledger.filter((e) => e.created !== false).map((e) => e.path);
     expect(paths).toContain(agentDir);
     expect(paths).toContain(join(agentDir, ".pi-agent"));
     expect(paths).not.toContain(soul);
@@ -175,7 +181,7 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     expect(ino(ledger.find((e) => e.path === failedTemp))).toBe(published.ino);
   });
 
-  it("does not record a sub-directory a competing writer created first", () => {
+  it("records a competing sub-directory as a parent", () => {
     const name = "led-subdir";
     const agentDir = join(agentsRoot, name);
     const bin = join(agentDir, "bin");
@@ -193,16 +199,17 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     );
     scaffold(name, (e) => ledger.push(e));
 
-    const paths = ledger.map((e) => e.path);
+    const paths = ledger.filter((e) => e.created !== false).map((e) => e.path);
     expect(competitorIno).toBeDefined();
     expect(paths).not.toContain(bin);
+    expect(ledger.find((e) => e.path === bin)?.created).toBe(false);
     // The other levels this call did create are recorded.
     expect(paths).toContain(agentDir);
     expect(paths).toContain(join(agentDir, "work"));
     expect(lstatSync(bin, { bigint: true }).ino).toBe(competitorIno as bigint);
   });
 
-  it("--force: an existing agent directory and sub-directory are not recorded; what this call created is, with its final identity", () => {
+  it("--force: records existing directories as parents and new entries as creations", () => {
     const name = "led-force";
     const agentDir = join(agentsRoot, name);
     mkdirSync(join(agentDir, "bin"), { recursive: true });
@@ -210,9 +217,11 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     const ledger: PublishedEntry[] = [];
     scaffold(name, (e) => ledger.push(e), { noClobber: false });
 
-    const paths = ledger.map((e) => e.path);
+    const paths = ledger.filter((e) => e.created !== false).map((e) => e.path);
     expect(paths).not.toContain(agentDir);
     expect(paths).not.toContain(join(agentDir, "bin"));
+    expect(ledger.find((e) => e.path === agentDir)?.created).toBe(false);
+    expect(ledger.find((e) => e.path === join(agentDir, "bin"))?.created).toBe(false);
     for (const sub of ["work", "memory", ".pi-agent"]) expect(paths).toContain(join(agentDir, sub));
     // soul.md was replaced (--force renames a new file over it): the ledger
     // holds the new file's identity.

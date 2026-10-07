@@ -85,7 +85,7 @@ describe("bob#326 — replacements at the original path during quarantine rollba
     expect(readdirSync(s.agentsRoot)).toEqual([name]);
   });
 
-  it("a scaffold file replaced at its ORIGINAL path after the sweep's identity check: the replacement is untouched", async () => {
+  it("keeps a file written at the original path while unlinking its quarantined counterpart", async () => {
     const s = scratch();
     const name = "rbb-entry";
     const agentDir = join(s.agentsRoot, name);

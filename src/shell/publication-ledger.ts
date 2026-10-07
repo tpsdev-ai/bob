@@ -1,9 +1,6 @@
 // Publication ledger for bind rollback (bob#326).
 // Removal requires recorded identity to match when checked; a swap
 // before unlink/rmdir can still remove a replacement or traverse a symlink.
-// Created directories are recorded before reading their identity; an unresolved
-// identity is retained. Git entries that cannot be read are not recorded.
-// Roots are renamed to quarantine and checked again before sweeping.
 // Move-back is attempted; errors and potentially retained quarantine names are
 // reported. A directory placeholder replaced before rename can be overwritten.
 // Leftovers are named when checked; arrivals after listing are not named.
@@ -30,15 +27,15 @@ import {
 } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 
-export type PublishedKind = "dir" | "file";
+export type PublishedKind = "dir" | "file" | "symlink";
 
-// A published entry; a created directory may still have an unresolved identity.
 export interface PublishedEntry {
   path: string;
   dev?: bigint;
   ino?: bigint;
   unresolved?: string;
   kind: PublishedKind;
+  created?: false;
 }
 
 export type OnPublished = (entry: PublishedEntry) => void;
@@ -51,6 +48,7 @@ export interface RollbackReport {
   stranded: Array<{ quarantine: string; original: string; leftovers: string[] }>;
   // Observed cleanup errors, with paths.
   errors: string[];
+  publications?: PublishedEntry[];
 }
 
 export const QUARANTINE_PREFIX = ".bob-rollback-";
@@ -58,10 +56,8 @@ export const QUARANTINE_PREFIX = ".bob-rollback-";
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const EXCLUSIVE_CREATE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
 
-// The kind lstat reports. A symlink (and anything that is neither a regular file
-// nor a directory) is "other", so it never matches a recorded entry.
 function kindOf(st: BigIntStats): PublishedKind | "other" {
-  if (st.isSymbolicLink()) return "other";
+  if (st.isSymbolicLink()) return "symlink";
   if (st.isDirectory()) return "dir";
   if (st.isFile()) return "file";
   return "other";
@@ -91,8 +87,6 @@ function lstatIfPresent(path: string): BigIntStats | undefined {
   }
 }
 
-// Record a successful mkdir before reading its identity. The callback receives
-// the entry object, which is updated after that read.
 export function mkdirOwned(
   path: string,
   onPublished?: OnPublished,
@@ -101,16 +95,20 @@ export function mkdirOwned(
   try {
     mkdirSync(path, mode === undefined ? undefined : { mode });
   } catch (err) {
-    if (code(err) === "EEXIST") return undefined;
+    if (code(err) === "EEXIST") {
+      const st = lstatSync(path, { bigint: true });
+      if (kindOf(st) !== "dir") throw new Error(`${path}: expected a directory`);
+      onPublished?.({ path, dev: st.dev, ino: st.ino, kind: "dir", created: false });
+      return undefined;
+    }
     throw err;
   }
-  const entry: PublishedEntry = { path, kind: "dir", unresolved: "directory identity not read" };
-  onPublished?.(entry);
+  const entry = pendingEntry(path, "dir", onPublished);
   try {
     const st = lstatSync(path, { bigint: true });
     if (kindOf(st) !== "dir") {
       entry.unresolved = "created path was not a directory when checked";
-      return undefined;
+      throw new Error(`${path}: ${entry.unresolved}`);
     }
     entry.dev = st.dev;
     entry.ino = st.ino;
@@ -122,55 +120,48 @@ export function mkdirOwned(
   }
 }
 
-// Create exclusively, then record descriptor identity and return the descriptor.
+export function mkdirParentsOwned(path: string, onPublished?: OnPublished): void {
+  try {
+    const st = lstatSync(path, { bigint: true });
+    if (kindOf(st) !== "dir") throw new Error(`${path}: expected a directory`);
+    onPublished?.({ path, dev: st.dev, ino: st.ino, kind: "dir", created: false });
+    return;
+  } catch (err) {
+    if (code(err) !== "ENOENT") throw err;
+  }
+  const parent = dirname(path);
+  if (parent === path) throw new Error(`${path}: directory root missing`);
+  mkdirParentsOwned(parent, onPublished);
+  mkdirOwned(path, onPublished);
+}
+
+export function pendingEntry(
+  path: string,
+  kind: PublishedKind,
+  onPublished?: OnPublished,
+): PublishedEntry {
+  const entry: PublishedEntry = { path, kind, unresolved: "identity not read" };
+  onPublished?.(entry);
+  return entry;
+}
+
 export function openOwned(path: string, mode: number, onPublished?: OnPublished): number {
   const fd = openSync(path, EXCLUSIVE_CREATE, mode);
+  let entry: PublishedEntry | undefined;
   try {
+    entry = pendingEntry(path, "file", onPublished);
     const st = fstatSync(fd, { bigint: true });
-    onPublished?.({ path, dev: st.dev, ino: st.ino, kind: "file" });
+    entry.dev = st.dev;
+    entry.ino = st.ino;
+    delete entry.unresolved;
   } catch (err) {
+    if (entry !== undefined) entry.unresolved = `file identity read failed: ${message(err)}`;
     closeSync(fd);
     throw err;
   }
   return fd;
 }
 
-// Record readable regular files and directories under the created Git root.
-// Filesystem read failures are suppressed; onPublished may throw. Directory
-// checks can race with traversal, including a symlink substitution.
-export function recordTree(root: PublishedEntry, onPublished: OnPublished): void {
-  const lstatOrSkip = (path: string): BigIntStats | undefined => {
-    try {
-      return lstatIfPresent(path);
-    } catch {
-      return undefined;
-    }
-  };
-  const st = lstatOrSkip(root.path);
-  if (st === undefined || !isRecorded(st, root)) return;
-  const walk = (dir: string): void => {
-    let names: string[];
-    try {
-      names = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const name of names) {
-      const path = join(dir, name);
-      const child = lstatOrSkip(path);
-      if (child === undefined) continue;
-      const kind = kindOf(child);
-      if (kind === "other") continue;
-      onPublished({ path, dev: child.dev, ino: child.ino, kind });
-      if (kind === "dir") walk(path);
-    }
-  };
-  walk(root.path);
-}
-
-// Remove the recorded entries, one root at a time (see the header). `base` is
-// the directory, trusted by path, that holds each root; `reportBase` is what
-// leftover paths are named relative to.
 export function rollbackPublished(input: {
   base: string;
   reportBase: string;
@@ -178,12 +169,46 @@ export function rollbackPublished(input: {
 }): RollbackReport {
   const report: RollbackReport = { leftovers: [], stranded: [], errors: [] };
   const byPath = new Map<string, PublishedEntry>();
-  for (const e of input.entries) byPath.set(e.path, e);
-  const roots = [...byPath.values()].filter((e) => dirname(e.path) === input.base);
+  for (const e of input.entries) {
+    if (e.created === false && byPath.get(e.path)?.created !== false && byPath.has(e.path))
+      continue;
+    byPath.set(e.path, e);
+  }
+  const creations = [...byPath.values()].filter((e) => e.created !== false);
+  const roots = creations.filter(
+    (e) =>
+      !creations.some(
+        (ancestor) => ancestor.kind === "dir" && e.path.startsWith(ancestor.path + sep),
+      ),
+  );
   const name = (path: string): string => relative(input.reportBase, path) || ".";
+  for (const entry of creations) {
+    if (entry.unresolved !== undefined) {
+      report.leftovers.push(name(entry.path));
+      report.errors.push(`${entry.path}: retained: ${entry.unresolved}`);
+    }
+  }
 
   for (const root of roots) {
     try {
+      const anchor =
+        root.path === input.base || input.base.startsWith(root.path + sep)
+          ? dirname(root.path)
+          : input.base;
+      if (
+        !ancestorsVerified(
+          anchor,
+          byPath.get(anchor) ?? { path: anchor, kind: "dir" },
+          relative(anchor, root.path),
+          byPath,
+        )
+      ) {
+        for (const e of creations) {
+          if (e.path === root.path || e.path.startsWith(root.path + sep))
+            report.leftovers.push(name(e.path));
+        }
+        continue;
+      }
       rollbackRoot(root, byPath, name, report);
     } catch (err) {
       report.errors.push(`${root.path}: ${message(err)}`);
@@ -191,17 +216,10 @@ export function rollbackPublished(input: {
     }
   }
 
-  // A recorded entry under no root (its parent is neither the base nor a
-  // recorded directory: an entry published inside a directory that was not
-  // ours) is not touched; it is named if present when checked.
-  const underRoot = (path: string) =>
-    roots.some((r) => path === r.path || path.startsWith(r.path + sep));
-  for (const e of byPath.values()) {
-    if (underRoot(e.path) || byPath.has(dirname(e.path))) continue;
-    try {
-      if (lstatIfPresent(e.path) !== undefined) report.leftovers.push(name(e.path));
-    } catch {
-      report.leftovers.push(name(e.path));
+  for (const entry of report.publications ?? []) {
+    if (entry.unresolved !== undefined) {
+      report.leftovers.push(name(entry.path));
+      report.errors.push(`${entry.path}: retained: ${entry.unresolved}`);
     }
   }
   report.leftovers = [...new Set(report.leftovers)].sort();
@@ -215,8 +233,11 @@ function rollbackRoot(
   report: RollbackReport,
 ): void {
   if (root.unresolved !== undefined) {
-    report.leftovers.push(name(root.path));
-    report.errors.push(`${root.path}: retained: ${root.unresolved}`);
+    for (const e of byPath.values()) {
+      if (e.created !== false && (e.path === root.path || e.path.startsWith(root.path + sep))) {
+        report.leftovers.push(name(e.path));
+      }
+    }
     return;
   }
   // ROOT: check identity before moving; check again after rename.
@@ -230,6 +251,10 @@ function rollbackRoot(
   // QUARANTINE: move the root out of its path, then check what moved.
   const quarantine = join(dirname(root.path), `${QUARANTINE_PREFIX}${randomUUID()}`);
   renameSync(root.path, quarantine);
+  const quarantined = pendingEntry(quarantine, root.kind, (entry) => {
+    report.publications ??= [];
+    report.publications.push(entry);
+  });
   let moved: BigIntStats | undefined;
   try {
     moved = lstatIfPresent(quarantine);
@@ -238,12 +263,21 @@ function rollbackRoot(
     report.stranded.push({ quarantine, original: root.path, leftovers: ["."] });
     return;
   }
+  if (moved !== undefined) {
+    const kind = kindOf(moved);
+    if (kind !== "other") {
+      quarantined.kind = kind;
+      quarantined.dev = moved.dev;
+      quarantined.ino = moved.ino;
+      delete quarantined.unresolved;
+    }
+  }
   if (moved === undefined || !isRecorded(moved, root)) {
     if (moved !== undefined) settle(quarantine, root.path, moved, [], name, report);
     else report.leftovers.push(name(root.path));
     return;
   }
-  if (root.kind === "file") {
+  if (root.kind !== "dir") {
     try {
       unlinkSync(quarantine);
     } catch (err) {
@@ -297,6 +331,8 @@ function sweep(
   for (const { e, rel } of inside) {
     try {
       if (!ancestorsVerified(quarantine, root, rel, byPath)) continue;
+      if (e.unresolved !== undefined) continue;
+      if (e.created === false) continue;
       const at = join(quarantine, rel);
       const st = lstatIfPresent(at);
       if (st === undefined || !isRecorded(st, e)) continue;
@@ -324,6 +360,9 @@ function ancestorsVerified(
   rel: string,
   byPath: ReadonlyMap<string, PublishedEntry>,
 ): boolean {
+  const top = lstatIfPresent(quarantine);
+  if (top === undefined || kindOf(top) !== "dir") return false;
+  if (root.dev !== undefined && !isRecorded(top, root)) return false;
   const parts = rel.split(sep);
   for (let i = 1; i < parts.length; i++) {
     const sub = parts.slice(0, i).join(sep);
@@ -416,25 +455,52 @@ function moveBack(
   if (st.isDirectory()) {
     let placeholder: PublishedEntry | undefined;
     try {
-      placeholder = mkdirOwned(original);
+      mkdirOwned(original, (entry) => {
+        placeholder = entry;
+        report.publications ??= [];
+        report.publications.push(entry);
+      });
     } catch (err) {
       return failed(err);
     }
-    if (placeholder === undefined) {
+    if (
+      placeholder === undefined ||
+      placeholder.created === false ||
+      placeholder.unresolved !== undefined
+    ) {
       return failed(new Error("original path occupied or placeholder identity unresolved"));
     }
     try {
       renameSync(quarantine, original);
+      const restored = pendingEntry(original, "dir", (entry) => {
+        report.publications ??= [];
+        report.publications.push(entry);
+      });
+      restored.dev = st.dev;
+      restored.ino = st.ino;
+      delete restored.unresolved;
       return { restored: true, quarantineRemains: false };
     } catch (err) {
       removeEmptyPlaceholder(original, placeholder, report);
       return failed(err);
     }
   }
+  let restored: PublishedEntry | undefined;
   try {
     if (st.isSymbolicLink()) symlinkSync(readlinkSync(quarantine), original);
     else linkNoReplace(quarantine, original);
+    restored = pendingEntry(original, st.isSymbolicLink() ? "symlink" : "file", (entry) => {
+      report.publications ??= [];
+      report.publications.push(entry);
+    });
+    const identity = st.isSymbolicLink() ? lstatSync(original, { bigint: true }) : st;
+    if (kindOf(identity) !== restored.kind) throw new Error("restored entry kind changed");
+    restored.dev = identity.dev;
+    restored.ino = identity.ino;
+    delete restored.unresolved;
   } catch (err) {
+    if (restored !== undefined)
+      restored.unresolved = `restored identity read failed: ${message(err)}`;
     return failed(err);
   }
   try {

@@ -18,11 +18,30 @@
 // (host-grant.ts), not a Git ref.
 
 import { execFileSync } from "node:child_process";
-import { closeSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  type Dirent,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { gitEnvironment } from "./git-environment.js";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
-import { mkdirOwned, type OnPublished, openOwned, recordTree } from "./publication-ledger.js";
+import {
+  mkdirOwned,
+  type OnPublished,
+  openOwned,
+  type PublishedEntry,
+} from "./publication-ledger.js";
 
 export interface Overrides {
   disable: {
@@ -318,9 +337,6 @@ export function resolvePositionFiles(
 
 // Initialize the local override repository: the directory, an empty override
 // document, and a Git repo with a base commit.
-//
-// bob#326: report created directories, descriptor-identified overrides.json,
-// and readable Git entries. A directory swap after a check can affect traversal.
 export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): string {
   const dir = overridesDir(agentDir);
   mkdirOwned(dir, onPublished, 0o700);
@@ -345,15 +361,36 @@ export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): s
       closeSync(fd);
     }
   }
-  // `.git` is created here, so git initializes the empty directory this call
-  // owns; an existing `.git` (EEXIST) means the repository is already there.
   const gitDir = mkdirOwned(join(dir, ".git"), onPublished);
   if (gitDir !== undefined) {
+    const stage = join(tmpdir(), `bob-override-git-${randomUUID()}`);
+    let stageEntry: PublishedEntry | undefined;
     try {
-      git(["init", "--quiet"], dir);
-      git(["add", "-A"], dir);
+      mkdirOwned(
+        stage,
+        (entry) => {
+          stageEntry = entry;
+        },
+        0o700,
+      );
+    } catch (err) {
+      throw new Error(`${stage}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (
+      stageEntry === undefined ||
+      stageEntry.created === false ||
+      stageEntry.unresolved !== undefined
+    ) {
+      throw new Error(`${stage}: staging directory identity unresolved or path occupied`);
+    }
+    const stagedGit = join(stage, ".git");
+    const repository = ["--git-dir", stagedGit, "--work-tree", dir];
+    try {
+      git(["init", "--quiet"], stage);
+      git([...repository, "add", "-A"], dir);
       git(
         [
+          ...repository,
           "-c",
           "user.email=bob@tps.dev",
           "-c",
@@ -371,10 +408,56 @@ export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): s
         dir,
       );
     } finally {
-      if (onPublished !== undefined) recordTree(gitDir, onPublished);
+      try {
+        publishGitTree(stagedGit, gitDir.path, onPublished);
+      } finally {
+        removeStagingDirectory(stage, stageEntry);
+      }
     }
   }
   return dir;
+}
+
+function removeStagingDirectory(stage: string, entry: PublishedEntry): void {
+  const st = lstatSync(stage, { bigint: true });
+  if (!st.isDirectory() || st.dev !== entry.dev || st.ino !== entry.ino) {
+    throw new Error(`${stage}: staging directory identity changed`);
+  }
+  rmSync(stage, { recursive: true, force: true });
+}
+
+function publishGitTree(from: string, to: string, onPublished?: OnPublished): void {
+  let children: Dirent[];
+  try {
+    children = readdirSync(from, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  for (const child of children) {
+    const source = join(from, child.name);
+    const destination = join(to, child.name);
+    if (child.isDirectory()) {
+      if (mkdirOwned(destination, onPublished) === undefined) {
+        throw new Error(`${destination}: Git publication path occupied`);
+      }
+      publishGitTree(source, destination, onPublished);
+    } else {
+      const sourceFd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const st = fstatSync(sourceFd);
+        if (!st.isFile()) throw new Error(`${source}: expected a regular Git file`);
+        const destinationFd = openOwned(destination, st.mode & 0o777, onPublished);
+        try {
+          writeFileSync(destinationFd, readFileSync(sourceFd));
+        } finally {
+          closeSync(destinationFd);
+        }
+      } finally {
+        closeSync(sourceFd);
+      }
+    }
+  }
 }
 
 // bob#248: the Git calls that initialize this repository (run only when it has

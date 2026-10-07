@@ -295,7 +295,12 @@ describe("bob#326 — the binding marker and the override repository follow the 
           spies.push(
             spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
               const fd = (open as (...a: unknown[]) => number)(path, ...rest);
-              if (String(path) === marker) markerFd = fd;
+              if (
+                String(path) === marker &&
+                typeof rest[0] === "number" &&
+                (rest[0] & fs.constants.O_CREAT) !== 0
+              )
+                markerFd = fd;
               return fd;
             }) as typeof fs.openSync),
             spyOn(fs, "writeFileSync").mockImplementation(((
@@ -348,6 +353,191 @@ describe("bob#326 — the binding marker and the override repository follow the 
 });
 
 describe("bob#326 — the rollback's own failures", () => {
+  it.each(["marker", "overrides.json", ".git/HEAD"])(
+    "retains and names adoption's %s after its descriptor identity read fails",
+    async (entry) => {
+      const s = scratch();
+      const name = "ar-marker-read";
+      adoptReadyAgent(s, name);
+      const agentDir = join(s.agentsRoot, name);
+      const marker =
+        entry === "marker" ? bindingMarkerPath(agentDir) : join(overridesDir(agentDir), entry);
+      const open = fs.openSync;
+      const fstat = fs.fstatSync;
+      let markerFd: number | undefined;
+      spies.push(
+        spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+          const fd = (open as (...a: unknown[]) => number)(path, ...rest);
+          if (
+            String(path) === marker &&
+            typeof rest[0] === "number" &&
+            (rest[0] & fs.constants.O_CREAT) !== 0
+          )
+            markerFd = fd;
+          return fd;
+        }) as typeof fs.openSync),
+        spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+          if (fd === markerFd) {
+            markerFd = undefined;
+            throw new Error("injected marker descriptor identity failure");
+          }
+          return (fstat as (...a: unknown[]) => unknown)(fd, ...rest);
+        }) as typeof fs.fstatSync),
+      );
+      const msg = await refusalOf(() =>
+        adoptAgent({
+          name,
+          positionName: "builder",
+          agentsRoot: s.agentsRoot,
+          hostRoot: s.hostRoot,
+          positionsRoot: DEFAULT_POSITIONS_ROOT,
+        }),
+      );
+      expect(readEntry(marker).text).toBe("");
+      expect(msg).toContain(entry === "marker" ? marker : `overrides/${entry}`);
+      expect(msg).toContain("left these entries in place");
+      expect(msg).toContain("injected marker descriptor identity failure");
+      expectNoBinding(s, name);
+    },
+  );
+
+  it("removes adoption entries inside an existing empty overrides directory and keeps the directory", async () => {
+    const s = scratch();
+    const name = "ar-existing-overrides";
+    adoptReadyAgent(s, name);
+    const agentDir = join(s.agentsRoot, name);
+    const dir = overridesDir(agentDir);
+    mkdirSync(dir);
+    const before = directoryInode(dir);
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        commitHook: (step) => {
+          if (step === "override-repo") throw new Error("injected override-repo failure");
+        },
+      }),
+    );
+    expect(directoryInode(dir)).toBe(before);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(msg).not.toContain("left these entries in place");
+    expectNoBinding(s, name);
+  });
+
+  it("retains nested adoption entries when their existing parent is replaced", async () => {
+    const s = scratch();
+    const name = "ar-parent-replaced";
+    adoptReadyAgent(s, name);
+    const agentDir = join(s.agentsRoot, name);
+    const dir = overridesDir(agentDir);
+    const aside = join(s.base, "override-aside");
+    mkdirSync(dir);
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        commitHook: (step) => {
+          if (step !== "override-repo") return;
+          renameSync(dir, aside);
+          mkdirSync(join(dir, "files"), { recursive: true });
+          writeFileSync(join(dir, "overrides.json"), "foreign document\n");
+          writeFileSync(join(dir, "files", "note.txt"), "foreign note\n");
+          throw new Error("injected parent replacement");
+        },
+      }),
+    );
+    expect(readEntry(join(dir, "overrides.json")).text).toBe("foreign document\n");
+    expect(readEntry(join(dir, "files", "note.txt")).text).toBe("foreign note\n");
+    expect(readEntry(join(aside, "overrides.json")).text).toContain('"disable"');
+    expect(msg).toContain("overrides/files");
+    expect(msg).toContain("overrides/overrides.json");
+    expect(msg).toContain("overrides/.git/HEAD");
+    expectNoBinding(s, name);
+  });
+
+  it("retains and names a move-back placeholder after its identity read fails", async () => {
+    const s = scratch();
+    const name = "rb-placeholder-read";
+    const agentDir = join(s.agentsRoot, name);
+    const mkdir = fs.mkdirSync;
+    const lstat = fs.lstatSync;
+    let placeholderCreated = false;
+    const msg = await refusalOf(() =>
+      hire(s, name, {
+        failAt: "scaffold",
+        act: () => {
+          writeFileSync(join(agentDir, "note.txt"), "foreign note\n");
+          spies.push(
+            spyOn(fs, "mkdirSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+              const result = (mkdir as (...a: unknown[]) => unknown)(path, ...rest);
+              if (String(path) === agentDir) placeholderCreated = true;
+              return result;
+            }) as typeof fs.mkdirSync),
+            spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+              if (placeholderCreated && String(path) === agentDir) {
+                placeholderCreated = false;
+                throw new Error("injected placeholder identity failure");
+              }
+              return (lstat as (...a: unknown[]) => unknown)(path, ...rest);
+            }) as typeof fs.lstatSync),
+          );
+        },
+      }),
+    );
+    expect(readdirSync(agentDir)).toEqual([]);
+    const quarantine = readdirSync(s.agentsRoot).find((n) => n.startsWith(".bob-rollback-"));
+    expect(quarantine).toBeDefined();
+    const at = join(s.agentsRoot, quarantine as string);
+    expect(readEntry(join(at, "note.txt")).text).toBe("foreign note\n");
+    expect(msg).toContain(agentDir);
+    expect(msg).toContain(at);
+    expect(msg).toContain("injected placeholder identity failure");
+  });
+
+  it("retains and names a scaffold temporary file after its descriptor identity read fails", async () => {
+    const s = scratch();
+    const name = "rb-temp-read";
+    const agentDir = join(s.agentsRoot, name);
+    const open = fs.openSync;
+    const fstat = fs.fstatSync;
+    let temp = "";
+    let tempFd: number | undefined;
+    spies.push(
+      spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+        const fd = (open as (...a: unknown[]) => number)(path, ...rest);
+        if (
+          basename(String(path)).startsWith(".soul.md-") &&
+          typeof rest[0] === "number" &&
+          (rest[0] & fs.constants.O_CREAT) !== 0
+        ) {
+          temp = String(path);
+          tempFd = fd;
+        }
+        return fd;
+      }) as typeof fs.openSync),
+      spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+        if (fd === tempFd) {
+          tempFd = undefined;
+          throw new Error("injected temporary descriptor identity failure");
+        }
+        return (fstat as (...a: unknown[]) => unknown)(fd, ...rest);
+      }) as typeof fs.fstatSync),
+    );
+    const msg = await refusalOf(() => hire(s, name));
+    expect(temp).not.toBe("");
+    expect(readEntry(temp).text).toBe("");
+    expect(readdirSync(agentDir)).toEqual([basename(temp)]);
+    expect(msg).toContain(basename(temp));
+    expect(msg).toContain("injected temporary descriptor identity failure");
+    expectNoBinding(s, name);
+  });
+
   it("preserves and reports a created directory when its identity read fails", async () => {
     const s = scratch();
     const name = "rb-mkdir-read";
