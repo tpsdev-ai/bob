@@ -7,7 +7,7 @@ import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-option
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type ProviderRequestPolicy,
-  type ProviderRequestTimeoutError,
+  ProviderRequestTimeoutError,
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
@@ -83,13 +83,34 @@ export function installBaseUrlTransport(
       if (callerSignal?.aborted) onCallerAbort();
       else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
     }
+    // bob#313: the deadline for the whole call, retries included, is armed once
+    // here, when the call starts. Aborting the caller's signal also ends a
+    // retry's backoff sleep, so an attempt that begins after the deadline does
+    // not run; each attempt's own total timer is clamped to the same deadline.
+    const totalTimeoutMs = request?.totalTimeoutMs ?? 0;
+    const deadlineMs = totalTimeoutMs > 0 ? Date.now() + totalTimeoutMs : undefined;
+    let deadlineHandle: ReturnType<typeof setTimeout> | undefined;
+    if (deadlineMs !== undefined) {
+      deadlineHandle = setTimeout(() => {
+        const error = new ProviderRequestTimeoutError(provider, totalTimeoutMs);
+        timeoutError = error;
+        controller.abort(error);
+      }, totalTimeoutMs);
+    }
     const requestFetch =
       request === undefined
         ? guardedFetch
-        : withStreamTimeouts(guardedFetch, request, provider, undefined, (error) => {
-            timeoutError = error;
-            controller.abort(error);
-          });
+        : withStreamTimeouts(
+            guardedFetch,
+            request,
+            provider,
+            undefined,
+            (error) => {
+              timeoutError = error;
+              controller.abort(error);
+            },
+            deadlineMs,
+          );
     // bob#185 item 2: the row's per-turn budget sets the request's thinking
     // level and names `max_tokens` as its output-cap field. The row's keyless
     // model is scaffolded non-reasoning, so a budget marks it reasoning-capable
@@ -156,6 +177,7 @@ export function installBaseUrlTransport(
           }
         }
       } finally {
+        if (deadlineHandle !== undefined) clearTimeout(deadlineHandle);
         callerSignal?.removeEventListener("abort", onCallerAbort);
         stream.end();
       }
