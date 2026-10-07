@@ -44,13 +44,19 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     const ledger: PublishedEntry[] = [];
     scaffold(name, (e) => ledger.push(e));
 
-    const paths = ledger.map((e) => e.path);
-    expect(paths).toContain(agentDir);
-    expect(paths).toContain(join(agentDir, "bin"));
-    expect(paths).toContain(join(agentDir, "bin", name));
-    expect(paths).toContain(join(agentDir, "soul.md"));
-    expect(paths).toContain(join(agentDir, "bob.yaml"));
-    expect(paths).toContain(join(agentDir, ".pi-agent", "models.json"));
+    const expected = [
+      agentDir,
+      join(agentDir, "bin"),
+      join(agentDir, "work"),
+      join(agentDir, "memory"),
+      join(agentDir, ".pi-agent"),
+      join(agentDir, "soul.md"),
+      join(agentDir, "bob.yaml"),
+      join(agentDir, ".pi-agent", "models.json"),
+      join(agentDir, ".pi-agent", "auth.json"),
+      join(agentDir, "bin", name),
+    ];
+    expect(ledger.map((e) => e.path).sort()).toEqual(expected.slice().sort());
     // Every recorded entry exists, and its recorded kind matches disk.
     for (const e of ledger) {
       const st = lstatSync(e.path);
