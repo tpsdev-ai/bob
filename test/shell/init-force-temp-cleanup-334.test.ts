@@ -253,7 +253,9 @@ describe("bob#334 — init temp cleanup on the --force path", () => {
     expect(entries.some((entry) => entry.path === temp)).toBe(false);
     const soul = join(agentDir, "soul.md");
     const publication = entries.find((entry) => entry.path === soul);
-    const identity = lstatSync(soul, { bigint: true });
+    const soulFd = fs.openSync(soul, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const identity = fs.fstatSync(soulFd, { bigint: true });
+    fs.closeSync(soulFd);
     expect(publication).toMatchObject({ dev: identity.dev, ino: identity.ino, kind: "file" });
     const ownTemp = entries.find(
       (entry) => entry.kind === "file" && entry.ino === identity.ino && entry.path !== soul,
