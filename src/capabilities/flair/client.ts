@@ -251,6 +251,10 @@ export interface FlairHttpClientOptions {
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
   readFile?: (path: string) => Buffer;
+  // An outer cancellation signal (bob#319): when it aborts, a bounded request
+  // (the per-PR memory get, list, write and delete) aborts too, alongside its
+  // per-request timeout.
+  signal?: AbortSignal;
   // Bounds on one bootstrap call (bob#254). Defaults: the constants above.
   bootstrapTimeoutMs?: number;
   bootstrapMaxResponseBytes?: number;
@@ -307,6 +311,7 @@ export class FlairHttpClient implements FlairClient {
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => Buffer;
+  private readonly signal: AbortSignal | undefined;
   private readonly bootstrapTimeoutMs: number;
   private readonly bootstrapMaxResponseBytes: number;
   // Parsed once; reused across requests.
@@ -329,6 +334,7 @@ export class FlairHttpClient implements FlairClient {
     this.now = opts.now ?? (() => Date.now());
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
+    this.signal = opts.signal;
     this.bootstrapTimeoutMs = opts.bootstrapTimeoutMs ?? DEFAULT_BOOTSTRAP_TIMEOUT_MS;
     this.bootstrapMaxResponseBytes =
       opts.bootstrapMaxResponseBytes ?? DEFAULT_BOOTSTRAP_MAX_RESPONSE_BYTES;
@@ -407,15 +413,19 @@ export class FlairHttpClient implements FlairClient {
     strictBody = false,
   ): Promise<unknown> {
     if (bounds.timeoutMs === undefined) {
-      // No deadline: still honor a byte bound by forwarding it to signedFetch.
+      // No deadline: still honor a byte bound and the outer signal by forwarding
+      // them to signedFetch.
       return this.signedFetch(
         method,
         path,
         body,
         nullOnStatus,
-        bounds.maxResponseBytes !== undefined
-          ? { maxResponseBytes: bounds.maxResponseBytes }
-          : undefined,
+        {
+          ...(this.signal !== undefined ? { signal: this.signal } : {}),
+          ...(bounds.maxResponseBytes !== undefined
+            ? { maxResponseBytes: bounds.maxResponseBytes }
+            : {}),
+        },
         strictBody,
       );
     }
@@ -427,6 +437,12 @@ export class FlairHttpClient implements FlairClient {
         reject(new Error("flair request timed out"));
       }, bounds.timeoutMs);
     });
+    // The request aborts on EITHER the per-request deadline OR the caller's own
+    // signal, so a caller torn down mid-request cancels it immediately.
+    const signal =
+      this.signal !== undefined
+        ? AbortSignal.any([controller.signal, this.signal])
+        : controller.signal;
     try {
       const pending = this.signedFetch(
         method,
@@ -434,7 +450,7 @@ export class FlairHttpClient implements FlairClient {
         body,
         nullOnStatus,
         {
-          signal: controller.signal,
+          signal,
           ...(bounds.maxResponseBytes !== undefined
             ? { maxResponseBytes: bounds.maxResponseBytes }
             : {}),

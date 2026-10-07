@@ -829,6 +829,7 @@ export async function attachPrMemory(
   target: FlairBootstrapTarget | undefined,
   seams?: PrMemorySeams,
   log?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const ref = config.taskBinding?.pr_ref;
   if (target === undefined || ref === undefined || configHoldsWeb(config)) return;
@@ -837,6 +838,7 @@ export async function attachPrMemory(
     ref,
     identity: { agentId: target.agentId, repository: ref.repository, prNumber: ref.number },
     ...(seams !== undefined ? { seams } : {}),
+    ...(signal !== undefined ? { signal } : {}),
     ...(log !== undefined ? { log } : {}),
   });
   if (result.status === "recalled" && result.block !== undefined) config.prMemory = result.block;
@@ -991,10 +993,30 @@ async function runBoundedSession(
     throw err;
   }
 
-  // Recall prior-round memory before session construction, with its own deadline.
-  await attachPrMemory(config, flairBootstrapTarget, opts.prMemorySeams, (m) =>
-    process.stderr.write(`bob run ${opts.name}: ${m}\n`),
-  );
+  // Recall prior-round memory before session construction, under the run's
+  // cancellation guard and with the run's abort signal (bob#319): a bound that
+  // fires while recall is in flight aborts the recall's request and ends the
+  // run, instead of letting it build a session afterwards.
+  try {
+    await bounds.guard(
+      attachPrMemory(
+        config,
+        flairBootstrapTarget,
+        opts.prMemorySeams,
+        (m) => process.stderr.write(`bob run ${opts.name}: ${m}\n`),
+        bounds.signal,
+      ),
+    );
+  } catch (err) {
+    if (err instanceof RunAbortedError) return finalizeAbort(err.reason);
+    throw err;
+  }
+
+  // A bound that fired after recall returned — which removed the guard's abort
+  // listener, so the guard resolved — must still end the run here, BEFORE the
+  // session factory is invoked (bob#319).
+  const firedAfterRecall = bounds.reason();
+  if (firedAfterRecall !== undefined) return finalizeAbort(firedAfterRecall);
 
   const factory =
     opts.sessionFactory ??
