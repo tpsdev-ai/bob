@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+} from "../../src/lib/ed25519-key.js";
 import { PR_MEMORY_PROMPT_HEADING, prMemoryKey } from "../../src/shell/pr-memory.js";
 import { type RunSession, runAgent } from "../../src/shell/run.js";
 import { makeFakeFlair } from "./flair-fake.js";
@@ -81,7 +85,17 @@ beforeEach(() => {
   );
   scaffold(root, "http://flair.test", keyFile);
   savedFetch = globalThis.fetch;
-  fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  // Register the agent's public key so the run's real signed requests verify.
+  fake = makeFakeFlair({
+    agents: {
+      [AGENT]: {
+        id: AGENT,
+        publicKey: deriveEd25519PublicKeyBase64(
+          normalizeEd25519PrivateKey(readFileSync(keyFile), keyFile),
+        ),
+      },
+    },
+  });
   globalThis.fetch = (async (url, init) => {
     if (new URL(String(url)).pathname === "/BootstrapMemories")
       return new Response('{"context":""}');

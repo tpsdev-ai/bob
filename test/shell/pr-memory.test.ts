@@ -1,6 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
+import { randomUUID } from "node:crypto";
+import {
+  FlairHttpClient,
+  loadFlairPrivateKey,
+  tpsEd25519AuthHeader,
+} from "../../src/capabilities/flair/client.js";
 import { parseTaskBinding } from "../../src/capabilities/work/task-binding.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+} from "../../src/lib/ed25519-key.js";
+import { checkFlairRegistration } from "../../src/shell/flair-pair.js";
 import {
   boundEnvelope,
   editToolFilePath,
@@ -29,7 +39,7 @@ import {
   validateRecalledRecord,
   writePrMemoryRound,
 } from "../../src/shell/pr-memory.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { type FakeFlairOptions, makeFakeFlair } from "./flair-fake.js";
 
 const AGENT = "anvil";
 const REPO = "github.com/tpsdev-ai/bob";
@@ -38,6 +48,15 @@ const ID = prMemoryKey(AGENT, REPO, PR);
 const IDENTITY = { agentId: AGENT, repository: REPO, prNumber: PR };
 
 const KEY = Buffer.alloc(32, 7);
+// The public key the stub registers for the test identity — derived from the
+// same seed the client signs with, so a correctly signed request verifies.
+const PUB = deriveEd25519PublicKeyBase64(normalizeEd25519PrivateKey(KEY, "test-private-key"));
+function fakeFlair(opts: FakeFlairOptions = {}): ReturnType<typeof makeFakeFlair> {
+  // Register the test public key on each agent row in place (a test may mutate
+  // this same options object after construction).
+  for (const row of Object.values(opts.agents ?? {})) row.publicKey ??= PUB;
+  return makeFakeFlair(opts);
+}
 // A constant clock by default, so every record written through it carries the
 // same createdAt.
 function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000_000) {
@@ -45,7 +64,8 @@ function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000
     fetchImpl: fake.fetchImpl,
     readFile: () => KEY,
     now,
-    uuid: () => "nonce-0000",
+    signedAt: () => Date.now(),
+    uuid: randomUUID,
   };
 }
 
@@ -262,7 +282,7 @@ describe("envelope parsing and validation", () => {
       archived: false,
       expiresAt,
     };
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, memories: { [ID]: record } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } }, memories: { [ID]: record } });
     const recalled = await recallPrMemoryRound({
       target: TARGET,
       ref: REF,
@@ -320,7 +340,7 @@ describe("envelope parsing and validation", () => {
     const record = { id: ID, agentId: AGENT, visibility: "private", content };
     expect(parseEnvelope(content, IDENTITY)).toBeUndefined();
     expect(validateRecalledRecord(record, { ...IDENTITY, id: ID })).toBeUndefined();
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: record },
     });
@@ -527,7 +547,7 @@ describe("findings — unresolved carried forward, resolved replace open", () =>
 
 describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   it("writes round N and recalls it in a later round, with no brief input", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
 
     const evidence = {
@@ -582,7 +602,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
         ],
       }),
     );
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior } },
     });
@@ -625,7 +645,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("returns empty for a different PR, agent or repository", async () => {
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT }, "someone-else": { id: "someone-else" } },
     });
     const s = seams(fake);
@@ -665,7 +685,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("starts empty on a 404", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const recalled = await recallPrMemoryRound({
       target: TARGET,
       ref: REF,
@@ -679,7 +699,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     const prior = JSON.stringify(
       envelope({ rounds: [round({ runId: "old", files_touched: ["earlier.ts"] })] }),
     );
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: {
         [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior },
@@ -715,7 +735,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("recalls a run id written twice once", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
     const write = () =>
       writePrMemoryRound({
@@ -745,7 +765,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
 
   it("rejects a stored record whose embedded identity does not match", async () => {
     const forged = JSON.stringify(envelope({ prNumber: PR + 1 }));
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: { id: ID, agentId: AGENT, visibility: "private", content: forged } },
     });
@@ -760,7 +780,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("proceeds and reports unavailability when Flair is unreachable", async () => {
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       transportFailure: { stage: "fetch", match: () => true },
     });
@@ -791,7 +811,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
 
 describe("concurrent rounds (bob#318)", () => {
   it("records and recalls both of two rounds written concurrently", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     // Neither writer's first request completes until both have sent one.
     const s = { ...seams(fake), fetchImpl: barrier(fake.fetchImpl, 2) };
     const write = (runId: string, endedAt: string) =>
@@ -861,7 +881,7 @@ describe("concurrent rounds (bob#318)", () => {
   ] as const)(
     "protects both PUTs before either prune lists: %s",
     async (_case, aged, retained, laterRetained) => {
-      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
       const at = 1_800_000_000_000;
       for (const day of [4, 5, 6])
         await writeDay(fake, day, () => at - (aged ? PR_MEMORY_PRUNE_PROTECTION_MS + 1 : 0));
@@ -914,7 +934,7 @@ describe("concurrent rounds (bob#318)", () => {
   );
 
   it("keeps and recalls a late round whose endedAt is older than a full history", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
     for (const day of [4, 5, 6]) await writeDay(fake, day, clock);
     // Ends before every stored round, but is written last.
@@ -924,7 +944,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("keeps its own write under a createdAt tie, then prunes on the next write", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     for (const day of [4, 5, 6]) await writeDay(fake, day);
     const start = fake.calls.length;
     expect((await writeDay(fake, 1)).status).toBe("written");
@@ -948,7 +968,7 @@ describe("concurrent rounds (bob#318)", () => {
       agents: { [AGENT]: { id: AGENT } },
       memoryDeleteStatus: 500,
     };
-    const fake = makeFakeFlair(options);
+    const fake = fakeFlair(options);
     const clock = writeClock();
     const backlog = PR_MEMORY_MAX_ROUNDS + PR_MEMORY_PRUNE_PAGE + 3; // 14
     for (let day = 1; day <= backlog; day++) await writeDay(fake, day, clock);
@@ -965,7 +985,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("breaks a createdAt tie by id", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     for (const day of [3, 1, 4, 2]) await writeDay(fake, day);
     expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
     expect(storedDays(fake)).toEqual([1, 2, 3, 4]);
@@ -973,7 +993,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("concurrent prunes over a full history retain the leading createdAt rows", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
     for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
     // Both writers list before either deletes, so both delete round 1.
@@ -1005,10 +1025,10 @@ describe("concurrent rounds (bob#318)", () => {
   ] as const)(
     "a failed prune %s is logged and the write still returns written",
     async (_stage, failure, logged) => {
-      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
       const clock = writeClock();
       for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
-      const failing = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
+      const failing = fakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
       for (const [id, record] of fake.memories) failing.memories.set(id, record);
       const logs: string[] = [];
       expect((await writeDay(failing, 4, clock, (m) => logs.push(m))).status).toBe("written");
@@ -1036,7 +1056,7 @@ describe("concurrent rounds (bob#318)", () => {
       createdAt: old,
       content: JSON.stringify(envelope({ rounds: [round()] })),
     };
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT }, [other]: { id: other } },
       memories: { [stray.id]: stray, [malformed.id]: malformed, [foreign.id]: foreign },
     });
@@ -1059,7 +1079,7 @@ describe("regressions from final review", () => {
         identity: IDENTITY,
         evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
         seams: {
-          ...seams(makeFakeFlair()),
+          ...seams(fakeFlair()),
           fetchImpl: async (_url, init) => {
             methods.push(init?.method ?? "");
             return new Response(body, { status: 200 });
@@ -1087,7 +1107,7 @@ describe("regressions from final review", () => {
       identity: { ...IDENTITY, repository: probe.repository },
       evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
       seams: {
-        ...seams(makeFakeFlair()),
+        ...seams(fakeFlair()),
         fetchImpl: async (_url, init) => {
           if (init?.method === "PUT") puts++;
           return new Response("{}", { status: 404 });
@@ -1206,7 +1226,7 @@ it("writes and recalls an overlong launcher task_id", async () => {
     }),
   );
   if (!binding) throw new Error("missing binding");
-  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
   expect(
     (
@@ -1244,7 +1264,7 @@ it.each([
   "evidence",
 ])("bounds a stored %s string for recall", async (field) => {
   const long = "x".repeat(700);
-  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
   const check = normalizeCheck({
     command: "check",
@@ -1282,12 +1302,12 @@ it.each([
 
 it("writes beside a hidden foreign row at the key, leaving it unchanged", async () => {
   const prior = { id: ID, agentId: "kern", visibility: "private", content: "foreign history" };
-  const fake = makeFakeFlair({
+  const fake = fakeFlair({
     agents: { [AGENT]: { id: AGENT }, kern: { id: "kern" } },
     memories: { [ID]: prior },
   });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
-  const client = new FlairHttpClient({ ...TARGET, ...seams(fake) });
+  const client = new FlairHttpClient({ ...TARGET, ...seams(fake) }, seams(fake));
   await expect(client.get(ID)).resolves.toBeNull();
   await expect(client.write("replacement", { id: ID, visibility: "private" })).rejects.toThrow(
     "403",
@@ -1307,4 +1327,321 @@ it("writes beside a hidden foreign row at the key, leaving it unchanged", async 
   ).toBe("written");
   expect(roundRecords(fake)).toHaveLength(1);
   expect(fake.memories.get(ID)).toEqual(prior);
+});
+
+describe("Flair stub signed authentication", () => {
+  const key = loadFlairPrivateKey(KEY, "test-private-key");
+  const otherKey = loadFlairPrivateKey(Buffer.alloc(32, 9), "other-private-key");
+  const NOW = 1_700_000_000_000;
+  const path = `/Memory/${encodeURIComponent(ID)}`;
+  const body = JSON.stringify({ id: ID, agentId: AGENT, content: "round" });
+  const registered = (now: () => number = () => NOW) =>
+    fakeFlair({ agents: { [AGENT]: { id: AGENT } }, now });
+  const send = (fake: ReturnType<typeof makeFakeFlair>, authorization?: string) =>
+    fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authorization ? { Authorization: authorization } : {}),
+      },
+      body,
+    });
+  const sign = (
+    opts: {
+      key?: ReturnType<typeof loadFlairPrivateKey>;
+      path?: string;
+      tsMs?: number;
+      agentId?: string;
+      nonce?: string;
+    } = {},
+  ) =>
+    tpsEd25519AuthHeader({
+      agentId: opts.agentId ?? AGENT,
+      key: opts.key ?? key,
+      method: "PUT",
+      path: opts.path ?? path,
+      tsMs: opts.tsMs ?? NOW,
+      nonce: opts.nonce ?? randomUUID(),
+    });
+
+  it("refuses an unsigned write with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake);
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a write signed by a different key with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ key: otherKey }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it.each(["appended !", "wrong padding", "non-base64 character"])(
+    "refuses signature encoding: %s before a write",
+    async (encoding) => {
+      const fake = registered();
+      const header = sign();
+      const split = header.lastIndexOf(":") + 1;
+      const signature = header.slice(split);
+      const malformed =
+        encoding === "appended !"
+          ? `${signature}!`
+          : encoding === "wrong padding"
+            ? `${signature}=`
+            : `${signature.slice(0, 8)}@${signature.slice(8)}`;
+      const res = await send(fake, header.slice(0, split) + malformed);
+      expect(res.status).toBe(401);
+      expect(JSON.parse(await res.text()).error).toBe("signature_verification_failed");
+      expect(fake.memories.size).toBe(0);
+    },
+  );
+
+  it.each(["appended !", "wrong padding", "non-base64 character"])(
+    "refuses public-key encoding: %s before a write",
+    async (encoding) => {
+      const publicKey =
+        encoding === "appended !"
+          ? `${PUB}!`
+          : encoding === "wrong padding"
+            ? `${PUB}==`
+            : `${PUB.slice(0, 8)}@${PUB.slice(8)}`;
+      const fake = fakeFlair({
+        agents: { [AGENT]: { id: AGENT, publicKey } },
+        now: () => NOW,
+      });
+      const res = await send(fake, sign());
+      expect(res.status).toBe(401);
+      expect(JSON.parse(await res.text()).error).toBe("signature_verification_failed");
+      expect(fake.memories.size).toBe(0);
+    },
+  );
+
+  for (const length of [31, 33]) {
+    it.each(["base64", "base64url", "hex"])(
+      `refuses a ${length}-byte public key encoded as %s before a write`,
+      async (encoding) => {
+        const raw = Buffer.concat([Buffer.from(PUB, "base64"), Buffer.alloc(1)]).subarray(
+          0,
+          length,
+        );
+        const fake = fakeFlair({
+          agents: { [AGENT]: { id: AGENT, publicKey: raw.toString(encoding as BufferEncoding) } },
+          now: () => NOW,
+        });
+        const res = await send(fake, sign());
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe("signature_verification_failed");
+        expect(fake.memories.size).toBe(0);
+      },
+    );
+  }
+
+  it.each([1, 63, 65])("refuses a %s-byte signature before a write", async (length) => {
+    const fake = registered();
+    const header = sign();
+    const split = header.lastIndexOf(":") + 1;
+    const raw = Buffer.concat([Buffer.from(header.slice(split), "base64"), Buffer.alloc(1)]);
+    const res = await send(
+      fake,
+      header.slice(0, split) + raw.subarray(0, length).toString("base64"),
+    );
+    expect(res.status).toBe(401);
+    expect(JSON.parse(await res.text()).error).toBe("invalid_signature");
+    expect(fake.memories.size).toBe(0);
+  });
+
+  it("refuses a hex-encoded signature before a write", async () => {
+    const fake = registered();
+    const header = sign();
+    const split = header.lastIndexOf(":") + 1;
+    const res = await send(
+      fake,
+      header.slice(0, split) + Buffer.from(header.slice(split), "base64").toString("hex"),
+    );
+    expect(res.status).toBe(401);
+    expect(JSON.parse(await res.text()).error).toBe("invalid_signature");
+    expect(fake.memories.size).toBe(0);
+  });
+
+  for (const signatureEncoding of ["base64", "base64url", "unpadded base64", "padded base64url"]) {
+    it.each(["base64", "base64url", "hex", "uppercase hex", "unpadded base64", "padded base64url"])(
+      `accepts a write with %s key encoding and a ${signatureEncoding} signature`,
+      async (encoding) => {
+        const rawKey = Buffer.from(PUB, "base64");
+        const publicKey =
+          encoding === "uppercase hex"
+            ? rawKey.toString("hex").toUpperCase()
+            : encoding === "unpadded base64"
+              ? PUB.replace(/=+$/, "")
+              : encoding === "padded base64url"
+                ? rawKey.toString("base64url") + "="
+                : rawKey.toString(encoding as BufferEncoding);
+        const fake = fakeFlair({
+          agents: { [AGENT]: { id: AGENT, publicKey } },
+          now: () => NOW,
+        });
+        const header = sign();
+        const split = header.lastIndexOf(":") + 1;
+        const rawSignature = Buffer.from(header.slice(split), "base64");
+        const signature =
+          signatureEncoding === "unpadded base64"
+            ? rawSignature.toString("base64").replace(/=+$/, "")
+            : signatureEncoding === "padded base64url"
+              ? rawSignature.toString("base64url") + "=="
+              : rawSignature.toString(signatureEncoding as BufferEncoding);
+        expect((await send(fake, header.slice(0, split) + signature)).status).toBe(200);
+        expect(fake.memories.get(ID)?.content).toBe("round");
+      },
+    );
+  }
+
+  it("refuses a write outside the timestamp window with 401 and stores nothing", async () => {
+    const fake = registered();
+    expect((await send(fake, sign({ tsMs: NOW - 60_000 }))).status).toBe(401);
+    expect((await send(fake, sign({ tsMs: NOW + 60_000 }))).status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a signature made over a different path with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ path: "/Memory/other" }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a write naming an unregistered agent with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ agentId: "agent-a" }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a signed deactivated-agent write before signature verification", async () => {
+    for (const status of ["deactivated", "disabled", null, false]) {
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT, status } }, now: () => NOW });
+      for (const signingKey of [key, otherKey]) {
+        const res = await send(fake, sign({ key: signingKey }));
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe("principal_deactivated");
+        expect(fake.memories.size).toBe(0);
+      }
+    }
+  });
+
+  it("refuses an unsigned malformed-JSON PUT before parsing and stores nothing", async () => {
+    const fake = registered();
+    const res = await fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    expect(res.status).toBe(401);
+    expect(fake.memories.size).toBe(0);
+  });
+
+  it("preserves signed auth errors on Agent, Soul and Memory routes", async () => {
+    for (const [method, target] of [
+      ["GET", `/Agent/${AGENT}`],
+      ["GET", `/Soul/${AGENT}:role`],
+      ["GET", "/Memory/?agentId=anvil&limit(1)"],
+      ["GET", path],
+      ["PUT", path],
+      ["DELETE", path],
+    ]) {
+      for (const [error, signingKey, tsMs, agentId] of [
+        ["timestamp_out_of_window", key, NOW - 60_000, AGENT],
+        ["invalid_signature", otherKey, NOW, AGENT],
+        ["unknown_agent", key, NOW, "unregistered"],
+      ] as const) {
+        const fake = registered();
+        const res = await fake.fetchImpl(`http://flair.test${target}`, {
+          method,
+          headers: {
+            Authorization: tpsEd25519AuthHeader({
+              agentId,
+              key: signingKey,
+              method,
+              path: target,
+              tsMs,
+              nonce: "nonce-route",
+            }),
+          },
+          body,
+        });
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe(error);
+        expect(fake.memories.size).toBe(0);
+      }
+    }
+  });
+
+  it("reports stale or wrongly signed Agent checks as unreachable through flair-pair", async () => {
+    for (const [seed, tsMs, error] of [
+      [KEY, NOW - 60_000, "timestamp_out_of_window"],
+      [Buffer.alloc(32, 9), NOW, "invalid_signature"],
+    ] as const) {
+      const fake = registered();
+      const result = await checkFlairRegistration({
+        name: AGENT,
+        flairUrl: TARGET.url,
+        keyFile: TARGET.keyFile,
+        fetchImpl: fake.fetchImpl,
+        readFile: () => seed,
+        now: () => tsMs,
+        uuid: () => "nonce-pair",
+      });
+      expect(result.state).toBe("unreachable");
+      expect(result.detail).toContain(error);
+    }
+  });
+
+  it("refuses a reused signed nonce across routes without changing the stored row", async () => {
+    const fake = registered();
+    const authorization = sign({ nonce: "nonce-replay" });
+    expect((await send(fake, authorization)).status).toBe(200);
+    const stored = { ...fake.memories.get(ID) };
+    const replay = await fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: { Authorization: authorization },
+      body: JSON.stringify({ id: ID, agentId: AGENT, content: "replayed" }),
+    });
+    expect(replay.status).toBe(401);
+    expect(JSON.parse(await replay.text()).error).toBe("nonce_replay_detected");
+    expect(fake.memories.get(ID)).toEqual(stored);
+    const target = `/Agent/${AGENT}`;
+    const crossRoute = await fake.fetchImpl(`http://flair.test${target}`, {
+      method: "GET",
+      headers: {
+        Authorization: tpsEd25519AuthHeader({
+          agentId: AGENT,
+          key,
+          method: "GET",
+          path: target,
+          tsMs: NOW,
+          nonce: "nonce-replay",
+        }),
+      },
+    });
+    expect(crossRoute.status).toBe(401);
+    expect(JSON.parse(await crossRoute.text()).error).toBe("nonce_replay_detected");
+  });
+
+  it("accepts the production client's signed write", async () => {
+    const fake = registered();
+    const client = new FlairHttpClient({
+      url: TARGET.url,
+      agentId: AGENT,
+      keyFile: TARGET.keyFile,
+      fetchImpl: fake.fetchImpl,
+      readFile: () => KEY,
+      now: () => NOW,
+      uuid: () => "nonce-client",
+    });
+    await expect(client.write("round", { id: ID, visibility: "private" })).resolves.toMatchObject({
+      id: ID,
+    });
+    expect(fake.memories.get(ID)?.content).toBe("round");
+  });
 });

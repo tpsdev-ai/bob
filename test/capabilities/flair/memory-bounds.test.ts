@@ -1,16 +1,28 @@
 import { describe, expect, it } from "bun:test";
 import { FlairHttpClient } from "../../../src/capabilities/flair/client.js";
-import { makeFakeFlair } from "../../shell/flair-fake.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+} from "../../../src/lib/ed25519-key.js";
+import { type FakeFlairOptions, makeFakeFlair } from "../../shell/flair-fake.js";
 
 const KEY = Buffer.alloc(32, 7);
+const PUB = deriveEd25519PublicKeyBase64(normalizeEd25519PrivateKey(KEY, "test-private-key"));
+const NOW = () => 1_700_000_000_000;
 const options = {
   url: "http://flair.test",
   agentId: "anvil",
   keyFile: "/unused",
   readFile: () => KEY,
-  now: () => 1_700_000_000_000,
-  uuid: () => "nonce",
+  now: NOW,
 };
+// Register the test identity's public key on the stub and pin its clock to the
+// client's, so the real signed requests verify.
+function fakeFlair(opts: FakeFlairOptions = {}): ReturnType<typeof makeFakeFlair> {
+  for (const row of Object.values(opts.agents ?? {})) row.publicKey ??= PUB;
+  opts.now ??= NOW;
+  return makeFakeFlair(opts);
+}
 type FetchImpl = NonNullable<ConstructorParameters<typeof FlairHttpClient>[0]["fetchImpl"]>;
 const methods = ["GET", "PUT"] as const;
 function request(
@@ -100,7 +112,7 @@ describe("Memory request bounds", () => {
 
 describe("Memory refusals from the Flair fake", () => {
   it("propagates a cross-owner PUT as a rejected write", async () => {
-    const fake = makeFakeFlair({ agents: { anvil: { id: "anvil" }, kern: { id: "kern" } } });
+    const fake = fakeFlair({ agents: { anvil: { id: "anvil" }, kern: { id: "kern" } } });
     const client = new FlairHttpClient({ ...options, fetchImpl: fake.fetchImpl });
     await expect(client.write("round", { id: "row", authorId: "kern" })).rejects.toThrow("403");
     expect(fake.memories.has("row")).toBe(false);
@@ -113,7 +125,7 @@ describe("Memory refusals from the Flair fake", () => {
 
   it("returns null for another owner's private row without exposing it", async () => {
     const row = { id: "row", agentId: "kern", visibility: "private", content: "secret" };
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { anvil: { id: "anvil" }, kern: { id: "kern" } },
       memories: { row },
     });

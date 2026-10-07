@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": { "rootDir": "../..", "noEmit": true },
-  "include": ["./provider-config.ts"]
+  "include": ["./provider-config.ts", "./flair-client-options.ts"]
 }

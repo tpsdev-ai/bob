@@ -309,6 +309,7 @@ export class FlairHttpClient implements FlairClient {
   private readonly keyFile: string;
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
+  private readonly signedAt: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => Buffer;
   private readonly signal: AbortSignal | undefined;
@@ -317,7 +318,7 @@ export class FlairHttpClient implements FlairClient {
   // Parsed once; reused across requests.
   private keyObject?: KeyObject;
 
-  constructor(opts: FlairHttpClientOptions) {
+  constructor(opts: FlairHttpClientOptions, prMemorySeams?: { signedAt?: () => number }) {
     // Drop trailing slashes so `${url}${path}` never doubles them. A linear
     // loop (not a `/\/+$/` regex) — the regex form is a polynomial-ReDoS class
     // on uncontrolled (config) input that CodeQL rightly flags.
@@ -332,6 +333,7 @@ export class FlairHttpClient implements FlairClient {
       : opts.keyFile;
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
+    this.signedAt = prMemorySeams?.signedAt ?? this.now;
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
     this.signal = opts.signal;
@@ -365,7 +367,7 @@ export class FlairHttpClient implements FlairClient {
         key: this.loadKey(),
         method,
         path,
-        tsMs: this.now(),
+        tsMs: this.signedAt(),
         nonce: this.uuid(),
       }),
     };
