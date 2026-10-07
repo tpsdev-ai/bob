@@ -674,6 +674,7 @@ export interface PrMemoryTarget {
 export interface PrMemorySeams {
   fetchImpl?: ConstructorParameters<typeof FlairHttpClient>[0]["fetchImpl"];
   now?: () => number;
+  signedAt?: () => number;
   uuid?: () => string;
   readFile?: (path: string) => Buffer;
 }
@@ -701,16 +702,19 @@ function clientFor(
   seams?: PrMemorySeams,
   signal?: AbortSignal,
 ): FlairHttpClient {
-  return new FlairHttpClient({
-    url: target.url,
-    agentId: target.agentId,
-    keyFile: target.keyFile,
-    ...(seams?.fetchImpl ? { fetchImpl: seams.fetchImpl } : {}),
-    ...(seams?.now ? { now: seams.now } : {}),
-    ...(seams?.uuid ? { uuid: seams.uuid } : {}),
-    ...(seams?.readFile ? { readFile: seams.readFile } : {}),
-    ...(signal !== undefined ? { signal } : {}),
-  });
+  return new FlairHttpClient(
+    {
+      url: target.url,
+      agentId: target.agentId,
+      keyFile: target.keyFile,
+      ...(seams?.fetchImpl ? { fetchImpl: seams.fetchImpl } : {}),
+      ...(seams?.now ? { now: seams.now } : {}),
+      ...(seams?.uuid ? { uuid: seams.uuid } : {}),
+      ...(seams?.readFile ? { readFile: seams.readFile } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+    },
+    seams,
+  );
 }
 
 // A code-owned reason. Never the server's error body (which can reflect a
