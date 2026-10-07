@@ -90,6 +90,17 @@ function flairKeyFile(name: string): string {
   return `~/.flair/keys/${name}.key`;
 }
 
+// One directory entry `initAgent` published, with the identity lstat reported at
+// publication time. A caller that must roll a scaffold back removes an entry
+// only while it is still this one (same device, inode and kind), so an entry
+// another writer has since replaced is left in place.
+export interface PublishedEntry {
+  path: string;
+  dev: number;
+  ino: number;
+  kind: "dir" | "file";
+}
+
 export interface InitOptions {
   name: string;
   role: BobRole;
@@ -136,6 +147,12 @@ export interface InitOptions {
   // and with the path of each file published with link(2), after its temp
   // write.
   beforePublish?: (path: string) => void;
+  // Called with each directory entry this call publishes (the agent directory,
+  // the sub-directories and every file), after it exists on disk, with the
+  // identity lstat reports. Unlike beforePublish (a pre-publication seam), this
+  // fires only for an entry that was actually created, even when a later publish
+  // fails. A caller records these to remove exactly its own entries on rollback.
+  onPublished?: (entry: PublishedEntry) => void;
 }
 
 export interface InitResult {
@@ -196,12 +213,31 @@ export function initAgent(opts: InitOptions): InitResult {
 
   const written: string[] = [];
 
+  // Record each entry THIS call creates, in creation order, so a caller can roll
+  // back exactly its own entries (and nothing a competing writer left behind).
+  const record = (path: string): void => {
+    if (opts.onPublished === undefined) return;
+    const st = lstatSync(path);
+    opts.onPublished({
+      path,
+      dev: st.dev,
+      ino: st.ino,
+      kind: st.isDirectory() ? "dir" : "file",
+    });
+  };
+
   // Without --force, the agent directory is created here with a non-recursive
   // mkdir, and `publish` does not replace an existing entry. With --force,
   // `publish` writes over.
   const publish: Publish = noClobber
-    ? (path, content, mode) => writeFileExclusive(path, content, opts.beforePublish, mode)
-    : (path, content, mode) => writeFileReplacing(path, content, mode);
+    ? (path, content, mode) => {
+        writeFileExclusive(path, content, opts.beforePublish, mode);
+        record(path);
+      }
+    : (path, content, mode) => {
+        writeFileReplacing(path, content, mode);
+        record(path);
+      };
   if (noClobber) {
     mkdirSync(root, { recursive: true });
     opts.beforePublish?.(agentDir);
@@ -211,13 +247,18 @@ export function initAgent(opts: InitOptions): InitResult {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
       throw err;
     }
+    record(agentDir);
   }
 
   // Top-level + subdirs
   mkdirSync(join(agentDir, "bin"), { recursive: true });
+  record(join(agentDir, "bin"));
   mkdirSync(join(agentDir, "work"), { recursive: true });
+  record(join(agentDir, "work"));
   mkdirSync(join(agentDir, "memory"), { recursive: true });
+  record(join(agentDir, "memory"));
   mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+  record(join(agentDir, ".pi-agent"));
 
   // soul.md (identity header + role template; user editable). The role
   // template only describes the ROLE — the header stamps WHO the agent is
@@ -250,7 +291,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // (launcher exports it). Written for every provider — see
   // writePiAgentConfig's doc comment for why bare baseUrl configs aren't
   // enough for `bob run`.
-  written.push(...writePiAgentConfig(opts, agentDir, publish));
+  written.push(...writePiAgentConfig(opts, agentDir, publish, record));
   if (opts.contextWindow === undefined) {
     console.error(
       `⚠ Set provider.context_window in ${yamlPath} before running — bob refuses to start a session without the model's context window.`,
@@ -479,7 +520,12 @@ export function piOpenAiCompletionsModel(
   };
 }
 
-function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publish): string[] {
+function writePiAgentConfig(
+  opts: InitOptions,
+  agentDir: string,
+  publish: Publish,
+  record: (path: string) => void,
+): string[] {
   const piDir = join(agentDir, ".pi-agent");
   // mkdirSync above already created it; defensive recreate in case caller
   // didn't go through the standard path.
@@ -540,6 +586,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publis
     ] as const) {
       if (opts.noClobber === false && fileExists(path)) continue;
       writeFileExclusive(path, content, opts.beforePublish, 0o600);
+      record(path);
       created.push(path);
     }
     const row = providerRecord(opts.provider, registry);

@@ -21,8 +21,17 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  rmdirSync,
+  rmSync,
+  type Stats,
+  unlinkSync,
+} from "node:fs";
+import { join, relative } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { resolveCapabilities } from "./capability-loader.js";
@@ -48,7 +57,7 @@ import {
   writeBindingMarker,
   writeGrant,
 } from "./host-grant.js";
-import { type InitResult, initAgent } from "./init.js";
+import { type InitResult, initAgent, type PublishedEntry } from "./init.js";
 import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
 import { initOverrideRepo, overridesDir } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
@@ -151,21 +160,131 @@ export interface BindHooks {
 interface BindTxn {
   agentDir: string;
   agentDirCreated: boolean;
+  // The entries `initAgent` published inside the agent directory (only when
+  // this operation created it), in creation order, with the identity init saw.
+  published: PublishedEntry[];
   markerPath?: string;
   overrideDirCreated: boolean;
   grantPath?: string;
   baselinePath?: string;
 }
 
-function rollbackBind(tx: BindTxn): void {
-  if (tx.agentDirCreated) {
-    rmSync(tx.agentDir, { recursive: true, force: true });
-  } else {
-    if (tx.markerPath !== undefined) rmSync(tx.markerPath, { force: true });
-    if (tx.overrideDirCreated) rmSync(overridesDir(tx.agentDir), { recursive: true, force: true });
-  }
+// Roll back a failed bind. The binding marker and the override repository are
+// this operation's own entries inside the agent directory, so they go first (init
+// did not publish them). When the agent directory was created here, the scaffold
+// is then swept entry by entry: the sweep removes a scaffold entry only while it
+// is still the one init published, deepest first, then the directory only if it
+// is now empty. Whatever is left stays in place; its path, relative to the agent
+// directory, is returned so the refusal can name it.
+function rollbackBind(tx: BindTxn): string[] {
+  // rmSync removes a symlink entry itself, without following it.
+  if (tx.markerPath !== undefined) rmSync(tx.markerPath, { force: true });
+  if (tx.overrideDirCreated) rmSync(overridesDir(tx.agentDir), { recursive: true, force: true });
+  const preserved = tx.agentDirCreated ? sweepPublished(tx.agentDir, tx.published) : [];
   if (tx.grantPath !== undefined) rmSync(tx.grantPath, { force: true });
   if (tx.baselinePath !== undefined) rmSync(tx.baselinePath, { force: true });
+  return preserved;
+}
+
+// The kind lstat reports, for the identity comparison. A symlink is neither a
+// directory nor a regular file, so a published file (or directory) replaced by a
+// symlink no longer counts as init's.
+function entryKind(st: Stats): "dir" | "file" | "other" {
+  if (st.isDirectory()) return "dir";
+  if (st.isSymbolicLink()) return "other";
+  return "file";
+}
+
+// Is `path` still the exact entry init published at it? False when it is gone,
+// when it is a different inode or kind, and when its identity cannot be read at
+// all (an unreadable entry is never claimed as ours).
+function stillPublished(path: string, published: PublishedEntry | undefined): boolean {
+  if (published === undefined) return false;
+  let st: Stats;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return false;
+  }
+  return st.dev === published.dev && st.ino === published.ino && entryKind(st) === published.kind;
+}
+
+// Remove the entries init published under `agentDir`, deepest first, then the
+// directory itself only if nothing else remains. An entry that is no longer (or
+// was never) init's is left in place and named by its path relative to
+// `agentDir`.
+function sweepPublished(agentDir: string, published: PublishedEntry[]): string[] {
+  const ours = new Map(published.map((e) => [e.path, e]));
+  const preserved = new Set<string>();
+  sweepDir(agentDir, agentDir, ours, preserved);
+  if (stillPublished(agentDir, ours.get(agentDir))) {
+    try {
+      rmdirSync(agentDir);
+    } catch (err) {
+      // ENOTEMPTY: the leftovers were named by the sweep, so the directory is
+      // not itself the thing to name.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && preserved.size === 0)
+        preserved.add(".");
+    }
+  } else if (preserved.size === 0) {
+    // Not (or no longer) the directory this operation created: it is never
+    // removed, and with nothing else named it is itself what stayed.
+    preserved.add(".");
+  }
+  return [...preserved];
+}
+
+function sweepDir(
+  dir: string,
+  agentDir: string,
+  ours: Map<string, PublishedEntry>,
+  preserved: Set<string>,
+): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") preserved.add(relative(agentDir, dir));
+    return;
+  }
+  for (const name of names) {
+    const path = join(dir, name);
+    const published = ours.get(path);
+    if (published === undefined || !stillPublished(path, published)) {
+      // Name it only when the entry is still there; an entry that vanished
+      // during the rollback is simply not there to preserve.
+      if (lstatExists(path)) preserved.add(relative(agentDir, path));
+      continue;
+    }
+    if (published.kind === "dir") {
+      sweepDir(path, agentDir, ours, preserved);
+      try {
+        rmdirSync(path);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        // ENOTEMPTY: a nested leftover was already named by the recursive sweep
+        // and the directory stays holding it.
+        if (code !== "ENOENT" && code !== "ENOTEMPTY") preserved.add(relative(agentDir, path));
+      }
+    } else {
+      try {
+        unlinkSync(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
+          preserved.add(relative(agentDir, path));
+      }
+    }
+  }
+}
+
+// Does the directory entry exist at all (a failed stat is never "absent")?
+function lstatExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
 }
 
 // A grant built from a ratifiable position + role. maxTools/maxCapabilities are
@@ -344,6 +463,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   const tx: BindTxn = {
     agentDir,
     agentDirCreated: !entryPresent(agentDir),
+    published: [],
     overrideDirCreated: false,
   };
   try {
@@ -353,6 +473,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       provider,
       model,
       agentsRoot: opts.agentsRoot,
+      onPublished: (entry) => tx.published.push(entry),
       ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       capabilities: position.manifest.capabilities.default,
       toolAllow: position.manifest.tools,
@@ -408,8 +529,11 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
 
     return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
   } catch (err) {
-    rollbackBind(tx);
-    throw err;
+    const preserved = rollbackBind(tx);
+    if (preserved.length === 0) throw err;
+    throw new Error(
+      `${err instanceof Error ? err.message : String(err)} This failed hire left these entries in the agent directory (paths relative to ${tx.agentDir}): ${preserved.join(", ")}.`,
+    );
   }
 }
 
@@ -572,7 +696,12 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
   // scaffolded by bob init), so on a later failure only the marker, the override
   // repository (when this operation created it) and the host grant/baseline are
   // removed — the existing bob.yaml, soul.md and any other file are untouched. ---
-  const tx: BindTxn = { agentDir, agentDirCreated: false, overrideDirCreated: false };
+  const tx: BindTxn = {
+    agentDir,
+    agentDirCreated: false,
+    published: [],
+    overrideDirCreated: false,
+  };
   try {
     const soulHashBefore = soulHashOf(agentDir);
     writeGrant(hostRoot, grant);
