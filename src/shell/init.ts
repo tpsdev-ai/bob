@@ -58,10 +58,14 @@ import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
 // keep them strict-safe.
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
+// The flair capability's name in bob.yaml's `capabilities:` list. Named so the
+// `--no-flair` opt-out (skipFlair) can drop this entry.
+export const FLAIR_CAPABILITY = "flair";
+
 // The capabilities `bob init` stamps into every new agent's bob.yaml. One
 // constant, so the capabilities: list and the allowlist computed from it cannot
 // drift apart.
-export const STAMPED_CAPABILITIES: readonly string[] = ["flair"];
+export const STAMPED_CAPABILITIES: readonly string[] = [FLAIR_CAPABILITY];
 
 // The allowlist a fresh agent is stamped with: the role's ceiling INTERSECTED
 // with the tools that can actually exist for this agent — pi's built-ins plus
@@ -238,15 +242,19 @@ export function initAgent(opts: InitOptions): InitResult {
   // intersected with the tools that can actually exist here (pi's built-ins +
   // the stamped capabilities' tools), so a freshly initialised agent of EVERY
   // role loads with a policy that holds.
+  const capabilities = (opts.capabilities ?? STAMPED_CAPABILITIES).filter(
+    (name) => !(opts.skipFlair === true && name === FLAIR_CAPABILITY),
+  );
+  const flairTools = new Set(lookupCapability(FLAIR_CAPABILITY)?.manifest.provides?.tools ?? []);
   const yamlPath = join(agentDir, "bob.yaml");
   publish(
     yamlPath,
     renderBobYaml(
       opts,
       opts.toolAllow !== undefined
-        ? [...opts.toolAllow]
-        : stampedToolAllowlist(template.tools.allow),
-      opts.capabilities ?? STAMPED_CAPABILITIES,
+        ? opts.toolAllow.filter((name) => !(opts.skipFlair === true && flairTools.has(name)))
+        : stampedToolAllowlist(template.tools.allow, capabilities),
+      capabilities,
     ),
   );
   written.push(yamlPath);
@@ -357,7 +365,14 @@ ${tools}
 
 capabilities:
 ${capabilities.map((c) => `  - ${c}`).join("\n")}
+${renderFlairBlock(opts, capabilities)}`;
+}
 
+// --no-flair skips key generation/provisioning and omits this capability block;
+// existing keys and identities are retained.
+function renderFlairBlock(opts: InitOptions, capabilities: readonly string[]): string {
+  if (!capabilities.includes(FLAIR_CAPABILITY)) return "";
+  return `
 flair:
   url: ${flairUrlFor(opts)}
   agentId: ${opts.name}

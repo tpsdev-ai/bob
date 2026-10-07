@@ -1,0 +1,1 @@
+- **`bob onboard --no-flair` omits the Flair capability, so a scaffolded agent makes no Flair request.** With `--no-flair` the scaffold declares no `flair` capability and writes neither its tools nor its `flair:` config block, so `bob run` loads no Flair bootstrap and contacts no Flair URL. (`test/shell/onboard-no-flair-310.test.ts`, `init.test.ts`)
