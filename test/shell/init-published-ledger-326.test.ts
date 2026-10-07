@@ -64,8 +64,7 @@ function readEntry(path: string): { ino: bigint; text: string } {
   }
 }
 
-// dev/ino as bigint whatever the ledger carries, so a comparison can never pass
-// on a number/bigint type mismatch.
+// Return the recorded inode without coercion.
 const ino = (e: PublishedEntry | undefined) => (e?.ino === undefined ? undefined : e.ino);
 
 describe("bob#326 — initAgent records each entry it publishes", () => {
