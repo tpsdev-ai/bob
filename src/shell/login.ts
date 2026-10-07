@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROVIDER_LOGIN_STORE } from "./confined-read.js";
+import { parsePiConfigValueReference } from "./pi-config-value.js";
 import { agentDirFor } from "./position-runtime.js";
 import { resolveRunConfig } from "./run.js";
 
@@ -169,12 +170,9 @@ function isPlaceholder(entry: unknown): boolean {
 // resolves to no key (dist/core/resolve-config-value.js:85, `resolveTemplate`).
 // bob mirrors that resolution WITHOUT executing a command reference: a `!cmd` key
 // is treated as unresolved rather than run to make doctor pass.
-const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const ENV_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
-
 function resolveStoredKey(key: unknown, entryEnv: unknown): string | undefined {
-  if (typeof key !== "string") return undefined;
-  if (key.startsWith("!")) return undefined;
+  const reference = parsePiConfigValueReference(key);
+  if (reference === undefined || reference.type !== "template") return undefined;
   const env: Record<string, string> =
     entryEnv && typeof entryEnv === "object" && !Array.isArray(entryEnv)
       ? (entryEnv as Record<string, string>)
@@ -184,48 +182,14 @@ function resolveStoredKey(key: unknown, entryEnv: unknown): string | undefined {
   // `env?.[name] || process.env[name] || undefined`).
   const lookup = (name: string): string | undefined => env[name] || process.env[name] || undefined;
   let out = "";
-  let i = 0;
-  while (i < key.length) {
-    const dollar = key.indexOf("$", i);
-    if (dollar < 0) {
-      out += key.slice(i);
-      break;
-    }
-    out += key.slice(i, dollar);
-    const next = key[dollar + 1];
-    if (next === "$" || next === "!") {
-      out += next;
-      i = dollar + 2;
+  for (const part of reference.parts) {
+    if (part.type === "literal") {
+      out += part.value;
       continue;
     }
-    if (next === "{") {
-      const end = key.indexOf("}", dollar + 2);
-      if (end < 0) {
-        out += "$";
-        i = dollar + 1;
-        continue;
-      }
-      const name = key.slice(dollar + 2, end);
-      if (ENV_NAME_RE.test(name)) {
-        const value = lookup(name);
-        if (value === undefined) return undefined;
-        out += value;
-      } else {
-        out += key.slice(dollar, end + 1);
-      }
-      i = end + 1;
-      continue;
-    }
-    const match = key.slice(dollar + 1).match(ENV_NAME_PREFIX_RE);
-    if (match) {
-      const value = lookup(match[0]);
-      if (value === undefined) return undefined;
-      out += value;
-      i = dollar + 1 + match[0].length;
-      continue;
-    }
-    out += "$";
-    i = dollar + 1;
+    const value = lookup(part.name);
+    if (value === undefined) return undefined;
+    out += value;
   }
   return out.length > 0 ? out : undefined;
 }
