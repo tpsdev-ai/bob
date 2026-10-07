@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
+import * as fs from "node:fs";
 import {
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -58,8 +61,10 @@ process.stdout.write("done\\n");
 
 const roots: string[] = [];
 const children: ChildProcess[] = [];
+const restoreSpies: (() => void)[] = [];
 
 afterEach(async () => {
+  for (const restore of restoreSpies.splice(0)) restore();
   for (const child of children.splice(0)) await stop(child);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -205,6 +210,301 @@ describe("bob#334 — init temp cleanup on the --force path", () => {
 });
 
 describe("bob#334 — token kinds and identity rechecks", () => {
+  function staleTemp(dir: string, pid = process.pid): string {
+    const temp = initTempPath(join(dir, "soul.md"), { pid, kind: "k", start: "123" });
+    writeFileSync(temp, "candidate\n");
+    return temp;
+  }
+
+  for (const pid of [0, Number.MAX_SAFE_INTEGER + 1]) {
+    it(`keeps a temp naming invalid PID ${pid} without probing it`, () => {
+      const root = freshRoot();
+      const temp = staleTemp(root, pid);
+      const probe = spyOn(process, "kill").mockImplementation(() => {
+        throw Object.assign(new Error("absent"), { code: "ESRCH" });
+      });
+      restoreSpies.push(() => probe.mockRestore());
+
+      expect(removeStaleInitTemps(root, root, { readStart: () => "456" })).toEqual([]);
+      expect(probe).not.toHaveBeenCalled();
+      expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+    });
+  }
+
+  it("keeps a temp when the PID probe returns EPERM", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const probe = spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("denied"), { code: "EPERM" });
+    });
+    restoreSpies.push(() => probe.mockRestore());
+
+    expect(removeStaleInitTemps(root, root, { readStart: () => "456" })).toEqual([]);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
+  it("keeps a temp outside the agents root", () => {
+    const root = freshRoot();
+    const outside = freshRoot();
+    const temp = staleTemp(outside);
+
+    expect(removeStaleInitTemps(outside, root, { readStart: () => "456" })).toEqual([]);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
+  it("does not reach beforeList through an initially symlinked root", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const alias = join(freshRoot(), "alias");
+    symlinkSync(root, alias);
+    const listed: string[] = [];
+
+    expect(
+      removeStaleInitTemps(alias, alias, {
+        readStart: () => "456",
+        beforeList: (dir) => listed.push(dir),
+      }),
+    ).toEqual([]);
+    expect(listed).toEqual([]);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
+  it("does not reach beforeList through a root that is a regular file", () => {
+    const root = freshRoot();
+    const file = join(root, "file");
+    writeFileSync(file, "root\n");
+    const listed: string[] = [];
+
+    expect(removeStaleInitTemps(file, file, { beforeList: (dir) => listed.push(dir) })).toEqual([]);
+    expect(listed).toEqual([]);
+    expect(readFileSync(file, "utf8")).toBe("root\n");
+  });
+
+  it("does not list a directory swapped at beforeList", () => {
+    const root = freshRoot();
+    const dir = join(root, "agent");
+    mkdirSync(dir);
+    const temp = staleTemp(dir);
+    const target = freshRoot();
+    const targetFile = join(target, basename(temp));
+    linkSync(temp, targetFile);
+    const list = spyOn(fs, "readdirSync");
+    restoreSpies.push(() => list.mockRestore());
+
+    expect(
+      removeStaleInitTemps(dir, root, {
+        readStart: () => "456",
+        beforeList: () => {
+          renameSync(dir, join(root, "parked"));
+          symlinkSync(target, dir);
+        },
+      }),
+    ).toEqual([]);
+    expect(list).not.toHaveBeenCalled();
+    expect(readFileSync(targetFile, "utf8")).toBe("candidate\n");
+  });
+
+  it("does not reach beforeUnlink after a directory swap during listing", () => {
+    const root = freshRoot();
+    const dir = join(root, "agent");
+    mkdirSync(dir);
+    const temp = staleTemp(dir);
+    const target = freshRoot();
+    const targetFile = join(target, basename(temp));
+    linkSync(temp, targetFile);
+    const realList = fs.readdirSync;
+    const list = spyOn(fs, "readdirSync").mockImplementation(((path, options) => {
+      const names = realList(path, options);
+      if (path === dir) {
+        renameSync(dir, join(root, "parked"));
+        symlinkSync(target, dir);
+      }
+      return names;
+    }) as typeof fs.readdirSync);
+    restoreSpies.push(() => list.mockRestore());
+    const reached: string[] = [];
+
+    expect(
+      removeStaleInitTemps(dir, root, {
+        readStart: () => "456",
+        beforeUnlink: (path) => reached.push(path),
+      }),
+    ).toEqual([]);
+    expect(reached).toEqual([]);
+    expect(readFileSync(targetFile, "utf8")).toBe("candidate\n");
+  });
+
+  it("does not reach beforeUnlink for a listed symlink", () => {
+    const root = freshRoot();
+    const target = join(root, "target");
+    writeFileSync(target, "target\n");
+    const temp = initTempPath(join(root, "soul.md"), { pid: process.pid, kind: "k", start: "123" });
+    symlinkSync(target, temp);
+    const reached: string[] = [];
+
+    expect(
+      removeStaleInitTemps(root, root, {
+        readStart: () => "456",
+        beforeUnlink: (path) => reached.push(path),
+      }),
+    ).toEqual([]);
+    expect(reached).toEqual([]);
+    expect(lstatSync(temp).isSymbolicLink()).toBe(true);
+  });
+
+  for (const entry of ["directory", "file"] as const) {
+    it(`keeps a temp when the ${entry} device changes with its inode unchanged`, () => {
+      const root = freshRoot();
+      const temp = staleTemp(root);
+      const checkedPath = entry === "directory" ? root : temp;
+      let changed = false;
+      const realStat = fs.lstatSync;
+      const stat = spyOn(fs, "lstatSync").mockImplementation(((path, options) => {
+        const result = realStat(path, options);
+        if (changed && path === checkedPath && typeof result.dev === "bigint") {
+          result.dev += 1n;
+        }
+        return result;
+      }) as typeof fs.lstatSync);
+      restoreSpies.push(() => stat.mockRestore());
+
+      expect(
+        removeStaleInitTemps(root, root, {
+          readStart: () => "456",
+          [entry === "directory" ? "beforeList" : "beforeUnlink"]: () => {
+            changed = true;
+          },
+        }),
+      ).toEqual([]);
+      expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+    });
+  }
+
+  for (const entry of ["directory", "file"] as const) {
+    it(`keeps a temp when the ${entry} path reports a reused inode with a different type`, () => {
+      const root = freshRoot();
+      const dir = join(root, "agent");
+      mkdirSync(dir);
+      const temp = staleTemp(dir);
+      const checkedPath = entry === "directory" ? dir : temp;
+      const original = lstatSync(checkedPath, { bigint: true });
+      let changed = false;
+      const realStat = fs.lstatSync;
+      const stat = spyOn(fs, "lstatSync").mockImplementation(((path, options) => {
+        const result = realStat(path, options);
+        if (changed && path === checkedPath && typeof result.ino === "bigint") {
+          result.ino = original.ino;
+        }
+        return result;
+      }) as typeof fs.lstatSync);
+      restoreSpies.push(() => stat.mockRestore());
+
+      expect(
+        removeStaleInitTemps(dir, root, {
+          readStart: () => "456",
+          [entry === "directory" ? "beforeList" : "beforeUnlink"]: () => {
+            renameSync(checkedPath, join(root, "parked"));
+            if (entry === "directory") writeFileSync(dir, "replacement\n");
+            else symlinkSync(join(root, "parked"), temp);
+            changed = true;
+          },
+        }),
+      ).toEqual([]);
+      expect(lstatSync(checkedPath).isFile()).toBe(entry === "directory");
+    });
+  }
+
+  it("keeps a temp when its directory disappears during listing", () => {
+    const root = freshRoot();
+    const dir = join(root, "agent");
+    mkdirSync(dir);
+    const temp = staleTemp(dir);
+    const parked = join(root, "parked");
+    const realList = fs.readdirSync;
+    const list = spyOn(fs, "readdirSync").mockImplementation(((path, options) => {
+      if (path === dir) renameSync(dir, parked);
+      return realList(path, options);
+    }) as typeof fs.readdirSync);
+    restoreSpies.push(() => list.mockRestore());
+
+    expect(removeStaleInitTemps(dir, root, { readStart: () => "456" })).toEqual([]);
+    expect(readFileSync(join(parked, basename(temp)), "utf8")).toBe("candidate\n");
+  });
+
+  it("keeps a temp when its directory becomes a regular file before unlink", () => {
+    const root = freshRoot();
+    const dir = join(root, "agent");
+    mkdirSync(dir);
+    const temp = staleTemp(dir);
+    const parked = join(root, "parked");
+
+    expect(
+      removeStaleInitTemps(dir, root, {
+        readStart: () => "456",
+        beforeUnlink: () => {
+          renameSync(dir, parked);
+          writeFileSync(dir, "replacement\n");
+        },
+      }),
+    ).toEqual([]);
+    expect(readFileSync(join(parked, basename(temp)), "utf8")).toBe("candidate\n");
+  });
+
+  it("propagates a listing error when the directory is unchanged", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const error = Object.assign(new Error("denied"), { code: "EACCES" });
+    const list = spyOn(fs, "readdirSync").mockImplementation(() => {
+      throw error;
+    });
+    restoreSpies.push(() => list.mockRestore());
+
+    expect(() => removeStaleInitTemps(root, root, { readStart: () => "456" })).toThrow(error);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
+  it("propagates an entry identity error other than ENOENT or ENOTDIR", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const error = Object.assign(new Error("denied"), { code: "EACCES" });
+    const realStat = fs.lstatSync;
+    const stat = spyOn(fs, "lstatSync").mockImplementation(((path, options) => {
+      if (path === temp) throw error;
+      return realStat(path, options);
+    }) as typeof fs.lstatSync);
+    restoreSpies.push(() => stat.mockRestore());
+
+    expect(() => removeStaleInitTemps(root, root, { readStart: () => "456" })).toThrow(error);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
+  it("tolerates an entry disappearing at unlink", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const realUnlink = fs.unlinkSync;
+    const unlink = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+      realUnlink(path);
+      realUnlink(path);
+    });
+    restoreSpies.push(() => unlink.mockRestore());
+
+    expect(removeStaleInitTemps(root, root, { readStart: () => "456" })).toEqual([]);
+    expect(tempsIn(root)).not.toContain(basename(temp));
+  });
+
+  it("propagates an unlink error other than ENOENT", () => {
+    const root = freshRoot();
+    const temp = staleTemp(root);
+    const error = Object.assign(new Error("denied"), { code: "EACCES" });
+    const unlink = spyOn(fs, "unlinkSync").mockImplementation(() => {
+      throw error;
+    });
+    restoreSpies.push(() => unlink.mockRestore());
+
+    expect(() => removeStaleInitTemps(root, root, { readStart: () => "456" })).toThrow(error);
+    expect(readFileSync(temp, "utf8")).toBe("candidate\n");
+  });
+
   it("keeps a live PID's wall-clock temp after a failed kernel read followed by success", () => {
     const root = freshRoot();
     let available = false;
@@ -272,7 +572,9 @@ describe("bob#334 — token kinds and identity rechecks", () => {
         if (subdir) writeFileSync(candidate, "candidate\n");
         const target = freshRoot();
         const targetFile = join(target, name);
-        writeFileSync(targetFile, "target\n");
+        linkSync(candidate, targetFile);
+        expect(lstatSync(targetFile).ino).toBe(lstatSync(candidate).ino);
+        const content = readFileSync(candidate, "utf8");
         const parked = join(root, "parked");
         let swapped = false;
 
@@ -287,7 +589,7 @@ describe("bob#334 — token kinds and identity rechecks", () => {
 
         expect(swapped).toBe(true);
         expect(removed).not.toContain(candidate);
-        expect(readFileSync(targetFile, "utf8")).toBe("target\n");
+        expect(readFileSync(targetFile, "utf8")).toBe(content);
         expect(tempsIn(parked)).toContain(name);
       }, 30_000);
     }
@@ -322,14 +624,15 @@ describe("bob#334 — token kinds and identity rechecks", () => {
           if (path !== temp) return;
           renameSync(agentDir, parked);
           mkdirSync(agentDir);
-          writeFileSync(join(agentDir, name), "replacement\n");
+          linkSync(join(parked, name), join(agentDir, name));
           swapped = true;
         },
       }),
     ).toEqual([]);
 
     expect(swapped).toBe(true);
-    expect(readFileSync(temp, "utf8")).toBe("replacement\n");
+    expect(lstatSync(temp).ino).toBe(lstatSync(join(parked, name)).ino);
+    expect(readFileSync(temp, "utf8")).toBe(readFileSync(join(parked, name), "utf8"));
     expect(tempsIn(parked)).toContain(name);
   }, 30_000);
 
