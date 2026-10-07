@@ -9,8 +9,7 @@
 // not the entry init published (write_soul renamed a new file over it), and the
 // session store was written by pi, not recorded by this operation. Both stay in
 // place, so the persona the operator just shaped is not lost, and both are
-// named in the refusal. Everything init, the marker and the override repository
-// published is removed, and so are the host grant and baseline.
+// named in the refusal. The nonempty .pi-agent parent remains.
 
 import { afterAll, describe, expect, it } from "bun:test";
 import { readdirSync, rmSync } from "node:fs";
@@ -151,7 +150,7 @@ afterAll(() => {
 const PERSONA = "# Refined persona\n\nI am the builder the operator just interviewed.\n";
 
 describe("bob#326 — a hire that fails after a real interview session", () => {
-  it("the interview writes soul.md with the registered write_soul, then exits nonzero: the persona and the session store are kept and named, the rest is removed", async () => {
+  it("a nonzero interview exit retains the persona, session store and nonempty .pi-agent parent", async () => {
     const s = scratch();
     const name = "rbi-exit";
     const agentDir = join(s.agentsRoot, name);
@@ -165,7 +164,6 @@ describe("bob#326 — a hire that fails after a real interview session", () => {
     expect(msg).toContain(".pi-agent/sessions");
     // The persona write_soul wrote is retained byte for byte.
     expect(readEntry(join(agentDir, "soul.md")).text).toBe(PERSONA);
-    // Everything init published is gone; what stays is the interview's own.
     expect(entriesUnder(agentDir)).toEqual([".pi-agent", ".pi-agent/sessions", "soul.md"]);
     expect(readGrant(s.hostRoot, name)).toBeUndefined();
     expect(readdirSync(s.agentsRoot)).toEqual([name]);

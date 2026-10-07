@@ -5,9 +5,8 @@
 //                       host grant, store the diff baseline, initialize the
 //                       override repository, and run the hiring interview. It
 //                       validates the candidate BEFORE it writes anything; a
-//                       hire that fails after it has written rolls back the
-//                       entries it published (bob#326, publication-ledger.ts)
-//                       and names what it left in place.
+//                       failed hire attempts rollback and names observed leftovers;
+//                       arrivals after listing are missed.
 //   * `adoptAgent`    — bind an EXISTING agent to a position: independently
 //                       resolve it before and after, verify its requests, REQUIRE
 //                       the two resolutions to be equal, then record the
@@ -149,18 +148,19 @@ export interface BindHooks {
   afterStep?: (step: BindStep) => void;
 }
 
-// Ledger entries inside the agent directory; grant and baseline use path cleanup.
+// Ledger entries include scaffold parents; grant and baseline use path cleanup.
 interface BindTxn {
   agentDir: string;
-  // The directory that holds each ledger root: the agents root for a hire, the
-  // agent directory for an adoption.
+  // Traversal base: agents root for hire, agent directory for adoption;
+  // recorded scaffold parents can be roots above it.
   base: string;
   published: PublishedEntry[];
   grantPath?: string;
   baselinePath?: string;
 }
 
-// Attempt ledger, grant and baseline cleanup independently and collect errors.
+// Attempt ledger cleanup and recorded host-path cleanup independently.
+// Grant/baseline paths are recorded only after their writes return.
 function rollbackBind(tx: BindTxn): RollbackReport {
   const report: RollbackReport = { leftovers: [], stranded: [], errors: [] };
   try {

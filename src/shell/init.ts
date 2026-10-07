@@ -208,10 +208,8 @@ export function initAgent(opts: InitOptions): InitResult {
 
   const onPublished = opts.onPublished;
 
-  // Without --force, the agent directory is created here with a non-recursive
-  // mkdir, and `publish` does not replace an existing entry. With --force,
-  // `publish` writes over. Either way each file is reported to onPublished with
-  // the identity of the temporary file this call created.
+  // Without --force, `publish` refuses an existing entry; with --force, it replaces it.
+  // With onPublished supplied, file creations and publications are reported.
   const publish: Publish = noClobber
     ? (path, content, mode) =>
         writeFileExclusive(path, content, opts.beforePublish, mode, onPublished)
@@ -486,8 +484,7 @@ export function piOpenAiCompletionsModel(
 
 function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publish): string[] {
   const piDir = join(agentDir, ".pi-agent");
-  // initAgent created (or found) it above; defensive recreate in case a caller
-  // didn't go through the standard path. Created here, it is reported too.
+  // A directory created here is reported only with onPublished supplied.
   mkdirOwned(piDir, opts.onPublished);
 
   const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;

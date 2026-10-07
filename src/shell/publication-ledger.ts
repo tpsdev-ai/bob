@@ -290,8 +290,7 @@ function rollbackRoot(
   // SWEEP: the recorded entries inside the root, deepest first.
   sweep(quarantine, root, byPath, name, report);
 
-  // FINISH: an empty quarantine is removed; otherwise its leftovers are
-  // enumerated after the sweep and move-back is attempted.
+  // FINISH: attempt removal, then leftover listing and move-back if removal fails.
   try {
     rmdirSync(quarantine);
     return;
@@ -341,7 +340,6 @@ function sweep(
           rmdirSync(at);
         } catch (err) {
           const c = code(err);
-          // Not empty: what is inside it is named when the leftovers are listed.
           if (c !== "ENOTEMPTY" && c !== "EEXIST") throw err;
         }
       } else {
