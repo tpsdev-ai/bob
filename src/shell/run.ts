@@ -1014,8 +1014,8 @@ async function runBoundedSession(
 
   // A bound that fired after recall returned — which removed the guard's abort
   // listener, so the guard resolved — must still end the run here, BEFORE the
-  // session factory is called: a terminated run never constructs a session
-  // (bob#319).
+  // session factory is called: a run terminated before a session is constructed
+  // never constructs one (bob#319).
   const firedAfterRecall = bounds.reason();
   if (firedAfterRecall !== undefined) return finalizeAbort(firedAfterRecall);
 

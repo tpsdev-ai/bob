@@ -347,8 +347,9 @@ describe("`bob run` with a launcher pr_ref", () => {
 
 // bob#319 — the recall runs under the run's cancellation guard, with the run's
 // abort signal, and the run is checked again between recall and session
-// construction. A run that is terminated while recall is in flight cancels the
-// recall request; a run terminated after recall returns constructs no session.
+// construction. A run terminated while recall is in flight cancels the recall
+// request; a run terminated after recall returns and before session
+// construction builds no session.
 describe("`bob run` recall under the run's cancellation guard (bob#319)", () => {
   it("a run terminated while recall is in flight aborts the recall request and builds no session", async () => {
     scaffold(root, "http://127.0.0.1:1", keyFile); // no Flair is listening

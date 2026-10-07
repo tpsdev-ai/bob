@@ -251,9 +251,9 @@ export interface FlairHttpClientOptions {
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
   readFile?: (path: string) => Buffer;
-  // An outer cancellation signal (bob#319): when it aborts, every request this
-  // client makes aborts too, so a caller that is torn down (a run that hits a
-  // bound) cancels its in-flight request rather than leaving it to its timeout.
+  // An outer cancellation signal (bob#319): when it aborts, a bounded request
+  // (the per-PR memory get, list, write and delete) aborts too, alongside its
+  // per-request timeout.
   signal?: AbortSignal;
   // Bounds on one bootstrap call (bob#254). Defaults: the constants above.
   bootstrapTimeoutMs?: number;
