@@ -24,6 +24,7 @@ mock.module("harper", () => ({
   databases: {
     flair: {
       Agent: { get: async (id: string) => (id === agent.id ? agent : null), search: () => [] },
+      Memory: { get: async () => null },
       ReplayNonce: {
         expirationMS: 120_000,
         primaryStore: {
@@ -124,6 +125,47 @@ for (const field of ["signature", "publicKey"]) {
     assert.equal(fake.memories.size, 0);
   }
 }
+const refuse = async (authorization: string, error: string) => {
+  assert.equal(await verifyAgentRequest(request(authorization)), null);
+  const real = await gate(request(authorization), next);
+  assert.equal(real.status, 401);
+  assert.equal((await real.json()).error, error);
+  const stub = await fake.fetchImpl("http://flair.test/Memory/row", {
+    method: "PUT",
+    headers: { Authorization: authorization },
+    body: JSON.stringify({ id: "row", agentId: agent.id, content: "decode refusal" }),
+  });
+  assert.equal(stub.status, 401);
+  assert.equal(JSON.parse(await stub.text()).error, error);
+  assert.equal(reached, false);
+  assert.equal(fake.memories.size, 0);
+};
+for (const length of [31, 33]) {
+  for (const encoding of ["base64", "base64url", "hex"] as const) {
+    const raw = Buffer.concat([Buffer.from(publicKey, "base64"), Buffer.alloc(1)]).subarray(
+      0,
+      length,
+    );
+    agent.publicKey = raw.toString(encoding);
+    await refuse(sign(`key-${length}-${encoding}`), "signature_verification_failed");
+  }
+}
+agent.publicKey = publicKey;
+for (const length of [1, 63, 65]) {
+  const header = sign(`signature-${length}`);
+  const split = header.lastIndexOf(":") + 1;
+  const raw = Buffer.concat([Buffer.from(header.slice(split), "base64"), Buffer.alloc(1)]);
+  await refuse(
+    header.slice(0, split) + raw.subarray(0, length).toString("base64"),
+    "invalid_signature",
+  );
+}
+const hexHeader = sign("signature-hex");
+const hexSplit = hexHeader.lastIndexOf(":") + 1;
+await refuse(
+  hexHeader.slice(0, hexSplit) + Buffer.from(hexHeader.slice(hexSplit), "base64").toString("hex"),
+  "invalid_signature",
+);
 agent.publicKey = publicKey;
 for (const [header, error] of [
   [sign("stale", Date.now() - 60_000), "timestamp_out_of_window"],
@@ -136,6 +178,41 @@ for (const [header, error] of [
   assert.equal(JSON.parse(await (await send(header)).text()).error, error);
   assert.equal(reached, false);
 }
+const rawKey = Buffer.from(publicKey, "base64");
+for (const encodedKey of [
+  publicKey,
+  publicKey.replace(/=+$/, ""),
+  rawKey.toString("base64url"),
+  rawKey.toString("base64url") + "=",
+  rawKey.toString("hex"),
+  rawKey.toString("hex").toUpperCase(),
+]) {
+  agent.publicKey = encodedKey;
+  for (const encoding of ["base64", "base64url", "unpadded base64", "padded base64url"]) {
+    const header = sign(`accepted-${encodedKey}-${encoding.replaceAll(" ", "-")}`);
+    const split = header.lastIndexOf(":") + 1;
+    const raw = Buffer.from(header.slice(split), "base64");
+    const signature =
+      encoding === "unpadded base64"
+        ? raw.toString("base64").replace(/=+$/, "")
+        : encoding === "padded base64url"
+          ? raw.toString("base64url") + "=="
+          : raw.toString(encoding as BufferEncoding);
+    const authorization = header.slice(0, split) + signature;
+    assert.equal((await gate(request(authorization), next)).status, 200);
+    assert.equal(reached, true);
+    const stub = await fake.fetchImpl("http://flair.test/Memory/row", {
+      method: "PUT",
+      headers: { Authorization: authorization },
+      body: JSON.stringify({ id: "row", agentId: agent.id, content: "accepted encoding" }),
+    });
+    assert.equal(stub.status, 200);
+    assert.equal(fake.memories.get("row")?.content, "accepted encoding");
+    reached = false;
+    fake.memories.clear();
+  }
+}
+agent.publicKey = publicKey;
 agentReplayGuard.resetCacheForTest();
 rows.clear();
 const header = sign("single-use");

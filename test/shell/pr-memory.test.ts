@@ -1418,21 +1418,84 @@ describe("Flair stub signed authentication", () => {
     },
   );
 
-  it.each(["base64", "base64url", "hex"])(
-    "accepts a write with %s key encoding and an unpadded base64url signature",
-    async (encoding) => {
-      const publicKey = Buffer.from(PUB, "base64").toString(encoding as BufferEncoding);
-      const fake = fakeFlair({
-        agents: { [AGENT]: { id: AGENT, publicKey } },
-        now: () => NOW,
-      });
-      const header = sign();
-      const split = header.lastIndexOf(":") + 1;
-      const signature = Buffer.from(header.slice(split), "base64").toString("base64url");
-      expect((await send(fake, header.slice(0, split) + signature)).status).toBe(200);
-      expect(fake.memories.get(ID)?.content).toBe("round");
-    },
-  );
+  for (const length of [31, 33]) {
+    it.each(["base64", "base64url", "hex"])(
+      `refuses a ${length}-byte public key encoded as %s before a write`,
+      async (encoding) => {
+        const raw = Buffer.concat([Buffer.from(PUB, "base64"), Buffer.alloc(1)]).subarray(
+          0,
+          length,
+        );
+        const fake = fakeFlair({
+          agents: { [AGENT]: { id: AGENT, publicKey: raw.toString(encoding as BufferEncoding) } },
+          now: () => NOW,
+        });
+        const res = await send(fake, sign());
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe("signature_verification_failed");
+        expect(fake.memories.size).toBe(0);
+      },
+    );
+  }
+
+  it.each([1, 63, 65])("refuses a %s-byte signature before a write", async (length) => {
+    const fake = registered();
+    const header = sign();
+    const split = header.lastIndexOf(":") + 1;
+    const raw = Buffer.concat([Buffer.from(header.slice(split), "base64"), Buffer.alloc(1)]);
+    const res = await send(
+      fake,
+      header.slice(0, split) + raw.subarray(0, length).toString("base64"),
+    );
+    expect(res.status).toBe(401);
+    expect(JSON.parse(await res.text()).error).toBe("invalid_signature");
+    expect(fake.memories.size).toBe(0);
+  });
+
+  it("refuses a hex-encoded signature before a write", async () => {
+    const fake = registered();
+    const header = sign();
+    const split = header.lastIndexOf(":") + 1;
+    const res = await send(
+      fake,
+      header.slice(0, split) + Buffer.from(header.slice(split), "base64").toString("hex"),
+    );
+    expect(res.status).toBe(401);
+    expect(JSON.parse(await res.text()).error).toBe("invalid_signature");
+    expect(fake.memories.size).toBe(0);
+  });
+
+  for (const signatureEncoding of ["base64", "base64url", "unpadded base64", "padded base64url"]) {
+    it.each(["base64", "base64url", "hex", "uppercase hex", "unpadded base64", "padded base64url"])(
+      `accepts a write with %s key encoding and a ${signatureEncoding} signature`,
+      async (encoding) => {
+        const rawKey = Buffer.from(PUB, "base64");
+        const publicKey =
+          encoding === "uppercase hex"
+            ? rawKey.toString("hex").toUpperCase()
+            : encoding === "unpadded base64"
+              ? PUB.replace(/=+$/, "")
+              : encoding === "padded base64url"
+                ? rawKey.toString("base64url") + "="
+                : rawKey.toString(encoding as BufferEncoding);
+        const fake = fakeFlair({
+          agents: { [AGENT]: { id: AGENT, publicKey } },
+          now: () => NOW,
+        });
+        const header = sign();
+        const split = header.lastIndexOf(":") + 1;
+        const rawSignature = Buffer.from(header.slice(split), "base64");
+        const signature =
+          signatureEncoding === "unpadded base64"
+            ? rawSignature.toString("base64").replace(/=+$/, "")
+            : signatureEncoding === "padded base64url"
+              ? rawSignature.toString("base64url") + "=="
+              : rawSignature.toString(signatureEncoding as BufferEncoding);
+        expect((await send(fake, header.slice(0, split) + signature)).status).toBe(200);
+        expect(fake.memories.get(ID)?.content).toBe("round");
+      },
+    );
+  }
 
   it("refuses a write outside the timestamp window with 401 and stores nothing", async () => {
     const fake = registered();

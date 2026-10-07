@@ -420,13 +420,12 @@ function decodeBase64(value: string): Buffer {
   return Buffer.from(atob(standard), "latin1");
 }
 
-// Import an Ed25519 public key the way Flair's importEd25519Key does — hex (64
-// chars) or base64 of the raw 32-byte key — and wrap it in SPKI DER.
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 function ed25519PublicKey(publicKey: string) {
   const raw = /^[0-9a-f]{64}$/i.test(publicKey)
     ? Buffer.from(publicKey, "hex")
     : decodeBase64(publicKey);
+  if (raw.length !== 32) throw new Error("invalid Ed25519 public key length");
   return createPublicKey({
     key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
     format: "der",
