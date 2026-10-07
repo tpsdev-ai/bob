@@ -10,8 +10,13 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
-import { PR_MEMORY_PROMPT_HEADING, prMemoryKey } from "../../src/shell/pr-memory.js";
+import {
+  PR_MEMORY_PROMPT_HEADING,
+  prMemoryKey,
+  recallPrMemoryRound,
+} from "../../src/shell/pr-memory.js";
 import { type RunSession, type RunSessionConfig, runAgent } from "../../src/shell/run.js";
+import type { RunTimer } from "../../src/shell/run-bounds.js";
 import { makeFakeFlair } from "./flair-fake.js";
 
 const AGENT = "testbot";
@@ -146,6 +151,70 @@ let root: string;
 let keyFile: string;
 const stubs: Stub[] = [];
 
+// A timer seam whose wall-clock callback the test fires on demand (bob#135's
+// seam): the run never times out on its own, so a test ends it at the moment
+// it chooses.
+function captureWallClock(): { timer: RunTimer; fire: () => void } {
+  let wall: (() => void) | undefined;
+  const timer: RunTimer = {
+    setTimeout(callback) {
+      if (wall === undefined) wall = callback;
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimeout() {},
+  };
+  return { timer, fire: () => wall?.() };
+}
+
+// Capture what a run writes to stderr, without touching the real stream.
+async function captureStderr(fn: () => Promise<void>): Promise<string> {
+  let out = "";
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    out += chunk.toString();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = original;
+  }
+  return out;
+}
+
+// A recall row that carries one valid round and an `expiresAt`, so the recall's
+// post-fetch validation reads the clock (its `now()` seam).
+function recallRow(key: string): Record<string, unknown> {
+  return {
+    id: `${key}-r1-a`,
+    agentId: AGENT,
+    subject: key,
+    visibility: "private",
+    durability: "persistent",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    content: JSON.stringify({
+      v: 1,
+      agentId: AGENT,
+      repository: REPO,
+      prNumber: PR,
+      open_findings: [],
+      rounds: [
+        {
+          endedAt: "2026-01-01T00:00:00.000Z",
+          outcome: "completed",
+          blockers_addressed: [],
+          files_touched: [],
+          test_evidence: [],
+          incomplete: [],
+          omitted: [],
+        },
+      ],
+      omitted: [],
+    }),
+  };
+}
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "bob-prmem-run-"));
   keyFile = writeKeyFile(root);
@@ -274,4 +343,171 @@ describe("`bob run` with a launcher pr_ref", () => {
     expect(config?.prMemory).toBeUndefined();
     expect(stub.memories.size).toBe(0);
   });
+});
+
+// bob#319 — the recall runs under the run's cancellation guard, with the run's
+// abort signal, and the run is checked again between recall and session
+// construction. A run that is terminated while recall is in flight cancels the
+// recall request; a run terminated after recall returns constructs no session.
+describe("`bob run` recall under the run's cancellation guard (bob#319)", () => {
+  it("a run terminated while recall is in flight aborts the recall request and builds no session", async () => {
+    scaffold(root, "http://127.0.0.1:1", keyFile); // no Flair is listening
+    const wall = captureWallClock();
+    const started = Date.now();
+    const state = { aborts: 0, firstAbortMs: Number.POSITIVE_INFINITY };
+    // Hold the two recall requests (the by-id read and the listing) and report
+    // the abort the run's signal delivers to them; serve the round-end write and
+    // the prune listing so the run can finish.
+    const fetchImpl = ((url: string, init: { method?: string; signal?: AbortSignal }) =>
+      new Promise((resolve, reject) => {
+        if (init.method === "PUT") {
+          resolve({ ok: true, status: 200, text: async () => JSON.stringify({ id: "x" }) });
+          return;
+        }
+        if (url.includes("limit(3,")) {
+          resolve({ ok: true, status: 200, text: async () => "[]" });
+          return;
+        }
+        const signal = init.signal;
+        const onAbort = (): void => {
+          state.aborts += 1;
+          state.firstAbortMs = Math.min(state.firstAbortMs, Date.now() - started);
+          reject(new Error("aborted"));
+        };
+        if (signal === undefined) return;
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+        wall.fire(); // the run's bound fires while this request is in flight
+      })) as never;
+
+    let factoryCalls = 0;
+    let result: Awaited<ReturnType<typeof runAgent>> | undefined;
+    const stderr = await captureStderr(async () => {
+      result = await runAgent({
+        name: AGENT,
+        prompt: "hi",
+        agentsRoot: root,
+        taskBinding: binding(PR),
+        prMemorySeams: { fetchImpl },
+        wallClockMs: 60_000,
+        noProgressMs: 60_000,
+        timer: wall.timer,
+        sessionFactory: async () => {
+          factoryCalls += 1;
+          return scriptedSession();
+        },
+      });
+    });
+    expect(result?.exitCode).toBe(1);
+    expect(result?.aborted).toBe("wall_clock");
+    expect(factoryCalls).toBe(0);
+    // The recall's request was aborted by the run's signal, promptly (never by
+    // its own two-second timeout).
+    expect(state.aborts).toBeGreaterThan(0);
+    expect(state.firstAbortMs).toBeLessThan(1000);
+    expect(stderr).toContain("the run was terminated");
+  }, 15_000);
+
+  it("a run terminated after recall returns builds no session", async () => {
+    scaffold(root, "http://127.0.0.1:1", keyFile);
+    const wall = captureWallClock();
+    const row = recallRow(ID);
+    const state = { served: 0, scheduled: false };
+    const fetchImpl = ((url: string, init: { method?: string }) => {
+      state.served += 1;
+      return Promise.resolve(
+        init.method === "PUT"
+          ? { ok: true, status: 200, text: async () => JSON.stringify({ id: "x" }) }
+          : url.includes("limit(3,")
+            ? { ok: true, status: 200, text: async () => "[]" }
+            : url.includes("?")
+              ? { ok: true, status: 200, text: async () => JSON.stringify([row]) }
+              : { ok: false, status: 404, text: async () => "not found" },
+      );
+    }) as never;
+    // Both recall requests have been served by the time recall reaches its
+    // post-fetch validation, whose `now()` call is the last await inside recall.
+    // Firing the bound a fixed number of microtasks later lands it after recall
+    // returns (the guard's abort listener is gone) and before the session
+    // factory is called.
+    const now = (): number => {
+      if (state.served >= 2 && !state.scheduled) {
+        state.scheduled = true;
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => wall.fire())));
+      }
+      return 1_700_000_000_000;
+    };
+
+    let factoryCalls = 0;
+    const result = await runAgent({
+      name: AGENT,
+      prompt: "hi",
+      agentsRoot: root,
+      taskBinding: binding(PR),
+      prMemorySeams: { fetchImpl, now },
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      timer: wall.timer,
+      sessionFactory: async () => {
+        factoryCalls += 1;
+        return scriptedSession();
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.aborted).toBe("wall_clock");
+    expect(factoryCalls).toBe(0);
+  }, 15_000);
+
+  it("a live run whose recall fails still builds its session once", async () => {
+    scaffold(root, "http://127.0.0.1:1", keyFile);
+    const fetchImpl = ((url: string, init: { method?: string }) =>
+      init.method === "PUT"
+        ? Promise.resolve({ ok: true, status: 200, text: async () => JSON.stringify({ id: "x" }) })
+        : url.includes("limit(3,")
+          ? Promise.resolve({ ok: true, status: 200, text: async () => "[]" })
+          : Promise.reject(new Error("network down"))) as never;
+    let factoryCalls = 0;
+    let seen: RunSessionConfig | undefined;
+    const result = await runAgent({
+      name: AGENT,
+      prompt: "hi",
+      agentsRoot: root,
+      taskBinding: binding(PR),
+      prMemorySeams: { fetchImpl },
+      wallClockMs: 60_000,
+      noProgressMs: 60_000,
+      sessionFactory: async (c) => {
+        factoryCalls += 1;
+        seen = c;
+        return scriptedSession();
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(factoryCalls).toBe(1);
+    expect(seen?.prMemory).toBeUndefined();
+  }, 15_000);
+
+  it("a recall cancelled by the caller's signal resolves as unavailable", async () => {
+    scaffold(root, "http://127.0.0.1:1", keyFile);
+    const controller = new AbortController();
+    const fetchImpl = ((_url: string, init: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        const signal = init.signal;
+        const onAbort = (): void => reject(new Error("aborted"));
+        if (signal === undefined) return;
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      })) as never;
+    const pending = recallPrMemoryRound({
+      target: { url: "http://127.0.0.1:1", agentId: AGENT, keyFile },
+      ref: { repository: REPO, number: PR },
+      identity: { agentId: AGENT, repository: REPO, prNumber: PR },
+      seams: { fetchImpl },
+      signal: controller.signal,
+    });
+    controller.abort();
+    const recalled = await pending;
+    expect(recalled.status).toBe("unavailable");
+    expect(recalled.reason).toBe("the run was terminated");
+  }, 15_000);
 });

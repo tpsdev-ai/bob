@@ -696,7 +696,11 @@ export interface PrMemoryWriteResult {
 
 const TIMEOUT_MARKER = "flair request timed out";
 
-function clientFor(target: PrMemoryTarget, seams?: PrMemorySeams): FlairHttpClient {
+function clientFor(
+  target: PrMemoryTarget,
+  seams?: PrMemorySeams,
+  signal?: AbortSignal,
+): FlairHttpClient {
   return new FlairHttpClient({
     url: target.url,
     agentId: target.agentId,
@@ -705,6 +709,7 @@ function clientFor(target: PrMemoryTarget, seams?: PrMemorySeams): FlairHttpClie
     ...(seams?.now ? { now: seams.now } : {}),
     ...(seams?.uuid ? { uuid: seams.uuid } : {}),
     ...(seams?.readFile ? { readFile: seams.readFile } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   });
 }
 
@@ -762,16 +767,20 @@ function listRounds(
 // "empty". A malformed, mismatched or wrong-owner record contributes nothing;
 // when nothing else is recalled the result is "invalid". An unreachable or
 // timed-out Flair is "unavailable"; the round proceeds and the caller says so.
+// A caller-supplied `signal` (bob#319) aborts the requests when the run is
+// torn down; that is reported as an unavailable recall too, so the caller can
+// decide that a terminated run ends.
 export async function recallPrMemoryRound(opts: {
   target: PrMemoryTarget;
   ref: PrRef;
   identity: PrMemoryIdentity;
   seams?: PrMemorySeams;
+  signal?: AbortSignal;
   log?: (message: string) => void;
 }): Promise<PrMemoryRecallResult> {
   const log = opts.log ?? (() => {});
   const key = prMemoryKey(opts.identity.agentId, opts.identity.repository, opts.identity.prNumber);
-  const client = clientFor(opts.target, opts.seams);
+  const client = clientFor(opts.target, opts.seams, opts.signal);
   let earlierRecord: FlairMemory | null;
   let rows: FlairMemory[];
   try {
@@ -783,6 +792,12 @@ export async function recallPrMemoryRound(opts: {
       listRounds(client, key, { limit: PR_MEMORY_MAX_ROUNDS }, PR_MEMORY_START_TIMEOUT_MS),
     ]);
   } catch (err) {
+    // A run that was torn down aborted the request; that is a recall failure
+    // like any other (the round never fails a live run on its own).
+    if (opts.signal?.aborted === true) {
+      log("PR memory unavailable at start (the run was terminated).");
+      return { status: "unavailable", reason: "the run was terminated" };
+    }
     const reason = safeReason(err);
     log(`PR memory unavailable at start (${reason}).`);
     return { status: "unavailable", reason };
