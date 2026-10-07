@@ -27,6 +27,7 @@ import {
   initTempPath,
   removeStaleInitTemps,
 } from "../../src/shell/init.js";
+import { spawnNodeAsync } from "../cli-spawn.js";
 
 const MODULE = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -141,6 +142,8 @@ async function holdInit(
   writeFileSync(script, CHILD_SCRIPT);
   const child = spawn(process.execPath, [script, root, name, blockOn], {
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 60_000,
+    killSignal: "SIGKILL",
   });
   children.push(child);
   let stderr = "";
@@ -159,6 +162,70 @@ async function holdInit(
 }
 
 describe("bob#334 — init temp cleanup on the --force path", () => {
+  it.skipIf(process.platform !== "linux")(
+    "uses the child's /proc starttime in its kernel-kind temp name",
+    async () => {
+      const root = freshRoot();
+      const { child, temp } = await holdInit(root, "agent-a", "soul.md");
+      const pid = child.pid;
+      expect(pid).toBeDefined();
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat
+        .replace(/^\d+ \(.*\) /, "")
+        .trim()
+        .split(/\s+/);
+      const start = fields[22 - 3];
+      expect(start).toMatch(/^\d+$/);
+      expect(initTempOwner(pid)).toEqual({ pid, kind: "k", start });
+      expect(basename(temp)).toContain(`-bob-init-${pid}-k${start}-`);
+    },
+    30_000,
+  );
+
+  it("built bob init retains both temps on a plain rerun and removes only the orphan with --force", async () => {
+    const home = freshRoot();
+    const root = join(home, "agents");
+    mkdirSync(root);
+    const orphan = await holdInit(root, "agent-a", "soul.md");
+    await stop(orphan.child);
+    expect(orphan.child.signalCode).toBe("SIGKILL");
+    const live = await holdInit(freshRoot(), "agent-b", "soul.md");
+    const liveTemp = initTempPath(join(orphan.agentDir, "soul.md"), initTempOwner(live.child.pid));
+    writeFileSync(liveTemp, "live writer\n");
+    const cli = fileURLToPath(new URL("../../bin/bob", import.meta.url));
+    const args = [
+      cli,
+      "init",
+      "agent-a",
+      "--role",
+      "coder",
+      "--provider",
+      "ollama-cloud",
+      "--model",
+      "fixture-model",
+      "--context-window",
+      "200000",
+      "--no-flair",
+      "--no-interactive",
+    ];
+    const options = { env: { ...process.env, HOME: home }, timeoutMs: 10_000 };
+
+    const plain = await spawnNodeAsync(args, options);
+    expect(plain.signal).toBeNull();
+    expect(plain.code).not.toBe(0);
+    expect(plain.stderr).toMatch(/already exists/);
+    expect(tempsIn(orphan.agentDir)).toContain(basename(orphan.temp));
+    expect(readFileSync(liveTemp, "utf8")).toBe("live writer\n");
+
+    const forced = await spawnNodeAsync([...args, "--force"], options);
+    expect(forced.signal).toBeNull();
+    expect(forced.code).toBe(0);
+    expect(tempsIn(orphan.agentDir)).not.toContain(basename(orphan.temp));
+    expect(readFileSync(liveTemp, "utf8")).toBe("live writer\n");
+    expect(live.child.exitCode).toBeNull();
+    expect(live.child.signalCode).toBeNull();
+  }, 60_000);
+
   it("keeps the held child's temp, then removes it after the child exits", async () => {
     const root = freshRoot();
     const { child, agentDir, temp } = await holdInit(root, "agent-a", "soul.md");
