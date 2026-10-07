@@ -47,9 +47,10 @@
 // stored alongside, so `bob position diff` compares the current effective
 // configuration against what the operator ratified.
 
-import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { type OnPublished, openOwned } from "./publication-ledger.js";
 
 // Host state root. Overridable (tests, multi-tenant hosts). Deliberately NOT
 // under ~/agents: the grant is the trust root, and the agent lives under a
@@ -213,7 +214,17 @@ function entryPresent(p: string): boolean {
   }
 }
 
-export function writeBindingMarker(agentDir: string, grant: HostGrant): string {
+// The marker is created exclusively (O_CREAT|O_EXCL|O_NOFOLLOW): an entry that
+// appeared at its path after the occupancy check is refused, never written over
+// or through. Its identity is reported to `onPublished` from the new file's
+// descriptor before anything is written, so a marker that is only partly
+// written is still recorded, and a rollback removes it only while it is still
+// this file (bob#326).
+export function writeBindingMarker(
+  agentDir: string,
+  grant: HostGrant,
+  onPublished?: OnPublished,
+): string {
   const p = bindingMarkerPath(agentDir);
   const marker: PositionBindingMarker = {
     agent: grant.agent,
@@ -221,7 +232,20 @@ export function writeBindingMarker(agentDir: string, grant: HostGrant): string {
     role: grant.role,
     ratifiedAt: grant.ratifiedAt,
   };
-  writeFileSync(p, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o644 });
+  let fd: number;
+  try {
+    fd = openOwned(p, 0o644, onPublished);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    throw new Error(
+      `bob: refusing to write the binding marker ${p}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+    );
+  }
+  try {
+    writeFileSync(fd, `${JSON.stringify(marker, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
   return p;
 }
 

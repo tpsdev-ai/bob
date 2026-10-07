@@ -18,6 +18,7 @@ import {
   closeSync,
   constants,
   fchmodSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -46,9 +47,12 @@ import {
   reservedProviderNames,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
+import { mkdirOwned, type OnPublished } from "./publication-ledger.js";
 import { loadRole } from "./role-loader.js";
 import { assertNoReservedProviderEntries } from "./session.js";
 import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
+
+export type { PublishedEntry } from "./publication-ledger.js";
 
 // Same character class loadRole uses — agent names are filesystem paths,
 // keep them strict-safe.
@@ -88,17 +92,6 @@ export const DEFAULT_FLAIR_URL = "http://127.0.0.1:19926";
 // The launcher swaps `~` for `$HOME` (expanded at runtime, not render time).
 function flairKeyFile(name: string): string {
   return `~/.flair/keys/${name}.key`;
-}
-
-// One directory entry `initAgent` published, with the identity lstat reported at
-// publication time. A caller that must roll a scaffold back removes an entry
-// only while it is still this one (same device, inode and kind), so an entry
-// another writer has since replaced is left in place.
-export interface PublishedEntry {
-  path: string;
-  dev: number;
-  ino: number;
-  kind: "dir" | "file";
 }
 
 export interface InitOptions {
@@ -147,12 +140,21 @@ export interface InitOptions {
   // and with the path of each file published with link(2), after its temp
   // write.
   beforePublish?: (path: string) => void;
-  // Called with each directory entry this call publishes (the agent directory,
-  // the sub-directories and every file), after it exists on disk, with the
-  // identity lstat reports. Unlike beforePublish (a pre-publication seam), this
-  // fires only for an entry that was actually created, even when a later publish
-  // fails. A caller records these to remove exactly its own entries on rollback.
-  onPublished?: (entry: PublishedEntry) => void;
+  // The publication ledger (bob#326; see publication-ledger.ts). Called for each
+  // entry this call publishes INSIDE the agent directory:
+  //   * a directory (the agent directory, bin, work, memory, .pi-agent) only
+  //     when this call's own non-recursive mkdir created it, with the identity
+  //     lstat reads right after that mkdir. An existing directory (EEXIST,
+  //     including under --force) is not reported;
+  //   * a file with the identity of the temporary file this call created
+  //     exclusively, read from its descriptor before the file is linked or
+  //     renamed into place, and reported as soon as that link/rename succeeds,
+  //     before the temporary name is cleaned up (whose failure is then also
+  //     reported, with the temporary path);
+  //   * the .pi-agent key files the env-key branch publishes, the same way.
+  // The Flair key files (written under the keys directory, outside the agent
+  // directory, only when skipFlair is false) are not reported.
+  onPublished?: OnPublished;
 }
 
 export interface InitResult {
@@ -213,52 +215,27 @@ export function initAgent(opts: InitOptions): InitResult {
 
   const written: string[] = [];
 
-  // Record each entry THIS call creates, in creation order, so a caller can roll
-  // back exactly its own entries (and nothing a competing writer left behind).
-  const record = (path: string): void => {
-    if (opts.onPublished === undefined) return;
-    const st = lstatSync(path);
-    opts.onPublished({
-      path,
-      dev: st.dev,
-      ino: st.ino,
-      kind: st.isDirectory() ? "dir" : "file",
-    });
-  };
+  const onPublished = opts.onPublished;
 
   // Without --force, the agent directory is created here with a non-recursive
   // mkdir, and `publish` does not replace an existing entry. With --force,
-  // `publish` writes over.
+  // `publish` writes over. Either way each file is reported to onPublished with
+  // the identity of the temporary file this call created.
   const publish: Publish = noClobber
-    ? (path, content, mode) => {
-        writeFileExclusive(path, content, opts.beforePublish, mode);
-        record(path);
-      }
-    : (path, content, mode) => {
-        writeFileReplacing(path, content, mode);
-        record(path);
-      };
-  if (noClobber) {
-    mkdirSync(root, { recursive: true });
-    opts.beforePublish?.(agentDir);
-    try {
-      mkdirSync(agentDir);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
-      throw err;
-    }
-    record(agentDir);
-  }
+    ? (path, content, mode) =>
+        writeFileExclusive(path, content, opts.beforePublish, mode, onPublished)
+    : (path, content, mode) => writeFileReplacing(path, content, mode, onPublished);
+  mkdirSync(root, { recursive: true });
+  if (noClobber) opts.beforePublish?.(agentDir);
+  // One level at a time: a directory is reported only when this mkdir created
+  // it. Without --force an existing agent directory is refused; with --force it
+  // is used, but it is not this call's, so it is not reported.
+  if (mkdirOwned(agentDir, onPublished) === undefined && noClobber) throw new Error(exists);
 
-  // Top-level + subdirs
-  mkdirSync(join(agentDir, "bin"), { recursive: true });
-  record(join(agentDir, "bin"));
-  mkdirSync(join(agentDir, "work"), { recursive: true });
-  record(join(agentDir, "work"));
-  mkdirSync(join(agentDir, "memory"), { recursive: true });
-  record(join(agentDir, "memory"));
-  mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
-  record(join(agentDir, ".pi-agent"));
+  // Top-level + subdirs. An existing one (EEXIST) is used and not reported.
+  for (const sub of ["bin", "work", "memory", ".pi-agent"]) {
+    mkdirOwned(join(agentDir, sub), onPublished);
+  }
 
   // soul.md (identity header + role template; user editable). The role
   // template only describes the ROLE — the header stamps WHO the agent is
@@ -291,7 +268,7 @@ export function initAgent(opts: InitOptions): InitResult {
   // (launcher exports it). Written for every provider — see
   // writePiAgentConfig's doc comment for why bare baseUrl configs aren't
   // enough for `bob run`.
-  written.push(...writePiAgentConfig(opts, agentDir, publish, record));
+  written.push(...writePiAgentConfig(opts, agentDir, publish));
   if (opts.contextWindow === undefined) {
     console.error(
       `⚠ Set provider.context_window in ${yamlPath} before running — bob refuses to start a session without the model's context window.`,
@@ -520,16 +497,11 @@ export function piOpenAiCompletionsModel(
   };
 }
 
-function writePiAgentConfig(
-  opts: InitOptions,
-  agentDir: string,
-  publish: Publish,
-  record: (path: string) => void,
-): string[] {
+function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publish): string[] {
   const piDir = join(agentDir, ".pi-agent");
-  // mkdirSync above already created it; defensive recreate in case caller
-  // didn't go through the standard path.
-  mkdirSync(piDir, { recursive: true });
+  // initAgent created (or found) it above; defensive recreate in case a caller
+  // didn't go through the standard path. Created here, it is reported too.
+  mkdirOwned(piDir, opts.onPublished);
 
   const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
   const piProvider = resolveRuntimeProviderName(opts.provider, registry);
@@ -585,8 +557,7 @@ function writePiAgentConfig(
       [authPath, authContent],
     ] as const) {
       if (opts.noClobber === false && fileExists(path)) continue;
-      writeFileExclusive(path, content, opts.beforePublish, 0o600);
-      record(path);
+      writeFileExclusive(path, content, opts.beforePublish, 0o600, opts.onPublished);
       created.push(path);
     }
     const row = providerRecord(opts.provider, registry);
@@ -621,7 +592,12 @@ function fileExists(path: string): boolean {
 /** Writes `content` to `path`, with `mode` set exactly when given. */
 type Publish = (path: string, content: string, mode?: number) => void;
 
-function writeFileReplacing(path: string, content: string, mode?: number): void {
+function writeFileReplacing(
+  path: string,
+  content: string,
+  mode?: number,
+  onPublished?: OnPublished,
+): void {
   if (mode === undefined) {
     try {
       const destination = lstatSync(path);
@@ -630,7 +606,7 @@ function writeFileReplacing(path: string, content: string, mode?: number): void 
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
-  withTempFile(path, content, mode, (temp) => renameSync(temp, path));
+  withTempFile(path, content, mode, (temp) => renameSync(temp, path), onPublished);
 }
 
 /** Write an exclusive temp file, then publish it with link(2), which fails with
@@ -641,25 +617,38 @@ function writeFileExclusive(
   content: string,
   beforePublish?: (path: string) => void,
   mode?: number,
+  onPublished?: OnPublished,
 ): void {
-  withTempFile(path, content, mode, (temp) => {
-    beforePublish?.(path);
-    try {
-      linkSync(temp, path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      throw new Error(
-        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
-      );
-    }
-  });
+  withTempFile(
+    path,
+    content,
+    mode,
+    (temp) => {
+      beforePublish?.(path);
+      try {
+        linkSync(temp, path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        throw new Error(
+          `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+        );
+      }
+    },
+    onPublished,
+  );
 }
 
+// The temp file is created exclusively, and its identity is read from ITS
+// descriptor before it is published, so what onPublished records for `path` is
+// this call's file even if another writer replaces `path` afterwards. `path` is
+// reported as soon as `publish` returns, BEFORE the temp name is cleaned up; if
+// that cleanup fails, the temp name (still this call's file) is reported too.
 function withTempFile(
   path: string,
   content: string,
   mode: number | undefined,
   publish: (temp: string) => void,
+  onPublished?: OnPublished,
 ): void {
   const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
   const fd = openSync(
@@ -667,8 +656,19 @@ function withTempFile(
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
     mode ?? 0o666,
   );
+  let identity: { dev: bigint; ino: bigint } | undefined;
+  const cleanUp = (): void => {
+    try {
+      rmSync(temp, { force: true });
+    } catch (err) {
+      if (identity !== undefined) onPublished?.({ path: temp, ...identity, kind: "file" });
+      throw err;
+    }
+  };
   try {
     try {
+      const st = fstatSync(fd, { bigint: true });
+      identity = { dev: st.dev, ino: st.ino };
       writeFileSync(fd, content);
       if (mode !== undefined) fchmodSync(fd, mode);
       fsyncSync(fd);
@@ -676,8 +676,9 @@ function withTempFile(
       closeSync(fd);
     }
     publish(temp);
+    if (identity !== undefined) onPublished?.({ path, ...identity, kind: "file" });
   } finally {
-    rmSync(temp, { force: true });
+    cleanUp();
   }
 }
 

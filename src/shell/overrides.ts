@@ -18,17 +18,11 @@
 // (host-grant.ts), not a Git ref.
 
 import { execFileSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { gitEnvironment } from "./git-environment.js";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
+import { mkdirOwned, type OnPublished, openOwned, recordTree } from "./publication-ledger.js";
 
 export interface Overrides {
   disable: {
@@ -324,42 +318,67 @@ export function resolvePositionFiles(
 
 // Initialize the local override repository: the directory, an empty override
 // document, and a Git repo with a base commit.
-export function initOverrideRepo(agentDir: string): string {
+//
+// bob#326: each entry this call creates is reported to `onPublished` (the
+// publication ledger, publication-ledger.ts), including a partial publication
+// when a later step fails: `overrides/` and `overrides/files/` only when this
+// call's own mkdir created them; `overrides.json` from its descriptor, before a
+// byte is written; and `.git`, which this call creates with its own mkdir before
+// git runs, together with every file and directory git wrote inside it, read
+// once the git commands have finished or failed. An existing directory, document
+// or `.git` is used as before and not reported.
+export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): string {
   const dir = overridesDir(agentDir);
-  mkdirSync(join(dir, "files"), { recursive: true, mode: 0o700 });
+  mkdirOwned(dir, onPublished, 0o700);
+  mkdirOwned(join(dir, "files"), onPublished, 0o700);
   const docPath = join(dir, "overrides.json");
-  // `wx`: never clobber an existing document, and no existsSync-then-write
-  // window (CodeQL js/file-system-race). An existing document is left as-is.
+  // Exclusive create: never clobber an existing document, and no
+  // existsSync-then-write window (CodeQL js/file-system-race). An existing
+  // document is left as-is.
+  let fd: number | undefined;
   try {
-    writeFileSync(
-      docPath,
-      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
-      { flag: "wx" },
-    );
+    fd = openOwned(docPath, 0o666, onPublished);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
   }
-  if (!existsSync(join(dir, ".git"))) {
-    git(["init", "--quiet"], dir);
-    git(["add", "-A"], dir);
-    git(
-      [
-        "-c",
-        "user.email=bob@tps.dev",
-        "-c",
-        "user.name=bob",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "commit",
-        "--quiet",
-        "--no-verify",
-        "-m",
-        "override baseline",
-      ],
-      dir,
-    );
+  if (fd !== undefined) {
+    try {
+      writeFileSync(
+        fd,
+        `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
+      );
+    } finally {
+      closeSync(fd);
+    }
+  }
+  // `.git` is created here, so git initializes the empty directory this call
+  // owns; an existing `.git` (EEXIST) means the repository is already there.
+  const gitDir = mkdirOwned(join(dir, ".git"), onPublished);
+  if (gitDir !== undefined) {
+    try {
+      git(["init", "--quiet"], dir);
+      git(["add", "-A"], dir);
+      git(
+        [
+          "-c",
+          "user.email=bob@tps.dev",
+          "-c",
+          "user.name=bob",
+          "-c",
+          "commit.gpgsign=false",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--quiet",
+          "--no-verify",
+          "-m",
+          "override baseline",
+        ],
+        dir,
+      );
+    } finally {
+      if (onPublished !== undefined) recordTree(gitDir, onPublished);
+    }
   }
   return dir;
 }

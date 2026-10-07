@@ -4,9 +4,10 @@
 //   * `hireAgent`     — scaffold a NEW agent from a packaged position, ratify the
 //                       host grant, store the diff baseline, initialize the
 //                       override repository, and run the hiring interview. It
-//                       validates the candidate BEFORE it writes anything, so a
-//                       refused hire leaves no scaffold, grant or override
-//                       repository behind.
+//                       validates the candidate BEFORE it writes anything; a
+//                       hire that fails after it has written rolls back the
+//                       entries it published (bob#326, publication-ledger.ts)
+//                       and names what it left in place.
 //   * `adoptAgent`    — bind an EXISTING agent to a position: independently
 //                       resolve it before and after, verify its requests, REQUIRE
 //                       the two resolutions to be equal, then record the
@@ -21,17 +22,8 @@
 //   * `positionDiff`  — the ratified baseline vs the current effective config.
 
 import { createHash } from "node:crypto";
-import {
-  existsSync,
-  lstatSync,
-  readdirSync,
-  readFileSync,
-  rmdirSync,
-  rmSync,
-  type Stats,
-  unlinkSync,
-} from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { resolveCapabilities } from "./capability-loader.js";
@@ -57,11 +49,16 @@ import {
   writeBindingMarker,
   writeGrant,
 } from "./host-grant.js";
-import { type InitResult, initAgent, type PublishedEntry } from "./init.js";
+import { type InitResult, initAgent } from "./init.js";
 import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
-import { initOverrideRepo, overridesDir } from "./overrides.js";
+import { initOverrideRepo } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
 import { defaultProviderName, type ProviderRegistry } from "./provider-registry.js";
+import {
+  type PublishedEntry,
+  type RollbackReport,
+  rollbackPublished,
+} from "./publication-ledger.js";
 import { loadRole } from "./role-loader.js";
 import { assertProviderRunnable, mapBobProviderToPi, resolveAgentToolPolicy } from "./run.js";
 import type { SessionDeps } from "./session.js";
@@ -110,8 +107,8 @@ function readablePosition(hostRoot: string, agentDir: string, name: string): str
   return undefined;
 }
 
-// Occupancy and rollback ownership concern directory entries, not their targets.
-// Only ENOENT proves absence; an unreadable entry must never be claimed as ours.
+// Occupancy concerns directory entries, not their targets. Only ENOENT proves
+// absence; an unreadable entry is occupied.
 function entryPresent(path: string): boolean {
   try {
     lstatSync(path);
@@ -146,145 +143,92 @@ export type BindStep = "scaffold" | "interview" | "grant" | "marker" | "baseline
 
 export interface BindHooks {
   // Test-only failure-injection seam: invoked AFTER each bind step, so a test can
-  // throw at a chosen step and prove the rollback removes exactly what this
-  // operation created. Never set in production.
+  // throw at a chosen step and prove what the rollback removes and what it keeps.
+  // Never set in production.
   afterStep?: (step: BindStep) => void;
 }
 
-// The ledger of paths THIS operation creates, so a later failure removes exactly
-// them and nothing else. When the agent directory was created here, every
-// scaffold file (including the marker and the override repository) lives inside
-// it, so removing it is complete; for adoption the agent directory pre-exists, so
-// only the marker, the override repository (when this operation created it) and
-// the host grant/baseline are removed.
+// What THIS operation wrote, so a later failure removes exactly that. Inside the
+// agent directory that is the publication ledger (publication-ledger.ts): every
+// entry the scaffold, the binding marker and the override repository published,
+// with the identity each had when it was published. A hire's ledger starts with
+// the agent directory it created (its root sits in the agents root); an
+// adoption's agent directory pre-exists, so its roots are the marker and the
+// override repository entries it created inside it. The host grant and baseline
+// live under the host state root, outside the agent directory, and are removed
+// by path.
 interface BindTxn {
   agentDir: string;
-  agentDirCreated: boolean;
-  // The entries `initAgent` published inside the agent directory (only when
-  // this operation created it), in creation order, with the identity init saw.
+  // The directory that holds each ledger root: the agents root for a hire, the
+  // agent directory for an adoption.
+  base: string;
   published: PublishedEntry[];
-  markerPath?: string;
-  overrideDirCreated: boolean;
   grantPath?: string;
   baselinePath?: string;
 }
 
-// Roll back a failed bind. The binding marker and the override repository are
-// this operation's own entries inside the agent directory, so they go first (init
-// did not publish them). When the agent directory was created here, the scaffold
-// is then swept entry by entry: the sweep removes a scaffold entry only while it
-// is still the one init published, deepest first, then the directory only if it
-// is now empty. Whatever is left stays in place; its path, relative to the agent
-// directory, is returned so the refusal can name it.
-function rollbackBind(tx: BindTxn): string[] {
-  // rmSync removes a symlink entry itself, without following it.
-  if (tx.markerPath !== undefined) rmSync(tx.markerPath, { force: true });
-  if (tx.overrideDirCreated) rmSync(overridesDir(tx.agentDir), { recursive: true, force: true });
-  const preserved = tx.agentDirCreated ? sweepPublished(tx.agentDir, tx.published) : [];
-  if (tx.grantPath !== undefined) rmSync(tx.grantPath, { force: true });
-  if (tx.baselinePath !== undefined) rmSync(tx.baselinePath, { force: true });
-  return preserved;
-}
-
-// The kind lstat reports, for the identity comparison. A symlink is neither a
-// directory nor a regular file, so a published file (or directory) replaced by a
-// symlink no longer counts as init's.
-function entryKind(st: Stats): "dir" | "file" | "other" {
-  if (st.isDirectory()) return "dir";
-  if (st.isSymbolicLink()) return "other";
-  return "file";
-}
-
-// Is `path` still the exact entry init published at it? False when it is gone,
-// when it is a different inode or kind, and when its identity cannot be read at
-// all (an unreadable entry is never claimed as ours).
-function stillPublished(path: string, published: PublishedEntry | undefined): boolean {
-  if (published === undefined) return false;
-  let st: Stats;
+// Roll back a failed bind. The ledger's entries are rolled back under the
+// publication-ledger protocol: an entry is removed only while it is still the
+// one this operation published, and everything else stays and is named. Each
+// stage runs even when an earlier one failed; every failure is collected into
+// the report, which the refusal then carries.
+function rollbackBind(tx: BindTxn): RollbackReport {
+  const report: RollbackReport = { leftovers: [], stranded: [], errors: [] };
   try {
-    st = lstatSync(path);
-  } catch {
-    return false;
+    const own = rollbackPublished({
+      base: tx.base,
+      reportBase: tx.agentDir,
+      entries: tx.published,
+    });
+    report.leftovers.push(...own.leftovers);
+    report.stranded.push(...own.stranded);
+    report.errors.push(...own.errors);
+  } catch (err) {
+    report.errors.push(`${tx.agentDir}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  return st.dev === published.dev && st.ino === published.ino && entryKind(st) === published.kind;
-}
-
-// Remove the entries init published under `agentDir`, deepest first, then the
-// directory itself only if nothing else remains. An entry that is no longer (or
-// was never) init's is left in place and named by its path relative to
-// `agentDir`.
-function sweepPublished(agentDir: string, published: PublishedEntry[]): string[] {
-  const ours = new Map(published.map((e) => [e.path, e]));
-  const preserved = new Set<string>();
-  sweepDir(agentDir, agentDir, ours, preserved);
-  if (stillPublished(agentDir, ours.get(agentDir))) {
+  for (const path of [tx.grantPath, tx.baselinePath]) {
+    if (path === undefined) continue;
     try {
-      rmdirSync(agentDir);
+      // rmSync removes a symlink entry itself, without following it.
+      rmSync(path, { force: true });
     } catch (err) {
-      // ENOTEMPTY: the leftovers were named by the sweep, so the directory is
-      // not itself the thing to name.
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && preserved.size === 0)
-        preserved.add(".");
+      report.errors.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
     }
-  } else if (preserved.size === 0) {
-    // Not (or no longer) the directory this operation created: it is never
-    // removed, and with nothing else named it is itself what stayed.
-    preserved.add(".");
   }
-  return [...preserved];
+  return report;
 }
 
-function sweepDir(
-  dir: string,
+// The refusal for a failed bind: the original failure, then what the rollback
+// left in place (named by path relative to the agent directory), any directory
+// it could not move back, and every cleanup step that failed. With nothing to
+// report, the original error is rethrown unchanged.
+function refusalAfterRollback(
+  err: unknown,
+  operation: "hire" | "adoption",
   agentDir: string,
-  ours: Map<string, PublishedEntry>,
-  preserved: Set<string>,
-): void {
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") preserved.add(relative(agentDir, dir));
-    return;
+  report: RollbackReport,
+): unknown {
+  const notes: string[] = [];
+  if (report.leftovers.length > 0) {
+    const named = report.leftovers.map((p) =>
+      p === "." ? "the agent directory itself (it is not the directory this hire created)" : p,
+    );
+    notes.push(
+      `This failed ${operation} left these entries in place (paths relative to ${agentDir}; a directory named here is left with everything in it): ${named.join(", ")}.`,
+    );
   }
-  for (const name of names) {
-    const path = join(dir, name);
-    const published = ours.get(path);
-    if (published === undefined || !stillPublished(path, published)) {
-      // Name it only when the entry is still there; an entry that vanished
-      // during the rollback is simply not there to preserve.
-      if (lstatExists(path)) preserved.add(relative(agentDir, path));
-      continue;
-    }
-    if (published.kind === "dir") {
-      sweepDir(path, agentDir, ours, preserved);
-      try {
-        rmdirSync(path);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        // ENOTEMPTY: a nested leftover was already named by the recursive sweep
-        // and the directory stays holding it.
-        if (code !== "ENOENT" && code !== "ENOTEMPTY") preserved.add(relative(agentDir, path));
-      }
-    } else {
-      try {
-        unlinkSync(path);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
-          preserved.add(relative(agentDir, path));
-      }
-    }
+  for (const s of report.stranded) {
+    notes.push(
+      `${s.original} was occupied when the rollback moved it back, so what it still holds stays at ${s.quarantine} (paths relative to it): ${s.leftovers.join(", ")}.`,
+    );
   }
-}
-
-// Does the directory entry exist at all (a failed stat is never "absent")?
-function lstatExists(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  if (report.errors.length > 0) {
+    notes.push(`The rollback could not complete these steps: ${report.errors.join("; ")}.`);
   }
+  if (notes.length === 0) return err;
+  return new Error(`${err instanceof Error ? err.message : String(err)} ${notes.join(" ")}`, {
+    cause: err,
+  });
 }
 
 // A grant built from a ratifiable position + role. maxTools/maxCapabilities are
@@ -399,10 +343,12 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 // onboarding interview after the candidate is validated and scaffolded.
 //
 // Order: EVERY deterministic refusal runs before anything is written; the
-// scaffold and interview then run under a transaction, and the file commit
-// (grant, marker, baseline, override repository) removes everything THIS
-// operation created on any later failure. So a refused hire — including a failed
-// interview — leaves no scaffold and no half-written binding.
+// scaffold and interview then run under a transaction, followed by the file
+// commit (grant, marker, baseline, override repository). On any later failure
+// the rollback removes the entries THIS operation published while they are still
+// its own, and the host grant and baseline (bob#326); whatever stays (a file
+// another writer placed, an entry replaced since, the interview's own soul.md
+// and session files) is named in the refusal.
 export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
   if (opts.skipFlair === false) {
@@ -460,11 +406,9 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   const soulFile = effective.files.find((f) => f.kind === "soul");
 
   // --- The bind: scaffold, interview and the file commit, under a rollback. ---
-  const tx: BindTxn = {
-    agentDir,
-    agentDirCreated: !entryPresent(agentDir),
-    published: [],
-    overrideDirCreated: false,
+  const tx: BindTxn = { agentDir, base: dirname(agentDir), published: [] };
+  const onPublished = (entry: PublishedEntry) => {
+    tx.published.push(entry);
   };
   try {
     const init = initAgent({
@@ -473,7 +417,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       provider,
       model,
       agentsRoot: opts.agentsRoot,
-      onPublished: (entry) => tx.published.push(entry),
+      onPublished,
       ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       capabilities: position.manifest.capabilities.default,
       toolAllow: position.manifest.tools,
@@ -511,8 +455,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     tx.grantPath = grantPath(hostRoot, opts.name);
     opts.commitHook?.("grant");
 
-    writeBindingMarker(init.agentDir, grant);
-    tx.markerPath = bindingMarkerPath(init.agentDir);
+    writeBindingMarker(init.agentDir, grant, onPublished);
     opts.commitHook?.("marker");
 
     // The baseline is snapshotted AFTER the interview: what the operator ratified
@@ -523,17 +466,12 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !entryPresent(overridesDir(init.agentDir));
-    const overrideDir = initOverrideRepo(init.agentDir);
+    const overrideDir = initOverrideRepo(init.agentDir, onPublished);
     opts.commitHook?.("override-repo");
 
     return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
   } catch (err) {
-    const preserved = rollbackBind(tx);
-    if (preserved.length === 0) throw err;
-    throw new Error(
-      `${err instanceof Error ? err.message : String(err)} This failed hire left these entries in the agent directory (paths relative to ${tx.agentDir}): ${preserved.join(", ")}.`,
-    );
+    throw refusalAfterRollback(err, "hire", tx.agentDir, rollbackBind(tx));
   }
 }
 
@@ -693,14 +631,13 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
   }
 
   // --- The file commit, under a rollback. The agent directory PRE-EXISTS (it was
-  // scaffolded by bob init), so on a later failure only the marker, the override
-  // repository (when this operation created it) and the host grant/baseline are
-  // removed — the existing bob.yaml, soul.md and any other file are untouched. ---
-  const tx: BindTxn = {
-    agentDir,
-    agentDirCreated: false,
-    published: [],
-    overrideDirCreated: false,
+  // scaffolded by bob init), so on a later failure only the entries this
+  // operation published inside it (the marker, and the override repository
+  // entries it created) are rolled back, with the host grant/baseline. The
+  // existing bob.yaml, soul.md and every other entry are untouched. ---
+  const tx: BindTxn = { agentDir, base: agentDir, published: [] };
+  const onPublished = (entry: PublishedEntry) => {
+    tx.published.push(entry);
   };
   try {
     const soulHashBefore = soulHashOf(agentDir);
@@ -708,8 +645,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     tx.grantPath = grantPath(hostRoot, opts.name);
     opts.commitHook?.("grant");
 
-    writeBindingMarker(agentDir, grant);
-    tx.markerPath = bindingMarkerPath(agentDir);
+    writeBindingMarker(agentDir, grant, onPublished);
     opts.commitHook?.("marker");
 
     const baseline = snapshotForDiff(effective, soulHashBefore);
@@ -718,8 +654,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !entryPresent(overridesDir(agentDir));
-    const overrideDir = initOverrideRepo(agentDir);
+    const overrideDir = initOverrideRepo(agentDir, onPublished);
     opts.commitHook?.("override-repo");
 
     const soulHashAfter = soulHashOf(agentDir);
@@ -737,8 +672,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
       diff,
     };
   } catch (err) {
-    rollbackBind(tx);
-    throw err;
+    throw refusalAfterRollback(err, "adoption", tx.agentDir, rollbackBind(tx));
   }
 }
 

@@ -1,21 +1,42 @@
-// `initAgent`'s rollback ledger (bob#326): `onPublished` records each directory
-// entry the scaffold creates, so a caller can remove exactly its own entries
-// after init refuses part-way through a hire.
+// `initAgent`'s publication ledger (bob#326): `onPublished` reports a directory
+// only when this call's own mkdir created it, and a file with the identity of
+// the temporary file this call created, read before the file is published and
+// reported before the temporary name is cleaned up. These tests drive the real
+// scaffold on real files; the injections replace one node:fs call at the
+// boundary under test and keep the rest real.
 
-import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { initAgent } from "../../src/shell/index.js";
 import type { PublishedEntry } from "../../src/shell/init.js";
 
 let agentsRoot: string;
 const _dirs: string[] = [];
+const spies: Array<{ mockRestore(): void }> = [];
 beforeEach(() => {
-  const base = mkdtempSync(join(tmpdir(), "bob-led-"));
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "bob-led-")));
   _dirs.push(base);
   agentsRoot = join(base, "agents");
   mkdirSync(agentsRoot, { recursive: true });
+});
+afterEach(() => {
+  for (const s of spies.splice(0)) s.mockRestore();
 });
 afterAll(() => {
   for (const d of _dirs) rmSync(d, { recursive: true, force: true });
@@ -24,7 +45,7 @@ afterAll(() => {
 const scaffold = (
   name: string,
   onPublished: (e: PublishedEntry) => void,
-  beforePublish?: (path: string) => void,
+  extra: { beforePublish?: (path: string) => void; noClobber?: boolean } = {},
 ) =>
   initAgent({
     name,
@@ -34,8 +55,23 @@ const scaffold = (
     agentsRoot,
     skipFlair: true,
     onPublished,
-    ...(beforePublish !== undefined ? { beforePublish } : {}),
+    ...extra,
   });
+
+// The identity of a file, and its text, from ONE open descriptor (never a stat
+// of the path followed by a read of it).
+function readEntry(path: string): { ino: bigint; text: string } {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    return { ino: fstatSync(fd, { bigint: true }).ino, text: readFileSync(fd, "utf8") };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// dev/ino as bigint whatever the ledger carries, so a comparison can never pass
+// on a number/bigint type mismatch.
+const ino = (e: PublishedEntry | undefined) => (e === undefined ? undefined : BigInt(e.ino));
 
 describe("bob#326 — initAgent records each entry it publishes", () => {
   it("records the agent directory, the sub-directories and every file it created", () => {
@@ -57,10 +93,11 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
       join(agentDir, "bin", name),
     ];
     expect(ledger.map((e) => e.path).sort()).toEqual(expected.slice().sort());
-    // Every recorded entry exists, and its recorded kind matches disk.
+    // Every recorded entry is on disk as recorded: same inode, same kind.
     for (const e of ledger) {
-      const st = lstatSync(e.path);
+      const st = lstatSync(e.path, { bigint: true });
       expect(st.isDirectory() ? "dir" : "file").toBe(e.kind);
+      expect(st.ino).toBe(BigInt(e.ino));
     }
   });
 
@@ -71,22 +108,121 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     const ledger: PublishedEntry[] = [];
 
     expect(() =>
-      scaffold(
-        name,
-        (e) => ledger.push(e),
-        (path) => {
+      scaffold(name, (e) => ledger.push(e), {
+        beforePublish: (path) => {
           if (path === soul) writeFileSync(soul, "another writer\n");
         },
-      ),
+      }),
     ).toThrow(/refusing to write/);
 
-    // The entries created before the refusal are recorded...
     const paths = ledger.map((e) => e.path);
     expect(paths).toContain(agentDir);
     expect(paths).toContain(join(agentDir, ".pi-agent"));
-    // ...and the path the competitor took is not.
     expect(paths).not.toContain(soul);
-    // The competitor's file is untouched.
-    expect(readFileSync(soul, "utf8")).toBe("another writer\n");
+    expect(readEntry(soul).text).toBe("another writer\n");
+  });
+
+  it("records a file's identity from its own temporary file: a replacement at the destination right after the link is not recorded as ours", () => {
+    const name = "led-replaced";
+    const agentDir = join(agentsRoot, name);
+    const soul = join(agentDir, "soul.md");
+    const ledger: PublishedEntry[] = [];
+    let foreignIno: bigint | undefined;
+    const link = fs.linkSync;
+    spies.push(
+      spyOn(fs, "linkSync").mockImplementation((from, to) => {
+        link(from, to);
+        if (to === soul && foreignIno === undefined) {
+          // Another writer replaces soul.md between its publication and any
+          // later look at the destination.
+          const tmp = join(agentDir, "writer.tmp");
+          writeFileSync(tmp, "another writer's soul\n");
+          renameSync(tmp, soul);
+          foreignIno = readEntry(soul).ino;
+        }
+      }),
+    );
+    scaffold(name, (e) => ledger.push(e));
+
+    const recorded = ledger.find((e) => e.path === soul);
+    expect(foreignIno).toBeDefined();
+    expect(recorded).toBeDefined();
+    expect(ino(recorded)).not.toBe(foreignIno as bigint);
+    expect(readEntry(soul).text).toBe("another writer's soul\n");
+  });
+
+  it("registers a published file BEFORE its temporary name is cleaned up: a failed cleanup still leaves both names recorded", () => {
+    const name = "led-cleanup";
+    const agentDir = join(agentsRoot, name);
+    const soul = join(agentDir, "soul.md");
+    const ledger: PublishedEntry[] = [];
+    let failedTemp: string | undefined;
+    const rm = fs.rmSync;
+    spies.push(
+      spyOn(fs, "rmSync").mockImplementation((path, options) => {
+        const p = String(path);
+        if (failedTemp === undefined && basename(p).startsWith(".soul.md-")) {
+          failedTemp = p;
+          throw Object.assign(new Error(`EIO: injected cleanup failure, unlink '${p}'`), {
+            code: "EIO",
+          });
+        }
+        return rm(path, options);
+      }),
+    );
+    expect(() => scaffold(name, (e) => ledger.push(e))).toThrow(/injected cleanup failure/);
+
+    // soul.md was published (the link succeeded) and is in the ledger with the
+    // identity it has on disk; the temporary name, still the same file, is too.
+    const published = readEntry(soul);
+    expect(ino(ledger.find((e) => e.path === soul))).toBe(published.ino);
+    expect(failedTemp).toBeDefined();
+    expect(ino(ledger.find((e) => e.path === failedTemp))).toBe(published.ino);
+  });
+
+  it("does not record a sub-directory a competing writer created first", () => {
+    const name = "led-subdir";
+    const agentDir = join(agentsRoot, name);
+    const bin = join(agentDir, "bin");
+    const ledger: PublishedEntry[] = [];
+    let competitorIno: bigint | undefined;
+    const mkdir = fs.mkdirSync;
+    spies.push(
+      spyOn(fs, "mkdirSync").mockImplementation(((path: fs.PathLike, options?: unknown) => {
+        if (String(path) === bin && competitorIno === undefined) {
+          mkdir(bin);
+          competitorIno = lstatSync(bin, { bigint: true }).ino;
+        }
+        return mkdir(path, options as fs.MakeDirectoryOptions);
+      }) as typeof fs.mkdirSync),
+    );
+    scaffold(name, (e) => ledger.push(e));
+
+    const paths = ledger.map((e) => e.path);
+    expect(competitorIno).toBeDefined();
+    expect(paths).not.toContain(bin);
+    // The other levels this call did create are recorded.
+    expect(paths).toContain(agentDir);
+    expect(paths).toContain(join(agentDir, "work"));
+    expect(lstatSync(bin, { bigint: true }).ino).toBe(competitorIno as bigint);
+  });
+
+  it("--force: an existing agent directory and sub-directory are not recorded; what this call created is, with its final identity", () => {
+    const name = "led-force";
+    const agentDir = join(agentsRoot, name);
+    mkdirSync(join(agentDir, "bin"), { recursive: true });
+    writeFileSync(join(agentDir, "soul.md"), "operator's soul\n");
+    const ledger: PublishedEntry[] = [];
+    scaffold(name, (e) => ledger.push(e), { noClobber: false });
+
+    const paths = ledger.map((e) => e.path);
+    expect(paths).not.toContain(agentDir);
+    expect(paths).not.toContain(join(agentDir, "bin"));
+    for (const sub of ["work", "memory", ".pi-agent"]) expect(paths).toContain(join(agentDir, sub));
+    // soul.md was replaced (--force renames a new file over it): the ledger
+    // holds the new file's identity.
+    expect(ino(ledger.find((e) => e.path === join(agentDir, "soul.md")))).toBe(
+      readEntry(join(agentDir, "soul.md")).ino,
+    );
   });
 });
