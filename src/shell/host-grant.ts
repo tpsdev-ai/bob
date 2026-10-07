@@ -47,9 +47,10 @@
 // stored alongside, so `bob position diff` compares the current effective
 // configuration against what the operator ratified.
 
-import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { type OnPublished, openOwned } from "./publication-ledger.js";
 
 // Host state root. Overridable (tests, multi-tenant hosts). Deliberately NOT
 // under ~/agents: the grant is the trust root, and the agent lives under a
@@ -213,7 +214,14 @@ function entryPresent(p: string): boolean {
   }
 }
 
-export function writeBindingMarker(agentDir: string, grant: HostGrant): string {
+// Create the marker exclusively and record descriptor identity before writing
+// (bob#326). Identity must match when checked; substitution before unlink
+// can still remove a replacement.
+export function writeBindingMarker(
+  agentDir: string,
+  grant: HostGrant,
+  onPublished?: OnPublished,
+): string {
   const p = bindingMarkerPath(agentDir);
   const marker: PositionBindingMarker = {
     agent: grant.agent,
@@ -221,7 +229,20 @@ export function writeBindingMarker(agentDir: string, grant: HostGrant): string {
     role: grant.role,
     ratifiedAt: grant.ratifiedAt,
   };
-  writeFileSync(p, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o644 });
+  let fd: number;
+  try {
+    fd = openOwned(p, 0o644, onPublished);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    throw new Error(
+      `bob: refusing to write the binding marker ${p}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+    );
+  }
+  try {
+    writeFileSync(fd, `${JSON.stringify(marker, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
   return p;
 }
 

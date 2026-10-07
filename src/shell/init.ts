@@ -17,13 +17,11 @@ import { randomUUID } from "node:crypto";
 import {
   type BigIntStats,
   closeSync,
-  constants,
   fchmodSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -50,9 +48,19 @@ import {
   reservedProviderNames,
   resolveRuntimeProviderName,
 } from "./provider-registry.js";
+import {
+  mkdirOwned,
+  mkdirParentsOwned,
+  type OnPublished,
+  openOwned,
+  type PublishedEntry,
+  pendingEntry,
+} from "./publication-ledger.js";
 import { loadRole } from "./role-loader.js";
 import { assertNoReservedProviderEntries } from "./session.js";
 import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
+
+export type { PublishedEntry } from "./publication-ledger.js";
 
 // Same character class loadRole uses — agent names are filesystem paths,
 // keep them strict-safe.
@@ -144,6 +152,9 @@ export interface InitOptions {
   // and with the path of each file published with link(2), after its temp
   // write.
   beforePublish?: (path: string) => void;
+  // Flair keys outside the agent directory are not covered. Path substitution
+  // after a directory check remains possible.
+  onPublished?: OnPublished;
 }
 
 export interface InitResult {
@@ -204,30 +215,23 @@ export function initAgent(opts: InitOptions): InitResult {
 
   const written: string[] = [];
 
-  // Without --force, the agent directory is created here with a non-recursive
-  // mkdir, and `publish` does not replace an existing entry. With --force,
-  // `publish` writes over.
-  const publish: Publish = noClobber
-    ? (path, content, mode) => writeFileExclusive(path, content, opts.beforePublish, mode)
-    : (path, content, mode) => writeFileReplacing(path, content, mode);
-  if (noClobber) {
-    mkdirSync(root, { recursive: true });
-    opts.beforePublish?.(agentDir);
-    try {
-      mkdirSync(agentDir);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
-      throw err;
-    }
-  } else {
-    removeStaleInitTemps(agentDir, root);
-  }
+  const onPublished = opts.onPublished;
+  if (!noClobber) removeStaleInitTemps(agentDir, root);
 
-  // Top-level + subdirs
-  mkdirSync(join(agentDir, "bin"), { recursive: true });
-  mkdirSync(join(agentDir, "work"), { recursive: true });
-  mkdirSync(join(agentDir, "memory"), { recursive: true });
-  mkdirSync(join(agentDir, ".pi-agent"), { recursive: true });
+  // Without --force, `publish` refuses an existing entry; with --force, it replaces it.
+  // With onPublished supplied, file creations and publications are reported.
+  const publish: Publish = noClobber
+    ? (path, content, mode) =>
+        writeFileExclusive(path, content, opts.beforePublish, mode, onPublished)
+    : (path, content, mode) => writeFileReplacing(path, content, mode, onPublished);
+  if (!noClobber && onPublished === undefined) mkdirSync(root, { recursive: true });
+  else mkdirParentsOwned(root, onPublished);
+  if (noClobber) opts.beforePublish?.(agentDir);
+  if (mkdirOwned(agentDir, onPublished) === undefined && noClobber) throw new Error(exists);
+
+  for (const sub of ["bin", "work", "memory", ".pi-agent"]) {
+    mkdirOwned(join(agentDir, sub), onPublished);
+  }
 
   // soul.md (identity header + role template; user editable). The role
   // template only describes the ROLE — the header stamps WHO the agent is
@@ -502,9 +506,8 @@ export function piOpenAiCompletionsModel(
 
 function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publish): string[] {
   const piDir = join(agentDir, ".pi-agent");
-  // mkdirSync above already created it; defensive recreate in case caller
-  // didn't go through the standard path.
-  mkdirSync(piDir, { recursive: true });
+  // A directory created here is reported only with onPublished supplied.
+  mkdirOwned(piDir, opts.onPublished);
 
   const registry = opts.registry ?? DEFAULT_PROVIDER_REGISTRY;
   const piProvider = resolveRuntimeProviderName(opts.provider, registry);
@@ -560,7 +563,7 @@ function writePiAgentConfig(opts: InitOptions, agentDir: string, publish: Publis
       [authPath, authContent],
     ] as const) {
       if (opts.noClobber === false && fileExists(path)) continue;
-      writeFileExclusive(path, content, opts.beforePublish, 0o600);
+      writeFileExclusive(path, content, opts.beforePublish, 0o600, opts.onPublished);
       created.push(path);
     }
     const row = providerRecord(opts.provider, registry);
@@ -595,7 +598,12 @@ function fileExists(path: string): boolean {
 /** Writes `content` to `path`, with `mode` set exactly when given. */
 type Publish = (path: string, content: string, mode?: number) => void;
 
-function writeFileReplacing(path: string, content: string, mode?: number): void {
+function writeFileReplacing(
+  path: string,
+  content: string,
+  mode?: number,
+  onPublished?: OnPublished,
+): void {
   if (mode === undefined) {
     try {
       const destination = lstatSync(path);
@@ -604,7 +612,7 @@ function writeFileReplacing(path: string, content: string, mode?: number): void 
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
-  withTempFile(path, content, mode, (temp) => renameSync(temp, path));
+  withTempFile(path, content, mode, (temp) => renameSync(temp, path), onPublished);
 }
 
 /** Write an exclusive temp file, then publish it with link(2), which fails with
@@ -615,18 +623,25 @@ function writeFileExclusive(
   content: string,
   beforePublish?: (path: string) => void,
   mode?: number,
+  onPublished?: OnPublished,
 ): void {
-  withTempFile(path, content, mode, (temp) => {
-    beforePublish?.(path);
-    try {
-      linkSync(temp, path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      throw new Error(
-        `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
-      );
-    }
-  });
+  withTempFile(
+    path,
+    content,
+    mode,
+    (temp) => {
+      beforePublish?.(path);
+      try {
+        linkSync(temp, path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        throw new Error(
+          `bob: refusing to write ${path}: an entry already exists there and bob does not replace it. Inspect it, then re-run.`,
+        );
+      }
+    },
+    onPublished,
+  );
 }
 
 function withTempFile(
@@ -634,13 +649,24 @@ function withTempFile(
   content: string,
   mode: number | undefined,
   publish: (temp: string) => void,
+  onPublished?: OnPublished,
 ): void {
   const temp = initTempPath(path);
-  const fd = openSync(
-    temp,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    mode ?? 0o666,
-  );
+  let entry: PublishedEntry | undefined;
+  const fd = openOwned(temp, mode ?? 0o666, (created) => {
+    entry = created;
+    onPublished?.(created);
+  });
+  const cleanUp = (): void => {
+    if (entry?.unresolved !== undefined) return;
+    try {
+      const st = lstatSync(temp, { bigint: true });
+      if (st.isFile() && st.dev === entry?.dev && st.ino === entry?.ino)
+        rmSync(temp, { force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  };
   try {
     try {
       writeFileSync(fd, content);
@@ -650,8 +676,12 @@ function withTempFile(
       closeSync(fd);
     }
     publish(temp);
+    const destination = pendingEntry(path, "file", onPublished);
+    destination.dev = entry?.dev;
+    destination.ino = entry?.ino;
+    delete destination.unresolved;
   } finally {
-    rmSync(temp, { force: true });
+    cleanUp();
   }
 }
 

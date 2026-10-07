@@ -19,16 +19,25 @@
 
 import { execFileSync } from "node:child_process";
 import {
-  existsSync,
-  mkdirSync,
+  type BigIntStats,
+  closeSync,
+  constants,
+  type Dirent,
+  fstatSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { gitEnvironment } from "./git-environment.js";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
+import { mkdirOwned, type OnPublished, openOwned } from "./publication-ledger.js";
 
 export interface Overrides {
   disable: {
@@ -324,44 +333,111 @@ export function resolvePositionFiles(
 
 // Initialize the local override repository: the directory, an empty override
 // document, and a Git repo with a base commit.
-export function initOverrideRepo(agentDir: string): string {
+export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): string {
   const dir = overridesDir(agentDir);
-  mkdirSync(join(dir, "files"), { recursive: true, mode: 0o700 });
+  mkdirOwned(dir, onPublished, 0o700);
+  mkdirOwned(join(dir, "files"), onPublished, 0o700);
   const docPath = join(dir, "overrides.json");
-  // `wx`: never clobber an existing document, and no existsSync-then-write
-  // window (CodeQL js/file-system-race). An existing document is left as-is.
+  // Exclusive create: never clobber an existing document, and no
+  // existsSync-then-write window (CodeQL js/file-system-race). An existing
+  // document is left as-is.
+  let fd: number | undefined;
   try {
-    writeFileSync(
-      docPath,
-      `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
-      { flag: "wx" },
-    );
+    fd = openOwned(docPath, 0o600, onPublished);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
   }
-  if (!existsSync(join(dir, ".git"))) {
-    git(["init", "--quiet"], dir);
-    git(["add", "-A"], dir);
-    git(
-      [
-        "-c",
-        "user.email=bob@tps.dev",
-        "-c",
-        "user.name=bob",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "commit",
-        "--quiet",
-        "--no-verify",
-        "-m",
-        "override baseline",
-      ],
-      dir,
-    );
+  if (fd !== undefined) {
+    try {
+      writeFileSync(
+        fd,
+        `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
+        { flag: "wx", mode: 0o600 },
+      );
+    } finally {
+      closeSync(fd);
+    }
+  }
+  const gitDir = mkdirOwned(join(dir, ".git"), onPublished, 0o700);
+  if (gitDir !== undefined) {
+    const stage = mkdtempSync(join(tmpdir(), "bob-override-git-"));
+    const stageEntry = lstatSync(stage, { bigint: true });
+    if (!stageEntry.isDirectory()) throw new Error(`${stage}: expected a staging directory`);
+    const stagedGit = join(stage, ".git");
+    const repository = ["--git-dir", stagedGit, "--work-tree", dir];
+    try {
+      git(["init", "--quiet"], stage);
+      git([...repository, "add", "-A"], dir);
+      git(
+        [
+          ...repository,
+          "-c",
+          "user.email=bob@tps.dev",
+          "-c",
+          "user.name=bob",
+          "-c",
+          "commit.gpgsign=false",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--quiet",
+          "--no-verify",
+          "-m",
+          "override baseline",
+        ],
+        dir,
+      );
+    } finally {
+      try {
+        publishGitTree(stagedGit, gitDir.path, onPublished);
+      } finally {
+        removeStagingDirectory(stage, stageEntry);
+      }
+    }
   }
   return dir;
+}
+
+function removeStagingDirectory(stage: string, entry: BigIntStats): void {
+  const st = lstatSync(stage, { bigint: true });
+  if (!st.isDirectory() || st.dev !== entry.dev || st.ino !== entry.ino) {
+    throw new Error(`${stage}: staging directory identity changed`);
+  }
+  rmSync(stage, { recursive: true, force: true });
+}
+
+function publishGitTree(from: string, to: string, onPublished?: OnPublished): void {
+  let children: Dirent[];
+  try {
+    children = readdirSync(from, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  for (const child of children) {
+    const source = join(from, child.name);
+    const destination = join(to, child.name);
+    if (child.isDirectory()) {
+      if (mkdirOwned(destination, onPublished, 0o700) === undefined) {
+        throw new Error(`${destination}: Git publication path occupied`);
+      }
+      publishGitTree(source, destination, onPublished);
+    } else {
+      const sourceFd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const st = fstatSync(sourceFd);
+        if (!st.isFile()) throw new Error(`${source}: expected a regular Git file`);
+        const destinationFd = openOwned(destination, 0o600, onPublished);
+        try {
+          writeFileSync(destinationFd, readFileSync(sourceFd), { flag: "wx", mode: 0o600 });
+        } finally {
+          closeSync(destinationFd);
+        }
+      } finally {
+        closeSync(sourceFd);
+      }
+    }
+  }
 }
 
 // bob#248: the Git calls that initialize this repository (run only when it has

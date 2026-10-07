@@ -4,9 +4,9 @@
 //   * `hireAgent`     — scaffold a NEW agent from a packaged position, ratify the
 //                       host grant, store the diff baseline, initialize the
 //                       override repository, and run the hiring interview. It
-//                       validates the candidate BEFORE it writes anything, so a
-//                       refused hire leaves no scaffold, grant or override
-//                       repository behind.
+//                       validates the candidate BEFORE it writes anything; a
+//                       failed hire attempts rollback and names observed leftovers;
+//                       arrivals after listing are missed.
 //   * `adoptAgent`    — bind an EXISTING agent to a position: independently
 //                       resolve it before and after, verify its requests, REQUIRE
 //                       the two resolutions to be equal, then record the
@@ -22,7 +22,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { readAgentRole, readCapabilities, readTools } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { resolveCapabilities } from "./capability-loader.js";
@@ -50,9 +50,15 @@ import {
 } from "./host-grant.js";
 import { type InitResult, initAgent } from "./init.js";
 import { type OnboardResult, runOnboard, type SessionRunner } from "./onboard.js";
-import { initOverrideRepo, overridesDir } from "./overrides.js";
+import { initOverrideRepo } from "./overrides.js";
 import { DEFAULT_POSITIONS_ROOT, type LoadedPosition, loadPosition } from "./positions.js";
 import { defaultProviderName, type ProviderRegistry } from "./provider-registry.js";
+import {
+  mkdirOwned,
+  type PublishedEntry,
+  type RollbackReport,
+  rollbackPublished,
+} from "./publication-ledger.js";
 import { loadRole } from "./role-loader.js";
 import { assertProviderRunnable, mapBobProviderToPi, resolveAgentToolPolicy } from "./run.js";
 import type { SessionDeps } from "./session.js";
@@ -101,8 +107,8 @@ function readablePosition(hostRoot: string, agentDir: string, name: string): str
   return undefined;
 }
 
-// Occupancy and rollback ownership concern directory entries, not their targets.
-// Only ENOENT proves absence; an unreadable entry must never be claimed as ours.
+// Occupancy concerns directory entries, not their targets. Only ENOENT proves
+// absence; an unreadable entry is occupied.
 function entryPresent(path: string): boolean {
   try {
     lstatSync(path);
@@ -137,35 +143,75 @@ export type BindStep = "scaffold" | "interview" | "grant" | "marker" | "baseline
 
 export interface BindHooks {
   // Test-only failure-injection seam: invoked AFTER each bind step, so a test can
-  // throw at a chosen step and prove the rollback removes exactly what this
-  // operation created. Never set in production.
+  // throw at a chosen step and prove what the rollback removes and what it keeps.
+  // Never set in production.
   afterStep?: (step: BindStep) => void;
 }
 
-// The ledger of paths THIS operation creates, so a later failure removes exactly
-// them and nothing else. When the agent directory was created here, every
-// scaffold file (including the marker and the override repository) lives inside
-// it, so removing it is complete; for adoption the agent directory pre-exists, so
-// only the marker, the override repository (when this operation created it) and
-// the host grant/baseline are removed.
+// Ledger entries include scaffold parents; grant and baseline use path cleanup.
 interface BindTxn {
   agentDir: string;
-  agentDirCreated: boolean;
-  markerPath?: string;
-  overrideDirCreated: boolean;
+  // Traversal base: agents root for hire, agent directory for adoption;
+  // recorded scaffold parents can be roots above it.
+  base: string;
+  published: PublishedEntry[];
   grantPath?: string;
   baselinePath?: string;
 }
 
-function rollbackBind(tx: BindTxn): void {
-  if (tx.agentDirCreated) {
-    rmSync(tx.agentDir, { recursive: true, force: true });
-  } else {
-    if (tx.markerPath !== undefined) rmSync(tx.markerPath, { force: true });
-    if (tx.overrideDirCreated) rmSync(overridesDir(tx.agentDir), { recursive: true, force: true });
+// Attempt ledger cleanup and recorded host-path cleanup independently.
+// Grant/baseline paths are recorded only after their writes return.
+function rollbackBind(tx: BindTxn): RollbackReport {
+  const report: RollbackReport = { leftovers: [], stranded: [], errors: [] };
+  try {
+    const own = rollbackPublished({
+      base: tx.base,
+      reportBase: tx.agentDir,
+      entries: tx.published,
+    });
+    report.leftovers.push(...own.leftovers);
+    report.stranded.push(...own.stranded);
+    report.errors.push(...own.errors);
+  } catch (err) {
+    report.errors.push(`${tx.agentDir}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (tx.grantPath !== undefined) rmSync(tx.grantPath, { force: true });
-  if (tx.baselinePath !== undefined) rmSync(tx.baselinePath, { force: true });
+  for (const path of [tx.grantPath, tx.baselinePath]) {
+    if (path === undefined) continue;
+    try {
+      // rmSync removes a symlink entry itself, without following it.
+      rmSync(path, { force: true });
+    } catch (err) {
+      report.errors.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return report;
+}
+
+function refusalAfterRollback(
+  err: unknown,
+  operation: "hire" | "adoption",
+  agentDir: string,
+  report: RollbackReport,
+): unknown {
+  const notes: string[] = [];
+  if (report.leftovers.length > 0) {
+    const named = report.leftovers.map((p) => (p === "." ? "the agent directory itself" : p));
+    notes.push(
+      `Rollback for this failed ${operation} retained or could not verify these paths (relative to ${agentDir}): ${named.join(", ")}.`,
+    );
+  }
+  for (const s of report.stranded) {
+    notes.push(
+      `${s.original}: rollback could not finish cleanup at ${s.quarantine} (paths relative to it): ${s.leftovers.join(", ")}.`,
+    );
+  }
+  if (report.errors.length > 0) {
+    notes.push(`The rollback could not complete these steps: ${report.errors.join("; ")}.`);
+  }
+  if (notes.length === 0) return err;
+  return new Error(`${err instanceof Error ? err.message : String(err)} ${notes.join(" ")}`, {
+    cause: err,
+  });
 }
 
 // A grant built from a ratifiable position + role. maxTools/maxCapabilities are
@@ -279,11 +325,7 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 // Hire a NEW agent from a packaged position. ASYNC because it runs the existing
 // onboarding interview after the candidate is validated and scaffolded.
 //
-// Order: EVERY deterministic refusal runs before anything is written; the
-// scaffold and interview then run under a transaction, and the file commit
-// (grant, marker, baseline, override repository) removes everything THIS
-// operation created on any later failure. So a refused hire — including a failed
-// interview — leaves no scaffold and no half-written binding.
+// The scaffold, interview and file commit run under bind rollback (bob#326).
 export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
   if (opts.skipFlair === false) {
@@ -341,10 +383,9 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   const soulFile = effective.files.find((f) => f.kind === "soul");
 
   // --- The bind: scaffold, interview and the file commit, under a rollback. ---
-  const tx: BindTxn = {
-    agentDir,
-    agentDirCreated: !entryPresent(agentDir),
-    overrideDirCreated: false,
+  const tx: BindTxn = { agentDir, base: dirname(agentDir), published: [] };
+  const onPublished = (entry: PublishedEntry) => {
+    tx.published.push(entry);
   };
   try {
     const init = initAgent({
@@ -353,6 +394,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
       provider,
       model,
       agentsRoot: opts.agentsRoot,
+      onPublished,
       ...(opts.registry !== undefined ? { registry: opts.registry } : {}),
       capabilities: position.manifest.capabilities.default,
       toolAllow: position.manifest.tools,
@@ -390,8 +432,7 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     tx.grantPath = grantPath(hostRoot, opts.name);
     opts.commitHook?.("grant");
 
-    writeBindingMarker(init.agentDir, grant);
-    tx.markerPath = bindingMarkerPath(init.agentDir);
+    writeBindingMarker(init.agentDir, grant, onPublished);
     opts.commitHook?.("marker");
 
     // The baseline is snapshotted AFTER the interview: what the operator ratified
@@ -402,14 +443,12 @@ export async function hireAgent(opts: HireOptions): Promise<HireResult> {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !entryPresent(overridesDir(init.agentDir));
-    const overrideDir = initOverrideRepo(init.agentDir);
+    const overrideDir = initOverrideRepo(init.agentDir, onPublished);
     opts.commitHook?.("override-repo");
 
     return { agentDir: init.agentDir, init, grant, baseline, overrideDir, effective, interview };
   } catch (err) {
-    rollbackBind(tx);
-    throw err;
+    throw refusalAfterRollback(err, "hire", tx.agentDir, rollbackBind(tx));
   }
 }
 
@@ -568,19 +607,18 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     );
   }
 
-  // --- The file commit, under a rollback. The agent directory PRE-EXISTS (it was
-  // scaffolded by bob init), so on a later failure only the marker, the override
-  // repository (when this operation created it) and the host grant/baseline are
-  // removed — the existing bob.yaml, soul.md and any other file are untouched. ---
-  const tx: BindTxn = { agentDir, agentDirCreated: false, overrideDirCreated: false };
+  const tx: BindTxn = { agentDir, base: agentDir, published: [] };
+  const onPublished = (entry: PublishedEntry) => {
+    tx.published.push(entry);
+  };
   try {
+    mkdirOwned(agentDir, onPublished);
     const soulHashBefore = soulHashOf(agentDir);
     writeGrant(hostRoot, grant);
     tx.grantPath = grantPath(hostRoot, opts.name);
     opts.commitHook?.("grant");
 
-    writeBindingMarker(agentDir, grant);
-    tx.markerPath = bindingMarkerPath(agentDir);
+    writeBindingMarker(agentDir, grant, onPublished);
     opts.commitHook?.("marker");
 
     const baseline = snapshotForDiff(effective, soulHashBefore);
@@ -589,8 +627,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
     tx.baselinePath = baselinePath(hostRoot, opts.name);
     opts.commitHook?.("baseline");
 
-    tx.overrideDirCreated = !entryPresent(overridesDir(agentDir));
-    const overrideDir = initOverrideRepo(agentDir);
+    const overrideDir = initOverrideRepo(agentDir, onPublished);
     opts.commitHook?.("override-repo");
 
     const soulHashAfter = soulHashOf(agentDir);
@@ -608,8 +645,7 @@ export function adoptAgent(opts: AdoptOptions): AdoptResult {
       diff,
     };
   } catch (err) {
-    rollbackBind(tx);
-    throw err;
+    throw refusalAfterRollback(err, "adoption", tx.agentDir, rollbackBind(tx));
   }
 }
 
