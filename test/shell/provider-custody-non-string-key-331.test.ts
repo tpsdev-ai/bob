@@ -85,8 +85,10 @@ describe("bob#331 — a non-string stored key through the real session factory",
 
       const { config, policy } = resolveRunConfig({ name, agentsRoot: tmpRoot });
       const factory = createBobRuntimeFactory({ config, policy });
+      process.env.OPENAI_API_KEY = "bob-331-disposable-sentinel";
       const result = await factory({ sessionManager: SessionManager.inMemory(config.cwd) });
       try {
+        expect(process.env.OPENAI_API_KEY).toBeUndefined();
         const runtime = result.services.modelRuntime as unknown as ModelRuntime;
         const bobError = await failure(runtime.getAuth(PROVIDER));
         const piRuntime = await ModelRuntime.create({
