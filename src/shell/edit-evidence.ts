@@ -19,6 +19,11 @@ import { TOOL_EFFECTS } from "./tool-allowlist.js";
 // Writer effects that run a command or a request rather than editing a file.
 const COMMAND_RUNNER_TOOLS: ReadonlySet<string> = new Set(["run", "bash", "powershell"]);
 
+/** True when the name runs a command (run, bash, PowerShell) rather than editing a file. */
+export function isCommandRunnerTool(toolName: string): boolean {
+  return COMMAND_RUNNER_TOOLS.has(toolName);
+}
+
 /** True when the name is a write-class FILE-EDIT tool. */
 export function isFileEditTool(toolName: string): boolean {
   return (

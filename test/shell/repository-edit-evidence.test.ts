@@ -1163,7 +1163,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
       const result = await run(
         [{ toolName: "run", action: () => firstCommit(cwd) }, { toolName: "read" }],
         undefined,
-        gate === "exploration" ? 2 : 20,
+        gate === "exploration" ? 1 : 20,
       );
       expect(git(cwd, "rev-parse", "--verify", "HEAD")).toHaveLength(40);
       expect(result.exitCode).toBe(0);
@@ -1227,7 +1227,7 @@ describe("repository evidence in the completion gate and exploration budget", ()
           { toolName: "read" },
         ],
         undefined,
-        gate === "exploration" ? 2 : 20,
+        gate === "exploration" ? 1 : 20,
       );
       expect(result.exitCode).toBe(0);
       expect(result.noEditNoBlocked).toBeUndefined();
@@ -1611,6 +1611,30 @@ describe("repository evidence in the completion gate and exploration budget", ()
         { toolName: "bash", action: () => writeFileSync(join(cwd, "tracked"), "edit\n") },
         { toolName: "read" },
         { toolName: "read" },
+      ],
+      undefined,
+      2,
+    );
+    expect(result.explorationBudgetExhausted).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("credits the edit a command commits on the call that reaches the budget", async () => {
+    // The fourth call's start reaches twice the budget (the exhaust threshold).
+    // The command commits an edit as it runs, so its evidence must credit the run
+    // rather than leave it ended as exhausted.
+    const result = await run(
+      [
+        { toolName: "read" },
+        { toolName: "read" },
+        { toolName: "read" },
+        {
+          toolName: "run",
+          action: () => {
+            writeFileSync(join(cwd, "tracked"), "committed edit\n");
+            commit(cwd);
+          },
+        },
       ],
       undefined,
       2,

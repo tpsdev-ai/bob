@@ -1,4 +1,9 @@
-import { isFileEditTool, isVerifiedEdit, type RepositoryEditEvidence } from "./edit-evidence.js";
+import {
+  isCommandRunnerTool,
+  isFileEditTool,
+  isVerifiedEdit,
+  type RepositoryEditEvidence,
+} from "./edit-evidence.js";
 
 export const BUILDER_LOCAL_EXPLORATION_BUDGET = 20;
 
@@ -40,6 +45,13 @@ export class ExplorationBudgetDetector {
     if (isFileEditTool(toolName)) {
       return { nonProgressCalls: this.count, inject: false, exhaust: false };
     }
+    if (isCommandRunnerTool(toolName)) {
+      // Count the command now so an instruction can fire at the limit, but defer
+      // the exhaust decision to its end: a command that makes and commits an edit
+      // on this very call must credit that edit instead of ending the run.
+      this.count += 1;
+      return { nonProgressCalls: this.count, inject: this.count === this.limit, exhaust: false };
+    }
     return this.countNonProgress();
   }
 
@@ -53,6 +65,14 @@ export class ExplorationBudgetDetector {
       this.count = 0;
     } else if (isFileEditTool(toolName)) {
       return this.countNonProgress();
+    } else if (isCommandRunnerTool(toolName)) {
+      // The command produced no edit. Its start already counted it, so the
+      // exhaust threshold is reached here.
+      return {
+        nonProgressCalls: this.count,
+        inject: false,
+        exhaust: this.count >= this.limit * 2,
+      };
     }
     return { nonProgressCalls: this.count, inject: false, exhaust: false };
   }

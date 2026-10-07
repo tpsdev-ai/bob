@@ -1,0 +1,1 @@
+- **The exploration budget credits an edit made by the command that reaches the budget.** Closes #314.
