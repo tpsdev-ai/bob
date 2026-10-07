@@ -13,7 +13,17 @@
 //
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_POSITIONS_ROOT, hireAgent, initOverrideRepo } from "../../src/shell/index.js";
@@ -104,6 +114,60 @@ describe("the override repository's initializing Git calls start no automatic ma
     initOverrideRepo(agentDir);
     expect(existsSync(join(agentDir, "overrides", ".git"))).toBe(true);
     expect(traceProblems(parseTrace(traceLines(tracePath)))).toEqual([]);
+  });
+
+  it("staging and published Git permissions", () => {
+    const base = scratchDir();
+    const agentDir = join(base, "agent");
+    mkdirSync(agentDir);
+    const execute = childProcess.execFileSync;
+    let stage: string | undefined;
+    traceSpy = spyOn(childProcess, "execFileSync").mockImplementation((command, args, options) => {
+      if (args?.includes("init")) {
+        stage = String(options?.cwd);
+        expect(stage.startsWith(join(tmpdir(), "bob-override-git-"))).toBe(true);
+        expect(lstatSync(stage).mode & 0o777).toBe(0o700);
+      }
+      return execute(command, args as string[], options);
+    });
+    const dir = initOverrideRepo(agentDir);
+    expect(stage).toBeDefined();
+    expect(existsSync(stage as string)).toBe(false);
+    const checkModes = (path: string): void => {
+      const st = lstatSync(path);
+      expect(st.mode & 0o777).toBe(st.isDirectory() ? 0o700 : 0o600);
+      if (st.isDirectory()) {
+        for (const name of readdirSync(path)) checkModes(join(path, name));
+      }
+    };
+    checkModes(dir);
+    expect(
+      execute("git", ["log", "-1", "--format=%s"], { cwd: dir, encoding: "utf8" }).trim(),
+    ).toBe("override baseline");
+  });
+
+  it("retains a replacement staging directory when cleanup checks its identity", () => {
+    const base = scratchDir();
+    const agentDir = join(base, "agent");
+    mkdirSync(agentDir);
+    const execute = childProcess.execFileSync;
+    let stage: string | undefined;
+    let replacementIno: bigint | undefined;
+    traceSpy = spyOn(childProcess, "execFileSync").mockImplementation((command, args, options) => {
+      if (args?.includes("init")) stage = String(options?.cwd);
+      const result = execute(command, args as string[], options);
+      if (args?.includes("commit")) {
+        renameSync(stage as string, join(base, "stage-aside"));
+        mkdirSync(stage as string, { mode: 0o700 });
+        scratch.push(stage as string);
+        replacementIno = lstatSync(stage as string, { bigint: true }).ino;
+        writeFileSync(join(stage as string, "foreign"), "retained", { flag: "wx", mode: 0o600 });
+      }
+      return result;
+    });
+    expect(() => initOverrideRepo(agentDir)).toThrow("staging directory identity changed");
+    expect(lstatSync(stage as string, { bigint: true }).ino).toBe(replacementIno as bigint);
+    expect(readFileSync(join(stage as string, "foreign"), "utf8")).toBe("retained");
   });
 
   it("hire", async () => {

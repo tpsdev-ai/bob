@@ -18,13 +18,14 @@
 // (host-grant.ts), not a Git ref.
 
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   type Dirent,
   fstatSync,
   lstatSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -36,12 +37,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { gitEnvironment } from "./git-environment.js";
 import { assertRelativeSafe, type LoadedPosition, readPositionFile } from "./positions.js";
-import {
-  mkdirOwned,
-  type OnPublished,
-  openOwned,
-  type PublishedEntry,
-} from "./publication-ledger.js";
+import { mkdirOwned, type OnPublished, openOwned } from "./publication-ledger.js";
 
 export interface Overrides {
   disable: {
@@ -347,7 +343,7 @@ export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): s
   // document is left as-is.
   let fd: number | undefined;
   try {
-    fd = openOwned(docPath, 0o666, onPublished);
+    fd = openOwned(docPath, 0o600, onPublished);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
   }
@@ -356,33 +352,17 @@ export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): s
       writeFileSync(
         fd,
         `${JSON.stringify({ disable: { tools: [], capabilities: [] }, files: [] }, null, 2)}\n`,
+        { flag: "wx", mode: 0o600 },
       );
     } finally {
       closeSync(fd);
     }
   }
-  const gitDir = mkdirOwned(join(dir, ".git"), onPublished);
+  const gitDir = mkdirOwned(join(dir, ".git"), onPublished, 0o700);
   if (gitDir !== undefined) {
-    const stage = join(tmpdir(), `bob-override-git-${randomUUID()}`);
-    let stageEntry: PublishedEntry | undefined;
-    try {
-      mkdirOwned(
-        stage,
-        (entry) => {
-          stageEntry = entry;
-        },
-        0o700,
-      );
-    } catch (err) {
-      throw new Error(`${stage}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (
-      stageEntry === undefined ||
-      stageEntry.created === false ||
-      stageEntry.unresolved !== undefined
-    ) {
-      throw new Error(`${stage}: staging directory identity unresolved or path occupied`);
-    }
+    const stage = mkdtempSync(join(tmpdir(), "bob-override-git-"));
+    const stageEntry = lstatSync(stage, { bigint: true });
+    if (!stageEntry.isDirectory()) throw new Error(`${stage}: expected a staging directory`);
     const stagedGit = join(stage, ".git");
     const repository = ["--git-dir", stagedGit, "--work-tree", dir];
     try {
@@ -418,7 +398,7 @@ export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): s
   return dir;
 }
 
-function removeStagingDirectory(stage: string, entry: PublishedEntry): void {
+function removeStagingDirectory(stage: string, entry: BigIntStats): void {
   const st = lstatSync(stage, { bigint: true });
   if (!st.isDirectory() || st.dev !== entry.dev || st.ino !== entry.ino) {
     throw new Error(`${stage}: staging directory identity changed`);
@@ -438,7 +418,7 @@ function publishGitTree(from: string, to: string, onPublished?: OnPublished): vo
     const source = join(from, child.name);
     const destination = join(to, child.name);
     if (child.isDirectory()) {
-      if (mkdirOwned(destination, onPublished) === undefined) {
+      if (mkdirOwned(destination, onPublished, 0o700) === undefined) {
         throw new Error(`${destination}: Git publication path occupied`);
       }
       publishGitTree(source, destination, onPublished);
@@ -447,9 +427,9 @@ function publishGitTree(from: string, to: string, onPublished?: OnPublished): vo
       try {
         const st = fstatSync(sourceFd);
         if (!st.isFile()) throw new Error(`${source}: expected a regular Git file`);
-        const destinationFd = openOwned(destination, st.mode & 0o777, onPublished);
+        const destinationFd = openOwned(destination, 0o600, onPublished);
         try {
-          writeFileSync(destinationFd, readFileSync(sourceFd));
+          writeFileSync(destinationFd, readFileSync(sourceFd), { flag: "wx", mode: 0o600 });
         } finally {
           closeSync(destinationFd);
         }
