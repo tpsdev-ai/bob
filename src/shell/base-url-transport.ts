@@ -1,4 +1,8 @@
-import { createAssistantMessageEventStream, lazyStream } from "@earendil-works/pi-ai";
+import {
+  type AssistantMessage,
+  createAssistantMessageEventStream,
+  lazyStream,
+} from "@earendil-works/pi-ai";
 import {
   stream as openaiStream,
   streamSimple as openaiStreamSimple,
@@ -7,7 +11,7 @@ import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-option
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type ProviderRequestPolicy,
-  type ProviderRequestTimeoutError,
+  ProviderRequestTimeoutError,
   type ProviderStreamIdleTimeoutError,
   withStreamTimeouts,
 } from "./provider-request-policy.js";
@@ -77,19 +81,60 @@ export function installBaseUrlTransport(
     const controller = new AbortController();
     const supplied = (options ?? {}) as Record<string, unknown>;
     const callerSignal = supplied.signal as AbortSignal | undefined;
-    let timeoutError: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError | undefined;
+    const stream = createAssistantMessageEventStream();
+    let finished = false;
+    let partial: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "pending",
+      timestamp: Date.now(),
+    };
+    let deadlineHandle: ReturnType<typeof setTimeout> | undefined;
     const onCallerAbort = () => controller.abort(callerSignal?.reason);
+    const cleanup = () => {
+      finished = true;
+      if (deadlineHandle !== undefined) clearTimeout(deadlineHandle);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+      stream.end();
+    };
+    const onTimeout = (error: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError) => {
+      if (finished) return;
+      const message = structuredClone(partial);
+      message.stopReason = "error";
+      message.errorMessage = `${error.name}: ${error.message}`;
+      stream.push({ type: "error", reason: "error", error: message });
+      cleanup();
+      controller.abort(error);
+    };
     if (request !== undefined) {
       if (callerSignal?.aborted) onCallerAbort();
       else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
     }
+    const totalTimeoutMs = request?.totalTimeoutMs ?? 0;
+    const deadlineMs =
+      totalTimeoutMs > 0 && request !== undefined && request.maxRetries > 0
+        ? Date.now() + totalTimeoutMs
+        : undefined;
+    if (deadlineMs !== undefined) {
+      deadlineHandle = setTimeout(() => {
+        onTimeout(new ProviderRequestTimeoutError(provider, totalTimeoutMs));
+      }, totalTimeoutMs);
+    }
     const requestFetch =
       request === undefined
         ? guardedFetch
-        : withStreamTimeouts(guardedFetch, request, provider, undefined, (error) => {
-            timeoutError = error;
-            controller.abort(error);
-          });
+        : withStreamTimeouts(guardedFetch, request, provider, undefined, onTimeout, deadlineMs);
     // bob#185 item 2: the row's per-turn budget sets the request's thinking
     // level and names `max_tokens` as its output-cap field. The row's keyless
     // model is scaffolded non-reasoning, so a budget marks it reasoning-capable
@@ -143,21 +188,16 @@ export function installBaseUrlTransport(
       fetch: requestFetch,
     } as never);
     if (request === undefined) return source;
-    const stream = createAssistantMessageEventStream();
     void (async () => {
       try {
         for await (const event of source) {
-          if (event.type === "error" && timeoutError !== undefined) {
-            event.error.stopReason = "error";
-            event.error.errorMessage = `${timeoutError.name}: ${timeoutError.message}`;
-            stream.push({ ...event, reason: "error" });
-          } else {
-            stream.push(event);
-          }
+          if (finished) break;
+          if ("partial" in event) partial = event.partial;
+          stream.push(event);
+          if (event.type === "done" || event.type === "error") cleanup();
         }
       } finally {
-        callerSignal?.removeEventListener("abort", onCallerAbort);
-        stream.end();
+        cleanup();
       }
     })();
     return stream;

@@ -60,6 +60,7 @@ export function withStreamTimeouts(
   provider: string,
   timers: TimerSeam = systemTimers,
   onTimeout?: (error: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError) => void,
+  deadlineMs?: number,
 ): typeof globalThis.fetch {
   const wrapped = async (
     input: Parameters<typeof globalThis.fetch>[0],
@@ -102,9 +103,16 @@ export function withStreamTimeouts(
     };
 
     if (policy.totalTimeoutMs > 0) {
-      totalHandle = timers.setTimeout(() => {
+      const remaining = deadlineMs === undefined ? policy.totalTimeoutMs : deadlineMs - Date.now();
+      if (remaining <= 0) {
         abortTimeout(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
-      }, policy.totalTimeoutMs);
+        cleanup();
+        throw controller.signal.reason;
+      } else {
+        totalHandle = timers.setTimeout(() => {
+          abortTimeout(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
+        }, remaining);
+      }
     }
     armIdle();
 
