@@ -15,6 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   fchmodSync,
@@ -28,6 +29,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -214,10 +216,6 @@ export function initAgent(opts: InitOptions): InitResult {
       throw err;
     }
   } else {
-    // A run killed between creating a temp and renaming it into place leaves
-    // the temp behind. Cleanup runs on the --force path: it is the rerun that
-    // reaches publication. A plain rerun refuses an existing agent directory
-    // above, before any publication, so it never gets here.
     removeStaleInitTemps(agentDir, root);
   }
 
@@ -642,26 +640,19 @@ function withTempFile(
   }
 }
 
-/** A temp file's owner, as its name carries it: the writing process's pid and
- *  a start token. On Linux the token is /proc's starttime field, so a reused pid
- *  is told apart from the process that wrote the temp. */
 export interface InitTempOwner {
   pid: number;
+  kind: "k" | "w";
   start: string;
 }
 
-// The fixed token every init temp's NAME carries, between the destination's
-// basename and the owner marker. Cleanup removes only names that carry it.
 const INIT_TEMP_TOKEN = "bob-init";
+type ProcessStartReader = (pid: number) => string | undefined;
 
-/** The start token of `pid`, or undefined when this platform cannot report it
- *  (no /proc) and the caller must not treat absence as proof. */
 function readProcessStartToken(pid: number): string | undefined {
   if (process.platform !== "linux") return undefined;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // After "(comm)" the fields start at field 3 (state), so starttime (22) is
-    // index 19. comm can hold spaces and parens, so cut at the last ")".
     const fields = stat
       .slice(stat.lastIndexOf(")") + 2)
       .trim()
@@ -672,102 +663,131 @@ function readProcessStartToken(pid: number): string | undefined {
   }
 }
 
-/** The owner identity a process signs a temp with, defaulting to this process. */
-export function initTempOwner(pid: number = process.pid): InitTempOwner {
-  const start =
-    readProcessStartToken(pid) ?? String(Math.floor(Date.now() - process.uptime() * 1000));
-  return { pid, start };
+export function initTempOwner(
+  pid: number = process.pid,
+  readStart: ProcessStartReader = readProcessStartToken,
+): InitTempOwner {
+  const start = readStart(pid);
+  if (start !== undefined && /^\d+$/.test(start)) return { pid, kind: "k", start };
+  return { pid, kind: "w", start: String(Math.floor(Date.now() - process.uptime() * 1000)) };
 }
 
-/** The sibling temp init writes `destination` through: the destination's basename
- *  plus an init token, the owner marker and a random suffix, all in-dir. */
 export function initTempPath(destination: string, owner: InitTempOwner = initTempOwner()): string {
-  const name = `.${basename(destination)}-${INIT_TEMP_TOKEN}-${owner.pid}-${owner.start}-${randomUUID()}.tmp`;
+  const name = `.${basename(destination)}-${INIT_TEMP_TOKEN}-${owner.pid}-${owner.kind}${owner.start}-${randomUUID()}.tmp`;
   return join(dirname(destination), name);
 }
 
-const INIT_TEMP_NAME = new RegExp(`^\\.(.+)-${INIT_TEMP_TOKEN}-(\\d+)-(\\d+)-[0-9a-fA-F-]+\\.tmp$`);
+const INIT_TEMP_NAME = new RegExp(
+  `^\\.(.+)-${INIT_TEMP_TOKEN}-(\\d+)-([kw])(\\d+)-[0-9a-fA-F-]+\\.tmp$`,
+);
 
-/** The owner a temp's name carries, or undefined when the name is not init's. */
 function parseInitTempOwner(name: string): InitTempOwner | undefined {
   const match = INIT_TEMP_NAME.exec(name);
   if (match === null) return undefined;
-  return { pid: Number(match[2]), start: match[3] };
+  return { pid: Number(match[2]), kind: match[3] as InitTempOwner["kind"], start: match[4] };
 }
 
-/** True only when the process that wrote the temp has provably exited. Anything
- *  short of proof (a live pid, an unreadable start token, a probe error) keeps. */
-function ownerHasExited(owner: InitTempOwner): boolean {
+function ownerHasExited(owner: InitTempOwner, readStart: ProcessStartReader): boolean {
   if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
   try {
     process.kill(owner.pid, 0);
   } catch (err) {
-    // ESRCH: no such process. EPERM (present, not ours) and any other error: keep.
     return (err as NodeJS.ErrnoException).code === "ESRCH";
   }
-  const current = readProcessStartToken(owner.pid);
-  if (current === undefined) return false;
+  if (owner.kind !== "k") return false;
+  const current = readStart(owner.pid);
+  if (current === undefined || !/^\d+$/.test(current)) return false;
   return current !== owner.start;
 }
 
-/** True when `dir` is reached from `base` through a symlinked directory (lstat
- *  every component from `base` down). A `dir` outside `base` counts as reached
- *  through a symlink. Bounding at `base` keeps the operating system's own
- *  symlinks above the agent root (for example macOS /tmp) from refusing cleanup. */
-function hasSymlinkComponent(base: string, dir: string): boolean {
+type DirectoryIdentity = { path: string; dev: bigint; ino: bigint };
+
+function directoryChain(base: string, dir: string): DirectoryIdentity[] | undefined {
   const root = resolve(base);
   const target = resolve(dir);
-  if (target !== root && !target.startsWith(`${root}${sep}`)) return true;
-  const chain = [root];
+  if (target !== root && !target.startsWith(`${root}${sep}`)) return undefined;
+  const paths = [root];
   let current = root;
   if (target !== root) {
     for (const part of target.slice(root.length + 1).split(sep)) {
       current = join(current, part);
-      chain.push(current);
+      paths.push(current);
     }
   }
-  for (const path of chain) {
-    try {
-      if (lstatSync(path).isSymbolicLink()) return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw err;
-    }
+  const chain: DirectoryIdentity[] = [];
+  for (const path of paths) {
+    const stat = entryIdentity(path);
+    if (stat === undefined || !stat.isDirectory() || stat.isSymbolicLink()) return undefined;
+    chain.push({ path, dev: stat.dev, ino: stat.ino });
   }
-  return false;
+  return chain;
 }
 
-/** True when `path` lstat's as a regular file; ENOENT is false, other errors throw. */
-function isRegularFile(path: string): boolean {
+function entryIdentity(path: string): BigIntStats | undefined {
   try {
-    return lstatSync(path).isFile();
+    return lstatSync(path, { bigint: true });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
     throw err;
   }
 }
 
-/** Remove the temps a killed run left in the directories init manages, and
- *  return the paths removed. Never descends through a symlinked directory at or
- *  below the agent root, and never removes a temp whose owner is not proven gone. */
-export function removeStaleInitTemps(agentDir: string, agentsRoot: string): string[] {
+function directoryUnchanged(chain: DirectoryIdentity[]): boolean {
+  return chain.every(({ path, dev, ino }) => {
+    const stat = entryIdentity(path);
+    return stat?.isDirectory() && !stat.isSymbolicLink() && stat.dev === dev && stat.ino === ino;
+  });
+}
+
+interface InitTempCleanupOptions {
+  readStart?: ProcessStartReader;
+  beforeList?: (dir: string) => void;
+  beforeUnlink?: (path: string) => void;
+}
+
+export function removeStaleInitTemps(
+  agentDir: string,
+  agentsRoot: string,
+  options: InitTempCleanupOptions = {},
+): string[] {
   const removed: string[] = [];
-  for (const dir of [agentDir, join(agentDir, "bin"), join(agentDir, ".pi-agent")]) {
-    if (hasSymlinkComponent(agentsRoot, dir)) continue;
+  const directories = [agentDir, join(agentDir, "bin"), join(agentDir, ".pi-agent")].map((dir) => ({
+    dir,
+    chain: directoryChain(agentsRoot, dir),
+  }));
+  for (const { dir, chain } of directories) {
+    if (chain === undefined) continue;
+    const unchanged = () => {
+      if (directoryUnchanged(chain)) return true;
+      console.error(`bob: keeping remaining init temps in ${dir}: directory identity changed`);
+      return false;
+    };
+    options.beforeList?.(dir);
+    if (!unchanged()) continue;
     let names: string[];
     try {
       names = readdirSync(dir);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if (!unchanged()) continue;
       throw err;
     }
-    for (const name of names) {
-      const owner = parseInitTempOwner(name);
-      if (owner === undefined || !ownerHasExited(owner)) continue;
+    if (!unchanged()) continue;
+    const entries = names.map((name) => {
       const path = join(dir, name);
-      if (!isRegularFile(path)) continue; // a symlink or a directory is not init's temp.
+      return { path, owner: parseInitTempOwner(name), stat: entryIdentity(path) };
+    });
+    for (const { path, owner, stat } of entries) {
+      if (owner === undefined || !stat?.isFile()) continue;
+      if (!ownerHasExited(owner, options.readStart ?? readProcessStartToken)) continue;
+      options.beforeUnlink?.(path);
+      const current = entryIdentity(path);
+      if (!unchanged()) break;
+      if (!current?.isFile() || current.dev !== stat.dev || current.ino !== stat.ino) continue;
+      // Node has no unlinkat: a same-user process can swap a managed directory
+      // or this entry between the last identity checks and the pathname unlink.
       try {
-        rmSync(path, { force: true }); // unlink(2): removes the entry, never a link's target.
+        unlinkSync(path);
         removed.push(path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
