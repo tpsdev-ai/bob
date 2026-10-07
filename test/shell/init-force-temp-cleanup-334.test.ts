@@ -244,31 +244,55 @@ describe("bob#334 — init temp cleanup on the --force path", () => {
     const { child, agentDir, temp } = await holdInit(root, "agent-a", "soul.md");
     await stop(child);
     const entries: PublishedEntry[] = [];
-    initAgent({
-      ...initOptions(root, "agent-a"),
-      noClobber: false,
-      onPublished: (entry) => entries.push(entry),
-    });
-    expect(tempsIn(agentDir)).not.toContain(basename(temp));
-    expect(entries.some((entry) => entry.path === temp)).toBe(false);
-    const soul = join(agentDir, "soul.md");
-    const publication = entries.find((entry) => entry.path === soul);
-    const soulFd = fs.openSync(soul, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const identity = fs.fstatSync(soulFd, { bigint: true });
-    fs.closeSync(soulFd);
-    expect(publication).toMatchObject({ dev: identity.dev, ino: identity.ino, kind: "file" });
-    const ownTemp = entries.find(
-      (entry) => entry.kind === "file" && entry.ino === identity.ino && entry.path !== soul,
-    );
-    expect(ownTemp).toBeDefined();
-    expect(basename(ownTemp?.path ?? "")).toContain(`-bob-init-${process.pid}-`);
-    const replacement = join(root, "replacement");
-    writeFileSync(replacement, "another writer\n");
-    renameSync(replacement, soul);
-    const report = rollbackPublished({ base: root, reportBase: agentDir, entries });
-    expect(readFileSync(soul, "utf8")).toBe("another writer\n");
-    expect(report.leftovers).toContain("soul.md");
-    expect(report.errors).toEqual([]);
+    const descriptors: number[] = [];
+    try {
+      initAgent({
+        ...initOptions(root, "agent-a"),
+        noClobber: false,
+        onPublished: (entry) => {
+          entries.push(entry);
+          if (entry.kind === "file" && basename(entry.path).startsWith(".soul.md-bob-init-")) {
+            descriptors.push(openSync(entry.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW));
+          }
+        },
+      });
+      expect(descriptors).toHaveLength(1);
+      expect(tempsIn(agentDir)).not.toContain(basename(temp));
+      expect(entries.some((entry) => entry.path === temp)).toBe(false);
+      const soul = join(agentDir, "soul.md");
+      const publication = entries.find((entry) => entry.path === soul);
+      const identity = fstatSync(descriptors[0], { bigint: true });
+      expect(identity.isFile()).toBe(true);
+      expect(identity.nlink).toBe(1n);
+      expect(publication).toMatchObject({ dev: identity.dev, ino: identity.ino, kind: "file" });
+      const ownTemp = entries.find(
+        (entry) =>
+          entry.kind === "file" &&
+          entry.dev === identity.dev &&
+          entry.ino === identity.ino &&
+          entry.path !== soul,
+      );
+      expect(ownTemp).toBeDefined();
+      expect(basename(ownTemp?.path ?? "")).toContain(`-bob-init-${process.pid}-`);
+      const replacement = join(root, "replacement");
+      writeFileSync(replacement, "another writer\n");
+      const replacementFd = openSync(replacement, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      descriptors.push(replacementFd);
+      renameSync(replacement, soul);
+      const report = rollbackPublished({ base: root, reportBase: agentDir, entries });
+      const retained = fstatSync(replacementFd, { bigint: true });
+      expect(retained.nlink).toBe(1n);
+      const soulFd = openSync(soul, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      descriptors.push(soulFd);
+      const remaining = fstatSync(soulFd, { bigint: true });
+      expect(remaining.dev).toBe(retained.dev);
+      expect(remaining.ino).toBe(retained.ino);
+      expect(readFileSync(soulFd, "utf8")).toBe("another writer\n");
+      expect(report.leftovers).toContain("soul.md");
+      expect(report.errors).toEqual([]);
+    } finally {
+      for (const fd of descriptors) closeSync(fd);
+    }
   }, 30_000);
 
   it("removes an init temp but keeps an unrelated file that only resembles one", async () => {
