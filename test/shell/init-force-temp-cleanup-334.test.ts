@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import {
+  closeSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -387,7 +390,13 @@ describe("bob#334 — token kinds and identity rechecks", () => {
       mkdirSync(dir);
       const temp = staleTemp(dir);
       const checkedPath = entry === "directory" ? dir : temp;
-      const original = lstatSync(checkedPath, { bigint: true });
+      const fd = openSync(checkedPath, "r");
+      let original: fs.BigIntStats;
+      try {
+        original = fstatSync(fd, { bigint: true });
+      } finally {
+        closeSync(fd);
+      }
       let changed = false;
       const realStat = fs.lstatSync;
       const stat = spyOn(fs, "lstatSync").mockImplementation(((path, options) => {
@@ -573,7 +582,6 @@ describe("bob#334 — token kinds and identity rechecks", () => {
         const target = freshRoot();
         const targetFile = join(target, name);
         linkSync(candidate, targetFile);
-        expect(lstatSync(targetFile).ino).toBe(lstatSync(candidate).ino);
         const content = readFileSync(candidate, "utf8");
         const parked = join(root, "parked");
         let swapped = false;
@@ -591,6 +599,7 @@ describe("bob#334 — token kinds and identity rechecks", () => {
         expect(removed).not.toContain(candidate);
         expect(readFileSync(targetFile, "utf8")).toBe(content);
         expect(tempsIn(parked)).toContain(name);
+        expect(lstatSync(targetFile).ino).toBe(lstatSync(join(parked, name)).ino);
       }, 30_000);
     }
   }
@@ -631,9 +640,9 @@ describe("bob#334 — token kinds and identity rechecks", () => {
     ).toEqual([]);
 
     expect(swapped).toBe(true);
-    expect(lstatSync(temp).ino).toBe(lstatSync(join(parked, name)).ino);
     expect(readFileSync(temp, "utf8")).toBe(readFileSync(join(parked, name), "utf8"));
     expect(tempsIn(parked)).toContain(name);
+    expect(lstatSync(temp).ino).toBe(lstatSync(join(parked, name)).ino);
   }, 30_000);
 
   it("keeps a regular entry replaced after listing", async () => {
