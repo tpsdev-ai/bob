@@ -1,0 +1,1 @@
+- **`bob doctor` selects the provider to check through the session's own `provider.name` reader (bob#316).** A trailing comment on `provider.name` or a flow mapping for the `provider` block now reaches the applicable subscription check; strict YAML parse errors and non-scalar names are reported as failures. (`test/shell/doctor-provider-strict-parse-316.test.ts`)
