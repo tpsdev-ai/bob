@@ -96,6 +96,35 @@ for (const status of ["deactivated", "disabled", null, false]) {
   }
 }
 delete agent.status;
+for (const field of ["signature", "publicKey"]) {
+  for (const encoding of ["appended !", "wrong padding", "non-base64 character"]) {
+    const header = sign(`${field}-${encoding.replaceAll(" ", "-")}`);
+    const split = header.lastIndexOf(":") + 1;
+    const original = field === "signature" ? header.slice(split) : publicKey;
+    const malformed =
+      encoding === "appended !"
+        ? `${original}!`
+        : encoding === "wrong padding"
+          ? `${original}===`
+          : `${original.slice(0, 8)}@${original.slice(8)}`;
+    agent.publicKey = field === "publicKey" ? malformed : publicKey;
+    const authorization = field === "signature" ? header.slice(0, split) + malformed : header;
+    assert.equal(await verifyAgentRequest(request(authorization)), null);
+    const real = await gate(request(authorization), next);
+    assert.equal(real.status, 401);
+    assert.equal((await real.json()).error, "signature_verification_failed");
+    const stub = await fake.fetchImpl("http://flair.test/Memory/row", {
+      method: "PUT",
+      headers: { Authorization: authorization },
+      body: JSON.stringify({ id: "row", agentId: agent.id, content: "malformed encoding" }),
+    });
+    assert.equal(stub.status, real.status);
+    assert.equal(JSON.parse(await stub.text()).error, "signature_verification_failed");
+    assert.equal(reached, false);
+    assert.equal(fake.memories.size, 0);
+  }
+}
+agent.publicKey = publicKey;
 for (const [header, error] of [
   [sign("stale", Date.now() - 60_000), "timestamp_out_of_window"],
   [sign("bad-key", Date.now(), otherKey), "invalid_signature"],

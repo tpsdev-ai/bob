@@ -401,7 +401,7 @@ function authenticateAgent(
         null,
         Buffer.from(payload, "utf8"),
         ed25519PublicKey(String(agent.publicKey)),
-        Buffer.from(sigB64, "base64"),
+        decodeBase64(sigB64),
       )
     )
       return { error: "invalid_signature" };
@@ -412,13 +412,21 @@ function authenticateAgent(
   return { agentId };
 }
 
+function decodeBase64(value: string): Buffer {
+  let standard = value.replace(/-/g, "+").replace(/_/g, "/");
+  const remainder = standard.length % 4;
+  if (remainder === 2) standard += "==";
+  else if (remainder === 3) standard += "=";
+  return Buffer.from(atob(standard), "latin1");
+}
+
 // Import an Ed25519 public key the way Flair's importEd25519Key does — hex (64
 // chars) or base64 of the raw 32-byte key — and wrap it in SPKI DER.
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 function ed25519PublicKey(publicKey: string) {
   const raw = /^[0-9a-f]{64}$/i.test(publicKey)
     ? Buffer.from(publicKey, "hex")
-    : Buffer.from(publicKey, "base64");
+    : decodeBase64(publicKey);
   return createPublicKey({
     key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
     format: "der",
