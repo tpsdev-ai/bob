@@ -8,10 +8,7 @@ import { join } from "node:path";
 import { spawnNode, spawnNodeAsync } from "../cli-spawn.js";
 
 // bob#310: `bob onboard ... --no-flair` must not scaffold the flair capability.
-// The capability is what makes a session bootstrap Flair (run.ts resolves a
-// bootstrap target from the declared capability), so a scaffold that keeps it
-// reconnects the session the operator opted out of. This drives the BUILT CLI in
-// an isolated HOME and shows the Flair URL receives nothing.
+// Keeping it could reconnect when a valid key already existed.
 
 const CLI = join(import.meta.dir, "../../dist/cli.js");
 const RUN_TIMEOUT_MS = 60_000;

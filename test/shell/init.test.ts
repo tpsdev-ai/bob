@@ -339,6 +339,26 @@ describe("initAgent", () => {
     expect(yaml).not.toMatch(/^ {4}- flair_(?:search|write|get)$/m);
   });
 
+  it("skipFlair removes manifest tools from an explicit allowlist and preserves other tools", () => {
+    const res = initAgent({
+      ...baseOpts(),
+      skipFlair: true,
+      capabilities: ["flair", "discord"],
+      toolAllow: ["read", "flair_search", "discord_reply", "flair_write", "flair_get"],
+    });
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(readCapabilities(yaml)).toEqual(["discord"]);
+    expect(toolsAllowFromYaml(yaml)).toEqual(["read", "discord_reply"]);
+    expect(yaml).not.toMatch(/^flair:$/m);
+  });
+
+  it("an explicitly empty capability list omits the flair config block without skipFlair", () => {
+    const res = initAgent({ ...baseOpts(), capabilities: [] });
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(readCapabilities(yaml)).toEqual([]);
+    expect(yaml).not.toMatch(/^flair:$/m);
+  });
+
   // The control: without the opt-out the capability entry, its tools and its
   // config block are still stamped together.
   it("without skipFlair the flair capability, its tools and its config block are stamped", () => {

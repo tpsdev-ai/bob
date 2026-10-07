@@ -529,15 +529,23 @@ describe("bob#195 blocker 3 — every session entry path uses the resolved polic
       capabilities: { permitted: [], default: [] },
       files: [{ path: "soul.md", kind: "soul" }],
     });
-    await hireAgent({
+    initAgent({
+      name: "m1",
+      role: "coder",
+      provider: "exe-dev-gateway",
+      model: "claude-sonnet-4-6",
+      agentsRoot: s.agentsRoot,
+      flairKeysDir: join(s.base, "flair-keys"),
+      capabilities: [],
+      toolAllow: granted,
+      contextWindow: 200_000,
+    });
+    adoptAgent({
       name: "m1",
       positionName: "mail-desk",
       agentsRoot: s.agentsRoot,
       hostRoot: s.hostRoot,
       positionsRoot: s.positionsRoot,
-      skipFlair: true,
-      contextWindow: 200_000,
-      interview: noopInterview,
     });
     // Control: m1 IS adopted, and its ordinary session holds the grant's file and
     // shell tools — so any narrowing below is the mail turn's doing.
