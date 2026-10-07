@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
 import {
   PR_MEMORY_PROMPT_HEADING,
+  PR_MEMORY_START_TIMEOUT_MS,
   prMemoryKey,
   recallPrMemoryRound,
 } from "../../src/shell/pr-memory.js";
@@ -166,8 +167,9 @@ function captureWallClock(): { timer: RunTimer; fire: () => void } {
   return { timer, fire: () => wall?.() };
 }
 
-// Capture what a run writes to stderr, without touching the real stream.
-async function captureStderr(fn: () => Promise<void>): Promise<string> {
+// Capture what a run writes to stderr, without touching the real stream. `fn`
+// can read what has been captured so far.
+async function captureStderr(fn: (seen: () => string) => Promise<void>): Promise<string> {
   let out = "";
   const original = process.stderr.write.bind(process.stderr);
   process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -175,7 +177,7 @@ async function captureStderr(fn: () => Promise<void>): Promise<string> {
     return true;
   }) as typeof process.stderr.write;
   try {
-    await fn();
+    await fn(() => out);
   } finally {
     process.stderr.write = original;
   }
@@ -348,8 +350,8 @@ describe("`bob run` with a launcher pr_ref", () => {
 // bob#319 — the recall runs under the run's cancellation guard, with the run's
 // abort signal, and the run is checked again between recall and session
 // construction. A run terminated while recall is in flight cancels the recall
-// request; a run terminated after recall returns and before session
-// construction builds no session.
+// request; a termination detected after recall returns prevents the session
+// factory from being invoked.
 describe("`bob run` recall under the run's cancellation guard (bob#319)", () => {
   it("a run terminated while recall is in flight aborts the recall request and builds no session", async () => {
     scaffold(root, "http://127.0.0.1:1", keyFile); // no Flair is listening
@@ -409,7 +411,7 @@ describe("`bob run` recall under the run's cancellation guard (bob#319)", () => 
     expect(stderr).toContain("the run was terminated");
   }, 15_000);
 
-  it("a run terminated after recall returns builds no session", async () => {
+  it("a run terminated after recall returns, before the session factory is invoked, does not invoke it", async () => {
     scaffold(root, "http://127.0.0.1:1", keyFile);
     const wall = captureWallClock();
     const row = recallRow(ID);
@@ -426,11 +428,10 @@ describe("`bob run` recall under the run's cancellation guard (bob#319)", () => 
               : { ok: false, status: 404, text: async () => "not found" },
       );
     }) as never;
-    // Both recall requests have been served by the time recall reaches its
-    // post-fetch validation, whose `now()` call is the last await inside recall.
-    // Firing the bound a fixed number of microtasks later lands it after recall
-    // returns (the guard's abort listener is gone) and before the session
-    // factory is called.
+    // Both recall requests have been served by the time recall validates their
+    // results, synchronously. The validation's clock callback (`now()`) schedules
+    // the bound's termination through queued microtasks, which places it after
+    // the guard resolves and before the session factory is invoked.
     const now = (): number => {
       if (state.served >= 2 && !state.scheduled) {
         state.scheduled = true;
@@ -511,4 +512,120 @@ describe("`bob run` recall under the run's cancellation guard (bob#319)", () => 
     expect(recalled.status).toBe("unavailable");
     expect(recalled.reason).toBe("the run was terminated");
   }, 15_000);
+});
+
+// Polls `ready` every 10 ms until it holds or the clock passes `deadline`.
+async function waitUntil(ready: () => boolean, deadline: number): Promise<void> {
+  while (!ready() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+// bob#319 over real HTTP: a local server stands in for Flair, and the recall's
+// requests go through the client's real fetch with the run's composed signal
+// (the fetch seam passes each call to the global fetch and counts the recall
+// responses whose headers arrived). The server holds both recall
+// requests, before their headers or after their headers and part of their
+// bodies, and the run's bound fires while they are held.
+describe("`bob run` recall cancelled over real HTTP (bob#319)", () => {
+  for (const phase of ["awaiting response headers", "reading a response body"] as const) {
+    it(`a run terminated while recall is ${phase} aborts both held requests and does not invoke the session factory`, async () => {
+      const wall = captureWallClock();
+      let firedAt = Number.NaN;
+      const fire = (): void => {
+        firedAt = Date.now();
+        wall.fire();
+      };
+      const isRecall = (method: string | undefined, url: string): boolean =>
+        method === "GET" && url.includes("/Memory/") && !url.includes("limit(3,");
+      // Milliseconds from the bound firing to the server seeing each held
+      // request's socket close.
+      const closedAfterFire: number[] = [];
+      let held = 0;
+      const server = createServer((req, res) => {
+        const url = req.url ?? "";
+        if (isRecall(req.method, url)) {
+          // One of the two recall requests (the by-id read or the listing): hold
+          // it. Its request stream is not resumed: under Bun, resuming it
+          // suppresses the socket close event observed here.
+          req.socket.once("close", () => closedAfterFire.push(Date.now() - firedAt));
+          if (phase === "reading a response body") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.write('{"id":"'); // part of a body that never finishes
+          }
+          held += 1;
+          if (phase === "awaiting response headers" && held === 2) setTimeout(fire, 50);
+          return;
+        }
+        req.resume();
+        req.on("end", () => {
+          const send = (status: number, body: string): void => {
+            res.writeHead(status, { "content-type": "application/json" });
+            res.end(body);
+          };
+          if (url === "/BootstrapMemories") return send(200, JSON.stringify({ context: "" }));
+          if (req.method === "PUT") return send(200, JSON.stringify({ id: "x" }));
+          if (url.includes("limit(3,")) return send(200, "[]");
+          send(404, "not found");
+        });
+      });
+      let headersSeen = 0;
+      const fetchImpl = ((url: string, init: { method?: string }) =>
+        fetch(url, init as RequestInit).then((res) => {
+          if (isRecall(init.method, url)) {
+            headersSeen += 1;
+            if (phase === "reading a response body" && headersSeen === 2) setTimeout(fire, 50);
+          }
+          return res;
+        })) as never;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("missing server port");
+        scaffold(root, `http://127.0.0.1:${address.port}`, keyFile);
+
+        let factoryCalls = 0;
+        let result: Awaited<ReturnType<typeof runAgent>> | undefined;
+        const unavailable = "PR memory unavailable at start (the run was terminated).";
+        const stderr = await captureStderr(async (seen) => {
+          result = await runAgent({
+            name: AGENT,
+            prompt: "hi",
+            agentsRoot: root,
+            taskBinding: binding(PR),
+            prMemorySeams: { fetchImpl },
+            wallClockMs: 60_000,
+            noProgressMs: 60_000,
+            timer: wall.timer,
+            sessionFactory: async () => {
+              factoryCalls += 1;
+              return scriptedSession();
+            },
+          });
+          // Wait for both closes and the recall's report, up to half the
+          // requests' own deadline after the bound fired.
+          await waitUntil(
+            () => closedAfterFire.length === 2 && seen().includes(unavailable),
+            firedAt + PR_MEMORY_START_TIMEOUT_MS / 2,
+          );
+        });
+        expect(result?.exitCode).toBe(1);
+        expect(result?.aborted).toBe("wall_clock");
+        expect(factoryCalls).toBe(0);
+        expect(held).toBe(2);
+        expect(headersSeen).toBe(phase === "awaiting response headers" ? 0 : 2);
+        // The run's signal aborted both requests: the server saw each socket
+        // close well before the requests' own deadline would have aborted them.
+        expect(closedAfterFire).toHaveLength(2);
+        for (const ms of closedAfterFire) expect(ms).toBeLessThan(PR_MEMORY_START_TIMEOUT_MS / 2);
+        expect(stderr).toContain(unavailable);
+      } finally {
+        server.closeAllConnections();
+        if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }, 15_000);
+  }
 });
