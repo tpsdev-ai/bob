@@ -58,10 +58,14 @@ import { PI_BUILTIN_TOOLS } from "./tool-allowlist.js";
 // keep them strict-safe.
 const AGENT_NAME = /^[a-z0-9-]+$/;
 
+// The flair capability's name in bob.yaml's `capabilities:` list. Named so the
+// `--no-flair` opt-out (skipFlair) can drop this entry.
+export const FLAIR_CAPABILITY = "flair";
+
 // The capabilities `bob init` stamps into every new agent's bob.yaml. One
 // constant, so the capabilities: list and the allowlist computed from it cannot
 // drift apart.
-export const STAMPED_CAPABILITIES: readonly string[] = ["flair"];
+export const STAMPED_CAPABILITIES: readonly string[] = [FLAIR_CAPABILITY];
 
 // The allowlist a fresh agent is stamped with: the role's ceiling INTERSECTED
 // with the tools that can actually exist for this agent — pi's built-ins plus
@@ -238,6 +242,13 @@ export function initAgent(opts: InitOptions): InitResult {
   // intersected with the tools that can actually exist here (pi's built-ins +
   // the stamped capabilities' tools), so a freshly initialised agent of EVERY
   // role loads with a policy that holds.
+  // The capabilities this scaffold declares: the caller's list, or the stamped
+  // default. `--no-flair` (skipFlair) drops the flair capability — with its
+  // tools and its config block — because the capability is what makes a session
+  // bootstrap Flair (#310).
+  const capabilities = (opts.capabilities ?? STAMPED_CAPABILITIES).filter(
+    (name) => !(opts.skipFlair === true && name === FLAIR_CAPABILITY),
+  );
   const yamlPath = join(agentDir, "bob.yaml");
   publish(
     yamlPath,
@@ -245,8 +256,8 @@ export function initAgent(opts: InitOptions): InitResult {
       opts,
       opts.toolAllow !== undefined
         ? [...opts.toolAllow]
-        : stampedToolAllowlist(template.tools.allow),
-      opts.capabilities ?? STAMPED_CAPABILITIES,
+        : stampedToolAllowlist(template.tools.allow, capabilities),
+      capabilities,
     ),
   );
   written.push(yamlPath);
@@ -357,7 +368,15 @@ ${tools}
 
 capabilities:
 ${capabilities.map((c) => `  - ${c}`).join("\n")}
+${renderFlairBlock(opts)}`;
+}
 
+// The flair capability's config block, written when the capability is declared
+// (not under `--no-flair`): the agent has no keypair and no identity then, so it
+// must not carry a Flair URL and key either (#310).
+function renderFlairBlock(opts: InitOptions): string {
+  if (opts.skipFlair) return "";
+  return `
 flair:
   url: ${flairUrlFor(opts)}
   agentId: ${opts.name}

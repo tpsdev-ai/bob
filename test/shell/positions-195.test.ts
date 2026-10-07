@@ -1041,7 +1041,10 @@ describe("positions (bob#195) — 3. boot refusals for an ungranted role / capab
     const good = readFileSync(bobYamlPath(name), "utf8");
     expect(good).toContain("    - find\n");
     expect(good).toContain("capabilities:\n");
-    const withinGrant = good.replace("capabilities:\n", "capabilities:\n  - flair\n");
+    const withinGrant = good.replace(
+      "capabilities:\n",
+      `capabilities:\n  - flair\n\nflair:\n  url: http://127.0.0.1:19926\n  agentId: ${name}\n  keyFile: ~/.flair/keys/${name}.key\n`,
+    );
     writeFileSync(bobYamlPath(name), withinGrant);
     expect(resolve(name).config.tools).toContain("find");
     expect(Object.values(resolve(name).config.capabilityBySource)).toEqual(["flair"]);
@@ -1327,7 +1330,9 @@ describe("positions (bob#195) — an un-adopted `bob init` agent boots unchanged
       provider: "exe-dev-gateway",
       model: "claude-sonnet-4-6",
       agentsRoot: s.agentsRoot,
-      skipFlair: true,
+      // A real `bob init` generates the Flair keypair; keep it in the scratch
+      // tree rather than the developer's HOME.
+      flairKeysDir: join(s.base, "flair-keys"),
     });
     expect(readGrant(s.hostRoot, "plain")).toBeUndefined();
     expect(readBindingMarker(join(s.agentsRoot, "plain"))).toBeUndefined();

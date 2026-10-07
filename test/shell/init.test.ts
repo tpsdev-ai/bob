@@ -327,6 +327,28 @@ describe("initAgent", () => {
     expect(res.files.some((f) => f.endsWith(".pub"))).toBe(false);
   });
 
+  // bob#310: the flair capability is what makes a session bootstrap Flair, so
+  // --no-flair (skipFlair) omits it — its capabilities: entry, its tools and its
+  // config block — rather than leaving a session pointed at a Flair URL.
+  it("skipFlair omits the flair capability, its tools and its config block", () => {
+    const res = initAgent({ ...baseOpts(), skipFlair: true });
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(readCapabilities(yaml)).toEqual([]);
+    expect(yaml).not.toMatch(/^ {2}- flair$/m);
+    expect(yaml).not.toMatch(/^flair:$/m);
+    expect(yaml).not.toMatch(/^ {4}- flair_(?:search|write|get)$/m);
+  });
+
+  // The control: without the opt-out the capability entry, its tools and its
+  // config block are still stamped together.
+  it("without skipFlair the flair capability, its tools and its config block are stamped", () => {
+    const res = initAgent(baseOpts());
+    const yaml = readFileSync(join(res.agentDir, "bob.yaml"), "utf8");
+    expect(readCapabilities(yaml)).toEqual(["flair"]);
+    expect(yaml).toMatch(/^flair:$/m);
+    expect(yaml).toMatch(/^ {4}- flair_search$/m);
+  });
+
   // #93: the caller registers the Agent record, so it needs the SAME url and
   // key path the scaffold baked into bob.yaml + the launcher. Re-deriving the
   // default in the caller is how an agent gets registered on one instance and

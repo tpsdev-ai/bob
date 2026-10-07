@@ -70,15 +70,11 @@ function onboard(home: string, provider: string, baseUrl?: string): string {
     { env: childEnv(home) },
   );
   const agentDir = join(home, "agents", "agent-a");
-  // --no-flair still scaffolds the flair capability (a separate issue); this
-  // run has no Flair, so the fixture removes it.
-  const yamlPath = join(agentDir, "bob.yaml");
-  const yaml = readFileSync(yamlPath, "utf8")
-    .replace("capabilities:\n  - flair\n", "capabilities: []\n")
-    .replace(/\nflair:\n(?: {2}.*\n)+/, "\n")
-    .replace(/ {4}- flair_(?:search|write|get)\n/g, "");
+  // bob#310: --no-flair omits the flair capability (its config block and its
+  // tools with it), so this run makes no Flair connection and needs no fixture
+  // surgery.
+  const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8");
   expect(yaml).not.toMatch(/^ {2}- flair$/m);
-  writeFileSync(yamlPath, yaml);
   return agentDir;
 }
 
