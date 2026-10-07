@@ -29,7 +29,9 @@ describe("doctor resolution against pi's real resolveConfigValue", () => {
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "bob-login-parity-"));
-    for (const name of [NAME, UNSET]) {
+    // "1x" is the name a widened name-start rule would read from `$1x`; clear it so
+    // the result never depends on the runner's environment.
+    for (const name of [NAME, UNSET, "1x"]) {
       saved.set(name, process.env[name]);
       delete process.env[name];
     }

@@ -2,4 +2,4 @@
   names (bob#331).** `piConfigValueEnvVarNames` returns no names for a
   non-string `key` — a number, `null`, an object or an array — instead of
   calling a string method on it, so the session scrub treats a malformed entry
-  as referencing nothing rather than failing before pi reads the store.
+  as referencing nothing rather than failing before pi's model runtime resolves the credential.
