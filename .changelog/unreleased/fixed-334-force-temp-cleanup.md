@@ -1,0 +1,1 @@
+- **`bob init --force` checks for stale init temps (#334).** Cleanup checks the PID and token kind in `.<file>-bob-init-<pid>-<kind><start>-<uuid>.tmp` and rechecks directory and regular-file identities before unlinking. (`src/shell/init.ts`, `test/shell/init-force-temp-cleanup-334.test.ts`)

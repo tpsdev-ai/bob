@@ -15,6 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   fchmodSync,
@@ -23,13 +24,16 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
@@ -211,6 +215,8 @@ export function initAgent(opts: InitOptions): InitResult {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
       throw err;
     }
+  } else {
+    removeStaleInitTemps(agentDir, root);
   }
 
   // Top-level + subdirs
@@ -614,7 +620,7 @@ function withTempFile(
   mode: number | undefined,
   publish: (temp: string) => void,
 ): void {
-  const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
+  const temp = initTempPath(path);
   const fd = openSync(
     temp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -632,6 +638,163 @@ function withTempFile(
   } finally {
     rmSync(temp, { force: true });
   }
+}
+
+export interface InitTempOwner {
+  pid: number;
+  kind: "k" | "w";
+  start: string;
+}
+
+const INIT_TEMP_TOKEN = "bob-init";
+type ProcessStartReader = (pid: number) => string | undefined;
+
+function readProcessStartToken(pid: number): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat
+      .slice(stat.lastIndexOf(")") + 2)
+      .trim()
+      .split(/\s+/);
+    return fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+export function initTempOwner(
+  pid: number = process.pid,
+  readStart: ProcessStartReader = readProcessStartToken,
+): InitTempOwner {
+  const start = readStart(pid);
+  if (start !== undefined && /^\d+$/.test(start)) return { pid, kind: "k", start };
+  return { pid, kind: "w", start: String(Math.floor(Date.now() - process.uptime() * 1000)) };
+}
+
+export function initTempPath(destination: string, owner: InitTempOwner = initTempOwner()): string {
+  const name = `.${basename(destination)}-${INIT_TEMP_TOKEN}-${owner.pid}-${owner.kind}${owner.start}-${randomUUID()}.tmp`;
+  return join(dirname(destination), name);
+}
+
+const INIT_TEMP_NAME = new RegExp(
+  `^\\.(.+)-${INIT_TEMP_TOKEN}-(\\d+)-([kw])(\\d+)-[0-9a-fA-F-]+\\.tmp$`,
+);
+
+function parseInitTempOwner(name: string): InitTempOwner | undefined {
+  const match = INIT_TEMP_NAME.exec(name);
+  if (match === null) return undefined;
+  return { pid: Number(match[2]), kind: match[3] as InitTempOwner["kind"], start: match[4] };
+}
+
+function ownerHasExited(owner: InitTempOwner, readStart: ProcessStartReader): boolean {
+  if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
+  try {
+    process.kill(owner.pid, 0);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  if (owner.kind !== "k") return false;
+  const current = readStart(owner.pid);
+  if (current === undefined || !/^\d+$/.test(current)) return false;
+  return current !== owner.start;
+}
+
+type DirectoryIdentity = { path: string; dev: bigint; ino: bigint };
+
+function directoryChain(base: string, dir: string): DirectoryIdentity[] | undefined {
+  const root = resolve(base);
+  const target = resolve(dir);
+  if (target !== root && !target.startsWith(`${root}${sep}`)) return undefined;
+  const paths = [root];
+  let current = root;
+  if (target !== root) {
+    for (const part of target.slice(root.length + 1).split(sep)) {
+      current = join(current, part);
+      paths.push(current);
+    }
+  }
+  const chain: DirectoryIdentity[] = [];
+  for (const path of paths) {
+    const stat = entryIdentity(path);
+    if (stat === undefined || !stat.isDirectory() || stat.isSymbolicLink()) return undefined;
+    chain.push({ path, dev: stat.dev, ino: stat.ino });
+  }
+  return chain;
+}
+
+function entryIdentity(path: string): BigIntStats | undefined {
+  try {
+    return lstatSync(path, { bigint: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw err;
+  }
+}
+
+function directoryUnchanged(chain: DirectoryIdentity[]): boolean {
+  return chain.every(({ path, dev, ino }) => {
+    const stat = entryIdentity(path);
+    return stat?.isDirectory() && !stat.isSymbolicLink() && stat.dev === dev && stat.ino === ino;
+  });
+}
+
+interface InitTempCleanupOptions {
+  readStart?: ProcessStartReader;
+  beforeList?: (dir: string) => void;
+  beforeUnlink?: (path: string) => void;
+}
+
+export function removeStaleInitTemps(
+  agentDir: string,
+  agentsRoot: string,
+  options: InitTempCleanupOptions = {},
+): string[] {
+  const removed: string[] = [];
+  const directories = [agentDir, join(agentDir, "bin"), join(agentDir, ".pi-agent")].map((dir) => ({
+    dir,
+    chain: directoryChain(agentsRoot, dir),
+  }));
+  for (const { dir, chain } of directories) {
+    if (chain === undefined) continue;
+    const unchanged = () => {
+      if (directoryUnchanged(chain)) return true;
+      console.error(`bob: keeping remaining init temps in ${dir}: directory identity changed`);
+      return false;
+    };
+    options.beforeList?.(dir);
+    if (!unchanged()) continue;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch (err) {
+      if (!unchanged()) continue;
+      throw err;
+    }
+    if (!unchanged()) continue;
+    const entries = names.map((name) => {
+      const path = join(dir, name);
+      return { path, owner: parseInitTempOwner(name), stat: entryIdentity(path) };
+    });
+    for (const { path, owner, stat } of entries) {
+      if (owner === undefined || !stat?.isFile()) continue;
+      if (!ownerHasExited(owner, options.readStart ?? readProcessStartToken)) continue;
+      options.beforeUnlink?.(path);
+      const current = entryIdentity(path);
+      if (!unchanged()) break;
+      if (!current?.isFile() || current.dev !== stat.dev || current.ino !== stat.ino) continue;
+      // Node has no unlinkat: a same-user process can swap a managed directory
+      // or this entry between the last identity checks and the pathname unlink.
+      try {
+        unlinkSync(path);
+        removed.push(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+  }
+  return removed;
 }
 
 function capitalize(s: string): string {
