@@ -1,20 +1,10 @@
-// A refused hire's (and adoption's) rollback removes only the entries this
-// operation published, and leaves everything else in place, naming it (bob#326).
-//
-// Every test drives the real hire or adoption transaction in a scratch tree on
-// real files: the scaffold, the (injected) interview, the commit stages and the
-// rollback. A failure is injected at a named bind step (after the scaffold,
-// after the interview, or after a commit stage), so the rollback runs on what
-// that step left on disk. Where a test needs a failure INSIDE a writer or the
-// rollback, it replaces one node:fs or child_process call for the duration of
-// the rollback and keeps the rest real.
+// Real-file bind rollback failure injections (bob#326).
 
 import { afterAll, afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
   readdirSync,
   readlinkSync,
@@ -35,6 +25,7 @@ import {
 } from "../../src/shell/index.js";
 import {
   adoptReadyAgent,
+  directoryInode,
   entriesUnder,
   hire,
   newScratch,
@@ -80,7 +71,7 @@ function expectNoBinding(s: Scratch, name: string): void {
   expect(existsSync(baselinePath(s.hostRoot, name))).toBe(false);
 }
 
-describe("bob#326 — a refused hire's rollback keeps what is not its own, and names it", () => {
+describe("bob#326 — hire rollback with competing entries", () => {
   it("preserves and names a file another writer placed in the new agent directory, removes init's files, keeps the directory", async () => {
     const s = scratch();
     const name = "rb-competing";
@@ -357,6 +348,117 @@ describe("bob#326 — the binding marker and the override repository follow the 
 });
 
 describe("bob#326 — the rollback's own failures", () => {
+  it("preserves and reports a created directory when its identity read fails", async () => {
+    const s = scratch();
+    const name = "rb-mkdir-read";
+    const agentDir = join(s.agentsRoot, name);
+    const mkdir = fs.mkdirSync;
+    const lstat = fs.lstatSync;
+    let created = false;
+    let failed = false;
+    spies.push(
+      spyOn(fs, "mkdirSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+        const result = (mkdir as (...a: unknown[]) => unknown)(path, ...rest);
+        if (String(path) === agentDir) created = true;
+        return result;
+      }) as typeof fs.mkdirSync),
+      spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+        if (created && !failed && String(path) === agentDir) {
+          failed = true;
+          throw new Error("injected post-mkdir identity read failure");
+        }
+        return (lstat as (...a: unknown[]) => unknown)(path, ...rest);
+      }) as typeof fs.lstatSync),
+    );
+    const msg = await refusalOf(() => hire(s, name));
+    expect(failed).toBe(true);
+    expect(readdirSync(agentDir)).toEqual([]);
+    expect(msg).toContain(agentDir);
+    expect(msg).toContain("left these entries in place");
+    expect(msg).toContain("identity");
+    expect(msg).toContain("injected post-mkdir identity read failure");
+  });
+
+  it("reports both marker names and the failed quarantine unlink after link-back", async () => {
+    const s = scratch();
+    const name = "ar-unlink-back";
+    adoptReadyAgent(s, name);
+    const agentDir = join(s.agentsRoot, name);
+    const marker = bindingMarkerPath(agentDir);
+    const unlink = fs.unlinkSync;
+    let quarantine = "";
+    let failures = 0;
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        commitHook: (step) => {
+          if (step !== "marker") return;
+          spies.push(
+            spyOn(fs, "unlinkSync").mockImplementation((path) => {
+              if (basename(String(path)).startsWith(".bob-rollback-")) {
+                quarantine = String(path);
+                failures++;
+                throw new Error(`injected quarantine unlink failure ${failures}`);
+              }
+              return unlink(path);
+            }),
+          );
+          throw new Error("injected failure at marker");
+        },
+      }),
+    );
+    expect(failures).toBe(2);
+    const restored = readEntry(marker);
+    expect(readEntry(quarantine)).toEqual(restored);
+    expect(msg).toContain(marker);
+    expect(msg).toContain(quarantine);
+    expect(msg).toContain("injected quarantine unlink failure 1");
+    expect(msg).toContain("injected quarantine unlink failure 2");
+    expectNoBinding(s, name);
+  });
+
+  it("reports the original marker and quarantine when the post-rename identity read fails", async () => {
+    const s = scratch();
+    const name = "ar-quarantine-read";
+    adoptReadyAgent(s, name);
+    const agentDir = join(s.agentsRoot, name);
+    const marker = bindingMarkerPath(agentDir);
+    const lstat = fs.lstatSync;
+    let quarantine = "";
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        commitHook: (step) => {
+          if (step !== "marker") return;
+          spies.push(
+            spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+              if (quarantine === "" && basename(String(path)).startsWith(".bob-rollback-")) {
+                quarantine = String(path);
+                throw new Error("injected post-rename identity read failure");
+              }
+              return (lstat as (...a: unknown[]) => unknown)(path, ...rest);
+            }) as typeof fs.lstatSync),
+          );
+          throw new Error("injected failure at marker");
+        },
+      }),
+    );
+    expect(quarantine).not.toBe("");
+    expect(JSON.parse(readEntry(quarantine).text).agent).toBe(name);
+    expect(msg).toContain(marker);
+    expect(msg).toContain(quarantine);
+    expect(msg).toContain("injected post-rename identity read failure");
+    expectNoBinding(s, name);
+  });
+
   it("a file whose temporary name could not be cleaned up after it was published is still removed, with its temporary name", async () => {
     const s = scratch();
     const name = "rb-temp-cleanup";
@@ -443,7 +545,7 @@ describe("bob#326 — the rollback's own failures", () => {
                 basename(String(path)).startsWith(".bob-rollback-")
               ) {
                 mkdirSync(agentDir);
-                occupantIno = lstatSync(agentDir, { bigint: true }).ino;
+                occupantIno = directoryInode(agentDir);
               }
               return (rmdir as (...a: unknown[]) => void)(path, ...rest);
             }) as typeof fs.rmdirSync),
@@ -453,14 +555,14 @@ describe("bob#326 — the rollback's own failures", () => {
     );
     expect(occupantIno).toBeDefined();
     // The occupant is untouched: the same, empty directory.
-    expect(lstatSync(agentDir, { bigint: true }).ino).toBe(occupantIno as bigint);
+    expect(directoryInode(agentDir)).toBe(occupantIno as bigint);
     expect(readdirSync(agentDir)).toEqual([]);
     const quarantine = readdirSync(s.agentsRoot).filter((n) => n.startsWith(".bob-rollback-"));
     expect(quarantine).toHaveLength(1);
     const at = join(s.agentsRoot, quarantine[0] as string);
     expect(readEntry(join(at, "writer-note.txt")).text).toBe("another writer's file\n");
     expect(readdirSync(at)).toEqual(["writer-note.txt"]);
-    expect(msg).toContain(`${agentDir} was occupied`);
+    expect(msg).toContain(`${agentDir}: rollback`);
     expect(msg).toContain(at);
     expect(msg).toContain("writer-note.txt");
     expect(dirname(at)).toBe(s.agentsRoot);

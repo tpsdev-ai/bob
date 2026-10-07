@@ -1,9 +1,4 @@
-// `initAgent`'s publication ledger (bob#326): `onPublished` reports a directory
-// only when this call's own mkdir created it, and a file with the identity of
-// the temporary file this call created, read before the file is published and
-// reported before the temporary name is cleaned up. These tests drive the real
-// scaffold on real files; the injections replace one node:fs call at the
-// boundary under test and keep the rest real.
+// Real-file scaffold publication injections (bob#326).
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
@@ -71,7 +66,7 @@ function readEntry(path: string): { ino: bigint; text: string } {
 
 // dev/ino as bigint whatever the ledger carries, so a comparison can never pass
 // on a number/bigint type mismatch.
-const ino = (e: PublishedEntry | undefined) => (e === undefined ? undefined : BigInt(e.ino));
+const ino = (e: PublishedEntry | undefined) => (e?.ino === undefined ? undefined : e.ino);
 
 describe("bob#326 — initAgent records each entry it publishes", () => {
   it("records the agent directory, the sub-directories and every file it created", () => {
@@ -97,7 +92,7 @@ describe("bob#326 — initAgent records each entry it publishes", () => {
     for (const e of ledger) {
       const st = lstatSync(e.path, { bigint: true });
       expect(st.isDirectory() ? "dir" : "file").toBe(e.kind);
-      expect(st.ino).toBe(BigInt(e.ino));
+      expect(st.ino).toBe(e.ino);
     }
   });
 

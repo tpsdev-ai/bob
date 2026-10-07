@@ -1,77 +1,15 @@
-// The publication ledger and the rollback that removes only this operation's own
-// entries (bob#326).
-//
-// A bind (hire or adoption) records each directory entry it publishes inside the
-// agent directory: the scaffold `bob init` writes, the binding marker and the
-// override repository. When the bind fails, the rollback removes a recorded
-// entry only while it is still the entry that was recorded (same device, inode
-// and kind), and leaves everything else in place, naming it.
-//
-// RECORDING
-//
-//   * A FILE is created exclusively (O_CREAT|O_EXCL|O_NOFOLLOW) and its identity
-//     is read from that descriptor (fstat) before the file is linked or renamed
-//     into place, so a replacement at the destination can never be recorded as
-//     ours. The destination is registered the moment its link/rename succeeds,
-//     before any fallible cleanup of the temporary name.
-//   * A DIRECTORY is recorded only when this run's own non-recursive mkdir
-//     created it. EEXIST means the directory is not ours, with or without
-//     --force.
-//   * The override repository's `.git` directory is created by this run's mkdir;
-//     what git then writes inside it is recorded by walking that directory once
-//     the git commands have finished (or failed).
-//
-// ROLLBACK, for each ROOT (a recorded entry directly inside the caller's base
-// directory: the agent directory for a hire; the marker and the override
-// repository for an adoption):
-//
-//   ROOT        lstat the root path. Unless it is still the recorded entry (same
-//               device, inode and kind; a symlink never matches), nothing is
-//               removed and the root is named.
-//   QUARANTINE  rename the root to a fresh sibling `.bob-rollback-<uuid>`
-//               (atomic), then lstat the quarantine. If what moved is not the
-//               recorded entry, it is moved back (only into a free path) and
-//               named; nothing is removed. A recorded file root is unlinked
-//               from the quarantine.
-//   SWEEP       inside the quarantine, deepest first, ONLY the recorded entries,
-//               by relative path. An entry is reached only through recorded
-//               directories that lstat still verifies, so the sweep never
-//               descends through a symlink or a directory that is not ours. A
-//               recorded entry that still matches is removed: unlink for a file,
-//               rmdir for a directory (which only ever removes an empty one).
-//               Anything else stays. There is no recursive removal.
-//   FINISH      rmdir the quarantine. If it is not empty, its leftovers are
-//               enumerated NOW, after the sweep (so an entry that arrived during
-//               the sweep is named too), and the quarantine is moved back to the
-//               original path if that path is free. If the path is occupied, the
-//               quarantine stays where it is, and its path is reported with its
-//               leftovers.
-//
-// RESIDUAL. Once a root is quarantined, nothing that reaches the agent directory
-// by its ORIGINAL path can reach the entries the sweep removes: a writer that
-// opens that path finds it free (or its own new entry there). A process that
-// already holds a file descriptor or a working directory inside the tree, or
-// that finds the quarantine's random name by listing the parent directory, can
-// still write into the quarantined tree. It can also swap an entry, or a
-// directory above it, between the sweep's lstat and its unlink/rmdir; the
-// unlink/rmdir then acts on whatever is at that path (through a swapped-in
-// symlink, the same-named entry in the link's target directory), though rmdir
-// only ever removes an empty directory. Node has no openat/unlinkat/renameat,
-// so the sweep cannot be anchored to a directory descriptor.
-//
-// The other check-then-use windows, by step:
-//   * a directory's identity is read by lstat right after its mkdir, and git's
-//     entries are read after git exits: an entry substituted in either interval
-//     is attributed to this run. The sweep would remove such an entry only if it
-//     is a file, or a directory that is empty when it is swept;
-//   * moving a quarantined directory back first claims the original path with a
-//     new empty directory (mkdir fails when the path is occupied) and then
-//     renames the quarantine over that placeholder; a writer that removes the
-//     placeholder and puts its own EMPTY directory there in between loses that
-//     empty directory to the rename;
-//   * the leftovers named are those present when they are enumerated; one that
-//     arrives after the enumeration (through a descriptor or working directory)
-//     is not named.
+// Publication ledger for bind rollback (bob#326).
+// Removal requires recorded identity to match when checked; a swap
+// before unlink/rmdir can still remove a replacement or traverse a symlink.
+// Created directories are recorded before reading their identity; an unresolved
+// identity is retained. Git entries that cannot be read are not recorded.
+// Roots are renamed to quarantine and checked again before sweeping.
+// Move-back is attempted; errors and potentially retained quarantine names are
+// reported. A directory placeholder replaced before rename can be overwritten.
+// Leftovers are named when checked; arrivals after listing are not named.
+// A writer holding a descriptor or discovering the quarantine can change it,
+// including linking the original path to it. Path operations are not anchored
+// to directory descriptors.
 
 import { randomUUID } from "node:crypto";
 import {
@@ -94,27 +32,24 @@ import { dirname, join, relative, sep } from "node:path";
 
 export type PublishedKind = "dir" | "file";
 
-// One directory entry this operation published, with the identity it had when
-// it was published.
+// A published entry; a created directory may still have an unresolved identity.
 export interface PublishedEntry {
   path: string;
-  dev: bigint;
-  ino: bigint;
+  dev?: bigint;
+  ino?: bigint;
+  unresolved?: string;
   kind: PublishedKind;
 }
 
 export type OnPublished = (entry: PublishedEntry) => void;
 
-// What a rollback left behind. Paths in `leftovers` are relative to the
-// caller's report directory ("." is that directory itself); a directory named
-// there is left with everything in it.
+// Rollback accounting; leftover paths are relative to the caller's report
+// directory ("." is that directory itself).
 export interface RollbackReport {
   leftovers: string[];
-  // A quarantine that could not be moved back because its original path was
-  // occupied: where it is now, and what it holds (paths relative to it).
+  // Quarantine names potentially retained, with their original paths.
   stranded: Array<{ quarantine: string; original: string; leftovers: string[] }>;
-  // Each cleanup step that failed, naming the path and the error. A failure in
-  // one step never stops the independent steps after it.
+  // Observed cleanup errors, with paths.
   errors: string[];
 }
 
@@ -132,11 +67,10 @@ function kindOf(st: BigIntStats): PublishedKind | "other" {
   return "other";
 }
 
-function isRecorded(
-  st: BigIntStats,
-  e: { dev: bigint; ino: bigint; kind: PublishedKind },
-): boolean {
-  return st.dev === e.dev && st.ino === e.ino && kindOf(st) === e.kind;
+function isRecorded(st: BigIntStats, e: PublishedEntry): boolean {
+  return (
+    e.unresolved === undefined && st.dev === e.dev && st.ino === e.ino && kindOf(st) === e.kind
+  );
 }
 
 function code(err: unknown): string | undefined {
@@ -157,9 +91,8 @@ function lstatIfPresent(path: string): BigIntStats | undefined {
   }
 }
 
-// Create ONE directory level and record it when this call created it. Returns
-// the recorded entry, or undefined when the path already existed (EEXIST: not
-// ours) or was no longer a directory when its identity was read.
+// Record a successful mkdir before reading its identity. The callback receives
+// the entry object, which is updated after that read.
 export function mkdirOwned(
   path: string,
   onPublished?: OnPublished,
@@ -171,16 +104,25 @@ export function mkdirOwned(
     if (code(err) === "EEXIST") return undefined;
     throw err;
   }
-  const st = lstatSync(path, { bigint: true });
-  if (kindOf(st) !== "dir") return undefined;
-  const entry: PublishedEntry = { path, dev: st.dev, ino: st.ino, kind: "dir" };
+  const entry: PublishedEntry = { path, kind: "dir", unresolved: "directory identity not read" };
   onPublished?.(entry);
-  return entry;
+  try {
+    const st = lstatSync(path, { bigint: true });
+    if (kindOf(st) !== "dir") {
+      entry.unresolved = "created path was not a directory when checked";
+      return undefined;
+    }
+    entry.dev = st.dev;
+    entry.ino = st.ino;
+    delete entry.unresolved;
+    return entry;
+  } catch (err) {
+    entry.unresolved = `directory identity read failed: ${message(err)}`;
+    throw err;
+  }
 }
 
-// Create `path` exclusively (never through a symlink at it) and record it from
-// the descriptor before anything else can fail. Returns the open descriptor;
-// the caller writes and closes it.
+// Create exclusively, then record descriptor identity and return the descriptor.
 export function openOwned(path: string, mode: number, onPublished?: OnPublished): number {
   const fd = openSync(path, EXCLUSIVE_CREATE, mode);
   try {
@@ -193,12 +135,9 @@ export function openOwned(path: string, mode: number, onPublished?: OnPublished)
   return fd;
 }
 
-// Record what an external program (git) wrote inside `root`, a directory this
-// run created: every regular file and directory, walking only through
-// directories that lstat reports as real directories. Anything else (a symlink,
-// a socket), and anything that cannot be read, is left unrecorded, so a rollback
-// keeps it and names it. Never throws, so it cannot mask the program's own
-// failure.
+// Record readable regular files and directories under the created Git root.
+// Filesystem read failures are suppressed; onPublished may throw. Directory
+// checks can race with traversal, including a symlink substitution.
 export function recordTree(root: PublishedEntry, onPublished: OnPublished): void {
   const lstatOrSkip = (path: string): BigIntStats | undefined => {
     try {
@@ -231,7 +170,7 @@ export function recordTree(root: PublishedEntry, onPublished: OnPublished): void
 
 // Remove the recorded entries, one root at a time (see the header). `base` is
 // the directory, trusted by path, that holds each root; `reportBase` is what
-// leftover paths are named relative to. Never throws: every failure is reported.
+// leftover paths are named relative to.
 export function rollbackPublished(input: {
   base: string;
   reportBase: string;
@@ -254,7 +193,7 @@ export function rollbackPublished(input: {
 
   // A recorded entry under no root (its parent is neither the base nor a
   // recorded directory: an entry published inside a directory that was not
-  // ours) is never touched; it is named when it is still there.
+  // ours) is not touched; it is named if present when checked.
   const underRoot = (path: string) =>
     roots.some((r) => path === r.path || path.startsWith(r.path + sep));
   for (const e of byPath.values()) {
@@ -275,7 +214,12 @@ function rollbackRoot(
   name: (path: string) => string,
   report: RollbackReport,
 ): void {
-  // ROOT: nothing is moved or removed unless the root is still ours.
+  if (root.unresolved !== undefined) {
+    report.leftovers.push(name(root.path));
+    report.errors.push(`${root.path}: retained: ${root.unresolved}`);
+    return;
+  }
+  // ROOT: check identity before moving; check again after rename.
   const st = lstatIfPresent(root.path);
   if (st === undefined) return;
   if (!isRecorded(st, root)) {
@@ -286,7 +230,14 @@ function rollbackRoot(
   // QUARANTINE: move the root out of its path, then check what moved.
   const quarantine = join(dirname(root.path), `${QUARANTINE_PREFIX}${randomUUID()}`);
   renameSync(root.path, quarantine);
-  const moved = lstatIfPresent(quarantine);
+  let moved: BigIntStats | undefined;
+  try {
+    moved = lstatIfPresent(quarantine);
+  } catch (err) {
+    report.errors.push(`${quarantine}: ${message(err)}`);
+    report.stranded.push({ quarantine, original: root.path, leftovers: ["."] });
+    return;
+  }
   if (moved === undefined || !isRecorded(moved, root)) {
     if (moved !== undefined) settle(quarantine, root.path, moved, [], name, report);
     else report.leftovers.push(name(root.path));
@@ -306,7 +257,7 @@ function rollbackRoot(
   sweep(quarantine, root, byPath, name, report);
 
   // FINISH: an empty quarantine is removed; otherwise its leftovers are
-  // enumerated after the sweep and it is moved back.
+  // enumerated after the sweep and move-back is attempted.
   try {
     rmdirSync(quarantine);
     return;
@@ -320,17 +271,16 @@ function rollbackRoot(
     try {
       rmdirSync(quarantine);
       return;
-    } catch {
+    } catch (err) {
+      report.errors.push(`${quarantine}: ${message(err)}`);
       left = ["."];
     }
   }
   settle(quarantine, root.path, moved, left, name, report);
 }
 
-// Remove the recorded entries inside `root` (now at `quarantine`), deepest
-// first. An entry is touched only when every directory above it (inside the
-// root) is a recorded directory that lstat still verifies, and only while the
-// entry itself still matches its record.
+// Sweep deepest first after checking the entry and recorded ancestors.
+// A substitution between these checks and removal can affect a replacement.
 function sweep(
   quarantine: string,
   root: PublishedEntry,
@@ -367,9 +317,7 @@ function sweep(
   }
 }
 
-// Is every directory above `rel` (inside the root) a recorded directory that
-// lstat still reports as that directory? Checked from the top down, so each
-// lstat goes only through directories already verified.
+// Check recorded ancestors from the top down; a later swap can affect traversal.
 function ancestorsVerified(
   quarantine: string,
   root: PublishedEntry,
@@ -387,9 +335,8 @@ function ancestorsVerified(
   return true;
 }
 
-// The entries left in the quarantine, relative to it. A recorded directory that
-// still verifies is listed through (and named itself only when nothing inside
-// it is named); anything else is named and never descended into.
+// List leftovers through directories whose identity matches when checked;
+// substitution before readdir can affect traversal, and later arrivals are missed.
 function leftoversIn(
   quarantine: string,
   root: PublishedEntry,
@@ -412,7 +359,8 @@ function leftoversIn(
       let st: BigIntStats | undefined;
       try {
         st = lstatIfPresent(childAt);
-      } catch {
+      } catch (err) {
+        report.errors.push(`${childAt}: ${message(err)}`);
         out.push(childRel);
         continue;
       }
@@ -431,9 +379,7 @@ function leftoversIn(
   return out;
 }
 
-// Move a quarantined entry back to `original` when that path is free, and name
-// what it holds; when the path is occupied, leave it in the quarantine and
-// report where it is.
+// Attempt move-back and report the observed locations and errors.
 function settle(
   quarantine: string,
   original: string,
@@ -442,62 +388,77 @@ function settle(
   name: (path: string) => string,
   report: RollbackReport,
 ): void {
-  if (moveBack(quarantine, original, st)) {
+  const result = moveBack(quarantine, original, st, report);
+  if (result.restored) {
     if (left.length === 0 || (left.length === 1 && left[0] === ".")) {
       report.leftovers.push(name(original));
     } else {
       for (const rel of left) report.leftovers.push(name(join(original, rel)));
     }
-    return;
   }
-  report.stranded.push({ quarantine, original, leftovers: left.length > 0 ? left : ["."] });
+  if (result.quarantineRemains) {
+    report.stranded.push({ quarantine, original, leftovers: left.length > 0 ? left : ["."] });
+  }
 }
 
-// Move `quarantine` back to `original` without replacing anything at
-// `original`. A directory first claims the path with a new empty directory
-// (mkdir fails when the path is occupied) and is then renamed over that
-// placeholder; a file is hard-linked (link fails when the path is occupied) and
-// the quarantine name removed; a symlink is re-created with the same target.
-function moveBack(quarantine: string, original: string, st: BigIntStats): boolean {
+// mkdir/link refuse an occupied original path when checked. A directory
+// placeholder replaced before rename can still be overwritten.
+function moveBack(
+  quarantine: string,
+  original: string,
+  st: BigIntStats,
+  report: RollbackReport,
+): { restored: boolean; quarantineRemains: boolean } {
+  const failed = (err: unknown) => {
+    report.errors.push(`${quarantine} -> ${original}: ${message(err)}`);
+    return { restored: false, quarantineRemains: true };
+  };
   if (st.isDirectory()) {
     let placeholder: PublishedEntry | undefined;
     try {
       placeholder = mkdirOwned(original);
-    } catch {
-      return false;
+    } catch (err) {
+      return failed(err);
     }
-    if (placeholder === undefined) return false;
+    if (placeholder === undefined) {
+      return failed(new Error("original path occupied or placeholder identity unresolved"));
+    }
     try {
       renameSync(quarantine, original);
-      return true;
-    } catch {
-      removeEmptyPlaceholder(original, placeholder);
-      return false;
+      return { restored: true, quarantineRemains: false };
+    } catch (err) {
+      removeEmptyPlaceholder(original, placeholder, report);
+      return failed(err);
     }
   }
   try {
     if (st.isSymbolicLink()) symlinkSync(readlinkSync(quarantine), original);
     else linkNoReplace(quarantine, original);
-  } catch {
-    return false;
+  } catch (err) {
+    return failed(err);
   }
   try {
     unlinkSync(quarantine);
-  } catch {
-    /* both names now hold the same entry; the original path is restored */
+    return { restored: true, quarantineRemains: false };
+  } catch (err) {
+    report.errors.push(`${quarantine}: ${message(err)}`);
+    return { restored: true, quarantineRemains: true };
   }
-  return true;
 }
 
 function linkNoReplace(from: string, to: string): void {
   linkSync(from, to);
 }
 
-function removeEmptyPlaceholder(path: string, placeholder: PublishedEntry): void {
+function removeEmptyPlaceholder(
+  path: string,
+  placeholder: PublishedEntry,
+  report: RollbackReport,
+): void {
   try {
     const st = lstatIfPresent(path);
     if (st !== undefined && isRecorded(st, placeholder)) rmdirSync(path);
-  } catch {
-    /* a placeholder that is not empty, or no longer ours, stays */
+  } catch (err) {
+    report.errors.push(`${path}: ${message(err)}`);
   }
 }

@@ -319,14 +319,8 @@ export function resolvePositionFiles(
 // Initialize the local override repository: the directory, an empty override
 // document, and a Git repo with a base commit.
 //
-// bob#326: each entry this call creates is reported to `onPublished` (the
-// publication ledger, publication-ledger.ts), including a partial publication
-// when a later step fails: `overrides/` and `overrides/files/` only when this
-// call's own mkdir created them; `overrides.json` from its descriptor, before a
-// byte is written; and `.git`, which this call creates with its own mkdir before
-// git runs, together with every file and directory git wrote inside it, read
-// once the git commands have finished or failed. An existing directory, document
-// or `.git` is used as before and not reported.
+// bob#326: report created directories, descriptor-identified overrides.json,
+// and readable Git entries. A directory swap after a check can affect traversal.
 export function initOverrideRepo(agentDir: string, onPublished?: OnPublished): string {
   const dir = overridesDir(agentDir);
   mkdirOwned(dir, onPublished, 0o700);

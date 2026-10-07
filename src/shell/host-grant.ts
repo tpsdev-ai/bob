@@ -214,12 +214,9 @@ function entryPresent(p: string): boolean {
   }
 }
 
-// The marker is created exclusively (O_CREAT|O_EXCL|O_NOFOLLOW): an entry that
-// appeared at its path after the occupancy check is refused, never written over
-// or through. Its identity is reported to `onPublished` from the new file's
-// descriptor before anything is written, so a marker that is only partly
-// written is still recorded, and a rollback removes it only while it is still
-// this file (bob#326).
+// Create the marker exclusively and record descriptor identity before writing
+// (bob#326). Identity must match when checked; substitution before unlink
+// can still remove a replacement.
 export function writeBindingMarker(
   agentDir: string,
   grant: HostGrant,

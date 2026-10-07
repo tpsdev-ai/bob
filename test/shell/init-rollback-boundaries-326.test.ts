@@ -1,15 +1,11 @@
-// The rollback's check-to-removal boundaries (bob#326). Each test runs the real
-// hire and its rollback on real files, and replaces ONE node:fs call so that
-// another writer acts exactly between the rollback's identity check and the
-// operation that follows it. The rollback first moves the agent directory to a
-// quarantine (an atomic rename), so a writer that then works by the ORIGINAL
-// path can no longer reach what the sweep removes.
+// Real-file bind rollback failure injections (bob#326).
 
 import { afterAll, afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
-import { lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
+  directoryInode,
   entriesUnder,
   hire,
   newScratch,
@@ -55,7 +51,7 @@ function onceBefore(ops: FsOp[], match: (path: string) => boolean, before: (path
   return () => fired;
 }
 
-describe("bob#326 — a replacement between the rollback's check and its removal is left in place", () => {
+describe("bob#326 — replacements at the original path during quarantine rollback", () => {
   it("the agent directory replaced after its identity check: the replacement stays at the original path", async () => {
     const s = scratch();
     const name = "rbb-root";
@@ -75,14 +71,14 @@ describe("bob#326 — a replacement between the rollback's check and its removal
             () => {
               renameSync(agentDir, aside);
               mkdirSync(agentDir);
-              foreignIno = lstatSync(agentDir, { bigint: true }).ino;
+              foreignIno = directoryInode(agentDir);
             },
           );
         },
       }),
     );
     expect(fired()).toBe(true);
-    expect(lstatSync(agentDir, { bigint: true }).ino).toBe(foreignIno as bigint);
+    expect(directoryInode(agentDir)).toBe(foreignIno as bigint);
     expect(readdirSync(agentDir)).toEqual([]);
     expect(msg).toContain("the agent directory itself");
     // No quarantine is left in the agents root.

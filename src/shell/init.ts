@@ -140,20 +140,10 @@ export interface InitOptions {
   // and with the path of each file published with link(2), after its temp
   // write.
   beforePublish?: (path: string) => void;
-  // The publication ledger (bob#326; see publication-ledger.ts). Called for each
-  // entry this call publishes INSIDE the agent directory:
-  //   * a directory (the agent directory, bin, work, memory, .pi-agent) only
-  //     when this call's own non-recursive mkdir created it, with the identity
-  //     lstat reads right after that mkdir. An existing directory (EEXIST,
-  //     including under --force) is not reported;
-  //   * a file with the identity of the temporary file this call created
-  //     exclusively, read from its descriptor before the file is linked or
-  //     renamed into place, and reported as soon as that link/rename succeeds,
-  //     before the temporary name is cleaned up (whose failure is then also
-  //     reported, with the temporary path);
-  //   * the .pi-agent key files the env-key branch publishes, the same way.
-  // The Flair key files (written under the keys directory, outside the agent
-  // directory, only when skipFlair is false) are not reported.
+  // Publication ledger (bob#326): created directories are reported before
+  // their identity read; files use descriptor identity before publication.
+  // Flair keys outside the agent directory are not covered. Path substitution
+  // after a directory check remains possible.
   onPublished?: OnPublished;
 }
 

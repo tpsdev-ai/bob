@@ -1,5 +1,4 @@
-// Shared helpers for the bob#326 rollback tests: a real scratch tree, the real
-// hire/adoption transactions, and reads that never stat a path and then read it.
+// Shared real-file helpers for the bob#326 rollback tests.
 
 import {
   closeSync,
@@ -39,12 +38,19 @@ export function newScratch(prefix: string): Scratch {
   return { base, agentsRoot, hostRoot: join(base, "host") };
 }
 
-// A file's identity and text from ONE open descriptor (never a stat of the path
-// followed by a read of it).
 export function readEntry(path: string): { ino: bigint; text: string } {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     return { ino: fstatSync(fd, { bigint: true }).ino, text: readFileSync(fd, "utf8") };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function directoryInode(path: string): bigint {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+  try {
+    return fstatSync(fd, { bigint: true }).ino;
   } finally {
     closeSync(fd);
   }

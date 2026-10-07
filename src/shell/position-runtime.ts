@@ -148,15 +148,7 @@ export interface BindHooks {
   afterStep?: (step: BindStep) => void;
 }
 
-// What THIS operation wrote, so a later failure removes exactly that. Inside the
-// agent directory that is the publication ledger (publication-ledger.ts): every
-// entry the scaffold, the binding marker and the override repository published,
-// with the identity each had when it was published. A hire's ledger starts with
-// the agent directory it created (its root sits in the agents root); an
-// adoption's agent directory pre-exists, so its roots are the marker and the
-// override repository entries it created inside it. The host grant and baseline
-// live under the host state root, outside the agent directory, and are removed
-// by path.
+// Ledger entries inside the agent directory; grant and baseline use path cleanup.
 interface BindTxn {
   agentDir: string;
   // The directory that holds each ledger root: the agents root for a hire, the
@@ -167,11 +159,7 @@ interface BindTxn {
   baselinePath?: string;
 }
 
-// Roll back a failed bind. The ledger's entries are rolled back under the
-// publication-ledger protocol: an entry is removed only while it is still the
-// one this operation published, and everything else stays and is named. Each
-// stage runs even when an earlier one failed; every failure is collected into
-// the report, which the refusal then carries.
+// Attempt ledger, grant and baseline cleanup independently and collect errors.
 function rollbackBind(tx: BindTxn): RollbackReport {
   const report: RollbackReport = { leftovers: [], stranded: [], errors: [] };
   try {
@@ -198,10 +186,7 @@ function rollbackBind(tx: BindTxn): RollbackReport {
   return report;
 }
 
-// The refusal for a failed bind: the original failure, then what the rollback
-// left in place (named by path relative to the agent directory), any directory
-// it could not move back, and every cleanup step that failed. With nothing to
-// report, the original error is rethrown unchanged.
+// Append observed leftovers, quarantine locations and cleanup errors.
 function refusalAfterRollback(
   err: unknown,
   operation: "hire" | "adoption",
@@ -210,16 +195,14 @@ function refusalAfterRollback(
 ): unknown {
   const notes: string[] = [];
   if (report.leftovers.length > 0) {
-    const named = report.leftovers.map((p) =>
-      p === "." ? "the agent directory itself (it is not the directory this hire created)" : p,
-    );
+    const named = report.leftovers.map((p) => (p === "." ? "the agent directory itself" : p));
     notes.push(
       `This failed ${operation} left these entries in place (paths relative to ${agentDir}; a directory named here is left with everything in it): ${named.join(", ")}.`,
     );
   }
   for (const s of report.stranded) {
     notes.push(
-      `${s.original} was occupied when the rollback moved it back, so what it still holds stays at ${s.quarantine} (paths relative to it): ${s.leftovers.join(", ")}.`,
+      `${s.original}: rollback could not finish cleanup at ${s.quarantine} (paths relative to it): ${s.leftovers.join(", ")}.`,
     );
   }
   if (report.errors.length > 0) {
@@ -342,13 +325,7 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 // Hire a NEW agent from a packaged position. ASYNC because it runs the existing
 // onboarding interview after the candidate is validated and scaffolded.
 //
-// Order: EVERY deterministic refusal runs before anything is written; the
-// scaffold and interview then run under a transaction, followed by the file
-// commit (grant, marker, baseline, override repository). On any later failure
-// the rollback removes the entries THIS operation published while they are still
-// its own, and the host grant and baseline (bob#326); whatever stays (a file
-// another writer placed, an entry replaced since, the interview's own soul.md
-// and session files) is named in the refusal.
+// The scaffold, interview and file commit run under bind rollback (bob#326).
 export async function hireAgent(opts: HireOptions): Promise<HireResult> {
   if (!AGENT_NAME.test(opts.name)) refuse(`invalid agent name ${JSON.stringify(opts.name)}.`);
   if (opts.skipFlair === false) {
