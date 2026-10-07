@@ -16,10 +16,9 @@ import {
 import { gitEnvironment } from "./git-environment.js";
 import { TOOL_EFFECTS } from "./tool-allowlist.js";
 
-// Writer effects that run a command or a request rather than editing a file.
 const COMMAND_RUNNER_TOOLS: ReadonlySet<string> = new Set(["run", "bash", "powershell"]);
 
-/** True when the name runs a command (run, bash, PowerShell) rather than editing a file. */
+/** True for command-runner tool names: run, bash, powershell. */
 export function isCommandRunnerTool(toolName: string): boolean {
   return COMMAND_RUNNER_TOOLS.has(toolName);
 }
