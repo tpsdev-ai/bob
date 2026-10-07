@@ -23,13 +23,15 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { providerBaseUrlRefusal } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { type FlairPairResult, flairPair } from "./flair-pair.js";
@@ -211,6 +213,12 @@ export function initAgent(opts: InitOptions): InitResult {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(exists);
       throw err;
     }
+  } else {
+    // A run killed between creating a temp and renaming it into place leaves
+    // the temp behind. Cleanup runs on the --force path: it is the rerun that
+    // reaches publication. A plain rerun refuses an existing agent directory
+    // above, before any publication, so it never gets here.
+    removeStaleInitTemps(agentDir, root);
   }
 
   // Top-level + subdirs
@@ -614,7 +622,7 @@ function withTempFile(
   mode: number | undefined,
   publish: (temp: string) => void,
 ): void {
-  const temp = join(dirname(path), `.${basename(path)}-${randomUUID()}.tmp`);
+  const temp = initTempPath(path);
   const fd = openSync(
     temp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -632,6 +640,141 @@ function withTempFile(
   } finally {
     rmSync(temp, { force: true });
   }
+}
+
+/** A temp file's owner, as its name carries it: the writing process's pid and
+ *  a start token. On Linux the token is /proc's starttime field, so a reused pid
+ *  is told apart from the process that wrote the temp. */
+export interface InitTempOwner {
+  pid: number;
+  start: string;
+}
+
+// The fixed token every init temp's NAME carries, between the destination's
+// basename and the owner marker. Cleanup removes only names that carry it.
+const INIT_TEMP_TOKEN = "bob-init";
+
+/** The start token of `pid`, or undefined when this platform cannot report it
+ *  (no /proc) and the caller must not treat absence as proof. */
+function readProcessStartToken(pid: number): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // After "(comm)" the fields start at field 3 (state), so starttime (22) is
+    // index 19. comm can hold spaces and parens, so cut at the last ")".
+    const fields = stat
+      .slice(stat.lastIndexOf(")") + 2)
+      .trim()
+      .split(/\s+/);
+    return fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** The owner identity a process signs a temp with, defaulting to this process. */
+export function initTempOwner(pid: number = process.pid): InitTempOwner {
+  const start =
+    readProcessStartToken(pid) ?? String(Math.floor(Date.now() - process.uptime() * 1000));
+  return { pid, start };
+}
+
+/** The sibling temp init writes `destination` through: the destination's basename
+ *  plus an init token, the owner marker and a random suffix, all in-dir. */
+export function initTempPath(destination: string, owner: InitTempOwner = initTempOwner()): string {
+  const name = `.${basename(destination)}-${INIT_TEMP_TOKEN}-${owner.pid}-${owner.start}-${randomUUID()}.tmp`;
+  return join(dirname(destination), name);
+}
+
+const INIT_TEMP_NAME = new RegExp(`^\\.(.+)-${INIT_TEMP_TOKEN}-(\\d+)-(\\d+)-[0-9a-fA-F-]+\\.tmp$`);
+
+/** The owner a temp's name carries, or undefined when the name is not init's. */
+function parseInitTempOwner(name: string): InitTempOwner | undefined {
+  const match = INIT_TEMP_NAME.exec(name);
+  if (match === null) return undefined;
+  return { pid: Number(match[2]), start: match[3] };
+}
+
+/** True only when the process that wrote the temp has provably exited. Anything
+ *  short of proof (a live pid, an unreadable start token, a probe error) keeps. */
+function ownerHasExited(owner: InitTempOwner): boolean {
+  if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
+  try {
+    process.kill(owner.pid, 0);
+  } catch (err) {
+    // ESRCH: no such process. EPERM (present, not ours) and any other error: keep.
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  const current = readProcessStartToken(owner.pid);
+  if (current === undefined) return false;
+  return current !== owner.start;
+}
+
+/** True when `dir` is reached from `base` through a symlinked directory (lstat
+ *  every component from `base` down). A `dir` outside `base` counts as reached
+ *  through a symlink. Bounding at `base` keeps the operating system's own
+ *  symlinks above the agent root (for example macOS /tmp) from refusing cleanup. */
+function hasSymlinkComponent(base: string, dir: string): boolean {
+  const root = resolve(base);
+  const target = resolve(dir);
+  if (target !== root && !target.startsWith(`${root}${sep}`)) return true;
+  const chain = [root];
+  let current = root;
+  if (target !== root) {
+    for (const part of target.slice(root.length + 1).split(sep)) {
+      current = join(current, part);
+      chain.push(current);
+    }
+  }
+  for (const path of chain) {
+    try {
+      if (lstatSync(path).isSymbolicLink()) return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  }
+  return false;
+}
+
+/** True when `path` lstat's as a regular file; ENOENT is false, other errors throw. */
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+/** Remove the temps a killed run left in the directories init manages, and
+ *  return the paths removed. Never descends through a symlinked directory at or
+ *  below the agent root, and never removes a temp whose owner is not proven gone. */
+export function removeStaleInitTemps(agentDir: string, agentsRoot: string): string[] {
+  const removed: string[] = [];
+  for (const dir of [agentDir, join(agentDir, "bin"), join(agentDir, ".pi-agent")]) {
+    if (hasSymlinkComponent(agentsRoot, dir)) continue;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw err;
+    }
+    for (const name of names) {
+      const owner = parseInitTempOwner(name);
+      if (owner === undefined || !ownerHasExited(owner)) continue;
+      const path = join(dir, name);
+      if (!isRegularFile(path)) continue; // a symlink or a directory is not init's temp.
+      try {
+        rmSync(path, { force: true }); // unlink(2): removes the entry, never a link's target.
+        removed.push(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+  }
+  return removed;
 }
 
 function capitalize(s: string): string {
