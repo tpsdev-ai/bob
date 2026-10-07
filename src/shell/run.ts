@@ -2756,8 +2756,8 @@ export function declaredProviderModel(yamlText: string): string | undefined {
 
 // provider.name as the session resolver reads it: the scalar under `provider:`,
 // surrounding quotes stripped; an empty value is not a name. Exported so
-// `bob doctor` selects the provider it checks exactly as a session does
-// (bob#316) — a trailing comment or a flow mapping reads the same name to both.
+// `bob doctor` picks the provider it checks through the same reader a session
+// uses (bob#316).
 export function declaredProviderName(yamlText: string): string | undefined {
   const name = readProviderField(yamlText, "name");
   return name ? name : undefined;

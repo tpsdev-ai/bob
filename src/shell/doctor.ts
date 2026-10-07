@@ -318,10 +318,9 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     let providerName: string | undefined;
     let providerParseError: string | undefined;
     try {
-      // Read provider.name through the session resolver's own reader: for every
-      // bob.yaml a session accepts (a trailing comment, a flow mapping), doctor
-      // selects the same provider and runs that provider's checks, and for one
-      // the session refuses it reports the same refusal (bob#316).
+      // Read provider.name through the session resolver's own reader, so doctor
+      // picks the provider a session runs and reports the session's refusal when
+      // the document is refused (bob#316).
       providerName = declaredProviderName(yamlText);
     } catch (err) {
       providerParseError = err instanceof Error ? err.message : String(err);
