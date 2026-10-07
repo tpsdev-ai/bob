@@ -8,12 +8,6 @@ import { installBaseUrlTransport } from "../../src/shell/base-url-transport.js";
 import { initAgent } from "../../src/shell/init.js";
 import { PROVIDER_RECORDS, ProviderRegistry } from "../../src/shell/provider-registry.js";
 
-// bob#313: `totalTimeoutMs` bounds the whole provider call, retries included.
-// The stub here stalls every request (no response) and then drops the socket,
-// which reaches the client as a retryable connection error. With the cap
-// enforced per attempt, a call with retries ran to a multiple of it; the fix
-// sets the deadline once, when the call starts.
-
 const CONTEXT = { messages: [{ role: "user" as const, content: "hi", timestamp: 0 }] };
 
 /** A 127.0.0.1 server that stalls each request, then drops the socket. */
@@ -31,6 +25,7 @@ function stallingServer(
       socket.destroy();
     }, resetAfterMs).unref();
   });
+  server.setTimeout(5_000);
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -96,7 +91,7 @@ describe("bob#313 — the total cap spans retries", () => {
     return { runtime, model };
   }
 
-  it("with retries, a stalling server ends the call near totalTimeoutMs, not a multiple of it", async () => {
+  it("reports the total timeout after a retryable connection error", async () => {
     const totalTimeoutMs = 500;
     const server = await stallingServer(100);
     try {
@@ -111,7 +106,6 @@ describe("bob#313 — the total cap spans retries", () => {
       expect(reply.stopReason).toBe("error");
       expect(reply.errorMessage).toContain("ProviderRequestTimeoutError");
       expect(reply.errorMessage).toContain('provider "fake-local"');
-      // Without a call-wide deadline, three stalled attempts take ~3x the cap.
       expect(elapsed).toBeLessThan(totalTimeoutMs + 500);
     } finally {
       await server.close();
@@ -139,7 +133,7 @@ describe("bob#313 — the total cap spans retries", () => {
     }
   }, 15_000);
 
-  it("with retries, a long server-requested retry delay does not outlive totalTimeoutMs", async () => {
+  it("reports the total timeout during a server-requested retry delay", async () => {
     const totalTimeoutMs = 500;
     let requests = 0;
     const server: Server = createServer((_req, res) => {
@@ -147,6 +141,7 @@ describe("bob#313 — the total cap spans retries", () => {
       res.writeHead(503, { "content-type": "application/json", "retry-after-ms": "2000" });
       res.end(JSON.stringify({ error: { message: "unavailable" } }));
     });
+    server.setTimeout(5_000);
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => resolve());
@@ -167,6 +162,7 @@ describe("bob#313 — the total cap spans retries", () => {
       expect(requests).toBeGreaterThan(0);
       expect(elapsed).toBeLessThan(totalTimeoutMs + 500);
     } finally {
+      server.closeAllConnections();
       await new Promise<void>((done) => server.close(() => done()));
     }
   }, 15_000);

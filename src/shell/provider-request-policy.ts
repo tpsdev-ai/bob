@@ -60,9 +60,6 @@ export function withStreamTimeouts(
   provider: string,
   timers: TimerSeam = systemTimers,
   onTimeout?: (error: ProviderStreamIdleTimeoutError | ProviderRequestTimeoutError) => void,
-  // The whole call's deadline (epoch ms), shared across retries. When set, an
-  // attempt's total timer is clamped to the time left instead of starting a
-  // fresh `policy.totalTimeoutMs`; a deadline already past aborts at once.
   deadlineMs?: number,
 ): typeof globalThis.fetch {
   const wrapped = async (
@@ -109,6 +106,8 @@ export function withStreamTimeouts(
       const remaining = deadlineMs === undefined ? policy.totalTimeoutMs : deadlineMs - Date.now();
       if (remaining <= 0) {
         abortTimeout(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
+        cleanup();
+        throw controller.signal.reason;
       } else {
         totalHandle = timers.setTimeout(() => {
           abortTimeout(new ProviderRequestTimeoutError(provider, policy.totalTimeoutMs));
