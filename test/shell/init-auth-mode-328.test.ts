@@ -101,11 +101,6 @@ describe("bob#328 — auth.json under a --force init", () => {
       roots.push(root);
       const authPath = join(root, "agent-a", ".pi-agent", "auth.json");
 
-      // The directory tree exists before the umask is set: a umask that strips
-      // an owner bit strips it from a mkdir too, and a directory without owner
-      // write (0o200), owner read or owner execute cannot then hold the files
-      // the init below writes. The files themselves are still created under
-      // the umask.
       for (const rel of ["", "bin", "work", "memory", ".pi-agent"]) {
         realFs.mkdirSync(join(root, "agent-a", rel), { recursive: true });
       }

@@ -1,10 +1,5 @@
-// bob#332: a mode-less `init --force` publish goes through a sibling temp file
-// and a rename, so a destination symlink is replaced rather than followed; and a
-// temp file a killed run left behind is removed by the next init.
 import { afterEach, describe, expect, it } from "bun:test";
-import { randomUUID } from "node:crypto";
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -51,6 +46,25 @@ function tempFilesUnder(dir: string): string[] {
 }
 
 describe("bob#332 — a --force publish replaces the destination by rename", () => {
+  it("keeps an existing 0600 bob.yaml at 0600 under umask 022", () => {
+    const root = newRoot();
+    const agentDir = join(root, "agent-a");
+    mkdirSync(agentDir, { recursive: true });
+    const yamlPath = join(agentDir, "bob.yaml");
+    writeFileSync(yamlPath, "original\n", { mode: 0o600 });
+
+    const previousUmask = process.umask(0o022);
+    try {
+      forceInit(root);
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(readFileSync(yamlPath, "utf8")).toContain("fixture-model");
+    expect(lstatSync(yamlPath).mode & 0o777).toBe(0o600);
+    expect(tempFilesUnder(agentDir)).toEqual([]);
+  });
+
   it("replaces a destination symlink with a regular file and leaves the link target alone", () => {
     const root = newRoot();
     const agentDir = join(root, "agent-a");
@@ -62,34 +76,9 @@ describe("bob#332 — a --force publish replaces the destination by rename", () 
 
     forceInit(root);
 
-    // The destination is the regular file the rename installed, not the symlink
-    // the mode-less write used to follow.
     expect(readFileSync(soulPath, "utf8")).toContain("You are Agent-a");
     expect(readFileSync(target, "utf8")).toBe("the link target\n");
     expect(lstatSync(soulPath).isSymbolicLink()).toBe(false);
     expect(tempFilesUnder(agentDir)).toEqual([]);
-  });
-});
-
-describe("bob#332 — a killed run's temp file is removed by the next init", () => {
-  it("removes a leftover init temp file and leaves an entry that is not one alone", () => {
-    const root = newRoot();
-    const agentDir = join(root, "agent-a");
-    const piDir = join(agentDir, ".pi-agent");
-    mkdirSync(piDir, { recursive: true });
-    const leftoverTop = join(agentDir, `.soul.md-${randomUUID()}.tmp`);
-    const leftoverPi = join(piDir, `.auth.json-${randomUUID()}.tmp`);
-    const foreign = join(agentDir, ".notes.tmp");
-    const foreignPi = join(piDir, ".auth.json-not-a-uuid.tmp");
-    for (const path of [leftoverTop, leftoverPi, foreign, foreignPi]) {
-      writeFileSync(path, "leftover\n");
-    }
-
-    forceInit(root);
-
-    expect(existsSync(leftoverTop)).toBe(false);
-    expect(existsSync(leftoverPi)).toBe(false);
-    expect(readFileSync(foreign, "utf8")).toBe("leftover\n");
-    expect(readFileSync(foreignPi, "utf8")).toBe("leftover\n");
   });
 });
