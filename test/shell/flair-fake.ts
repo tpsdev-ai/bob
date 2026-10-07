@@ -1,3 +1,5 @@
+import { createPublicKey, verify as verifyEd25519 } from "node:crypto";
+
 // A fake Flair instance for the provisioning tests.
 //
 // Serves BOTH surfaces bob talks to, at the seam bob already injects
@@ -36,10 +38,9 @@ export interface FakeFlairOptions {
   agents?: Record<string, FakeAgentRow>;
   // Pre-existing Soul rows, keyed by "<agentId>:<key>".
   souls?: Record<string, string>;
-  // When true, /Agent/<id> answers 401 unknown_agent for ids with no row —
-  // this is Flair's real behavior (the signed-auth middleware rejects before
-  // the resource is reached), and it is what checkFlairRegistration decodes.
-  unknownAgentIs401?: boolean;
+  // The clock the signed-auth check reads for its timestamp window. Defaults
+  // to Date.now; tests that pin the client's clock pass the same value here.
+  now?: () => number;
   // Force every ops-API call to this status (for failure-path tests).
   opsStatus?: number;
   // Soul PUT enforces flair#1537: agent signatures are refused; only this
@@ -104,6 +105,7 @@ function reply(status: number, body: unknown) {
 }
 
 export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
+  const now = opts.now ?? (() => Date.now());
   const calls: RecordedCall[] = [];
   const agents: Record<string, FakeAgentRow> = { ...(opts.agents ?? {}) };
   const souls: Record<string, string> = { ...(opts.souls ?? {}) };
@@ -146,6 +148,9 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const parsed = new URL(url);
     const path = parsed.pathname;
     const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+    // The signed target: pathname + query, exactly as the production client
+    // signs it (tpsEd25519AuthHeader) and Flair's verifier rebuilds it.
+    const target = `${path}${parsed.search}`;
     const call: RecordedCall = {
       method: init.method,
       url,
@@ -210,19 +215,18 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const agentMatch = /^\/Agent\/(.+)$/.exec(path);
     if (agentMatch && init.method === "GET") {
       const id = decodeURIComponent(agentMatch[1]);
-      if (agents[id]) return reply(200, agents[id]);
-      // Flair's signed-auth middleware rejects an unresolvable signing
-      // identity BEFORE the Agent resource, so a missing agent is 401
-      // unknown_agent, not 404 (flair checkAgentRegistered).
-      return opts.unknownAgentIs401 === false
-        ? reply(404, { error: "not found" })
-        : reply(401, { error: "unknown_agent" });
+      // Flair's signed-auth middleware verifies the Ed25519 header and rejects
+      // an unauthenticated caller BEFORE the Agent resource is reached, so an
+      // unsigned, stale or wrongly signed request is 401 unknown_agent, never
+      // a 404 (flair checkAgentRegistered).
+      if (!verifiedAgentId(init.headers, init.method, target, agents, now))
+        return reply(401, { error: "unknown_agent" });
+      return agents[id] ? reply(200, agents[id]) : reply(404, { error: "not found" });
     }
 
     const soulMatch = /^\/Soul\/(.+)$/.exec(path);
     if (soulMatch) {
       const id = decodeURIComponent(soulMatch[1]);
-      const signerId = signingAgentId(init.headers);
       if (init.method === "PUT") {
         if (opts.soulPutStatus && opts.soulPutStatus >= 400) {
           return reply(opts.soulPutStatus, { error: "soul write refused" });
@@ -237,7 +241,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
         return reply(200, { id });
       }
       if (init.method === "GET") {
-        if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
+        if (!verifiedAgentId(init.headers, init.method, target, agents, now))
+          return reply(401, { error: "unknown_agent" });
         if (!(id in souls)) return reply(404, { error: "not found" });
         const [agentId, key] = id.split(":");
         return reply(200, { id, agentId, key, value: souls[id], durability: "permanent" });
@@ -245,8 +250,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     }
 
     if (path === "/Memory/" && init.method === "GET") {
-      const signerId = signingAgentId(init.headers);
-      if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
+      const signerId = verifiedAgentId(init.headers, init.method, target, agents, now);
+      if (!signerId) return reply(401, { error: "unknown_agent" });
       if (opts.memoryListStatus && opts.memoryListStatus >= 400)
         return reply(opts.memoryListStatus, { error: "memory list refused" });
       const query = parseMemoryQuery(parsed.search.slice(1));
@@ -272,8 +277,8 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const memoryMatch = /^\/Memory\/(.+)$/.exec(path);
     if (memoryMatch) {
       const id = decodeURIComponent(memoryMatch[1]);
-      const signerId = signingAgentId(init.headers);
-      if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
+      const signerId = verifiedAgentId(init.headers, init.method, target, agents, now);
+      if (!signerId) return reply(401, { error: "unknown_agent" });
       if (init.method === "PUT") {
         if (opts.memoryPutStatus && opts.memoryPutStatus >= 400)
           return reply(opts.memoryPutStatus, { error: "memory write refused" });
@@ -353,18 +358,63 @@ function parseMemoryQuery(search: string): MemoryQuery | string {
   return query;
 }
 
-// Pull the agent id out of a TPS-Ed25519 header without verifying the
-// signature — the fake is checking ATTRIBUTION rules, not crypto (the real
-// signing code path is still exercised: a malformed header yields no id).
-function signingAgentId(headers: Record<string, string>): string | undefined {
+// Verify a TPS-Ed25519 header the way Flair's signed-auth middleware does —
+// the scheme, the agent id, the timestamp window, and an Ed25519 signature
+// over `${agentId}:${ts}:${nonce}:${METHOD}:${path}` against the agent's stored
+// public key. Returns the authenticated agent id, or undefined (which every
+// caller answers with 401 and no side effect). Mirrors resources/agent-auth.ts
+// and resources/ed25519-auth.ts: same header grammar and length cap, same 30s
+// window, same signed payload — so an unsigned, wrongly signed, stale,
+// wrong-agent or wrong-path request is refused as the real server refuses it.
+const AUTH_HEADER_RE = /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/;
+const MAX_AUTH_HEADER_LEN = 4096;
+const WINDOW_MS = 30_000;
+
+function verifiedAgentId(
+  headers: Record<string, string>,
+  method: string,
+  path: string,
+  agents: Record<string, FakeAgentRow>,
+  now: () => number,
+): string | undefined {
   const raw = headers.authorization ?? headers.Authorization;
-  if (!raw?.startsWith("TPS-Ed25519 ")) return undefined;
-  const [agentId, ts, nonce, sig] = raw.slice("TPS-Ed25519 ".length).split(":");
-  if (!agentId || !ts || !nonce || !sig) return undefined;
-  // tsMs must be MILLISECONDS — a seconds-precision value is the 1000x defect
-  // that answers 401 in production, so the fake rejects it too.
-  if (Number(ts) < 1e12) return undefined;
+  if (!raw || raw.length > MAX_AUTH_HEADER_LEN) return undefined;
+  const m = AUTH_HEADER_RE.exec(raw);
+  if (!m) return undefined;
+  const [, agentId, tsRaw, nonce, sigB64] = m;
+  const ts = Number(tsRaw);
+  if (!Number.isFinite(ts) || Math.abs(now() - ts) > WINDOW_MS) return undefined;
+  const agent = agents[agentId];
+  if (!agent?.publicKey) return undefined;
+  const payload = `${agentId}:${tsRaw}:${nonce}:${method}:${path}`;
+  try {
+    if (
+      !verifyEd25519(
+        null,
+        Buffer.from(payload, "utf8"),
+        ed25519PublicKey(String(agent.publicKey)),
+        Buffer.from(sigB64, "base64"),
+      )
+    )
+      return undefined;
+  } catch {
+    return undefined;
+  }
   return agentId;
+}
+
+// Import an Ed25519 public key the way Flair's importEd25519Key does — hex (64
+// chars) or base64 of the raw 32-byte key — and wrap it in SPKI DER.
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+function ed25519PublicKey(publicKey: string) {
+  const raw = /^[0-9a-f]{64}$/i.test(publicKey)
+    ? Buffer.from(publicKey, "hex")
+    : Buffer.from(publicKey, "base64");
+  return createPublicKey({
+    key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
+    format: "der",
+    type: "spki",
+  });
 }
 
 // What a header-reflecting server appends to an error body.

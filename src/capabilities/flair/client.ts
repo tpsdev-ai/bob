@@ -247,6 +247,12 @@ export interface FlairHttpClientOptions {
   // Seams (tests). Production uses global fetch, Date.now, randomUUID, fs.
   fetchImpl?: FetchLike;
   now?: () => number;
+  // The clock the request SIGNATURE's timestamp is read from. Defaults to
+  // `now`, so production behaviour is unchanged. A caller that pins `now` to
+  // shape record ordering (createdAt) can point the signature at the wall
+  // clock instead, keeping signed requests fresh while the stored order stays
+  // deterministic.
+  signedAt?: () => number;
   uuid?: () => string;
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
@@ -309,6 +315,7 @@ export class FlairHttpClient implements FlairClient {
   private readonly keyFile: string;
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
+  private readonly signedAt: () => number;
   private readonly uuid: () => string;
   private readonly readFile: (path: string) => Buffer;
   private readonly signal: AbortSignal | undefined;
@@ -332,6 +339,7 @@ export class FlairHttpClient implements FlairClient {
       : opts.keyFile;
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
+    this.signedAt = opts.signedAt ?? this.now;
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
     this.signal = opts.signal;
@@ -365,7 +373,7 @@ export class FlairHttpClient implements FlairClient {
         key: this.loadKey(),
         method,
         path,
-        tsMs: this.now(),
+        tsMs: this.signedAt(),
         nonce: this.uuid(),
       }),
     };

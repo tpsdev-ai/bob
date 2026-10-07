@@ -674,6 +674,7 @@ export interface PrMemoryTarget {
 export interface PrMemorySeams {
   fetchImpl?: ConstructorParameters<typeof FlairHttpClient>[0]["fetchImpl"];
   now?: () => number;
+  signedAt?: () => number;
   uuid?: () => string;
   readFile?: (path: string) => Buffer;
 }
@@ -707,6 +708,7 @@ function clientFor(
     keyFile: target.keyFile,
     ...(seams?.fetchImpl ? { fetchImpl: seams.fetchImpl } : {}),
     ...(seams?.now ? { now: seams.now } : {}),
+    ...(seams?.signedAt ? { signedAt: seams.signedAt } : {}),
     ...(seams?.uuid ? { uuid: seams.uuid } : {}),
     ...(seams?.readFile ? { readFile: seams.readFile } : {}),
     ...(signal !== undefined ? { signal } : {}),

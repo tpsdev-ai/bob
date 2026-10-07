@@ -1,6 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { FlairHttpClient } from "../../src/capabilities/flair/client.js";
+import {
+  FlairHttpClient,
+  loadFlairPrivateKey,
+  tpsEd25519AuthHeader,
+} from "../../src/capabilities/flair/client.js";
 import { parseTaskBinding } from "../../src/capabilities/work/task-binding.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+} from "../../src/lib/ed25519-key.js";
 import {
   boundEnvelope,
   editToolFilePath,
@@ -29,7 +37,7 @@ import {
   validateRecalledRecord,
   writePrMemoryRound,
 } from "../../src/shell/pr-memory.js";
-import { makeFakeFlair } from "./flair-fake.js";
+import { type FakeFlairOptions, makeFakeFlair } from "./flair-fake.js";
 
 const AGENT = "anvil";
 const REPO = "github.com/tpsdev-ai/bob";
@@ -38,6 +46,17 @@ const ID = prMemoryKey(AGENT, REPO, PR);
 const IDENTITY = { agentId: AGENT, repository: REPO, prNumber: PR };
 
 const KEY = Buffer.alloc(32, 7);
+// The public key the stub registers for the test identity — derived from the
+// same seed the client signs with, so a correctly signed request verifies.
+const PUB = deriveEd25519PublicKeyBase64(normalizeEd25519PrivateKey(KEY, "test-private-key"));
+// The fake signs off the WALL clock (signedAt), so signed requests verify;
+// `now` is pinned only to make stored createdAt deterministic.
+function fakeFlair(opts: FakeFlairOptions = {}): ReturnType<typeof makeFakeFlair> {
+  // Register the test public key on each agent row in place (a test may mutate
+  // this same options object after construction).
+  for (const row of Object.values(opts.agents ?? {})) row.publicKey ??= PUB;
+  return makeFakeFlair(opts);
+}
 // A constant clock by default, so every record written through it carries the
 // same createdAt.
 function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000_000) {
@@ -45,6 +64,7 @@ function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000
     fetchImpl: fake.fetchImpl,
     readFile: () => KEY,
     now,
+    signedAt: () => Date.now(),
     uuid: () => "nonce-0000",
   };
 }
@@ -262,7 +282,7 @@ describe("envelope parsing and validation", () => {
       archived: false,
       expiresAt,
     };
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, memories: { [ID]: record } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } }, memories: { [ID]: record } });
     const recalled = await recallPrMemoryRound({
       target: TARGET,
       ref: REF,
@@ -320,7 +340,7 @@ describe("envelope parsing and validation", () => {
     const record = { id: ID, agentId: AGENT, visibility: "private", content };
     expect(parseEnvelope(content, IDENTITY)).toBeUndefined();
     expect(validateRecalledRecord(record, { ...IDENTITY, id: ID })).toBeUndefined();
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: record },
     });
@@ -527,7 +547,7 @@ describe("findings — unresolved carried forward, resolved replace open", () =>
 
 describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   it("writes round N and recalls it in a later round, with no brief input", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
 
     const evidence = {
@@ -582,7 +602,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
         ],
       }),
     );
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior } },
     });
@@ -625,7 +645,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("returns empty for a different PR, agent or repository", async () => {
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT }, "someone-else": { id: "someone-else" } },
     });
     const s = seams(fake);
@@ -665,7 +685,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("starts empty on a 404", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const recalled = await recallPrMemoryRound({
       target: TARGET,
       ref: REF,
@@ -679,7 +699,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
     const prior = JSON.stringify(
       envelope({ rounds: [round({ runId: "old", files_touched: ["earlier.ts"] })] }),
     );
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: {
         [ID]: { id: ID, agentId: AGENT, visibility: "private", content: prior },
@@ -715,7 +735,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("recalls a run id written twice once", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const s = seams(fake);
     const write = () =>
       writePrMemoryRound({
@@ -745,7 +765,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
 
   it("rejects a stored record whose embedded identity does not match", async () => {
     const forged = JSON.stringify(envelope({ prNumber: PR + 1 }));
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       memories: { [ID]: { id: ID, agentId: AGENT, visibility: "private", content: forged } },
     });
@@ -760,7 +780,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
   });
 
   it("proceeds and reports unavailability when Flair is unreachable", async () => {
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT } },
       transportFailure: { stage: "fetch", match: () => true },
     });
@@ -791,7 +811,7 @@ describe("round trip through a fake Flair (real signed GET/PUT)", () => {
 
 describe("concurrent rounds (bob#318)", () => {
   it("records and recalls both of two rounds written concurrently", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     // Neither writer's first request completes until both have sent one.
     const s = { ...seams(fake), fetchImpl: barrier(fake.fetchImpl, 2) };
     const write = (runId: string, endedAt: string) =>
@@ -861,7 +881,7 @@ describe("concurrent rounds (bob#318)", () => {
   ] as const)(
     "protects both PUTs before either prune lists: %s",
     async (_case, aged, retained, laterRetained) => {
-      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
       const at = 1_800_000_000_000;
       for (const day of [4, 5, 6])
         await writeDay(fake, day, () => at - (aged ? PR_MEMORY_PRUNE_PROTECTION_MS + 1 : 0));
@@ -914,7 +934,7 @@ describe("concurrent rounds (bob#318)", () => {
   );
 
   it("keeps and recalls a late round whose endedAt is older than a full history", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
     for (const day of [4, 5, 6]) await writeDay(fake, day, clock);
     // Ends before every stored round, but is written last.
@@ -924,7 +944,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("keeps its own write under a createdAt tie, then prunes on the next write", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     for (const day of [4, 5, 6]) await writeDay(fake, day);
     const start = fake.calls.length;
     expect((await writeDay(fake, 1)).status).toBe("written");
@@ -948,7 +968,7 @@ describe("concurrent rounds (bob#318)", () => {
       agents: { [AGENT]: { id: AGENT } },
       memoryDeleteStatus: 500,
     };
-    const fake = makeFakeFlair(options);
+    const fake = fakeFlair(options);
     const clock = writeClock();
     const backlog = PR_MEMORY_MAX_ROUNDS + PR_MEMORY_PRUNE_PAGE + 3; // 14
     for (let day = 1; day <= backlog; day++) await writeDay(fake, day, clock);
@@ -965,7 +985,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("breaks a createdAt tie by id", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     for (const day of [3, 1, 4, 2]) await writeDay(fake, day);
     expect(new Set(roundRecords(fake).map((r) => r.createdAt)).size).toBe(1);
     expect(storedDays(fake)).toEqual([1, 2, 3, 4]);
@@ -973,7 +993,7 @@ describe("concurrent rounds (bob#318)", () => {
   });
 
   it("concurrent prunes over a full history retain the leading createdAt rows", async () => {
-    const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+    const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
     const clock = writeClock();
     for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
     // Both writers list before either deletes, so both delete round 1.
@@ -1005,10 +1025,10 @@ describe("concurrent rounds (bob#318)", () => {
   ] as const)(
     "a failed prune %s is logged and the write still returns written",
     async (_stage, failure, logged) => {
-      const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
       const clock = writeClock();
       for (const day of [1, 2, 3]) await writeDay(fake, day, clock);
-      const failing = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
+      const failing = fakeFlair({ agents: { [AGENT]: { id: AGENT } }, ...failure });
       for (const [id, record] of fake.memories) failing.memories.set(id, record);
       const logs: string[] = [];
       expect((await writeDay(failing, 4, clock, (m) => logs.push(m))).status).toBe("written");
@@ -1036,7 +1056,7 @@ describe("concurrent rounds (bob#318)", () => {
       createdAt: old,
       content: JSON.stringify(envelope({ rounds: [round()] })),
     };
-    const fake = makeFakeFlair({
+    const fake = fakeFlair({
       agents: { [AGENT]: { id: AGENT }, [other]: { id: other } },
       memories: { [stray.id]: stray, [malformed.id]: malformed, [foreign.id]: foreign },
     });
@@ -1059,7 +1079,7 @@ describe("regressions from final review", () => {
         identity: IDENTITY,
         evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
         seams: {
-          ...seams(makeFakeFlair()),
+          ...seams(fakeFlair()),
           fetchImpl: async (_url, init) => {
             methods.push(init?.method ?? "");
             return new Response(body, { status: 200 });
@@ -1087,7 +1107,7 @@ describe("regressions from final review", () => {
       identity: { ...IDENTITY, repository: probe.repository },
       evidence: { endedAt: "now", outcome: "completed", filesTouched: [], testEvidence: [] },
       seams: {
-        ...seams(makeFakeFlair()),
+        ...seams(fakeFlair()),
         fetchImpl: async (_url, init) => {
           if (init?.method === "PUT") puts++;
           return new Response("{}", { status: 404 });
@@ -1206,7 +1226,7 @@ it("writes and recalls an overlong launcher task_id", async () => {
     }),
   );
   if (!binding) throw new Error("missing binding");
-  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
   expect(
     (
@@ -1244,7 +1264,7 @@ it.each([
   "evidence",
 ])("bounds a stored %s string for recall", async (field) => {
   const long = "x".repeat(700);
-  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
   const check = normalizeCheck({
     command: "check",
@@ -1282,7 +1302,7 @@ it.each([
 
 it("writes beside a hidden foreign row at the key, leaving it unchanged", async () => {
   const prior = { id: ID, agentId: "kern", visibility: "private", content: "foreign history" };
-  const fake = makeFakeFlair({
+  const fake = fakeFlair({
     agents: { [AGENT]: { id: AGENT }, kern: { id: "kern" } },
     memories: { [ID]: prior },
   });
@@ -1307,4 +1327,91 @@ it("writes beside a hidden foreign row at the key, leaving it unchanged", async 
   ).toBe("written");
   expect(roundRecords(fake)).toHaveLength(1);
   expect(fake.memories.get(ID)).toEqual(prior);
+});
+
+describe("Flair stub authentication — as the real server authenticates", () => {
+  const key = loadFlairPrivateKey(KEY, "test-private-key");
+  const otherKey = loadFlairPrivateKey(Buffer.alloc(32, 9), "other-private-key");
+  const NOW = 1_700_000_000_000;
+  const path = `/Memory/${encodeURIComponent(ID)}`;
+  const body = JSON.stringify({ id: ID, agentId: AGENT, content: "round" });
+  const registered = (now: () => number = () => NOW) =>
+    fakeFlair({ agents: { [AGENT]: { id: AGENT } }, now });
+  const send = (fake: ReturnType<typeof makeFakeFlair>, authorization?: string) =>
+    fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authorization ? { Authorization: authorization } : {}),
+      },
+      body,
+    });
+  const sign = (
+    opts: {
+      key?: ReturnType<typeof loadFlairPrivateKey>;
+      path?: string;
+      tsMs?: number;
+      agentId?: string;
+    } = {},
+  ) =>
+    tpsEd25519AuthHeader({
+      agentId: opts.agentId ?? AGENT,
+      key: opts.key ?? key,
+      method: "PUT",
+      path: opts.path ?? path,
+      tsMs: opts.tsMs ?? NOW,
+      nonce: "nonce-auth-test",
+    });
+
+  it("refuses an unsigned write with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake);
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a write signed by a different key with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ key: otherKey }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a write outside the timestamp window with 401 and stores nothing", async () => {
+    const fake = registered();
+    expect((await send(fake, sign({ tsMs: NOW - 60_000 }))).status).toBe(401);
+    expect((await send(fake, sign({ tsMs: NOW + 60_000 }))).status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a signature made over a different path with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ path: "/Memory/other" }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("refuses a write naming an unregistered agent with 401 and stores nothing", async () => {
+    const fake = registered();
+    const res = await send(fake, sign({ agentId: "agent-a" }));
+    expect(res.status).toBe(401);
+    expect(fake.memories.has(ID)).toBe(false);
+  });
+
+  it("accepts the production client's signed write", async () => {
+    const fake = registered();
+    const client = new FlairHttpClient({
+      url: TARGET.url,
+      agentId: AGENT,
+      keyFile: TARGET.keyFile,
+      fetchImpl: fake.fetchImpl,
+      readFile: () => KEY,
+      signedAt: () => NOW,
+      uuid: () => "nonce-client",
+    });
+    await expect(client.write("round", { id: ID, visibility: "private" })).resolves.toMatchObject({
+      id: ID,
+    });
+    expect(fake.memories.get(ID)?.content).toBe("round");
+  });
 });

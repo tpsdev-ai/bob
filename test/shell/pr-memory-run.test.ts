@@ -5,11 +5,15 @@
 // a memory GET and a memory listing), with nothing pasted into either brief.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
+import {
+  deriveEd25519PublicKeyBase64,
+  normalizeEd25519PrivateKey,
+} from "../../src/lib/ed25519-key.js";
 import {
   PR_MEMORY_PROMPT_HEADING,
   PR_MEMORY_START_TIMEOUT_MS,
@@ -44,7 +48,12 @@ interface Stub {
 // Serves the shared fake Flair (by-id GET/PUT, the Memory listing, DELETE)
 // over real HTTP, plus an empty bootstrap.
 async function startMemoryStub(): Promise<Stub> {
-  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
+  // Register the agent's public key on the stub, so the real signed requests
+  // the run makes verify against it (as Flair's signed-auth middleware does).
+  const publicKey = deriveEd25519PublicKeyBase64(
+    normalizeEd25519PrivateKey(readFileSync(keyFile), keyFile),
+  );
+  const fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT, publicKey } } });
   const srv = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => {
