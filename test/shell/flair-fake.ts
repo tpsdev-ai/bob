@@ -106,6 +106,7 @@ function reply(status: number, body: unknown) {
 
 export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const now = opts.now ?? (() => Date.now());
+  const nonces = new Map<string, number>();
   const calls: RecordedCall[] = [];
   const agents: Record<string, FakeAgentRow> = { ...(opts.agents ?? {}) };
   const souls: Record<string, string> = { ...(opts.souls ?? {}) };
@@ -117,9 +118,10 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const failure = opts.transportFailure;
     if (failure) {
       const path = new URL(url).pathname;
-      const op = init.body
-        ? (JSON.parse(init.body) as { operation?: string }).operation
-        : undefined;
+      const op =
+        new URL(url).pathname === "/" && init.body
+          ? (JSON.parse(init.body) as { operation?: string }).operation
+          : undefined;
       if (failure.match({ method: init.method, path, op })) {
         if (failure.stage === "fetch") {
           calls.push({ method: init.method, url, path, headers: init.headers, op });
@@ -147,10 +149,28 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
   const route: FakeFlair["fetchImpl"] = async (url, init) => {
     const parsed = new URL(url);
     const path = parsed.pathname;
-    const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
     // The signed target: pathname + query, exactly as the production client
     // signs it (tpsEd25519AuthHeader) and Flair's verifier rebuilds it.
     const target = `${path}${parsed.search}`;
+    let signerId = "";
+    if (
+      /^\/(?:Agent|Memory)\//.test(path) ||
+      (path.startsWith("/Soul/") && init.method === "GET")
+    ) {
+      const auth = authenticateAgent(init.headers, init.method, target, agents, now, nonces);
+      if ("error" in auth) {
+        calls.push({
+          method: init.method,
+          url,
+          path,
+          headers: init.headers,
+          redirect: init.redirect,
+        });
+        return reply(401, { error: auth.error });
+      }
+      signerId = auth.agentId;
+    }
+    const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
     const call: RecordedCall = {
       method: init.method,
       url,
@@ -215,12 +235,6 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const agentMatch = /^\/Agent\/(.+)$/.exec(path);
     if (agentMatch && init.method === "GET") {
       const id = decodeURIComponent(agentMatch[1]);
-      // Flair's signed-auth middleware verifies the Ed25519 header and rejects
-      // an unauthenticated caller BEFORE the Agent resource is reached, so an
-      // unsigned, stale or wrongly signed request is 401 unknown_agent (which
-      // checkFlairRegistration decodes as "not registered").
-      if (!verifiedAgentId(init.headers, init.method, target, agents, now))
-        return reply(401, { error: "unknown_agent" });
       return agents[id] ? reply(200, agents[id]) : reply(404, { error: "not found" });
     }
 
@@ -241,8 +255,6 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
         return reply(200, { id });
       }
       if (init.method === "GET") {
-        if (!verifiedAgentId(init.headers, init.method, target, agents, now))
-          return reply(401, { error: "unknown_agent" });
         if (!(id in souls)) return reply(404, { error: "not found" });
         const [agentId, key] = id.split(":");
         return reply(200, { id, agentId, key, value: souls[id], durability: "permanent" });
@@ -250,8 +262,6 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     }
 
     if (path === "/Memory/" && init.method === "GET") {
-      const signerId = verifiedAgentId(init.headers, init.method, target, agents, now);
-      if (!signerId) return reply(401, { error: "unknown_agent" });
       if (opts.memoryListStatus && opts.memoryListStatus >= 400)
         return reply(opts.memoryListStatus, { error: "memory list refused" });
       const query = parseMemoryQuery(parsed.search.slice(1));
@@ -277,8 +287,6 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     const memoryMatch = /^\/Memory\/(.+)$/.exec(path);
     if (memoryMatch) {
       const id = decodeURIComponent(memoryMatch[1]);
-      const signerId = verifiedAgentId(init.headers, init.method, target, agents, now);
-      if (!signerId) return reply(401, { error: "unknown_agent" });
       if (init.method === "PUT") {
         if (opts.memoryPutStatus && opts.memoryPutStatus >= 400)
           return reply(opts.memoryPutStatus, { error: "memory write refused" });
@@ -358,34 +366,34 @@ function parseMemoryQuery(search: string): MemoryQuery | string {
   return query;
 }
 
-// Verify a TPS-Ed25519 header the way Flair's signed-auth middleware does —
-// the scheme, the agent id, the timestamp window, and an Ed25519 signature
-// over `${agentId}:${ts}:${nonce}:${METHOD}:${path}` against the agent's stored
-// public key. Returns the authenticated agent id, or undefined (callers answer
-// with 401 and take no side effect). Mirrors resources/agent-auth.ts
-// and resources/ed25519-auth.ts: same header grammar and length cap, same 30s
-// window, same signed payload — so an unsigned, wrongly signed, stale,
-// wrong-agent or wrong-path request is refused as the real server refuses it.
 const AUTH_HEADER_RE = /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/;
 const MAX_AUTH_HEADER_LEN = 4096;
 const WINDOW_MS = 30_000;
 
-function verifiedAgentId(
+function authenticateAgent(
   headers: Record<string, string>,
   method: string,
   path: string,
   agents: Record<string, FakeAgentRow>,
   now: () => number,
-): string | undefined {
+  nonces: Map<string, number>,
+): { agentId: string } | { error: string } {
   const raw = headers.authorization ?? headers.Authorization;
-  if (!raw || raw.length > MAX_AUTH_HEADER_LEN) return undefined;
+  if (!raw || raw.length > MAX_AUTH_HEADER_LEN) return { error: "unauthorized" };
   const m = AUTH_HEADER_RE.exec(raw);
-  if (!m) return undefined;
+  if (!m) return { error: "unauthorized" };
   const [, agentId, tsRaw, nonce, sigB64] = m;
   const ts = Number(tsRaw);
-  if (!Number.isFinite(ts) || Math.abs(now() - ts) > WINDOW_MS) return undefined;
+  const current = now();
+  if (!Number.isFinite(ts) || Math.abs(current - ts) > WINDOW_MS)
+    return { error: "timestamp_out_of_window" };
+  for (const [key, expiresAt] of nonces) if (expiresAt <= current) nonces.delete(key);
+  const nonceKey = `${agentId}:${nonce}`;
+  if (nonces.has(nonceKey)) return { error: "nonce_replay_detected" };
   const agent = agents[agentId];
-  if (!agent?.publicKey) return undefined;
+  if (!agent) return { error: "unknown_agent" };
+  if (agent.status !== undefined && agent.status !== "active")
+    return { error: "principal_deactivated" };
   const payload = `${agentId}:${tsRaw}:${nonce}:${method}:${path}`;
   try {
     if (
@@ -396,11 +404,12 @@ function verifiedAgentId(
         Buffer.from(sigB64, "base64"),
       )
     )
-      return undefined;
+      return { error: "invalid_signature" };
   } catch {
-    return undefined;
+    return { error: "signature_verification_failed" };
   }
-  return agentId;
+  nonces.set(nonceKey, current + 120_000);
+  return { agentId };
 }
 
 // Import an Ed25519 public key the way Flair's importEd25519Key does — hex (64

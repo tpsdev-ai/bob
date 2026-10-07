@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { randomUUID } from "node:crypto";
 import {
   FlairHttpClient,
   loadFlairPrivateKey,
@@ -9,6 +10,7 @@ import {
   deriveEd25519PublicKeyBase64,
   normalizeEd25519PrivateKey,
 } from "../../src/lib/ed25519-key.js";
+import { checkFlairRegistration } from "../../src/shell/flair-pair.js";
 import {
   boundEnvelope,
   editToolFilePath,
@@ -49,8 +51,6 @@ const KEY = Buffer.alloc(32, 7);
 // The public key the stub registers for the test identity — derived from the
 // same seed the client signs with, so a correctly signed request verifies.
 const PUB = deriveEd25519PublicKeyBase64(normalizeEd25519PrivateKey(KEY, "test-private-key"));
-// The fake signs off the WALL clock (signedAt), so signed requests verify;
-// `now` is pinned to keep stored-record ordering deterministic.
 function fakeFlair(opts: FakeFlairOptions = {}): ReturnType<typeof makeFakeFlair> {
   // Register the test public key on each agent row in place (a test may mutate
   // this same options object after construction).
@@ -65,7 +65,7 @@ function seams(fake: ReturnType<typeof makeFakeFlair>, now = () => 1_700_000_000
     readFile: () => KEY,
     now,
     signedAt: () => Date.now(),
-    uuid: () => "nonce-0000",
+    uuid: randomUUID,
   };
 }
 
@@ -1307,7 +1307,7 @@ it("writes beside a hidden foreign row at the key, leaving it unchanged", async 
     memories: { [ID]: prior },
   });
   const options = { target: TARGET, ref: REF, identity: IDENTITY, seams: seams(fake) };
-  const client = new FlairHttpClient({ ...TARGET, ...seams(fake) });
+  const client = new FlairHttpClient({ ...TARGET, ...seams(fake) }, seams(fake));
   await expect(client.get(ID)).resolves.toBeNull();
   await expect(client.write("replacement", { id: ID, visibility: "private" })).rejects.toThrow(
     "403",
@@ -1329,7 +1329,7 @@ it("writes beside a hidden foreign row at the key, leaving it unchanged", async 
   expect(fake.memories.get(ID)).toEqual(prior);
 });
 
-describe("Flair stub authentication — as the real server authenticates", () => {
+describe("Flair stub signed authentication", () => {
   const key = loadFlairPrivateKey(KEY, "test-private-key");
   const otherKey = loadFlairPrivateKey(Buffer.alloc(32, 9), "other-private-key");
   const NOW = 1_700_000_000_000;
@@ -1352,6 +1352,7 @@ describe("Flair stub authentication — as the real server authenticates", () =>
       path?: string;
       tsMs?: number;
       agentId?: string;
+      nonce?: string;
     } = {},
   ) =>
     tpsEd25519AuthHeader({
@@ -1360,7 +1361,7 @@ describe("Flair stub authentication — as the real server authenticates", () =>
       method: "PUT",
       path: opts.path ?? path,
       tsMs: opts.tsMs ?? NOW,
-      nonce: "nonce-auth-test",
+      nonce: opts.nonce ?? randomUUID(),
     });
 
   it("refuses an unsigned write with 401 and stores nothing", async () => {
@@ -1398,6 +1399,116 @@ describe("Flair stub authentication — as the real server authenticates", () =>
     expect(fake.memories.has(ID)).toBe(false);
   });
 
+  it("refuses a signed deactivated-agent write before signature verification", async () => {
+    for (const status of ["deactivated", "disabled", null, false]) {
+      const fake = fakeFlair({ agents: { [AGENT]: { id: AGENT, status } }, now: () => NOW });
+      for (const signingKey of [key, otherKey]) {
+        const res = await send(fake, sign({ key: signingKey }));
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe("principal_deactivated");
+        expect(fake.memories.size).toBe(0);
+      }
+    }
+  });
+
+  it("refuses an unsigned malformed-JSON PUT before parsing and stores nothing", async () => {
+    const fake = registered();
+    const res = await fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    expect(res.status).toBe(401);
+    expect(fake.memories.size).toBe(0);
+  });
+
+  it("preserves signed auth errors on Agent, Soul and Memory routes", async () => {
+    for (const [method, target] of [
+      ["GET", `/Agent/${AGENT}`],
+      ["GET", `/Soul/${AGENT}:role`],
+      ["GET", "/Memory/?agentId=anvil&limit(1)"],
+      ["GET", path],
+      ["PUT", path],
+      ["DELETE", path],
+    ]) {
+      for (const [error, signingKey, tsMs, agentId] of [
+        ["timestamp_out_of_window", key, NOW - 60_000, AGENT],
+        ["invalid_signature", otherKey, NOW, AGENT],
+        ["unknown_agent", key, NOW, "unregistered"],
+      ] as const) {
+        const fake = registered();
+        const res = await fake.fetchImpl(`http://flair.test${target}`, {
+          method,
+          headers: {
+            Authorization: tpsEd25519AuthHeader({
+              agentId,
+              key: signingKey,
+              method,
+              path: target,
+              tsMs,
+              nonce: "nonce-route",
+            }),
+          },
+          body,
+        });
+        expect(res.status).toBe(401);
+        expect(JSON.parse(await res.text()).error).toBe(error);
+        expect(fake.memories.size).toBe(0);
+      }
+    }
+  });
+
+  it("reports stale or wrongly signed Agent checks as unreachable through flair-pair", async () => {
+    for (const [seed, tsMs, error] of [
+      [KEY, NOW - 60_000, "timestamp_out_of_window"],
+      [Buffer.alloc(32, 9), NOW, "invalid_signature"],
+    ] as const) {
+      const fake = registered();
+      const result = await checkFlairRegistration({
+        name: AGENT,
+        flairUrl: TARGET.url,
+        keyFile: TARGET.keyFile,
+        fetchImpl: fake.fetchImpl,
+        readFile: () => seed,
+        now: () => tsMs,
+        uuid: () => "nonce-pair",
+      });
+      expect(result.state).toBe("unreachable");
+      expect(result.detail).toContain(error);
+    }
+  });
+
+  it("refuses a reused signed nonce across routes without changing the stored row", async () => {
+    const fake = registered();
+    const authorization = sign({ nonce: "nonce-replay" });
+    expect((await send(fake, authorization)).status).toBe(200);
+    const stored = { ...fake.memories.get(ID) };
+    const replay = await fake.fetchImpl(`http://flair.test${path}`, {
+      method: "PUT",
+      headers: { Authorization: authorization },
+      body: JSON.stringify({ id: ID, agentId: AGENT, content: "replayed" }),
+    });
+    expect(replay.status).toBe(401);
+    expect(JSON.parse(await replay.text()).error).toBe("nonce_replay_detected");
+    expect(fake.memories.get(ID)).toEqual(stored);
+    const target = `/Agent/${AGENT}`;
+    const crossRoute = await fake.fetchImpl(`http://flair.test${target}`, {
+      method: "GET",
+      headers: {
+        Authorization: tpsEd25519AuthHeader({
+          agentId: AGENT,
+          key,
+          method: "GET",
+          path: target,
+          tsMs: NOW,
+          nonce: "nonce-replay",
+        }),
+      },
+    });
+    expect(crossRoute.status).toBe(401);
+    expect(JSON.parse(await crossRoute.text()).error).toBe("nonce_replay_detected");
+  });
+
   it("accepts the production client's signed write", async () => {
     const fake = registered();
     const client = new FlairHttpClient({
@@ -1406,7 +1517,7 @@ describe("Flair stub authentication — as the real server authenticates", () =>
       keyFile: TARGET.keyFile,
       fetchImpl: fake.fetchImpl,
       readFile: () => KEY,
-      signedAt: () => NOW,
+      now: () => NOW,
       uuid: () => "nonce-client",
     });
     await expect(client.write("round", { id: ID, visibility: "private" })).resolves.toMatchObject({

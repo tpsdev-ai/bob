@@ -247,12 +247,6 @@ export interface FlairHttpClientOptions {
   // Seams (tests). Production uses global fetch, Date.now, randomUUID, fs.
   fetchImpl?: FetchLike;
   now?: () => number;
-  // The clock the request SIGNATURE's timestamp is read from. Defaults to
-  // `now`, so production behaviour is unchanged. A caller that pins `now` to
-  // shape record ordering (createdAt) can point the signature at the wall
-  // clock instead, keeping signed requests fresh while the stored order stays
-  // deterministic.
-  signedAt?: () => number;
   uuid?: () => string;
   // Returns the key file's raw BYTES — the normalizer needs the byte length to
   // tell a raw seed from text, so this seam must NOT decode to a string.
@@ -324,7 +318,7 @@ export class FlairHttpClient implements FlairClient {
   // Parsed once; reused across requests.
   private keyObject?: KeyObject;
 
-  constructor(opts: FlairHttpClientOptions) {
+  constructor(opts: FlairHttpClientOptions, prMemorySeams?: { signedAt?: () => number }) {
     // Drop trailing slashes so `${url}${path}` never doubles them. A linear
     // loop (not a `/\/+$/` regex) — the regex form is a polynomial-ReDoS class
     // on uncontrolled (config) input that CodeQL rightly flags.
@@ -339,7 +333,7 @@ export class FlairHttpClient implements FlairClient {
       : opts.keyFile;
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i) as unknown as ReturnType<FetchLike>);
     this.now = opts.now ?? (() => Date.now());
-    this.signedAt = opts.signedAt ?? this.now;
+    this.signedAt = prMemorySeams?.signedAt ?? this.now;
     this.uuid = opts.uuid ?? (() => webcrypto.randomUUID());
     this.readFile = opts.readFile ?? ((p) => readFileSync(p));
     this.signal = opts.signal;

@@ -702,17 +702,19 @@ function clientFor(
   seams?: PrMemorySeams,
   signal?: AbortSignal,
 ): FlairHttpClient {
-  return new FlairHttpClient({
-    url: target.url,
-    agentId: target.agentId,
-    keyFile: target.keyFile,
-    ...(seams?.fetchImpl ? { fetchImpl: seams.fetchImpl } : {}),
-    ...(seams?.now ? { now: seams.now } : {}),
-    ...(seams?.signedAt ? { signedAt: seams.signedAt } : {}),
-    ...(seams?.uuid ? { uuid: seams.uuid } : {}),
-    ...(seams?.readFile ? { readFile: seams.readFile } : {}),
-    ...(signal !== undefined ? { signal } : {}),
-  });
+  return new FlairHttpClient(
+    {
+      url: target.url,
+      agentId: target.agentId,
+      keyFile: target.keyFile,
+      ...(seams?.fetchImpl ? { fetchImpl: seams.fetchImpl } : {}),
+      ...(seams?.now ? { now: seams.now } : {}),
+      ...(seams?.uuid ? { uuid: seams.uuid } : {}),
+      ...(seams?.readFile ? { readFile: seams.readFile } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+    },
+    seams,
+  );
 }
 
 // A code-owned reason. Never the server's error body (which can reflect a

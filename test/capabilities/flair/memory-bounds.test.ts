@@ -15,7 +15,6 @@ const options = {
   keyFile: "/unused",
   readFile: () => KEY,
   now: NOW,
-  uuid: () => "nonce",
 };
 // Register the test identity's public key on the stub and pin its clock to the
 // client's, so the real signed requests verify.

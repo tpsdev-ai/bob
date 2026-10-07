@@ -48,8 +48,6 @@ interface Stub {
 // Serves the shared fake Flair (by-id GET/PUT, the Memory listing, DELETE)
 // over real HTTP, plus an empty bootstrap.
 async function startMemoryStub(): Promise<Stub> {
-  // Register the agent's public key on the stub, so the real signed requests
-  // the run makes verify against it (as Flair's signed-auth middleware does).
   const publicKey = deriveEd25519PublicKeyBase64(
     normalizeEd25519PrivateKey(readFileSync(keyFile), keyFile),
   );
