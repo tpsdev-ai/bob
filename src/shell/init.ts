@@ -20,6 +20,7 @@ import {
   fchmodSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   renameSync,
@@ -575,8 +576,12 @@ type Publish = (path: string, content: string, mode?: number) => void;
 
 function writeFileReplacing(path: string, content: string, mode?: number): void {
   if (mode === undefined) {
-    writeFileSync(path, content);
-    return;
+    try {
+      const destination = lstatSync(path);
+      if (destination.isFile()) mode = destination.mode & 0o7777;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
   withTempFile(path, content, mode, (temp) => renameSync(temp, path));
 }

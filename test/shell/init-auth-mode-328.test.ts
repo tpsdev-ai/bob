@@ -93,13 +93,17 @@ afterEach(() => {
 });
 
 describe("bob#328 — auth.json under a --force init", () => {
-  it.each([0o022, 0o077])(
+  it.each([0o022, 0o077, 0o200])(
     "creates auth.json without group/other bits under umask %i",
     async (umask) => {
       const { initAgent } = await import("../../src/shell/init.js");
       const root = realFs.mkdtempSync(join(tmpdir(), "bob-328-"));
       roots.push(root);
       const authPath = join(root, "agent-a", ".pi-agent", "auth.json");
+
+      for (const rel of ["", "bin", "work", "memory", ".pi-agent"]) {
+        realFs.mkdirSync(join(root, "agent-a", rel), { recursive: true });
+      }
 
       observedModes.length = 0;
       watchPath = authPath;
