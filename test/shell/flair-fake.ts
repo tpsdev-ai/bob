@@ -52,6 +52,9 @@ export interface FakeFlairOptions {
   memories?: Record<string, Record<string, unknown>>;
   memoryPutStatus?: number;
   memoryGetStatus?: number;
+  // bob#318 — force the Memory collection read / DELETE to this status.
+  memoryListStatus?: number;
+  memoryDeleteStatus?: number;
   // A server or intermediary that reflects request headers into its error
   // bodies. When set, every non-2xx reply appends the request's credential:
   // "authorization" echoes the Authorization header verbatim; "decoded-basic"
@@ -241,6 +244,31 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
       }
     }
 
+    if (path === "/Memory/" && init.method === "GET") {
+      const signerId = signingAgentId(init.headers);
+      if (!signerId || !agents[signerId]) return reply(401, { error: "unknown_agent" });
+      if (opts.memoryListStatus && opts.memoryListStatus >= 400)
+        return reply(opts.memoryListStatus, { error: "memory list refused" });
+      const query = parseMemoryQuery(parsed.search.slice(1));
+      if (typeof query === "string") return reply(400, { error: query });
+      const rows = [...memories.values()]
+        .filter((r) => r.agentId === signerId || r.visibility !== "private")
+        .filter((r) =>
+          query.conditions.every(([attr, value]) => {
+            const field = r[attr];
+            return Array.isArray(field) ? field.includes(value) : field === value;
+          }),
+        );
+      rows.sort((a, b) => {
+        for (const key of query.sort) {
+          const [x, y] = [String(a[key.attr] ?? ""), String(b[key.attr] ?? "")];
+          if (x !== y) return (x < y ? -1 : 1) * (key.descending ? -1 : 1);
+        }
+        return 0;
+      });
+      return reply(200, rows.slice(query.start, query.end));
+    }
+
     const memoryMatch = /^\/Memory\/(.+)$/.exec(path);
     if (memoryMatch) {
       const id = decodeURIComponent(memoryMatch[1]);
@@ -266,6 +294,18 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
           return reply(404, { error: "not found" });
         return reply(200, stored);
       }
+      if (init.method === "DELETE") {
+        if (opts.memoryDeleteStatus && opts.memoryDeleteStatus >= 400)
+          return reply(opts.memoryDeleteStatus, { error: "memory delete refused" });
+        const stored = memories.get(id);
+        if (stored === undefined) return reply(200, false);
+        if (stored.agentId !== signerId)
+          return reply(403, {
+            error: "forbidden: cannot modify Memory owned by another principal",
+          });
+        memories.delete(id);
+        return reply(200, true);
+      }
     }
 
     return reply(404, { error: `fake flair: no route for ${init.method} ${path}` });
@@ -281,6 +321,36 @@ export function makeFakeFlair(opts: FakeFlairOptions = {}): FakeFlair {
     sequence: () =>
       calls.map((c) => (c.op ? `ops:${c.op}:${c.table}` : `rest:${c.method}:${c.path}`)),
   };
+}
+
+interface MemoryQuery {
+  conditions: Array<[string, string]>;
+  sort: Array<{ attr: string; descending: boolean }>;
+  start: number;
+  end?: number;
+}
+
+// The subset of Harper's REST query syntax the Memory listing uses. Returns an
+// error string for anything else.
+function parseMemoryQuery(search: string): MemoryQuery | string {
+  const query: MemoryQuery = { conditions: [], sort: [], start: 0 };
+  for (const part of search.split("&")) {
+    const sort = /^sort\(([-+]?\w+(?:,[-+]?\w+)*)\)$/.exec(part);
+    const limit = /^limit\((\d+)(?:,(\d+))?\)$/.exec(part);
+    const condition = /^(\w+)=([^&|=[\]{}]+)$/.exec(part);
+    if (sort)
+      query.sort = (sort[1] as string).split(",").map((key) => ({
+        attr: key.replace(/^[-+]/, ""),
+        descending: key.startsWith("-"),
+      }));
+    else if (limit) {
+      if (limit[2] === undefined) query.end = Number(limit[1]);
+      else [query.start, query.end] = [Number(limit[1]), Number(limit[2])];
+    } else if (condition)
+      query.conditions.push([condition[1] as string, decodeURIComponent(condition[2] as string)]);
+    else return `fake flair: unsupported query part ${JSON.stringify(part)}`;
+  }
+  return query;
 }
 
 // Pull the agent id out of a TPS-Ed25519 header without verifying the

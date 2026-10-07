@@ -238,7 +238,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
 
   it("write PUTs /Memory/<id> with durability + a derived id", async () => {
     const { client, captured } = await makeClientWithCapture();
-    const { id } = await client.write("note", { durability: "persistent" });
+    const { id, createdAt } = await client.write("note", { durability: "persistent" });
     // The default id is `agent + a random UUID` (here the injected uuid seam),
     // never a counter and never wall-clock alone (bob#180 round 4).
     expect(id).toBe("pulse-nonce-abc");
@@ -249,6 +249,7 @@ describe("FlairHttpClient protocol + Ed25519 signing", () => {
     expect(body.agentId).toBe("pulse");
     expect(body.content).toBe("note");
     expect(body.durability).toBe("persistent");
+    expect(createdAt).toBe(body.createdAt);
   });
 
   it("expands a leading ~/ in keyFile to homedir", async () => {

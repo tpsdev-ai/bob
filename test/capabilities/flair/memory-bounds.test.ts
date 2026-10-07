@@ -104,7 +104,9 @@ describe("Memory refusals from the Flair fake", () => {
     const client = new FlairHttpClient({ ...options, fetchImpl: fake.fetchImpl });
     await expect(client.write("round", { id: "row", authorId: "kern" })).rejects.toThrow("403");
     expect(fake.memories.has("row")).toBe(false);
-    await expect(client.write("round", { id: "row", visibility: "private" })).resolves.toEqual({
+    await expect(
+      client.write("round", { id: "row", visibility: "private" }),
+    ).resolves.toMatchObject({
       id: "row",
     });
   });

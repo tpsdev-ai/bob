@@ -7,6 +7,7 @@ import { createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TaskBinding } from "../../src/capabilities/work/task-binding.js";
 import { PR_MEMORY_PROMPT_HEADING, prMemoryKey } from "../../src/shell/pr-memory.js";
 import { type RunSession, runAgent } from "../../src/shell/run.js";
+import { makeFakeFlair } from "./flair-fake.js";
 
 const AGENT = "testbot";
 const REPO = "github.com/tpsdev-ai/bob";
@@ -63,7 +64,14 @@ function binding(prNumber: number): TaskBinding {
 let root: string;
 let keyFile: string;
 let savedFetch: typeof fetch;
-const store = new Map<string, string>();
+let fake = makeFakeFlair();
+// The one round record written for this PR.
+function roundContent(): { rounds: Array<{ outcome: string; files_touched: string[] }> } {
+  const prefix = `${prMemoryKey(AGENT, REPO, PR)}-r`;
+  const records = [...fake.memories.values()].filter((r) => String(r.id).startsWith(prefix));
+  expect(records).toHaveLength(1);
+  return JSON.parse(String(records[0]?.content));
+}
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "bob-prmem-runtime-"));
   keyFile = join(root, "key");
@@ -73,15 +81,16 @@ beforeEach(() => {
   );
   scaffold(root, "http://flair.test", keyFile);
   savedFetch = globalThis.fetch;
-  store.clear();
+  fake = makeFakeFlair({ agents: { [AGENT]: { id: AGENT } } });
   globalThis.fetch = (async (url, init) => {
-    const path = new URL(String(url)).pathname;
-    if (path === "/BootstrapMemories") return new Response('{"context":""}');
-    if (init?.method === "PUT") {
-      store.set(path, String(init.body));
-      return new Response("{}");
-    }
-    return new Response(store.get(path) ?? "{}", { status: store.has(path) ? 200 : 404 });
+    if (new URL(String(url)).pathname === "/BootstrapMemories")
+      return new Response('{"context":""}');
+    const r = await fake.fetchImpl(String(url), {
+      method: init?.method ?? "GET",
+      headers: (init?.headers ?? {}) as Record<string, string>,
+      ...(typeof init?.body === "string" ? { body: init.body } : {}),
+    });
+    return new Response(await r.text(), { status: r.status });
   }) as typeof fetch;
 });
 afterEach(() => {
@@ -119,7 +128,6 @@ it.each([
 });
 
 it.each(["bootstrap", "factory"])("records a pre-session abort during %s", async (stage) => {
-  store.clear();
   const normalFetch = globalThis.fetch;
   if (stage === "bootstrap")
     globalThis.fetch = (async (url, init) =>
@@ -136,8 +144,7 @@ it.each(["bootstrap", "factory"])("records a pre-session abort during %s", async
   });
   globalThis.fetch = normalFetch;
   expect(result.aborted).toBeDefined();
-  const record = JSON.parse(store.get(`/Memory/${prMemoryKey(AGENT, REPO, PR)}`) ?? "{}");
-  expect(JSON.parse(record.content).rounds[0].outcome).toBe("aborted");
+  expect(roundContent().rounds[0]?.outcome).toBe("aborted");
 });
 
 it("keeps both actual session prompts free of recall and records only verified paths", async () => {
@@ -194,6 +201,9 @@ it("keeps both actual session prompts free of recall and records only verified p
     expect(prompt).not.toContain(PR_MEMORY_PROMPT_HEADING);
     expect(prompt).not.toContain("<<<BOB-PR-MEMORY>>>");
   }
-  const record = JSON.parse(store.get(`/Memory/${prMemoryKey(AGENT, REPO, PR)}`) ?? "{}");
-  expect(JSON.parse(record.content).rounds[0].files_touched).toEqual(["verified.ts"]);
+  const prefix = `${prMemoryKey(AGENT, REPO, PR)}-r`;
+  const records = [...fake.memories.values()].filter((r) => String(r.id).startsWith(prefix));
+  expect(records).toHaveLength(2);
+  for (const r of records)
+    expect(JSON.parse(String(r.content)).rounds[0].files_touched).toEqual(["verified.ts"]);
 });
