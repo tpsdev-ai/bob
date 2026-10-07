@@ -87,7 +87,7 @@ describe("bob#326 — hire rollback with competing entries", () => {
     expect(readEntry(join(agentDir, "writer-note.txt")).text).toBe("another writer's file\n");
     expect(readdirSync(agentDir)).toEqual(["writer-note.txt"]);
     expect(msg).toContain("injected failure at scaffold");
-    expect(msg).toContain(`left these entries in place (paths relative to ${agentDir}`);
+    expect(msg).toContain(`retained or could not verify these paths (relative to ${agentDir}`);
     expect(msg).toContain("writer-note.txt");
     expectNoBinding(s, name);
   });
@@ -97,7 +97,7 @@ describe("bob#326 — hire rollback with competing entries", () => {
     const name = "rb-clean";
     const msg = await refusalOf(() => hire(s, name, { interview: failing }));
     expect(msg).toMatch(/exited with code 7/);
-    expect(msg).not.toContain("left these entries");
+    expect(msg).not.toContain("retained or could not verify these paths");
     expect(existsSync(join(s.agentsRoot, name))).toBe(false);
     // No quarantine is left behind in the agents root.
     expect(readdirSync(s.agentsRoot)).toEqual([]);
@@ -271,7 +271,9 @@ describe("bob#326 — the binding marker and the override repository follow the 
       ].sort(),
     );
     expect(readEntry(join(agentDir, "soul.md"))).toEqual(soulBefore);
-    expect(msg).toContain("This failed adoption left these entries in place");
+    expect(msg).toContain(
+      "Rollback for this failed adoption retained or could not verify these paths",
+    );
     expect(msg).toContain(".position-binding.json");
     expect(msg).toContain("overrides/files/foreign.md");
     expectNoBinding(s, name);
@@ -346,7 +348,7 @@ describe("bob#326 — the binding marker and the override repository follow the 
       }),
     );
     expect(msg).toContain("injected git commit failure");
-    expect(msg).not.toContain("left these entries");
+    expect(msg).not.toContain("retained or could not verify these paths");
     expect(existsSync(agentDir)).toBe(false);
     expectNoBinding(s, name);
   });
@@ -395,7 +397,7 @@ describe("bob#326 — the rollback's own failures", () => {
       );
       expect(readEntry(marker).text).toBe("");
       expect(msg).toContain(entry === "marker" ? marker : `overrides/${entry}`);
-      expect(msg).toContain("left these entries in place");
+      expect(msg).toContain("retained or could not verify these paths");
       expect(msg).toContain("injected marker descriptor identity failure");
       expectNoBinding(s, name);
     },
@@ -423,7 +425,7 @@ describe("bob#326 — the rollback's own failures", () => {
     );
     expect(directoryInode(dir)).toBe(before);
     expect(readdirSync(dir)).toEqual([]);
-    expect(msg).not.toContain("left these entries in place");
+    expect(msg).not.toContain("retained or could not verify these paths");
     expectNoBinding(s, name);
   });
 
@@ -564,7 +566,7 @@ describe("bob#326 — the rollback's own failures", () => {
     expect(failed).toBe(true);
     expect(readdirSync(agentDir)).toEqual([]);
     expect(msg).toContain(agentDir);
-    expect(msg).toContain("left these entries in place");
+    expect(msg).toContain("retained or could not verify these paths");
     expect(msg).toContain("identity");
     expect(msg).toContain("injected post-mkdir identity read failure");
   });
@@ -649,6 +651,47 @@ describe("bob#326 — the rollback's own failures", () => {
     expectNoBinding(s, name);
   });
 
+  it("reports a quarantine entry removed before its identity read as an unknown location", async () => {
+    const s = scratch();
+    const name = "ar-quarantine-vanished";
+    adoptReadyAgent(s, name);
+    const agentDir = join(s.agentsRoot, name);
+    const marker = bindingMarkerPath(agentDir);
+    const lstat = fs.lstatSync;
+    let quarantine = "";
+    const msg = await refusalOf(() =>
+      adoptAgent({
+        name,
+        positionName: "builder",
+        agentsRoot: s.agentsRoot,
+        hostRoot: s.hostRoot,
+        positionsRoot: DEFAULT_POSITIONS_ROOT,
+        commitHook: (step) => {
+          if (step !== "marker") return;
+          spies.push(
+            spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+              if (quarantine === "" && basename(String(path)).startsWith(".bob-rollback-")) {
+                quarantine = String(path);
+                fs.rmSync(quarantine, { recursive: true });
+              }
+              return (lstat as (...a: unknown[]) => unknown)(path, ...rest);
+            }) as typeof fs.lstatSync),
+          );
+          throw new Error("injected failure at marker");
+        },
+      }),
+    );
+    expect(quarantine).not.toBe("");
+    expect(fs.existsSync(quarantine)).toBe(false);
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(msg).toContain(`${quarantine}: vanished before identity read`);
+    expect(msg).toContain(`renamed away from ${marker}; current location unknown`);
+    expect(msg).not.toContain("left these entries in place");
+    expect(msg).not.toContain("retained or could not verify these paths");
+    expect(msg).not.toContain("rollback could not finish cleanup at");
+    expectNoBinding(s, name);
+  });
+
   it("a file whose temporary name could not be cleaned up after it was published is still removed, with its temporary name", async () => {
     const s = scratch();
     const name = "rb-temp-cleanup";
@@ -667,7 +710,7 @@ describe("bob#326 — the rollback's own failures", () => {
     const msg = await refusalOf(() => hire(s, name));
     expect(failed).toBe(true);
     expect(msg).toContain("injected temp cleanup failure");
-    expect(msg).not.toContain("left these entries");
+    expect(msg).not.toContain("retained or could not verify these paths");
     expect(existsSync(agentDir)).toBe(false);
     expectNoBinding(s, name);
   });

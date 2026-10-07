@@ -159,7 +159,7 @@ describe("bob#326 — a hire that fails after a real interview session", () => {
     );
 
     expect(msg).toContain(`the onboarding interview for "${name}" exited with code 5`);
-    expect(msg).toContain(`left these entries in place (paths relative to ${agentDir}`);
+    expect(msg).toContain(`retained or could not verify these paths (relative to ${agentDir}`);
     expect(msg).toContain("soul.md");
     expect(msg).toContain(".pi-agent/sessions");
     // The persona write_soul wrote is retained byte for byte.

@@ -263,18 +263,22 @@ function rollbackRoot(
     report.stranded.push({ quarantine, original: root.path, leftovers: ["."] });
     return;
   }
-  if (moved !== undefined) {
-    const kind = kindOf(moved);
-    if (kind !== "other") {
-      quarantined.kind = kind;
-      quarantined.dev = moved.dev;
-      quarantined.ino = moved.ino;
-      delete quarantined.unresolved;
-    }
+  if (moved === undefined) {
+    report.publications = report.publications?.filter((entry) => entry !== quarantined);
+    report.errors.push(
+      `${quarantine}: vanished before identity read; renamed away from ${root.path}; current location unknown`,
+    );
+    return;
   }
-  if (moved === undefined || !isRecorded(moved, root)) {
-    if (moved !== undefined) settle(quarantine, root.path, moved, [], name, report);
-    else report.leftovers.push(name(root.path));
+  const kind = kindOf(moved);
+  if (kind !== "other") {
+    quarantined.kind = kind;
+    quarantined.dev = moved.dev;
+    quarantined.ino = moved.ino;
+    delete quarantined.unresolved;
+  }
+  if (!isRecorded(moved, root)) {
+    settle(quarantine, root.path, moved, [], name, report);
     return;
   }
   if (root.kind !== "dir") {

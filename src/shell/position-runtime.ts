@@ -187,7 +187,6 @@ function rollbackBind(tx: BindTxn): RollbackReport {
   return report;
 }
 
-// Append observed leftovers, quarantine locations and cleanup errors.
 function refusalAfterRollback(
   err: unknown,
   operation: "hire" | "adoption",
@@ -198,7 +197,7 @@ function refusalAfterRollback(
   if (report.leftovers.length > 0) {
     const named = report.leftovers.map((p) => (p === "." ? "the agent directory itself" : p));
     notes.push(
-      `This failed ${operation} left these entries in place (paths relative to ${agentDir}; a directory named here is left with everything in it): ${named.join(", ")}.`,
+      `Rollback for this failed ${operation} retained or could not verify these paths (relative to ${agentDir}): ${named.join(", ")}.`,
     );
   }
   for (const s of report.stranded) {
