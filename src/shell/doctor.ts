@@ -55,6 +55,7 @@ import {
 import { REFUSAL_REASONS } from "../capabilities/tps-mail/envelope.js";
 import {
   type ProviderLimitsBlock,
+  parseBobYamlBlock,
   readAgentRole,
   readBlock,
   readCapabilities,
@@ -316,11 +317,15 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     });
   } else if (yamlText !== undefined) {
     let providerName: string | undefined;
+    let providerDeclared = false;
     let providerParseError: string | undefined;
     try {
       // Read provider.name through the session reader; doctor reports strict YAML parse
-      // errors and non-scalar `provider.name` refusals (bob#316).
+      // errors and non-scalar `provider.name` refusals (bob#316). Whether a
+      // `provider:` block is declared at all is read through the same parser,
+      // so a block present without a name is reported (bob#345).
       providerName = declaredProviderName(yamlText);
+      providerDeclared = parseBobYamlBlock(yamlText, "provider") !== undefined;
     } catch (err) {
       providerParseError = err instanceof Error ? err.message : String(err);
     }
@@ -333,6 +338,18 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
         status: "fail",
         detail: `cannot read the provider block in bob.yaml — ${providerParseError}`,
         fix: `fix the provider block in bob.yaml, then re-run 'bob doctor ${opts.name}'`,
+      });
+    } else if (providerDeclared && providerName === undefined) {
+      // bob#345: a provider block with no provider.name is a config error, not a
+      // pass. A session resolves the provider and refuses the document, and the
+      // subscription check has no provider to check — so FAIL with the remedy
+      // rather than silently skipping, as the unreadable and unparseable cases
+      // above do.
+      checks.push({
+        name: "subscription auth",
+        status: "fail",
+        detail: `provider.name is not declared in ${bobYamlPath} — a session resolves the provider and refuses this document without it`,
+        fix: `add "name: <provider>" under "provider:" in ${bobYamlPath}, then re-run 'bob doctor ${opts.name}'`,
       });
     } else if (providerName !== undefined) {
       const piProvider = mapBobProviderToPi(providerName, opts.registry);
