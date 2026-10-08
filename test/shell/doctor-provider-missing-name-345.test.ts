@@ -28,13 +28,17 @@ describe("bob#345 — doctor reports a provider block with no name", () => {
     writeFileSync(join(agentDir, "bob.yaml"), yaml);
   }
 
-  function subscriptionCheck(): DoctorCheck | undefined {
+  function doctorChecks(): DoctorCheck[] {
     return runDoctor({
       name: "testbot",
       agentsRoot: join(home, "agents"),
       homeDir: home,
       flairKeysDir: join(home, ".flair", "keys"),
-    }).checks.find((c) => c.name === "subscription auth");
+    }).checks;
+  }
+
+  function subscriptionCheck(): DoctorCheck | undefined {
+    return doctorChecks().find((c) => c.name === "subscription auth");
   }
 
   it("fails a provider block with no name, naming the remedy, and the session refuses the same document", () => {
@@ -55,6 +59,18 @@ describe("bob#345 — doctor reports a provider block with no name", () => {
     expect(check?.status).toBe("fail");
     expect(check?.detail).toContain("provider.name is not declared");
     expect(check?.fix).toContain('add "name: <provider>" under "provider:"');
+  });
+
+  it("reports no provider-name failure for a config with no provider block", () => {
+    writeAgentBobYaml("agent:\n  id: testbot\n  name: Testbot\n  role: builder-local\n");
+
+    // bob#345's check is bounded to a DECLARED provider block: with no provider
+    // block there is nothing to resolve, so the missing-provider-name failure
+    // must not fire.
+    const providerNameFailure = doctorChecks().find(
+      (c) => c.status === "fail" && (c.detail ?? "").includes("provider.name is not declared"),
+    );
+    expect(providerNameFailure).toBeUndefined();
   });
 
   it("still runs the subscription check for a named provider, as before", () => {

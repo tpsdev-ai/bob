@@ -1,0 +1,1 @@
+- **The `bob run` config-reader comment matches the code, and a test pins `bob doctor`'s no-provider-block case (bob#347).** The comment on `readBobYaml` records that the provider block is parsed by the YAML library; `test/shell/doctor-provider-missing-name-345.test.ts` now holds `bob doctor` to no provider-name failure when `bob.yaml` declares no `provider` block.
