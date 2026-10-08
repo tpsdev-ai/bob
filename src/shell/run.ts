@@ -2681,8 +2681,8 @@ function assistantContentToText(content: unknown): string {
 
 // Read ~/agents/<name>/bob.yaml, erroring with an onboard hint when absent.
 // Returned text is parsed by the targeted readers below + the capability
-// loader — all hand-rolled to avoid a YAML dependency the monorepo has
-// deliberately deferred (see the note in init.ts renderBobYaml).
+// loader — hand-rolled, except the provider block, which is parsed by the YAML
+// library (parseBobYamlBlock in bob-yaml.ts).
 function readBobYaml(agentDir: string, name: string): string {
   const yamlPath = join(agentDir, "bob.yaml");
   if (!existsSync(yamlPath)) {
