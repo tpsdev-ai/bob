@@ -80,7 +80,12 @@ import {
 } from "./compaction-contract.js";
 import { collectCredentialPaths } from "./confined-read.js";
 import { configHoldsWeb, gatedNoteInjection } from "./data-class.js";
-import { captureRepositoryState, isVerifiedEdit, type RepositoryState } from "./edit-evidence.js";
+import {
+  captureRepositoryState,
+  isCommandRunnerTool,
+  isVerifiedEdit,
+  type RepositoryState,
+} from "./edit-evidence.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -957,7 +962,8 @@ async function runBoundedSession(
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
       : { kind: "unavailable" };
-  let repositoryAtLastTool = repositoryAtLaunch;
+  const commandStarts = new Map<string, { toolName: string; before: RepositoryState }>();
+  const seenCommandIds = new Set<string>();
   const finalizeAbort = async (reason: TerminationReason): Promise<RunResult> => {
     await finalizePrMemory(
       config,
@@ -1317,21 +1323,44 @@ async function runBoundedSession(
       explorationDetector !== undefined &&
       explorationExhausted === undefined
     ) {
-      const call = event as unknown as { toolName?: unknown; isError?: unknown; result?: unknown };
+      const call = event as unknown as {
+        toolName?: unknown;
+        toolCallId?: unknown;
+        isError?: unknown;
+        result?: unknown;
+      };
       const toolName = String(call.toolName ?? "");
+      const callId =
+        typeof call.toolCallId === "string" && call.toolCallId.length > 0
+          ? call.toolCallId
+          : undefined;
+      if (event.type === "tool_execution_start" && isCommandRunnerTool(toolName)) {
+        const before = captureRepositoryState(config.cwd, repositoryAtLaunch);
+        if (callId !== undefined) {
+          commandStarts.set(callId, {
+            toolName,
+            before: seenCommandIds.has(callId) ? { kind: "unavailable" } : before,
+          });
+          seenCommandIds.add(callId);
+        }
+      }
+      const start =
+        event.type === "tool_execution_end" && callId !== undefined
+          ? commandStarts.get(callId)
+          : undefined;
+      if (event.type === "tool_execution_end" && callId !== undefined) commandStarts.delete(callId);
       const repository =
-        event.type === "tool_execution_end" && repositoryAtLaunch.kind === "git"
+        start !== undefined && start.toolName === toolName && start.before.kind === "git"
           ? {
               cwd: config.cwd,
-              before: repositoryAtLastTool,
-              after: captureRepositoryState(config.cwd, repositoryAtLaunch),
+              before: start.before,
+              after: captureRepositoryState(config.cwd, start.before),
             }
           : undefined;
       const budget =
         event.type === "tool_execution_start"
           ? explorationDetector.observeStart(toolName)
           : explorationDetector.observeEnd(toolName, call.isError, call.result, repository);
-      if (repository?.after.kind === "git") repositoryAtLastTool = repository.after;
       if (budget.inject) {
         writeRunLog(
           {

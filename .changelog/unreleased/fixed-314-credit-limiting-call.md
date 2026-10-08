@@ -1,0 +1,1 @@
+- **The exploration budget credits a command’s during-call change that paired repository evidence verifies.** Credit is withheld when the launch-history check was unavailable or skipped. Closes #314.
