@@ -1,0 +1,1 @@
+- **`bob doctor` reports a `provider` block with no `name` as a failure (bob#345).** A session resolves the provider and refuses the document, so the subscription-auth check now FAILs with the remedy (`add "name: <provider>" under "provider:"`) instead of skipping. (`test/shell/doctor-provider-missing-name-345.test.ts`)
