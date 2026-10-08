@@ -207,16 +207,31 @@ describe("T1 — the operator loader validates every row before returning", () =
     ).toThrow(/unknown field/);
   });
 
-  it("a real parser refuses duplicate keys, tags, aliases and merge keys", () => {
-    const docs = [
-      "version: 1\nversion: 1\nproviders: []\n",
-      "version: 1\nproviders: []\nx: !!acme y\n",
-      "version: 1\nproviders: []\na: &x 1\nb: *x\n",
-      "version: 1\nproviders: []\nbase: &b {a: 1}\nc:\n  <<: *b\n",
-    ];
-    for (const doc of docs) {
-      expect(() => loadProviderRegistry({ path: writeRegistry(doc) })).toThrow(/provider registry/);
-    }
+  it("a real parser refuses duplicate keys", () => {
+    expect(() =>
+      loadProviderRegistry({ path: writeRegistry("version: 1\nversion: 1\nproviders: []\n") }),
+    ).toThrow(/provider registry: invalid /);
+  });
+
+  it("a real parser refuses a YAML tag with its named refusal", () => {
+    expect(() =>
+      loadProviderRegistry({ path: writeRegistry("version: 1\nproviders: []\nx: !!acme y\n") }),
+    ).toThrow(/provider registry: unsupported tag in /);
+  });
+
+  it("a real parser refuses a YAML alias or anchor with its named refusal", () => {
+    expect(() =>
+      loadProviderRegistry({ path: writeRegistry("version: 1\nproviders: []\na: &x 1\nb: *x\n") }),
+    ).toThrow(/uses a YAML alias\/anchor, which is not allowed/);
+  });
+
+  it("a real parser refuses a YAML merge key with its named refusal", () => {
+    // No anchor/alias anywhere: the merge key must be what refuses.
+    expect(() =>
+      loadProviderRegistry({
+        path: writeRegistry("version: 1\nproviders: []\nbase:\n  <<: {a: 1}\n"),
+      }),
+    ).toThrow(/uses a YAML merge key, which is not allowed/);
   });
 });
 

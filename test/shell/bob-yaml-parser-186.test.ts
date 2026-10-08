@@ -41,15 +41,23 @@ describe("bob#186 slice 2 (T7) — the provider readers parse real YAML", () => 
     );
   });
 
-  it("an alias, anchor or merge key refuses", () => {
+  it("an alias or anchor refuses with its named refusal", () => {
     expect(() =>
       readProviderLimits("provider: &p\n  name: ollama\n  model: m\nbase: *p\n"),
-    ).toThrow(/alias\/anchor/);
+    ).toThrow(/bob\.yaml uses a YAML alias\/anchor, which is not allowed/);
+  });
+
+  it("a merge key refuses with its named refusal", () => {
+    // No anchor/alias anywhere: the merge key must be what refuses.
     expect(() =>
-      readProviderLimits(
-        "base: &b {a: 1}\nprovider:\n  name: ollama\n  model: m\n  extra:\n    <<: *b\n",
-      ),
-    ).toThrow(/alias\/anchor|merge/);
+      readProviderLimits("base:\n  <<: {a: 1}\nprovider:\n  name: ollama\n  model: m\n"),
+    ).toThrow(/bob\.yaml uses a YAML merge key, which is not allowed/);
+  });
+
+  it("a YAML tag refuses with its named refusal", () => {
+    expect(() =>
+      readProviderLimits("provider:\n  name: ollama\n  model: m\ntag: !!acme x\n"),
+    ).toThrow(/unsupported YAML tag in bob\.yaml/);
   });
 
   it("an unknown provider key still refuses", () => {

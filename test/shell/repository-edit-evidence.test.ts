@@ -837,6 +837,8 @@ describe("repository evidence in the completion gate and exploration budget", ()
   });
 
   it("retains launch paths removed from the final index and HEAD", async () => {
+    const before = captureRepositoryState(cwd);
+    if (before.kind !== "git") throw new Error("missing repository evidence");
     const result = await run([
       {
         toolName: "run",
@@ -847,6 +849,11 @@ describe("repository evidence in the completion gate and exploration budget", ()
       },
     ]);
     expect(result.exitCode).toBe(0);
+    const after = captureRepositoryState(cwd, before);
+    if (after.kind !== "git") throw new Error("missing repository evidence");
+    // The launch path is gone from the index and HEAD, yet the observation keeps
+    // it as a deleted entry — that retention is what this test names.
+    expect(after.tracked).toEqual(new Map([["tracked", { mode: "deleted", object: "" }]]));
   });
 
   function changePresentation() {
