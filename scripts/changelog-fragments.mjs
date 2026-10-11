@@ -691,7 +691,7 @@ function moveBack(staged, hooks = {}) {
 
 function unlinkStaged(m) {
   if (m.identity.state === "UNKNOWN") {
-    return `${stagingDirRel()}/${m.name}: identity unknown; staged path left in place`;
+    return stagedPathNote(m);
   }
   const current = lstatSync(m.staged, { bigint: true });
   if (current.dev !== m.identity.dev || current.ino !== m.identity.ino) {
@@ -704,7 +704,15 @@ function unlinkStaged(m) {
 function stagedPathNote(m) {
   const path = `${stagingDirRel()}/${m.name}`;
   if (m.identity.state === "UNKNOWN") {
-    return `${path}: identity unknown; staged path left in place`;
+    try {
+      lstatSync(m.staged);
+      return `identity unknown; promote did not unlink ${path}`;
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        return `identity unknown; nothing is at ${path} (promote did not unlink it)`;
+      }
+      return `identity unknown; promote did not unlink ${path} (its state could not be read)`;
+    }
   }
   try {
     if (lstatSync(m.staged).isFile()) {
