@@ -664,7 +664,7 @@ function assertNoStagingLeftover(stagingDir) {
   );
 }
 
-// Link each staging path to its original path, then unlink it if its identity matches.
+// Attempt each link back; only after a successful link, check the staged identity before unlinking.
 // A link, unlike a rename, refuses to replace a file a writer put at the path since
 // the move.
 function moveBack(staged, hooks = {}) {
@@ -690,8 +690,11 @@ function moveBack(staged, hooks = {}) {
 }
 
 function unlinkStaged(m) {
+  if (m.identity.state === "UNKNOWN") {
+    return `${stagingDirRel()}/${m.name}: identity unknown; staged path left in place`;
+  }
   const current = lstatSync(m.staged, { bigint: true });
-  if (current.dev !== m.dev || current.ino !== m.ino) {
+  if (current.dev !== m.identity.dev || current.ino !== m.identity.ino) {
     return `${stagingDirRel()}/${m.name}: not the staged file; left in place`;
   }
   unlinkSync(m.staged);
@@ -700,6 +703,9 @@ function unlinkStaged(m) {
 
 function stagedPathNote(m) {
   const path = `${stagingDirRel()}/${m.name}`;
+  if (m.identity.state === "UNKNOWN") {
+    return `${path}: identity unknown; staged path left in place`;
+  }
   try {
     if (lstatSync(m.staged).isFile()) {
       return `a regular file is at ${path} (not verified to be the staged copy)`;
@@ -720,7 +726,7 @@ function removeStagingDir(stagingDir) {
 }
 
 // Rename fragments into staging; attempt rollback if a rename fails.
-function stageFragments(fragments, stagingDir) {
+function stageFragments(fragments, stagingDir, hooks = {}) {
   try {
     mkdirSync(stagingDir);
   } catch (err) {
@@ -736,22 +742,39 @@ function stageFragments(fragments, stagingDir) {
     );
   }
   const staged = [];
+  let name;
   try {
     for (const f of fragments) {
+      name = f.name;
       const dest = join(stagingDir, f.name);
       renameSync(f.path, dest);
-      const m = { name: f.name, orig: f.path, staged: dest, category: f.category, slug: f.slug };
+      const m = {
+        name: f.name,
+        orig: f.path,
+        staged: dest,
+        category: f.category,
+        slug: f.slug,
+        identity: { state: "UNKNOWN" },
+      };
       staged.push(m);
-      const identity = lstatSync(dest, { bigint: true });
-      m.dev = identity.dev;
-      m.ino = identity.ino;
+      try {
+        const identity = (hooks.stagedLstat ?? lstatSync)(dest, { bigint: true });
+        m.identity = { state: "KNOWN", dev: identity.dev, ino: identity.ino };
+      } catch (err) {
+        throw new FragmentError(
+          `promote: ${FRAGMENT_DIR_REL}/${f.name} moved to staging but its identity could not be read (${err?.code ?? err})`,
+        );
+      }
     }
   } catch (err) {
     const notes = moveBack(staged);
-    const name = fragments[staged.length]?.name ?? "a fragment";
+    const failure =
+      err instanceof FragmentError
+        ? err.message
+        : `promote: could not move ${FRAGMENT_DIR_REL}/${name} into ${stagingDirRel()}/ (${err?.code ?? err})`;
     const extra = notes.length > 0 ? ` ${notes.join("; ")}.` : "";
     throw new FragmentError(
-      `promote: could not move ${FRAGMENT_DIR_REL}/${name} into ${stagingDirRel()}/ (${err?.code ?? err}); ` +
+      `${failure}; ` +
         `nothing was folded and nothing was written. Restore the fragment directory ` +
         `(git checkout -- ${FRAGMENT_DIR_REL}) if needed.${extra} Inspect ${stagingDirRel()}/ before removing it and running promote again.`,
     );
@@ -826,7 +849,7 @@ export function promote(
   const blobs = gitRestorableOrThrow({ changelogPath, dir, names });
   if (hooks.afterIndexCheck) hooks.afterIndexCheck();
 
-  const staged = stageFragments(fragments, stagingDir);
+  const staged = stageFragments(fragments, stagingDir, hooks);
   if (hooks.afterStage) hooks.afterStage();
 
   const day = date ?? new Date().toISOString().slice(0, 10);
