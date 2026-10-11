@@ -104,7 +104,7 @@ index byte for byte (so a file that `core.autocrlf` or a clean filter changes on
 its way into git counts as differing), naming each. After that check, `promote` moves each fragment it will fold into a
 staging directory (`.changelog/promote-staging`)
 with a rename, folds the section from the moved bytes once they hash to the index
-blob, and deletes them only after the section is written. A fragment whose moved bytes differ
+blob, and, after the section is written, removes staged paths whose dev and ino still match. A fragment whose moved bytes differ
 from the preflight index blob is refused, folding nothing; a fragment
 rewritten at its path after the move leaves a new file there, which `promote` does not
 touch and, on a successful promote, reports as `changed during promote, kept: <path>`. A write through a file
@@ -112,7 +112,7 @@ descriptor opened before the move lands in the staged copy and is not detected a
 has been verified. Preflight failures need not create `.changelog/promote-staging`.
 After staging, move/fold/write failures attempt rollback and report paths that could not
 be restored; cleanup failures report paths that could not be removed. Exceptions from
-`afterStage` and `afterWrite` bypass these diagnostics, and checking recreated paths can
+`afterStage` and `afterWrite` bypass these diagnostics, and checking original paths can
 fail after staging is removed. The next promote refuses if staging still exists.
 
 Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`

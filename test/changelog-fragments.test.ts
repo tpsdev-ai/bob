@@ -918,6 +918,57 @@ describe("changelog fragments — render + promote (bob#236)", () => {
 });
 
 describe("changelog fragments — promote stages the fragments (bob#296)", () => {
+  for (const phase of ["cleanup", "rollback unlink"] as const) {
+    it(`leaves and names a replacement staged file before ${phase}`, () => {
+      const { dir, changelogPath } = project();
+      const body = "- **a fix.**\n";
+      const replacement = "- **a replacement.**\n";
+      fragment(dir, "fixed-a.md", body);
+      stageAll();
+      const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+      const original = join(dir, "fixed-a.md");
+      const saved = join(root, "saved-fixed-a.md");
+      const replaceStaged = () => {
+        const identity = lstatSync(staged, { bigint: true });
+        renameSync(staged, saved);
+        writeFileSync(staged, replacement);
+        const current = lstatSync(staged, { bigint: true });
+        expect(current.dev).toBe(identity.dev);
+        expect(current.ino).not.toBe(identity.ino);
+      };
+      expect(() =>
+        cf.promote("1.2.3", {
+          dir,
+          changelogPath,
+          hooks:
+            phase === "cleanup"
+              ? { afterWrite: replaceStaged }
+              : {
+                  afterStage: () => {
+                    rmSync(changelogPath);
+                    symlinkSync(join(root, "missing-changelog"), changelogPath);
+                  },
+                  beforeRollbackUnlink: replaceStaged,
+                },
+        }),
+      ).toThrow(".changelog/promote-staging/fixed-a.md: not the staged file; left in place");
+      expect(readFileSync(staged, "utf8")).toBe(replacement);
+      expect(readFileSync(saved, "utf8")).toBe(body);
+      expect(lstatSync(staged, { bigint: true }).ino).not.toBe(
+        lstatSync(saved, { bigint: true }).ino,
+      );
+      if (phase === "cleanup") {
+        expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+        expect(existsSync(original)).toBe(false);
+      } else {
+        expect(readFileSync(original, "utf8")).toBe(body);
+        expect(lstatSync(original, { bigint: true }).ino).toBe(
+          lstatSync(saved, { bigint: true }).ino,
+        );
+      }
+    });
+  }
+
   it("reports a failed git hash-object separately from a byte mismatch", () => {
     const { dir, changelogPath } = project();
     const body = "- **a fix.**\n";
@@ -1014,7 +1065,7 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
     });
   }
 
-  it("checking recreated paths can fail after the staging directory is removed", () => {
+  it("checking original paths can fail after the staging directory is removed", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.**\n");
     stageAll();
@@ -1249,7 +1300,7 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
     expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
   });
 
-  it("reports unknown staged state when rollback unlink encounters a directory", () => {
+  it("leaves and names a directory replacing the staged file before rollback unlink", () => {
     const { dir, changelogPath } = project();
     const body = "- **a fix.** \n";
     fragment(dir, "fixed-a.md", body);
@@ -1274,9 +1325,8 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toContain("staged path could not be removed");
     expect(message).toContain(
-      "path state is unknown; inspect .changelog/promote-staging/fixed-a.md",
+      ".changelog/promote-staging/fixed-a.md: not the staged file; left in place",
     );
     expect(message).not.toContain("remains");
     expect(message).not.toContain("both paths");
@@ -1350,9 +1400,8 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
     }
     expect(message).toContain("fixed-a.md");
     expect(message).toContain(".changelog/promote-staging/");
-    expect(message).toContain("could not be removed");
     expect(message).toContain(
-      "path state is unknown; inspect .changelog/promote-staging/fixed-a.md",
+      ".changelog/promote-staging/fixed-a.md: not the staged file; left in place",
     );
     expect(message).not.toContain("remains");
     expect(lstatSync(join(staging, "fixed-a.md")).isDirectory()).toBe(true);

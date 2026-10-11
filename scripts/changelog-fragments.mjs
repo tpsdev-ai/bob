@@ -635,8 +635,8 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 // ─── promote ──────────────────────────────────────────────────────────────────
 //
 // bob#296: rename fragments into .changelog/promote-staging, verify the moved
-// bytes against the preflight's index blobs, then fold and delete the staged copies
-// after the changelog write. Recreated paths are kept.
+// bytes against the preflight's index blobs, then fold and, after the changelog
+// write, remove matching staged paths.
 
 export const STAGING_BASENAME = "promote-staging";
 
@@ -664,7 +664,7 @@ function assertNoStagingLeftover(stagingDir) {
   );
 }
 
-// Link each staging path to its original path, then unlink the staging path.
+// Link each staging path to its original path, then unlink it if its identity matches.
 // A link, unlike a rename, refuses to replace a file a writer put at the path since
 // the move.
 function moveBack(staged, hooks = {}) {
@@ -680,12 +680,22 @@ function moveBack(staged, hooks = {}) {
     }
     try {
       if (hooks.beforeRollbackUnlink) hooks.beforeRollbackUnlink(m);
-      unlinkSync(m.staged);
+      const note = unlinkStaged(m);
+      if (note) notes.push(note);
     } catch (err) {
       notes.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
     }
   }
   return notes;
+}
+
+function unlinkStaged(m) {
+  const current = lstatSync(m.staged, { bigint: true });
+  if (current.dev !== m.dev || current.ino !== m.ino) {
+    return `${stagingDirRel()}/${m.name}: not the staged file; left in place`;
+  }
+  unlinkSync(m.staged);
+  return null;
 }
 
 function stagedPathNote(m) {
@@ -730,7 +740,11 @@ function stageFragments(fragments, stagingDir) {
     for (const f of fragments) {
       const dest = join(stagingDir, f.name);
       renameSync(f.path, dest);
-      staged.push({ name: f.name, orig: f.path, staged: dest, category: f.category, slug: f.slug });
+      const m = { name: f.name, orig: f.path, staged: dest, category: f.category, slug: f.slug };
+      staged.push(m);
+      const identity = lstatSync(dest, { bigint: true });
+      m.dev = identity.dev;
+      m.ino = identity.ino;
     }
   } catch (err) {
     const notes = moveBack(staged);
@@ -898,12 +912,13 @@ export function promote(
     );
   }
   if (hooks.afterWrite) hooks.afterWrite(staged);
-  // The section is written; the staged files are now redundant. Deleting them is the
-  // last step.
+  // Clean up matching staged files after the write; on success, remove the directory
+  // before checking original paths.
   const left = [];
   for (const m of staged) {
     try {
-      unlinkSync(m.staged);
+      const note = unlinkStaged(m);
+      if (note) left.push(note);
     } catch (err) {
       left.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
     }
@@ -923,7 +938,7 @@ export function promote(
         `next promote (the next promote refuses while it is there).`,
     );
   }
-  // Report recreated fragment paths on success.
+  // Report entries found at the original paths on success.
   const kept = [];
   for (const m of staged) {
     try {
