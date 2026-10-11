@@ -664,7 +664,7 @@ function assertNoStagingLeftover(stagingDir) {
   );
 }
 
-// Link the staged files back to their original paths, then unlink the staged copy.
+// Link each staging path to its original path, then unlink the staging path.
 // A link, unlike a rename, refuses to replace a file a writer put at the path since
 // the move.
 function moveBack(staged, hooks = {}) {
@@ -691,7 +691,9 @@ function moveBack(staged, hooks = {}) {
 function stagedPathNote(m) {
   const path = `${stagingDirRel()}/${m.name}`;
   try {
-    if (lstatSync(m.staged).isFile()) return `staged copy remains in ${path}`;
+    if (lstatSync(m.staged).isFile()) {
+      return `a regular file is at ${path} (not verified to be the staged copy)`;
+    }
   } catch {}
   return `path state is unknown; inspect ${path}`;
 }
@@ -707,7 +709,7 @@ function removeStagingDir(stagingDir) {
   }
 }
 
-// Rename fragments into staging; on failure, attempt rollback.
+// Rename fragments into staging; attempt rollback if a rename fails.
 function stageFragments(fragments, stagingDir) {
   try {
     mkdirSync(stagingDir);
@@ -822,10 +824,15 @@ export function promote(
     // bytes.
     const folded = [];
     const changedBefore = [];
+    const unverified = [];
     for (const m of staged) {
       const bytes = readFileSync(m.staged);
       const sha = gitHashBytes(dir, bytes);
-      if (sha === null || sha !== blobs.get(m.name)) {
+      if (sha === null) {
+        unverified.push(m.name);
+        continue;
+      }
+      if (sha !== blobs.get(m.name)) {
         changedBefore.push(m.name);
         continue;
       }
@@ -841,10 +848,20 @@ export function promote(
         body: body.replace(/\s+$/, ""),
       });
     }
+    const problems = [];
+    if (unverified.length > 0) {
+      problems.push(
+        `${unverified.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} could not verify (git hash-object failed)`,
+      );
+    }
     if (changedBefore.length > 0) {
+      problems.push(
+        `${changedBefore.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} changed after the index check`,
+      );
+    }
+    if (problems.length > 0) {
       throw new FragmentError(
-        `promote: ${changedBefore.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} changed after the index ` +
-          `check; nothing was folded and ` +
+        `promote: ${problems.join("; ")}; nothing was folded and ` +
           `nothing was written to CHANGELOG.md.`,
       );
     }
