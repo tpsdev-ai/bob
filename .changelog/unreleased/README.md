@@ -108,10 +108,13 @@ with a rename, folds the section from the moved bytes once they hash to the inde
 blob, and deletes them only after the section is written. A fragment that changed
 before the move is refused, folding nothing; a fragment
 rewritten at its path after the move leaves a new file there, which `promote` does not
-touch and reports as `changed during promote, kept: <path>`. A write through a file
+touch and, on a successful promote, reports as `changed during promote, kept: <path>`. A write through a file
 descriptor opened before the move lands in the staged copy and is not detected after it
-has been verified. Rollback restores staged fragments or leaves them in the staging directory and names them. If a run leaves the
-staging directory behind, the next `promote` refuses, naming it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
+has been verified. Rollback links staged fragments to their original paths, then unlinks the
+staged names. If linking fails (including when the original path reappears), the copy
+stays in staging and is named; if unlinking fails after linking succeeds, it is present
+at both paths and is named. An existing staging path is refused by name; it may be left
+from an interrupted run, so inspect it before removing it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 remove a staged fragment after writing the section, it names each one left: those
 are already in the new section, so remove `.changelog/promote-staging`, or restore
 both (`git checkout -- CHANGELOG.md .changelog/unreleased`), remove

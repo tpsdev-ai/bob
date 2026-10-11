@@ -636,8 +636,8 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 //
 // bob#296: rename fragments into .changelog/promote-staging, verify the moved
 // bytes against the preflight's index blobs, then fold and delete the staged copies
-// after the changelog write. Recreated paths are kept. Rollback restores staged
-// files or leaves them in the staging directory and names them.
+// after the changelog write. Recreated paths are kept. Rollback names copies left
+// in staging if linking fails, or at both paths if unlinking the staged name fails.
 
 export const STAGING_BASENAME = "promote-staging";
 
@@ -649,9 +649,8 @@ function stagingDirRel() {
   return join(dirname(FRAGMENT_DIR_REL), STAGING_BASENAME);
 }
 
-// A staging directory that is already there belongs to a run that did not finish;
-// the fragments it moved are missing from the fragment directory, so promote must
-// not read the shorter set and fold it. Refused by name before anything is read.
+// An existing staging path may be left from an interrupted run. Refused by name
+// before fragments are read; its provenance and contents are not checked.
 // `lstat` so a link there is named, not followed.
 function assertNoStagingLeftover(stagingDir) {
   try {
@@ -661,9 +660,8 @@ function assertNoStagingLeftover(stagingDir) {
     throw err;
   }
   throw new FragmentError(
-    `promote: ${stagingDirRel()}/ is left over from an earlier promote that did not finish; the fragments it ` +
-      `moved there are missing from ${FRAGMENT_DIR_REL}/. Move them back or delete ${stagingDirRel()}/ once you ` +
-      `have checked, then run promote again. Nothing was written.`,
+    `promote: ${stagingDirRel()}/ already exists and may be left from an interrupted run. ` +
+      `Inspect it before removing it, then run promote again. Nothing was written.`,
   );
 }
 
@@ -694,7 +692,7 @@ function moveBack(staged) {
 function moveBackNotes({ failed, changed }) {
   const notes = [];
   if (failed.length > 0)
-    notes.push(`${failed.join(", ")} could not be moved back and remain in ${stagingDirRel()}/`);
+    notes.push(`${failed.join(", ")} staged copies remain in ${stagingDirRel()}/`);
   for (const n of changed)
     notes.push(`${n} changed during promote; its staged copy remains in ${stagingDirRel()}/`);
   return notes;
@@ -916,7 +914,7 @@ export function promote(
         `next promote (the next promote refuses while it is there).`,
     );
   }
-  // Report recreated fragment paths.
+  // Report recreated fragment paths on success.
   const kept = [];
   for (const m of staged) {
     try {
