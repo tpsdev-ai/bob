@@ -37,6 +37,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { lazyStream } from "@earendil-works/pi-ai";
 import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   type AgentSessionRuntime,
@@ -540,6 +541,36 @@ function captureKeyedRuntimeTransport(
   });
 }
 
+/**
+ * True when the runtime's effective provider for `row` still matches the
+ * provider captured when bob registered the row, BEFORE the session services
+ * were built: same id, name, endpoint and composed models. pi re-composes the
+ * provider on every refresh (a NEW provider object), so identity cannot be
+ * compared; a read that throws counts as a mismatch (refuse).
+ */
+function keyedProviderMatchesRegistration(
+  modelRuntime: ModelRuntime,
+  row: KeyedRow,
+  registered: { provider: EffectiveKeyedProvider } | undefined,
+): boolean {
+  if (registered === undefined) return false;
+  const effective = modelRuntime.getProvider(row.runtime);
+  if (!effective) return false;
+  const before = registered.provider;
+  if (
+    effective.id !== before.id ||
+    effective.baseUrl !== before.baseUrl ||
+    effective.name !== before.name
+  ) {
+    return false;
+  }
+  try {
+    return JSON.stringify(effective.getModels()) === JSON.stringify(before.getModels());
+  } catch {
+    return false;
+  }
+}
+
 export async function assertKeyedRuntimeUnchanged(
   modelRuntime: ModelRuntime,
   input: { row: KeyedRow; model: string; expected: OpenrouterProviderConfig; apiKey: string },
@@ -801,6 +832,37 @@ export function guardProviderRegistration(
 /** The openrouter-specific registration guard, pinned to the openrouter runtime. */
 export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
   guardProviderRegistration(modelRuntime, ["openrouter"]);
+}
+
+/**
+ * Refuse a request pi composed for a keyed row under a different API flavour.
+ * pi's composed provider picks the stream handler by the effective model's
+ * `api` before it reaches the registered transport, so a request re-routed to
+ * another adapter never enters `keyedTransport`. This wraps the runtime's
+ * request verbs — what pi's agent session calls — so the check runs on the
+ * composed request itself, not only at registration.
+ */
+export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: KeyedRow): void {
+  const rerouted = (model: unknown): boolean => {
+    const candidate = (model ?? {}) as { provider?: unknown; api?: unknown };
+    return candidate.provider === row.runtime && candidate.api !== row.api;
+  };
+  const refuse = (model: unknown) =>
+    lazyStream(model as never, async () => {
+      throw new Error(
+        `bob: refusing an ${row.id} request — its composed API is not the row's (${row.api})`,
+      );
+    });
+  const originalSimple = modelRuntime.streamSimple.bind(modelRuntime);
+  modelRuntime.streamSimple = ((model, context, options) =>
+    rerouted(model)
+      ? refuse(model)
+      : originalSimple(model, context, options)) as ModelRuntime["streamSimple"];
+  const originalStream = modelRuntime.stream.bind(modelRuntime);
+  modelRuntime.stream = ((model, context, options) =>
+    rerouted(model)
+      ? refuse(model)
+      : originalStream(model, context, options)) as ModelRuntime["stream"];
 }
 
 export function installKeyedDeferredRefusal(modelRuntime: ModelRuntime, row: KeyedRow): void {
@@ -1550,6 +1612,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         apiKey,
       });
       installKeyedDeferredRefusal(modelRuntime, keyedRow);
+      installKeyedComposedApiGuard(modelRuntime, keyedRow);
       // GUARD THE VERB (round 5, item 1): bob registered its own provider; wrap
       // the runtime's registration verbs so a LATER registerProvider(runtime)
       // — from session_start, before_agent_start, or a print-mode bind — is
@@ -1574,7 +1637,16 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       const selected = keyedRow;
       modelRuntime.refresh = async (options) => {
         const refreshed = await originalRefresh.call(modelRuntime, options);
-        captureKeyedRuntimeTransport(modelRuntime, selected.runtime, selected.id);
+        // pi re-composes the provider on every refresh. Only a re-composition
+        // that still matches the row's registration before services started
+        // updates the baseline; a re-composition that changes the id, name,
+        // endpoint or models leaves the pre-services baseline in place, so the
+        // post-services check refuses it. (Re-capturing unconditionally here
+        // would accept it.)
+        const registered = keyedRuntimeTransports.get(modelRuntime)?.get(selected.runtime);
+        if (keyedProviderMatchesRegistration(modelRuntime, selected, registered)) {
+          captureKeyedRuntimeTransport(modelRuntime, selected.runtime, selected.id);
+        }
         return refreshed;
       };
     }
