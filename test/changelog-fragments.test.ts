@@ -929,8 +929,8 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
       const original = join(dir, "fixed-a.md");
       const saved = join(root, "saved-fixed-a.md");
       const replaceStaged = () => {
-        const identity = lstatSync(staged, { bigint: true });
         renameSync(staged, saved);
+        const identity = lstatSync(saved, { bigint: true });
         writeFileSync(staged, replacement);
         const current = lstatSync(staged, { bigint: true });
         expect(current.dev).toBe(identity.dev);
