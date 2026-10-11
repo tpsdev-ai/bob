@@ -110,7 +110,7 @@ blob, and deletes them only after the section is written. A fragment that change
 before the move is moved back and refused, folding nothing; a fragment that
 changes after the move leaves a new file at its path, which `promote` does not
 touch and reports as `changed during promote, kept: <path>`. Any failure before
-the section is written moves every staged fragment back. If a run leaves the
+the section is written moves the staged fragments back. If a run leaves the
 staging directory behind, the next `promote` refuses, naming it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 remove a staged fragment after writing the section, it names each one left: those
 are already in the new section, so remove `.changelog/promote-staging`, or restore

@@ -675,7 +675,7 @@ function assertNoStagingLeftover(stagingDir) {
   );
 }
 
-// Rename every staged file back to its original path. Returns the names that could
+// Rename the staged files back to their original paths. Returns the names that could
 // not be moved back, each with its error code.
 function moveBack(staged) {
   const failed = [];
@@ -927,7 +927,7 @@ export function promote(
     );
   }
   // A fragment that changed after the move is a NEW file at its old path. promote
-  // never touched it; report it so the operator knows it is not in this release.
+  // does not touch it; report it so the operator knows it is not in this release.
   const kept = [];
   for (const m of staged) {
     try {
