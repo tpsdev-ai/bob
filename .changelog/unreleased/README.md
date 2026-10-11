@@ -110,15 +110,9 @@ before the move is refused, folding nothing; a fragment
 rewritten at its path after the move leaves a new file there, which `promote` does not
 touch and, on a successful promote, reports as `changed during promote, kept: <path>`. A write through a file
 descriptor opened before the move lands in the staged copy and is not detected after it
-has been verified. Rollback links staged fragments to their original paths, then unlinks the
-staged names. If linking fails (including when the original path reappears), the copy
-stays in staging and is named; if unlinking fails after linking succeeds, it is present
-at both paths and is named. An existing staging path is refused by name; it may be left
-from an interrupted run, so inspect it before removing it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
-remove a staged fragment after writing the section, it names each one left: those
-are already in the new section, so remove `.changelog/promote-staging`, or restore
-both (`git checkout -- CHANGELOG.md .changelog/unreleased`), remove
-`.changelog/promote-staging`, and run it again.
+has been verified. On any failure, promote stops before deleting what it could not account for,
+names the paths it could not restore, and leaves `.changelog/promote-staging` for
+inspection; the next promote refuses until that directory is removed.
 
 Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`
 rewrites that section's body to the note, so `check` and `promote` both refuse

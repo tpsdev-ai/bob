@@ -636,8 +636,7 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 //
 // bob#296: rename fragments into .changelog/promote-staging, verify the moved
 // bytes against the preflight's index blobs, then fold and delete the staged copies
-// after the changelog write. Recreated paths are kept. Rollback names copies left
-// in staging if linking fails, or at both paths if unlinking the staged name fails.
+// after the changelog write. Recreated paths are kept.
 
 export const STAGING_BASENAME = "promote-staging";
 
@@ -667,35 +666,34 @@ function assertNoStagingLeftover(stagingDir) {
 
 // Link the staged files back to their original paths, then unlink the staged copy.
 // A link, unlike a rename, refuses to replace a file a writer put at the path since
-// the move. Returns what stayed in the staging directory: `failed` names with an
-// error code, `changed` names whose path was rewritten.
-function moveBack(staged) {
-  const failed = [];
-  const changed = [];
+// the move.
+function moveBack(staged, hooks = {}) {
+  const notes = [];
   for (const m of staged) {
     try {
       linkSync(m.staged, m.orig);
     } catch (err) {
-      if (err?.code === "EEXIST") changed.push(m.name);
-      else failed.push(`${m.name} (${err?.code ?? err})`);
+      notes.push(
+        `${FRAGMENT_DIR_REL}/${m.name} could not be restored (${err?.code ?? err}); ${stagedPathNote(m)}`,
+      );
       continue;
     }
     try {
+      if (hooks.beforeRollbackUnlink) hooks.beforeRollbackUnlink(m);
       unlinkSync(m.staged);
     } catch (err) {
-      failed.push(`${m.name} (${err?.code ?? err})`);
+      notes.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
     }
   }
-  return { failed, changed };
+  return notes;
 }
 
-function moveBackNotes({ failed, changed }) {
-  const notes = [];
-  if (failed.length > 0)
-    notes.push(`${failed.join(", ")} staged copies remain in ${stagingDirRel()}/`);
-  for (const n of changed)
-    notes.push(`${n} changed during promote; its staged copy remains in ${stagingDirRel()}/`);
-  return notes;
+function stagedPathNote(m) {
+  const path = `${stagingDirRel()}/${m.name}`;
+  try {
+    if (lstatSync(m.staged).isFile()) return `staged copy remains in ${path}`;
+  } catch {}
+  return `path state is unknown; inspect ${path}`;
 }
 
 // Remove the staging directory; null on success or when it is already gone, else
@@ -709,7 +707,7 @@ function removeStagingDir(stagingDir) {
   }
 }
 
-// Rename fragments into staging; on failure, restore them or name those left there.
+// Rename fragments into staging; on failure, attempt rollback.
 function stageFragments(fragments, stagingDir) {
   try {
     mkdirSync(stagingDir);
@@ -733,17 +731,13 @@ function stageFragments(fragments, stagingDir) {
       staged.push({ name: f.name, orig: f.path, staged: dest, category: f.category, slug: f.slug });
     }
   } catch (err) {
-    const notes = moveBackNotes(moveBack(staged));
-    const dirErr = removeStagingDir(stagingDir);
+    const notes = moveBack(staged);
     const name = fragments[staged.length]?.name ?? "a fragment";
     const extra = notes.length > 0 ? ` ${notes.join("; ")}.` : "";
-    const extraDir = dirErr
-      ? ` ${stagingDirRel()}/ could not be removed (${dirErr?.code ?? dirErr}).`
-      : "";
     throw new FragmentError(
       `promote: could not move ${FRAGMENT_DIR_REL}/${name} into ${stagingDirRel()}/ (${err?.code ?? err}); ` +
         `nothing was folded and nothing was written. Restore the fragment directory ` +
-        `(git checkout -- ${FRAGMENT_DIR_REL}) if needed, then run promote again.${extra}${extraDir}`,
+        `(git checkout -- ${FRAGMENT_DIR_REL}) if needed.${extra} Inspect ${stagingDirRel()}/ before removing it and running promote again.`,
     );
   }
   return staged;
@@ -868,40 +862,38 @@ export function promote(
       writeChangelog(changelogPath, next.join("\n"), changelogRead, { fstat });
     } catch (err) {
       if (err instanceof FragmentError) {
-        throw new FragmentError(`promote: ${err.message} No fragment was deleted.`);
+        throw new FragmentError(`promote: ${err.message}`);
       }
       throw new FragmentError(
-        `promote: could not write CHANGELOG.md (${err?.code ?? err}); no fragment was deleted. Restore it ` +
+        `promote: could not write CHANGELOG.md (${err?.code ?? err}). Restore it ` +
           `(git checkout -- CHANGELOG.md) and run promote again.`,
       );
     }
   } catch (err) {
-    // Restore staged files or name those left in staging.
-    const parts = moveBackNotes(moveBack(staged));
-    const dirErr = removeStagingDir(stagingDir);
-    if (parts.length === 0 && !dirErr) throw err;
+    const parts = moveBack(staged, hooks);
     const base =
       err instanceof FragmentError
         ? err.message
         : `promote: could not complete (${err?.code ?? err})`;
-    if (dirErr) parts.push(`${stagingDirRel()}/ could not be removed (${dirErr?.code ?? dirErr})`);
-    throw new FragmentError(`${base} Additionally, ${parts.join("; ")}.`);
+    const extra = parts.length > 0 ? ` Additionally, ${parts.join("; ")}.` : "";
+    throw new FragmentError(
+      `${base}${extra} Inspect ${stagingDirRel()}/ before removing it and running promote again.`,
+    );
   }
   if (hooks.afterWrite) hooks.afterWrite(staged);
   // The section is written; the staged files are now redundant. Deleting them is the
-  // last step. A failure here leaves the fragment in the staging directory, named.
+  // last step.
   const left = [];
   for (const m of staged) {
     try {
       unlinkSync(m.staged);
     } catch (err) {
-      left.push(`${m.name} (${err?.code ?? err})`);
+      left.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
     }
   }
   if (left.length > 0) {
     throw new FragmentError(
-      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.length} fragment(s) could ` +
-        `not be removed from ${stagingDirRel()}/: ${left.join(", ")}. They are already in that section: remove ` +
+      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.join("; ")}. Inspect ` +
         `${stagingDirRel()}/ before the next promote, or restore both ` +
         `(git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}), remove ${stagingDirRel()}/, and run promote again.`,
     );
@@ -909,7 +901,7 @@ export function promote(
   const stagingErr = removeStagingDir(stagingDir);
   if (stagingErr) {
     throw new FragmentError(
-      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md and the fragments are removed, but ` +
+      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ` +
         `${stagingDirRel()}/ could not be removed (${stagingErr?.code ?? stagingErr}); remove it before the ` +
         `next promote (the next promote refuses while it is there).`,
     );
