@@ -102,11 +102,19 @@ while `CHANGELOG.md` is not a regular file or has more than one hard link, or
 while it or any fragment is untracked (not in the index) or differs from the
 index byte for byte (so a file that `core.autocrlf` or a clean filter changes on
 its way into git counts as differing), naming each, so that `git checkout -- CHANGELOG.md .changelog/unreleased`
-restores everything it changed, unless another process changes those files
-while `promote` runs. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
-delete a fragment after writing the section, it names each one left: those are
-already in the new section, so delete them, or restore both
-(`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.
+restores everything it changed. To close the window between that check and the
+fragments' deletion, `promote` then moves each fragment it will fold into a
+private staging directory (`.changelog/promote-staging`, on the same filesystem)
+with a rename, folds the section from the moved bytes once they hash to the index
+blob, and deletes them only after the section is written. A fragment that changed
+before the move is moved back and refused, folding nothing; a fragment that
+changes after the move leaves a new file at its path, which `promote` does not
+touch and reports as `changed during promote, kept: <path>`. Any failure before
+the section is written moves every staged fragment back. If a run leaves the
+staging directory behind, the next `promote` refuses, naming it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
+remove a staged fragment after writing the section, it names each one left: those
+are already in the new section, so remove `.changelog/promote-staging`, or restore
+both (`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.
 
 Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`
 rewrites that section's body to the note, so `check` and `promote` both refuse
