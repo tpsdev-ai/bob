@@ -107,14 +107,17 @@ fragments' deletion, `promote` then moves each fragment it will fold into a
 private staging directory (`.changelog/promote-staging`, on the same filesystem)
 with a rename, folds the section from the moved bytes once they hash to the index
 blob, and deletes them only after the section is written. A fragment that changed
-before the move is moved back and refused, folding nothing; a fragment that
-changes after the move leaves a new file at its path, which `promote` does not
-touch and reports as `changed during promote, kept: <path>`. Any failure before
+before the move is moved back and refused, folding nothing; a fragment
+rewritten at its path after the move leaves a new file there, which `promote` does not
+touch and reports as `changed during promote, kept: <path>`. A write through a file
+descriptor opened before the move lands in the staged copy and is not detected after it
+has been verified. Any failure before
 the section is written moves the staged fragments back. If a run leaves the
 staging directory behind, the next `promote` refuses, naming it. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
 remove a staged fragment after writing the section, it names each one left: those
 are already in the new section, so remove `.changelog/promote-staging`, or restore
-both (`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.
+both (`git checkout -- CHANGELOG.md .changelog/unreleased`), remove
+`.changelog/promote-staging`, and run it again.
 
 Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`
 rewrites that section's body to the note, so `check` and `promote` both refuse
