@@ -1,0 +1,1 @@
+- **The output backstop counts the Responses end-event backfill (bob#225).** When pi's OpenAI Responses client emits a text block's `text_end` carrying more text than the deltas streamed for that block, the piece-count backstop counts that text as one further piece. An end event that carries several tokens still counts once.

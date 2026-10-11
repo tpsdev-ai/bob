@@ -481,6 +481,11 @@ export function effectiveOutputCap(
  * would break the "never early" premise; bob does not tokenize, so it cannot
  * detect that.)
  *
+ * An end event's backfill counts too (bob#225 item 5). On the OpenAI Responses
+ * path a text block's `text_end` can carry the item's final text after the
+ * deltas streamed for it; the wrapper counts text there that the deltas did not
+ * carry as one further piece.
+ *
  * What the wrapper forwards is built from the pieces it accepted, never copied
  * from pi-ai's shared partial: pi-ai emits every event with ONE mutable partial
  * message, and events queue ahead of their reader, so by the time an event is
@@ -529,19 +534,19 @@ export function capOutputStream(
       let pieces = 0;
       try {
         for await (const event of source) {
-          if (isOutputDelta(event)) {
-            pieces += 1;
-            if (pieces > cap) {
-              // The piece that crossed the cap is neither applied nor forwarded.
-              const message = accepted.cut(cap);
-              controller.abort(new Error(`bob: output backstop: more than ${cap} streamed pieces`));
-              log(
-                `bob: the provider streamed more than ${cap} pieces against the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
-              );
-              out.push({ type: "done", reason: "length", message });
-              out.end(message);
-              return;
-            }
+          // Count the end event's backfill, then a streamed piece.
+          pieces += accepted.backfillPieces(event);
+          if (isOutputDelta(event)) pieces += 1;
+          if (pieces > cap) {
+            // The piece that crossed the cap is neither applied nor forwarded.
+            const message = accepted.cut(cap);
+            controller.abort(new Error(`bob: output backstop: more than ${cap} streamed pieces`));
+            log(
+              `bob: the provider streamed more than ${cap} pieces against the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
+            );
+            out.push({ type: "done", reason: "length", message });
+            out.end(message);
+            return;
           }
           out.push(accepted.forward(event));
           if (event.type === "done") {
@@ -619,6 +624,7 @@ function identityOf(live: unknown, type: Block["type"]): Record<string, unknown>
  */
 function acceptedMessage(model: Parameters<StreamFunction>[0]): {
   forward(event: AssistantMessageEvent): AssistantMessageEvent;
+  backfillPieces(event: AssistantMessageEvent): number;
   cut(cap: number): AssistantMessage;
 } {
   const message: AssistantMessage = {
@@ -743,6 +749,17 @@ function acceptedMessage(model: Parameters<StreamFunction>[0]): {
           return event;
       }
       return { ...event, partial: message };
+    },
+    // bob#225 item 5: the end-event backfill. A text block's `text_end` can carry
+    // text the deltas did not (pi's Responses client sets the block to the item's
+    // final text there), so it holds generated output the piece count has not
+    // seen. Count it as one further piece: one event, and by the premise above at
+    // least one more token. An event that carries several tokens still counts
+    // once, so this stays possibly late.
+    backfillPieces(event) {
+      if (event.type !== "text_end") return 0;
+      const acceptedText = at(event.contentIndex, "text")?.text ?? "";
+      return event.content.length > acceptedText.length ? 1 : 0;
     },
     cut(cap) {
       // A copy, so the final message shares nothing with the forwarded partial.
