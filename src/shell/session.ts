@@ -550,9 +550,9 @@ function captureKeyedRuntimeTransport(
 /**
  * True when the runtime's effective provider for `row` still matches the
  * provider captured when bob registered the row, BEFORE the session services
- * were built: same id, name, endpoint and composed models. pi re-composes the
- * provider on every refresh (a NEW provider object), so identity cannot be
- * compared; a read that throws counts as a mismatch (refuse).
+ * were built: same id, name, endpoint and composed models. The full refresh
+ * used during services construction re-composes the provider, so identity
+ * cannot be compared; a read that throws counts as a mismatch (refuse).
  */
 function keyedProviderMatchesRegistration(
   modelRuntime: ModelRuntime,
@@ -1649,8 +1649,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       const selected = keyedRow;
       modelRuntime.refresh = async (options) => {
         const refreshed = await originalRefresh.call(modelRuntime, options);
-        // pi re-composes the provider on every refresh. Only a re-composition
-        // that still matches the row's registration before services started
+        // The full refresh during services construction re-composes this provider.
+        // Only a re-composition matching the row's pre-services registration
         // updates the baseline; a re-composition that changes the id, name,
         // endpoint or models leaves the pre-services baseline in place, so the
         // post-services check refuses it while it is still the active provider.
