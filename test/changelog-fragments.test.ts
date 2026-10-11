@@ -871,47 +871,48 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(readFileSync(join(dir, "fixed-a.md")).equals(crlf)).toBe(true);
   });
 
-  // Permission bits do not bind root, so these two cannot fail a write as root.
-  const asRoot = process.getuid?.() === 0;
+  it("refuses a symlink replacing CHANGELOG.md before the write and deletes no fragment", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const target = join(root, "replacement.md");
+    writeFileSync(target, before);
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            rmSync(changelogPath);
+            symlinkSync(target, changelogPath);
+          },
+        },
+      }),
+    ).toThrow(/CHANGELOG\.md.*No fragment was deleted/);
+    expect(readFileSync(target).equals(before)).toBe(true);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
 
-  it.skipIf(asRoot)(
-    "promote that cannot write CHANGELOG.md deletes no fragment and says how to recover",
-    () => {
-      const { dir, changelogPath } = project();
-      fragment(dir, "fixed-a.md", "- **a fix.** \n");
-      stageAll();
-      chmodSync(changelogPath, 0o444);
-      try {
-        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-          /could not write CHANGELOG\.md \(EACCES\); no fragment was deleted/,
-        );
-      } finally {
-        chmodSync(changelogPath, 0o644);
-      }
-      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
-    },
-  );
-
-  it.skipIf(asRoot)(
-    "promote that cannot move a fragment into the staging directory folds nothing and writes nothing",
-    () => {
-      const { dir, changelogPath } = project();
-      fragment(dir, "fixed-a.md", "- **a fix.** \n");
-      stageAll();
-      const before = readFileSync(changelogPath);
-      chmodSync(dir, 0o555);
-      try {
-        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-          /could not move \.changelog\/unreleased\/fixed-a\.md into \.changelog\/promote-staging\/ \(EACCES\)/,
-        );
-      } finally {
-        chmodSync(dir, 0o755);
-      }
-      expect(readFileSync(changelogPath).equals(before)).toBe(true);
-      expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe("- **a fix.** \n");
-      expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
-    },
-  );
+  it("restores an already moved fragment when a later fragment disappears before staging", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "added-a.md", "- **an addition.** \n");
+    fragment(dir, "fixed-b.md", "- **a fix.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: { afterIndexCheck: () => rmSync(join(dir, "fixed-b.md")) },
+      }),
+    ).toThrow(/could not move \.changelog\/unreleased\/fixed-b\.md.*ENOENT/);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readFileSync(join(dir, "added-a.md"), "utf8")).toBe("- **an addition.** \n");
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
+  });
 });
 
 describe("changelog fragments — promote stages the fragments (bob#296)", () => {
@@ -930,7 +931,7 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
         hooks: { afterIndexCheck: () => writeFileSync(join(dir, "fixed-a.md"), changed) },
       }),
     ).toThrow(
-      "promote: .changelog/unreleased/fixed-a.md changed after the index check, so it was moved back; nothing was folded and nothing was written to CHANGELOG.md.",
+      "promote: .changelog/unreleased/fixed-a.md changed after the index check; nothing was folded and nothing was written to CHANGELOG.md.",
     );
     // The changed bytes are back at their path and the section was not cut.
     expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(changed);
@@ -941,6 +942,32 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
         .sort(),
     ).toEqual(["added-b.md", "fixed-a.md"]);
     expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
+  });
+
+  it("refuses a fragment changed and staged after preflight", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const changed = "- **changed and staged after preflight.**\n";
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: {
+          afterIndexCheck: () => {
+            writeFileSync(join(dir, "fixed-a.md"), changed);
+            expect(gitSync(root, ["add", "--", ".changelog/unreleased/fixed-a.md"]).status).toBe(0);
+          },
+        },
+      }),
+    ).toThrow(/fixed-a\.md changed after the index check; nothing was folded/);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(changed);
+    expect(readFileSync(join(dir, "added-b.md"), "utf8")).toBe("- **an addition.** \n");
     expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
   });
 
@@ -968,7 +995,7 @@ describe("changelog fragments — promote stages the fragments (bob#296)", () =>
     expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
   });
 
-  it("moves every staged fragment back when the CHANGELOG write fails", () => {
+  it("restores staged fragments to vacant paths when the CHANGELOG write fails", () => {
     const { dir, changelogPath } = project();
     fragment(dir, "fixed-a.md", "- **a fix.** \n");
     fragment(dir, "added-b.md", "- **an addition.** \n");

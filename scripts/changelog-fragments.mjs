@@ -634,19 +634,10 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 
 // ─── promote ──────────────────────────────────────────────────────────────────
 //
-// bob#296: the index check and the fragment deletion are two separate reads of the
-// same path, and a fragment that changed between them was lost. promote closes
-// that window by MOVING each fragment it will fold into a private staging
-// directory with a rename (atomic, same filesystem), verifying the moved bytes
-// against the index blob the check saw, folding the section from those moved
-// bytes, and deleting the staged copies after the changelog write succeeded. A
-// writer that changes a fragment after the move writes a NEW file at the original
-// path; promote does not touch it and reports it by name. A fragment changed before
-// the move no longer hashes to the index blob, so it and the other staged files are
-// moved back and promote refuses, folding nothing. Any failure before the write
-// moves the staged files back (with a link, so a file written at the path since is not replaced). The staging directory sits beside the fragment
-// directory and is removed at the end; one left behind by a crashed run is refused
-// by name.
+// bob#296: rename fragments into .changelog/promote-staging, verify the moved
+// bytes against the preflight's index blobs, then fold and delete the staged copies
+// after the changelog write. Recreated paths are kept. Rollback restores staged
+// files or leaves them in the staging directory and names them.
 
 export const STAGING_BASENAME = "promote-staging";
 
@@ -720,9 +711,7 @@ function removeStagingDir(stagingDir) {
   }
 }
 
-// Move each fragment into the staging directory with a rename. On a rename
-// failure the ones already moved are moved back first, so the fragment directory
-// is left as it was.
+// Rename fragments into staging; on failure, restore them or name those left there.
 function stageFragments(fragments, stagingDir) {
   try {
     mkdirSync(stagingDir);
@@ -826,17 +815,7 @@ export function promote(
   }
 
   const names = fragments.map((f) => f.name);
-  gitRestorableOrThrow({ changelogPath, dir, names });
-  // The blob each fragment has in the index, which the check above compared the
-  // working tree to. The staged bytes are verified against the same blob, so a
-  // fragment that changed between the check and the move is caught, not folded.
-  const blobs = indexBlobs(dir, names);
-  if (blobs === null) {
-    throw new FragmentError(
-      `promote: git ls-files -s could not read the index, so the staged fragments could not be verified ` +
-        `against it; nothing was written. Repair the Git index or its environment, then retry promote.`,
-    );
-  }
+  const blobs = gitRestorableOrThrow({ changelogPath, dir, names });
   if (hooks.afterIndexCheck) hooks.afterIndexCheck();
 
   const staged = stageFragments(fragments, stagingDir);
@@ -845,9 +824,7 @@ export function promote(
   const day = date ?? new Date().toISOString().slice(0, 10);
   let section;
   try {
-    // Fold from the STAGED bytes, verified against the index blob, not from the
-    // original paths: a writer that changed a fragment after the move writes a new
-    // file at the old path, which is not what gets folded. The bytes are decoded and
+    // Fold from the staged bytes verified against the preflight blob. They are decoded and
     // re-validated here, not reused from the earlier read, so a fragment that
     // changed between that read and the index check is still judged on its current
     // bytes.
@@ -875,7 +852,7 @@ export function promote(
     if (changedBefore.length > 0) {
       throw new FragmentError(
         `promote: ${changedBefore.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} changed after the index ` +
-          `check, so ${changedBefore.length === 1 ? "it was" : "they were"} moved back; nothing was folded and ` +
+          `check; nothing was folded and ` +
           `nothing was written to CHANGELOG.md.`,
       );
     }
@@ -901,9 +878,7 @@ export function promote(
       );
     }
   } catch (err) {
-    // Any failure before the section is written moves the staged files back. A file
-    // that could not be moved back (or a staging directory that could not be removed)
-    // is named on top of the original message.
+    // Restore staged files or name those left in staging.
     const parts = moveBackNotes(moveBack(staged));
     const dirErr = removeStagingDir(stagingDir);
     if (parts.length === 0 && !dirErr) throw err;
@@ -941,8 +916,7 @@ export function promote(
         `next promote (the next promote refuses while it is there).`,
     );
   }
-  // A fragment that changed after the move is a NEW file at its old path. promote
-  // does not touch it; report it so the operator knows it is not in this release.
+  // Report recreated fragment paths.
   const kept = [];
   for (const m of staged) {
     try {
@@ -1010,9 +984,8 @@ function gitHashBytes(cwd, bytes) {
 // The paths (relative to `cwd`) whose RAW working-tree bytes (`git hash-object
 // --no-filters`) hash to something other than their index blob; null when git
 // cannot answer.
-function differsFromIndex(cwd, paths) {
+function differsFromIndex(cwd, paths, index = indexBlobs(cwd, paths)) {
   if (paths.length === 0) return [];
-  const index = indexBlobs(cwd, paths);
   const hashed = git(cwd, ["hash-object", "--no-filters", "--", ...paths]);
   if (index === null || !hashed.ok) return null;
   const work = hashed.out.split("\n").filter(Boolean);
@@ -1056,10 +1029,9 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   // core.autocrlf=input, a CRLF rewrite of an LF file hashes like the original),
   // so a file whose bytes a filter changes counts as changed: conservative, and
   // the refusal says so.
-  const fragmentsDiffer = differsFromIndex(
-    dir,
-    names.filter((n) => tracked.has(n)),
-  );
+  const fragmentNames = names.filter((n) => tracked.has(n));
+  const blobs = indexBlobs(dir, fragmentNames);
+  const fragmentsDiffer = differsFromIndex(dir, fragmentNames, blobs);
   const changelogDiffers = clTracked.has(clName) ? differsFromIndex(clDir, [clName]) : [];
   if (fragmentsDiffer === null || changelogDiffers === null) {
     throw new FragmentError(
@@ -1087,6 +1059,7 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
         `Stage them (git add) or remove them, then run promote again.${rawNote}`,
     );
   }
+  return blobs;
 }
 
 // The versions `promote` accepts: MAJOR.MINOR.PATCH, each 0 or a number with no
