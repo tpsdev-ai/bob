@@ -1233,65 +1233,119 @@ describe("K11 — code-owned tables stay aligned", () => {
 });
 
 describe("K12 — #307: the composed API, and a replacement during the services refresh", () => {
-  it("the composed request refuses an API pi substituted on the model it sends", async () => {
+  // The guard wraps BOTH request verbs; each must refuse a re-routed request on
+  // its own (delete the `stream` wrapper and the `stream` pass fails).
+  for (const method of ["stream", "streamSimple"] as const) {
+    it(`the composed request refuses an API pi substituted on the model it sends (${method})`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const stub = stubFetch();
+      const { result } = await buildFixtureSession(`fxk12a${method.toLowerCase()}`, registry);
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const model = rt.getModel(RUNTIME, MODEL)!;
+        // The runtime method pi's agent session calls, with the model's api
+        // substituted: the composed request must refuse, and send nothing.
+        const substituted = await rt[method](
+          { ...model, api: "anthropic-messages" } as never,
+          CTX as never,
+          {} as never,
+        ).result();
+        expect(substituted.stopReason).toBe("error");
+        expect(String(substituted.errorMessage)).toMatch(/composed API is not the row's/);
+        expect(stub.seen).toEqual([]);
+        // The row's own api still streams to the row's endpoint.
+        const sent = await rt[method](model as never, CTX as never, {} as never).result();
+        expect(sent.stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([`${ENDPOINT}/chat/completions`]);
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+        stub.restore();
+      }
+    });
+  }
+
+  // A refresh during services construction replaces the effective provider. The
+  // baseline is re-captured ONLY while the re-composition still matches the
+  // row's registration, so each single-field change must survive to the
+  // post-services check: skip the models comparison and the models pass fails;
+  // skip the name comparison and the name pass fails.
+  for (const change of ["models", "name"] as const) {
+    it(`the post-services check rejects a refresh that changed the ${change} during the services refresh`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      scaffold(`fxk12b${change}`, registry);
+      const { config, policy } = resolveRunConfig({
+        name: `fxk12b${change}`,
+        agentsRoot: tmpRoot,
+        registry,
+      });
+      const rt = await ModelRuntime.create({
+        credentials: new InMemoryCredentialStore(),
+        modelsStore: new InMemoryModelsStore(),
+        modelsPath: join(tmpRoot, `fxk12b${change}-models.json`),
+      });
+      // `models`: same id/name/endpoint, an extra composed model. `name`: same
+      // id/endpoint/models, a different name. Either way the model the session
+      // selects still resolves unchanged, and the replacement is not bob's.
+      let replaced = false;
+      const realRefresh = rt.refresh.bind(rt);
+      (rt as unknown as { refresh: (o?: unknown) => Promise<unknown> }).refresh = async (o) => {
+        const refreshed = await realRefresh(o as never);
+        if (!replaced) {
+          replaced = true;
+          const effective = rt.getProvider(RUNTIME)!;
+          const models = effective.getModels();
+          (rt as unknown as { models: { setProvider(p: unknown): void } }).models.setProvider({
+            ...effective,
+            ...(change === "name"
+              ? { name: `${effective.name}-replaced` }
+              : { getModels: () => [...models, { ...models[0], id: "replaced/model" }] }),
+          });
+        }
+        return refreshed;
+      };
+      const factory = createBobRuntimeFactory({ config, policy, registry, modelRuntime: rt });
+      await expect(
+        factory({ sessionManager: SessionManager.inMemory(config.cwd) }),
+      ).rejects.toThrow(/the effective provider does not match/);
+    });
+  }
+
+  // The strongest form: a REAL pi session on a substituted api. Remove
+  // installKeyedComposedApiGuard(...) and this reaches pi's anthropic-messages
+  // adapter (stub.seen non-empty) instead of refusing with zero requests.
+  it("a real pi session on a substituted api is refused by the guard, and sends nothing", async () => {
     const registry = fixtureRegistry();
     process.env[VARIABLE] = SENTINEL;
     const stub = stubFetch();
-    const { result } = await buildFixtureSession("fxk12a", registry);
+    scaffold("fxk12c", registry);
+    const { config, policy } = resolveRunConfig({ name: "fxk12c", agentsRoot: tmpRoot, registry });
+    const factory = createBobRuntimeFactory({ config, policy, registry });
+    const runtime = await createAgentSessionRuntime(factory, {
+      cwd: config.cwd,
+      agentDir: config.piAgentDir,
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
     try {
-      const rt = result.services.modelRuntime as unknown as ModelRuntime;
-      const model = rt.getModel(RUNTIME, MODEL)!;
-      // The runtime method pi's agent session calls, with the model's api
-      // substituted: the composed request must refuse, and send nothing.
-      const substituted = await rt
-        .streamSimple({ ...model, api: "anthropic-messages" } as never, CTX as never, {} as never)
-        .result();
-      expect(substituted.stopReason).toBe("error");
-      expect(String(substituted.errorMessage)).toMatch(/composed API is not the row's/);
+      // The model pi's agent actually streams with, its api substituted as if a
+      // composed provider re-routed the request to another adapter.
+      const agent = runtime.session.agent as unknown as {
+        state: { model: Record<string, unknown> };
+      };
+      expect(agent.state.model.provider).toBe(RUNTIME);
+      agent.state.model = { ...agent.state.model, api: "anthropic-messages" };
+      await runtime.session.prompt("x");
+      const last = runtime.session.messages.at(-1);
+      expect(last?.role).toBe("assistant");
+      if (last?.role !== "assistant") throw new Error("no assistant message");
+      expect(last.stopReason).toBe("error");
+      expect(String(last.errorMessage)).toMatch(/composed API is not the row's/);
       expect(stub.seen).toEqual([]);
-      // The row's own api still streams to the row's endpoint.
-      const sent = await rt.streamSimple(model as never, CTX as never, {} as never).result();
-      expect(sent.stopReason).not.toBe("error");
-      expect(stub.seen.map((s) => s.url)).toEqual([`${ENDPOINT}/chat/completions`]);
     } finally {
-      (result.session as unknown as { dispose(): void }).dispose();
+      await runtime.dispose();
       stub.restore();
     }
-  });
-
-  it("the post-services check catches a provider whose composition changed during the services refresh", async () => {
-    const registry = fixtureRegistry();
-    process.env[VARIABLE] = SENTINEL;
-    scaffold("fxk12b", registry);
-    const { config, policy } = resolveRunConfig({ name: "fxk12b", agentsRoot: tmpRoot, registry });
-    const rt = await ModelRuntime.create({
-      credentials: new InMemoryCredentialStore(),
-      modelsStore: new InMemoryModelsStore(),
-      modelsPath: join(tmpRoot, "fxk12b-models.json"),
-    });
-    // A refresh that lands while the services are built replaces the effective
-    // provider with one that is not bob's registration (an extra model and a
-    // different name); the model the session selects still resolves unchanged.
-    let replaced = false;
-    const realRefresh = rt.refresh.bind(rt);
-    (rt as unknown as { refresh: (o?: unknown) => Promise<unknown> }).refresh = async (o) => {
-      const refreshed = await realRefresh(o as never);
-      if (!replaced) {
-        replaced = true;
-        const effective = rt.getProvider(RUNTIME)!;
-        const models = effective.getModels();
-        (rt as unknown as { models: { setProvider(p: unknown): void } }).models.setProvider({
-          ...effective,
-          name: `${effective.name}-replaced`,
-          getModels: () => [...models, { ...models[0], id: "replaced/model" }],
-        });
-      }
-      return refreshed;
-    };
-    const factory = createBobRuntimeFactory({ config, policy, registry, modelRuntime: rt });
-    await expect(factory({ sessionManager: SessionManager.inMemory(config.cwd) })).rejects.toThrow(
-      /after services|no longer bob's/,
-    );
   });
 });
 

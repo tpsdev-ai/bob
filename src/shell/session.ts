@@ -205,6 +205,14 @@ export function keyedPlaceholder(id: string): string {
 }
 
 /**
+ * "a" or "an" for a provider row id, so a refusal reads grammatically for any
+ * operator row ("a keyed-fixture request", "an openrouter request").
+ */
+function refusalArticle(id: string): string {
+  return /^[aeiou]/i.test(id) ? "an" : "a";
+}
+
+/**
  * The fetch wrapper the generic keyed transport delegates through: it refuses,
  * BEFORE calling `baseFetch`, any request URL that does not start with
  * `endpoint + "/"`, or that is not a canonical HTTPS URL on the row's host with
@@ -221,7 +229,7 @@ export function guardedKeyedFetch(
     if (typeof url !== "string" && !(url instanceof URL)) {
       return Promise.reject(
         new Error(
-          `bob: refusing an ${row.id} request whose URL is a ${url instanceof Request ? "Request object" : typeof url} — bob's transport accepts only a string or URL`,
+          `bob: refusing ${refusalArticle(row.id)} ${row.id} request whose URL is a ${url instanceof Request ? "Request object" : typeof url} — bob's transport accepts only a string or URL`,
         ),
       );
     }
@@ -230,7 +238,9 @@ export function guardedKeyedFetch(
     try {
       parsed = new URL(asString);
     } catch {
-      return Promise.reject(new Error(`bob: refusing an ${row.id} request with an invalid URL`));
+      return Promise.reject(
+        new Error(`bob: refusing ${refusalArticle(row.id)} ${row.id} request with an invalid URL`),
+      );
     }
     if (
       parsed.protocol !== "https:" ||
@@ -244,7 +254,7 @@ export function guardedKeyedFetch(
         new Error(
           row.id === "openrouter"
             ? "bob: refusing an openrouter request — bob's transport sends only to https://openrouter.ai/api/v1/"
-            : `bob: refusing an ${row.id} request — bob's transport sends only to the configured endpoint`,
+            : `bob: refusing ${refusalArticle(row.id)} ${row.id} request — bob's transport sends only to the configured endpoint`,
         ),
       );
     }
@@ -266,7 +276,7 @@ export function guardedKeyedFetch(
       if (/redirect/i.test(text)) {
         return Promise.reject(
           new Error(
-            `bob: refusing an ${row.id} redirect — bob's transport does not follow redirects (redirect: "error")`,
+            `bob: refusing ${refusalArticle(row.id)} ${row.id} redirect — bob's transport does not follow redirects (redirect: "error")`,
           ),
         );
       }
@@ -291,7 +301,9 @@ export function keyedTransport(input: {
       headers?: Record<string, string | null>;
     };
     if (prepared.baseUrl !== row.endpoint || prepared.api !== row.api) {
-      throw new Error(`bob: refusing an ${row.id} request with a mismatched endpoint or API`);
+      throw new Error(
+        `bob: refusing ${refusalArticle(row.id)} ${row.id} request with a mismatched endpoint or API`,
+      );
     }
     const opts = (options ?? {}) as { headers?: Record<string, string | null> };
     // The EFFECTIVE headers the delegate will send: the model's own headers AND
@@ -302,7 +314,7 @@ export function keyedTransport(input: {
         const value = opts.headers?.[name] ?? preparedHeaders[name];
         if (value != null) {
           throw new Error(
-            `bob: refusing an ${row.id} request with a credential-bearing ${name} header — bob sets the ${row.id} Authorization itself`,
+            `bob: refusing ${refusalArticle(row.id)} ${row.id} request with a credential-bearing ${name} header — bob sets the ${row.id} Authorization itself`,
           );
         }
       }
@@ -850,7 +862,7 @@ export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: Ke
   const refuse = (model: unknown) =>
     lazyStream(model as never, async () => {
       throw new Error(
-        `bob: refusing an ${row.id} request — its composed API is not the row's (${row.api})`,
+        `bob: refusing ${refusalArticle(row.id)} ${row.id} request — its composed API is not the row's (${row.api})`,
       );
     });
   const originalSimple = modelRuntime.streamSimple.bind(modelRuntime);
@@ -1641,8 +1653,8 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         // that still matches the row's registration before services started
         // updates the baseline; a re-composition that changes the id, name,
         // endpoint or models leaves the pre-services baseline in place, so the
-        // post-services check refuses it. (Re-capturing unconditionally here
-        // would accept it.)
+        // post-services check refuses it while it is still the active provider.
+        // (Re-capturing unconditionally here would accept it.)
         const registered = keyedRuntimeTransports.get(modelRuntime)?.get(selected.runtime);
         if (keyedProviderMatchesRegistration(modelRuntime, selected, registered)) {
           captureKeyedRuntimeTransport(modelRuntime, selected.runtime, selected.id);
