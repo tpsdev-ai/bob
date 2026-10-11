@@ -20,6 +20,11 @@ import {
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { processResponsesStream } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import type {
+  Response,
+  ResponseOutputMessage,
+  ResponseStreamEvent,
+} from "openai/resources/responses/responses.js";
 import { capOutputStream, type StreamFunction } from "../../src/shell/model-budget.js";
 
 const CAP = 3;
@@ -52,29 +57,73 @@ function noUsage(): AssistantMessage["usage"] {
 
 /** The Responses events for a message item whose final text is `finalText`,
  *  streamed first as `deltas` (one piece each) and carried again in the item. */
-function responsesEvents(deltas: readonly string[], finalText: string): unknown[] {
+function responsesEvents(deltas: readonly string[], finalText: string): ResponseStreamEvent[] {
+  const item: ResponseOutputMessage = {
+    type: "message",
+    id: "msg_1",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: finalText, annotations: [] }],
+  };
+  const response: Response = {
+    id: "resp_1",
+    object: "response",
+    created_at: 0,
+    completed_at: 1,
+    status: "completed",
+    model: MODEL_ID,
+    output: [item],
+    output_text: finalText,
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    metadata: null,
+    parallel_tool_calls: false,
+    temperature: null,
+    top_p: null,
+    tool_choice: "auto",
+    tools: [],
+    usage: {
+      input_tokens: 5,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 20,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 25,
+    },
+  };
   return [
-    { type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } },
-    ...deltas.map((delta) => ({ type: "response.output_text.delta", output_index: 0, delta })),
+    {
+      type: "response.output_item.added",
+      sequence_number: 0,
+      output_index: 0,
+      item: { ...item, status: "in_progress", content: [] },
+    },
+    ...deltas.map<ResponseStreamEvent>((delta, index) => ({
+      type: "response.output_text.delta",
+      sequence_number: index + 1,
+      output_index: 0,
+      content_index: 0,
+      item_id: item.id,
+      logprobs: [],
+      delta,
+    })),
     {
       type: "response.output_item.done",
+      sequence_number: deltas.length + 1,
       output_index: 0,
-      item: { type: "message", id: "msg_1", content: [{ type: "output_text", text: finalText }] },
+      item,
     },
     {
       type: "response.completed",
-      response: {
-        id: "resp_1",
-        status: "completed",
-        usage: { input_tokens: 5, output_tokens: 20, total_tokens: 25 },
-      },
+      sequence_number: deltas.length + 2,
+      response,
     },
   ];
 }
 
 /** A provider stream that runs the REAL pi-ai Responses processor over `events`
  *  the way pi-ai's own `stream` does: start, process, done, end. */
-function responsesStream(events: readonly unknown[]): AssistantMessageEventStream {
+function responsesStream(events: readonly ResponseStreamEvent[]): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const output: AssistantMessage = {
     role: "assistant",
@@ -91,7 +140,7 @@ function responsesStream(events: readonly unknown[]): AssistantMessageEventStrea
     await processResponsesStream(
       (async function* () {
         for (const event of events) yield event;
-      })() as never,
+      })(),
       output,
       stream,
       model as never,
@@ -104,7 +153,7 @@ function responsesStream(events: readonly unknown[]): AssistantMessageEventStrea
 
 /** Drive the REAL backstop over a stream built from `events`; return the message
  *  it ended with. */
-async function capped(events: readonly unknown[]): Promise<CappedMessage> {
+async function capped(events: readonly ResponseStreamEvent[]): Promise<CappedMessage> {
   const inner = (() => Promise.resolve(responsesStream(events))) as StreamFunction;
   const wrapped = capOutputStream(inner, { log: () => {} });
   const stream = await wrapped(model, { systemPrompt: "", messages: [] } as never, {} as never);
@@ -121,8 +170,8 @@ const textOf = (message: AssistantMessage) =>
 
 describe("bob#225 item 5 — the output backstop counts the Responses end-event backfill", () => {
   it("ends a stream whose deltas are at the cap once its text_end carries the item's longer final text", async () => {
-    // Three deltas (three pieces — AT the cap, not over it), then the message
-    // item carries five more words only in the end event.
+    // The deltas reach the piece-count limit.
+    // The item carries additional text only in the end event.
     const message = await capped(responsesEvents(["a", "b", "c"], "abcDE FGH IJ KLM"));
     expect(message.stopReason).toBe("length");
     expect(message.bobOutputCap).toBe(true);
@@ -131,7 +180,7 @@ describe("bob#225 item 5 — the output backstop counts the Responses end-event 
     expect(message.usage.output).toBe(CAP);
   });
 
-  it("does not count a text_end that repeats the streamed deltas: a server within the cap is not cut", async () => {
+  it("does not count a text_end that repeats the streamed deltas: a stream within the piece-count limit is not cut", async () => {
     // The item's text is exactly the deltas: no backfill, so no further piece.
     const message = await capped(responsesEvents(["a", "b", "c"], "abc"));
     expect(message.stopReason).toBe("stop");
