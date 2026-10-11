@@ -1220,8 +1220,6 @@ describe("K11 — code-owned tables stay aligned", () => {
 });
 
 describe("K12 — #307: the composed API, and a replacement during the services refresh", () => {
-  // The guard wraps BOTH request verbs; each must refuse a re-routed request on
-  // its own (delete the `stream` wrapper and the `stream` pass fails).
   for (const method of ["stream", "streamSimple"] as const) {
     it(`a composed API mismatch is refused (${method})`, async () => {
       const registry = fixtureRegistry();
@@ -1248,13 +1246,59 @@ describe("K12 — #307: the composed API, and a replacement during the services 
         stub.restore();
       }
     });
+
+    it(`caller model changes preserve the checked request (${method})`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const stub = stubFetch();
+      const { result } = await buildFixtureSession(
+        `fxk12snapshot${method.toLowerCase()}`,
+        registry,
+      );
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const model = { ...rt.getModel(RUNTIME, MODEL)!, headers: { "x-fixture": "checked" } };
+        const originalPrepare = rt.prepareRequest.bind(rt);
+        let preparedModel: typeof model | undefined;
+        rt.prepareRequest = async (checked, options) => {
+          preparedModel = checked as typeof model;
+          return originalPrepare(checked, options);
+        };
+        const stream = rt[method](model as never, CTX as never, {} as never);
+        model.api = "anthropic-messages";
+        const sent = await stream.result();
+        expect(sent.stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([`${ENDPOINT}/chat/completions`]);
+        expect(stub.seen[0]?.auth).toBe(`Bearer ${SENTINEL}`);
+        expect(preparedModel).not.toBe(model);
+        expect(preparedModel?.api).toBe("openai-completions");
+        model.api = "openai-completions";
+        const next = rt[method](model as never, CTX as never, {} as never);
+        model.provider = "changed-provider";
+        model.baseUrl = "https://changed.example/v1";
+        model.headers["x-fixture"] = "changed";
+        expect((await next.result()).stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([
+          `${ENDPOINT}/chat/completions`,
+          `${ENDPOINT}/chat/completions`,
+        ]);
+        expect(preparedModel).not.toBe(model);
+        expect(preparedModel?.api).toBe("openai-completions");
+        expect(preparedModel?.provider).toBe(RUNTIME);
+        expect(preparedModel?.baseUrl).toBe(ENDPOINT);
+        expect(preparedModel?.headers["x-fixture"]).toBe("checked");
+        expect(Object.isFrozen(preparedModel)).toBe(true);
+        expect(Object.isFrozen(preparedModel?.headers)).toBe(true);
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+        stub.restore();
+      }
+    });
   }
 
   // A refresh during services construction replaces the effective provider. The
-  // baseline is re-captured ONLY while the re-composition still matches the
-  // row's registration, so each single-field change must survive to the
-  // post-services check: skip the models comparison and the models pass fails;
-  // skip the name comparison and the name pass fails.
+  // baseline is re-captured only while the re-composition still matches the
+  // row's registration.
   for (const change of ["models", "name"] as const) {
     it(`the post-services check rejects a refresh that changed the ${change} during the services refresh`, async () => {
       const registry = fixtureRegistry();
@@ -1297,9 +1341,6 @@ describe("K12 — #307: the composed API, and a replacement during the services 
     });
   }
 
-  // The strongest form: a REAL pi session on a substituted api. Remove
-  // installKeyedComposedApiGuard(...) and this reaches pi's anthropic-messages
-  // adapter (stub.seen non-empty) instead of refusing with zero requests.
   it("a real pi session on a substituted api is refused by the guard, and sends nothing", async () => {
     const registry = fixtureRegistry();
     process.env[VARIABLE] = SENTINEL;

@@ -845,6 +845,16 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
  * `complete`) against a composed API mismatch.
  */
 export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: KeyedRow): void {
+  const snapshot = <T>(model: T): T => {
+    const copy = structuredClone(model);
+    const freeze = (value: unknown): void => {
+      if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+      Object.freeze(value);
+      for (const child of Object.values(value)) freeze(child);
+    };
+    freeze(copy);
+    return copy;
+  };
   const rerouted = (model: unknown): boolean => {
     const candidate = (model ?? {}) as { provider?: unknown; api?: unknown };
     return candidate.provider === row.runtime && candidate.api !== row.api;
@@ -856,15 +866,15 @@ export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: Ke
       );
     });
   const originalSimple = modelRuntime.streamSimple.bind(modelRuntime);
-  modelRuntime.streamSimple = ((model, context, options) =>
-    rerouted(model)
-      ? refuse(model)
-      : originalSimple(model, context, options)) as ModelRuntime["streamSimple"];
+  modelRuntime.streamSimple = ((model, context, options) => {
+    const checked = snapshot(model);
+    return rerouted(checked) ? refuse(checked) : originalSimple(checked, context, options);
+  }) as ModelRuntime["streamSimple"];
   const originalStream = modelRuntime.stream.bind(modelRuntime);
-  modelRuntime.stream = ((model, context, options) =>
-    rerouted(model)
-      ? refuse(model)
-      : originalStream(model, context, options)) as ModelRuntime["stream"];
+  modelRuntime.stream = ((model, context, options) => {
+    const checked = snapshot(model);
+    return rerouted(checked) ? refuse(checked) : originalStream(checked, context, options);
+  }) as ModelRuntime["stream"];
 }
 
 export function installKeyedDeferredRefusal(modelRuntime: ModelRuntime, row: KeyedRow): void {
