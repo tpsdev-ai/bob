@@ -8,15 +8,7 @@
 // `BOB_PROVIDER_KEYED_FIXTURE_KEY`.
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -303,8 +295,8 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
       called++;
       return new Response("{}", { status: 200 });
     }) as typeof globalThis.fetch;
-    const f = guardedKeyedFetch({ id: "keyed-fixture", endpoint: ENDPOINT }, base);
-    await expect(f(`${ENDPOINT}/%2e%2e/evil`)).rejects.toThrow(/keyed-fixture request/);
+    const f = guardedKeyedFetch({ id: "8bit", endpoint: ENDPOINT }, base);
+    await expect(f(`${ENDPOINT}/%2e%2e/evil`)).rejects.toThrow(/request for provider row "8bit"/);
     await expect(f(new Request(`${ENDPOINT}/chat/completions`))).rejects.toThrow(/Request object/);
     await expect(f("https://keyed-fixture.example/other/chat/completions")).rejects.toThrow(
       /sends only to/,
@@ -920,33 +912,28 @@ describe("K7 — the writers run the reserved-name check before the first write"
     }
   });
 
-  it("an unwritable pi directory leaves no models file or temp file", () => {
-    if (process.getuid?.() === 0) return;
+  it("a file at the pi directory path leaves no models file or temp file", () => {
     const registry = fixtureRegistry();
-    const { piDir } = scaffold("fxk7e", registry);
-    rmSync(join(piDir, "models.json"), { force: true });
-    chmodSync(piDir, 0o500);
-    try {
-      expect(() =>
-        initAgent({
-          name: "fxk7e",
-          role: "coder",
-          provider: "keyed-fixture",
-          model: MODEL,
-          contextWindow: 200_000,
-          agentsRoot: tmpRoot,
-          flairKeysDir: keysRoot,
-          skipFlair: true,
-          registry,
-          noClobber: false,
-        }),
-      ).toThrow();
-      expect(existsSync(join(piDir, "models.json"))).toBe(false);
-      const leftover = readdirSync(piDir).filter((n) => n.includes(".tmp"));
-      expect(leftover).toEqual([]);
-    } finally {
-      chmodSync(piDir, 0o700);
-    }
+    const { agentDir, piDir } = scaffold("fxk7e", registry);
+    rmSync(piDir, { recursive: true, force: true });
+    writeFileSync(piDir, "blocked");
+    expect(() =>
+      initAgent({
+        name: "fxk7e",
+        role: "coder",
+        provider: "keyed-fixture",
+        model: MODEL,
+        contextWindow: 200_000,
+        agentsRoot: tmpRoot,
+        flairKeysDir: keysRoot,
+        skipFlair: true,
+        registry,
+        noClobber: false,
+      }),
+    ).toThrow();
+    expect(existsSync(join(piDir, "models.json"))).toBe(false);
+    expect(readFileSync(piDir, "utf8")).toBe("blocked");
+    expect(readdirSync(agentDir).filter((n) => n.includes(".tmp"))).toEqual([]);
   });
 });
 
@@ -1236,7 +1223,7 @@ describe("K12 — #307: the composed API, and a replacement during the services 
   // The guard wraps BOTH request verbs; each must refuse a re-routed request on
   // its own (delete the `stream` wrapper and the `stream` pass fails).
   for (const method of ["stream", "streamSimple"] as const) {
-    it(`the composed request refuses an API pi substituted on the model it sends (${method})`, async () => {
+    it(`a composed API mismatch is refused (${method})`, async () => {
       const registry = fixtureRegistry();
       process.env[VARIABLE] = SENTINEL;
       const stub = stubFetch();
@@ -1244,8 +1231,6 @@ describe("K12 — #307: the composed API, and a replacement during the services 
       try {
         const rt = result.services.modelRuntime as unknown as ModelRuntime;
         const model = rt.getModel(RUNTIME, MODEL)!;
-        // The runtime method pi's agent session calls, with the model's api
-        // substituted: the composed request must refuse, and send nothing.
         const substituted = await rt[method](
           { ...model, api: "anthropic-messages" } as never,
           CTX as never,

@@ -205,14 +205,6 @@ export function keyedPlaceholder(id: string): string {
 }
 
 /**
- * "a" or "an" for a provider row id, so a refusal reads grammatically for any
- * operator row ("a keyed-fixture request", "an openrouter request").
- */
-function refusalArticle(id: string): string {
-  return /^[aeiou]/i.test(id) ? "an" : "a";
-}
-
-/**
  * The fetch wrapper the generic keyed transport delegates through: it refuses,
  * BEFORE calling `baseFetch`, any request URL that does not start with
  * `endpoint + "/"`, or that is not a canonical HTTPS URL on the row's host with
@@ -229,7 +221,7 @@ export function guardedKeyedFetch(
     if (typeof url !== "string" && !(url instanceof URL)) {
       return Promise.reject(
         new Error(
-          `bob: refusing ${refusalArticle(row.id)} ${row.id} request whose URL is a ${url instanceof Request ? "Request object" : typeof url} — bob's transport accepts only a string or URL`,
+          `bob: refusing request for provider row "${row.id}" whose URL is a ${url instanceof Request ? "Request object" : typeof url} — bob's transport accepts only a string or URL`,
         ),
       );
     }
@@ -239,7 +231,7 @@ export function guardedKeyedFetch(
       parsed = new URL(asString);
     } catch {
       return Promise.reject(
-        new Error(`bob: refusing ${refusalArticle(row.id)} ${row.id} request with an invalid URL`),
+        new Error(`bob: refusing request for provider row "${row.id}" with an invalid URL`),
       );
     }
     if (
@@ -253,13 +245,15 @@ export function guardedKeyedFetch(
       return Promise.reject(
         new Error(
           row.id === "openrouter"
-            ? "bob: refusing an openrouter request — bob's transport sends only to https://openrouter.ai/api/v1/"
-            : `bob: refusing ${refusalArticle(row.id)} ${row.id} request — bob's transport sends only to the configured endpoint`,
+            ? `bob: refusing request for provider row "openrouter" — bob's transport sends only to https://openrouter.ai/api/v1/`
+            : `bob: refusing request for provider row "${row.id}" — bob's transport sends only to the configured endpoint`,
         ),
       );
     }
     if (asString !== parsed.href) {
-      return Promise.reject(new Error(`bob: refusing a non-canonical ${row.id} request URL`));
+      return Promise.reject(
+        new Error(`bob: refusing request for provider row "${row.id}" with a non-canonical URL`),
+      );
     }
     try {
       return await baseFetch(parsed.href, {
@@ -276,7 +270,7 @@ export function guardedKeyedFetch(
       if (/redirect/i.test(text)) {
         return Promise.reject(
           new Error(
-            `bob: refusing ${refusalArticle(row.id)} ${row.id} redirect — bob's transport does not follow redirects (redirect: "error")`,
+            `bob: refusing redirect for provider row "${row.id}" — bob's transport does not follow redirects (redirect: "error")`,
           ),
         );
       }
@@ -302,7 +296,7 @@ export function keyedTransport(input: {
     };
     if (prepared.baseUrl !== row.endpoint || prepared.api !== row.api) {
       throw new Error(
-        `bob: refusing ${refusalArticle(row.id)} ${row.id} request with a mismatched endpoint or API`,
+        `bob: refusing request for provider row "${row.id}" with a mismatched endpoint or API`,
       );
     }
     const opts = (options ?? {}) as { headers?: Record<string, string | null> };
@@ -314,7 +308,7 @@ export function keyedTransport(input: {
         const value = opts.headers?.[name] ?? preparedHeaders[name];
         if (value != null) {
           throw new Error(
-            `bob: refusing ${refusalArticle(row.id)} ${row.id} request with a credential-bearing ${name} header — bob sets the ${row.id} Authorization itself`,
+            `bob: refusing request for provider row "${row.id}" with a credential-bearing ${name} header — bob sets the ${row.id} Authorization itself`,
           );
         }
       }
@@ -847,12 +841,8 @@ export function guardOpenrouterRegistration(modelRuntime: ModelRuntime): void {
 }
 
 /**
- * Refuse a request pi composed for a keyed row under a different API flavour.
- * pi's composed provider picks the stream handler by the effective model's
- * `api` before it reaches the registered transport, so a request re-routed to
- * another adapter never enters `keyedTransport`. This wraps the runtime's
- * request verbs — what pi's agent session calls — so the check runs on the
- * composed request itself, not only at registration.
+ * Guard `streamSimple` (pi's agent session) and `stream` (direct calls and
+ * `complete`) against a composed API mismatch.
  */
 export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: KeyedRow): void {
   const rerouted = (model: unknown): boolean => {
@@ -862,7 +852,7 @@ export function installKeyedComposedApiGuard(modelRuntime: ModelRuntime, row: Ke
   const refuse = (model: unknown) =>
     lazyStream(model as never, async () => {
       throw new Error(
-        `bob: refusing ${refusalArticle(row.id)} ${row.id} request — its composed API is not the row's (${row.api})`,
+        `bob: refusing request for provider row "${row.id}" — its composed API is not the row's (${row.api})`,
       );
     });
   const originalSimple = modelRuntime.streamSimple.bind(modelRuntime);
