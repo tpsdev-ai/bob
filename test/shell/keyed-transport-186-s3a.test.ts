@@ -8,15 +8,7 @@
 // `BOB_PROVIDER_KEYED_FIXTURE_KEY`.
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -303,8 +295,8 @@ describe("K3 — substitution with zero requests and a redacted error", () => {
       called++;
       return new Response("{}", { status: 200 });
     }) as typeof globalThis.fetch;
-    const f = guardedKeyedFetch({ id: "keyed-fixture", endpoint: ENDPOINT }, base);
-    await expect(f(`${ENDPOINT}/%2e%2e/evil`)).rejects.toThrow(/keyed-fixture request/);
+    const f = guardedKeyedFetch({ id: "8bit", endpoint: ENDPOINT }, base);
+    await expect(f(`${ENDPOINT}/%2e%2e/evil`)).rejects.toThrow(/request for provider row "8bit"/);
     await expect(f(new Request(`${ENDPOINT}/chat/completions`))).rejects.toThrow(/Request object/);
     await expect(f("https://keyed-fixture.example/other/chat/completions")).rejects.toThrow(
       /sends only to/,
@@ -920,33 +912,28 @@ describe("K7 — the writers run the reserved-name check before the first write"
     }
   });
 
-  it("an unwritable pi directory leaves no models file or temp file", () => {
-    if (process.getuid?.() === 0) return;
+  it("a file at the pi directory path leaves no models file or temp file", () => {
     const registry = fixtureRegistry();
-    const { piDir } = scaffold("fxk7e", registry);
-    rmSync(join(piDir, "models.json"), { force: true });
-    chmodSync(piDir, 0o500);
-    try {
-      expect(() =>
-        initAgent({
-          name: "fxk7e",
-          role: "coder",
-          provider: "keyed-fixture",
-          model: MODEL,
-          contextWindow: 200_000,
-          agentsRoot: tmpRoot,
-          flairKeysDir: keysRoot,
-          skipFlair: true,
-          registry,
-          noClobber: false,
-        }),
-      ).toThrow();
-      expect(existsSync(join(piDir, "models.json"))).toBe(false);
-      const leftover = readdirSync(piDir).filter((n) => n.includes(".tmp"));
-      expect(leftover).toEqual([]);
-    } finally {
-      chmodSync(piDir, 0o700);
-    }
+    const { agentDir, piDir } = scaffold("fxk7e", registry);
+    rmSync(piDir, { recursive: true, force: true });
+    writeFileSync(piDir, "blocked");
+    expect(() =>
+      initAgent({
+        name: "fxk7e",
+        role: "coder",
+        provider: "keyed-fixture",
+        model: MODEL,
+        contextWindow: 200_000,
+        agentsRoot: tmpRoot,
+        flairKeysDir: keysRoot,
+        skipFlair: true,
+        registry,
+        noClobber: false,
+      }),
+    ).toThrow();
+    expect(existsSync(join(piDir, "models.json"))).toBe(false);
+    expect(readFileSync(piDir, "utf8")).toBe("blocked");
+    expect(readdirSync(agentDir).filter((n) => n.includes(".tmp"))).toEqual([]);
   });
 });
 
@@ -1229,6 +1216,162 @@ describe("K11 — code-owned tables stay aligned", () => {
     expect(CUSTODY_IMPLEMENTATIONS).toEqual(["openai-completions"]);
     expect(CUSTODY_PINS.map((pin) => pin.runtime)).toEqual(["openrouter"]);
     expect(keyedPlaceholder("keyed-fixture")).toBe(PLACEHOLDER);
+  });
+});
+
+describe("K12 — #307: the composed API, and a replacement during the services refresh", () => {
+  for (const method of ["stream", "streamSimple"] as const) {
+    it(`a composed API mismatch is refused (${method})`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const stub = stubFetch();
+      const { result } = await buildFixtureSession(`fxk12a${method.toLowerCase()}`, registry);
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const model = rt.getModel(RUNTIME, MODEL)!;
+        const substituted = await rt[method](
+          { ...model, api: "anthropic-messages" } as never,
+          CTX as never,
+          {} as never,
+        ).result();
+        expect(substituted.stopReason).toBe("error");
+        expect(String(substituted.errorMessage)).toMatch(/composed API is not the row's/);
+        expect(stub.seen).toEqual([]);
+        // The row's own api still streams to the row's endpoint.
+        const sent = await rt[method](model as never, CTX as never, {} as never).result();
+        expect(sent.stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([`${ENDPOINT}/chat/completions`]);
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+        stub.restore();
+      }
+    });
+
+    it(`caller model changes preserve the checked request (${method})`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      const stub = stubFetch();
+      const { result } = await buildFixtureSession(
+        `fxk12snapshot${method.toLowerCase()}`,
+        registry,
+      );
+      try {
+        const rt = result.services.modelRuntime as unknown as ModelRuntime;
+        const model = { ...rt.getModel(RUNTIME, MODEL)!, headers: { "x-fixture": "checked" } };
+        const originalPrepare = rt.prepareRequest.bind(rt);
+        let preparedModel: typeof model | undefined;
+        rt.prepareRequest = async (checked, options) => {
+          preparedModel = checked as typeof model;
+          return originalPrepare(checked, options);
+        };
+        const stream = rt[method](model as never, CTX as never, {} as never);
+        model.api = "anthropic-messages";
+        const sent = await stream.result();
+        expect(sent.stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([`${ENDPOINT}/chat/completions`]);
+        expect(stub.seen[0]?.auth).toBe(`Bearer ${SENTINEL}`);
+        expect(preparedModel).not.toBe(model);
+        expect(preparedModel?.api).toBe("openai-completions");
+        model.api = "openai-completions";
+        const next = rt[method](model as never, CTX as never, {} as never);
+        model.provider = "changed-provider";
+        model.baseUrl = "https://changed.example/v1";
+        model.headers["x-fixture"] = "changed";
+        expect((await next.result()).stopReason).not.toBe("error");
+        expect(stub.seen.map((s) => s.url)).toEqual([
+          `${ENDPOINT}/chat/completions`,
+          `${ENDPOINT}/chat/completions`,
+        ]);
+        expect(preparedModel).not.toBe(model);
+        expect(preparedModel?.api).toBe("openai-completions");
+        expect(preparedModel?.provider).toBe(RUNTIME);
+        expect(preparedModel?.baseUrl).toBe(ENDPOINT);
+        expect(preparedModel?.headers["x-fixture"]).toBe("checked");
+        expect(Object.isFrozen(preparedModel)).toBe(true);
+        expect(Object.isFrozen(preparedModel?.headers)).toBe(true);
+      } finally {
+        (result.session as unknown as { dispose(): void }).dispose();
+        stub.restore();
+      }
+    });
+  }
+
+  // A refresh during services construction replaces the effective provider. The
+  // baseline is re-captured only while the re-composition still matches the
+  // row's registration.
+  for (const change of ["models", "name"] as const) {
+    it(`the post-services check rejects a refresh that changed the ${change} during the services refresh`, async () => {
+      const registry = fixtureRegistry();
+      process.env[VARIABLE] = SENTINEL;
+      scaffold(`fxk12b${change}`, registry);
+      const { config, policy } = resolveRunConfig({
+        name: `fxk12b${change}`,
+        agentsRoot: tmpRoot,
+        registry,
+      });
+      const rt = await ModelRuntime.create({
+        credentials: new InMemoryCredentialStore(),
+        modelsStore: new InMemoryModelsStore(),
+        modelsPath: join(tmpRoot, `fxk12b${change}-models.json`),
+      });
+      // `models`: same id/name/endpoint, an extra composed model. `name`: same
+      // id/endpoint/models, a different name. Either way the model the session
+      // selects still resolves unchanged, and the replacement is not bob's.
+      let replaced = false;
+      const realRefresh = rt.refresh.bind(rt);
+      (rt as unknown as { refresh: (o?: unknown) => Promise<unknown> }).refresh = async (o) => {
+        const refreshed = await realRefresh(o as never);
+        if (!replaced) {
+          replaced = true;
+          const effective = rt.getProvider(RUNTIME)!;
+          const models = effective.getModels();
+          (rt as unknown as { models: { setProvider(p: unknown): void } }).models.setProvider({
+            ...effective,
+            ...(change === "name"
+              ? { name: `${effective.name}-replaced` }
+              : { getModels: () => [...models, { ...models[0], id: "replaced/model" }] }),
+          });
+        }
+        return refreshed;
+      };
+      const factory = createBobRuntimeFactory({ config, policy, registry, modelRuntime: rt });
+      await expect(
+        factory({ sessionManager: SessionManager.inMemory(config.cwd) }),
+      ).rejects.toThrow(/the effective provider does not match/);
+    });
+  }
+
+  it("a real pi session on a substituted api is refused by the guard, and sends nothing", async () => {
+    const registry = fixtureRegistry();
+    process.env[VARIABLE] = SENTINEL;
+    const stub = stubFetch();
+    scaffold("fxk12c", registry);
+    const { config, policy } = resolveRunConfig({ name: "fxk12c", agentsRoot: tmpRoot, registry });
+    const factory = createBobRuntimeFactory({ config, policy, registry });
+    const runtime = await createAgentSessionRuntime(factory, {
+      cwd: config.cwd,
+      agentDir: config.piAgentDir,
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
+    try {
+      // The model pi's agent actually streams with, its api substituted as if a
+      // composed provider re-routed the request to another adapter.
+      const agent = runtime.session.agent as unknown as {
+        state: { model: Record<string, unknown> };
+      };
+      expect(agent.state.model.provider).toBe(RUNTIME);
+      agent.state.model = { ...agent.state.model, api: "anthropic-messages" };
+      await runtime.session.prompt("x");
+      const last = runtime.session.messages.at(-1);
+      expect(last?.role).toBe("assistant");
+      if (last?.role !== "assistant") throw new Error("no assistant message");
+      expect(last.stopReason).toBe("error");
+      expect(String(last.errorMessage)).toMatch(/composed API is not the row's/);
+      expect(stub.seen).toEqual([]);
+    } finally {
+      await runtime.dispose();
+      stub.restore();
+    }
   });
 });
 

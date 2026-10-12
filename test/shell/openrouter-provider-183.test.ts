@@ -1143,7 +1143,7 @@ describe("openrouter round 7 — the key leaves the environment; refresh cannot 
     }) as typeof globalThis.fetch;
     const f = guardedOpenrouterFetch(OPENROUTER_BASE_URL, base);
     await expect(f("https://openrouter.ai/api/v1/%2e%2e/evil")).rejects.toThrow(
-      /openrouter request/,
+      /request for provider row "openrouter"/,
     ); // assertion A: non-canonical
     await expect(f(new Request("https://openrouter.ai/api/v1/chat/completions"))).rejects.toThrow(
       /Request object/,
