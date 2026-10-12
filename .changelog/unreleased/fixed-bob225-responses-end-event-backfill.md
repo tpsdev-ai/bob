@@ -1,0 +1,1 @@
+- **The output backstop counts Responses end-event backfills (bob#225).** Longer text or thinking and changed parsed tool-call arguments count as one further piece per block. Repeated output is not counted again; long backfills still count once. Tool-call JSON formatting changes alone are not detected. (`test/shell/model-budget-225-backfill.test.ts`)

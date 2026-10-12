@@ -34,6 +34,7 @@
 //     the token cap pi sent (`capOutputStream`). It counts pieces, not tokens:
 //     never early, possibly late (see there).
 
+import { isDeepStrictEqual } from "node:util";
 import {
   type AssistantMessage,
   type AssistantMessageEvent,
@@ -481,6 +482,9 @@ export function effectiveOutputCap(
  * would break the "never early" premise; bob does not tokenize, so it cannot
  * detect that.)
  *
+ * End-event backfills count once per block (bob#225 item 5): longer text or
+ * thinking, or tool-call arguments differing from the accepted buffer's parse.
+ *
  * What the wrapper forwards is built from the pieces it accepted, never copied
  * from pi-ai's shared partial: pi-ai emits every event with ONE mutable partial
  * message, and events queue ahead of their reader, so by the time an event is
@@ -529,19 +533,19 @@ export function capOutputStream(
       let pieces = 0;
       try {
         for await (const event of source) {
-          if (isOutputDelta(event)) {
-            pieces += 1;
-            if (pieces > cap) {
-              // The piece that crossed the cap is neither applied nor forwarded.
-              const message = accepted.cut(cap);
-              controller.abort(new Error(`bob: output backstop: more than ${cap} streamed pieces`));
-              log(
-                `bob: the provider streamed more than ${cap} pieces against the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
-              );
-              out.push({ type: "done", reason: "length", message });
-              out.end(message);
-              return;
-            }
+          // Count the end event's backfill, then a streamed piece.
+          pieces += accepted.backfillPieces(event);
+          if (isOutputDelta(event)) pieces += 1;
+          if (pieces > cap) {
+            // The piece that crossed the cap is neither applied nor forwarded.
+            const message = accepted.cut(cap);
+            controller.abort(new Error(`bob: output backstop: more than ${cap} streamed pieces`));
+            log(
+              `bob: the provider streamed more than ${cap} pieces against the ${cap}-token output cap it was sent; bob ended the stream (stopReason "length")`,
+            );
+            out.push({ type: "done", reason: "length", message });
+            out.end(message);
+            return;
           }
           out.push(accepted.forward(event));
           if (event.type === "done") {
@@ -619,6 +623,7 @@ function identityOf(live: unknown, type: Block["type"]): Record<string, unknown>
  */
 function acceptedMessage(model: Parameters<StreamFunction>[0]): {
   forward(event: AssistantMessageEvent): AssistantMessageEvent;
+  backfillPieces(event: AssistantMessageEvent): number;
   cut(cap: number): AssistantMessage;
 } {
   const message: AssistantMessage = {
@@ -743,6 +748,22 @@ function acceptedMessage(model: Parameters<StreamFunction>[0]): {
           return event;
       }
       return { ...event, partial: message };
+    },
+    backfillPieces(event) {
+      if (event.type === "text_end") {
+        const acceptedText = at(event.contentIndex, "text")?.text ?? "";
+        return event.content.length > acceptedText.length ? 1 : 0;
+      }
+      if (event.type === "thinking_end") {
+        const acceptedThinking = at(event.contentIndex, "thinking")?.thinking ?? "";
+        return event.content.length > acceptedThinking.length ? 1 : 0;
+      }
+      if (event.type === "toolcall_end") {
+        // End events expose parsed arguments, so formatting-only backfills are invisible.
+        const acceptedArgs = parseStreamingJson(toolArgs.get(event.contentIndex) ?? "");
+        return isDeepStrictEqual(event.toolCall.arguments ?? {}, acceptedArgs) ? 0 : 1;
+      }
+      return 0;
     },
     cut(cap) {
       // A copy, so the final message shares nothing with the forwarded partial.
