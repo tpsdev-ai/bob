@@ -34,6 +34,7 @@
 //     the token cap pi sent (`capOutputStream`). It counts pieces, not tokens:
 //     never early, possibly late (see there).
 
+import { isDeepStrictEqual } from "node:util";
 import {
   type AssistantMessage,
   type AssistantMessageEvent,
@@ -481,10 +482,8 @@ export function effectiveOutputCap(
  * would break the "never early" premise; bob does not tokenize, so it cannot
  * detect that.)
  *
- * An end event's backfill counts too (bob#225 item 5). On the OpenAI Responses
- * path a text block's `text_end` can carry the item's final text after the
- * deltas streamed for it; the wrapper counts text there that the deltas did not
- * carry as one further piece.
+ * End-event backfills count once per block (bob#225 item 5): longer text or
+ * thinking, or tool-call arguments differing from the accepted buffer's parse.
  *
  * What the wrapper forwards is built from the pieces it accepted, never copied
  * from pi-ai's shared partial: pi-ai emits every event with ONE mutable partial
@@ -750,16 +749,21 @@ function acceptedMessage(model: Parameters<StreamFunction>[0]): {
       }
       return { ...event, partial: message };
     },
-    // bob#225 item 5: the end-event backfill. A text block's `text_end` can carry
-    // text the deltas did not (pi's Responses client sets the block to the item's
-    // final text there), so it holds generated output the piece count has not
-    // seen. Count it as one further piece: one event, and by the premise above at
-    // least one more token. An event that carries several tokens still counts
-    // once, so this stays possibly late.
     backfillPieces(event) {
-      if (event.type !== "text_end") return 0;
-      const acceptedText = at(event.contentIndex, "text")?.text ?? "";
-      return event.content.length > acceptedText.length ? 1 : 0;
+      if (event.type === "text_end") {
+        const acceptedText = at(event.contentIndex, "text")?.text ?? "";
+        return event.content.length > acceptedText.length ? 1 : 0;
+      }
+      if (event.type === "thinking_end") {
+        const acceptedThinking = at(event.contentIndex, "thinking")?.thinking ?? "";
+        return event.content.length > acceptedThinking.length ? 1 : 0;
+      }
+      if (event.type === "toolcall_end") {
+        // End events expose parsed arguments, so formatting-only backfills are invisible.
+        const acceptedArgs = parseStreamingJson(toolArgs.get(event.contentIndex) ?? "");
+        return isDeepStrictEqual(event.toolCall.arguments ?? {}, acceptedArgs) ? 0 : 1;
+      }
+      return 0;
     },
     cut(cap) {
       // A copy, so the final message shares nothing with the forwarded partial.

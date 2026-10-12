@@ -1,16 +1,4 @@
-// bob#225 (item 5) — the output backstop counts the end-event backfill.
-//
-// pi's OpenAI Responses client streams a text block as `text_delta` events and,
-// when the response's message item is done, sets the block's text to that item's
-// final text and emits `text_end` carrying it. When the item's text is LONGER
-// than the deltas streamed for it (the server delivered the rest only in the end
-// item), that final text is output the piece-count backstop did not count, so a
-// stream that packs its answer into the end event went uncounted.
-//
-// These tests run the REAL pi-ai Responses stream processor
-// (processResponsesStream) to produce a backfilled `text_end`, and the REAL
-// backstop (capOutputStream) over it. The OpenAI Responses server is not on this
-// host, so the events it would stream are built here in the documented shapes.
+// bob#225 item 5 — real Responses processor fixtures through the output backstop.
 
 import { describe, expect, it } from "bun:test";
 import {
@@ -22,7 +10,9 @@ import {
 import { processResponsesStream } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import type {
   Response,
+  ResponseFunctionToolCallItem,
   ResponseOutputMessage,
+  ResponseReasoningItem,
   ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 import { capOutputStream, type StreamFunction } from "../../src/shell/model-budget.js";
@@ -55,16 +45,40 @@ function noUsage(): AssistantMessage["usage"] {
   };
 }
 
-/** The Responses events for a message item whose final text is `finalText`,
- *  streamed first as `deltas` (one piece each) and carried again in the item. */
-function responsesEvents(deltas: readonly string[], finalText: string): ResponseStreamEvent[] {
-  const item: ResponseOutputMessage = {
-    type: "message",
-    id: "msg_1",
-    role: "assistant",
-    status: "completed",
-    content: [{ type: "output_text", text: finalText, annotations: [] }],
-  };
+type Fixture = { kind: "text" | "thinking" | "toolCall"; deltas: readonly string[]; end: string };
+
+function responsesEvents(...blocks: Fixture[]): ResponseStreamEvent[] {
+  const items = blocks.map(
+    (
+      block,
+      index,
+    ): ResponseOutputMessage | ResponseReasoningItem | ResponseFunctionToolCallItem => {
+      if (block.kind === "thinking") {
+        return {
+          type: "reasoning",
+          id: `rs_${index}`,
+          summary: [{ type: "summary_text", text: block.end }],
+        };
+      }
+      if (block.kind === "toolCall") {
+        return {
+          type: "function_call",
+          id: `fc_${index}`,
+          call_id: `call_${index}`,
+          name: "lookup",
+          arguments: block.end,
+          status: "completed",
+        };
+      }
+      return {
+        type: "message",
+        id: `msg_${index}`,
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: block.end, annotations: [] }],
+      };
+    },
+  );
   const response: Response = {
     id: "resp_1",
     object: "response",
@@ -72,8 +86,11 @@ function responsesEvents(deltas: readonly string[], finalText: string): Response
     completed_at: 1,
     status: "completed",
     model: MODEL_ID,
-    output: [item],
-    output_text: finalText,
+    output: items,
+    output_text: blocks
+      .filter((b) => b.kind === "text")
+      .map((b) => b.end)
+      .join(""),
     error: null,
     incomplete_details: null,
     instructions: null,
@@ -91,34 +108,44 @@ function responsesEvents(deltas: readonly string[], finalText: string): Response
       total_tokens: 25,
     },
   };
-  return [
-    {
+  const events: ResponseStreamEvent[] = [];
+  for (const [output_index, item] of items.entries()) {
+    const block = blocks[output_index];
+    events.push({
       type: "response.output_item.added",
-      sequence_number: 0,
-      output_index: 0,
-      item: { ...item, status: "in_progress", content: [] },
-    },
-    ...deltas.map<ResponseStreamEvent>((delta, index) => ({
-      type: "response.output_text.delta",
-      sequence_number: index + 1,
-      output_index: 0,
-      content_index: 0,
-      item_id: item.id,
-      logprobs: [],
-      delta,
-    })),
-    {
+      sequence_number: events.length,
+      output_index,
+      item:
+        item.type === "message"
+          ? { ...item, status: "in_progress", content: [] }
+          : item.type === "reasoning"
+            ? { ...item, summary: [] }
+            : { ...item, status: "in_progress", arguments: "" },
+    });
+    for (const delta of block.deltas) {
+      const common = { sequence_number: events.length, output_index, item_id: item.id, delta };
+      if (block.kind === "thinking") {
+        events.push({ ...common, type: "response.reasoning_summary_text.delta", summary_index: 0 });
+      } else if (block.kind === "toolCall") {
+        events.push({ ...common, type: "response.function_call_arguments.delta" });
+      } else {
+        events.push({
+          ...common,
+          type: "response.output_text.delta",
+          content_index: 0,
+          logprobs: [],
+        });
+      }
+    }
+    events.push({
       type: "response.output_item.done",
-      sequence_number: deltas.length + 1,
-      output_index: 0,
+      sequence_number: events.length,
+      output_index,
       item,
-    },
-    {
-      type: "response.completed",
-      sequence_number: deltas.length + 2,
-      response,
-    },
-  ];
+    });
+  }
+  events.push({ type: "response.completed", sequence_number: events.length, response });
+  return events;
 }
 
 /** A provider stream that runs the REAL pi-ai Responses processor over `events`
@@ -145,7 +172,7 @@ function responsesStream(events: readonly ResponseStreamEvent[]): AssistantMessa
       stream,
       model as never,
     );
-    stream.push({ type: "done", reason: "stop", message: output });
+    stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
     stream.end(output);
   })();
   return stream;
@@ -153,10 +180,12 @@ function responsesStream(events: readonly ResponseStreamEvent[]): AssistantMessa
 
 /** Drive the REAL backstop over a stream built from `events`; return the message
  *  it ended with. */
-async function capped(events: readonly ResponseStreamEvent[]): Promise<CappedMessage> {
+async function capped(events: readonly ResponseStreamEvent[], cap = CAP): Promise<CappedMessage> {
   const inner = (() => Promise.resolve(responsesStream(events))) as StreamFunction;
   const wrapped = capOutputStream(inner, { log: () => {} });
-  const stream = await wrapped(model, { systemPrompt: "", messages: [] } as never, {} as never);
+  const stream = await wrapped(model, { systemPrompt: "", messages: [] } as never, {
+    maxTokens: cap,
+  });
   let message: AssistantMessage | undefined;
   for await (const event of stream as AsyncIterable<AssistantMessageEvent>) {
     if (event.type === "done") message = event.message;
@@ -172,7 +201,9 @@ describe("bob#225 item 5 — the output backstop counts the Responses end-event 
   it("ends a stream whose deltas are at the cap once its text_end carries the item's longer final text", async () => {
     // The deltas reach the piece-count limit.
     // The item carries additional text only in the end event.
-    const message = await capped(responsesEvents(["a", "b", "c"], "abcDE FGH IJ KLM"));
+    const message = await capped(
+      responsesEvents({ kind: "text", deltas: ["a", "b", "c"], end: "abcDE FGH IJ KLM" }),
+    );
     expect(message.stopReason).toBe("length");
     expect(message.bobOutputCap).toBe(true);
     // The cut holds the pieces bob accepted (the three deltas), not the backfill.
@@ -182,9 +213,99 @@ describe("bob#225 item 5 — the output backstop counts the Responses end-event 
 
   it("does not count a text_end that repeats the streamed deltas: a stream within the piece-count limit is not cut", async () => {
     // The item's text is exactly the deltas: no backfill, so no further piece.
-    const message = await capped(responsesEvents(["a", "b", "c"], "abc"));
+    const message = await capped(
+      responsesEvents({ kind: "text", deltas: ["a", "b", "c"], end: "abc" }),
+    );
     expect(message.stopReason).toBe("stop");
     expect(message.bobOutputCap).toBeUndefined();
     expect(textOf(message)).toBe("abc");
+  });
+
+  it("counts a later text block's backfill even when shorter than block zero", async () => {
+    const message = await capped(
+      responsesEvents(
+        { kind: "text", deltas: ["a", "b", "c"], end: "abc" },
+        { kind: "text", deltas: [], end: "XY" },
+      ),
+    );
+    expect(message.stopReason).toBe("length");
+    expect(message.bobOutputCap).toBe(true);
+    expect(textOf(message)).toBe("abc");
+  });
+
+  it("counts a long text backfill once at the cap boundary", async () => {
+    const end = `ab${"many words ".repeat(10)}`;
+    const message = await capped(responsesEvents({ kind: "text", deltas: ["a", "b"], end }));
+    expect(message.stopReason).toBe("stop");
+    expect(message.bobOutputCap).toBeUndefined();
+    expect(textOf(message)).toBe(end);
+  });
+
+  for (const kind of ["thinking", "toolCall"] as const) {
+    const deltas = kind === "thinking" ? ["a", "b", "c"] : ['{"a":', "1,", '"b":'];
+    const end =
+      kind === "thinking"
+        ? `abc${"many words ".repeat(10)}`
+        : `{"a":1,"b":"${"many words ".repeat(10)}"}`;
+
+    it(`counts a ${kind} end-item backfill before forwarding it`, async () => {
+      const message = await capped(responsesEvents({ kind, deltas, end }));
+      expect(message.stopReason).toBe("length");
+      expect(message.bobOutputCap).toBe(true);
+      const block = message.content[0];
+      if (kind === "thinking") expect(block).toMatchObject({ type: "thinking", thinking: "abc" });
+      else expect(block).toMatchObject({ type: "toolCall", arguments: { a: 1 } });
+    });
+
+    it(`counts a long ${kind} backfill once at the cap boundary`, async () => {
+      const message = await capped(responsesEvents({ kind, deltas: deltas.slice(0, 2), end }));
+      expect(message.stopReason).toBe(kind === "thinking" ? "stop" : "toolUse");
+      expect(message.bobOutputCap).toBeUndefined();
+      if (kind === "thinking")
+        expect(message.content[0]).toMatchObject({ type: "thinking", thinking: end });
+      else
+        expect(message.content[0]).toMatchObject({ type: "toolCall", arguments: JSON.parse(end) });
+    });
+
+    it(`does not count a ${kind} end event repeating accepted output`, async () => {
+      const repeated = kind === "thinking" ? "abc" : '{"a":1,"b":2}';
+      const repeatedDeltas = kind === "thinking" ? deltas : ['{"a":', "1,", '"b":2}'];
+      const message = await capped(
+        responsesEvents({ kind, deltas: repeatedDeltas, end: repeated }),
+      );
+      expect(message.stopReason).toBe(kind === "thinking" ? "stop" : "toolUse");
+      expect(message.bobOutputCap).toBeUndefined();
+    });
+
+    it(`compares a later ${kind} backfill with that block's accepted output`, async () => {
+      const repeated = kind === "thinking" ? "abc" : '{"a":1,"b":2}';
+      const repeatedDeltas = kind === "thinking" ? deltas : ['{"a":', "1,", '"b":2}'];
+      const message = await capped(
+        responsesEvents(
+          { kind, deltas: repeatedDeltas, end: repeated },
+          { kind, deltas: [], end: kind === "thinking" ? "XY" : repeated },
+        ),
+      );
+      expect(message.stopReason).toBe("length");
+      expect(message.bobOutputCap).toBe(true);
+      expect(message.content[1]).toMatchObject(
+        kind === "thinking"
+          ? { type: "thinking", thinking: "" }
+          : { type: "toolCall", arguments: {} },
+      );
+    });
+  }
+
+  it("does not count tool-call JSON formatting changes without changed parsed arguments", async () => {
+    const message = await capped(
+      responsesEvents({
+        kind: "toolCall",
+        deltas: ['{"a":1,', '"b":2', "}"],
+        end: '{ "b": 2, "a": 1 }',
+      }),
+    );
+    expect(message.stopReason).toBe("toolUse");
+    expect(message.bobOutputCap).toBeUndefined();
+    expect(message.content[0]).toMatchObject({ type: "toolCall", arguments: { a: 1, b: 2 } });
   });
 });
