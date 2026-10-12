@@ -871,44 +871,674 @@ describe("changelog fragments — render + promote (bob#236)", () => {
     expect(readFileSync(join(dir, "fixed-a.md")).equals(crlf)).toBe(true);
   });
 
-  // Permission bits do not bind root, so these two cannot fail a write as root.
-  const asRoot = process.getuid?.() === 0;
+  it("refuses a symlink replacing CHANGELOG.md before the write", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const target = join(root, "replacement.md");
+    writeFileSync(target, before);
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            rmSync(changelogPath);
+            symlinkSync(target, changelogPath);
+          },
+        },
+      }),
+    ).toThrow(/CHANGELOG\.md/);
+    expect(readFileSync(target).equals(before)).toBe(true);
+    expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
+  });
 
-  it.skipIf(asRoot)(
-    "promote that cannot write CHANGELOG.md deletes no fragment and says how to recover",
-    () => {
+  it("restores an already moved fragment when a later fragment disappears before staging", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "added-a.md", "- **an addition.** \n");
+    fragment(dir, "fixed-b.md", "- **a fix.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: { afterIndexCheck: () => rmSync(join(dir, "fixed-b.md")) },
+      }),
+    ).toThrow(/could not move \.changelog\/unreleased\/fixed-b\.md.*ENOENT/);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readFileSync(join(dir, "added-a.md"), "utf8")).toBe("- **an addition.** \n");
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(true);
+    expect(readdirSync(join(root, ".changelog", "promote-staging"))).toEqual([]);
+    expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+  });
+});
+
+describe("changelog fragments — promote stages the fragments (bob#296)", () => {
+  for (const occupied of [false, true]) {
+    it(`names the fragment whose staged identity read fails, original occupied=${occupied}`, () => {
+      const { dir, changelogPath } = project();
+      const body = "- **b fix.**\n";
+      fragment(dir, "fixed-a.md", "- **a fix.**\n");
+      fragment(dir, "fixed-b.md", body);
+      fragment(dir, "fixed-c.md", "- **c fix.**\n");
+      stageAll();
+      const before = readFileSync(changelogPath);
+      const staging = join(root, ".changelog", "promote-staging");
+      const staged = join(staging, "fixed-b.md");
+      const original = join(dir, "fixed-b.md");
+      const replacement = "- **replacement.**\n";
+      let message = "";
+      try {
+        cf.promote("1.2.3", {
+          dir,
+          changelogPath,
+          hooks: {
+            stagedLstat: (path: string, options: { bigint: true }) => {
+              if (path === staged) {
+                expect(readFileSync(path, "utf8")).toBe(body);
+                if (occupied) writeFileSync(original, replacement);
+                return lstatSync(join(path, "missing"), options);
+              }
+              return lstatSync(path, options);
+            },
+          },
+        });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain(
+        ".changelog/unreleased/fixed-b.md moved to staging but its identity could not be read (ENOTDIR)",
+      );
+      expect(message).not.toContain("could not move .changelog/unreleased/fixed-c.md");
+      expect(message).toContain(
+        "identity unknown; promote did not unlink .changelog/promote-staging/fixed-b.md",
+      );
+      expect(message).not.toContain("not the staged file");
+      if (occupied) expect(message).toContain("fixed-b.md could not be restored (EEXIST)");
+      expect(readFileSync(staged, "utf8")).toBe(body);
+      expect(readFileSync(original, "utf8")).toBe(occupied ? replacement : body);
+      if (!occupied) {
+        expect(lstatSync(staged, { bigint: true }).ino).toBe(
+          lstatSync(original, { bigint: true }).ino,
+        );
+      }
+      expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe("- **a fix.**\n");
+      expect(readFileSync(join(dir, "fixed-c.md"), "utf8")).toBe("- **c fix.**\n");
+      expect(readdirSync(staging)).toEqual(["fixed-b.md"]);
+      expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    });
+  }
+
+  it("cleanup reports an existing staged path with unknown identity", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.**\n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterWrite: (records: { identity: { state: string } }[]) => {
+            records[0].identity.state = "UNKNOWN";
+          },
+        },
+      }),
+    ).toThrow("identity unknown; promote did not unlink .changelog/promote-staging/fixed-a.md");
+    expect(readFileSync(staged, "utf8")).toBe(body);
+    expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
+    expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+  });
+
+  it("cleanup reports an absent staged path with unknown identity", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.**\n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+    const saved = join(root, "saved-fixed-a.md");
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterWrite: (records: { identity: { state: string } }[]) => {
+            records[0].identity.state = "UNKNOWN";
+            renameSync(staged, saved);
+          },
+        },
+      }),
+    ).toThrow(
+      "identity unknown; nothing is at .changelog/promote-staging/fixed-a.md (promote did not unlink it)",
+    );
+    expect(existsSync(staged)).toBe(false);
+    expect(readFileSync(saved, "utf8")).toBe(body);
+    expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+  });
+
+  for (const phase of ["cleanup", "rollback unlink"] as const) {
+    it(`leaves and names a replacement staged file before ${phase}`, () => {
+      const { dir, changelogPath } = project();
+      const body = "- **a fix.**\n";
+      const replacement = "- **a replacement.**\n";
+      fragment(dir, "fixed-a.md", body);
+      stageAll();
+      const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+      const original = join(dir, "fixed-a.md");
+      const saved = join(root, "saved-fixed-a.md");
+      const replaceStaged = () => {
+        renameSync(staged, saved);
+        const identity = lstatSync(saved, { bigint: true });
+        writeFileSync(staged, replacement);
+        const current = lstatSync(staged, { bigint: true });
+        expect(current.dev).toBe(identity.dev);
+        expect(current.ino).not.toBe(identity.ino);
+      };
+      expect(() =>
+        cf.promote("1.2.3", {
+          dir,
+          changelogPath,
+          hooks:
+            phase === "cleanup"
+              ? { afterWrite: replaceStaged }
+              : {
+                  afterStage: () => {
+                    rmSync(changelogPath);
+                    symlinkSync(join(root, "missing-changelog"), changelogPath);
+                  },
+                  beforeRollbackUnlink: replaceStaged,
+                },
+        }),
+      ).toThrow(".changelog/promote-staging/fixed-a.md: not the staged file; left in place");
+      expect(readFileSync(staged, "utf8")).toBe(replacement);
+      expect(readFileSync(saved, "utf8")).toBe(body);
+      expect(lstatSync(staged, { bigint: true }).ino).not.toBe(
+        lstatSync(saved, { bigint: true }).ino,
+      );
+      if (phase === "cleanup") {
+        expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+        expect(existsSync(original)).toBe(false);
+      } else {
+        expect(readFileSync(original, "utf8")).toBe(body);
+        expect(lstatSync(original, { bigint: true }).ino).toBe(
+          lstatSync(saved, { bigint: true }).ino,
+        );
+      }
+    });
+  }
+
+  it("reports a failed git hash-object separately from a byte mismatch", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.**\n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const before = readFileSync(changelogPath);
+    let message = "";
+    try {
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            renameSync(join(root, ".git"), join(root, ".git-saved"));
+            writeFileSync(join(root, ".git"), "gitdir: missing-git-directory\n");
+            expect(gitSync(dir, ["hash-object", "--no-filters", "--stdin"]).status).not.toBe(0);
+          },
+        },
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain(
+      ".changelog/unreleased/fixed-a.md could not verify (git hash-object failed)",
+    );
+    expect(message).not.toContain("changed after the index check");
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(body);
+    expect(readdirSync(join(root, ".changelog", "promote-staging"))).toEqual([]);
+  });
+
+  it("reports a regular file without identifying a rollback-path replacement as the staged copy", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.**\n";
+    const replacement = "- **a replacement.**\n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+    const original = join(dir, "fixed-a.md");
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            rmSync(changelogPath);
+            symlinkSync(join(root, "missing-changelog"), changelogPath);
+          },
+          beforeRollbackUnlink: () => {
+            rmSync(staged);
+            writeFileSync(staged, replacement);
+            throw new Error("replacement installed");
+          },
+        },
+      }),
+    ).toThrow(
+      "a regular file is at .changelog/promote-staging/fixed-a.md (not verified to be the staged copy)",
+    );
+    expect(readFileSync(original, "utf8")).toBe(body);
+    expect(readFileSync(staged, "utf8")).toBe(replacement);
+    expect(lstatSync(staged, { bigint: true }).ino).not.toBe(
+      lstatSync(original, { bigint: true }).ino,
+    );
+  });
+
+  for (const hook of ["afterStage", "afterWrite"] as const) {
+    it(`an exception from ${hook} bypasses rollback diagnostics`, () => {
+      const { dir, changelogPath } = project();
+      const body = "- **a fix.**\n";
+      fragment(dir, "fixed-a.md", body);
+      stageAll();
+      const before = readFileSync(changelogPath);
+      const failure = new Error(`${hook} failed`);
+      let caught: unknown;
+      try {
+        cf.promote("1.2.3", {
+          dir,
+          changelogPath,
+          hooks: {
+            [hook]: () => {
+              throw failure;
+            },
+          },
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBe(failure);
+      expect(readFileSync(join(root, ".changelog", "promote-staging", "fixed-a.md"), "utf8")).toBe(
+        body,
+      );
+      expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
+      expect(readFileSync(changelogPath).equals(before)).toBe(hook === "afterStage");
+    });
+  }
+
+  it("checking original paths can fail after the staging directory is removed", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.**\n");
+    stageAll();
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterWrite: () => {
+            rmSync(dir, { recursive: true });
+            symlinkSync(dir, dir);
+          },
+        },
+      }),
+    ).toThrow(/ELOOP/);
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
+    expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+  });
+
+  it("moves a fragment that changed after the index check back, refuses, and folds nothing", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const changed = "- **a fix, edited after the index check.**\n";
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: { afterIndexCheck: () => writeFileSync(join(dir, "fixed-a.md"), changed) },
+      }),
+    ).toThrow(
+      "promote: .changelog/unreleased/fixed-a.md changed after the index check; nothing was folded and nothing was written to CHANGELOG.md.",
+    );
+    // The changed bytes are back at their path and the section was not cut.
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(changed);
+    expect(
+      cf
+        .readFragments(dir)
+        .map((f) => f.name)
+        .sort(),
+    ).toEqual(["added-b.md", "fixed-a.md"]);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(true);
+    expect(readdirSync(join(root, ".changelog", "promote-staging"))).toEqual([]);
+    expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+  });
+
+  it("refuses a fragment changed and staged after preflight", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    const changed = "- **changed and staged after preflight.**\n";
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        hooks: {
+          afterIndexCheck: () => {
+            writeFileSync(join(dir, "fixed-a.md"), changed);
+            expect(gitSync(root, ["add", "--", ".changelog/unreleased/fixed-a.md"]).status).toBe(0);
+          },
+        },
+      }),
+    ).toThrow(/fixed-a\.md changed after the index check; nothing was folded/);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(changed);
+    expect(readFileSync(join(dir, "added-b.md"), "utf8")).toBe("- **an addition.** \n");
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(true);
+    expect(readdirSync(join(root, ".changelog", "promote-staging"))).toEqual([]);
+    expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+  });
+
+  it("keeps a fragment written at its path after the move, reports it on success, and folds the staged bytes", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **the staged fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const after = "- **written after the move.**\n";
+    const res = cf.promote("1.2.3", {
+      date: "2022-01-02",
+      dir,
+      changelogPath,
+      hooks: { afterStage: () => writeFileSync(join(dir, "fixed-a.md"), after) },
+    });
+    expect(res.kept).toEqual([".changelog/unreleased/fixed-a.md"]);
+    expect(res.removed.sort()).toEqual(["added-b.md", "fixed-a.md"]);
+    const text = readFileSync(changelogPath, "utf8");
+    // The section carries the staged bytes, not the file written after the move.
+    expect(text).toContain("### Fixed\n\n- **the staged fix.**");
+    expect(text).not.toContain("written after the move");
+    // The new file is untouched at its path; the other fragment folded and is gone.
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(after);
+    expect(existsSync(join(dir, "added-b.md"))).toBe(false);
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(false);
+  });
+
+  it("restores staged fragments to vacant paths when the CHANGELOG write fails", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    let calls = 0;
+    // The fstat stub reports a different inode; the write opens the same file.
+    const fstat = (fd: number) => {
+      const real = fstatSync(fd, { bigint: true });
+      calls += 1;
+      return {
+        isFile: () => real.isFile(),
+        nlink: 1n,
+        dev: 7n,
+        ino: calls === 1 ? 2n ** 53n : 2n ** 53n + 1n,
+      };
+    };
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath, fstat })).toThrow(
+      /promote: CHANGELOG\.md was replaced after it was read/,
+    );
+    expect(calls).toBe(2);
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(
+      cf
+        .readFragments(dir)
+        .map((f) => f.name)
+        .sort(),
+    ).toEqual(["added-b.md", "fixed-a.md"]);
+    expect(existsSync(join(root, ".changelog", "promote-staging"))).toBe(true);
+    expect(readdirSync(join(root, ".changelog", "promote-staging"))).toEqual([]);
+    expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+  });
+
+  it("does not replace a fragment rewritten at its path when a later step fails", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **the staged fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const after = "- **written after the move.**\n";
+    let calls = 0;
+    const fstat = (fd: number) => {
+      const real = fstatSync(fd, { bigint: true });
+      calls += 1;
+      return {
+        isFile: () => real.isFile(),
+        nlink: 1n,
+        dev: 7n,
+        ino: calls === 1 ? 2n ** 53n : 2n ** 53n + 1n,
+      };
+    };
+    const staging = join(root, ".changelog", "promote-staging");
+    expect(() =>
+      cf.promote("1.2.3", {
+        date: "2022-01-02",
+        dir,
+        changelogPath,
+        fstat,
+        hooks: { afterStage: () => writeFileSync(join(dir, "fixed-a.md"), after) },
+      }),
+    ).toThrow(
+      /fixed-a\.md could not be restored \(EEXIST\); a regular file is at \.changelog\/promote-staging\/fixed-a\.md \(not verified to be the staged copy\)/,
+    );
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(after);
+    expect(readFileSync(join(staging, "fixed-a.md"), "utf8")).toBe("- **the staged fix.** \n");
+    expect(existsSync(join(staging, "added-b.md"))).toBe(false);
+    expect(readFileSync(join(dir, "added-b.md"), "utf8")).toBe("- **an addition.** \n");
+  });
+
+  for (const recreated of [false, true]) {
+    it(`reports unknown staging state when the staged file is missing and the original path is ${recreated ? "recreated" : "vacant"}`, () => {
       const { dir, changelogPath } = project();
       fragment(dir, "fixed-a.md", "- **a fix.** \n");
       stageAll();
-      chmodSync(changelogPath, 0o444);
+      const staging = join(root, ".changelog", "promote-staging");
+      const original = join(dir, "fixed-a.md");
+      const staged = join(staging, "fixed-a.md");
+      let message = "";
       try {
-        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-          /could not write CHANGELOG\.md \(EACCES\); no fragment was deleted/,
-        );
-      } finally {
-        chmodSync(changelogPath, 0o644);
+        cf.promote("1.2.3", {
+          date: "2022-01-02",
+          dir,
+          changelogPath,
+          hooks: {
+            afterStage: () => {
+              rmSync(staged);
+              if (recreated) writeFileSync(original, "- **recreated.**\n");
+            },
+          },
+        });
+      } catch (err) {
+        message = (err as Error).message;
       }
-      expect(cf.readFragments(dir).map((f) => f.name)).toEqual(["fixed-a.md"]);
-    },
-  );
+      expect(message).toContain(".changelog/unreleased/fixed-a.md could not be restored");
+      expect(message).toContain(
+        "path state is unknown; inspect .changelog/promote-staging/fixed-a.md",
+      );
+      expect(message).not.toContain("remains");
+      expect(message).not.toContain("both paths");
+      expect(existsSync(staged)).toBe(false);
+      expect(existsSync(original)).toBe(recreated);
+      if (recreated) expect(readFileSync(original, "utf8")).toBe("- **recreated.**\n");
+      expect(existsSync(staging)).toBe(true);
+      expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+    });
+  }
 
-  it.skipIf(asRoot)(
-    "promote that cannot delete a fragment names it and says how to recover",
-    () => {
-      const { dir, changelogPath } = project();
-      fragment(dir, "fixed-a.md", "- **a fix.** \n");
-      stageAll();
-      chmodSync(dir, 0o555);
-      try {
-        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-          /is written to CHANGELOG\.md, but 1 fragment\(s\) could not be deleted: fixed-a\.md \(EACCES\)/,
-        );
-      } finally {
-        chmodSync(dir, 0o755);
-      }
-      expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] - 2022-01-02");
-    },
-  );
+  it("reports a regular file at the staging path after rollback cannot link into a missing original directory", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.** \n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            rmSync(dir, { recursive: true });
+            rmSync(changelogPath);
+            symlinkSync(join(root, "missing-changelog"), changelogPath);
+          },
+        },
+      }),
+    ).toThrow(
+      ".changelog/unreleased/fixed-a.md could not be restored (ENOENT); a regular file is at .changelog/promote-staging/fixed-a.md (not verified to be the staged copy)",
+    );
+    expect(readFileSync(staged, "utf8")).toBe(body);
+    expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
+  });
+
+  it("leaves and names a directory replacing the staged file before rollback unlink", () => {
+    const { dir, changelogPath } = project();
+    const body = "- **a fix.** \n";
+    fragment(dir, "fixed-a.md", body);
+    stageAll();
+    const staged = join(root, ".changelog", "promote-staging", "fixed-a.md");
+    let message = "";
+    try {
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: {
+          afterStage: () => {
+            rmSync(changelogPath);
+            symlinkSync(join(root, "missing-changelog"), changelogPath);
+          },
+          beforeRollbackUnlink: () => {
+            rmSync(staged);
+            mkdirSync(staged);
+          },
+        },
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain(
+      ".changelog/promote-staging/fixed-a.md: not the staged file; left in place",
+    );
+    expect(message).not.toContain("remains");
+    expect(message).not.toContain("both paths");
+    expect(lstatSync(staged).isDirectory()).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe(body);
+  });
+
+  it("reports unknown staging state when a staged file disappears after the write", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    const staging = join(root, ".changelog", "promote-staging");
+    const staged = join(staging, "fixed-a.md");
+    let message = "";
+    try {
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: { afterWrite: () => rmSync(staged) },
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("staged path could not be removed (ENOENT)");
+    expect(message).toContain(
+      "path state is unknown; inspect .changelog/promote-staging/fixed-a.md",
+    );
+    expect(message).not.toContain("remains");
+    expect(existsSync(staged)).toBe(false);
+    expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
+    expect(existsSync(staging)).toBe(true);
+    expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3]");
+    expect(() => cf.promote("1.2.3", { dir, changelogPath })).toThrow("already exists");
+  });
+
+  it("names the staging directory when an extra file prevents its removal", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    stageAll();
+    const staging = join(root, ".changelog", "promote-staging");
+    expect(() =>
+      cf.promote("1.2.3", {
+        dir,
+        changelogPath,
+        hooks: { afterWrite: () => writeFileSync(join(staging, "extra"), "inspect me") },
+      }),
+    ).toThrow(/\.changelog\/promote-staging\/ could not be removed/);
+    expect(readFileSync(join(staging, "extra"), "utf8")).toBe("inspect me");
+    expect(existsSync(join(staging, "fixed-a.md"))).toBe(false);
+    expect(existsSync(join(dir, "fixed-a.md"))).toBe(false);
+  });
+
+  it("names a staged path replaced by a non-empty directory after the write, and the stated remedy works", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    fragment(dir, "added-b.md", "- **an addition.** \n");
+    stageAll();
+    const staging = join(root, ".changelog", "promote-staging");
+    // Preserve the staged bytes, then put a non-empty directory at the unlink path.
+    const afterWrite = () => {
+      const p = join(staging, "fixed-a.md");
+      renameSync(p, join(staging, "saved-fixed-a.md"));
+      mkdirSync(p);
+      writeFileSync(join(p, "x"), "x");
+    };
+    let message = "";
+    try {
+      cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath, hooks: { afterWrite } });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("fixed-a.md");
+    expect(message).toContain(".changelog/promote-staging/");
+    expect(message).toContain(
+      ".changelog/promote-staging/fixed-a.md: not the staged file; left in place",
+    );
+    expect(message).not.toContain("remains");
+    expect(lstatSync(join(staging, "fixed-a.md")).isDirectory()).toBe(true);
+    expect(existsSync(join(staging, "added-b.md"))).toBe(false);
+    expect(message).toContain("git checkout -- CHANGELOG.md .changelog/unreleased");
+    expect(readFileSync(join(staging, "saved-fixed-a.md"), "utf8")).toBe("- **a fix.** \n");
+    expect(existsSync(staging)).toBe(true);
+    // The remedy the message states: restore both, remove the staging directory, run again.
+    expect(gitSync(root, ["checkout", "--", "CHANGELOG.md", ".changelog/unreleased"]).status).toBe(
+      0,
+    );
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      /already exists and may be left from an interrupted run/,
+    );
+    rmSync(staging, { recursive: true, force: true });
+    const res = cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath });
+    expect(res.removed.sort()).toEqual(["added-b.md", "fixed-a.md"]);
+  });
+
+  it("refuses an existing staging path, naming it and requiring inspection before removal", () => {
+    const { dir, changelogPath } = project();
+    fragment(dir, "fixed-a.md", "- **a fix.** \n");
+    const staging = join(root, ".changelog", "promote-staging");
+    mkdirSync(staging);
+    writeFileSync(join(staging, "fixed-old.md"), "- **staged by a crashed run.** \n");
+    stageAll();
+    const before = readFileSync(changelogPath);
+    expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
+      /promote: \.changelog\/promote-staging\/ already exists and may be left from an interrupted run\. Inspect it before removing it/,
+    );
+    expect(readFileSync(changelogPath).equals(before)).toBe(true);
+    expect(existsSync(join(staging, "fixed-old.md"))).toBe(true);
+    expect(readFileSync(join(dir, "fixed-a.md"), "utf8")).toBe("- **a fix.** \n");
+  });
 });
 
 describe("changelog fragments — the migration (bob#236)", () => {

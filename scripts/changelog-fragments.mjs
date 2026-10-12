@@ -52,11 +52,15 @@ import {
   constants,
   fstatSync,
   ftruncateSync,
+  linkSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -629,10 +633,166 @@ export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {
 }
 
 // ─── promote ──────────────────────────────────────────────────────────────────
+//
+// bob#296: rename fragments into .changelog/promote-staging, verify the moved
+// bytes against the preflight's index blobs, then fold and, after the changelog
+// write, remove matching staged paths.
+
+export const STAGING_BASENAME = "promote-staging";
+
+function stagingDirFor(dir) {
+  return join(dirname(dir), STAGING_BASENAME);
+}
+
+function stagingDirRel() {
+  return join(dirname(FRAGMENT_DIR_REL), STAGING_BASENAME);
+}
+
+// An existing staging path may be left from an interrupted run. Refused by name
+// before fragments are read; its provenance and contents are not checked.
+// `lstat` so a link there is named, not followed.
+function assertNoStagingLeftover(stagingDir) {
+  try {
+    lstatSync(stagingDir);
+  } catch (err) {
+    if (err?.code === "ENOENT") return;
+    throw err;
+  }
+  throw new FragmentError(
+    `promote: ${stagingDirRel()}/ already exists and may be left from an interrupted run. ` +
+      `Inspect it before removing it, then run promote again. Nothing was written.`,
+  );
+}
+
+// Attempt each link back; only after a successful link, check the staged identity before unlinking.
+// A link, unlike a rename, refuses to replace a file a writer put at the path since
+// the move.
+function moveBack(staged, hooks = {}) {
+  const notes = [];
+  for (const m of staged) {
+    try {
+      linkSync(m.staged, m.orig);
+    } catch (err) {
+      notes.push(
+        `${FRAGMENT_DIR_REL}/${m.name} could not be restored (${err?.code ?? err}); ${stagedPathNote(m)}`,
+      );
+      continue;
+    }
+    try {
+      if (hooks.beforeRollbackUnlink) hooks.beforeRollbackUnlink(m);
+      const note = unlinkStaged(m);
+      if (note) notes.push(note);
+    } catch (err) {
+      notes.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
+    }
+  }
+  return notes;
+}
+
+function unlinkStaged(m) {
+  if (m.identity.state === "UNKNOWN") {
+    return stagedPathNote(m);
+  }
+  const current = lstatSync(m.staged, { bigint: true });
+  if (current.dev !== m.identity.dev || current.ino !== m.identity.ino) {
+    return `${stagingDirRel()}/${m.name}: not the staged file; left in place`;
+  }
+  unlinkSync(m.staged);
+  return null;
+}
+
+function stagedPathNote(m) {
+  const path = `${stagingDirRel()}/${m.name}`;
+  if (m.identity.state === "UNKNOWN") {
+    try {
+      lstatSync(m.staged);
+      return `identity unknown; promote did not unlink ${path}`;
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        return `identity unknown; nothing is at ${path} (promote did not unlink it)`;
+      }
+      return `identity unknown; promote did not unlink ${path} (its state could not be read)`;
+    }
+  }
+  try {
+    if (lstatSync(m.staged).isFile()) {
+      return `a regular file is at ${path} (not verified to be the staged copy)`;
+    }
+  } catch {}
+  return `path state is unknown; inspect ${path}`;
+}
+
+// Remove the staging directory; null on success or when it is already gone, else
+// the error.
+function removeStagingDir(stagingDir) {
+  try {
+    rmdirSync(stagingDir);
+    return null;
+  } catch (err) {
+    return err?.code === "ENOENT" ? null : err;
+  }
+}
+
+// Rename fragments into staging; attempt rollback if a rename fails.
+function stageFragments(fragments, stagingDir, hooks = {}) {
+  try {
+    mkdirSync(stagingDir);
+  } catch (err) {
+    if (err?.code === "EEXIST") {
+      throw new FragmentError(
+        `promote: ${stagingDirRel()}/ appeared while promote was running; another promote may be in ` +
+          `progress, or a previous one left it. Nothing was written.`,
+      );
+    }
+    throw new FragmentError(
+      `promote: could not create the staging directory ${stagingDirRel()}/ (${err?.code ?? err}); ` +
+        `nothing was written.`,
+    );
+  }
+  const staged = [];
+  let name;
+  try {
+    for (const f of fragments) {
+      name = f.name;
+      const dest = join(stagingDir, f.name);
+      renameSync(f.path, dest);
+      const m = {
+        name: f.name,
+        orig: f.path,
+        staged: dest,
+        category: f.category,
+        slug: f.slug,
+        identity: { state: "UNKNOWN" },
+      };
+      staged.push(m);
+      try {
+        const identity = (hooks.stagedLstat ?? lstatSync)(dest, { bigint: true });
+        m.identity = { state: "KNOWN", dev: identity.dev, ino: identity.ino };
+      } catch (err) {
+        throw new FragmentError(
+          `promote: ${FRAGMENT_DIR_REL}/${f.name} moved to staging but its identity could not be read (${err?.code ?? err})`,
+        );
+      }
+    }
+  } catch (err) {
+    const notes = moveBack(staged);
+    const failure =
+      err instanceof FragmentError
+        ? err.message
+        : `promote: could not move ${FRAGMENT_DIR_REL}/${name} into ${stagingDirRel()}/ (${err?.code ?? err})`;
+    const extra = notes.length > 0 ? ` ${notes.join("; ")}.` : "";
+    throw new FragmentError(
+      `${failure}; ` +
+        `nothing was folded and nothing was written. Restore the fragment directory ` +
+        `(git checkout -- ${FRAGMENT_DIR_REL}) if needed.${extra} Inspect ${stagingDirRel()}/ before removing it and running promote again.`,
+    );
+  }
+  return staged;
+}
 
 export function promote(
   version,
-  { date, changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR, fstat } = {},
+  { date, changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR, fstat, hooks = {} } = {},
 ) {
   if (!isReleaseVersion(version)) {
     throw new FragmentError(
@@ -647,6 +807,8 @@ export function promote(
       `promote: invalid --date '${date}'. Expected a real date as YYYY-MM-DD, e.g. 2026-09-29; nothing was written.`,
     );
   }
+  const stagingDir = stagingDirFor(dir);
+  assertNoStagingLeftover(stagingDir);
   const fragments = readFragments(dir);
   if (fragments.length === 0) {
     throw new FragmentError(
@@ -691,49 +853,139 @@ export function promote(
     );
   }
 
-  const section = assemble(fragments);
-  const entries = countEntries(section);
-  if (entries !== fragments.length) {
-    throw new FragmentError(
-      `promote: assembled ${entries} entries from ${fragments.length} fragments. A fragment holds more than ` +
-        `one top-level '- ' item; split it into one file per entry.`,
-    );
-  }
+  const names = fragments.map((f) => f.name);
+  const blobs = gitRestorableOrThrow({ changelogPath, dir, names });
+  if (hooks.afterIndexCheck) hooks.afterIndexCheck();
 
-  gitRestorableOrThrow({ changelogPath, dir, names: fragments.map((f) => f.name) });
+  const staged = stageFragments(fragments, stagingDir, hooks);
+  if (hooks.afterStage) hooks.afterStage();
 
   const day = date ?? new Date().toISOString().slice(0, 10);
-  const replacement = ["", UNRELEASED_NOTE, "", `## [${version}] - ${day}`, "", section, ""];
-  const next = [...lines.slice(0, loc.start + 1), ...replacement, ...lines.slice(loc.end)];
-  // A failure part-way must say what state it left and how to recover: the
-  // section is written first, and the fragments are deleted only after that.
+  let section;
   try {
-    writeChangelog(changelogPath, next.join("\n"), changelogRead, { fstat });
-  } catch (err) {
-    if (err instanceof FragmentError) {
-      throw new FragmentError(`promote: ${err.message} No fragment was deleted.`);
+    // Fold from the staged bytes verified against the preflight blob. They are decoded and
+    // re-validated here, not reused from the earlier read, so a fragment that
+    // changed between that read and the index check is still judged on its current
+    // bytes.
+    const folded = [];
+    const changedBefore = [];
+    const unverified = [];
+    for (const m of staged) {
+      const bytes = readFileSync(m.staged);
+      const sha = gitHashBytes(dir, bytes);
+      if (sha === null) {
+        unverified.push(m.name);
+        continue;
+      }
+      if (sha !== blobs.get(m.name)) {
+        changedBefore.push(m.name);
+        continue;
+      }
+      const rel = `${FRAGMENT_DIR_REL}/${m.name}`;
+      const body = decodeUtf8OrThrow(bytes, rel);
+      validateFragmentBody(rel, body);
+      validateLede(rel, body);
+      folded.push({
+        name: m.name,
+        path: m.staged,
+        category: m.category,
+        slug: m.slug,
+        body: body.replace(/\s+$/, ""),
+      });
     }
+    const problems = [];
+    if (unverified.length > 0) {
+      problems.push(
+        `${unverified.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} could not verify (git hash-object failed)`,
+      );
+    }
+    if (changedBefore.length > 0) {
+      problems.push(
+        `${changedBefore.map((n) => `${FRAGMENT_DIR_REL}/${n}`).join(", ")} changed after the index check`,
+      );
+    }
+    if (problems.length > 0) {
+      throw new FragmentError(
+        `promote: ${problems.join("; ")}; nothing was folded and ` +
+          `nothing was written to CHANGELOG.md.`,
+      );
+    }
+    section = assemble(folded);
+    const entries = countEntries(section);
+    if (entries !== fragments.length) {
+      throw new FragmentError(
+        `promote: assembled ${entries} entries from ${fragments.length} fragments. A fragment holds more than ` +
+          `one top-level '- ' item; split it into one file per entry.`,
+      );
+    }
+    const replacement = ["", UNRELEASED_NOTE, "", `## [${version}] - ${day}`, "", section, ""];
+    const next = [...lines.slice(0, loc.start + 1), ...replacement, ...lines.slice(loc.end)];
+    try {
+      writeChangelog(changelogPath, next.join("\n"), changelogRead, { fstat });
+    } catch (err) {
+      if (err instanceof FragmentError) {
+        throw new FragmentError(`promote: ${err.message}`);
+      }
+      throw new FragmentError(
+        `promote: could not write CHANGELOG.md (${err?.code ?? err}). Restore it ` +
+          `(git checkout -- CHANGELOG.md) and run promote again.`,
+      );
+    }
+  } catch (err) {
+    const parts = moveBack(staged, hooks);
+    const base =
+      err instanceof FragmentError
+        ? err.message
+        : `promote: could not complete (${err?.code ?? err})`;
+    const extra = parts.length > 0 ? ` Additionally, ${parts.join("; ")}.` : "";
     throw new FragmentError(
-      `promote: could not write CHANGELOG.md (${err?.code ?? err}); no fragment was deleted. Restore it ` +
-        `(git checkout -- CHANGELOG.md) and run promote again.`,
+      `${base}${extra} Inspect ${stagingDirRel()}/ before removing it and running promote again.`,
     );
   }
+  if (hooks.afterWrite) hooks.afterWrite(staged);
+  // Clean up matching staged files after the write; on success, remove the directory
+  // before checking original paths.
   const left = [];
-  for (const f of fragments) {
+  for (const m of staged) {
     try {
-      unlinkSync(f.path);
+      const note = unlinkStaged(m);
+      if (note) left.push(note);
     } catch (err) {
-      left.push(`${f.name} (${err?.code ?? err})`);
+      left.push(`staged path could not be removed (${err?.code ?? err}); ${stagedPathNote(m)}`);
     }
   }
   if (left.length > 0) {
     throw new FragmentError(
-      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.length} fragment(s) could ` +
-        `not be deleted: ${left.join(", ")}. They are already in that section: delete them before the next ` +
-        `check or promote, or restore both (git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}) and run promote again.`,
+      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.join("; ")}. Inspect ` +
+        `${stagingDirRel()}/ before the next promote, or restore both ` +
+        `(git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}), remove ${stagingDirRel()}/, and run promote again.`,
     );
   }
-  return { version, date: day, entries, removed: fragments.map((f) => f.name) };
+  const stagingErr = removeStagingDir(stagingDir);
+  if (stagingErr) {
+    throw new FragmentError(
+      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ` +
+        `${stagingDirRel()}/ could not be removed (${stagingErr?.code ?? stagingErr}); remove it before the ` +
+        `next promote (the next promote refuses while it is there).`,
+    );
+  }
+  // Report entries found at the original paths on success.
+  const kept = [];
+  for (const m of staged) {
+    try {
+      lstatSync(m.orig);
+      kept.push(`${FRAGMENT_DIR_REL}/${m.name}`);
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+  }
+  return {
+    version,
+    date: day,
+    entries: countEntries(section),
+    removed: staged.map((m) => m.name),
+    kept,
+  };
 }
 
 // `promote` rewrites CHANGELOG.md and deletes the fragments, and its recovery from
@@ -753,19 +1005,42 @@ function git(cwd, args) {
   return { ok: !r.error && r.status === 0, out: r.stdout ?? "" };
 }
 
-// The paths (relative to `cwd`) whose RAW working-tree bytes (`git hash-object
-// --no-filters`) hash to something other than their index blob; null when git
-// cannot answer.
-function differsFromIndex(cwd, paths) {
-  if (paths.length === 0) return [];
+// The blob SHA each path has in the index, as `git ls-files -s` reports it; the
+// value the index check compares the working tree against. Null when git cannot
+// answer.
+function indexBlobs(cwd, paths) {
+  if (paths.length === 0) return new Map();
   const staged = git(cwd, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", ...paths]);
-  const hashed = git(cwd, ["hash-object", "--no-filters", "--", ...paths]);
-  if (!staged.ok || !hashed.ok) return null;
+  if (!staged.ok) return null;
   const index = new Map();
   for (const record of staged.out.split("\0").filter(Boolean)) {
     const tab = record.indexOf("\t");
     index.set(record.slice(tab + 1), record.slice(0, tab).split(" ")[1]);
   }
+  return index;
+}
+
+// The blob SHA git would store for these bytes (`git hash-object --no-filters
+// --stdin`): the same content hash the index check compares against. Null on
+// failure, so a caller can refuse rather than treat "unknown" as "unchanged".
+function gitHashBytes(cwd, bytes) {
+  const r = spawnSync("git", ["-C", cwd, "hash-object", "--no-filters", "--stdin"], {
+    input: bytes,
+    timeout: 10_000,
+    env: process.env,
+  });
+  if (r.error || r.status !== 0) return null;
+  const sha = (r.stdout ?? Buffer.alloc(0)).toString("utf8").trim();
+  return sha.length > 0 ? sha : null;
+}
+
+// The paths (relative to `cwd`) whose RAW working-tree bytes (`git hash-object
+// --no-filters`) hash to something other than their index blob; null when git
+// cannot answer.
+function differsFromIndex(cwd, paths, index = indexBlobs(cwd, paths)) {
+  if (paths.length === 0) return [];
+  const hashed = git(cwd, ["hash-object", "--no-filters", "--", ...paths]);
+  if (index === null || !hashed.ok) return null;
   const work = hashed.out.split("\n").filter(Boolean);
   if (work.length !== paths.length) return null;
   return paths.filter((p, i) => index.get(p) !== work[i]);
@@ -807,10 +1082,9 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
   // core.autocrlf=input, a CRLF rewrite of an LF file hashes like the original),
   // so a file whose bytes a filter changes counts as changed: conservative, and
   // the refusal says so.
-  const fragmentsDiffer = differsFromIndex(
-    dir,
-    names.filter((n) => tracked.has(n)),
-  );
+  const fragmentNames = names.filter((n) => tracked.has(n));
+  const blobs = indexBlobs(dir, fragmentNames);
+  const fragmentsDiffer = differsFromIndex(dir, fragmentNames, blobs);
   const changelogDiffers = clTracked.has(clName) ? differsFromIndex(clDir, [clName]) : [];
   if (fragmentsDiffer === null || changelogDiffers === null) {
     throw new FragmentError(
@@ -838,6 +1112,7 @@ export function gitRestorableOrThrow({ changelogPath, dir, names }) {
         `Stage them (git add) or remove them, then run promote again.${rawNote}`,
     );
   }
+  return blobs;
 }
 
 // The versions `promote` accepts: MAJOR.MINOR.PATCH, each 0 or a number with no
@@ -921,6 +1196,9 @@ if (isEntryPoint()) {
       process.stdout.write(
         `✓ promoted ${res.entries} entr(ies) into '## [${res.version}] - ${res.date}'; removed ${res.removed.length} fragment(s).\n`,
       );
+      if (res.kept.length > 0) {
+        process.stdout.write(`changed during promote, kept: ${res.kept.join(", ")}\n`);
+      }
     } else {
       usageError(`unknown command '${cmd}'`);
     }

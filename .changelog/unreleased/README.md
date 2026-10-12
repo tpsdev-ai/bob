@@ -101,12 +101,19 @@ machines and filesystems.
 while `CHANGELOG.md` is not a regular file or has more than one hard link, or
 while it or any fragment is untracked (not in the index) or differs from the
 index byte for byte (so a file that `core.autocrlf` or a clean filter changes on
-its way into git counts as differing), naming each, so that `git checkout -- CHANGELOG.md .changelog/unreleased`
-restores everything it changed, unless another process changes those files
-while `promote` runs. If `promote` cannot write `CHANGELOG.md`, it deletes no fragment. If it cannot
-delete a fragment after writing the section, it names each one left: those are
-already in the new section, so delete them, or restore both
-(`git checkout -- CHANGELOG.md .changelog/unreleased`) and run it again.
+its way into git counts as differing), naming each. After that check, `promote` moves each fragment it will fold into a
+staging directory (`.changelog/promote-staging`)
+with a rename, folds the section from the moved bytes once they hash to the index
+blob, and, after the section is written, removes staged paths whose dev and ino still match. A fragment whose moved bytes differ
+from the preflight index blob is refused, folding nothing; a fragment
+rewritten at its path after the move leaves a new file there, which `promote` does not
+touch and, on a successful promote, reports as `changed during promote, kept: <path>`. A write through a file
+descriptor opened before the move lands in the staged copy and is not detected after it
+has been verified. Preflight failures need not create `.changelog/promote-staging`.
+After staging, move/fold/write failures attempt rollback and report paths that could not
+be restored; cleanup failures report paths that could not be removed. Exceptions from
+`afterStage` and `afterWrite` bypass these diagnostics, and checking original paths can
+fail after staging is removed. The next promote refuses if staging still exists.
 
 Do not add anything to `## [Unreleased]` in `CHANGELOG.md` by hand. `promote`
 rewrites that section's body to the note, so `check` and `promote` both refuse
