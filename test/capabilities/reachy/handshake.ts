@@ -29,17 +29,17 @@ export function healthLine(
   };
 }
 
-/** The handshake, synchronously: `connected()` and the health line's acceptance
- *  both complete before their first await (the recorder's `send` resolves at
- *  once). The `configure` command is removed from a recorder's log, so a test's
- *  command assertions see only what it caused. */
-export function handshakeNow(
+/** Bring the link to READY in the protocol's order: `connected()` sends
+ *  `configure` and returns once that write SUCCEEDED; only then is the health
+ *  line judged. The `configure` command is removed from a recorder's log, so a
+ *  test's command assertions see only what it caused. */
+export async function readyLink(
   wired: WiredReachy,
   state: { profile: string; wakeName: string },
   commands?: ReachyCommands & { sent?: unknown[] },
-): void {
-  void wired.connected();
-  void wired.handleLine(healthLine(wired, state));
+): Promise<void> {
+  await wired.connected();
+  await wired.handleLine(healthLine(wired, state));
   if (wired.link().phase !== "ready") throw new Error("test handshake did not reach ready");
   if (commands?.sent) commands.sent.length = 0;
 }

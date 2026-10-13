@@ -945,11 +945,12 @@ naming its test (`test/capabilities/reachy/`):
   taken before any awaited audit write (and rolled back if the audit fails) — two
   visitor lines arriving while the store is slow cannot both acknowledge.
   (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
-- **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
-  `sudo -n -u jarvis-sidecar /bin/cat` on 0600 fixtures (and, on the release
-  host, on the real admin password and agent key); it skips (visibly, reason in
-  the name) when the user or `sudo -n` is unavailable, and FAILS instead under
-  the release check. `isolation.test.ts`.
+- **A DIFFERENT OS user cannot read the 0600 key fixtures.** As
+  `jarvis-sidecar`, opening the 0600 fixtures fails while a 0644 control opens;
+  on the release host the same holds for bob's ACTIVE credentials, derived from
+  the agent's own `bob.yaml`. The proof skips (visibly, reason in the name) when
+  the user or its `sudo -n` path is missing, and fails instead under the
+  release-host check. `isolation.test.ts`.
 
 #### Voice V1 — the mouth (bob#356)
 
@@ -959,37 +960,59 @@ tools `reachy_say` and `reachy_state`) and `reachy` (adds the body tools
 loads, and an allowlist naming a tool the configured profile does not register
 is refused by name before any session. Under `voice`, body proposals refuse and
 a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
-`test/shell/voice-origin-356.test.ts`.)
+`voice-session.test.ts`; `test/shell/voice-origin-356.test.ts`.)
 
 - **The `reachy-voice/1` handshake.** On every connection bob first sends one
   control command, `configure` (protocol, profile, the wake name from
   `voice.wakeName` — default `jarvis`, the only source of the name — and a fresh
-  generation). The sidecar's strict health line must repeat all four and carry
-  the exact `sidecarVersion` bob pins, plus its wake mode (`off` in V1: no ears)
-  and its device mute. Until it matches, nothing but control/status traffic
-  moves; a mismatch, a legacy health line or any other line first disconnects
-  and raises ONE `reachy.link.refused` alarm naming only the fields. bob
-  reconnects with a doubling backoff; every reconnect is a fresh handshake.
-- **Speech is split by caller.** `reachy_say` from an authenticated turn speaks
-  without any transcript when `reachy.roomSpeechOrigins` grants that exact
-  origin (`run`, `cron:<job>`, `discord:<channelId>`, `mail:<sender>`; empty by
-  default). A voice-origin call, an ungranted turn and every sidecar proposal
-  are refused; a room transcript authorizes nothing. All speech needs a ready,
-  unmuted link (bob mute OR device mute OR no link = muted), one line of at most
-  500 characters, no memory reference, and a successful audit BEFORE the send;
-  a link that reconnected or a mute that flipped during that audit refuses the
-  queued line (`stale`), and a failed send is a linked refusal.
+  generation), and judges nothing until that write SUCCEEDED (a line that
+  arrives earlier is held; a failed write refuses the link). The sidecar's
+  strict health line must repeat all four, carry the exact `sidecarVersion`
+  bob pins, and report its wake mode with a consistent trained-artifact pair
+  (`off`: none; `gate-only`: none for this name; `trained`: this name's) and
+  its mute. Until it matches, nothing but control/status traffic moves; a
+  mismatch, a legacy health line or any other line disconnects and raises ONE
+  `reachy.link.refused` alarm naming only the fields. bob reconnects with a
+  doubling backoff; every reconnect is a fresh handshake.
+- **Speech is split by caller, and bound by the runtime.** `reachy_say` speaks
+  without any transcript only for the origin the runtime BINDS the call to —
+  the admitted turn it runs inside (persistent runtime) or the `run` an
+  operator's one-shot `bob run` declares — and only when
+  `reachy.roomSpeechOrigins` grants that exact origin (`run`, `cron:<job>`,
+  `discord:<channelId>`, `mail:<sender>`; empty by default). A call bound to
+  nothing (a persistent prompt outside every admission, a mail turn) is
+  refused, never treated as `run`; so are a voice-origin call, an ungranted
+  turn and every sidecar proposal, and a room transcript authorizes nothing.
+  All speech needs a ready, unmuted link (bob mute OR the sidecar-reported mute
+  OR no link = muted), one line of at most 500 characters, no memory
+  reference, and a successful audit BEFORE the send; a reconnect or ANY mute
+  transition during that audit refuses the queued line (`stale`), and a failed
+  socket write is a linked refusal.
+- **What bob's audit covers.** bob audits every `say` it SENDS. The sidecar's
+  socket is a UNIX socket (mode 0660, owner `jarvis-sidecar`, group
+  `jarvis-voice`): a process with access to it — bob's own OS user, or another
+  member of that group — can make the sidecar speak without bob's policy or
+  audit. That boundary is the socket's permissions, not bob.
+- **The mute is what the sidecar REPORTS.** V1's sidecar does not read the
+  speakerphone's hardware switch: it reports what its operator configured
+  (`--device-mute absent` for a mouth-only host; otherwise `unknown`, reported
+  as muted). Reading the hardware mute is V2.
 - **The `voice` turn origin** exists in the origin union, its validation,
   projection and label, and is NOT admitted yet (its tool admission and
   disposable session are V2).
 - **The sidecar** (`sidecar/reachy-voice/`) speaks with local Piper through an
   ephemeral 0600 file in a 0700 directory, removed after playback, under a
-  deny-default seatbelt profile, as its own `jarvis-sidecar` user; its runbook
-  gives the one-time admin steps. The isolation proofs show each refusal
-  succeeding unconfined first, and the real sidecar round-tripping the handshake
-  and a `say` under the profile with no audio left behind; on the release host
-  `bun run check:reachy-isolation` fails on any skipped proof.
-  (`isolation.test.ts`; `voice-sidecar.test.ts`.)
+  deny-default seatbelt profile, as its own `jarvis-sidecar` user; it refuses to
+  start when a stale speech file cannot be removed, stops speaking and reports
+  `ok: false` when a removal fails after playback, and logs only a digest of
+  the (sender-chosen) playback id. Its runbook gives the one-time admin steps.
+  The isolation proofs show each probed refusal succeeding unconfined first (a
+  mach service name this macOS does not register is excluded; at least two
+  must have working controls), and the real sidecar round-tripping the
+  handshake and a `say` under the profile with no audio left behind.
+  `bun run check:reachy-isolation` is a MANUAL release-host prerequisite (no CI
+  workflow runs it): it fails on any skipped, failed or missing pinned proof.
+  (`isolation.test.ts`; `voice-sidecar.test.ts`; `handshake-socket.test.ts`.)
 
 What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),
 any body/head motion on real hardware, or memory-backed speech. Voice V1 adds no

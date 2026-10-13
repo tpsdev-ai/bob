@@ -39,7 +39,7 @@ export function superviseLink(deps: {
   /** Timer seam (tests). Default: an unref'd setTimeout. */
   schedule?: (fn: () => void, ms: number) => void;
   log?: (m: string) => void;
-}): { start(): Promise<void>; nextDelayMs(): number } {
+}): { start(): Promise<void>; stop(): void; nextDelayMs(): number } {
   const log = deps.log ?? ((m: string) => console.error(m));
   const schedule =
     deps.schedule ??
@@ -48,7 +48,9 @@ export function superviseLink(deps: {
       setTimeout(fn, ms).unref();
     });
   let delay = RECONNECT_MIN_MS;
+  let stopped = false;
   const later = (): void => {
+    if (stopped) return;
     const wait = delay;
     delay = Math.min(delay * 2, RECONNECT_MAX_MS);
     schedule(() => void start(), wait);
@@ -60,6 +62,7 @@ export function superviseLink(deps: {
     later();
   });
   async function start(): Promise<void> {
+    if (stopped) return;
     try {
       await deps.client.connect();
     } catch (err) {
@@ -72,7 +75,11 @@ export function superviseLink(deps: {
     // A refused handshake closes the socket; the close listener retries.
     await deps.wired.connected();
   }
-  return { start, nextDelayMs: () => delay };
+  // The session is over: no further connect, no pending retry acts.
+  const stop = (): void => {
+    stopped = true;
+  };
+  return { start, stop, nextDelayMs: () => delay };
 }
 
 /**
@@ -206,10 +213,30 @@ export class UnixSocketReachyClient implements ReachyCommands {
     this.listeners.push(listener);
   }
 
+  /** Write one command. Resolves only when the socket ACCEPTED the write; a
+   *  write error REJECTS, and so does the socket closing before the write
+   *  completed, so the caller's refusal path runs instead of a false "sent"
+   *  (bob#356). The close case matters on its own: Node reports a destroyed
+   *  socket's pending write to its callback (ECANCELED), but Bun never calls
+   *  that callback at all — without it, the send would never settle. */
   async send(command: string, args?: Record<string, unknown>): Promise<unknown> {
-    if (!this.socket) throw new Error("reachy: not connected to the sidecar socket");
-    return new Promise((resolve) => {
-      this.socket?.write(`${JSON.stringify({ command, args: args ?? {} })}\n`, () => resolve(null));
+    const sock = this.socket;
+    if (!sock || sock.destroyed) throw new Error("reachy: not connected to the sidecar socket");
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onClose = (): void => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("reachy: the sidecar socket closed before the write completed"));
+      };
+      sock.once("close", onClose);
+      sock.write(`${JSON.stringify({ command, args: args ?? {} })}\n`, (err?: Error | null) => {
+        sock.off("close", onClose);
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(null);
+      });
     });
   }
 

@@ -36,6 +36,7 @@ import {
   HEALTH_LINE,
   VOICE_PROTOCOL,
 } from "../../../src/capabilities/reachy/wire.js";
+import { boundOrigin, createTurnAdmission } from "../../../src/shell/turn-admission.js";
 import type { TurnOrigin } from "../../../src/shell/turn-origin.js";
 import { handshake, healthLine, must, TEST_MODEL_HASH, TEST_SIDECAR_VERSION } from "./handshake.js";
 
@@ -99,7 +100,8 @@ function harness(
     profile?: "voice" | "reachy";
     roomSpeechOrigins?: string[];
     origin?: TurnOrigin | undefined;
-    noAdmission?: boolean;
+    // no origin reader at all (nothing bound: everything refuses)
+    noReader?: boolean;
     mute?: boolean;
   } = {},
 ) {
@@ -122,7 +124,7 @@ function harness(
     nowMs: () => 1_000,
     roomSpeechOrigins: opts.roomSpeechOrigins ?? ["run"],
   };
-  let origin: TurnOrigin = opts.origin ?? { kind: "run" };
+  let origin: TurnOrigin | undefined = "origin" in opts ? opts.origin : { kind: "run" };
   const wired = wireReachyCapability({
     pi,
     commands,
@@ -130,7 +132,7 @@ function harness(
     store,
     state,
     sidecarVersion: TEST_SIDECAR_VERSION,
-    ...(opts.noAdmission ? {} : { readOrigin: () => origin }),
+    ...(opts.noReader ? {} : { readOrigin: () => origin }),
     log: (m) => logs.push(m),
   });
   return {
@@ -141,7 +143,7 @@ function harness(
     wired,
     logs,
     order,
-    setOrigin: (o: TurnOrigin) => {
+    setOrigin: (o: TurnOrigin | undefined) => {
       origin = o;
     },
     ready: async (over: Record<string, unknown> = {}) => {
@@ -172,7 +174,7 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     ).toThrow(/profile/);
   });
 
-  it("under voice the EFFECTIVE registry has no body tool; under reachy it has all four", () => {
+  it("core registration: under voice the capability registers no body tool; under reachy all four", () => {
     const voice = harness({ profile: "voice" });
     expect([...voice.pi.tools.keys()].sort()).toEqual(["reachy_say", "reachy_state"]);
     expect(voice.wired.tools).toEqual(PROFILE_TOOLS.voice);
@@ -270,7 +272,7 @@ describe("bob#356 V1 — the strict reachy-voice/1 health line", () => {
       expect(decodeLine(bad)).toMatchObject({ kind: "malformed", protocol: true });
     }
   });
-  it("checkHealth names every mismatched field (never its value) and enforces the trained-artifact rule", () => {
+  it("checkHealth names every mismatched field (never its value)", () => {
     const expect_ = { version: "v", profile: "voice" as const, wakeName: "jarvis", generation: 3 };
     const h = (over: Record<string, unknown>) => ({ ...good, generation: 3, ...over }) as never;
     expect(checkHealth(h({}), expect_)).toEqual([]);
@@ -279,26 +281,30 @@ describe("bob#356 V1 — the strict reachy-voice/1 health line", () => {
     expect(checkHealth(h({ wakeName: "rocky" }), expect_)).toEqual(["wakeName"]);
     expect(checkHealth(h({ generation: 2 }), expect_)).toEqual(["generation"]);
     expect(checkHealth(h({ ok: false }), expect_)).toEqual(["ok"]);
-    // trained: the artifact must be for THIS name, and present
-    expect(
-      checkHealth(
-        h({ mode: "trained", trainedPhrase: "jarvis", modelHash: TEST_MODEL_HASH }),
-        expect_,
-      ),
-    ).toEqual([]);
-    expect(
-      checkHealth(
-        h({ mode: "trained", trainedPhrase: "rocky", modelHash: TEST_MODEL_HASH }),
-        expect_,
-      ),
-    ).toEqual(["trainedPhrase"]);
-    expect(
-      checkHealth(h({ mode: "trained", trainedPhrase: "jarvis", modelHash: null }), expect_),
-    ).toEqual(["modelHash"]);
-    // gate-only (training) explicitly carries no matching trained artifact
-    expect(
-      checkHealth(h({ mode: "gate-only", trainedPhrase: "rocky", modelHash: null }), expect_),
-    ).toEqual([]);
+  });
+
+  it("the trained-artifact rule, per mode, with matching and non-matching artifacts", () => {
+    const expect_ = { version: "v", profile: "voice" as const, wakeName: "jarvis", generation: 3 };
+    const art = (mode: string, trainedPhrase: string | null, modelHash: string | null) =>
+      checkHealth({ ...good, generation: 3, mode, trainedPhrase, modelHash } as never, expect_);
+    const H = TEST_MODEL_HASH;
+    // the artifact is a pair, in every mode
+    for (const mode of ["off", "gate-only", "trained"]) {
+      expect(art(mode, "jarvis", null)).toEqual(["trainedPhrase/modelHash pair"]);
+      expect(art(mode, null, H)).toEqual(["trainedPhrase/modelHash pair"]);
+    }
+    // off: no ears, no artifact
+    expect(art("off", null, null)).toEqual([]);
+    expect(art("off", "jarvis", H)).toEqual(["trainedPhrase (mode off)"]);
+    expect(art("off", "rocky", H)).toEqual(["trainedPhrase (mode off)"]);
+    // gate-only (training): no artifact for THIS name — another name's is fine
+    expect(art("gate-only", null, null)).toEqual([]);
+    expect(art("gate-only", "rocky", H)).toEqual([]);
+    expect(art("gate-only", "jarvis", H)).toEqual(["trainedPhrase (mode gate-only)"]);
+    // trained: exactly this name's artifact
+    expect(art("trained", "jarvis", H)).toEqual([]);
+    expect(art("trained", "rocky", H)).toEqual(["trainedPhrase"]);
+    expect(art("trained", null, null)).toEqual(["trainedPhrase", "modelHash"]);
   });
 });
 
@@ -314,6 +320,67 @@ describe("bob#356 V1 — the handshake: control/status first, mismatch disconnec
     ]);
     expect(h.wired.link().phase).toBe("handshaking");
     expect(h.wired.link().effectiveMuted).toBe(true); // unknown = muted
+  });
+
+  it("RACE: a health line that arrives before the `configure` write completes is HELD, judged only after it", async () => {
+    const h = harness();
+    let finish!: () => void;
+    const pending = new Promise<void>((r) => {
+      finish = r;
+    });
+    const send = h.commands.send.bind(h.commands);
+    h.commands.send = async (command, args) => {
+      if (command === "configure") await pending;
+      return send(command, args);
+    };
+    const connecting = h.wired.connected();
+    expect(h.wired.link().phase).toBe("configuring");
+    expect((await h.wired.handleLine(healthLine(h.wired, h.state))).kind).toBe("none");
+    expect(h.wired.link().phase).toBe("configuring"); // NOT ready: the write is pending
+    expect(await h.pi.call("reachy_say", { text: "hi" })).toContain("refused: muted");
+    finish();
+    await connecting;
+    expect(h.wired.link().phase).toBe("ready"); // judged after the write succeeded
+  });
+
+  it("RACE: a `configure` write that FAILS refuses the link even though a matching health line arrived", async () => {
+    const h = harness();
+    let fail!: (e: Error) => void;
+    const pending = new Promise<never>((_r, j) => {
+      fail = j;
+    });
+    h.commands.send = async (command) => {
+      if (command === "configure") return pending;
+      throw new Error("unexpected send");
+    };
+    const connecting = h.wired.connected();
+    await h.wired.handleLine(healthLine(h.wired, h.state));
+    fail(new Error("EPIPE"));
+    await connecting;
+    expect(h.wired.link().phase).toBe("disconnected");
+    expect(h.store.all.find((e) => e.kind === "reachy.link.refused")?.summary).toContain(
+      "configure send",
+    );
+  });
+
+  it("a second line before the `configure` write completes fails the link", async () => {
+    const h = harness();
+    let finish!: () => void;
+    const pending = new Promise<void>((r) => {
+      finish = r;
+    });
+    const send = h.commands.send.bind(h.commands);
+    h.commands.send = async (command, args) => {
+      if (command === "configure") await pending;
+      return send(command, args);
+    };
+    const connecting = h.wired.connected();
+    await h.wired.handleLine(healthLine(h.wired, h.state));
+    const r = await h.wired.handleLine(healthLine(h.wired, h.state));
+    expect(r).toMatchObject({ kind: "refused", action: "handshake" });
+    finish();
+    await connecting;
+    expect(h.wired.link().phase).toBe("disconnected");
   });
 
   it("before the handshake no action is sent, and a non-health line fails the link", async () => {
@@ -425,16 +492,42 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
     expect(JSON.stringify(ev)).not.toContain("Standup in five minutes.");
   });
 
-  it("a one-shot `bob run` (no admission) is an operator's run: it speaks only when `run` is granted", async () => {
-    const granted = harness({ noAdmission: true, roomSpeechOrigins: ["run"] });
-    await granted.ready();
-    expect(await granted.pi.call("reachy_say", { text: "hi" })).toBe("say: hi");
-    const denied = harness({ noAdmission: true, roomSpeechOrigins: [] });
-    await denied.ready();
-    expect(await denied.pi.call("reachy_say", { text: "hi" })).toContain(
-      "no room-publication grant",
+  it("UNBOUND: a call bound to no admitted turn and no declared run refuses, even with `run` granted", async () => {
+    const none = harness({ origin: undefined, roomSpeechOrigins: ["run"] });
+    await none.ready();
+    expect(await none.pi.call("reachy_say", { text: "hi" })).toContain(
+      "bound to no admitted turn and no runtime-declared run",
     );
-    expect(said(denied)).toEqual([]);
+    const noReader = harness({ noReader: true, roomSpeechOrigins: ["run"] });
+    await noReader.ready();
+    expect(await noReader.pi.call("reachy_say", { text: "hi" })).toContain("bound to no admitted");
+    expect([...said(none), ...said(noReader)]).toEqual([]);
+  });
+
+  it("the REAL turn admission binds: outside an admitted turn nothing (refused); inside, that turn's origin", async () => {
+    const admission = createTurnAdmission({ log: () => {} });
+    const h = harness({ roomSpeechOrigins: ["run", "cron:standup"] });
+    h.setOrigin(undefined);
+    const read = () => boundOrigin({ admission });
+    // a persistent prompt outside every admission is NOT `run`
+    expect(read()).toBeUndefined();
+    await h.ready();
+    const outcomes: string[] = [];
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt() {
+        h.setOrigin(read());
+        outcomes.push(await h.pi.call("reachy_say", { text: "Standup now." }));
+      },
+    });
+    await admission.admitTurn({ kind: "cron", job: "standup" }, "speak");
+    expect(outcomes).toEqual(["say: Standup now."]);
+    // after the turn settled, the binding is gone again
+    expect(read()).toBeUndefined();
+    // a declared one-shot run binds `run` for its session
+    expect(boundOrigin({ sessionOrigin: { kind: "run" } })).toEqual({ kind: "run" });
+    expect(boundOrigin({})).toBeUndefined();
   });
 
   it.each([
@@ -531,6 +624,20 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
     };
     expect(await h.pi.call("reachy_say", { text: "hello" })).toContain("stale");
     expect(said(h)).toEqual([]);
+  });
+
+  it("STALE: a mute that flips ON and back OFF during the audit still cancels the queued say", async () => {
+    const h = harness();
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.say") return;
+      h.store.during = undefined;
+      void h.wired.handleLine(healthLine(h.wired, h.state, { muted: true }));
+      void h.wired.handleLine(healthLine(h.wired, h.state, { muted: false }));
+    };
+    expect(await h.pi.call("reachy_say", { text: "hello" })).toContain("stale");
+    expect(h.wired.link().effectiveMuted).toBe(false); // unmuted again...
+    expect(said(h)).toEqual([]); // ...and the line queued across the flips was not sent
   });
 
   it("all speech is one line of at most 500 characters, with no memory reference", async () => {
@@ -678,8 +785,15 @@ describe("bob#356 V1 — reconnect supervision and per-connection buffers", () =
     pending.shift()?.();
     await new Promise((r) => setTimeout(r, 0));
     expect(phase).toBe("ready");
-    close[0]?.();
+    must(close[0], "the close listener")();
     expect(delays.at(-1)).toBe(RECONNECT_MIN_MS);
+    // after stop() (session_shutdown), a close schedules nothing and start() is inert
+    const scheduled = delays.length;
+    sup.stop();
+    must(close[0], "the close listener")();
+    fail = true;
+    await sup.start();
+    expect(delays.length).toBe(scheduled);
   });
 
   it("a partial line from a dropped connection never prefixes the next connection's first line", async () => {

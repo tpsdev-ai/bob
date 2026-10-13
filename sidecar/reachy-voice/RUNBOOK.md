@@ -4,8 +4,9 @@ The voice sidecar speaks for a jarvis-class agent through a USB speakerphone. In
 V1 it only **speaks**: it has no microphone code, no wake model and no
 speech-to-text, and it reports wake mode `off`. It is untrusted (bob#180 §3.2):
 it runs as its own unprivileged macOS user, under the deny-default seatbelt
-profile `reachy-voice.sb`, and talks to bob only through one UNIX socket. bob
-applies its own policy and writes its audit record before any `say` reaches it.
+profile `reachy-voice.sb`, and listens on one UNIX socket. For every `say` bob
+SENDS, bob applies its policy and writes its audit record first; a process that
+reaches the socket directly bypasses both (see "What bob's audit covers").
 
 Everything below needs an administrator **once**, at the host. bob never creates
 users, edits sudoers or loads launchd jobs.
@@ -16,7 +17,14 @@ Files in this directory:
 | --- | --- |
 | `sidecar.py` | The sidecar (Python 3.9+, standard library only). Reports version `0.1.0`. |
 | `reachy-voice.sb` | The deny-default seatbelt profile it runs under. |
+| `proof.py` | The ONE command the isolation proofs run as another user (step 2). |
+| `egress-probe.py` | The egress probe `proof.py` runs, confined and unconfined. |
 | `RUNBOOK.md` | This file. |
+
+**What bob's audit covers.** bob audits every `say` it sends. The socket below
+is 0660, owner `jarvis-sidecar`, group `jarvis-voice`: any process with access
+to it — bob's own OS user, or another member of that group — can make the
+sidecar speak without bob's policy or audit. Keep that group to bob's user.
 
 ## 0. Set the names once
 
@@ -59,25 +67,31 @@ id $SIDECAR_USER            # check: the uid, and the jarvis-voice group
 
 ## 2. The constrained `sudo -n` proof path
 
-The isolation proofs run two commands **as the sidecar user**: `cat` (the key-read
-proof) and `sandbox-exec` (the sidecar and its egress probes under the profile).
-This rule lets the agent user run exactly those two, as `jarvis-sidecar` only —
-never as root — without a password.
+The isolation proofs run ONE command as another user: the installed `proof.py`
+under the pinned interpreter (step 3 installs it root-owned). Its subcommands
+are bounded — `open` reports whether a path OPENS (it never reads), `connect`
+reports whether a socket accepts, and `probe`/`sidecar`/`clean` act only on a
+proof's scratch layout under `/private/tmp/rv-`, with the installed profile and
+sidecar. No other command, and never root:
 
 ```sh
 sudo tee /etc/sudoers.d/bob-reachy-voice-proofs >/dev/null <<EOF
-# bob#356 V1 isolation proofs: $AGENT_USER may run ONLY these, ONLY as $SIDECAR_USER.
-$AGENT_USER ALL=($SIDECAR_USER) NOPASSWD: /usr/bin/sandbox-exec, /bin/cat
+# bob#356 V1 isolation proofs: $AGENT_USER may run ONLY the installed proof command.
+$AGENT_USER ALL=($SIDECAR_USER) NOPASSWD: $PYTHON -I $INSTALL/proof.py *
+$AGENT_USER ALL=(nobody) NOPASSWD: $PYTHON -I $INSTALL/proof.py connect *
 EOF
 sudo chmod 0440 /etc/sudoers.d/bob-reachy-voice-proofs
 sudo visudo -cf /etc/sudoers.d/bob-reachy-voice-proofs
-sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER /bin/cat /dev/null && echo "proof path OK"
+sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER $PYTHON -I $INSTALL/proof.py open /dev/null
 ```
 
-**Remove this rule before V2 grants the sidecar user the microphone.**
-`sandbox-exec` as `jarvis-sidecar` is arbitrary code as that user, which is
-harmless while the user holds nothing, and is a way around bob's gates once it
-holds the microphone. V2 replaces it with fixed-argument proof commands.
+The `nobody` line is the OUTSIDER: the proof shows a user outside
+`jarvis-voice` cannot connect to the deployed socket.
+
+**Re-review this rule before V2 grants `jarvis-sidecar` the microphone.** The
+`probe` and `sidecar` subcommands run a proof's stand-in programs as that user
+(confined by the profile); once that user holds the microphone, that is a
+capture path around bob's gates.
 
 ## 3. Install the sidecar and Piper (root-owned, hash-recorded)
 
@@ -85,14 +99,18 @@ The sidecar user can read and run these but never modify them.
 
 ```sh
 sudo install -d -o root -g wheel -m 0755 $INSTALL $PIPER_DIR
-sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py $REPO/sidecar/reachy-voice/reachy-voice.sb $INSTALL/
+sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
+  $REPO/sidecar/reachy-voice/reachy-voice.sb $REPO/sidecar/reachy-voice/proof.py \
+  $REPO/sidecar/reachy-voice/egress-probe.py $INSTALL/
 # Piper: the build and voice measured in rocky:~/voice-prep (hash-listed there).
 sudo cp -R <piper build dir>/. $PIPER_DIR/
 sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR
-shasum -a 256 $INSTALL/sidecar.py $INSTALL/reachy-voice.sb $PIPER_DIR/piper <voice>.onnx
+shasum -a 256 $INSTALL/* $PIPER_DIR/piper <voice>.onnx
 ```
 
-Record those four hashes in the host's install log. `--piper-model-sha256` below
+Record those hashes in the host's install log. The release check (step 8)
+verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py` and
+`egress-probe.py` are byte-identical to the reviewed checkout and root-owned. `--piper-model-sha256` below
 is the voice model's: the sidecar refuses to start when the model differs.
 
 ## 4. State directories
@@ -151,11 +169,17 @@ sudo plutil -lint /Library/LaunchDaemons/dev.tps.reachy-voice.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.tps.reachy-voice.plist
 ```
 
-`--device-mute absent` is the operator's statement that **no capture device is
-read in V1**: the sidecar then reports `muted: false`. Without it the sidecar
-cannot read the speakerphone's hardware mute and reports `muted: true`, and bob
-refuses every `say` (unknown is muted). V2 replaces this with the HID mute
-reader; a software-only mute does not qualify.
+The mute bob sees is the **sidecar-reported mute**. V1's sidecar does not read
+the speakerphone's hardware switch: `--device-mute absent` is the operator's
+statement that no capture device is read in V1, and the sidecar then reports
+`muted: false`. Without it the sidecar reports `muted: true` (unknown is muted)
+and bob refuses every `say`. V2 replaces this with the HID mute reader; a
+software-only mute does not qualify.
+
+The sidecar fails closed on its speech files: it refuses to start while a stale
+one cannot be removed, and after a removal fails it stops speaking and reports
+`ok: false` (bob refuses the link and raises one alarm) until it is restarted
+cleanly. Its log names a digest of each playback id, never the id itself.
 
 The log is content-free (event names, playback ids, error classes — never the
 spoken text). Core dumps are disabled in the process.
@@ -177,9 +201,12 @@ reachy:
 ```
 
 `roomSpeechOrigins` names the authenticated turns whose `reachy_say` may speak
-in the room: `run` (an operator's run), `cron:<job>`, `discord:<channelId>`,
-`mail:<sender>`. Empty means nothing speaks. No shipped role allows
-`reachy_say` yet; a role that does is a separate, reviewed change.
+in the room: `run` (an operator's one-shot `bob run`), `cron:<job>`,
+`discord:<channelId>`, `mail:<sender>`. Empty means bob speaks for nothing. A
+call bound to no admitted turn (a persistent prompt outside admission, a mail
+turn) never speaks. No shipped role allows `reachy_say` yet; a role that does
+is a separate, reviewed change — and the socket's group (above) can still make
+the sidecar speak directly, without bob.
 
 ## 7. TCC and the launcher (record; V1 needs no grant)
 
@@ -206,23 +233,29 @@ the screen; if it cannot, V2 is blocked until a reviewed capture design exists.
 Also measure, from the running LaunchDaemon: that one `say` plays on the
 speakerphone (the job's default output device), not another output.
 
-## 8. The release check
+## 8. The release-host check (manual prerequisite)
 
-Run on this host, from the reviewed checkout, before the sidecar ships:
+No CI workflow runs this (CI is Linux; the seatbelt proofs are macOS-only). Run
+it on this host, from the reviewed checkout, before the sidecar ships. Name the
+AGENT only — the credential files are derived from its own `bob.yaml`:
 
 ```sh
 cd $REPO
-BOB_ISOLATION_ADMIN_PASS=/Users/$AGENT_USER/.flair/admin-pass \
-BOB_ISOLATION_AGENT_KEY=<the agent's Flair key path> \
+BOB_ISOLATION_AGENT=<the agent's name> \
+BOB_REACHY_VOICE_PYTHON=$PYTHON \
 bun run check:reachy-isolation
 ```
 
 It runs `test/capabilities/reachy/isolation.test.ts` with
-`BOB_REQUIRE_ISOLATION_PROOFS=1`: the deny-default confinement proofs (network,
-child, exec, service and file egress denied, each shown to succeed unconfined
-first; the real sidecar's handshake and `say` over the authorized socket; no
-audio left behind) as this user and as `jarvis-sidecar`, and #180 S1's key-read
-proof on fixtures and on the two real files (0600, owned by the agent, and
-refused to the sidecar user — the test only `stat`s them; the read attempt runs
-as the sidecar user with its output discarded). **A proof that cannot run fails
-the check; a skipped proof never passes a release.**
+`BOB_REQUIRE_ISOLATION_PROOFS=1` and requires all seven pinned proofs to pass:
+[P1]/[P3] deny-default confinement (network, child, exec, service and file
+egress denied, each probed denial shown to succeed unconfined first) as this
+user and as `jarvis-sidecar`; [P2]/[P4] the real sidecar's handshake and `say`
+over the authorized socket with no audio left — [P4] on the DEPLOYED 0660
+`jarvis-voice` socket, with an outsider refused; [P5] #180 S1's key-read proof
+on fixtures; [P6] the same on bob's active credentials (the provider stores
+and every key file the agent's `bob.yaml` names, plus bob's admin-password
+path): each 0600, owned by the agent, and refused to the sidecar user — this
+process only `stat`s them, and the sidecar user's attempt only opens; [P7] the
+installed files match the checkout. **A proof that is skipped, fails or is
+missing fails the check.**

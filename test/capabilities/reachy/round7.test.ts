@@ -12,7 +12,7 @@ import {
 import { flairOrgEventStore } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
-import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
+import { readyLink, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -94,7 +94,7 @@ function ev(over: Partial<OrgEvent> & { id: string; kind: string }): OrgEvent {
   };
 }
 
-function harness(store: OrgEventStore) {
+async function harness(store: OrgEventStore) {
   const commands = new RecordingCommands();
   const memory = new RecordingMemory();
   const state: PolicyState = {
@@ -115,7 +115,7 @@ function harness(store: OrgEventStore) {
     sidecarVersion: TEST_SIDECAR_VERSION,
     log: () => {},
   });
-  handshakeNow(wired, state, commands);
+  await readyLink(wired, state, commands);
   return { commands, memory, store, wired };
 }
 
@@ -167,7 +167,7 @@ describe("reachy round 7 item 1: the read side accepts only a `written` event th
 describe("reachy round 7 item 2: success needs the store to hold the EXACT pre-generated id", () => {
   it("(a) a write that REPORTS a different id is an UNAUDITED refusal with a linked failed event", async () => {
     const store = new MismatchIdStore();
-    const h = harness(store);
+    const h = await harness(store);
     const r = await h.wired.handleLine(speakerLine);
     expect(r.kind).toBe("refused");
     expect(h.memory.last).toBeDefined(); // the memory WAS created (and retained)
@@ -184,7 +184,7 @@ describe("reachy round 7 item 2: success needs the store to hold the EXACT pre-g
 
   it("(b) a write whose READBACK returns null is an UNAUDITED refusal with a linked failed event", async () => {
     const store = new NullReadbackStore();
-    const h = harness(store);
+    const h = await harness(store);
     const r = await h.wired.handleLine(speakerLine);
     expect(r.kind).toBe("refused");
     expect(h.memory.last).toBeDefined();
@@ -205,7 +205,7 @@ describe("reachy round 7 item 2: success needs the store to hold the EXACT pre-g
 
 describe("reachy round 7 item 3: args are BOUNDED by action", () => {
   it("look yaw 1e100, an ask with a newline, and a 501-char say are all malformed and never sent", async () => {
-    const h = harness(new MapStore());
+    const h = await harness(new MapStore());
     await h.wired.handleLine(speakerLine); // a transcript (which no longer authorizes speech)
 
     const badYaw = await h.wired.handleLine({
@@ -336,7 +336,7 @@ describe("reachy round 7 item 1b: shape validation at the membership site", () =
 describe("reachy round 7 item 2b: a string targetIds in readback → ReadbackTargets refusal", () => {
   it("returns UNAUDITED refusal when the readback has string targetIds", async () => {
     const store = new BadTargetIdsStore();
-    const h = harness(store);
+    const h = await harness(store);
     const r = await h.wired.handleLine(speakerLine);
     expect(r.kind).toBe("refused");
     // The readback had targetIds as a string so the array check failed.
@@ -356,7 +356,7 @@ describe("reachy round 9 item 3c: a store whose write PERSISTS the written outco
   it("is the UNAUDITED refusal, and explainMemory on the SAME store still returns the persisted event", async () => {
     // ONE store: it persists EVERY event, then throws on the `written` outcome.
     const store = new PersistThenThrowStore();
-    const h = harness(store);
+    const h = await harness(store);
     const r = await h.wired.handleLine(speakerLine);
     expect(r.kind).toBe("refused"); // assertion: the handler refuses
     expect("reason" in r && r.reason).toContain("unaudited"); // assertion: UNAUDITED, not "NOT written"

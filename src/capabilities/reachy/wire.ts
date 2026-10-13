@@ -28,10 +28,15 @@ import { isValidProposal, type PolicyState, type Proposal, type Transcript } fro
 export const VOICE_PROTOCOL = "reachy-voice/1";
 
 /** The sidecar's wake-detection mode, as it ASSERTS it (bob#356 NEW-9: the mode
- *  gates no authority; bob's own name compare stays the gate).
- *   - `off`: no ears at all — no capture, no wake model, no speech-to-text (V1).
- *   - `gate-only`: the name gate on transcripts while a model trains (V2).
- *   - `trained`: a trained wake model for this exact name (V2). */
+ *  gates no authority; bob's own name compare stays the gate). Each mode fixes
+ *  what the trained-artifact fields may say (`checkHealth`):
+ *   - `off`: no ears at all — no capture, no wake model, no speech-to-text
+ *     (V1). No trained artifact is reported: both fields null.
+ *   - `gate-only`: the name gate on transcripts while a model TRAINS (V2). It
+ *     carries no matching trained artifact: one for this name means training
+ *     is done, and an always-transcribing gate must not outlive it.
+ *   - `trained`: a trained wake model for this exact name (V2): the phrase is
+ *     the wake name and the model hash is present. */
 export const WAKE_MODES = ["off", "gate-only", "trained"] as const;
 export type WakeMode = (typeof WAKE_MODES)[number];
 
@@ -68,8 +73,9 @@ const PROPOSAL_LINE = Type.Object(
   { additionalProperties: false },
 );
 // bob#356: the strict `reachy-voice/1` health line. Every field is REQUIRED (a
-// legacy `{type:"health",ok:true}` is malformed), every value is bounded, and an
-// unknown field is malformed. `replayEnd` is the stub's end-of-replay marker.
+// legacy `{type:"health",ok:true}` is malformed), every string and number is
+// bounded, and an unknown field is malformed. `replayEnd` is the stub's
+// end-of-replay marker.
 export const HEALTH_LINE = Type.Object(
   {
     type: Type.Literal("health"),
@@ -77,14 +83,15 @@ export const HEALTH_LINE = Type.Object(
     version: Type.String({ minLength: 1, maxLength: 64 }),
     profile: Type.Union([Type.Literal("voice"), Type.Literal("reachy")]),
     // The configuration generation bob pushed on THIS connection.
-    generation: Type.Integer({ minimum: 1 }),
+    generation: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
     wakeName: Type.String({ minLength: 1, maxLength: 32 }),
     mode: Type.Union([Type.Literal("off"), Type.Literal("gate-only"), Type.Literal("trained")]),
     // The name the installed wake model was trained for, and that model's
     // sha256 — null when there is none.
     trainedPhrase: Type.Union([Type.String({ minLength: 1, maxLength: 32 }), Type.Null()]),
     modelHash: Type.Union([Type.String({ pattern: "^[0-9a-f]{64}$" }), Type.Null()]),
-    // The device's own (hardware) mute, as the sidecar reports it.
+    // The mute the sidecar REPORTS. V1's sidecar does not read the hardware
+    // switch: it reports its operator's `--device-mute` setting.
     muted: Type.Boolean(),
     ok: Type.Boolean(),
     replayEnd: Type.Optional(Type.Boolean()),
@@ -187,9 +194,10 @@ export function configureArgs(expect: HandshakeExpectation): Record<string, unkn
  *   - version, profile, wake name and generation must equal bob's EXACTLY — the
  *     sidecar can neither downgrade nor upgrade the profile;
  *   - `ok` must be true;
- *   - in `trained` mode the trained phrase must be bob's wake name and the model
- *     hash present; `off` and `gate-only` explicitly carry no matching trained
- *     artifact, and the mode itself grants nothing.
+ *   - the trained artifact is a PAIR: phrase and hash are both null or both set;
+ *   - `off` reports no artifact; `gate-only` reports no artifact for THIS name;
+ *     `trained` reports exactly this name's artifact (see WAKE_MODES). The
+ *     mode itself grants nothing.
  */
 export function checkHealth(health: SidecarHealth, expect: HandshakeExpectation): string[] {
   const bad: string[] = [];
@@ -198,7 +206,13 @@ export function checkHealth(health: SidecarHealth, expect: HandshakeExpectation)
   if (health.wakeName !== expect.wakeName) bad.push("wakeName");
   if (health.generation !== expect.generation) bad.push("generation");
   if (health.ok !== true) bad.push("ok");
-  if (health.mode === "trained") {
+  if ((health.trainedPhrase === null) !== (health.modelHash === null)) {
+    bad.push("trainedPhrase/modelHash pair");
+  } else if (health.mode === "off") {
+    if (health.trainedPhrase !== null) bad.push("trainedPhrase (mode off)");
+  } else if (health.mode === "gate-only") {
+    if (health.trainedPhrase === expect.wakeName) bad.push("trainedPhrase (mode gate-only)");
+  } else {
     if (health.trainedPhrase !== expect.wakeName) bad.push("trainedPhrase");
     if (health.modelHash === null) bad.push("modelHash");
   }

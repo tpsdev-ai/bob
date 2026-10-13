@@ -1,45 +1,56 @@
-// bob#356 V1 — the reachy-voice sidecar's isolation proofs.
+// bob#356 V1 — the reachy-voice sidecar's isolation proofs. Each proof carries a
+// stable id [P1]…[P7]; scripts/check-reachy-isolation.mjs pins that set, so a
+// missing proof fails the release-host check even when nothing was skipped.
 //
-//   1. DENY-DEFAULT CONFINEMENT (macOS seatbelt, the shipped
-//      sidecar/reachy-voice/reachy-voice.sb). Every refusal is shown to SUCCEED
-//      without the profile first (a probe whose control fails proves nothing):
-//      TCP over IPv4 and IPv6, UDP, another UNIX socket, the DNS service socket,
-//      network-capable mach services, a child process's connect, exec of an
-//      arbitrary binary, and reads/writes outside the allow-list. Then the REAL
-//      sidecar runs under the same profile and bob's REAL client round-trips the
-//      reachy-voice/1 handshake and a `say` over the one authorized socket; the
-//      speech artifact is 0600 in a 0700 directory while it plays and is gone
-//      after, and the log never carries the spoken text.
-//   2. The SAME proofs as the separate `jarvis-sidecar` user (bob#180 §3.2).
-//   3. #180 S1's KEY-READ proof: as `jarvis-sidecar`, reading the admin password
-//      and the agent key fails with EACCES/EPERM, while both are 0600 and owned
-//      by the agent, and a 0644 control in the same traversable directory IS
-//      readable — so the denial is the file mode, not the directory. Fixtures
-//      always; the REAL files when the release host names them.
+//   [P1] DENY-DEFAULT CONFINEMENT (macOS seatbelt, the shipped
+//        sidecar/reachy-voice/reachy-voice.sb), as this user: TCP over IPv4 and
+//        IPv6, UDP, another UNIX socket, the DNS service socket, network-capable
+//        mach services, a child process's connect, exec of an arbitrary binary,
+//        and reads/writes outside the allow-list are refused — each one first
+//        shown to SUCCEED unconfined (a mach service name this macOS does not
+//        register has no control and is excluded; at least two must have one).
+//   [P2] The REAL sidecar under that profile round-trips the reachy-voice/1
+//        handshake and a `say` with bob's REAL client over the one authorized
+//        socket; the speech artifact is 0600 in a 0700 directory while it plays
+//        and gone after; the log carries neither the text nor the playback id.
+//   [P3] [P1] as the separate `jarvis-sidecar` user (bob#180 §3.2).
+//   [P4] [P2] as `jarvis-sidecar`, with the DEPLOYED socket mode (0660, group
+//        jarvis-voice): bob's user connects as a group member, and an outsider
+//        (`nobody`) is refused.
+//   [P5] #180 S1's key-read proof on fixtures: as `jarvis-sidecar`, opening the
+//        admin password and the agent key fails (EACCES/EPERM) while both are
+//        0600 and agent-owned, and a 0644 control in the same traversable
+//        directory opens — so the denial is the file mode, not the directory.
+//   [P6] The same on bob's ACTIVE credentials, DERIVED from the agent's bob.yaml
+//        and bob's own admin-password path (isolation-credentials.ts) — the
+//        release host names only the agent.
+//   [P7] The INSTALLED sidecar, profile and proof tooling are the reviewed
+//        files (sha256 equal to this checkout's) and root-owned, not writable by
+//        anyone else.
 //
-// Locally the separate-user proofs SKIP with their reason (the sidecar user and
-// its constrained `sudo -n` path are provisioned once, by an admin — see
-// sidecar/reachy-voice/RUNBOOK.md). Nothing here creates a user or calls sudo
-// unless that user already exists. With BOB_REQUIRE_ISOLATION_PROOFS=1 (the
-// release check) a proof that would skip FAILS.
+// Every separate-user step runs ONE installed command, `proof.py`, through the
+// runbook's exact sudoers rule (RUNBOOK step 2): never `sudo` with free
+// arguments, and never `sudo` at all unless the sidecar user exists. Locally
+// [P3]–[P7] SKIP with their reason; with BOB_REQUIRE_ISOLATION_PROOFS=1 (the
+// release-host check) a proof that would skip FAILS.
 import { afterAll, describe, expect } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
 import {
   chmodSync,
+  chownSync,
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type OrgEventStore,
@@ -50,16 +61,20 @@ import {
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { must } from "./handshake.js";
+import { deriveActiveCredentials } from "./isolation-credentials.js";
 import { proof } from "./isolation-gate.js";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR_SRC = join(REPO, "sidecar", "reachy-voice");
 const FIXTURES = join(REPO, "test", "fixtures", "reachy-voice");
-const PROBE = readFileSync(join(FIXTURES, "egress-probe.py"), "utf8");
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const SIDECAR_USER = "jarvis-sidecar";
+const VOICE_GROUP = "jarvis-voice";
+const OUTSIDER = "nobody";
 const DARWIN = process.platform === "darwin";
-// The version the shipped sidecar reports; bob's config pins it exactly.
+// The files the release host installs (RUNBOOK step 3), compared by hash.
+const INSTALLED_FILES = ["sidecar.py", "reachy-voice.sb", "proof.py", "egress-probe.py"];
+const INSTALL_DIR = process.env.BOB_REACHY_VOICE_DIR ?? "/usr/local/libexec/bob/reachy-voice";
 const SIDECAR_VERSION = /^SIDECAR_VERSION = "([^"]+)"$/m.exec(
   readFileSync(join(SIDECAR_SRC, "sidecar.py"), "utf8"),
 )?.[1];
@@ -72,17 +87,41 @@ const MACH_SERVICES = [
   "com.apple.analyticsd",
 ];
 const MIN_MACH_CONTROLS = 2;
-// The audio signatures the fs audit refuses (RIFF/WAVE, Ogg, FLAC, MP3/ID3,
-// AIFF) and the extensions.
 const AUDIO_MAGIC = ["RIFF", "OggS", "fLaC", "ID3", "FORM"];
 const AUDIO_EXT = /\.(wav|wave|ogg|oga|opus|flac|mp3|aif|aiff|caf|m4a|pcm|raw)$/i;
+const digest = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 16);
+
+// The interpreter, RESOLVED (the profile's paths and the sudoers rule name it).
+function interpreter(): string {
+  const configured = process.env.BOB_REACHY_VOICE_PYTHON;
+  if (configured) return configured;
+  const r = spawnSync(
+    "python3",
+    ["-I", "-c", "import os,sys;print(os.path.realpath(sys.executable))"],
+    {
+      encoding: "utf8",
+    },
+  );
+  const py = r.stdout.trim();
+  if (r.status !== 0 || !py) throw new Error("python3 is not available");
+  return py;
+}
+const PY = (() => {
+  try {
+    return interpreter();
+  } catch {
+    return "";
+  }
+})();
 
 // ── what this host can prove ────────────────────────────────────────────────
 const seatbeltSkip = !DARWIN
   ? "sandbox-exec (seatbelt) is macOS-only"
   : !existsSync(SANDBOX_EXEC)
     ? "sandbox-exec is not installed"
-    : "";
+    : !PY
+      ? "python3 is not available"
+      : "";
 const hasUser = (() => {
   try {
     execFileSync("id", ["-u", SIDECAR_USER], { stdio: "ignore" });
@@ -91,51 +130,58 @@ const hasUser = (() => {
     return false;
   }
 })();
+const installed = INSTALLED_FILES.every((f) => existsSync(join(INSTALL_DIR, f)));
+const installedSkip = installed
+  ? ""
+  : `the sidecar is not installed at ${INSTALL_DIR} (RUNBOOK step 3)`;
+// The proof command the sudoers rule names: the INSTALLED one where it is
+// installed (the release host); elsewhere (CI, whose runner sudo is broad) a
+// copy in each proof's world-readable scratch layout.
+const runAsUser = (user: string, proofPath: string, args: string[]) =>
+  spawnSync("sudo", ["-n", "-u", user, PY, "-I", proofPath, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 // sudo is touched ONLY when the user exists: never on a host without it.
-const sudoCat =
+const sudoProof =
   hasUser &&
-  spawnSync("sudo", ["-n", "-u", SIDECAR_USER, "/bin/cat", "/dev/null"], { stdio: "ignore" })
-    .status === 0;
-const sudoSandbox =
-  hasUser &&
-  DARWIN &&
-  spawnSync(
-    "sudo",
-    ["-n", "-u", SIDECAR_USER, SANDBOX_EXEC, "-p", "(version 1)(allow default)", "/usr/bin/true"],
-    { stdio: "ignore" },
-  ).status === 0;
+  PY !== "" &&
+  (installed
+    ? runAsUser(SIDECAR_USER, join(INSTALL_DIR, "proof.py"), ["open", "/dev/null"]).status === 0
+    : spawnSync("sudo", ["-n", "-u", SIDECAR_USER, "true"], { stdio: "ignore" }).status === 0);
 const userSkip = !hasUser
   ? `the ${SIDECAR_USER} user is not provisioned (RUNBOOK step 1)`
-  : !sudoCat
-    ? `the constrained sudo -n path to ${SIDECAR_USER} is unavailable (RUNBOOK step 2)`
+  : !sudoProof
+    ? `the constrained sudo -n proof path to ${SIDECAR_USER} is unavailable (RUNBOOK step 2)`
     : "";
-const separateSeatbeltSkip =
+const voiceGid = (() => {
+  if (!hasUser || !PY) return undefined;
+  const r = spawnSync(
+    PY,
+    ["-I", "-c", `import grp;print(grp.getgrnam(${JSON.stringify(VOICE_GROUP)}).gr_gid)`],
+    {
+      encoding: "utf8",
+    },
+  );
+  return r.status === 0 ? Number(r.stdout.trim()) : undefined;
+})();
+const outsiderOk =
+  hasUser &&
+  installed &&
+  runAsUser(OUTSIDER, join(INSTALL_DIR, "proof.py"), ["connect", "/nonexistent"]).status === 0;
+const separateSkip =
   seatbeltSkip ||
   userSkip ||
-  (!sudoSandbox ? `sudo -n cannot run sandbox-exec as ${SIDECAR_USER} (RUNBOOK step 2)` : "");
-const REAL_ADMIN_PASS = process.env.BOB_ISOLATION_ADMIN_PASS;
-const REAL_AGENT_KEY = process.env.BOB_ISOLATION_AGENT_KEY;
-const realKeysSkip =
+  installedSkip ||
+  (voiceGid === undefined ? `the ${VOICE_GROUP} group is not provisioned (RUNBOOK step 1)` : "");
+const deployedSkip =
+  separateSkip ||
+  (!outsiderOk ? `the outsider (${OUTSIDER}) proof path is unavailable (RUNBOOK step 2)` : "");
+const AGENT = process.env.BOB_ISOLATION_AGENT;
+const AGENTS_ROOT = process.env.BOB_ISOLATION_AGENTS_ROOT ?? join(homedir(), "agents");
+const activeSkip =
   userSkip ||
-  (!REAL_ADMIN_PASS || !REAL_AGENT_KEY
-    ? "the real key paths are not given (BOB_ISOLATION_ADMIN_PASS, BOB_ISOLATION_AGENT_KEY)"
-    : "");
-
-// The interpreter, RESOLVED (the profile's paths must be real paths).
-function pythonPaths(): { python: string; prefix: string } {
-  const r = spawnSync(
-    "python3",
-    [
-      "-I",
-      "-c",
-      "import os,sys;e=os.path.realpath(sys.executable);print(e);print(os.path.commonpath([e,os.path.realpath(sys.base_prefix)]))",
-    ],
-    { encoding: "utf8" },
-  );
-  const [python, prefix] = r.stdout.trim().split("\n");
-  if (r.status !== 0 || !python || !prefix) throw new Error("python3 is not available");
-  return { python, prefix };
-}
+  (!AGENT ? "the agent whose credentials to check is not named (BOB_ISOLATION_AGENT)" : "");
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const scratch: string[] = [];
@@ -153,23 +199,20 @@ afterAll(() => {
 
 interface Layout {
   base: string;
-  sd: string; // the installed sidecar (sidecar.py + profile), world-readable
-  tts: string; // the fake Piper install: piper, player, model
+  sd: string; // a copy of the sidecar directory (sidecar, profile, proof tooling)
+  tts: string; // the stand-in Piper install: piper, player, model
   side: string; // where the sidecar creates its work dir and socket
   work: string;
   sock: string;
   outside: string; // outside every allow-list
-  python: string;
-  prefix: string;
   modelSha: string;
 }
 
-/** A fresh layout. Under /private/tmp on macOS (a volume that keeps owners, and
- *  that another user can traverse); the base is 0711. `shared` makes the
- *  sidecar's directory sticky-world-writable so a DIFFERENT user can create its
- *  work dir and socket there. */
-function layout(shared: boolean): Layout {
-  const { python, prefix } = pythonPaths();
+/** A fresh layout under /private/tmp/rv-* (a volume that keeps owners, that
+ *  another user can traverse, and the only prefix proof.py accepts). With a
+ *  `group`, the sidecar's directory belongs to it (0771: members create, an
+ *  outsider may only traverse) — the deployed shape of the socket directory. */
+function layout(shared: { group?: number } | false): Layout {
   const base = mkdtempSync(join(DARWIN ? "/private/tmp" : tmpdir(), "rv-"));
   scratch.push(base);
   chmodSync(base, 0o711);
@@ -177,14 +220,19 @@ function layout(shared: boolean): Layout {
   const tts = join(base, "tts");
   const side = join(base, "side");
   const outside = join(base, "outside");
-  for (const d of [sd, tts]) mkdirSync(d, { mode: 0o755 });
-  mkdirSync(side, { mode: 0o700 });
-  mkdirSync(outside, { mode: 0o755 });
-  chmodSync(sd, 0o755);
-  chmodSync(tts, 0o755);
-  chmodSync(outside, shared ? 0o1777 : 0o755);
-  chmodSync(side, shared ? 0o1777 : 0o700);
-  for (const f of ["sidecar.py", "reachy-voice.sb"]) {
+  for (const d of [sd, tts, outside]) {
+    mkdirSync(d);
+    chmodSync(d, 0o755);
+  }
+  mkdirSync(side);
+  if (shared && shared.group !== undefined) {
+    chownSync(side, process.getuid?.() ?? -1, shared.group);
+    chmodSync(side, 0o771);
+  } else {
+    chmodSync(side, shared ? 0o1777 : 0o700);
+  }
+  if (shared) chmodSync(outside, 0o1777);
+  for (const f of INSTALLED_FILES) {
     copyFileSync(join(SIDECAR_SRC, f), join(sd, f));
     chmodSync(join(sd, f), 0o644);
   }
@@ -193,13 +241,13 @@ function layout(shared: boolean): Layout {
     ["player", "fake-player.py"],
   ] as const) {
     const body = readFileSync(join(FIXTURES, src), "utf8");
-    writeFileSync(join(tts, name), `#!${python} -I\n${body}`, { mode: 0o755 });
+    writeFileSync(join(tts, name), `#!${PY} -I\n${body}`);
     chmodSync(join(tts, name), 0o755);
   }
   const model = randomBytes(64);
-  writeFileSync(join(tts, "model.onnx"), model, { mode: 0o644 });
+  writeFileSync(join(tts, "model.onnx"), model);
   chmodSync(join(tts, "model.onnx"), 0o644);
-  writeFileSync(join(outside, "control-0644"), "fixture-control-not-a-secret\n", { mode: 0o644 });
+  writeFileSync(join(outside, "control-0644"), "fixture-control-not-a-secret\n");
   chmodSync(join(outside, "control-0644"), 0o644);
   return {
     base,
@@ -209,38 +257,22 @@ function layout(shared: boolean): Layout {
     work: join(side, "work"),
     sock: join(side, "s.sock"),
     outside,
-    python,
-    prefix,
     modelSha: createHash("sha256").update(model).digest("hex"),
   };
 }
 
-function profileArgs(l: Layout): string[] {
-  return [
-    "-f",
-    join(l.sd, "reachy-voice.sb"),
-    "-D",
-    `PYTHON_PREFIX=${l.prefix}`,
-    "-D",
-    `SIDECAR_DIR=${l.sd}`,
-    "-D",
-    `TTS_DIR=${l.tts}`,
-    "-D",
-    `PLAYER=${join(l.tts, "player")}`,
-    "-D",
-    `WORK_DIR=${l.work}`,
-    "-D",
-    `SOCKET=${l.sock}`,
-  ];
+/** Run proof.py as this user (its layout copy) or as another user (the
+ *  installed one, through the exact sudoers rule). */
+function proofArgv(l: Layout, as: string | undefined, args: string[]): string[] {
+  if (as === undefined) return [PY, "-I", join(l.sd, "proof.py"), ...args];
+  return ["sudo", "-n", "-u", as, PY, "-I", join(INSTALL_DIR, "proof.py"), ...args];
 }
 
-const UNCONFINED = ["-p", "(version 1)(allow default)"];
-
-/** Run argv as this user, or as the sidecar user through the constrained path. */
-function runAs(asSidecarUser: boolean, argv: string[]) {
-  const [cmd, ...rest] = asSidecarUser ? ["sudo", "-n", "-u", SIDECAR_USER, ...argv] : argv;
+function run(argv: string[]) {
   return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
-    const p = spawn(must(cmd, "a command"), rest, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(must(argv[0], "a command"), argv.slice(1), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     // Never hang the suite: a probe that outlives this is killed (and fails).
     const timer = setTimeout(() => p.kill("SIGKILL"), 30_000);
     let stdout = "";
@@ -262,16 +294,20 @@ type ProbeResults = Record<string, { ok: boolean; err: string; files?: string[] 
 
 async function probe(
   l: Layout,
-  asSidecarUser: boolean,
+  as: string | undefined,
   confined: boolean,
   spec: Record<string, unknown>,
 ): Promise<ProbeResults> {
-  const py = [l.python, "-I", "-c", PROBE, JSON.stringify(spec)];
-  const r = await runAs(asSidecarUser, [
-    SANDBOX_EXEC,
-    ...(confined ? profileArgs(l) : UNCONFINED),
-    ...py,
-  ]);
+  const r = await run(
+    proofArgv(l, as, [
+      "probe",
+      confined ? "confined" : "open",
+      l.tts,
+      l.work,
+      l.sock,
+      JSON.stringify(spec),
+    ]),
+  );
   if (r.status !== 0) throw new Error(`the probe itself failed (status ${r.status}): ${r.stderr}`);
   return JSON.parse(r.stdout) as ProbeResults;
 }
@@ -311,8 +347,8 @@ async function listeners(l: Layout) {
 }
 
 /** Every refusal, with its control: the full egress/escape matrix. */
-async function proveConfinement(asSidecarUser: boolean) {
-  const l = layout(asSidecarUser);
+async function proveConfinement(as: string | undefined) {
+  const l = layout(as === undefined ? false : {});
   const net = await listeners(l);
   try {
     const spec = {
@@ -327,8 +363,8 @@ async function proveConfinement(asSidecarUser: boolean) {
       readOutside: join(l.outside, "control-0644"),
       writeOutside: join(l.outside, `w-${randomBytes(6).toString("hex")}`),
     };
-    const control = await probe(l, asSidecarUser, false, spec);
-    const confined = await probe(l, asSidecarUser, true, spec);
+    const control = await probe(l, as, false, spec);
+    const confined = await probe(l, as, true, spec);
     let machControls = 0;
     for (const [name, result] of Object.entries(control)) {
       if (name.startsWith("mach:")) {
@@ -398,43 +434,46 @@ async function waitFor(cond: () => boolean, what: string, ms = 15_000): Promise<
 }
 
 /** The REAL sidecar under the shipped profile, and bob's REAL client: the
- *  handshake and one `say` over the authorized socket, then the fs audit. */
-async function proveRoundTrip(asSidecarUser: boolean) {
-  const l = layout(asSidecarUser);
+ *  handshake and one `say` over the authorized socket, then the fs audit. As
+ *  the sidecar user, the socket is the DEPLOYED 0660 in a jarvis-voice
+ *  directory, and an outsider's connect is refused. */
+async function proveRoundTrip(as: string | undefined) {
+  const deployed = as !== undefined;
+  const l = layout(deployed ? { group: must(voiceGid, "the voice group") } : false);
   const SECRET = `SAYWORD${randomBytes(4).toString("hex")}`;
-  const argv = [
-    SANDBOX_EXEC,
-    ...profileArgs(l),
-    l.python,
-    "-I",
-    join(l.sd, "sidecar.py"),
-    "--socket",
-    l.sock,
-    "--work-dir",
+  const argv = proofArgv(l, as, [
+    "sidecar",
+    l.tts,
     l.work,
-    "--piper",
-    join(l.tts, "piper"),
-    "--piper-model",
-    join(l.tts, "model.onnx"),
-    "--piper-model-sha256",
+    l.sock,
     l.modelSha,
-    "--player",
-    join(l.tts, "player"),
-    "--device-mute",
-    "absent",
-    "--socket-mode",
-    asSidecarUser ? "0666" : "0600",
-  ];
-  const [cmd, ...rest] = asSidecarUser ? ["sudo", "-n", "-u", SIDECAR_USER, ...argv] : argv;
-  const proc = spawn(must(cmd, "a command"), rest, { stdio: ["ignore", "ignore", "pipe"] });
+    deployed ? "0660" : "0600",
+  ]);
+  const proc = spawn(must(argv[0], "a command"), argv.slice(1), {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
   let log = "";
-  proc.stderr.on("data", (b: Buffer) => {
+  proc.stderr?.on("data", (b: Buffer) => {
     log += b.toString();
   });
   cleanups.push(() => proc.kill());
+  if (deployed) {
+    // The work dir belongs to the sidecar user: it removes its own.
+    const clean = proofArgv(l, as, ["clean", l.work]);
+    cleanups.push(() =>
+      spawnSync(must(clean[0], "a command"), clean.slice(1), { stdio: "ignore" }),
+    );
+  }
   const client = new UnixSocketReachyClient({ socket: l.sock });
   try {
     await waitFor(() => log.includes("listening"), "the sidecar to listen");
+    if (deployed) {
+      const st = statSync(l.sock);
+      expect((st.mode & 0o777).toString(8)).toBe("660");
+      expect(st.gid).toBe(must(voiceGid, "the voice group"));
+      const outsider = await run(proofArgv(l, OUTSIDER, ["connect", l.sock]));
+      expect(JSON.parse(outsider.stdout).connect).toMatch(/^(EACCES|EPERM)$/);
+    }
     const pi = new NoPi();
     const store = new MemStore();
     const state: PolicyState = {
@@ -452,30 +491,35 @@ async function proveRoundTrip(asSidecarUser: boolean) {
       store,
       state,
       sidecarVersion: must(SIDECAR_VERSION, "the sidecar version"),
+      readOrigin: () => ({ kind: "run" }),
       log: () => {},
     });
     client.onLine((line) => void wired.handleLine(line));
-    await client.connect();
+    await client.connect(); // bob's user, as a member of the socket's group
     await wired.connected();
     await waitFor(() => wired.link().phase === "ready", "the reachy-voice/1 handshake");
     expect(wired.link().health?.version).toBe(SIDECAR_VERSION);
     expect(wired.link().health?.mode).toBe("off"); // no ears in V1
 
-    const out = await pi.tools.get("reachy_say")?.execute("tc", { text: `hello ${SECRET}` });
+    const out = await must(pi.tools.get("reachy_say"), "reachy_say").execute("tc", {
+      text: `hello ${SECRET}`,
+    });
     expect(out.content[0]?.text).toBe(`say: hello ${SECRET}`);
     const say = store.all.find((e) => e.kind === "reachy.say");
-    const playbackId = say?.targetIds?.find((t) => t.startsWith("play_"));
-    expect(playbackId).toBeDefined();
-    await waitFor(() => log.includes(`say.spoken playback=${playbackId}`), "the playback");
+    const playbackId = must(
+      say?.targetIds?.find((t) => t.startsWith("play_")),
+      "the playback id",
+    );
+    await waitFor(() => log.includes(`say.spoken playback=${digest(playbackId)}`), "the playback");
 
     // The fs audit of everything the sidecar may write (its work dir; the
-    // socket is not a file), read AS the sidecar's user.
-    const audit = await probe(l, asSidecarUser, true, { listAudio: [l.work] });
+    // socket is not a file), read AS the sidecar's user, under the profile.
+    const audit = await probe(l, as, true, { listAudio: [l.work] });
     const files = audit.listAudio?.files ?? [];
-    // Only the fake player's observation record remains — no speech artifact.
+    // Only the stand-in player's observation record remains — no speech artifact.
     expect(files.map((f) => f.slice(l.work.length + 1))).toEqual(["player-obs.jsonl"]);
     for (const f of files) expect(AUDIO_EXT.test(f), f).toBe(false);
-    if (!asSidecarUser) {
+    if (!deployed) {
       for (const f of files) {
         const head = readFileSync(f).subarray(0, 4).toString("latin1");
         expect(
@@ -492,8 +536,9 @@ async function proveRoundTrip(asSidecarUser: boolean) {
       expect(obs.uid).toBe(process.getuid?.());
       expect((statSync(l.work).mode & 0o777).toString(8)).toBe("700");
     }
-    // Content-free logs: the spoken text never reaches the sidecar's log.
+    // Content-free logs: neither the spoken text nor the playback id appears.
     expect(log).not.toContain(SECRET);
+    expect(log).not.toContain(playbackId);
   } finally {
     client.close();
     proc.kill();
@@ -502,50 +547,49 @@ async function proveRoundTrip(asSidecarUser: boolean) {
 
 describe("reachy-voice isolation — deny-default confinement (seatbelt)", () => {
   proof(
-    "the shipped profile denies network, child, exec, service and file egress — each control succeeds unconfined",
+    "[P1] the shipped profile denies network, child, exec, service and file egress — each control succeeds unconfined",
     seatbeltSkip,
-    () => proveConfinement(false),
+    () => proveConfinement(undefined),
     60_000,
   );
   proof(
-    "the REAL sidecar under the profile round-trips the handshake and a `say` over the authorized socket; no audio remains",
+    "[P2] the REAL sidecar under the profile round-trips the handshake and a `say` over the authorized socket; no audio, text or id remains",
     seatbeltSkip,
-    () => proveRoundTrip(false),
+    () => proveRoundTrip(undefined),
     60_000,
   );
 });
 
 describe(`reachy-voice isolation — as the separate ${SIDECAR_USER} user`, () => {
   proof(
-    `as ${SIDECAR_USER}: the profile denies every egress, each control succeeding unconfined as that user`,
-    separateSeatbeltSkip,
-    () => proveConfinement(true),
+    `[P3] as ${SIDECAR_USER}: the profile denies every egress, each control succeeding unconfined as that user`,
+    separateSkip,
+    () => proveConfinement(SIDECAR_USER),
     60_000,
   );
   proof(
-    `as ${SIDECAR_USER}: the REAL sidecar round-trips the handshake and a \`say\`; no audio remains`,
-    separateSeatbeltSkip,
-    () => proveRoundTrip(true),
+    `[P4] as ${SIDECAR_USER}, on the DEPLOYED 0660 ${VOICE_GROUP} socket: bob's user round-trips a \`say\`, an outsider is refused, no audio remains`,
+    deployedSkip,
+    () => proveRoundTrip(SIDECAR_USER),
     60_000,
   );
 });
 
 describe("reachy-voice isolation — #180 S1 key-read proof", () => {
-  /** Read `path` as the sidecar user. stdout is DISCARDED: if the read ever
-   *  succeeded on a secret, its bytes must not reach this process. */
-  function readAsSidecar(path: string, keepStdout: boolean) {
-    return spawnSync("sudo", ["-n", "-u", SIDECAR_USER, "/bin/cat", path], {
-      encoding: "utf8",
-      stdio: ["ignore", keepStdout ? "pipe" : "ignore", "pipe"],
-    });
+  /** Open each path as the sidecar user (never read): errno per path. */
+  function openAs(proofPath: string, paths: string[]): Record<string, string> {
+    const r = runAsUser(SIDECAR_USER, proofPath, ["open", ...paths]);
+    if (r.status !== 0) throw new Error(`the open proof failed (status ${r.status})`);
+    return JSON.parse(r.stdout) as Record<string, string>;
   }
-  const denied = /Permission denied|Operation not permitted/; // EACCES | EPERM
+  const DENIED = /^(EACCES|EPERM)$/;
+  const uid = process.getuid?.() ?? -1;
 
   proof(
-    "fixtures: 0644 control readable, 0600 admin-pass and agent-key DENIED (EACCES/EPERM), both 0600 and agent-owned",
+    "[P5] fixtures: a 0644 control opens; the 0600 admin-pass and agent-key are DENIED (EACCES/EPERM), both agent-owned",
     userSkip,
     () => {
-      const dir = mkdtempSync(join(DARWIN ? "/private/tmp" : tmpdir(), "reachy-keyread-"));
+      const dir = mkdtempSync(join(DARWIN ? "/private/tmp" : tmpdir(), "rv-keyread-"));
       scratch.push(dir);
       // TRAVERSABLE (0711): a 0700 dir would deny traversal and prove nothing
       // about the file modes (round 4 item 5).
@@ -554,53 +598,65 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
       const control = join(dir, "control-0644");
       const adminPass = join(dir, "admin-pass");
       const agentKey = join(dir, "agent-key");
-      writeFileSync(control, "fixture-control-not-a-secret\n", { mode: 0o644 });
-      writeFileSync(adminPass, "fixture-not-a-real-secret\n", { mode: 0o600 });
-      writeFileSync(agentKey, "fixture-not-a-real-key\n", { mode: 0o600 });
+      writeFileSync(control, "fixture-control-not-a-secret\n");
+      writeFileSync(adminPass, "fixture-not-a-real-secret\n");
+      writeFileSync(agentKey, "fixture-not-a-real-key\n");
       chmodSync(control, 0o644);
       chmodSync(adminPass, 0o600);
       chmodSync(agentKey, 0o600);
-      expect((statSync(control).mode & 0o777).toString(8)).toBe("644");
       for (const f of [adminPass, agentKey]) {
         expect((statSync(f).mode & 0o777).toString(8)).toBe("600");
-        expect(statSync(f).uid).toBe(process.getuid?.() ?? -1); // the agent owns it
+        expect(statSync(f).uid).toBe(uid); // the agent owns it
       }
-      const ok = readAsSidecar(control, true);
-      expect(ok.status, `cat ${control} as ${SIDECAR_USER} should SUCCEED`).toBe(0);
-      expect(ok.stdout).toContain("fixture-control-not-a-secret");
-      for (const f of [adminPass, agentKey]) {
-        const r = readAsSidecar(f, false);
-        expect(r.status, `cat ${f} as ${SIDECAR_USER} must fail`).not.toBe(0);
-        expect(r.stderr).toMatch(denied);
+      // The proof command: the installed one, or (CI) a world-readable copy.
+      let proofPath = join(INSTALL_DIR, "proof.py");
+      if (!installed) {
+        proofPath = join(dir, "proof.py");
+        copyFileSync(join(SIDECAR_SRC, "proof.py"), proofPath);
+        chmodSync(proofPath, 0o644);
       }
+      const result = openAs(proofPath, [control, adminPass, agentKey]);
+      expect(result[control]).toBe("OPENED");
+      expect(result[adminPass]).toMatch(DENIED);
+      expect(result[agentKey]).toMatch(DENIED);
     },
   );
 
   proof(
-    "the REAL admin-pass and agent key: 0600, agent-owned, and DENIED to the sidecar user (never read here)",
-    realKeysSkip,
+    "[P6] bob's ACTIVE credentials, derived from the agent's bob.yaml: each 0600, agent-owned, and DENIED to the sidecar user (never read)",
+    activeSkip,
     () => {
-      for (const f of [must(REAL_ADMIN_PASS, "admin-pass"), must(REAL_AGENT_KEY, "agent key")]) {
+      const creds = deriveActiveCredentials({
+        name: must(AGENT, "agent"),
+        agentsRoot: AGENTS_ROOT,
+      });
+      expect(creds.agentKeys.length, "the agent's own key file must exist").toBeGreaterThan(0);
+      expect(existsSync(creds.adminPass), `${creds.adminPass} must exist`).toBe(true);
+      for (const f of creds.present) {
         const st = statSync(f); // metadata only: this process never opens it
         expect((st.mode & 0o777).toString(8), `${f} mode`).toBe("600");
-        expect(st.uid, `${f} owner`).toBe(process.getuid?.() ?? -1);
-        const r = readAsSidecar(f, false);
-        expect(r.status, `${SIDECAR_USER} must not read ${f}`).not.toBe(0);
-        expect(r.stderr).toMatch(denied);
+        expect(st.uid, `${f} owner`).toBe(uid);
+      }
+      const result = openAs(join(INSTALL_DIR, "proof.py"), creds.present);
+      for (const f of creds.present) expect(result[f], f).toMatch(DENIED);
+    },
+  );
+
+  proof(
+    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's, root-owned and writable by no one else",
+    installedSkip,
+    () => {
+      const dirSt = statSync(INSTALL_DIR);
+      expect(dirSt.uid).toBe(0);
+      expect(dirSt.mode & 0o022).toBe(0);
+      for (const f of INSTALLED_FILES) {
+        const path = join(INSTALL_DIR, f);
+        const st = statSync(path);
+        expect(st.uid, `${f} owner`).toBe(0);
+        expect(st.mode & 0o022, `${f} writable by group/other`).toBe(0);
+        const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+        expect(sha(path), `${f} is not the reviewed file`).toBe(sha(join(SIDECAR_SRC, f)));
       }
     },
   );
-});
-
-// Leave nothing in the scratch roots even when a proof failed mid-way.
-afterAll(() => {
-  for (const d of scratch) {
-    if (existsSync(d)) {
-      try {
-        for (const e of readdirSync(d)) rmSync(join(d, e), { recursive: true, force: true });
-      } catch {
-        /* a sidecar-user-owned entry may need the admin; reported by the leak check */
-      }
-    }
-  }
 });

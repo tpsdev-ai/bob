@@ -150,7 +150,7 @@ import {
   ToolLoopError,
 } from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
-import { originValidationError } from "./turn-origin.js";
+import { originValidationError, type TurnOrigin } from "./turn-origin.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -613,6 +613,10 @@ export interface RunSessionConfig {
   persistent?: boolean;
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
+  // bob#356: the origin the runtime DECLARES for a session no admission serves:
+  // `{kind:"run"}` for an operator's one-shot `bob run` (runAgent), absent for
+  // a mail turn and an interactive launch. Never read from bob.yaml or a prompt.
+  sessionOrigin?: TurnOrigin;
   // The tool policy resolved from bob.yaml's `tools:` block + top-level
   // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
   // `tools` is pi's STRICT allowlist and is REQUIRED: the type says so, and
@@ -934,6 +938,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
     ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
   });
+  // bob#356: an operator's one-shot run binds the `run` origin for the whole
+  // session; a mail turn binds none (its sender is not an operator).
+  if (opts.mailTurn !== true) resolved.config.sessionOrigin = { kind: "run" };
   const bounds = createRunBounds(limits, opts.timer);
   try {
     return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);

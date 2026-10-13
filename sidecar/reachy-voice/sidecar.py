@@ -5,8 +5,10 @@ The voice-profile sidecar: it speaks, and it does nothing else. It has NO
 microphone code at all — no capture, no wake model, no speech-to-text — so its
 health reports mode "off". It is UNTRUSTED by design (bob#180 §3.2): it runs as
 its own unprivileged OS user under the deny-default sandbox profile beside it
-(reachy-voice.sb), it talks to bob only through one UNIX socket, and bob applies
-its own policy and audit before any command reaches it.
+(reachy-voice.sb), and it listens on one UNIX socket. bob applies its policy
+and audit to every command bob SENDS; this process cannot tell bob's commands
+from another client's, so the socket's permissions (0660, group jarvis-voice)
+are what keep other clients out.
 
 Protocol (reachy-voice/1, one JSON object per line, bob -> sidecar commands
 {"command": name, "args": {...}}, sidecar -> bob events {"type": ...}):
@@ -14,7 +16,8 @@ Protocol (reachy-voice/1, one JSON object per line, bob -> sidecar commands
      Until it does, every other command is ignored.
   2. the sidecar answers with a strict health line: its own version and device
      profile (never bob's), the wake name and generation bob pushed, its wake
-     mode ("off": no ears), trainedPhrase/modelHash (null), the device mute and ok.
+     mode ("off": no ears), trainedPhrase/modelHash (null), its mute (V1: what
+     --device-mute says; the hardware switch is not read) and ok.
   3. after that: `say` {text, playbackId} speaks one line; `state` and `health`
      answer with the current health line; another `configure` re-configures.
 
@@ -24,10 +27,15 @@ Speech (local text-to-speech with Piper):
     file created 0600 before Piper opens it (and the process umask is 077);
   - the OS player plays that file; the file and its directory are removed
     afterwards, whatever happened. Nothing else is written anywhere.
-  - Nothing captured: this process never opens an input device. Leftover
-    artifacts from a crash are removed at startup.
+  - Nothing captured: this process never opens an input device.
+  - FAIL CLOSED (bob#356 round 1): leftover artifacts from a crash are removed
+    at startup, and a sidecar that cannot remove them refuses to start. A
+    removal that fails after playback is logged, the sidecar stops speaking,
+    and it reports ok=false at once (bob then refuses the link) until it is
+    restarted and its startup sweep succeeds.
 
-Logs are content-free: event names, playback ids and error CLASSES — never the
+Logs are content-free: event names, a DIGEST of the playback id (the id is
+sender-chosen, so it is never logged verbatim), and error CLASSES — never the
 spoken text, never a path inside an artifact. Core dumps are disabled.
 
 Usage (normally via the operator's launcher; see RUNBOOK.md):
@@ -72,6 +80,12 @@ def log(event, **fields):
     sys.stderr.flush()
 
 
+def digest(value):
+    """A short, non-reversible tag for a sender-chosen value (never logged raw).
+    bob can compute the same tag from the playback id it issued."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -100,13 +114,32 @@ class Mouth:
         self.env["PATH"] = "/usr/bin:/bin"
         self.env["HOME"] = work_dir
 
+    dirty = False  # set when an artifact could not be removed
+
     def sweep(self):
-        """Remove artifacts a crash left behind: speech is never kept."""
+        """Remove artifacts a crash left behind: speech is never kept. Raises
+        when one cannot be removed — the caller refuses to start."""
         for name in os.listdir(self.work_dir):
             if name.startswith(TTS_DIR_PREFIX):
-                shutil.rmtree(os.path.join(self.work_dir, name), ignore_errors=True)
+                path = os.path.join(self.work_dir, name)
+                shutil.rmtree(path)
+                if os.path.lexists(path):
+                    raise OSError("a stale speech artifact survived removal")
+
+    def _remove(self, tts_dir, tag):
+        """Remove one utterance's artifact directory; on failure, go dirty."""
+        try:
+            shutil.rmtree(tts_dir)
+        except OSError as err:
+            log("say.cleanup_failed", playback=tag, error=type(err).__name__)
+            self.dirty = True
+            return
+        if os.path.lexists(tts_dir):
+            log("say.cleanup_failed", playback=tag, error="Survived")
+            self.dirty = True
 
     def speak(self, text, playback_id):
+        tag = digest(playback_id)
         tts_dir = tempfile.mkdtemp(prefix=TTS_DIR_PREFIX, dir=self.work_dir)
         try:
             os.chmod(tts_dir, 0o700)
@@ -123,14 +156,14 @@ class Mouth:
                 check=False,
             )
             if synth.returncode != 0:
-                log("say.synth_failed", playback=playback_id, rc=synth.returncode)
+                log("say.synth_failed", playback=tag, rc=synth.returncode)
                 return False
             st = os.lstat(wav)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
-                log("say.artifact_refused", playback=playback_id)
+                log("say.artifact_refused", playback=tag)
                 return False
             if st.st_size == 0:
-                log("say.synth_empty", playback=playback_id)
+                log("say.synth_empty", playback=tag)
                 return False
             play = subprocess.run(
                 [self.player, wav],
@@ -142,18 +175,18 @@ class Mouth:
                 check=False,
             )
             if play.returncode != 0:
-                log("say.play_failed", playback=playback_id, rc=play.returncode)
+                log("say.play_failed", playback=tag, rc=play.returncode)
                 return False
-            log("say.spoken", playback=playback_id)
+            log("say.spoken", playback=tag)
             return True
         except subprocess.TimeoutExpired:
-            log("say.timeout", playback=playback_id)
+            log("say.timeout", playback=tag)
             return False
         except OSError as err:
-            log("say.error", playback=playback_id, error=type(err).__name__)
+            log("say.error", playback=tag, error=type(err).__name__)
             return False
         finally:
-            shutil.rmtree(tts_dir, ignore_errors=True)
+            self._remove(tts_dir, tag)
 
 
 class Session:
@@ -180,7 +213,8 @@ class Session:
             "trainedPhrase": None,
             "modelHash": None,
             "muted": self.device_muted,
-            "ok": True,
+            # False once an artifact could not be removed: bob refuses the link.
+            "ok": not self.mouth.dirty,
         }
 
     def handle(self, cmd):
@@ -225,18 +259,25 @@ class Session:
             if not isinstance(playback_id, str) or not PLAYBACK_ID.match(playback_id):
                 log("say.refused", reason="playbackId")
                 return
+            tag = digest(playback_id)
             if (
                 not isinstance(text, str)
                 or not (1 <= len(text) <= 500)
                 or "\r" in text
                 or "\n" in text
             ):
-                log("say.refused", playback=playback_id, reason="text")
+                log("say.refused", playback=tag, reason="text")
                 return
             if self.device_muted:
-                log("say.muted", playback=playback_id)
+                log("say.muted", playback=tag)
+                return
+            if self.mouth.dirty:
+                log("say.refused", playback=tag, reason="dirty")
                 return
             self.mouth.speak(text, playback_id)
+            if self.mouth.dirty:
+                # Report at once: the next health bob reads must say so.
+                self.send(self.health())
             return
         log("command.unsupported")
 
@@ -313,7 +354,10 @@ def main(argv=None):
     private_dir(opts.work_dir)
 
     mouth = Mouth(opts.work_dir, opts.piper, opts.piper_model, opts.player)
-    mouth.sweep()
+    try:
+        mouth.sweep()
+    except OSError:
+        raise SystemExit("reachy-voice: a stale speech artifact cannot be removed; refusing to start")
     device_muted = opts.device_mute != "absent"
 
     if os.path.lexists(opts.socket):

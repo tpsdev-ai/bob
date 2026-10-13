@@ -1,9 +1,20 @@
-// bob#356 V1: a skipped isolation proof never passes a release. The gate turns
-// a skip into a failure under BOB_REQUIRE_ISOLATION_PROOFS=1, and the release
-// check script fails on any skip or failure it sees in the report.
+// bob#356 V1: a skipped or missing isolation proof never passes the release-host
+// check. The gate turns a skip into a failure under BOB_REQUIRE_ISOLATION_PROOFS=1,
+// and the check script requires every PINNED proof id to have passed.
 import { describe, expect, it } from "bun:test";
-import { proofCounts, verdict } from "../../../scripts/check-reachy-isolation.mjs";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  EXPECTED_PROOFS,
+  passedProofs,
+  proofCounts,
+  verdict,
+} from "../../../scripts/check-reachy-isolation.mjs";
 import { proofDisposition, REQUIRE_ENV } from "./isolation-gate.js";
+
+const report = (lines: string[], counts: { pass: number; skip: number; fail: number }) =>
+  `${lines.join("\n")}\n\n ${counts.pass} pass\n ${counts.skip} skip\n ${counts.fail} fail\n`;
+const ALL = EXPECTED_PROOFS.map((id) => `(pass) isolation > [${id}] a proof [1.0ms]`);
 
 describe("bob#356 — the isolation-proof release gate", () => {
   it("a proof that can run, runs; one that cannot SKIPS locally and FAILS when required", () => {
@@ -14,14 +25,27 @@ describe("bob#356 — the isolation-proof release gate", () => {
     expect(proofDisposition("no sidecar user", { [REQUIRE_ENV]: "0" })).toBe("skip");
   });
 
-  it("the release check passes only when every proof RAN and passed", () => {
-    const report = (pass: number, skip: number, fail: number) =>
-      `\n ${pass} pass\n ${skip} skip\n ${fail} fail\nRan ${pass + skip + fail} tests`;
-    expect(proofCounts(report(6, 0, 0))).toEqual({ pass: 6, skip: 0, fail: 0 });
-    expect(verdict(0, report(6, 0, 0)).ok).toBe(true);
-    expect(verdict(0, report(2, 4, 0))).toMatchObject({ ok: false });
-    expect(verdict(0, report(2, 4, 0)).why).toContain("skipped");
-    expect(verdict(1, report(5, 0, 1)).ok).toBe(false);
-    expect(verdict(0, report(0, 0, 0)).ok).toBe(false);
+  it("the check passes only when EVERY pinned proof ran and passed", () => {
+    const full = report(ALL, { pass: ALL.length, skip: 0, fail: 0 });
+    expect(proofCounts(full)).toEqual({ pass: ALL.length, skip: 0, fail: 0 });
+    expect(verdict(0, full).ok).toBe(true);
+    // a skip fails it
+    expect(verdict(0, report(ALL.slice(0, 2), { pass: 2, skip: 5, fail: 0 })).why).toContain(
+      "skipped",
+    );
+    // a failure fails it
+    expect(verdict(1, report(ALL, { pass: 6, skip: 0, fail: 1 })).ok).toBe(false);
+    // a MISSING proof fails it, even with zero skips and zero failures
+    const minusP4 = ALL.filter((l) => !l.includes("[P4]"));
+    const v = verdict(0, report(minusP4, { pass: minusP4.length, skip: 0, fail: 0 }));
+    expect(v).toEqual({ ok: false, why: "proof(s) missing: P4" });
+    // a `(fail)` line naming a proof does not count as passed
+    expect(passedProofs("(fail) x > [P1] y").has("P1")).toBe(false);
+  });
+
+  it("the pinned ids are exactly the ids isolation.test.ts declares", () => {
+    const src = readFileSync(join(import.meta.dirname, "isolation.test.ts"), "utf8");
+    const declared = [...src.matchAll(/^\s*[`"]\[(P\d+)\]/gm)].map((m) => m[1]);
+    expect(declared.sort()).toEqual([...EXPECTED_PROOFS].sort());
   });
 });

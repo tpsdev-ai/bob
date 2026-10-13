@@ -1,7 +1,9 @@
 # A stand-in for the OS audio player (bob#356 tests): it records what it was
 # handed — the artifact's mode, owner, directory mode and header, never its
 # audio — as one JSON line in $HOME/player-obs.jsonl ($HOME is the sidecar's
-# work directory), then exits 0.
+# work directory), then exits 0. When $HOME/sabotage-cleanup exists it makes
+# the artifact's directory unwritable, so the sidecar's removal FAILS (the
+# fail-closed test).
 import json
 import os
 import stat
@@ -22,3 +24,5 @@ obs = {
 }
 with open(os.path.join(os.environ["HOME"], "player-obs.jsonl"), "a", encoding="utf-8") as out:
     out.write(json.dumps(obs) + "\n")
+if os.path.exists(os.path.join(os.environ["HOME"], "sabotage-cleanup")):
+    os.chmod(os.path.dirname(path), 0o500)

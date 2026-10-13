@@ -12,8 +12,10 @@
 //     until it does the link is control/status only. A mismatch, a legacy
 //     health line or any other line first disconnects and raises ONE alarm
 //     (repeated only when the failure changes or after a good handshake).
-//   * Effective mute = bob mute OR the device mute the sidecar reports OR no
-//     ready link (unknown/disconnected is muted). No action is sent while muted.
+//   * Effective mute = bob mute OR the sidecar-reported mute OR no ready link
+//     (unknown/disconnected is muted). No action is sent while muted. The V1
+//     sidecar does not read the hardware switch: it reports what its operator
+//     configured (`--device-mute`; unknown reports muted).
 //   * Speech is split by caller (policy.ts `speechCallerRefusal`), and every
 //     action is re-checked after its audit write: a link that reconnected or a
 //     mute that flipped during the await refuses the queued command (stale).
@@ -91,10 +93,12 @@ export interface WireOptions {
   state: PolicyState;
   /** bob#356: the exact sidecar version `health.version` must equal. */
   sidecarVersion: string;
-  /** bob#356: the origin of the admitted turn a tool call runs inside (bob's
-   *  turn admission). Absent in a one-shot `bob run`, which is an operator's
-   *  `run`. Never read from the tool's arguments. */
-  readOrigin?: () => TurnOrigin;
+  /** bob#356: the origin a tool call is BOUND to (shell/turn-admission.ts
+   *  `boundOrigin`): the admitted turn it runs inside, or the origin the
+   *  runtime declared for the session (an operator's one-shot run) — or
+   *  undefined, which refuses speech. Absent: nothing is bound, everything
+   *  refuses. Never read from the tool's arguments, never defaulted. */
+  readOrigin?: () => TurnOrigin | undefined;
   log?: (msg: string) => void;
   /** Id seam (tests): every generated id and nonce comes from here. */
   uuid?: () => string;
@@ -112,12 +116,15 @@ export type DecisionSummary =
 /** The link to the sidecar as bob sees it (bob#356). Bob's own facts, apart
  *  from the sidecar's assertions (`health`). */
 export interface LinkState {
-  phase: "disconnected" | "handshaking" | "ready";
+  // configuring: the `configure` write has not completed; handshaking: it
+  // has, and bob awaits the matching health line; ready: that line matched.
+  phase: "disconnected" | "configuring" | "handshaking" | "ready";
   /** The configuration generation bob pushed on the current connection. */
   generation: number;
-  /** The device mute the sidecar last reported; undefined = unknown. */
+  /** The mute the sidecar last reported (V1: operator-configured, not read
+   *  from the hardware); undefined = unknown. */
   deviceMuted: boolean | undefined;
-  /** bob mute OR device mute OR no ready link. */
+  /** bob mute OR sidecar-reported mute OR no ready link. */
   effectiveMuted: boolean;
   /** The last accepted health line — a sidecar ASSERTION, never authority. */
   health: SidecarHealth | null;
@@ -167,6 +174,9 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     deviceMuted: boolean | undefined;
     health: SidecarHealth | null;
     lastAlarm: string | undefined;
+    // A line that arrived before the `configure` write completed: held, and
+    // judged only once that write succeeded (never accepted before it).
+    held: { raw: unknown } | undefined;
   } = {
     phase: "disconnected",
     generation: 0,
@@ -174,6 +184,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     deviceMuted: undefined,
     health: null,
     lastAlarm: undefined,
+    held: undefined,
   };
   const effectiveMuted = (): boolean =>
     state.mute || link.phase !== "ready" || link.deviceMuted !== false;
@@ -183,7 +194,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     wakeName: state.wakeName,
     generation: link.generation,
   });
-  const callerOrigin = (): TurnOrigin => opts.readOrigin?.() ?? { kind: "run" };
+  const callerOrigin = (): TurnOrigin | undefined => opts.readOrigin?.();
 
   async function audit(event: OrgEvent): Promise<boolean> {
     try {
@@ -238,6 +249,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
    *  and an identical failure repeats only in the log until a good handshake. */
   async function linkRefused(fields: string[]): Promise<DecisionSummary> {
     link.phase = "disconnected";
+    link.held = undefined;
     link.epoch++;
     link.deviceMuted = undefined;
     link.health = null;
@@ -281,7 +293,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       return malformed(`proposal action '${action}' failed its argument schema`);
     }
     // bob#356: no action leaves bob without a ready, unmuted link (bob mute,
-    // the device mute, or an unknown/disconnected link — all muted).
+    // the sidecar-reported mute, or an unknown/disconnected link — all muted).
     if (effectiveMuted()) return { kind: "drop" };
     const epoch = link.epoch;
     const decision = admitAction(action, args, confidence, inputs, state, caller);
@@ -337,7 +349,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     r.kind === "admitted"
       ? admitted
       : r.kind === "drop"
-        ? "refused: muted (bob mute, device mute, or no ready reachy-voice/1 sidecar link)"
+        ? "refused: muted (bob mute, sidecar-reported mute, or no ready reachy-voice/1 sidecar link)"
         : `refused: ${"reason" in r ? r.reason : r.kind}`;
   const tools = PROFILE_TOOLS[state.profile];
   const register: Record<string, () => void> = {
@@ -433,7 +445,13 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   /** The health line was accepted: update what bob knows. A flip of the device
    *  mute (either way) forgets the last transcript. */
   function acceptHealth(health: SidecarHealth): void {
-    if (link.deviceMuted !== health.muted) lastTranscript = null;
+    // Every mute TRANSITION (on or off) forgets the last transcript and
+    // advances the epoch, so an admission pending across it — even one that
+    // flips back before its audit returns — is refused as stale (bob#356).
+    if (link.deviceMuted !== undefined && link.deviceMuted !== health.muted) {
+      lastTranscript = null;
+      link.epoch++;
+    }
     link.deviceMuted = health.muted;
     link.health = health;
   }
@@ -444,6 +462,15 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     // A line with no live connection behind it (it raced a disconnect) is
     // dropped: nothing it says is current, and dropping it bounds the audit.
     if (link.phase === "disconnected") return { kind: "drop" };
+
+    // bob#356: nothing is judged before the `configure` write succeeded. The
+    // first early line is held for `connected()` to judge after the write; a
+    // second one fails the link.
+    if (link.phase === "configuring") {
+      if (link.held !== undefined) return linkRefused(["lines before configure was written"]);
+      link.held = { raw };
+      return { kind: "none" };
+    }
 
     // bob#356: before the handshake, the only acceptable line is the health
     // reply to this connection's `configure`. Anything else fails the link.
@@ -476,7 +503,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       return { kind: "none" };
     }
     if (decoded.kind === "malformed" && decoded.protocol) return linkRefused(["health"]);
-    // The device mute drops transcripts and proposals, like bob's own.
+    // The sidecar-reported mute drops transcripts and proposals, like bob's own.
     if (effectiveMuted()) return { kind: "drop" };
 
     if (decoded.kind === "malformed") {
@@ -657,23 +684,33 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   async function connected(): Promise<void> {
     link.epoch++;
     link.generation++;
-    link.phase = "handshaking";
+    link.phase = "configuring";
+    link.held = undefined;
     link.deviceMuted = undefined;
     link.health = null;
     lastTranscript = null;
     const epoch = link.epoch;
     try {
-      // The ONE control command before the handshake.
+      // The ONE control command before the handshake. Its write must SUCCEED
+      // before any health line is judged (bob#356 round 1).
       await commands.send("configure", configureArgs(expectation()));
     } catch (err) {
       if (link.epoch !== epoch) return;
       log(`reachy: configure send failed: ${err instanceof Error ? err.message : err}`);
       await linkRefused(["configure send"]);
+      return;
     }
+    if (link.epoch !== epoch) return;
+    link.phase = "handshaking";
+    // (handleLine may have set it during the awaited write.)
+    const held = link.held as { raw: unknown } | undefined;
+    link.held = undefined;
+    if (held !== undefined) await handleLine(held.raw);
   }
 
   function disconnected(): void {
     link.phase = "disconnected";
+    link.held = undefined;
     link.epoch++;
     link.deviceMuted = undefined;
     link.health = null;

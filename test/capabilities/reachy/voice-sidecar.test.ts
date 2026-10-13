@@ -30,6 +30,8 @@ import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { must } from "./handshake.js";
 
+const digest = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 16);
+
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR = join(REPO, "sidecar", "reachy-voice", "sidecar.py");
 const FIXTURES = join(REPO, "test", "fixtures", "reachy-voice");
@@ -171,6 +173,8 @@ async function connectBob(inst: ReturnType<typeof install>, profile: "voice" | "
     store,
     state,
     sidecarVersion: SIDECAR_VERSION,
+    // an operator's one-shot run, as the runtime declares it
+    readOrigin: () => ({ kind: "run" }),
     log: () => {},
   });
   client.onLine((l) => void wired.handleLine(l));
@@ -251,8 +255,105 @@ describe("bob#356 V1 — the real voice sidecar", () => {
       const obs = JSON.parse(readFileSync(must(files[0], "the record"), "utf8").trim());
       expect(obs).toMatchObject({ mode: "0o600", dirMode: "0o700", riff: true, inWorkDir: true });
       expect(sc.log()).not.toContain(SECRET);
+      // the playback id is logged only as a digest
+      const say = bob.store.all.find((e) => e.kind === "reachy.say");
+      const id = must(
+        say?.targetIds?.find((t) => t.startsWith("play_")),
+        "the playback id",
+      );
+      expect(sc.log()).toContain(`say.spoken playback=${digest(id)}`);
+      expect(sc.log()).not.toContain(id);
     } finally {
       bob.client.close();
+    }
+  }, 30_000);
+
+  it("a sender-chosen playback id never reaches the log verbatim, even one carrying text", async () => {
+    const inst = install();
+    const sc = start(inst, ["--device-mute", "absent"]);
+    await waitFor(() => sc.log().includes("listening"), "listening");
+    const raw = new UnixSocketReachyClient({ socket: inst.sock });
+    await raw.connect();
+    const SMUGGLED = `the-launch-code-is-${randomBytes(4).toString("hex")}`;
+    try {
+      await raw.send("configure", {
+        protocol: "reachy-voice/1",
+        profile: "voice",
+        wakeName: "jarvis",
+        generation: 1,
+      });
+      await raw.send("say", { text: "ok", playbackId: SMUGGLED });
+      await raw.send("say", { text: "two\nlines", playbackId: `${SMUGGLED}-2` });
+      await waitFor(() => sc.log().includes("say.spoken"), "the playback");
+      await waitFor(() => sc.log().includes("say.refused"), "the refusal");
+      expect(sc.log()).not.toContain(SMUGGLED);
+      expect(sc.log()).toContain(`playback=${digest(SMUGGLED)}`);
+    } finally {
+      raw.close();
+    }
+  }, 30_000);
+
+  it("FAIL CLOSED: a removal that fails after playback is logged, reported (ok=false), and stops all speech", async () => {
+    const inst = install();
+    const sc = start(inst, ["--device-mute", "absent"]);
+    await waitFor(() => sc.log().includes("listening"), "listening");
+    writeFileSync(join(inst.work, "sabotage-cleanup"), "");
+    const bob = await connectBob(inst);
+    try {
+      await waitFor(() => bob.wired.link().phase === "ready", "the handshake");
+      const out = await must(bob.pi.tools.get("reachy_say"), "reachy_say").execute("tc", {
+        text: "hello",
+      });
+      expect(out.content[0]?.text).toBe("say: hello");
+      await waitFor(() => sc.log().includes("say.cleanup_failed"), "the cleanup failure");
+      // the sidecar reported it at once, and bob refused the link on it
+      await waitFor(
+        () => bob.store.all.some((e) => e.kind === "reachy.link.refused"),
+        "bob's refusal",
+      );
+      expect(
+        must(
+          bob.store.all.find((e) => e.kind === "reachy.link.refused"),
+          "the alarm",
+        ).summary,
+      ).toContain("ok did not match");
+      expect(bob.wired.link().phase).toBe("disconnected");
+      // a direct client cannot make it speak again
+      const raw = new UnixSocketReachyClient({ socket: inst.sock });
+      await raw.connect();
+      await raw.send("configure", {
+        protocol: "reachy-voice/1",
+        profile: "voice",
+        wakeName: "jarvis",
+        generation: 9,
+      });
+      await raw.send("say", { text: "again", playbackId: "play_again" });
+      await waitFor(() => sc.log().includes("reason=dirty"), "the dirty refusal");
+      expect(sc.log().match(/say\.spoken/g)?.length).toBe(1);
+      raw.close();
+    } finally {
+      bob.client.close();
+      for (const d of readdirSync(inst.work)) {
+        if (d.startsWith("tts-")) chmodSync(join(inst.work, d), 0o700); // let afterAll remove it
+      }
+    }
+  }, 30_000);
+
+  it("FAIL CLOSED: a stale artifact that cannot be removed refuses startup", async () => {
+    const inst = install();
+    const stale = join(inst.work, "tts-stale");
+    mkdirSync(stale, { recursive: true });
+    chmodSync(inst.work, 0o700);
+    writeFileSync(join(stale, "speech.wav"), "RIFF....");
+    chmodSync(stale, 0o500); // its entries cannot be unlinked
+    try {
+      const sc = start(inst, ["--device-mute", "absent"]);
+      await waitFor(() => sc.exit() !== undefined, "the refusal");
+      expect(sc.exit()).not.toBe(0);
+      expect(sc.log()).toContain("cannot be removed; refusing to start");
+      expect(existsSync(inst.sock)).toBe(false); // it never listened
+    } finally {
+      chmodSync(stale, 0o700);
     }
   }, 30_000);
 
@@ -274,11 +375,14 @@ describe("bob#356 V1 — the real voice sidecar", () => {
       await raw.send("say", { text: "hi", playbackId: "play_2", memoryId: "m" });
       await raw.send("say", { text: "x".repeat(501), playbackId: "play_3" });
       await raw.send("say", { text: "ok", playbackId: "play_4" }); // control: spoken
-      await waitFor(() => sc.log().includes("say.spoken playback=play_4"), "the control playback");
+      await waitFor(
+        () => sc.log().includes(`say.spoken playback=${digest("play_4")}`),
+        "the control playback",
+      );
       expect(sc.log()).toContain("command.before_configure");
-      expect(sc.log()).not.toContain("say.spoken playback=play_1");
-      expect(sc.log()).not.toContain("say.spoken playback=play_2");
-      expect(sc.log()).not.toContain("say.spoken playback=play_3");
+      expect(sc.log()).not.toContain(`say.spoken playback=${digest("play_1")}`);
+      expect(sc.log()).not.toContain(`say.spoken playback=${digest("play_2")}`);
+      expect(sc.log()).not.toContain(`say.spoken playback=${digest("play_3")}`);
       const obs = readFileSync(join(inst.work, "player-obs.jsonl"), "utf8").trim().split("\n");
       expect(obs.length).toBe(1);
     } finally {
@@ -286,7 +390,7 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     }
   }, 30_000);
 
-  it("an unreadable device mute reports MUTED (fail closed): bob refuses speech", async () => {
+  it("with the hardware mute unread (the default), the sidecar reports MUTED (fail closed): bob refuses speech", async () => {
     const inst = install();
     const sc = start(inst); // --device-mute defaults to unknown
     await waitFor(() => sc.log().includes("listening"), "listening");

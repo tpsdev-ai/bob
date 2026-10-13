@@ -1,9 +1,10 @@
 ;; reachy-voice.sb — the deny-default seatbelt profile for the reachy-voice
 ;; sidecar (bob#356 V1; bob#180 §3.2). Everything not allowed below is denied:
 ;; every network operation except the ONE authorized UNIX socket, every mach
-;; service except the audio HAL's, every exec except the interpreter, Piper and
-;; the player, and every file write except the sidecar's own work directory and
-;; socket. Children inherit it.
+;; service except the audio HAL's, every exec except executables under the
+;; interpreter's install root and Piper's install root (TTS_DIR) and the one
+;; player binary, and every file write except the sidecar's own work directory
+;; and socket. Children inherit it.
 ;;
 ;; Parameters (sandbox-exec -D NAME=value; every path RESOLVED — /tmp is
 ;; /private/tmp, a Homebrew python is its Cellar path):
@@ -14,8 +15,9 @@
 ;;   WORK_DIR       the sidecar's private 0700 work directory (read, write)
 ;;   SOCKET         the one UNIX socket the sidecar listens on
 ;;
-;; Proven both ways by test/capabilities/reachy/isolation.test.ts: each denial
-;; below is shown to SUCCEED without this profile first, and the authorized
+;; Proven both ways by test/capabilities/reachy/isolation.test.ts: each probed
+;; denial is shown to SUCCEED without this profile first (a mach service this
+;; macOS does not register has no control and is excluded), and the authorized
 ;; socket round-trips a handshake and a `say` under it.
 
 (version 1)
@@ -25,7 +27,8 @@
 ;; network, no mach service and no write).
 (import "dyld-support.sb")
 
-;; Processes: fork, and exec only these binaries.
+;; Processes: fork, and exec only executables under these two install roots
+;; and the one player binary.
 (allow process-fork)
 (allow process-exec
        (subpath (param "PYTHON_PREFIX"))

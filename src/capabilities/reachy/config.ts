@@ -71,7 +71,7 @@ export const CONFIG_SCHEMA = Type.Object(
     // compare in bob, never the sidecar's flag.
     wakeName: Type.Optional(WAKE_NAME_SCHEMA),
     // Bob's own mute: no sidecar connection, no transcripts, no proposals, no
-    // speech. The sidecar's reported device mute is ORed with it.
+    // speech. The sidecar-reported mute is ORed with it.
     mute: Type.Optional(Type.Boolean({ description: "Bob mute: drop every event." })),
     // bob#356: which authenticated turn origins may speak in the room through
     // `reachy_say` without a transcript. Empty by default: no tool-path speech

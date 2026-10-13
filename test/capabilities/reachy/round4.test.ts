@@ -14,7 +14,7 @@ import { MAX_LINE_BYTES, UnixSocketReachyClient } from "../../../src/capabilitie
 import { reachyManifest } from "../../../src/capabilities/reachy/manifest.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { decodeLine, VOICE_PROTOCOL } from "../../../src/capabilities/reachy/wire.js";
-import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
+import { readyLink, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 // A complete reachy-voice/1 health line (bob#356): what a sidecar sends.
 const VALID_HEALTH = {
@@ -250,7 +250,7 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
       sidecarVersion: TEST_SIDECAR_VERSION,
       log: () => {},
     });
-    handshakeNow(wired, state);
+    await readyLink(wired, state);
     const line = JSON.stringify({
       type: "transcript",
       text: "jarvis, remember this",

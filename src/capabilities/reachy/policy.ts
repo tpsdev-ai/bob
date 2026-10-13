@@ -144,7 +144,9 @@ export interface PolicyState {
  *  admitted turn's origin, a sidecar proposal carries the transcript policy
  *  reads (for the body's rate limit only — never for speech). */
 export type Caller =
-  | { path: "tool"; origin: TurnOrigin }
+  // `origin` undefined: the call is bound to no admitted turn and no
+  // runtime-declared session origin (shell/turn-admission.ts `boundOrigin`).
+  | { path: "tool"; origin: TurnOrigin | undefined }
   | { path: "proposal"; transcript: Transcript | null };
 
 /** The body actions (bob#356 delta 1): present only under the `reachy` profile. */
@@ -175,6 +177,9 @@ export function speechCallerRefusal(caller: Caller, state: PolicyState): string 
     return "a sidecar proposal cannot speak: free-form proposal speech is off before enrolment";
   }
   const { origin } = caller;
+  if (origin === undefined) {
+    return "this call is bound to no admitted turn and no runtime-declared run, so it has no origin to grant";
+  }
   if (origin.kind === "voice") {
     return "a voice-origin call needs its own current addressed utterance, which V1 does not have";
   }
@@ -316,7 +321,7 @@ export function decideTranscript(
  * `frame` are rate-limited for an unverified speaker — ADMITTING one advances
  * the rate limit, so the next within the minute refuses; speech is admitted only
  * for a caller `speechCallerRefusal` allows. Every admitted action returns
- * exactly one OrgEvent. Readiness and the device mute are the capability's
+ * exactly one OrgEvent. Readiness and the sidecar-reported mute are the capability's
  * (capability.ts) — this function sees bob's own mute only.
  */
 export function admitAction(

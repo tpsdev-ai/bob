@@ -16,7 +16,13 @@ import {
   readVoiceWakeName,
   resolveCapabilities,
 } from "../../src/shell/capability-loader.js";
-import { createTurnAdmission } from "../../src/shell/turn-admission.js";
+import {
+  boundOrigin,
+  createTurnAdmission,
+  getSessionOrigin,
+  getTurnAdmission,
+  runtimeEventBus,
+} from "../../src/shell/turn-admission.js";
 import {
   approvedOrigin,
   isValidOrigin,
@@ -73,6 +79,51 @@ describe("bob#356 — the voice turn origin", () => {
     expect(prompts).toEqual([]);
     await admission.admitTurn({ kind: "run" }, "next");
     expect(prompts).toEqual(["next"]);
+  });
+});
+
+describe("bob#356 round 1 — the origin a tool call is BOUND to, never defaulted", () => {
+  it("readAdmittedOrigin: the admitted turn's origin inside it; undefined outside and after it settled", async () => {
+    const admission = createTurnAdmission();
+    const seen: Array<TurnOrigin | undefined> = [];
+    const late: Array<TurnOrigin | undefined> = [];
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt() {
+        seen.push(admission.readAdmittedOrigin());
+        // a continuation of the turn that runs AFTER its prompt settled
+        setTimeout(() => late.push(admission.readAdmittedOrigin()), 30);
+      },
+    });
+    expect(admission.readAdmittedOrigin()).toBeUndefined();
+    expect(admission.readOrigin()).toEqual({ kind: "run" }); // the defaulting reader, unchanged
+    await admission.admitTurn({ kind: "cron", job: "standup" }, "go");
+    expect(seen).toEqual([{ kind: "cron", job: "standup" }]);
+    expect(admission.readAdmittedOrigin()).toBeUndefined();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(late).toEqual([undefined]); // the settled turn binds nothing any more
+  });
+
+  it("the runtime bus carries the admission and/or the declared session origin; nothing when neither", () => {
+    const admission = createTurnAdmission();
+    const both = { events: runtimeEventBus({ admission, sessionOrigin: { kind: "run" } }) };
+    expect(getTurnAdmission(both)).toBe(admission);
+    expect(getSessionOrigin(both)).toEqual({ kind: "run" });
+    const runOnly = { events: runtimeEventBus({ sessionOrigin: { kind: "run" } }) };
+    expect(getTurnAdmission(runOnly)).toBeUndefined();
+    const none = { events: runtimeEventBus({}) };
+    expect(getSessionOrigin(none)).toBeUndefined();
+    // a declared origin is validated and copied: an extra field never travels
+    expect(
+      getSessionOrigin({
+        events: runtimeEventBus({ sessionOrigin: { kind: "run", extra: 1 } as TurnOrigin }),
+      }),
+    ).toEqual({ kind: "run" });
+    // binding: an admission wins (and binds nothing outside a turn); else the declared origin
+    expect(boundOrigin({ admission, sessionOrigin: { kind: "run" } })).toBeUndefined();
+    expect(boundOrigin({ sessionOrigin: { kind: "run" } })).toEqual({ kind: "run" });
+    expect(boundOrigin({})).toBeUndefined();
   });
 });
 

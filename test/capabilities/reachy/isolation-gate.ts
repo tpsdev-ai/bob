@@ -2,9 +2,10 @@
 //
 // An isolation proof that cannot run where it is run (no sidecar user, no
 // `sudo -n` path, not macOS) SKIPS, visibly, with its reason in the test name.
-// On the release host the operator sets BOB_REQUIRE_ISOLATION_PROOFS=1
-// (`bun run check:reachy-isolation` does), and then a proof that would skip
-// FAILS instead: a skipped proof never passes a release.
+// On the release host the operator runs `bun run check:reachy-isolation` — a
+// MANUAL prerequisite, no CI workflow runs it — which sets
+// BOB_REQUIRE_ISOLATION_PROOFS=1: a proof that would skip FAILS instead, and the
+// check also fails on any pinned proof that did not pass.
 
 import { it } from "bun:test";
 

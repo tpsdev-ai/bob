@@ -9,10 +9,10 @@ export type TurnOrigin =
   | { kind: "cron"; job: string }
   | { kind: "discord"; channelId: string }
   // bob#356: speech heard in the room (both reachy profiles use this one kind).
-  // Every field is bob-computed at admission: `speakerVerified` from bob's own
-  // enrolment, the utterance and correlation ids issued by bob. Nothing the
-  // sidecar or the transcript says can set them, and the label never carries
-  // the utterance's words.
+  // V2's producer will compute every field at admission: `speakerVerified` from
+  // bob's own enrolment, the utterance and correlation ids issued by bob. V1
+  // has no producer: admission validates and copies the fields, then refuses
+  // the turn (turn-admission.ts). The label never carries the utterance's words.
   | { kind: "voice"; speakerVerified: boolean; utteranceId: string; correlationId: string };
 
 const DEFAULT_MAX_LABEL_CHARS = 120;

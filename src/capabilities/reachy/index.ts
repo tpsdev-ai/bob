@@ -5,17 +5,18 @@
 // hand them to the testable core (wireReachyCapability). Inbound socket lines are
 // decoded by wire.ts (one shape, schema-checked) before policy.
 //
-// SECURITY: the capability holds no keys and reads no key files; it talks to the
-// sidecar only through the socket. bob never launches the sidecar: it runs as its
-// own OS user under a deny-default sandbox profile, started by the operator's
-// launcher (sidecar/reachy-voice/RUNBOOK.md). bob only connects.
+// SECURITY: the capability holds no key of its own, but its Flair client's
+// signer reads the agent's key file to sign the audit and memory writes; it talks
+// to the sidecar only through the socket. bob never launches the sidecar: it runs
+// as its own OS user under a deny-default sandbox profile, started by the
+// operator's launch job (sidecar/reachy-voice/RUNBOOK.md). bob only connects.
 //
 // bob#356 V1: every connection begins with the reachy-voice/1 handshake
 // (capability.ts `connected`), and a dropped or refused connection is retried
 // with a bounded backoff — each retry is a fresh handshake.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getTurnAdmission } from "../../shell/turn-admission.js";
+import { boundOrigin, getSessionOrigin, getTurnAdmission } from "../../shell/turn-admission.js";
 import { FlairHttpClient } from "../flair/client.js";
 import { loadConfigFromEnv as loadFlairConfig } from "../flair/config.js";
 import {
@@ -71,10 +72,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     lastAcknowledgeAtMs: undefined as number | undefined,
   };
 
-  // The runtime-owned turn admission, read from pi's per-loader event bus. Its
-  // `readOrigin` names the admitted turn a tool call runs inside — the CALLER
-  // of `reachy_say`. Absent in a one-shot `bob run` (an operator's run).
+  // The CALLER of `reachy_say` (bob#356): the origin the runtime binds a tool
+  // call to, read from pi's per-loader event bus. In the persistent runtime
+  // only an admitted turn binds one; in a one-shot `bob run` the runtime
+  // declares `run` for the session; anywhere else nothing is bound and speech
+  // refuses. A missing admission never passes as `run`.
   const admission = getTurnAdmission(pi);
+  const sessionOrigin = getSessionOrigin(pi);
 
   const wired = wireReachyCapability({
     pi: pi as unknown as PiLike,
@@ -83,7 +87,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     store,
     state,
     sidecarVersion: config.sidecarVersion,
-    ...(admission ? { readOrigin: () => admission.readOrigin() } : {}),
+    readOrigin: () =>
+      boundOrigin({
+        ...(admission ? { admission } : {}),
+        ...(sessionOrigin ? { sessionOrigin } : {}),
+      }),
   });
 
   if (config.mute) {
@@ -99,5 +107,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   });
 
-  await superviseLink({ client: commands, wired }).start();
+  const supervisor = superviseLink({ client: commands, wired });
+  // The sidecar serves ONE connection at a time: when pi ends this session
+  // (shutdown, reload, a replacement session), release it, and stop retrying,
+  // so the next session's link can connect.
+  pi.on("session_shutdown", () => {
+    supervisor.stop();
+    wired.disconnected();
+    commands.close();
+  });
+  await supervisor.start();
 }
