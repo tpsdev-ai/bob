@@ -23,8 +23,9 @@
 //     package.json's packageManager declares (the version bob's lockfile is
 //     written with). Host-level, so it is checked before the agent directory
 //     and reports even when the agent does not exist yet. FAILS on a mismatch,
-//     on a bun that cannot be read, and on a declaration that is absent or
-//     cannot be read or parsed — a host whose bun has moved may fail
+//     on an installed bun whose version cannot be determined, and on a
+//     declaration that is absent or whose package.json cannot be read, is not
+//     JSON, or is not a JSON object — a host whose bun has moved may fail
 //     'bun install --frozen-lockfile' before anything else runs, so doctor names
 //     the remedy here instead
 //   - TPS mail inbox dir + new/cur counts
@@ -163,8 +164,8 @@ export type BunProbe = { version: string } | { error: string };
 
 // The installed bun, asked `bun --version` with a fixed argv and no shell. Only
 // PATH is passed through. A probe that cannot start, is killed at its timeout,
-// or prints anything that is not a whole version is an { error }, never a
-// version.
+// or prints nothing or anything that is not a whole version is an { error },
+// never a version.
 export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): BunProbe {
   const res = spawnSync("bun", ["--version"], {
     encoding: "utf8",
@@ -182,6 +183,7 @@ export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): Bun
     return { error: `'bun --version' exited ${res.status ?? res.signal}` };
   }
   const out = (typeof res.stdout === "string" ? res.stdout : "").trim();
+  if (out === "") return { error: "'bun --version' printed nothing" };
   return BUN_VERSION_OUTPUT.test(out)
     ? { version: out }
     : { error: `'bun --version' printed ${JSON.stringify(out)}` };
@@ -189,10 +191,10 @@ export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): Bun
 
 // The `bun version` check: the installed bun against the declared one. Every
 // case that is not an exact match FAILS with a named remedy — a declaration
-// that is absent, or a package.json that cannot be read or parsed, is a finding
-// too, never a silent pass. The declared version's remedy is
-// `npx -y bun@<declared> install --frozen-lockfile`, the one the issue names, or
-// installing that bun.
+// that is absent, or a package.json that cannot be read, parsed, or is not a
+// JSON object, is a finding too, never a silent pass. The declared version's
+// remedy is `npx -y bun@<declared> install --frozen-lockfile`, the one the issue
+// names, or installing that bun.
 export function bunVersionFinding(o: {
   declaration: DeclaredBunVersion;
   probe: BunProbe;
@@ -222,7 +224,7 @@ export function bunVersionFinding(o: {
     return {
       name: BUN_VERSION_CHECK,
       status: "fail",
-      detail: `the installed bun could not be read (${o.probe.error}); the lockfile is written with bun ${declared}, so 'bun install --frozen-lockfile' may fail`,
+      detail: `the installed bun version could not be determined (${o.probe.error}); the lockfile is written with bun ${declared}, so 'bun install --frozen-lockfile' may fail`,
       fix: `install bun ${declared}, or run 'npx -y bun@${declared} install --frozen-lockfile'`,
     };
   }
@@ -242,14 +244,15 @@ export function bunVersionFinding(o: {
 }
 
 // package.json as read: the packageManager declaration, or the reason it could
-// not be read. An unreadable or invalid manifest keeps its read/parse error —
-// doctor never reports it as a declaration that is absent.
+// not be read. An unreadable manifest, one that is not JSON, and one that is
+// JSON but not an object each keep their own reason — doctor never reports
+// them as a declaration that is absent.
 export type DeclaredBunVersion = { packageManager: unknown } | { error: string };
 
 // The packageManager a given package.json carries. The default is the
 // package.json beside the running module (a checkout or an npm install); a test
-// passes its own. Never throws: the read or parse error is returned, not
-// swallowed.
+// passes its own. Never throws: the read, parse or shape error is returned,
+// not swallowed.
 export function readDeclaredBunVersion(
   packageJsonPath: string | URL = new URL("../../package.json", import.meta.url),
 ): DeclaredBunVersion {
@@ -259,11 +262,20 @@ export function readDeclaredBunVersion(
   } catch (error) {
     return { error: `package.json could not be read: ${(error as Error).message}` };
   }
+  let manifest: unknown;
   try {
-    return { packageManager: (JSON.parse(raw) as { packageManager?: unknown }).packageManager };
+    manifest = JSON.parse(raw);
   } catch (error) {
     return { error: `package.json could not be parsed: ${(error as Error).message}` };
   }
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    const shape =
+      manifest === null ? "null" : Array.isArray(manifest) ? "an array" : `a ${typeof manifest}`;
+    return {
+      error: `package.json has an invalid manifest shape: expected a JSON object, got ${shape}`,
+    };
+  }
+  return { packageManager: (manifest as { packageManager?: unknown }).packageManager };
 }
 
 export function runDoctor(opts: DoctorOptions): DoctorReport {

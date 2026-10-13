@@ -1,8 +1,9 @@
 // bob#355: `bob doctor` reports the host's bun version against the version
 // package.json's packageManager declares (the version bob's lockfile is written
 // with). Host-level, so it reports whether or not the agent exists. A mismatch,
-// a bun that cannot be read, and a declaration that is absent or cannot be read
-// or parsed each become a named finding.
+// an installed bun whose version cannot be determined, and a declaration that
+// is absent, unreadable, not JSON or not a JSON object each become a named
+// finding.
 import { afterEach, describe, expect, it } from "bun:test";
 import {
   chmodSync,
@@ -78,6 +79,21 @@ describe("readDeclaredBunVersion", () => {
     if ("error" in result) expect(result.error).toContain("could not be parsed");
   });
 
+  it("reports a valid-JSON manifest that is not an object as an invalid shape, not a parse error", () => {
+    const dir = scratch();
+    const path = join(dir, "package.json");
+    for (const [contents, shape] of [
+      ["null", "null"],
+      ["[]", "an array"],
+      ["42", "a number"],
+    ]) {
+      writeFileSync(path, `${contents}\n`);
+      expect(readDeclaredBunVersion(path)).toEqual({
+        error: `package.json has an invalid manifest shape: expected a JSON object, got ${shape}`,
+      });
+    }
+  });
+
   it("keeps the read error of an unreadable manifest, for every uid", () => {
     // A dangling symlink fails the read for root too, unlike mode 000.
     const dir = scratch();
@@ -107,11 +123,38 @@ describe("bunVersionFinding", () => {
     expect(finding.fix).toContain("npx -y bun@1.3.10 install --frozen-lockfile");
   });
 
-  it("FAILs when bun cannot be read, naming the remedy, and never crashes", () => {
+  it("FAILs when the installed bun's version cannot be determined, naming the remedy", () => {
     const finding = bunVersionFinding({ declaration, probe: { error: "ENOENT" } });
     expect(finding.status).toBe("fail");
-    expect(finding.detail).toContain("could not be read (ENOENT)");
+    expect(finding.detail).toContain("the installed bun version could not be determined (ENOENT)");
     expect(finding.fix).toContain("npx -y bun@1.3.10 install --frozen-lockfile");
+  });
+
+  it("FAILs a bun that runs but prints no version or an invalid one as undetermined", () => {
+    for (const [output, printed] of [
+      ["", "'bun --version' printed nothing"],
+      ["not-a-version", `'bun --version' printed "not-a-version"`],
+    ]) {
+      const finding = bunVersionFinding({ declaration, probe: probeInstalledBun(fakeBun(output)) });
+      expect(finding.status).toBe("fail");
+      expect(finding.detail).toContain(
+        `the installed bun version could not be determined (${printed})`,
+      );
+      expect(finding.detail).not.toContain("could not be read");
+    }
+  });
+
+  it("FAILs a manifest of invalid shape with that reason, not a parse error", () => {
+    const dir = scratch();
+    const path = join(dir, "package.json");
+    writeFileSync(path, "null\n");
+    const finding = bunVersionFinding({
+      declaration: readDeclaredBunVersion(path),
+      probe: { version: "1.3.10" },
+    });
+    expect(finding.status).toBe("fail");
+    expect(finding.detail).toContain("package.json has an invalid manifest shape");
+    expect(finding.detail).not.toContain("could not be parsed");
   });
 
   it("FAILs an absent declaration rather than passing", () => {

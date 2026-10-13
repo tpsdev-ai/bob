@@ -1,14 +1,17 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // bob#355: package.json's packageManager declares the bun version bob's
 // lockfile is written with. Every CI workflow step that uses oven-sh/setup-bun
 // must install that same version: package.json is the one source of truth, and
 // this check fails when a step's bun-version input is missing, is not a literal
 // version, or drifts from it.
+//
+// It runs on bun and parses with bun's built-in YAML parser, with no installed
+// dependency, so CI runs it before `bun install --frozen-lockfile`: a drifting
+// step is named even when that install would fail.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
 const BUN_PACKAGE_MANAGER = /^bun@(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/;
@@ -42,39 +45,83 @@ function stepLabel(step, index) {
   return `step ${index + 1}`;
 }
 
-// Report a packageManager that is not a pinned bun, every setup-bun step that
-// is missing, non-literal or drifting, a workflow that does not parse, and the
-// vacuous case (no setup-bun step to check). [] means the check passed.
+// What a parsed JSON or YAML value is, for an error message.
+function shapeOf(value) {
+  if (value === null) return "null";
+  return Array.isArray(value) ? "an array" : `a ${typeof value}`;
+}
+
+function isMapping(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Report a package.json that cannot be read, parsed, or is not an object, a
+// packageManager that is not a pinned bun, every setup-bun step that is
+// missing, non-literal or drifting, a workflow that cannot be read or parsed,
+// and the vacuous case (no setup-bun step to check). [] means the check passed.
 export function checkBunVersionPins({ root = ROOT } = {}) {
   const errors = [];
-  let declared;
-  try {
-    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    declared =
-      typeof pkg.packageManager === "string"
-        ? BUN_PACKAGE_MANAGER.exec(pkg.packageManager.trim())?.[1]
-        : undefined;
-  } catch (error) {
-    errors.push(`package.json could not be read: ${error.message}`);
+  const fail = (error) => {
+    errors.push(error);
     return { declared: undefined, pins: 0, errors };
+  };
+  let raw;
+  try {
+    raw = readFileSync(join(root, "package.json"), "utf8");
+  } catch (error) {
+    return fail(`package.json could not be read: ${error.message}`);
   }
+  let pkg;
+  try {
+    pkg = JSON.parse(raw);
+  } catch (error) {
+    return fail(`package.json could not be parsed as JSON: ${error.message}`);
+  }
+  if (!isMapping(pkg)) {
+    return fail(
+      `package.json has an invalid manifest shape: expected a JSON object, got ${shapeOf(pkg)}`,
+    );
+  }
+  const declared =
+    typeof pkg.packageManager === "string"
+      ? BUN_PACKAGE_MANAGER.exec(pkg.packageManager.trim())?.[1]
+      : undefined;
   if (declared === undefined) {
-    errors.push(
+    return fail(
       'package.json packageManager is not a pinned "bun@<version>", so the workflow pins cannot be checked against it',
     );
-    return { declared: undefined, pins: 0, errors };
+  }
+  const parseYaml = globalThis.Bun?.YAML?.parse;
+  if (typeof parseYaml !== "function") {
+    errors.push(
+      "Bun.YAML is not available: run this check with a bun that has the built-in YAML parser",
+    );
+    return { declared, pins: 0, errors };
   }
   let pins = 0;
   for (const file of workflowFiles(root)) {
     const rel = relative(root, file);
+    let text;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch (error) {
+      errors.push(`${rel}: could not be read: ${error.message}`);
+      continue;
+    }
     let doc;
     try {
-      doc = parseYaml(readFileSync(file, "utf8"));
+      doc = parseYaml(text);
     } catch (error) {
       errors.push(`${rel}: could not be parsed as YAML: ${String(error.message).split("\n")[0]}`);
       continue;
     }
-    for (const [job, config] of Object.entries(doc?.jobs ?? {})) {
+    // bun's parser returns an array for a stream of several documents, where a
+    // workflow is one mapping; such a file is reported, not skipped.
+    if (!isMapping(doc)) {
+      errors.push(`${rel}: is not one YAML mapping (parsed as ${shapeOf(doc)})`);
+      continue;
+    }
+    for (const [job, config] of Object.entries(doc.jobs ?? {})) {
       const steps = Array.isArray(config?.steps) ? config.steps : [];
       for (const [index, step] of steps.entries()) {
         if (!step || typeof step !== "object") continue;
@@ -98,8 +145,8 @@ export function checkBunVersionPins({ root = ROOT } = {}) {
       }
     }
   }
-  // Only a run that parsed every workflow can conclude there is nothing to
-  // check; a parse error above is already the finding.
+  // Only a run that read and parsed every workflow can conclude there is
+  // nothing to check; an error above is already the finding.
   if (pins === 0 && errors.length === 0) {
     errors.push("no oven-sh/setup-bun step found in .github/workflows to check");
   }
