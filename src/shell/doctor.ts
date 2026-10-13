@@ -19,6 +19,12 @@
 //     session for that model refuses to start without it), naming the exact
 //     line to add; SKIPS when it declares no provider.model; OK when it
 //     declares both
+//   - bun version (bob#355): the host's installed bun against the version
+//     package.json's packageManager declares (the version bob's lockfile is
+//     written with). FAILS on a mismatch, on a bun that cannot be read, and on
+//     an absent or unparseable declaration — a host whose bun has moved fails
+//     'bun install --frozen-lockfile' before anything else runs, so doctor names
+//     the remedy here instead
 //   - TPS mail inbox dir + new/cur counts
 //   - Discord token file (if path-hint exists)
 //   - tps-mail (bob#200): FAILS when channels.tps_mail is declared with no
@@ -113,6 +119,9 @@ export interface DoctorOptions {
   flairKeysDir?: string;
   // Override for tests. Defaults to process.env.HOME.
   homeDir?: string;
+  // Override for tests: the host's bun version doctor would read. Default:
+  // probe `bun --version` on PATH.
+  installedBunVersion?: string;
   // PATH searched for the tps CLI (tests). Defaults to process.env.PATH.
   pathEnv?: string;
   // Wall-clock bound on the tps reply-contract probe (tests). Default 10 s.
@@ -121,6 +130,107 @@ export interface DoctorOptions {
   // Default: <home>/.bob/host and bob's packaged positions.
   hostRoot?: string;
   positionsRoot?: string;
+}
+
+// bob#355: the bun version bob's lockfile is written with. package.json's
+// packageManager declares it, and CI's setup-bun pins must agree with it
+// (scripts/check-bun-version.mjs). A host whose bun has moved — a Homebrew bun
+// upgraded past the lockfile's version — fails
+// `bun install --frozen-lockfile` with "overrides in package.json changed since
+// bun.lock was saved", before any of bob runs. Doctor reports the mismatch, or
+// the missing declaration, before that install.
+export const BUN_VERSION_CHECK = "bun version";
+export const BUN_PROBE_TIMEOUT_MS = 5_000;
+
+// package.json's packageManager pin, as npm writes it: "bun@1.3.10".
+const BUN_PACKAGE_MANAGER = /^bun@(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/;
+
+// The version in `packageManager`, or undefined when it is absent or not a
+// pinned bun. Never throws: a shape doctor cannot parse is a finding, not a
+// crash.
+export function declaredBunVersion(packageManager: unknown): string | undefined {
+  if (typeof packageManager !== "string") return undefined;
+  return BUN_PACKAGE_MANAGER.exec(packageManager.trim())?.[1];
+}
+
+export type BunProbe = { version: string } | { error: string };
+
+// The installed bun, asked `bun --version` with a fixed argv, no shell, and an
+// environment of PATH only, so no ambient variable reaches the child. A probe
+// that cannot start, is killed at its timeout, or prints something that is not
+// a version is an { error }, never a version.
+export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): BunProbe {
+  const res = spawnSync("bun", ["--version"], {
+    encoding: "utf8",
+    env: { PATH: pathEnv },
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+    timeout: BUN_PROBE_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: 64 * 1024,
+  });
+  if (res.error) {
+    return { error: (res.error as NodeJS.ErrnoException).code ?? res.error.message };
+  }
+  if (res.status !== 0) {
+    return { error: `'bun --version' exited ${res.status ?? res.signal}` };
+  }
+  const out = (typeof res.stdout === "string" ? res.stdout : "").trim();
+  return /^\d+\.\d+\.\d+/.test(out)
+    ? { version: out }
+    : { error: `'bun --version' printed ${JSON.stringify(out)}` };
+}
+
+// The `bun version` check: the installed bun against the declared one. Every
+// case that is not an exact match FAILS with a named remedy — the declaration
+// absent or unparseable is a finding too, never a silent pass. The declared
+// version's remedy is `npx -y bun@<declared> install --frozen-lockfile`, the
+// one the issue names, or installing that bun.
+export function bunVersionFinding(o: { packageManager: unknown; probe: BunProbe }): DoctorCheck {
+  const declared = declaredBunVersion(o.packageManager);
+  if (declared === undefined) {
+    return {
+      name: BUN_VERSION_CHECK,
+      status: "fail",
+      detail: `package.json declares packageManager ${
+        o.packageManager === undefined ? "not at all" : JSON.stringify(o.packageManager)
+      }, so the bun version bob's lockfile is written with cannot be determined`,
+      fix: 'set packageManager to "bun@<version>" in package.json (the version CI installs with)',
+    };
+  }
+  if ("error" in o.probe) {
+    return {
+      name: BUN_VERSION_CHECK,
+      status: "fail",
+      detail: `the installed bun could not be read (${o.probe.error}); the lockfile is written with bun ${declared}, so 'bun install --frozen-lockfile' may fail`,
+      fix: `install bun ${declared}, or run 'npx -y bun@${declared} install --frozen-lockfile'`,
+    };
+  }
+  if (o.probe.version !== declared) {
+    return {
+      name: BUN_VERSION_CHECK,
+      status: "fail",
+      detail: `bun ${o.probe.version} does not match the declared bun ${declared}; 'bun install --frozen-lockfile' fails under a version the lockfile was not written with`,
+      fix: `run 'npx -y bun@${declared} install --frozen-lockfile', or install bun ${declared}`,
+    };
+  }
+  return {
+    name: BUN_VERSION_CHECK,
+    status: "ok",
+    detail: `bun ${declared} matches packageManager in package.json`,
+  };
+}
+
+// package.json's packageManager, as the installed (or checked-out) package
+// carries it. A package.json doctor cannot read yields undefined, and the check
+// above reports the missing declaration rather than throwing.
+function readDeclaredBunVersion(): unknown {
+  try {
+    const raw = readFileSync(new URL("../../package.json", import.meta.url), "utf8");
+    return (JSON.parse(raw) as { packageManager?: unknown }).packageManager;
+  } catch {
+    return undefined;
+  }
 }
 
 export function runDoctor(opts: DoctorOptions): DoctorReport {
@@ -145,6 +255,18 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     return finalize(opts.name, agentDir, checks);
   }
   checks.push({ name: "agent dir", status: "ok", detail: agentDir });
+
+  // bob#355: the bun the lockfile is written with, checked before the layout so
+  // a host that cannot install bob hears it. Overridden in tests.
+  checks.push(
+    bunVersionFinding({
+      packageManager: readDeclaredBunVersion(),
+      probe:
+        opts.installedBunVersion !== undefined
+          ? { version: opts.installedBunVersion }
+          : probeInstalledBun(),
+    }),
+  );
 
   // soul.md
   checks.push(
