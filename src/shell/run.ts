@@ -614,8 +614,9 @@ export interface RunSessionConfig {
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
   // bob#356: the origin the runtime DECLARES for a session no admission serves:
-  // `{kind:"run"}` for an operator's one-shot `bob run` (runAgent), absent for
-  // a mail turn and an interactive launch. Never read from bob.yaml or a prompt.
+  // `{kind:"run"}` only for an operator's one-shot `bob run` (the CLI entry
+  // passes RunOptions.sessionOrigin); absent for `bob launch`, a mail turn and
+  // every other caller. Never read from bob.yaml or a prompt.
   sessionOrigin?: TurnOrigin;
   // The tool policy resolved from bob.yaml's `tools:` block + top-level
   // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
@@ -702,6 +703,11 @@ export type RunSessionFactory = (config: RunSessionConfig) => Promise<RunSession
 export interface RunOptions {
   // Agent name. Config lives at ~/agents/<name>/.
   name: string;
+  // bob#356: the origin the RUNTIME declares for this one-shot session. Only
+  // the `bob run <name> "<task>"` CLI entry passes it (an operator's run); a
+  // prompted `bob launch`, a mail turn and every other caller leave it unset,
+  // so their tool calls are bound to nothing.
+  sessionOrigin?: { kind: "run" };
   // The validated provider selection this run resolves against. Loaded ONCE by
   // the caller (the CLI) and threaded here; it defaults to the built-in table
   // for tests. Never re-loaded per call.
@@ -938,9 +944,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
     ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
   });
-  // bob#356: an operator's one-shot run binds the `run` origin for the whole
-  // session; a mail turn binds none (its sender is not an operator).
-  if (opts.mailTurn !== true) resolved.config.sessionOrigin = { kind: "run" };
+  // bob#356: only the session the `bob run` CLI entry declares an operator's
+  // run binds the `run` origin (never a mail turn, whatever the caller passes).
+  if (opts.sessionOrigin?.kind === "run" && opts.mailTurn !== true) {
+    resolved.config.sessionOrigin = { kind: "run" };
+  }
   const bounds = createRunBounds(limits, opts.timer);
   try {
     return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);

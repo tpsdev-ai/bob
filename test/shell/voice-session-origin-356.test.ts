@@ -1,9 +1,10 @@
-// bob#356 round 1: which sessions the RUNTIME declares an origin for. Only an
-// operator's one-shot `bob run` declares `run`; a mail turn (its sender is not
-// an operator) and the persistent runtime (served by turn admission) declare
-// none — so a tool call there is bound only by an admitted turn, or not at all.
+// bob#356: which sessions the RUNTIME declares an origin for. Only an
+// operator's one-shot `bob run` (the CLI entry) declares `run`; a prompted
+// `bob launch`, a mail turn (its sender is not an operator) and the persistent
+// runtime (served by turn admission) declare none — so a tool call there is
+// bound only by an admitted turn, or not at all.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serializeMailTurnInput } from "../../src/capabilities/tps-mail/prompt.js";
@@ -12,6 +13,7 @@ import {
   type RunSession,
   type RunSessionConfig,
   runAgent,
+  runLaunch,
   runMailTurnLaunch,
 } from "../../src/shell/run.js";
 
@@ -78,11 +80,55 @@ function capture(): {
   };
 }
 
-describe("bob#356 round 1 — the runtime-declared session origin", () => {
-  it("a one-shot `bob run` declares `run`", async () => {
+describe("bob#356 — the runtime-declared session origin", () => {
+  it("runAgent declares `run` ONLY when its caller (the `bob run` CLI entry) says so", async () => {
+    const declared = capture();
+    await runAgent({
+      name: "testbot",
+      prompt: "hi",
+      agentsRoot,
+      sessionOrigin: { kind: "run" },
+      sessionFactory: declared.factory,
+    });
+    expect(declared.seen[0]?.sessionOrigin).toEqual({ kind: "run" });
+    const plain = capture();
+    await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: plain.factory });
+    expect(plain.seen[0]?.sessionOrigin).toBeUndefined();
+  });
+
+  it("a PROMPTED `bob launch` declares nothing: its tool calls are unbound", async () => {
     const c = capture();
-    await runAgent({ name: "testbot", prompt: "hi", agentsRoot, sessionFactory: c.factory });
-    expect(c.seen[0]?.sessionOrigin).toEqual({ kind: "run" });
+    const code = await runLaunch({
+      name: "testbot",
+      prompt: "say hello",
+      agentsRoot,
+      sessionFactory: c.factory,
+    });
+    expect(code).toBe(0);
+    expect(c.seen[0]).toBeDefined();
+    expect(c.seen[0]?.sessionOrigin).toBeUndefined();
+  });
+
+  it("the `bob run` CLI entry is the one caller that passes the `run` origin", () => {
+    // src/cli.ts runs on import, so this reads its source: the one-shot
+    // runAgent call in run() declares the origin, and nothing else in the CLI
+    // or in runLaunch does.
+    const cli = readFileSync(join(import.meta.dirname, "..", "..", "src", "cli.ts"), "utf8");
+    const runFn = cli.slice(
+      cli.indexOf("async function run("),
+      cli.indexOf("async function installServiceCmd"),
+    );
+    expect(runFn).toContain('sessionOrigin: { kind: "run" }');
+    expect(cli.split('sessionOrigin: { kind: "run" }').length - 1).toBe(1);
+    const runTs = readFileSync(
+      join(import.meta.dirname, "..", "..", "src", "shell", "run.ts"),
+      "utf8",
+    );
+    const launch = runTs.slice(
+      runTs.indexOf("export async function runLaunch"),
+      runTs.indexOf("export function watchParent"),
+    );
+    expect(launch).not.toContain("sessionOrigin");
   });
 
   it("a MAIL turn declares nothing (its sender is not an operator)", async () => {

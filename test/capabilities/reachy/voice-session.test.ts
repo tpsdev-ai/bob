@@ -1,23 +1,25 @@
-// bob#356 round 1 — the speech origin through the REAL session path. No fake pi
-// registry: an agent on disk (bob.yaml declaring `flair` and `reachy`), bob's
-// real config resolution, resource loader and session factory, the REAL reachy
-// extension (the built package), a scripted model that calls `reachy_say`, the
-// REAL voice sidecar on a UNIX socket, and a local HTTP Flair double that
-// accepts the audit writes.
+// bob#356 — the speech origin and the link lifecycle through the REAL session
+// path. No fake pi registry: an agent on disk (bob.yaml declaring `flair` and
+// `reachy`), bob's real config resolution, resource loader and session factory,
+// the REAL reachy extension (the built package), the REAL voice sidecar on a
+// UNIX socket, and bob's real Flair client. What is NOT production: a scripted
+// model that calls `reachy_say`; stand-in Piper and player programs; an HTTP
+// Flair double (flair-double.ts) that verifies the request signature and
+// enforces Flair's Memory owner guard; and the session factory's tool policy —
+// no shipped role allows a reachy tool yet, so the factory is handed the reachy
+// tools (as the anchored-edit integration test does).
 //
-//   * one-shot `bob run`: the runtime declares `run` for the session, so a
-//     `run` grant speaks; the session's EFFECTIVE tools under the voice profile
-//     are reachy_say/reachy_state, and no body tool is even registered;
+//   * `bob run` (the CLI entry declares `run`): a `run` grant speaks; the
+//     session's effective tools under the voice profile are reachy_say and
+//     reachy_state, and no body tool is even registered;
+//   * a PROMPTED `bob launch` declares nothing: refused, even with `run` granted;
 //   * persistent runtime: a prompt OUTSIDE every admission is bound to nothing
-//     and refuses — even with `run` granted — while an admitted cron turn
-//     speaks under its own `cron:<job>` grant.
-//
-// No shipped role allows a reachy tool yet, so the session factory is handed
-// the reachy tools as its policy (as the anchored-edit integration test does);
-// everything else is production code.
+//     and refused, while an admitted cron turn speaks under `cron:<job>`;
+//   * a real pi RELOAD emits `session_shutdown`: the old extension closes its
+//     link, and the replacement extension handshakes on the freed sidecar.
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, type KeyObject, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -27,7 +29,6 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer as createHttpServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -39,8 +40,9 @@ import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { initAgent } from "../../../src/shell/init.js";
 import { startPersistent } from "../../../src/shell/persistent.js";
 import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../../src/shell/run.js";
-import { runAgent } from "../../../src/shell/run.js";
+import { runAgent, runLaunch } from "../../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../../src/shell/session.js";
+import { type FlairDouble, startFlairDouble } from "./flair-double.js";
 import { must } from "./handshake.js";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
@@ -54,9 +56,9 @@ const STUB_MODEL = "stub-1";
 let root: string;
 let sidecar: ChildProcess | undefined;
 let sidecarLog = "";
-let flair: Server;
-let flairUrl = "";
-const audits: Array<{ kind: string; summary: string }> = [];
+let flair: FlairDouble;
+const AGENTS = ["voicerun", "voicelaunch", "voicepersist", "voicereload"] as const;
+const keys = new Map<string, KeyObject>();
 
 function python(): string {
   return spawnSync(
@@ -70,37 +72,13 @@ function python(): string {
 
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "rvs-session-"));
-  // The local Flair double: Memory PUTs are recorded (the reachy audit store
-  // writes its OrgEvents there); everything else is 404.
-  flair = createHttpServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
-      body += c;
-    });
-    req.on("end", () => {
-      if (req.method === "PUT" && req.url?.startsWith("/Memory/")) {
-        try {
-          const event = JSON.parse(JSON.parse(body).content) as { kind: string; summary: string };
-          audits.push({ kind: event.kind, summary: event.summary });
-        } catch {
-          /* not an OrgEvent */
-        }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end("{}");
-        return;
-      }
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end("{}");
-    });
-  });
-  await new Promise<void>((r) => flair.listen(0, "127.0.0.1", () => r()));
-  const addr = flair.address();
-  flairUrl = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+  for (const name of AGENTS) keys.set(name, generateKeyPairSync("ed25519").privateKey);
+  flair = await startFlairDouble(Object.fromEntries(keys));
 });
 
 afterAll(() => {
   sidecar?.kill();
-  flair.close();
+  flair?.close();
   delete process.env.BOB_CAP_REACHY;
   delete process.env.BOB_CAP_FLAIR;
   rmSync(root, { recursive: true, force: true });
@@ -172,7 +150,7 @@ function agentOnDisk(name: string, roomSpeechOrigins: string[], sock: string): s
     skipFlair: true,
   });
   const keyFile = join(root, `${name}.key`);
-  const { privateKey } = generateKeyPairSync("ed25519");
+  const privateKey = must(keys.get(name), `a key for ${name}`);
   writeFileSync(keyFile, privateKey.export({ type: "pkcs8", format: "pem" }));
   chmodSync(keyFile, 0o600);
   const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8");
@@ -181,7 +159,7 @@ function agentOnDisk(name: string, roomSpeechOrigins: string[], sock: string): s
     [
       yaml.replace(/^capabilities:.*$/m, "capabilities:\n  - flair\n  - reachy"),
       "flair:",
-      `  url: ${flairUrl}`,
+      `  url: ${flair.url}`,
       `  agentId: ${name}`,
       `  keyFile: ${keyFile}`,
       "",
@@ -313,6 +291,13 @@ function realFactory(
 }
 
 const spoken = () => sidecarLog.match(/say\.spoken/g)?.length ?? 0;
+async function until(cond: () => boolean, what: string): Promise<void> {
+  const end = Date.now() + 10_000;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
 /** Playback completes after the tool returns: wait for the count to reach `n`. */
 async function spokenReaches(n: number): Promise<void> {
   const until = Date.now() + 10_000;
@@ -322,25 +307,56 @@ async function spokenReaches(n: number): Promise<void> {
   }
 }
 
-describe("bob#356 round 1 — the speech origin through the REAL session path", () => {
-  it("one-shot `bob run`: the runtime-declared `run` origin speaks under a `run` grant; the voice registry has no body tool", async () => {
+const audits = () => flair.audits;
+
+describe("bob#356 — the speech origin and the link lifecycle through the REAL session path", () => {
+  it("`bob run` (the CLI entry declares `run`): a `run` grant speaks, owned by the agent; the voice registry has no body tool", async () => {
     expect(existsSync(BUILT), "the reachy extension must be built (bun run build)").toBe(true);
     const agentsRoot = agentOnDisk("voicerun", ["run"], await startSidecar("run"));
     const seen: { active?: string[]; registered?: string[] } = {};
     const before = spoken();
-    audits.length = 0;
+    flair.audits.length = 0;
+    flair.refusals.length = 0;
     await runAgent({
       name: "voicerun",
       prompt: "say hello",
       agentsRoot,
+      sessionOrigin: { kind: "run" }, // as src/cli.ts's `bob run` passes it
       sessionFactory: realFactory("Hello from a one-shot run.", seen),
     });
     await spokenReaches(before + 1);
-    expect(audits.some((a) => a.kind === "reachy.say")).toBe(true);
+    const say = must(
+      audits().find((a) => a.kind === "reachy.say"),
+      "the say audit",
+    );
+    expect(say.owner).toBe("voicerun"); // the authenticated agent owns the record
+    expect(flair.refusals).toEqual([]); // the owner guard refused nothing
     expect(must(seen.active, "active tools").sort()).toEqual(["reachy_say", "reachy_state"]);
     expect(seen.registered).toContain("reachy_say");
     expect(seen.registered).not.toContain("reachy_look");
     expect(seen.registered).not.toContain("reachy_frame");
+  }, 60_000);
+
+  it("a PROMPTED `bob launch` is bound to nothing: refused, even with `run` granted", async () => {
+    const agentsRoot = agentOnDisk("voicelaunch", ["run"], await startSidecar("launch"));
+    const before = spoken();
+    flair.audits.length = 0;
+    const code = await runLaunch({
+      name: "voicelaunch",
+      prompt: "say hello",
+      agentsRoot,
+      sessionFactory: realFactory("Hello from a launch.", {}),
+    });
+    expect(code).toBe(0);
+    expect(
+      must(
+        audits().find((a) => a.kind === "reachy.refused"),
+        "the refusal",
+      ).summary,
+    ).toContain("bound to no admitted turn and no runtime-declared run");
+    expect(audits().some((a) => a.kind === "reachy.say")).toBe(false);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(spoken()).toBe(before);
   }, 60_000);
 
   it("persistent: a prompt OUTSIDE every admission is bound to nothing and refused, even with `run` granted; an admitted cron turn speaks", async () => {
@@ -359,20 +375,48 @@ describe("bob#356 round 1 — the speech origin through the REAL session path", 
     });
     try {
       const before = spoken();
-      audits.length = 0;
+      flair.audits.length = 0;
       await handle.session.prompt("speak", { expandPromptTemplates: false });
-      const refusal = audits.find((a) => a.kind === "reachy.refused");
+      const refusal = audits().find((a) => a.kind === "reachy.refused");
       expect(must(refusal, "the refusal").summary).toContain(
         "bound to no admitted turn and no runtime-declared run",
       );
-      expect(audits.some((a) => a.kind === "reachy.say")).toBe(false);
+      expect(audits().some((a) => a.kind === "reachy.say")).toBe(false);
       await new Promise((r) => setTimeout(r, 500));
       expect(spoken()).toBe(before); // nothing was sent, so nothing plays
 
       await handle.admitTurn({ kind: "cron", job: "speak" }, "speak");
       await spokenReaches(before + 1);
-      expect(audits.some((a) => a.kind === "reachy.say")).toBe(true);
+      expect(audits().some((a) => a.kind === "reachy.say" && a.owner === "voicepersist")).toBe(
+        true,
+      );
       expect(must(seen.active, "active tools").sort()).toEqual(["reachy_say", "reachy_state"]);
+    } finally {
+      await handle.shutdown();
+    }
+  }, 60_000);
+
+  it("a real pi RELOAD: `session_shutdown` closes the old link, and the replacement extension handshakes on the freed sidecar", async () => {
+    const agentsRoot = agentOnDisk("voicereload", ["cron:speak"], await startSidecar("reload"));
+    const handle = await startPersistent({
+      name: "voicereload",
+      agentsRoot,
+      installSignalHandlers: false,
+      keepAlive: async () => {},
+      sessionFactory: realFactory("After the reload.", {}),
+    });
+    try {
+      await until(() => configured() === 1, "the first handshake");
+      // pi's own reload: it emits session_shutdown to the OLD extension, then
+      // loads a NEW instance of every extension.
+      await (handle.session as unknown as { reload(): Promise<void> }).reload();
+      // The sidecar serves one connection at a time: the replacement can only
+      // handshake once the old link is gone.
+      await until(() => sidecarLog.includes("disconnected"), "the old link to close");
+      await until(() => configured() === 2, "the replacement's handshake");
+      const before = spoken();
+      await handle.admitTurn({ kind: "cron", job: "speak" }, "speak");
+      await spokenReaches(before + 1); // the replacement link speaks
     } finally {
       await handle.shutdown();
     }

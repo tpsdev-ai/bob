@@ -25,8 +25,9 @@ Speech (local text-to-speech with Piper):
   - the text is validated again here (one line, 1-500 characters);
   - Piper writes the waveform into a fresh 0700 directory under --work-dir, to a
     file created 0600 before Piper opens it (and the process umask is 077);
-  - the OS player plays that file; the file and its directory are removed
-    afterwards, whatever happened. Nothing else is written anywhere.
+  - the OS player plays that file; then the sidecar removes the file and its
+    directory. If that removal FAILS, the artifact can remain on disk: the
+    sidecar then fails closed (below). It writes nothing else of its own.
   - Nothing captured: this process never opens an input device.
   - FAIL CLOSED (bob#356 round 1): leftover artifacts from a crash are removed
     at startup, and a sidecar that cannot remove them refuses to start. A
@@ -81,8 +82,10 @@ def log(event, **fields):
 
 
 def digest(value):
-    """A short, non-reversible tag for a sender-chosen value (never logged raw).
-    bob can compute the same tag from the playback id it issued."""
+    """A 16-hex sha256 tag for a sender-chosen value, logged instead of it.
+    It hides the value from the log, not from a guess: a short or predictable
+    id can be recovered by hashing candidates. bob can compute the same tag
+    from the playback id it issued."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
@@ -330,7 +333,8 @@ def main(argv=None):
         choices=("unknown", "absent"),
         default="unknown",
         help="unknown: the hardware mute cannot be read, so report muted (fail closed); "
-        "absent: the operator declares no capture device is attached (V1 mouth only)",
+        "absent: report unmuted — V1 does not read the speakerphone's microphone or its "
+        "mute switch at all (mouth only)",
     )
     ap.add_argument("--socket-mode", default="0660")
     opts = ap.parse_args(argv)

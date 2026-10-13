@@ -68,11 +68,14 @@ id $SIDECAR_USER            # check: the uid, and the jarvis-voice group
 ## 2. The constrained `sudo -n` proof path
 
 The isolation proofs run ONE command as another user: the installed `proof.py`
-under the pinned interpreter (step 3 installs it root-owned). Its subcommands
-are bounded — `open` reports whether a path OPENS (it never reads), `connect`
-reports whether a socket accepts, and `probe`/`sidecar`/`clean` act only on a
-proof's scratch layout under `/private/tmp/rv-`, with the installed profile and
-sidecar. No other command, and never root:
+under the pinned interpreter (step 3 installs it root-owned). Nothing it runs
+as that user is unconfined and caller-chosen: `open` reports whether a path
+OPENS (it never reads), `connect` reports whether a socket accepts (and sends
+nothing), `probe` runs the installed egress probe ONLY under the installed
+profile with every spec field checked against a fixed whitelist (the one
+executable is `/usr/bin/true`), and `sidecar`/`clean` act only on a proof's
+scratch layout under `/private/tmp/rv-`. The unconfined controls run as bob's
+own user, without sudo. No other command, and never root:
 
 ```sh
 sudo tee /etc/sudoers.d/bob-reachy-voice-proofs >/dev/null <<EOF
@@ -86,12 +89,14 @@ sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER $PYTHON -I $INSTALL/proof.py open /
 ```
 
 The `nobody` line is the OUTSIDER: the proof shows a user outside
-`jarvis-voice` cannot connect to the deployed socket.
+`jarvis-voice` cannot connect to the socket ([P4] on a scratch socket with the
+deployed mode and group, [P8] on the deployed one).
 
 **Re-review this rule before V2 grants `jarvis-sidecar` the microphone.** The
-`probe` and `sidecar` subcommands run a proof's stand-in programs as that user
-(confined by the profile); once that user holds the microphone, that is a
-capture path around bob's gates.
+`sidecar` subcommand runs a proof's stand-in Piper and player (programs in the
+proof's scratch layout) as that user, confined by the profile — which allows
+the audio HAL; once that user holds the microphone, that is a capture path
+around bob's gates.
 
 ## 3. Install the sidecar and Piper (root-owned, hash-recorded)
 
@@ -181,7 +186,7 @@ one cannot be removed, and after a removal fails it stops speaking and reports
 `ok: false` (bob refuses the link and raises one alarm) until it is restarted
 cleanly. Its log names a digest of each playback id, never the id itself.
 
-The log is content-free (event names, playback ids, error classes — never the
+The log is content-free (event names, playback-id digests, error classes — never the
 spoken text). Core dumps are disabled in the process.
 
 ## 6. The agent's bob.yaml
@@ -247,15 +252,23 @@ bun run check:reachy-isolation
 ```
 
 It runs `test/capabilities/reachy/isolation.test.ts` with
-`BOB_REQUIRE_ISOLATION_PROOFS=1` and requires all seven pinned proofs to pass:
+`BOB_REQUIRE_ISOLATION_PROOFS=1`, with a minimal environment and the PINNED
+roots (it refuses to start when `BOB_REACHY_VOICE_DIR` or
+`BOB_ISOLATION_AGENTS_ROOT` is set), and requires all eight pinned proofs to
+pass:
 [P1]/[P3] deny-default confinement (network, child, exec, service and file
-egress denied, each probed denial shown to succeed unconfined first) as this
-user and as `jarvis-sidecar`; [P2]/[P4] the real sidecar's handshake and `say`
-over the authorized socket with no audio left — [P4] on the DEPLOYED 0660
-`jarvis-voice` socket, with an outsider refused; [P5] #180 S1's key-read proof
+egress denied) as this user and as `jarvis-sidecar`, each probed denial shown
+to succeed unconfined first — as THIS user, since the sudo rule allows no
+unconfined probe; [P2]/[P4] the real sidecar's handshake and `say` over the
+authorized socket with no audio left — [P4] as `jarvis-sidecar` on a SCRATCH
+socket with the deployed mode and group (0660, `jarvis-voice`), with an
+outsider refused; [P5] #180 S1's key-read proof
 on fixtures; [P6] the same on bob's active credentials (the provider stores
 and every key file the agent's `bob.yaml` names, plus bob's admin-password
 path): each 0600, owned by the agent, and refused to the sidecar user — this
 process only `stat`s them, and the sidecar user's attempt only opens; [P7] the
-installed files match the checkout. **A proof that is skipped, fails or is
+installed files at the pinned install root match the checkout; [P8] the
+DEPLOYED socket at `/usr/local/var/bob/reachy-voice/run/voice.sock` is 0660
+`jarvis-sidecar:jarvis-voice` in a 0750 directory of that owner and group, and
+an outsider's connect is refused. **A proof that is skipped, fails or is
 missing fails the check.**

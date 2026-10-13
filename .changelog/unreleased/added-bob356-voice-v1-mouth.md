@@ -30,11 +30,12 @@
   the sidecar's 0660 `jarvis-voice` socket can make it speak without bob. The
   `voice` turn origin is in the origin union, its validation, projection and
   label, and is not admitted until V2. The new sidecar (`sidecar/reachy-voice/`)
-  speaks with local Piper through an ephemeral 0600 file in a 0700 directory,
-  removed after playback, under a deny-default seatbelt profile as its own
+  speaks with local Piper through an ephemeral 0600 file in a 0700 directory
+  that it removes after playback (a failed removal leaves it on disk and the
+  sidecar fails closed), under a deny-default seatbelt profile as its own
   `jarvis-sidecar` user; it refuses to start when a stale speech file cannot be
   removed, stops speaking and reports `ok: false` when a removal fails, and logs
-  only a digest of each playback id. Its runbook gives the one-time admin steps,
+  only a truncated digest of each playback id. Its runbook gives the one-time admin steps,
   including a sudoers rule that names one installed proof command, and
   `bun run check:reachy-isolation` — a manual release-host prerequisite no CI
   workflow runs — fails on any skipped, failed or missing pinned isolation

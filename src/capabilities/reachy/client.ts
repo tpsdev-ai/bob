@@ -1,7 +1,8 @@
 // reachy/client.ts — the real UNIX-socket command channel + the durable OrgEvent
 // store and memory writer over the flair capability client (spec §3.2/§3.4).
-// Kept thin; the policy lives in policy.ts and the wiring in capability.ts, so
-// tests drive a fake and never open a socket or touch a real Flair.
+// Kept thin; the policy lives in policy.ts and the wiring in capability.ts. The
+// policy tests drive fakes; the socket client is also tested against real
+// local UNIX sockets (sidecar-stub, handshake-socket, voice-sidecar tests).
 
 import { createConnection, type Socket } from "node:net";
 import {
@@ -250,8 +251,10 @@ export class UnixSocketReachyClient implements ReachyCommands {
 
 /**
  * The memory-writer seam over the flair capability client. A memory jarvis writes
- * is ALWAYS `private`, authored by `jarvis`, with the speakerId AND the audit
- * correlation id in metadata (spec §3.4).
+ * is ALWAYS `private`, with the speakerId AND the audit correlation id in
+ * metadata (spec §3.4). Its Flair OWNER is the client's authenticated agent
+ * (bob#356 round 2): Flair's Memory owner guard refuses a body whose agentId is
+ * not the signing agent, so no `authorId` label is sent as the owner.
  */
 export function flairMemoryWriter(client: {
   write(
@@ -269,7 +272,6 @@ export function flairMemoryWriter(client: {
       return client.write(write.content, {
         durability: "standard",
         visibility: "private",
-        authorId: write.authorId,
         metadata: write.metadata,
       });
     },
@@ -302,7 +304,8 @@ export function flairOrgEventStore(client: {
         id: recordId,
         durability: "persistent",
         visibility: "private",
-        authorId: "jarvis",
+        // No authorId: the record's owner is the authenticated agent (round 2).
+        // The event's own `authorId` label travels inside its content.
         metadata: { kind: event.kind, orgEventId: recordId },
       });
       return { id };

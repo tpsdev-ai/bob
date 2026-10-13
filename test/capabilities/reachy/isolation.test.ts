@@ -1,5 +1,5 @@
 // bob#356 V1 — the reachy-voice sidecar's isolation proofs. Each proof carries a
-// stable id [P1]…[P7]; scripts/check-reachy-isolation.mjs pins that set, so a
+// stable id [P1]…[P8]; scripts/check-reachy-isolation.mjs pins that set, so a
 // missing proof fails the release-host check even when nothing was skipped.
 //
 //   [P1] DENY-DEFAULT CONFINEMENT (macOS seatbelt, the shipped
@@ -13,26 +13,32 @@
 //        handshake and a `say` with bob's REAL client over the one authorized
 //        socket; the speech artifact is 0600 in a 0700 directory while it plays
 //        and gone after; the log carries neither the text nor the playback id.
-//   [P3] [P1] as the separate `jarvis-sidecar` user (bob#180 §3.2).
-//   [P4] [P2] as `jarvis-sidecar`, with the DEPLOYED socket mode (0660, group
-//        jarvis-voice): bob's user connects as a group member, and an outsider
-//        (`nobody`) is refused.
+//   [P3] The same probes are refused when run as the separate `jarvis-sidecar`
+//        user under the profile (bob#180 §3.2). Their unconfined controls run as
+//        THIS user — the sudo rule allows no unconfined probe (round 2).
+//   [P4] [P2] as `jarvis-sidecar` on a SCRATCH socket with the deployed mode
+//        and group (0660, jarvis-voice): bob's user connects as a member, and an
+//        outsider (`nobody`) is refused by the socket's mode.
 //   [P5] #180 S1's key-read proof on fixtures: as `jarvis-sidecar`, opening the
 //        admin password and the agent key fails (EACCES/EPERM) while both are
 //        0600 and agent-owned, and a 0644 control in the same traversable
 //        directory opens — so the denial is the file mode, not the directory.
 //   [P6] The same on bob's ACTIVE credentials, DERIVED from the agent's bob.yaml
-//        and bob's own admin-password path (isolation-credentials.ts) — the
-//        release host names only the agent.
-//   [P7] The INSTALLED sidecar, profile and proof tooling are the reviewed
-//        files (sha256 equal to this checkout's) and root-owned, not writable by
-//        anyone else.
+//        under the pinned agents root and bob's own admin-password path
+//        (isolation-credentials.ts) — the release host names only the agent.
+//   [P7] The INSTALLED sidecar, profile and proof tooling (at the pinned
+//        install root) are the reviewed files (sha256 equal to this checkout's)
+//        and root-owned, not writable by anyone else.
+//   [P8] The DEPLOYED socket (the pinned state root): 0660, owner
+//        jarvis-sidecar, group jarvis-voice, in a 0750 directory of that owner
+//        and group; an outsider's connect is refused.
 //
 // Every separate-user step runs ONE installed command, `proof.py`, through the
 // runbook's exact sudoers rule (RUNBOOK step 2): never `sudo` with free
 // arguments, and never `sudo` at all unless the sidecar user exists. Locally
-// [P3]–[P7] SKIP with their reason; with BOB_REQUIRE_ISOLATION_PROOFS=1 (the
-// release-host check) a proof that would skip FAILS.
+// [P3]–[P8] SKIP with their reason; with BOB_REQUIRE_ISOLATION_PROOFS=1 (the
+// release-host check) a proof that would skip FAILS, and the roots are PINNED:
+// a substitute install root or agents root fails the proofs that read it.
 import { afterAll, describe, expect } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -50,7 +56,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type OrgEventStore,
@@ -62,7 +68,7 @@ import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { must } from "./handshake.js";
 import { deriveActiveCredentials } from "./isolation-credentials.js";
-import { proof } from "./isolation-gate.js";
+import { PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR_SRC = join(REPO, "sidecar", "reachy-voice");
@@ -74,7 +80,11 @@ const OUTSIDER = "nobody";
 const DARWIN = process.platform === "darwin";
 // The files the release host installs (RUNBOOK step 3), compared by hash.
 const INSTALLED_FILES = ["sidecar.py", "reachy-voice.sb", "proof.py", "egress-probe.py"];
-const INSTALL_DIR = process.env.BOB_REACHY_VOICE_DIR ?? "/usr/local/libexec/bob/reachy-voice";
+// The release-host roots, PINNED in required mode (isolation-gate.ts).
+const ROOTS = releaseRoots();
+const rootsSkip = ROOTS.skip;
+const INSTALL_DIR = ROOTS.installDir;
+const DEPLOYED_SOCKET = join(PINNED_STATE_DIR, "run", "voice.sock");
 const SIDECAR_VERSION = /^SIDECAR_VERSION = "([^"]+)"$/m.exec(
   readFileSync(join(SIDECAR_SRC, "sidecar.py"), "utf8"),
 )?.[1];
@@ -131,9 +141,8 @@ const hasUser = (() => {
   }
 })();
 const installed = INSTALLED_FILES.every((f) => existsSync(join(INSTALL_DIR, f)));
-const installedSkip = installed
-  ? ""
-  : `the sidecar is not installed at ${INSTALL_DIR} (RUNBOOK step 3)`;
+const installedSkip =
+  rootsSkip || (installed ? "" : `the sidecar is not installed at ${INSTALL_DIR} (RUNBOOK step 3)`);
 // The proof command the sudoers rule names: the INSTALLED one where it is
 // installed (the release host); elsewhere (CI, whose runner sudo is broad) a
 // copy in each proof's world-readable scratch layout.
@@ -174,12 +183,22 @@ const separateSkip =
   userSkip ||
   installedSkip ||
   (voiceGid === undefined ? `the ${VOICE_GROUP} group is not provisioned (RUNBOOK step 1)` : "");
-const deployedSkip =
-  separateSkip ||
-  (!outsiderOk ? `the outsider (${OUTSIDER}) proof path is unavailable (RUNBOOK step 2)` : "");
+const outsiderSkip = !outsiderOk
+  ? `the outsider (${OUTSIDER}) proof path is unavailable (RUNBOOK step 2)`
+  : "";
+const scratchSocketSkip = separateSkip || outsiderSkip;
+const deployedSocketSkip =
+  userSkip ||
+  installedSkip ||
+  (voiceGid === undefined ? `the ${VOICE_GROUP} group is not provisioned (RUNBOOK step 1)` : "") ||
+  (!existsSync(DEPLOYED_SOCKET)
+    ? `no deployed socket at ${DEPLOYED_SOCKET} (the launch job, RUNBOOK step 5)`
+    : "") ||
+  outsiderSkip;
 const AGENT = process.env.BOB_ISOLATION_AGENT;
-const AGENTS_ROOT = process.env.BOB_ISOLATION_AGENTS_ROOT ?? join(homedir(), "agents");
+const AGENTS_ROOT = ROOTS.agentsRoot;
 const activeSkip =
+  rootsSkip ||
   userSkip ||
   (!AGENT ? "the agent whose credentials to check is not named (BOB_ISOLATION_AGENT)" : "");
 
@@ -292,6 +311,9 @@ function run(argv: string[]) {
 
 type ProbeResults = Record<string, { ok: boolean; err: string; files?: string[] }>;
 
+/** Confined: proof.py runs the probe under the profile (as `as`, through the
+ *  sudo rule, when given). Unconfined — the control — always as THIS user and
+ *  without sudo: the sudo rule allows no unconfined probe. */
 async function probe(
   l: Layout,
   as: string | undefined,
@@ -299,14 +321,9 @@ async function probe(
   spec: Record<string, unknown>,
 ): Promise<ProbeResults> {
   const r = await run(
-    proofArgv(l, as, [
-      "probe",
-      confined ? "confined" : "open",
-      l.tts,
-      l.work,
-      l.sock,
-      JSON.stringify(spec),
-    ]),
+    confined
+      ? proofArgv(l, as, ["probe", l.tts, l.work, l.sock, JSON.stringify(spec)])
+      : [PY, "-I", "-c", readFileSync(join(l.sd, "egress-probe.py"), "utf8"), JSON.stringify(spec)],
   );
   if (r.status !== 0) throw new Error(`the probe itself failed (status ${r.status}): ${r.stderr}`);
   return JSON.parse(r.stdout) as ProbeResults;
@@ -363,7 +380,7 @@ async function proveConfinement(as: string | undefined) {
       readOutside: join(l.outside, "control-0644"),
       writeOutside: join(l.outside, `w-${randomBytes(6).toString("hex")}`),
     };
-    const control = await probe(l, as, false, spec);
+    const control = await probe(l, undefined, false, spec); // this user, no sudo
     const confined = await probe(l, as, true, spec);
     let machControls = 0;
     for (const [name, result] of Object.entries(control)) {
@@ -562,14 +579,14 @@ describe("reachy-voice isolation — deny-default confinement (seatbelt)", () =>
 
 describe(`reachy-voice isolation — as the separate ${SIDECAR_USER} user`, () => {
   proof(
-    `[P3] as ${SIDECAR_USER}: the profile denies every egress, each control succeeding unconfined as that user`,
+    `[P3] as ${SIDECAR_USER}: the profile denies every egress (the controls run unconfined as bob's user)`,
     separateSkip,
     () => proveConfinement(SIDECAR_USER),
     60_000,
   );
   proof(
-    `[P4] as ${SIDECAR_USER}, on the DEPLOYED 0660 ${VOICE_GROUP} socket: bob's user round-trips a \`say\`, an outsider is refused, no audio remains`,
-    deployedSkip,
+    `[P4] as ${SIDECAR_USER}, on a SCRATCH socket with the deployed mode and group (0660, ${VOICE_GROUP}): bob's user round-trips a \`say\`, an outsider is refused, no audio remains`,
+    scratchSocketSkip,
     () => proveRoundTrip(SIDECAR_USER),
     60_000,
   );
@@ -657,6 +674,31 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
         const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
         expect(sha(path), `${f} is not the reviewed file`).toBe(sha(join(SIDECAR_SRC, f)));
       }
+    },
+  );
+});
+
+describe("reachy-voice isolation — the deployed socket", () => {
+  proof(
+    `[P8] the DEPLOYED socket: 0660, ${SIDECAR_USER}:${VOICE_GROUP}, in a 0750 directory of that owner and group; an outsider is refused`,
+    deployedSocketSkip,
+    () => {
+      const uidOf = (user: string) =>
+        Number(execFileSync("id", ["-u", user], { encoding: "utf8" }).trim());
+      const sidecarUid = uidOf(SIDECAR_USER);
+      const gid = must(voiceGid, "the voice group");
+      const sock = statSync(DEPLOYED_SOCKET);
+      expect(sock.isSocket()).toBe(true);
+      expect((sock.mode & 0o777).toString(8)).toBe("660");
+      expect(sock.uid).toBe(sidecarUid);
+      expect(sock.gid).toBe(gid);
+      const dir = statSync(join(PINNED_STATE_DIR, "run"));
+      expect((dir.mode & 0o777).toString(8)).toBe("750");
+      expect(dir.uid).toBe(sidecarUid);
+      expect(dir.gid).toBe(gid);
+      // The outsider's connect is refused; it sends nothing either way.
+      const r = runAsUser(OUTSIDER, join(INSTALL_DIR, "proof.py"), ["connect", DEPLOYED_SOCKET]);
+      expect(JSON.parse(r.stdout).connect).toMatch(/^(EACCES|EPERM)$/);
     },
   );
 });

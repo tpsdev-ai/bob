@@ -1001,11 +1001,14 @@ a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
   projection and label, and is NOT admitted yet (its tool admission and
   disposable session are V2).
 - **The sidecar** (`sidecar/reachy-voice/`) speaks with local Piper through an
-  ephemeral 0600 file in a 0700 directory, removed after playback, under a
+  ephemeral 0600 file in a 0700 directory that it removes after playback (a
+  removal that fails leaves it on disk, and the sidecar fails closed), under a
   deny-default seatbelt profile, as its own `jarvis-sidecar` user; it refuses to
   start when a stale speech file cannot be removed, stops speaking and reports
-  `ok: false` when a removal fails after playback, and logs only a digest of
-  the (sender-chosen) playback id. Its runbook gives the one-time admin steps.
+  `ok: false` when a removal fails after playback, and logs only a truncated
+  sha256 digest of the (sender-chosen) playback id — which keeps the id out of
+  the log but does not stop a guess of a short one. Its runbook gives the
+  one-time admin steps.
   The isolation proofs show each probed refusal succeeding unconfined first (a
   mach service name this macOS does not register is excluded; at least two
   must have working controls), and the real sidecar round-tripping the

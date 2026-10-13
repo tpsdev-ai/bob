@@ -2,10 +2,14 @@
 #
 # Run as `python -I -c "<this source>" '<json spec>'` — passed as an argument,
 # so the sandboxed interpreter never needs to READ this file — once WITHOUT the
-# sandbox (the control: every probe must succeed, or it proves nothing) and once
-# UNDER the shipped profile (every probe must be refused). Prints one JSON object:
-# {probe: {"ok": bool, "err": str}}. It sends no data anywhere that is not a
-# listener the test itself opened; the mach probes only LOOK UP a service name.
+# sandbox, as the CALLER's own user (the control), and once UNDER the shipped
+# profile (proof.py probe, which first checks every spec field against a fixed
+# whitelist). The caller supplies the targets: loopback ports, scratch paths,
+# fixed mach names and the DNS service socket. A mach name this macOS does not
+# register has no working control and proves nothing, so the proofs exclude it.
+# Prints one JSON object: {probe: {"ok": bool, "err": str}}. Network probes
+# connect and close (or send 5 bytes of UDP) to loopback only; the mach probes
+# only LOOK UP a service name.
 import ctypes
 import json
 import os
