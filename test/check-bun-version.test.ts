@@ -263,8 +263,10 @@ test("run without bun's YAML parser, the check fails rather than passing", () =>
 });
 
 test("CI's build job runs the check before the frozen install", () => {
-  // The check names a drifting step; a frozen install that fails first would
-  // stop the job before it could.
+  // When the setup-bun step succeeds and Bun.YAML is available, the check
+  // names a drifting step; a frozen install that failed first would stop the
+  // job before it could. (Without Bun.YAML the check still fails, with a
+  // parser-unavailable error.)
   const ci = parseYaml(readFileSync(join(REPO, ".github", "workflows", "ci.yml"), "utf8")) as {
     jobs: { build: { steps: Array<{ run?: string }> } };
   };

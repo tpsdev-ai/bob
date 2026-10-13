@@ -6,8 +6,11 @@
 // version, or drifts from it.
 //
 // It runs on bun and parses with bun's built-in YAML parser, with no installed
-// dependency, so CI runs it before `bun install --frozen-lockfile`: a drifting
-// step is named even when that install would fail.
+// dependency, so CI runs it before `bun install --frozen-lockfile`. When the
+// setup-bun step succeeds and Bun.YAML is available, it names a drifting step,
+// and a workflow's read or parse error, even when that install would fail.
+// Without Bun.YAML it still fails, with a parser-unavailable error; a failed
+// setup step stops the job before it runs.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -58,7 +61,9 @@ function isMapping(value) {
 // Report a package.json that cannot be read, parsed, or is not an object, a
 // packageManager that is not a pinned bun, every setup-bun step that is
 // missing, non-literal or drifting, a workflow that cannot be read or parsed,
-// and the vacuous case (no setup-bun step to check). [] means the check passed.
+// and the vacuous case (no setup-bun step to check). Without Bun.YAML the
+// workflows are not read, and a package.json that passes yields a
+// parser-unavailable error instead. [] means the check passed.
 export function checkBunVersionPins({ root = ROOT } = {}) {
   const errors = [];
   const fail = (error) => {
