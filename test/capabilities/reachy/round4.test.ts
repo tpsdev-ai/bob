@@ -13,7 +13,23 @@ import {
 import { MAX_LINE_BYTES, UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import { reachyManifest } from "../../../src/capabilities/reachy/manifest.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
-import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { decodeLine, VOICE_PROTOCOL } from "../../../src/capabilities/reachy/wire.js";
+import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
+
+// A complete reachy-voice/1 health line (bob#356): what a sidecar sends.
+const VALID_HEALTH = {
+  type: "health",
+  protocol: VOICE_PROTOCOL,
+  version: TEST_SIDECAR_VERSION,
+  profile: "voice",
+  generation: 1,
+  wakeName: "jarvis",
+  mode: "off",
+  trainedPhrase: null,
+  modelHash: null,
+  muted: false,
+  ok: true,
+};
 
 class CapturingPi implements PiLike {
   readonly tools = new Map<
@@ -113,10 +129,8 @@ describe("reachy round 4 — the line bound discards through the newline", () =>
   });
 
   it("a large chunk of SHORT lines is fully retained (not dropped wholesale)", () => {
-    const n = 4000; // ~23 bytes/line × 4000 ≈ 92 KiB, well over the 64 KiB bound
-    const chunk =
-      Array.from({ length: n }, () => JSON.stringify({ type: "health", ok: true })).join("\n") +
-      "\n";
+    const n = 4000; // ~200 bytes/line × 4000 ≈ 800 KiB, well over the 64 KiB bound
+    const chunk = Array.from({ length: n }, () => JSON.stringify(VALID_HEALTH)).join("\n") + "\n";
     expect(chunk.length).toBeGreaterThan(MAX_LINE_BYTES);
     const lines = collect([chunk]);
     expect(lines.length).toBe(n);
@@ -149,14 +163,16 @@ describe("reachy round 4 — strict wire envelopes and the stub's health shape",
   });
 
   it("the stub's REAL health line is valid (and an unknown health field is not)", () => {
-    // Exactly what test/fixtures/reachy-stub/sidecar.py sends:
-    expect(decodeLine({ type: "health", ok: true })).toMatchObject({ kind: "health" });
-    expect(decodeLine({ type: "health", ok: true, replayEnd: true })).toMatchObject({
-      kind: "health",
-    });
-    // The old `ack` reply the stub used to send is now malformed by the strict schema.
-    expect(decodeLine({ type: "health", ok: true, ack: "state" })).toMatchObject({
+    // bob#356: exactly the reachy-voice/1 shape test/fixtures/reachy-stub/sidecar.py
+    // sends (and the end-of-replay marker on it):
+    expect(decodeLine(VALID_HEALTH)).toMatchObject({ kind: "health" });
+    expect(decodeLine({ ...VALID_HEALTH, replayEnd: true })).toMatchObject({ kind: "health" });
+    // The old `ack` reply the stub used to send is malformed by the strict schema.
+    expect(decodeLine({ ...VALID_HEALTH, ack: "state" })).toMatchObject({ kind: "malformed" });
+    // And so is the LEGACY health line the stub sent before reachy-voice/1.
+    expect(decodeLine({ type: "health", ok: true })).toMatchObject({
       kind: "malformed",
+      protocol: true,
     });
   });
 });
@@ -168,13 +184,23 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
     const memory = new NoMemory();
     const store = new NoStore();
     const state: PolicyState = {
+      profile: "reachy",
       wakeName: "jarvis",
       enrolment: {},
       mute: false,
       nowMs: () => 1,
       lastAcknowledgeAtMs: undefined,
+      roomSpeechOrigins: ["run"],
     };
-    wireReachyCapability({ pi, commands, memory, store, state, log: () => {} });
+    wireReachyCapability({
+      pi,
+      commands,
+      memory,
+      store,
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      log: () => {},
+    });
     return { pi, commands, store };
   }
 
@@ -207,11 +233,13 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
       },
     } as unknown as MemoryWriter;
     const state: PolicyState = {
+      profile: "reachy",
       wakeName: "jarvis",
       enrolment: { "spk-1": "member-1" }, // addressed + verified → tries to write
       mute: false,
       nowMs: () => 1,
       lastAcknowledgeAtMs: undefined,
+      roomSpeechOrigins: [],
     };
     const wired = wireReachyCapability({
       pi,
@@ -219,8 +247,10 @@ describe("reachy round 4 — claims that hold in the real runtime", () => {
       memory: failing,
       store,
       state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
       log: () => {},
     });
+    handshakeNow(wired, state);
     const line = JSON.stringify({
       type: "transcript",
       text: "jarvis, remember this",

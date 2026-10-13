@@ -15,7 +15,8 @@
 // and the extension lifecycle — no Bob-side tool/hook registry.
 
 import { Value } from "typebox/value";
-import { readBlock, readCapabilities } from "./bob-yaml.js";
+import { DEFAULT_WAKE_NAME, WAKE_NAME_SCHEMA } from "../capabilities/reachy/config.js";
+import { BobYamlError, lineOf, readBlock, readCapabilities } from "./bob-yaml.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 import { lookupCapability as defaultLookup } from "./capability-catalog.js";
 import { resolveExtensionSource as defaultResolveSource } from "./capability-resolve.js";
@@ -103,7 +104,7 @@ export function resolveCapabilities(opts: ResolveCapabilitiesOptions): Capabilit
       );
     }
 
-    const config = readBlock(opts.yamlText, name) ?? {};
+    const config = projectAgentSettings(name, readBlock(opts.yamlText, name) ?? {}, opts.yamlText);
     if (!Value.Check(entry.manifest.configSchema, config)) {
       const first = [...Value.Errors(entry.manifest.configSchema, config)][0];
       const where = first?.instancePath ? ` (at ${first.instancePath})` : "";
@@ -161,4 +162,117 @@ export function capabilityConfigEnv(resolution: CapabilityResolution): Record<st
     out[capabilityEnvVar(cap.name)] = JSON.stringify(cap.config);
   }
   return out;
+}
+
+// ─── bob#356: agent-level settings projected into one capability ──────────────
+
+// The keys of the agent-level `voice:` block. One today: the wake name.
+const VOICE_KEYS = ["wakeName"] as const;
+
+/** The agent's wake name: bob.yaml `voice.wakeName`, or "jarvis" (the class
+ *  name) when the block or the key is absent. Bob-owned: it is the ONLY source,
+ *  projected into the `reachy` capability's config and pushed to the sidecar.
+ *  Throws on an unknown key or a value that is not a wake-name shape. */
+export function readVoiceWakeName(yamlText: string): string {
+  const block = readBlock(yamlText, "voice");
+  if (block === undefined) return DEFAULT_WAKE_NAME;
+  for (const key of Object.keys(block)) {
+    if (!(VOICE_KEYS as readonly string[]).includes(key)) {
+      throw new BobYamlError(
+        "voice",
+        lineOf(yamlText, new RegExp(`^\\s+${key}\\s*:`)),
+        `unknown key "${key}" — supported keys are ${VOICE_KEYS.join(", ")}.`,
+      );
+    }
+  }
+  const name = block.wakeName;
+  if (name === undefined) return DEFAULT_WAKE_NAME;
+  if (!Value.Check(WAKE_NAME_SCHEMA, name)) {
+    throw new BobYamlError(
+      "voice",
+      lineOf(yamlText, /^\s+wakeName\s*:/),
+      "wakeName must be 2-32 lowercase letters, words joined by one space or hyphen (e.g. jarvis).",
+    );
+  }
+  return name as string;
+}
+
+/** Apply the agent-level settings bob projects into a capability's config
+ *  block. `reachy` receives the wake name from `voice.wakeName`; its own block
+ *  may not set one (two sources of truth is how a device goes silently deaf). */
+function projectAgentSettings(
+  name: string,
+  block: Record<string, unknown>,
+  yamlText: string,
+): Record<string, unknown> {
+  if (name !== "reachy") return block;
+  if (Object.hasOwn(block, "wakeName")) {
+    throw new Error(
+      'capability "reachy" config sets wakeName, but the wake name is bob-owned at the agent level: move it to `voice:` → `wakeName:` (bob#356).',
+    );
+  }
+  return { ...block, wakeName: readVoiceWakeName(yamlText) };
+}
+
+/** The tools a capability registers under its configured value (bob#356): the
+ *  `toolsByConfig` row for its config, or every tool it declares when it has no
+ *  such map. */
+export function configuredCapabilityTools(cap: {
+  manifest: BobCapabilityManifest;
+  config: Record<string, unknown>;
+}): readonly string[] {
+  const conditional = cap.manifest.provides?.toolsByConfig;
+  if (!conditional) return cap.manifest.provides?.tools ?? [];
+  const raw = cap.config[conditional.field];
+  const value = typeof raw === "string" ? raw : conditional.default;
+  return conditional.values[value] ?? [];
+}
+
+/** Every allowlisted (and not excluded) tool that a declared capability
+ *  provides in its UNION but does not register under its configured value —
+ *  e.g. `reachy_look` while `reachy.profile` is `voice`. Each entry names the
+ *  tool and why. */
+export function conditionalToolRefusals(
+  policy: { tools: readonly string[]; excludeTools: readonly string[] },
+  capabilities: ReadonlyArray<{
+    name: string;
+    manifest: BobCapabilityManifest;
+    config: Record<string, unknown>;
+  }>,
+): string[] {
+  const excluded = new Set(policy.excludeTools);
+  const out: string[] = [];
+  for (const cap of capabilities) {
+    const conditional = cap.manifest.provides?.toolsByConfig;
+    if (!conditional) continue;
+    const union = new Set(cap.manifest.provides?.tools ?? []);
+    const registered = new Set(configuredCapabilityTools(cap));
+    const raw = cap.config[conditional.field];
+    const value = typeof raw === "string" ? raw : conditional.default;
+    for (const tool of policy.tools) {
+      if (excluded.has(tool) || !union.has(tool) || registered.has(tool)) continue;
+      out.push(
+        `${tool} (${cap.name}.${conditional.field} is ${value}, which does not register it)`,
+      );
+    }
+  }
+  return out;
+}
+
+/** Refuse, by name and before any session, an allowlist naming a tool the
+ *  configured capability does not register. Without this the session's
+ *  registry audit still refuses it, but only as "not active". */
+export function assertConditionalTools(
+  policy: { tools: readonly string[]; excludeTools: readonly string[] },
+  capabilities: ReadonlyArray<{
+    name: string;
+    manifest: BobCapabilityManifest;
+    config: Record<string, unknown>;
+  }>,
+): void {
+  const problems = conditionalToolRefusals(policy, capabilities);
+  if (problems.length === 0) return;
+  throw new Error(
+    `bob: ${problems.length} allowlisted tool${problems.length === 1 ? "" : "s"} the configured capability does not register: ${problems.join("; ")}. Fix: drop ${problems.length === 1 ? "it" : "them"} from tools.allow, or change the capability's setting.`,
+  );
 }

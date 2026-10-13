@@ -12,6 +12,7 @@ import {
 } from "../../../src/capabilities/reachy/capability.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
+import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -74,11 +75,13 @@ function harness(
   const memory = new RecordingMemory();
   const store = opts.store ?? new SelectiveStore();
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment,
     mute: false,
     nowMs: () => 1,
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: [],
   };
   const wired = wireReachyCapability({
     pi: new NoPi(),
@@ -86,8 +89,10 @@ function harness(
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: (m) => opts.logs?.push(m),
   });
+  handshakeNow(wired, state, commands);
   return { commands, memory, store, state, wired };
 }
 
@@ -162,9 +167,14 @@ describe("reachy round 6 item 2: args validated by action; the speech gate appli
       confidence: 0.9,
       inputs: ["mem_9"],
     });
-    expect(withMemory.kind).toBe("refused");
+    expect(withMemory).toMatchObject({
+      kind: "refused",
+      reason: "memory-backed speech is off in v1 (fail closed)",
+    });
     expect(h.commands.sent.some((c) => c.command === "say")).toBe(false);
-    // CONTROL: the same `ask` with NO memory input is admitted (sent as a `say`).
+    // bob#356 rev 2.1: the same `ask` with NO memory input is ALSO refused — but
+    // by the caller rule (a sidecar proposal never speaks before enrolment), a
+    // different gate, so the memory refusal above is the memory gate's own.
     const plain = await h.wired.handleLine({
       type: "proposal",
       action: "ask",
@@ -172,8 +182,9 @@ describe("reachy round 6 item 2: args validated by action; the speech gate appli
       confidence: 0.9,
       inputs: [],
     });
-    expect(plain.kind).toBe("admitted");
-    expect(h.commands.sent.at(-1)?.command).toBe("say");
+    expect(plain).toMatchObject({ kind: "refused" });
+    expect((plain as { reason: string }).reason).toContain("a sidecar proposal cannot speak");
+    expect(h.commands.sent.some((c) => c.command === "say")).toBe(false);
   });
 
   it("a `look` proposal with a string yaw or an extra field is malformed and sends no `look_at`", async () => {

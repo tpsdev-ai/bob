@@ -65,6 +65,7 @@ import {
   readTools,
 } from "./bob-yaml.js";
 import {
+  assertConditionalTools,
   capabilityConfigEnv,
   type ResolvedCapability,
   resolveCapabilities,
@@ -2511,6 +2512,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilityEnv = capabilityConfigEnv(resolution);
     capabilities = resolution.capabilities;
   }
+
+  // bob#356: a capability whose tools depend on its config (reachy's device
+  // profile) registers only the configured row. An allowlist naming a tool that
+  // row lacks is refused HERE, by name, for both branches — before the
+  // session's registry audit would refuse it only as "not active".
+  assertConditionalTools(toolPolicy, capabilities);
 
   // bob#214: the session budget (bob.yaml `session:` over role.json `session`),
   // resolved after the tool policy so a config the policy already refuses is

@@ -73,6 +73,8 @@ import {
   readTools,
   type ToolsBlock,
 } from "./bob-yaml.js";
+import { lookupCapability } from "./capability-catalog.js";
+import { conditionalToolRefusals } from "./capability-loader.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
@@ -756,6 +758,35 @@ function toolAllowlistCheck(yamlPath: string): DoctorCheck {
       status: "fail",
       detail: `allowlisted tool${policy.tools.length === 1 ? "" : "s"} from a capability this agent does not declare: ${summary}`,
       fix: `declare it in bob.yaml (capabilities:) and configure its block — a session refuses an allowlisted tool nothing provides — or drop ${[...missingByCapability.values()].flat().join(", ")} from tools.allow`,
+    };
+  }
+
+  // bob#356: a declared capability can still not register an allowlisted tool
+  // under its CONFIG (reachy's body tools under `profile: voice`). The session
+  // refuses that at load; report it here first, naming the setting.
+  const configured: Array<{
+    name: string;
+    manifest: NonNullable<ReturnType<typeof lookupCapability>>["manifest"];
+    config: Record<string, unknown>;
+  }> = [];
+  for (const capability of declaredCapabilities) {
+    const entry = lookupCapability(capability);
+    if (!entry?.manifest.provides?.toolsByConfig) continue;
+    let config: Record<string, unknown> = {};
+    try {
+      config = readBlock(yamlText, capability) ?? {};
+    } catch {
+      continue; // the config check reports an unreadable block
+    }
+    configured.push({ name: capability, manifest: entry.manifest, config });
+  }
+  const unregistered = conditionalToolRefusals(policy, configured);
+  if (unregistered.length > 0) {
+    return {
+      name,
+      status: "fail",
+      detail: `allowlisted tool${unregistered.length === 1 ? "" : "s"} the configured capability does not register: ${unregistered.join("; ")}`,
+      fix: "drop the tool from tools.allow, or change the capability's setting (for reachy: profile: reachy registers the body tools)",
     };
   }
 

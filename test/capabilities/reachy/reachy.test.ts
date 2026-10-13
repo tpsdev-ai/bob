@@ -17,6 +17,7 @@ import {
 } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
 import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class FakePi implements PiLike {
   readonly tools = new Map<
@@ -101,12 +102,16 @@ function harness(
   const commands = new FakeCommands();
   const memory = new FakeMemory();
   const store = opts.store ?? new FakeStore();
+  // bob#356: the S3 suite runs the BODY profile (it exercises look/frame) and
+  // grants room speech to an operator's run, so the tool path can speak.
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment,
     mute: opts.mute ?? false,
     nowMs: () => Date.now(),
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: ["run"],
   };
   const wired: WiredReachy = wireReachyCapability({
     pi,
@@ -114,8 +119,12 @@ function harness(
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: () => {},
   });
+  // A ready reachy-voice/1 link (bob mute drops the health line, as it drops
+  // every line, so a muted harness stays unready — and muted).
+  if (!state.mute) handshakeNow(wired, state, commands);
   return { pi, commands, memory, store, wired, state };
 }
 const transcriptLine = (over: Record<string, unknown> = {}) => ({

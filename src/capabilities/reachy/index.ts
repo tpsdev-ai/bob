@@ -6,11 +6,16 @@
 // decoded by wire.ts (one shape, schema-checked) before policy.
 //
 // SECURITY: the capability holds no keys and reads no key files; it talks to the
-// sidecar only through the socket. The STUB sidecar is NOT run as its own user
-// (S2) — the key-read proof runs the read PATH as a different OS user, but the
-// stub itself is launched as the agent's own user.
+// sidecar only through the socket. bob never launches the sidecar: it runs as its
+// own OS user under a deny-default sandbox profile, started by the operator's
+// launcher (sidecar/reachy-voice/RUNBOOK.md). bob only connects.
+//
+// bob#356 V1: every connection begins with the reachy-voice/1 handshake
+// (capability.ts `connected`), and a dropped or refused connection is retried
+// with a bounded backoff — each retry is a fresh handshake.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getTurnAdmission } from "../../shell/turn-admission.js";
 import { FlairHttpClient } from "../flair/client.js";
 import { loadConfigFromEnv as loadFlairConfig } from "../flair/config.js";
 import {
@@ -19,7 +24,12 @@ import {
   type PiLike,
   wireReachyCapability,
 } from "./capability.js";
-import { flairMemoryWriter, flairOrgEventStore, UnixSocketReachyClient } from "./client.js";
+import {
+  flairMemoryWriter,
+  flairOrgEventStore,
+  superviseLink,
+  UnixSocketReachyClient,
+} from "./client.js";
 import { loadConfigFromEnv } from "./config.js";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -28,7 +38,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // The durable audit + the memory both go over the flair capability client
   // (spec §3.4). If flair's config is unset the capability still registers its
-  // tools, but memory writes AND their audit fail closed.
+  // tools, but memory writes AND their audit fail closed — and since speech is
+  // sent only after a successful audit, so does every action.
   let memory: MemoryWriter = {
     writePrivate: async () => {
       throw new Error("reachy: memory writes disabled (no flair config)");
@@ -51,12 +62,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   const state = {
+    profile: config.profile,
     wakeName: config.wakeName,
     enrolment: config.enrolledSpeakers,
     mute: config.mute,
+    roomSpeechOrigins: config.roomSpeechOrigins,
     nowMs: () => Date.now(),
     lastAcknowledgeAtMs: undefined as number | undefined,
   };
+
+  // The runtime-owned turn admission, read from pi's per-loader event bus. Its
+  // `readOrigin` names the admitted turn a tool call runs inside — the CALLER
+  // of `reachy_say`. Absent in a one-shot `bob run` (an operator's run).
+  const admission = getTurnAdmission(pi);
 
   const wired = wireReachyCapability({
     pi: pi as unknown as PiLike,
@@ -64,24 +82,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     memory,
     store,
     state,
+    sidecarVersion: config.sidecarVersion,
+    ...(admission ? { readOrigin: () => admission.readOrigin() } : {}),
   });
 
-  if (!config.mute) {
-    try {
-      await commands.connect();
-      commands.onLine((line) => {
-        // Never fire-and-forget: a rejected handler would be an unhandled
-        // rejection. Log it; the run continues.
-        void wired.handleLine(line).catch((err: unknown) => {
-          console.error(`reachy: line handler failed: ${err instanceof Error ? err.message : err}`);
-        });
-      });
-    } catch (err) {
-      console.error(
-        `reachy capability: sidecar connect failed (tools still registered): ${err instanceof Error ? err.message : err}`,
-      );
-    }
-  } else {
+  if (config.mute) {
     console.error("reachy capability: mute — events dropped, no sidecar connection");
+    return;
   }
+
+  commands.onLine((line) => {
+    // Never fire-and-forget: a rejected handler would be an unhandled
+    // rejection. Log it; the run continues.
+    void wired.handleLine(line).catch((err: unknown) => {
+      console.error(`reachy: line handler failed: ${err instanceof Error ? err.message : err}`);
+    });
+  });
+
+  await superviseLink({ client: commands, wired }).start();
 }

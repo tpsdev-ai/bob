@@ -12,6 +12,7 @@ import {
 import { flairOrgEventStore } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
+import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -97,11 +98,13 @@ function harness(store: OrgEventStore) {
   const commands = new RecordingCommands();
   const memory = new RecordingMemory();
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment: { "spk-1": "member-1" },
     mute: false,
     nowMs: () => 1,
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: [],
   };
   const wired = wireReachyCapability({
     pi: new NoPi(),
@@ -109,8 +112,10 @@ function harness(store: OrgEventStore) {
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: () => {},
   });
+  handshakeNow(wired, state, commands);
   return { commands, memory, store, wired };
 }
 
@@ -201,7 +206,7 @@ describe("reachy round 7 item 2: success needs the store to hold the EXACT pre-g
 describe("reachy round 7 item 3: args are BOUNDED by action", () => {
   it("look yaw 1e100, an ask with a newline, and a 501-char say are all malformed and never sent", async () => {
     const h = harness(new MapStore());
-    await h.wired.handleLine(speakerLine); // a transcript so an addressed say would be admitted
+    await h.wired.handleLine(speakerLine); // a transcript (which no longer authorizes speech)
 
     const badYaw = await h.wired.handleLine({
       type: "proposal",
@@ -234,7 +239,9 @@ describe("reachy round 7 item 3: args are BOUNDED by action", () => {
     expect(h.commands.sent.some((c) => c.command === "say")).toBe(false);
     expect(h.store.all.filter((e) => e.kind === "reachy.malformed").length).toBe(3);
 
-    // CONTROL: within the bounds, all three are admitted (and sent).
+    // CONTROL: within the bounds, none is MALFORMED: the look is admitted (and
+    // sent), and the 500-char say passes its schema — it is refused only by the
+    // caller rule (bob#356: a sidecar proposal never speaks), a later gate.
     expect(
       (
         await h.wired.handleLine({
@@ -256,7 +263,7 @@ describe("reachy round 7 item 3: args are BOUNDED by action", () => {
           inputs: [],
         })
       ).kind,
-    ).toBe("admitted");
+    ).toBe("refused");
   });
 });
 

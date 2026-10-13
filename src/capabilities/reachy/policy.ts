@@ -17,6 +17,16 @@
 //     memory is refused); `answer` is OFF in v1.
 //   * `mute` drops every event — no transcripts, no proposals, no frames, no
 //     OrgEvents.
+//
+// bob#356 V1 (rev 2.1, "mouth first"):
+//   * The PROFILE is bob-owned: body actions (`look`, `frame`, `acknowledge`)
+//     exist only under `reachy`; under `voice` they refuse.
+//   * Speech is split BY CALLER, and no caller inherits earlier speech. A
+//     tool-path `say` from an authenticated turn needs no transcript, only that
+//     turn's room-publication grant (`roomSpeechOrigins`). A voice-origin call
+//     needs its own current addressed utterance (V2; none exists in V1), and a
+//     sidecar proposal never speaks before enrolment. The global last
+//     transcript is no authority for speech.
 
 import { randomBytes, randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
@@ -112,6 +122,9 @@ export interface Transcript {
 }
 
 export interface PolicyState {
+  // bob#356: the bob-owned device profile. Body actions exist only under
+  // `reachy`.
+  profile: ReachyProfile;
   // SSR "jarvis" — a string compare in bob, never the sidecar's flag.
   wakeName: string;
   // speakerId → memberId. EMPTY by default in v1 (nothing is verified).
@@ -120,9 +133,61 @@ export interface PolicyState {
   // Rate-limit state for an unverified speaker's acknowledge (one per minute).
   nowMs: () => number;
   lastAcknowledgeAtMs?: number;
+  // bob#356: the room-publication grants (`run`, `cron:<job>`,
+  // `discord:<channelId>`, `mail:<sender>`) a tool-path `say` is checked
+  // against. Empty: no turn may speak in the room.
+  roomSpeechOrigins: readonly string[];
 }
 
+/** WHO is asking for an action (bob#356 Kern 5). The capability builds this
+ *  from runtime state, never from the call's arguments: a tool call carries its
+ *  admitted turn's origin, a sidecar proposal carries the transcript policy
+ *  reads (for the body's rate limit only — never for speech). */
+export type Caller =
+  | { path: "tool"; origin: TurnOrigin }
+  | { path: "proposal"; transcript: Transcript | null };
+
+/** The body actions (bob#356 delta 1): present only under the `reachy` profile. */
+export const BODY_ACTIONS: ReadonlySet<ProposalAction> = new Set(["look", "frame", "acknowledge"]);
+
+/** The room-publication grant string an origin needs, or null when no grant
+ *  can name it (a voice origin can never be granted room speech by config). */
+export function roomSpeechGrant(origin: TurnOrigin): string | null {
+  switch (origin.kind) {
+    case "run":
+      return "run";
+    case "cron":
+      return `cron:${origin.job}`;
+    case "discord":
+      return `discord:${origin.channelId}`;
+    case "mail":
+      return `mail:${origin.from}`;
+    default:
+      return null;
+  }
+}
+
+/** The speech gate's caller rule (bob#356 rev 2.1). Returns the refusal reason,
+ *  or null when this caller may speak. Readiness, mute, the one-line bound, the
+ *  no-memory rule and the audit-before-send are checked around it. */
+export function speechCallerRefusal(caller: Caller, state: PolicyState): string | null {
+  if (caller.path === "proposal") {
+    return "a sidecar proposal cannot speak: free-form proposal speech is off before enrolment";
+  }
+  const { origin } = caller;
+  if (origin.kind === "voice") {
+    return "a voice-origin call needs its own current addressed utterance, which V1 does not have";
+  }
+  const grant = roomSpeechGrant(origin);
+  if (grant === null || !state.roomSpeechOrigins.includes(grant)) {
+    return `this ${origin.kind} turn has no room-publication grant (reachy roomSpeechOrigins)`;
+  }
+  return null;
+}
+
+import type { TurnOrigin } from "../../shell/turn-origin.js";
 import type { OrgEventRecord } from "../observatory/snapshot.js";
+import type { ReachyProfile } from "./config.js";
 /** The reachy audit event IS the record the rest of bob emits (observatory). */
 export type OrgEvent = OrgEventRecord;
 
@@ -245,11 +310,14 @@ export function decideTranscript(
 
 /**
  * Admit ONE action against the policy — the SAME path a proposal and a tool call
- * take (round 2, item 3). `answer` and memory-backed speech are OFF in v1 (fail
- * closed); `think` injects no turn in S3; `look`/`acknowledge` are rate-limited
- * for an unverified speaker — and ADMITTING one advances the rate limit, so the
- * next within the minute refuses; `ask` is one line; `say` is admitted only when
- * addressed. Every admitted action returns exactly one OrgEvent.
+ * take (round 2, item 3), told apart by `caller` (bob#356). `answer` and
+ * memory-backed speech are OFF in v1 (fail closed); `think` injects no turn;
+ * body actions exist only under the `reachy` profile, and `look`/`acknowledge`/
+ * `frame` are rate-limited for an unverified speaker — ADMITTING one advances
+ * the rate limit, so the next within the minute refuses; speech is admitted only
+ * for a caller `speechCallerRefusal` allows. Every admitted action returns
+ * exactly one OrgEvent. Readiness and the device mute are the capability's
+ * (capability.ts) — this function sees bob's own mute only.
  */
 export function admitAction(
   action: ProposalAction,
@@ -257,11 +325,13 @@ export function admitAction(
   confidence: number,
   inputs: string[],
   state: PolicyState,
-  transcript: Transcript | null,
+  caller: Caller,
 ): Decision {
   if (state.mute) return { kind: "drop" };
+  // The body's rate limit reads the PROPOSAL's transcript. A tool call has no
+  // speaker, so it is rate-limited like an unverified one.
+  const transcript = caller.path === "proposal" ? caller.transcript : null;
   const verified = transcript ? speakerVerified(transcript.speakerId, state.enrolment) : false;
-  const isAddressed = transcript ? addressed(transcript.text, state.wakeName) : false;
   const proposal: Proposal = { action, args, confidence, inputs };
 
   // v1: NO speech action accepts a memory reference — and `ask` IS speech (round 6
@@ -273,7 +343,17 @@ export function admitAction(
   }
   if (action === "think") return { kind: "refused", action, reason: "think injects no turn in S3" };
   if (action === "ignore") return { kind: "none" };
-  if (action === "say" && !isAddressed) return { kind: "refused", action, reason: "not addressed" };
+  if (BODY_ACTIONS.has(action) && state.profile !== "reachy") {
+    return {
+      kind: "refused",
+      action,
+      reason: `body actions are absent under the ${state.profile} profile`,
+    };
+  }
+  if (isSpeech) {
+    const refusal = speechCallerRefusal(caller, state);
+    if (refusal !== null) return { kind: "refused", action, reason: refusal };
+  }
   if (
     action === "look" ||
     action === "acknowledge" ||
@@ -317,12 +397,8 @@ export function decideProposal(
   state: PolicyState,
   transcript: Transcript | null,
 ): Decision {
-  return admitAction(
-    proposal.action,
-    proposal.args,
-    proposal.confidence,
-    proposal.inputs,
-    state,
+  return admitAction(proposal.action, proposal.args, proposal.confidence, proposal.inputs, state, {
+    path: "proposal",
     transcript,
-  );
+  });
 }

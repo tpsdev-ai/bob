@@ -946,12 +946,54 @@ naming its test (`test/capabilities/reachy/`):
   visitor lines arriving while the store is slow cannot both acknowledge.
   (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
 - **A DIFFERENT OS user cannot read the 0600 key fixtures.** The key proof runs
-  `sudo -n -u jarvis-sidecar cat` on 0600 fixtures; it skips (visibly, reason in
-  the name) when the user or `sudo -n` is unavailable. (It does NOT show the stub
-  running as that user — that is S2's sandbox slice.) `sidecar-stub.test.ts`.
+  `sudo -n -u jarvis-sidecar /bin/cat` on 0600 fixtures (and, on the release
+  host, on the real admin password and agent key); it skips (visibly, reason in
+  the name) when the user or `sudo -n` is unavailable, and FAILS instead under
+  the release check. `isolation.test.ts`.
+
+#### Voice V1 — the mouth (bob#356)
+
+One capability, two bob-owned **profiles**: `voice` (the default: a speakerphone,
+tools `reachy_say` and `reachy_state`) and `reachy` (adds the body tools
+`reachy_look` and `reachy_frame`). An unknown profile is refused when `bob.yaml`
+loads, and an allowlist naming a tool the configured profile does not register
+is refused by name before any session. Under `voice`, body proposals refuse and
+a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
+`test/shell/voice-origin-356.test.ts`.)
+
+- **The `reachy-voice/1` handshake.** On every connection bob first sends one
+  control command, `configure` (protocol, profile, the wake name from
+  `voice.wakeName` — default `jarvis`, the only source of the name — and a fresh
+  generation). The sidecar's strict health line must repeat all four and carry
+  the exact `sidecarVersion` bob pins, plus its wake mode (`off` in V1: no ears)
+  and its device mute. Until it matches, nothing but control/status traffic
+  moves; a mismatch, a legacy health line or any other line first disconnects
+  and raises ONE `reachy.link.refused` alarm naming only the fields. bob
+  reconnects with a doubling backoff; every reconnect is a fresh handshake.
+- **Speech is split by caller.** `reachy_say` from an authenticated turn speaks
+  without any transcript when `reachy.roomSpeechOrigins` grants that exact
+  origin (`run`, `cron:<job>`, `discord:<channelId>`, `mail:<sender>`; empty by
+  default). A voice-origin call, an ungranted turn and every sidecar proposal
+  are refused; a room transcript authorizes nothing. All speech needs a ready,
+  unmuted link (bob mute OR device mute OR no link = muted), one line of at most
+  500 characters, no memory reference, and a successful audit BEFORE the send;
+  a link that reconnected or a mute that flipped during that audit refuses the
+  queued line (`stale`), and a failed send is a linked refusal.
+- **The `voice` turn origin** exists in the origin union, its validation,
+  projection and label, and is NOT admitted yet (its tool admission and
+  disposable session are V2).
+- **The sidecar** (`sidecar/reachy-voice/`) speaks with local Piper through an
+  ephemeral 0600 file in a 0700 directory, removed after playback, under a
+  deny-default seatbelt profile, as its own `jarvis-sidecar` user; its runbook
+  gives the one-time admin steps. The isolation proofs show each refusal
+  succeeding unconfined first, and the real sidecar round-tripping the handshake
+  and a `say` under the profile with no audio left behind; on the release host
+  `bun run check:reachy-isolation` fails on any skipped proof.
+  (`isolation.test.ts`; `voice-sidecar.test.ts`.)
 
 What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),
-any body/head motion on real hardware, or memory-backed speech. **Trust model:** a
+any body/head motion on real hardware, or memory-backed speech. Voice V1 adds no
+microphone capture, no wake detection and no speech-to-text. **Trust model:** a
 sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-member
 mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
 by bob's gate (bob#180 §4).

@@ -12,6 +12,7 @@ import {
 import { MAX_LINE_BYTES, UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { handshakeNow, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -69,11 +70,13 @@ function harness(opts: {
   const memory = opts.memory ?? new RecordingMemory();
   const store = opts.store ?? new SlowStore();
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment: opts.enrolment ?? { "spk-1": "member-1" },
     mute: false,
     nowMs: opts.nowMs ?? (() => 1),
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: [],
   };
   const wired = wireReachyCapability({
     pi: new NoPi(),
@@ -81,9 +84,11 @@ function harness(opts: {
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: (m) => opts.logs?.push(m),
     ...(opts.uuid ? { uuid: opts.uuid } : {}),
   });
+  handshakeNow(wired, state);
   return { wired, memory, store, state };
 }
 
@@ -217,28 +222,35 @@ describe("reachy round 5 item 3: a memory write is audited as intent then outcom
 
 // ── round 5 review: a failed sidecar SEND after the audit is a refusal, not a reject ──
 describe("reachy round 5 review: a failed commands.send is handled, never swallowed", () => {
+  // The handshake's `configure` goes through (bob#356); every ACTION send fails.
   class FailingCommands implements ReachyCommands {
-    async send(): Promise<unknown> {
+    async send(command: string): Promise<unknown> {
+      if (command === "configure") return null;
       throw new Error("sidecar not connected");
     }
   }
   function wiredWithFailingSend() {
     const store = new SlowStore();
     const logs: string[] = [];
+    const state: PolicyState = {
+      profile: "reachy",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => 1,
+      lastAcknowledgeAtMs: undefined,
+      roomSpeechOrigins: [],
+    };
     const wired = wireReachyCapability({
       pi: new NoPi(),
       commands: new FailingCommands(),
       memory: new RecordingMemory(),
       store,
-      state: {
-        wakeName: "jarvis",
-        enrolment: {},
-        mute: false,
-        nowMs: () => 1,
-        lastAcknowledgeAtMs: undefined,
-      },
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
       log: (m) => logs.push(m),
     });
+    handshakeNow(wired, state);
     return { wired, store, logs };
   }
 
@@ -274,7 +286,7 @@ describe("reachy round 5 item 4: event ids are full UUIDs, not a time + short su
       memory: { writePrivate: async () => ({ id: "m" }) } as MemoryWriter,
     });
     // Two refusals at the SAME fixed clock (a valid `say` shape, refused because
-    // the transcript is not addressed).
+    // a sidecar proposal cannot speak — bob#356).
     await h.wired.handleLine(
       JSON.stringify({
         type: "proposal",

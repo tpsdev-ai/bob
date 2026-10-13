@@ -5,4 +5,8 @@ export const ORIGIN_FIELD_LIMITS = {
   mailFrom: 64,
   cronJob: 64,
   discordChannelId: 20,
+  // bob#356: the admission-bound identifiers a voice-origin turn carries. Bob
+  // issues both (never the sidecar), so the bound is bob's own id shape.
+  voiceUtteranceId: 64,
+  voiceCorrelationId: 64,
 } as const;

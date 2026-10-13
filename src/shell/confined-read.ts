@@ -130,7 +130,10 @@ export const CONFIG_FIELD_CLASSES: Readonly<
     // The sidecar's UNIX socket: a connection point, not a secret file.
     socket: "not-a-credential",
     sidecarVersion: "not-a-credential",
+    // bob#356: the device profile and the room-speech grants (origin names).
+    profile: "not-a-credential",
     wakeName: "not-a-credential",
+    "roomSpeechOrigins/[]": "not-a-credential",
     "enrolledSpeakers/*": "not-a-credential",
   },
   "tps-mail": { inbox: "not-a-credential", "senders/[]": "not-a-credential" },

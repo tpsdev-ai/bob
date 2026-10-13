@@ -7,7 +7,13 @@ export type TurnOrigin =
   | { kind: "run" }
   | { kind: "mail"; from: string }
   | { kind: "cron"; job: string }
-  | { kind: "discord"; channelId: string };
+  | { kind: "discord"; channelId: string }
+  // bob#356: speech heard in the room (both reachy profiles use this one kind).
+  // Every field is bob-computed at admission: `speakerVerified` from bob's own
+  // enrolment, the utterance and correlation ids issued by bob. Nothing the
+  // sidecar or the transcript says can set them, and the label never carries
+  // the utterance's words.
+  | { kind: "voice"; speakerVerified: boolean; utteranceId: string; correlationId: string };
 
 const DEFAULT_MAX_LABEL_CHARS = 120;
 
@@ -29,6 +35,10 @@ export function originLabel(
       break;
     case "discord":
       label = `discord ${origin.channelId}`;
+      break;
+    case "voice":
+      // Content-free: the verification state only, never the utterance.
+      label = origin.speakerVerified ? "voice (verified speaker)" : "voice (unverified speaker)";
       break;
     default:
       label = "run";
@@ -71,6 +81,22 @@ export function originValidationError(o: TurnOrigin): string | undefined {
         ORIGIN_FIELD_LIMITS.discordChannelId,
         /^[0-9]+$/,
       );
+    case "voice":
+      if (typeof o.speakerVerified !== "boolean") return "voice.speakerVerified must be a boolean";
+      return (
+        check(
+          o.utteranceId,
+          "voice.utteranceId",
+          ORIGIN_FIELD_LIMITS.voiceUtteranceId,
+          /^[A-Za-z0-9_-]+$/,
+        ) ??
+        check(
+          o.correlationId,
+          "voice.correlationId",
+          ORIGIN_FIELD_LIMITS.voiceCorrelationId,
+          /^[A-Za-z0-9_-]+$/,
+        )
+      );
     default:
       return "kind is unknown";
   }
@@ -97,6 +123,14 @@ export function approvedOrigin(o: TurnOrigin): TurnOrigin {
       break;
     case "discord":
       approved = { kind: "discord", channelId: o.channelId };
+      break;
+    case "voice":
+      approved = {
+        kind: "voice",
+        speakerVerified: o.speakerVerified,
+        utteranceId: o.utteranceId,
+        correlationId: o.correlationId,
+      };
       break;
     case "run":
       approved = { kind: "run" };

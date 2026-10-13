@@ -9,6 +9,7 @@ import {
   type OrgEventStore,
   orgEventRecordId,
   type ReachyCommands,
+  type WiredReachy,
 } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
 
@@ -18,6 +19,60 @@ export const MAX_LINE_BYTES = 64 * 1024;
 export interface SidecarLine {
   type: "transcript" | "proposal" | "presence" | "health";
   [k: string]: unknown;
+}
+
+/** Reconnect backoff (bob#356): 1 s doubling to a 60 s cap, reset by a good
+ *  handshake. A refused sidecar is retried, never spun on. */
+export const RECONNECT_MIN_MS = 1_000;
+export const RECONNECT_MAX_MS = 60_000;
+
+/**
+ * Keep the sidecar link up (bob#356 V1): connect, run the handshake, and on a
+ * failed connect or a closed connection retry after a backoff that doubles to
+ * a cap. Only a connection that reached a READY handshake resets the backoff,
+ * so a sidecar that keeps failing the handshake is retried slowly, and every
+ * retry is a fresh handshake (a new generation).
+ */
+export function superviseLink(deps: {
+  client: { connect(): Promise<void>; onClose(listener: () => void): void };
+  wired: Pick<WiredReachy, "connected" | "disconnected" | "link">;
+  /** Timer seam (tests). Default: an unref'd setTimeout. */
+  schedule?: (fn: () => void, ms: number) => void;
+  log?: (m: string) => void;
+}): { start(): Promise<void>; nextDelayMs(): number } {
+  const log = deps.log ?? ((m: string) => console.error(m));
+  const schedule =
+    deps.schedule ??
+    ((fn: () => void, ms: number) => {
+      // unref: a pending reconnect never keeps the process alive on its own.
+      setTimeout(fn, ms).unref();
+    });
+  let delay = RECONNECT_MIN_MS;
+  const later = (): void => {
+    const wait = delay;
+    delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+    schedule(() => void start(), wait);
+  };
+  deps.client.onClose(() => {
+    const wasReady = deps.wired.link().phase === "ready";
+    deps.wired.disconnected();
+    if (wasReady) delay = RECONNECT_MIN_MS;
+    later();
+  });
+  async function start(): Promise<void> {
+    try {
+      await deps.client.connect();
+    } catch (err) {
+      log(
+        `reachy capability: sidecar connect failed (tools still registered; retrying): ${err instanceof Error ? err.message : err}`,
+      );
+      later();
+      return;
+    }
+    // A refused handshake closes the socket; the close listener retries.
+    await deps.wired.connected();
+  }
+  return { start, nextDelayMs: () => delay };
 }
 
 /**
@@ -30,21 +85,60 @@ export class UnixSocketReachyClient implements ReachyCommands {
   private buffer = Buffer.alloc(0);
   private discarding = false;
   private listeners: Array<(line: unknown) => void> = [];
+  private closeListeners: Array<() => void> = [];
 
   constructor(private readonly opts: { socket: string }) {}
 
+  /** Open a NEW connection. bob#356: the raw buffer belongs to one connection
+   *  only — it is cleared here and on close, and bytes from a socket that is no
+   *  longer the current one are never ingested, so a partial line from a
+   *  dropped connection cannot prefix the next connection's first line. */
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.resetBuffer();
       const sock = createConnection(this.opts.socket);
-      sock.once("connect", () => resolve());
-      sock.once("error", reject);
-      // A socket error AFTER connect must not become an unhandled 'error' event.
-      sock.on("error", (err: Error) => console.error(`reachy: socket error: ${err.message}`));
+      let opened = false;
+      sock.once("connect", () => {
+        opened = true;
+        resolve();
+      });
+      sock.once("error", (err: Error) => {
+        if (!opened) reject(err);
+      });
+      // A socket error AFTER connect must not become an unhandled 'error' event
+      // (a failed connect is the caller's rejection, not a log line).
+      sock.on("error", (err: Error) => {
+        if (opened) console.error(`reachy: socket error: ${err.message}`);
+      });
       // Feed RAW BYTES: the bound is counted in UTF-8 bytes, and a line is
       // decoded only once it is complete AND under the bound (round 5 item 1).
-      sock.on("data", (chunk: Buffer) => this.ingest(chunk));
+      sock.on("data", (chunk: Buffer) => {
+        if (this.socket === sock) this.ingest(chunk);
+      });
+      sock.on("close", () => {
+        if (this.socket !== sock) return;
+        this.socket = null;
+        this.resetBuffer();
+        if (opened) for (const l of this.closeListeners) l();
+      });
       this.socket = sock;
     });
+  }
+
+  private resetBuffer(): void {
+    this.buffer = Buffer.alloc(0);
+    this.discarding = false;
+  }
+
+  /** Called once per connection that opened and then closed (either side). */
+  onClose(listener: () => void): void {
+    this.closeListeners.push(listener);
+  }
+
+  /** bob#356: drop the current connection (a failed handshake). The close
+   *  listeners run, so a reconnect starts a fresh handshake. */
+  disconnect(): void {
+    this.socket?.destroy();
   }
 
   /** The bound applies PER COMPLETE LINE (round 4 item 2): an oversized line is
@@ -120,8 +214,10 @@ export class UnixSocketReachyClient implements ReachyCommands {
   }
 
   close(): void {
-    this.socket?.end();
+    const sock = this.socket;
     this.socket = null;
+    this.resetBuffer();
+    sock?.end();
   }
 }
 

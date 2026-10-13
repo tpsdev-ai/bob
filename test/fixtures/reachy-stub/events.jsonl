@@ -1,4 +1,4 @@
-{"type":"health","ok":true}
+{"type":"health","protocol":"reachy-voice/1","version":"$version","profile":"$profile","generation":"$generation","wakeName":"$wakeName","mode":"off","trainedPhrase":null,"modelHash":null,"muted":false,"ok":true}
 {"type":"presence","count":1,"known":["spk-1"]}
 {"type":"transcript","text":"jarvis, the fire drill is on Tuesday","ts":"2026-09-26T10:00:00Z","wakeHeard":true,"speakerId":"spk-1"}
 {"type":"proposal","action":"look","args":{"yaw":12,"pitch":0},"confidence":0.74,"inputs":["cam-1"]}
