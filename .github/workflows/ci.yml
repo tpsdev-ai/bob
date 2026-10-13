@@ -50,6 +50,17 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      # bob#355: the lockfile is written with the bun version package.json's
+      # packageManager declares; every workflow step that uses setup-bun must
+      # install that same version, or this fails. It runs before the frozen
+      # install below, which a drifting version may fail: it needs no
+      # node_modules (bun's built-in YAML parser), and --no-install keeps bun
+      # from auto-installing a missing package. It names the file and step when
+      # the setup-bun step above succeeds and Bun.YAML is available; without
+      # Bun.YAML it still fails, with a parser-unavailable error, and a failed
+      # setup step stops the job before it runs.
+      - name: bun version pin matches package.json
+        run: bun --no-install scripts/check-bun-version.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck

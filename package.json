@@ -1,6 +1,7 @@
 {
   "name": "@tpsdev-ai/bob",
   "version": "0.2.0",
+  "packageManager": "bun@1.3.10",
   "type": "module",
   "description": "Bob — office-agent shell. Hire a Bob, give them a role, and they show up to work.",
   "bin": {
