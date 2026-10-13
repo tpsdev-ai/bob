@@ -22,7 +22,7 @@
 //   - bun version (bob#355): the host's installed bun against the version
 //     package.json's packageManager declares (the version bob's lockfile is
 //     written with). FAILS on a mismatch, on a bun that cannot be read, and on
-//     an absent or unparseable declaration — a host whose bun has moved fails
+//     an absent or unparseable declaration — a host whose bun has moved can fail
 //     'bun install --frozen-lockfile' before anything else runs, so doctor names
 //     the remedy here instead
 //   - TPS mail inbox dir + new/cur counts
@@ -135,7 +135,7 @@ export interface DoctorOptions {
 // bob#355: the bun version bob's lockfile is written with. package.json's
 // packageManager declares it, and CI's setup-bun pins must agree with it
 // (scripts/check-bun-version.mjs). A host whose bun has moved — a Homebrew bun
-// upgraded past the lockfile's version — fails
+// upgraded past the lockfile's version — can fail
 // `bun install --frozen-lockfile` with "overrides in package.json changed since
 // bun.lock was saved", before any of bob runs. Doctor reports the mismatch, or
 // the missing declaration, before that install.
