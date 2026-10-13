@@ -21,8 +21,10 @@
 //     declares both
 //   - bun version (bob#355): the host's installed bun against the version
 //     package.json's packageManager declares (the version bob's lockfile is
-//     written with). FAILS on a mismatch, on a bun that cannot be read, and on
-//     an absent or unparseable declaration — a host whose bun has moved can fail
+//     written with). Host-level, so it is checked before the agent directory
+//     and reports even when the agent does not exist yet. FAILS on a mismatch,
+//     on a bun that cannot be read, and on a declaration that is absent or
+//     cannot be read or parsed — a host whose bun has moved may fail
 //     'bun install --frozen-lockfile' before anything else runs, so doctor names
 //     the remedy here instead
 //   - TPS mail inbox dir + new/cur counts
@@ -133,17 +135,21 @@ export interface DoctorOptions {
 }
 
 // bob#355: the bun version bob's lockfile is written with. package.json's
-// packageManager declares it, and CI's setup-bun pins must agree with it
+// packageManager declares it, and CI's setup-bun steps must match it
 // (scripts/check-bun-version.mjs). A host whose bun has moved — a Homebrew bun
-// upgraded past the lockfile's version — can fail
+// upgraded past the lockfile's version — may fail
 // `bun install --frozen-lockfile` with "overrides in package.json changed since
-// bun.lock was saved", before any of bob runs. Doctor reports the mismatch, or
-// the missing declaration, before that install.
+// bun.lock was saved", before any of bob runs. This check is host-level: doctor
+// reports it whether or not the agent exists.
 export const BUN_VERSION_CHECK = "bun version";
 export const BUN_PROBE_TIMEOUT_MS = 5_000;
 
 // package.json's packageManager pin, as npm writes it: "bun@1.3.10".
 const BUN_PACKAGE_MANAGER = /^bun@(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/;
+
+// A whole version, the shape `bun --version` prints. Anything else — extra
+// text, no version — is an error, not a version.
+const BUN_VERSION_OUTPUT = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 // The version in `packageManager`, or undefined when it is absent or not a
 // pinned bun. Never throws: a shape doctor cannot parse is a finding, not a
@@ -155,10 +161,10 @@ export function declaredBunVersion(packageManager: unknown): string | undefined 
 
 export type BunProbe = { version: string } | { error: string };
 
-// The installed bun, asked `bun --version` with a fixed argv, no shell, and an
-// environment of PATH only, so no ambient variable reaches the child. A probe
-// that cannot start, is killed at its timeout, or prints something that is not
-// a version is an { error }, never a version.
+// The installed bun, asked `bun --version` with a fixed argv and no shell. Only
+// PATH is passed through. A probe that cannot start, is killed at its timeout,
+// or prints anything that is not a whole version is an { error }, never a
+// version.
 export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): BunProbe {
   const res = spawnSync("bun", ["--version"], {
     encoding: "utf8",
@@ -176,24 +182,38 @@ export function probeInstalledBun(pathEnv: string = process.env.PATH ?? ""): Bun
     return { error: `'bun --version' exited ${res.status ?? res.signal}` };
   }
   const out = (typeof res.stdout === "string" ? res.stdout : "").trim();
-  return /^\d+\.\d+\.\d+/.test(out)
+  return BUN_VERSION_OUTPUT.test(out)
     ? { version: out }
     : { error: `'bun --version' printed ${JSON.stringify(out)}` };
 }
 
 // The `bun version` check: the installed bun against the declared one. Every
-// case that is not an exact match FAILS with a named remedy — the declaration
-// absent or unparseable is a finding too, never a silent pass. The declared
-// version's remedy is `npx -y bun@<declared> install --frozen-lockfile`, the
-// one the issue names, or installing that bun.
-export function bunVersionFinding(o: { packageManager: unknown; probe: BunProbe }): DoctorCheck {
-  const declared = declaredBunVersion(o.packageManager);
+// case that is not an exact match FAILS with a named remedy — a declaration
+// that is absent, or a package.json that cannot be read or parsed, is a finding
+// too, never a silent pass. The declared version's remedy is
+// `npx -y bun@<declared> install --frozen-lockfile`, the one the issue names, or
+// installing that bun.
+export function bunVersionFinding(o: {
+  declaration: DeclaredBunVersion;
+  probe: BunProbe;
+}): DoctorCheck {
+  if ("error" in o.declaration) {
+    return {
+      name: BUN_VERSION_CHECK,
+      status: "fail",
+      detail: `the bun version bob's lockfile is written with cannot be determined: ${o.declaration.error}`,
+      fix: "restore package.json, or reinstall bob, so its packageManager declaration can be read",
+    };
+  }
+  const declared = declaredBunVersion(o.declaration.packageManager);
   if (declared === undefined) {
     return {
       name: BUN_VERSION_CHECK,
       status: "fail",
       detail: `package.json declares packageManager ${
-        o.packageManager === undefined ? "not at all" : JSON.stringify(o.packageManager)
+        o.declaration.packageManager === undefined
+          ? "not at all"
+          : JSON.stringify(o.declaration.packageManager)
       }, so the bun version bob's lockfile is written with cannot be determined`,
       fix: 'set packageManager to "bun@<version>" in package.json (the version CI installs with)',
     };
@@ -210,7 +230,7 @@ export function bunVersionFinding(o: { packageManager: unknown; probe: BunProbe 
     return {
       name: BUN_VERSION_CHECK,
       status: "fail",
-      detail: `bun ${o.probe.version} does not match the declared bun ${declared}; 'bun install --frozen-lockfile' fails under a version the lockfile was not written with`,
+      detail: `bun ${o.probe.version} does not match the declared bun ${declared}; 'bun install --frozen-lockfile' may fail under a version the lockfile was not written with`,
       fix: `run 'npx -y bun@${declared} install --frozen-lockfile', or install bun ${declared}`,
     };
   }
@@ -221,15 +241,28 @@ export function bunVersionFinding(o: { packageManager: unknown; probe: BunProbe 
   };
 }
 
-// package.json's packageManager, as the installed (or checked-out) package
-// carries it. A package.json doctor cannot read yields undefined, and the check
-// above reports the missing declaration rather than throwing.
-function readDeclaredBunVersion(): unknown {
+// package.json as read: the packageManager declaration, or the reason it could
+// not be read. An unreadable or invalid manifest keeps its read/parse error —
+// doctor never reports it as a declaration that is absent.
+export type DeclaredBunVersion = { packageManager: unknown } | { error: string };
+
+// The packageManager a given package.json carries. The default is the
+// package.json beside the running module (a checkout or an npm install); a test
+// passes its own. Never throws: the read or parse error is returned, not
+// swallowed.
+export function readDeclaredBunVersion(
+  packageJsonPath: string | URL = new URL("../../package.json", import.meta.url),
+): DeclaredBunVersion {
+  let raw: string;
   try {
-    const raw = readFileSync(new URL("../../package.json", import.meta.url), "utf8");
-    return (JSON.parse(raw) as { packageManager?: unknown }).packageManager;
-  } catch {
-    return undefined;
+    raw = readFileSync(packageJsonPath, "utf8");
+  } catch (error) {
+    return { error: `package.json could not be read: ${(error as Error).message}` };
+  }
+  try {
+    return { packageManager: (JSON.parse(raw) as { packageManager?: unknown }).packageManager };
+  } catch (error) {
+    return { error: `package.json could not be parsed: ${(error as Error).message}` };
   }
 }
 
@@ -244,6 +277,19 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
 
   const checks: DoctorCheck[] = [];
 
+  // bob#355: the bun the lockfile is written with is host-level, so it is
+  // reported before the agent directory — even when the agent does not exist
+  // yet. Overridden in tests.
+  checks.push(
+    bunVersionFinding({
+      declaration: readDeclaredBunVersion(),
+      probe:
+        opts.installedBunVersion !== undefined
+          ? { version: opts.installedBunVersion }
+          : probeInstalledBun(),
+    }),
+  );
+
   // Agent dir — root of everything else. If missing, everything else is moot.
   if (!existsSync(agentDir)) {
     checks.push({
@@ -255,18 +301,6 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
     return finalize(opts.name, agentDir, checks);
   }
   checks.push({ name: "agent dir", status: "ok", detail: agentDir });
-
-  // bob#355: the bun the lockfile is written with, checked before the layout so
-  // a host that cannot install bob hears it. Overridden in tests.
-  checks.push(
-    bunVersionFinding({
-      packageManager: readDeclaredBunVersion(),
-      probe:
-        opts.installedBunVersion !== undefined
-          ? { version: opts.installedBunVersion }
-          : probeInstalledBun(),
-    }),
-  );
 
   // soul.md
   checks.push(

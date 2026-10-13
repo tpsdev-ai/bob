@@ -112,9 +112,12 @@ describe("runDoctor", () => {
       homeDir: home,
     });
     expect(report.summary.fail).toBeGreaterThanOrEqual(1);
-    expect(report.checks[0].name).toBe("agent dir");
-    expect(report.checks[0].status).toBe("fail");
-    expect(report.checks[0].fix).toMatch(/bob onboard/);
+    // The host-level bun check runs before the layout, so the agent dir is the
+    // LAST check: nothing after it ran.
+    const last = report.checks[report.checks.length - 1];
+    expect(last.name).toBe("agent dir");
+    expect(last.status).toBe("fail");
+    expect(last.fix).toMatch(/bob onboard/);
   });
 
   it("FAIL on missing launcher", () => {

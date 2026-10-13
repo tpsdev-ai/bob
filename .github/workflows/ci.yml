@@ -47,15 +47,16 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-      # bob#355: the lockfile is written with the bun version package.json's
-      # packageManager declares; this fails when a workflow's setup-bun pin has
-      # drifted from it, so the two cannot disagree.
-      - name: bun version pin matches package.json
-        run: node scripts/check-bun-version.mjs
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
+      # bob#355: the lockfile is written with the bun version package.json's
+      # packageManager declares; every workflow step that uses setup-bun must
+      # install that same version, or this fails and names the step. Needs
+      # node_modules (the yaml parser), so it runs after the install above.
+      - name: bun version pin matches package.json
+        run: node scripts/check-bun-version.mjs
       - run: bun run lint
       - run: bun run typecheck
       - run: bun run build

@@ -1,7 +1,9 @@
 // bob#355: the version pin check. package.json's packageManager is the source
-// of truth for the bun version bob's lockfile is written with; every workflow's
-// setup-bun pin must match it. The check fails on a drifted pin, on a
-// packageManager that is not a pinned bun, and when there is no pin to check.
+// of truth for the bun version bob's lockfile is written with; every workflow
+// step that uses oven-sh/setup-bun must install it. The check fails on a
+// missing, non-literal or drifting bun-version input, on an unparseable
+// workflow, and on a packageManager that is not a pinned bun; a run with no
+// setup-bun step to check is a finding too.
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,12 +16,29 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+const SETUP_BUN = "      - uses: oven-sh/setup-bun@v2";
+
+// A workflow with one job whose steps are the given YAML fragments, each
+// indented as a list item under `steps:`.
+function workflow(...steps: string[]): string {
+  return [
+    "name: fixture",
+    "on: push",
+    "jobs:",
+    "  build:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    ...steps,
+    "",
+  ].join("\n");
+}
+
 // A fixture repo with a package.json (packageManager optional) and the given
 // workflow files, as [name, contents].
 function fixture(
   packageManager: string | undefined,
   workflows: Array<[string, string]> = [
-    ["ci.yml", '      - with:\n          bun-version: "1.3.10"\n'],
+    ["ci.yml", workflow(SETUP_BUN, "        with:", '          bun-version: "1.3.10"')],
   ],
 ): string {
   const root = mkdtempSync(join(tmpdir(), "bob-bun-version-"));
@@ -33,7 +52,7 @@ function fixture(
   return root;
 }
 
-test("a pin that matches package.json passes", () => {
+test("a workflow whose setup-bun step carries the declared version passes", () => {
   expect(checkBunVersionPins({ root: fixture("bun@1.3.10") })).toEqual({
     declared: "1.3.10",
     pins: 1,
@@ -41,32 +60,76 @@ test("a pin that matches package.json passes", () => {
   });
 });
 
-test("a drifted pin is reported with its file, line and remedy", () => {
+test("a removed bun-version input is reported with its file and step", () => {
+  const result = checkBunVersionPins({
+    root: fixture("bun@1.3.10", [["ci.yml", workflow(SETUP_BUN)]]),
+  });
+  expect(result.pins).toBe(1);
+  expect(result.errors).toHaveLength(1);
+  expect(result.errors[0]).toContain(".github/workflows/ci.yml: job build");
+  expect(result.errors[0]).toContain("no bun-version input");
+});
+
+test("a changed bun-version is reported with its file and step", () => {
   const result = checkBunVersionPins({
     root: fixture("bun@1.3.10", [
-      [
-        "ci.yml",
-        "jobs:\n  build:\n    steps:\n      - uses: x\n      - with:\n          bun-version: 1.4.2\n",
-      ],
+      ["ci.yml", workflow(SETUP_BUN, "        with:", '          bun-version: "1.4.2"')],
     ]),
   });
   expect(result.errors).toEqual([
-    ".github/workflows/ci.yml:6: setup-bun pin 1.4.2 does not match package.json's bun 1.3.10",
+    '.github/workflows/ci.yml: job build, step using oven-sh/setup-bun@v2: setup-bun bun-version 1.4.2 does not match package.json\'s bun 1.3.10; set it to "1.3.10"',
   ]);
 });
 
-test("every pin in every workflow is checked", () => {
-  const pin = '          bun-version: "1.4.2"\n';
+test("a non-literal bun-version expression is reported", () => {
+  // Split so a linter does not read the expression as a template string.
+  const expression = "          bun-version: " + "$" + "{{ vars.BUN }}";
+  const result = checkBunVersionPins({
+    root: fixture("bun@1.3.10", [["ci.yml", workflow(SETUP_BUN, "        with:", expression)]]),
+  });
+  expect(result.errors).toHaveLength(1);
+  expect(result.errors[0]).toContain("is not a literal version");
+});
+
+test("a workflow that does not parse is reported rather than skipped", () => {
+  const result = checkBunVersionPins({
+    root: fixture("bun@1.3.10", [["ci.yml", "jobs: [unclosed\n"]]),
+  });
+  expect(result.pins).toBe(0);
+  expect(result.errors).toHaveLength(1);
+  expect(result.errors[0]).toContain(".github/workflows/ci.yml: could not be parsed as YAML");
+});
+
+test("a setup-bun step in every workflow and job is checked", () => {
+  const bad = workflow(SETUP_BUN, "        with:", '          bun-version: "1.4.2"');
+  const twoJobs = [
+    "name: fixture",
+    "on: push",
+    "jobs:",
+    "  build:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    SETUP_BUN,
+    "        with:",
+    '          bun-version: "1.3.10"',
+    "  release:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    SETUP_BUN,
+    "        with:",
+    '          bun-version: "1.4.2"',
+    "",
+  ].join("\n");
   const result = checkBunVersionPins({
     root: fixture("bun@1.3.10", [
-      ["ci.yml", pin],
-      ["release.yml", pin],
+      ["ci.yml", twoJobs],
+      ["release.yml", bad],
     ]),
   });
-  expect(result.pins).toBe(2);
+  expect(result.pins).toBe(3);
   expect(result.errors).toHaveLength(2);
-  expect(result.errors[0]).toContain(".github/workflows/ci.yml:1:");
-  expect(result.errors[1]).toContain(".github/workflows/release.yml:1:");
+  expect(result.errors[0]).toContain(".github/workflows/ci.yml:");
+  expect(result.errors[1]).toContain(".github/workflows/release.yml:");
 });
 
 test("an absent packageManager is a finding, not a pass", () => {
@@ -81,22 +144,15 @@ test("a packageManager that is not a pinned bun is a finding", () => {
   expect(result.errors.join("\n")).toContain("packageManager is not a pinned");
 });
 
-test("no pin to check is a finding, not a vacuous pass", () => {
-  const result = checkBunVersionPins({ root: fixture("bun@1.3.10", [["ci.yml", "jobs: {}\n"]]) });
-  expect(result.pins).toBe(0);
-  expect(result.errors.join("\n")).toContain("no bun-version pin found");
-});
-
-test("quoted and unquoted pins, and trailing comments, are read", () => {
+test("no setup-bun step to check is a finding, not a vacuous pass", () => {
   const result = checkBunVersionPins({
-    root: fixture("bun@1.3.10", [
-      ["ci.yml", "          bun-version: 1.3.10 # pinned to the lockfile\n"],
-    ]),
+    root: fixture("bun@1.3.10", [["ci.yml", workflow("      - run: echo hi")]]),
   });
-  expect(result.errors).toEqual([]);
+  expect(result.pins).toBe(0);
+  expect(result.errors.join("\n")).toContain("no oven-sh/setup-bun step found");
 });
 
-test("this repository's own pins match its package.json", () => {
+test("this repository's own setup-bun steps match its package.json", () => {
   // The real component: this repo's package.json and its actual workflows.
   expect(checkBunVersionPins().errors).toEqual([]);
 });

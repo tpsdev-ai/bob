@@ -29,6 +29,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -253,6 +254,30 @@ try {
     if (r.status !== 0 && r.status !== 1) throw new Error(`exit ${r.status}\n${r.stderr}`);
     if (!r.stdout.includes("agent dir")) throw new Error("no doctor report");
     return `exit ${r.status}, report printed`;
+  });
+
+  check("bob doctor reads the bun version from the packed manifest (#355)", () => {
+    // The `bun version` finding resolves package.json beside the installed
+    // module. Write a version the checkout does not declare into the INSTALLED
+    // manifest: if doctor names it, the finding was read from the installed
+    // package, not from a checkout beside this script.
+    const manifest = join(install, "node_modules", "@tpsdev-ai", "bob", "package.json");
+    const original = readFileSync(manifest, "utf8");
+    try {
+      const pkg = JSON.parse(original);
+      pkg.packageManager = "bun@9.9.9";
+      writeFileSync(manifest, `${JSON.stringify(pkg, null, 2)}\n`);
+      const r = cli("doctor", "packbot");
+      const out = `${r.stdout}${r.stderr}`;
+      if (!out.includes("bun version"))
+        throw new Error(`no bun version finding:\n${out.slice(0, 400)}`);
+      if (!out.includes("9.9.9")) {
+        throw new Error(`finding did not read the installed manifest:\n${out.slice(0, 400)}`);
+      }
+      return "finding read the installed manifest";
+    } finally {
+      writeFileSync(manifest, original);
+    }
   });
 
   // ------------------------------------------------------- capabilities ----
