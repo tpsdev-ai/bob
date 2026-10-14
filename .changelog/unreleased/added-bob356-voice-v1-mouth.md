@@ -1,20 +1,25 @@
 - **Voice V1, the mouth: a `voice` profile, the versioned `reachy-voice/1` handshake, room speech by bound caller, and a confined local-TTS sidecar (#356).** The `reachy`
   capability takes a bob-owned `profile` (`voice`, the default, registers only
   `reachy_say` and `reachy_state`; `reachy` adds `reachy_look` and
-  `reachy_frame`; any other value is refused when `bob.yaml` loads), and an
+  `reachy_frame`; any other value is refused whenever bob loads the capability), and an
   allowlist naming a tool the configured profile does not register is refused by
-  name before any session; under `voice`, body proposals refuse and a `presence`
-  line is a content-free `reachy.malformed`. The wake name comes only from the
+  name before any session; under `voice`, a body proposal is refused on an
+  unmuted link (a muted link drops it) and a `presence` line on any ready link,
+  muted or not, is a content-free `reachy.malformed`. The wake name comes only from the
   agent's `voice.wakeName` (default `jarvis`); a `reachy:` block that sets one is
-  refused. Every sidecar connection starts with bob's `configure` (protocol,
-  profile, wake name, a fresh generation), and nothing is judged until that
-  write succeeded; the sidecar's strict health line must repeat them, carry the
+  refused. Every connection bob makes to the sidecar starts with its `configure` (protocol,
+  profile, wake name, a fresh generation); the first line that arrives before
+  that write succeeded is held and judged after it, and a second refuses the
+  link; the sidecar's strict health line must repeat them, carry the
   exact pinned `sidecarVersion`, and report its wake mode with a consistent
   trained-artifact pair (`off`: none; `gate-only`: none for this name;
   `trained`: this name's), its mute and its status. Until then only
   control/status traffic moves, and a mismatch, a legacy health line or any
-  other line disconnects with one bounded `reachy.link.refused` alarm, retried
-  on a doubling backoff with a fresh handshake each time; the link is released
+  other line disconnects and attempts a bounded `reachy.link.refused` alarm:
+  each reason once per failure episode, whatever came between, latched only
+  once recorded in that episode (a failed write is retried under the same
+  record id, and a write completing after a good handshake latches nothing); bob
+  reconnects on a doubling backoff with a fresh handshake each time; the link is released
   when pi shuts the session down. `reachy_say` speaks without a transcript only
   for the origin the runtime binds the call to — the admitted turn it runs in,
   or the `run` an operator's one-shot `bob run` declares — and only when
@@ -39,7 +44,11 @@
   including a sudoers rule that names one installed proof command, and
   `bun run check:reachy-isolation` — a manual release-host prerequisite no CI
   workflow runs — fails on any skipped, failed or missing pinned isolation
-  proof, checking bob's active credentials derived from the agent's `bob.yaml`.
+  proof, checking bob's active credentials derived from the agent's `bob.yaml`
+  (each configured key an absolute or `~/` path that exists as a regular file;
+  a relative one fails) as the OS account the host's root-owned deployment record names (never
+  as root, matched by uid in the OS account database, with its own HOME) and a
+  pinned PATH.
   Refs #356. (`test/capabilities/reachy/voice-v1.test.ts`,
   `test/capabilities/reachy/voice-session.test.ts`,
   `test/capabilities/reachy/handshake-socket.test.ts`,

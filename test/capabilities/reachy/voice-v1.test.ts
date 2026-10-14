@@ -219,6 +219,36 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     expect(h.commands.sent).toEqual([]);
   });
 
+  it("on a ready but MUTED voice link, presence is still audited (malformed); body proposals are dropped, and refused when unmuted", async () => {
+    const h = harness({ profile: "voice" });
+    await h.ready({ muted: true });
+    expect(h.wired.link()).toMatchObject({ phase: "ready", effectiveMuted: true });
+    const r = await h.wired.handleLine({ type: "presence", count: 3, known: ["spk-secret-id"] });
+    expect(r.kind).toBe("malformed");
+    const ev = must(
+      h.store.all.find((e) => e.kind === "reachy.malformed"),
+      "the malformed audit",
+    );
+    expect(ev.summary).toBe(
+      "dropped a malformed sidecar line: a presence line under the voice profile (no camera)",
+    );
+    // a body proposal on the muted link is dropped (mute wins)…
+    const look = {
+      type: "proposal",
+      action: "look",
+      args: { yaw: 1, pitch: 0 },
+      confidence: 1,
+      inputs: [],
+    };
+    expect((await h.wired.handleLine(look)).kind).toBe("drop");
+    // …and refused once unmuted
+    await h.wired.handleLine(healthLine(h.wired, h.state, { muted: false }));
+    expect(await h.wired.handleLine(look)).toMatchObject({
+      kind: "refused",
+      reason: "body actions are absent under the voice profile",
+    });
+  });
+
   it("a presence line under voice is a bounded, content-free malformed audit (and ignored under reachy)", async () => {
     const h = harness({ profile: "voice" });
     await h.ready();
@@ -432,6 +462,93 @@ describe("bob#356 V1 — the handshake: control/status first, mismatch disconnec
     expect(h.logs.filter((m) => m.includes("handshake refused")).length).toBe(2);
   });
 
+  it("an alarm whose audit write FAILED is not latched: the next identical failure retries it", async () => {
+    const h = harness();
+    h.store.fail = true;
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // legacy: refused, alarm write fails
+    expect(h.store.all.filter((e) => e.kind === "reachy.link.refused").length).toBe(0);
+    expect(h.logs.some((m) => m.includes("was not recorded; it is retried"))).toBe(true);
+    h.store.fail = false;
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // the same failure: retried, recorded
+    expect(h.store.all.filter((e) => e.kind === "reachy.link.refused").length).toBe(1);
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // recorded once: now latched
+    expect(h.store.all.filter((e) => e.kind === "reachy.link.refused").length).toBe(1);
+  });
+
+  it("an alarm write that completes AFTER a good handshake latches nothing: the next identical failure alarms again", async () => {
+    const h = harness();
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const write = h.store.write.bind(h.store);
+    let first = true;
+    h.store.write = async (e) => {
+      if (e.kind === "reachy.link.refused" && first) {
+        first = false;
+        await held; // the first alarm's write is slow
+      }
+      return write(e);
+    };
+    await h.wired.connected();
+    const pending = h.wired.handleLine({ type: "health", ok: true }); // failure #1, write held
+    await h.ready(); // a GOOD handshake ends that failure episode
+    release();
+    await pending; // the late write completes now — after the good handshake
+    // it WAS recorded, and the log says so (not "not recorded")
+    expect(h.logs.some((l) => l.includes("was recorded after the link recovered"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("was not recorded"))).toBe(false);
+    // the SAME failure again, straight after: it is a NEW episode's alarm
+    await h.wired.handleLine({ type: "health", ok: true });
+    const alarms = h.store.all.filter((e) => e.kind === "reachy.link.refused");
+    expect(alarms.length).toBe(2); // the late #1 did not latch and hide this one
+    expect(new Set(alarms.map((a) => a.id)).size).toBe(2); // different episodes, different records
+  });
+
+  it("an alarm's record id is STABLE within a failure episode: a retry after an uncertain write upserts one record", async () => {
+    const h = harness();
+    // the first write PERSISTS and then throws (the response was lost)
+    let first = true;
+    const write = h.store.write.bind(h.store);
+    h.store.write = async (e) => {
+      const r = await write(e);
+      if (e.kind === "reachy.link.refused" && first) {
+        first = false;
+        throw new Error("response lost");
+      }
+      return r;
+    };
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // write persisted, reported failed
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // retried — the same id
+    const alarms = h.store.all.filter((e) => e.kind === "reachy.link.refused");
+    expect(alarms.length).toBe(2); // two writes…
+    expect(new Set(alarms.map((a) => a.id)).size).toBe(1); // …of ONE record
+    await h.wired.connected();
+    await h.wired.handleLine({ type: "health", ok: true }); // recorded once: latched now
+    expect(h.store.all.filter((e) => e.kind === "reachy.link.refused").length).toBe(2);
+  });
+
+  it("within one failure episode each reason alarms ONCE, whatever came between: A, B, A writes two alarms", async () => {
+    const h = harness();
+    const A = { type: "health", ok: true }; // a legacy health line
+    await h.wired.connected();
+    await h.wired.handleLine(A);
+    await h.wired.connected();
+    await h.wired.handleLine(healthLine(h.wired, h.state, { version: "wrong" })); // B
+    await h.wired.connected();
+    await h.wired.handleLine(A); // A again — no good handshake in between
+    await h.wired.connected();
+    await h.wired.handleLine(healthLine(h.wired, h.state, { version: "wrong" })); // B again
+    const alarms = h.store.all.filter((e) => e.kind === "reachy.link.refused");
+    expect(alarms.length).toBe(2);
+    expect(new Set(alarms.map((a) => a.id)).size).toBe(2);
+  });
+
   it("reconnect: a fresh handshake with the NEXT generation works; the old generation's health is refused", async () => {
     const h = harness();
     await h.ready({ version: "wrong" });
@@ -443,7 +560,7 @@ describe("bob#356 V1 — the handshake: control/status first, mismatch disconnec
     await h.wired.connected();
     expect((await h.wired.handleLine(healthLine(h.wired, h.state))).kind).toBe("none");
     expect(h.wired.link()).toMatchObject({ phase: "ready", generation: 3, effectiveMuted: false });
-    // the alarm repeats only for a NEW failure after a good handshake
+    // after a good handshake (a NEW episode) the same reason alarms again
     await h.wired.handleLine(healthLine(h.wired, h.state, { version: "wrong" }));
     expect(h.store.all.filter((e) => e.kind === "reachy.link.refused").length).toBe(3);
   });

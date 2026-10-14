@@ -304,15 +304,24 @@ function valuesAt(value: unknown, segments: readonly string[]): unknown[] | "mal
   return out;
 }
 
-// Every key or token file the agent's parsed config names, plus pi's provider
-// stores — or a REASON the list cannot be built. The caller must not substitute
-// an empty list for a failure: a resident `read` is composed only with a list.
-export function collectCredentialPaths(src: CredentialSources): CredentialPathList {
+// Every key or token file the agent's parsed config NAMES — one entry per
+// configured value, with the absolute path(s) it can mean — or a REASON the
+// list cannot be built. Kept apart from pi's provider stores so a caller that
+// must know WHICH paths the agent configured (bob#356's release-host key proof)
+// never infers it from where a path happens to point.
+export type ConfiguredCredentials =
+  | {
+      ok: true;
+      // `relative`: the configured value (after `~` expansion) is not absolute,
+      // so which file it means depends on the opener's cwd (`candidates` holds
+      // both readings).
+      entries: Array<{ field: string; candidates: string[]; relative: boolean }>;
+    }
+  | { ok: false; reason: string };
+
+export function collectConfiguredCredentials(src: CredentialSources): ConfiguredCredentials {
   const processCwd = src.processCwd ?? process.cwd();
-  const paths = new Set<string>([
-    join(src.piAgentDir, PROVIDER_LOGIN_STORE),
-    join(src.piAgentDir, PROVIDER_MODELS_STORE),
-  ]);
+  const entries: Array<{ field: string; candidates: string[]; relative: boolean }> = [];
   const resolved = new Map(src.capabilities.map((c) => [c.name, c.config]));
   const classes = src.fieldClasses ?? CONFIG_FIELD_CLASSES;
   for (const [block, blockClasses] of Object.entries(classes)) {
@@ -345,10 +354,28 @@ export function collectCredentialPaths(src: CredentialSources): CredentialPathLi
             reason: `bob.yaml ${block}.${field.replaceAll("/", ".")} is not a file path (write it as a quoted string)`,
           };
         }
-        for (const p of credentialCandidates(value, src.workspaceRoot, processCwd)) paths.add(p);
+        entries.push({
+          field: `${block}.${field.replaceAll("/", ".")}`,
+          candidates: credentialCandidates(value, src.workspaceRoot, processCwd),
+          relative: !isAbsolute(expandHome(value)),
+        });
       }
     }
   }
+  return { ok: true, entries };
+}
+
+// Every key or token file the agent's parsed config names, plus pi's provider
+// stores — or a REASON the list cannot be built. The caller must not substitute
+// an empty list for a failure: a resident `read` is composed only with a list.
+export function collectCredentialPaths(src: CredentialSources): CredentialPathList {
+  const configured = collectConfiguredCredentials(src);
+  if (!configured.ok) return configured;
+  const paths = new Set<string>([
+    join(src.piAgentDir, PROVIDER_LOGIN_STORE),
+    join(src.piAgentDir, PROVIDER_MODELS_STORE),
+  ]);
+  for (const entry of configured.entries) for (const p of entry.candidates) paths.add(p);
   return { ok: true, paths: [...paths] };
 }
 

@@ -18,8 +18,9 @@ import { Value } from "typebox/value";
 
 export const CONFIG_ENV_VAR = "BOB_CAP_REACHY";
 
-/** The device profiles (bob#356 delta 1). `voice` is a microphone and a speaker;
- *  `reachy` adds the head, the antennas and the camera. */
+/** The device profiles (bob#356 delta 1). `voice` is a speakerphone — V1 drives
+ *  only its speaker (the microphone is V2); `reachy` adds the head, the antennas
+ *  and the camera. */
 export const PROFILES = ["voice", "reachy"] as const;
 export type ReachyProfile = (typeof PROFILES)[number];
 export const DEFAULT_PROFILE: ReachyProfile = "voice";
@@ -61,10 +62,13 @@ export const CONFIG_SCHEMA = Type.Object(
     // Exact pin of the sidecar's version: `health.version` must equal it.
     sidecarVersion: Type.String({ minLength: 1, description: "Exact sidecar version pin." }),
     // bob#356: the device profile. Omitted means `voice`; any other value is
-    // refused by this schema at bob.yaml load and again at extension load.
+    // refused by this schema whenever bob loads the capability (resolution
+    // and extension load). A capability the override layer disables is not
+    // loaded, so its block is not validated.
     profile: Type.Optional(
       Type.Union([Type.Literal("voice"), Type.Literal("reachy")], {
-        description: "Device profile: voice (mic + speaker) or reachy (adds the body).",
+        description:
+          "Device profile: voice (a speakerphone; V1 drives only its speaker) or reachy (adds the body).",
       }),
     ),
     // The wake name — bob-owned, projected from `voice.wakeName`. A string

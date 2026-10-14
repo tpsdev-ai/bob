@@ -2,24 +2,41 @@
 // check. The gate turns a skip into a failure under BOB_REQUIRE_ISOLATION_PROOFS=1,
 // and the check script requires every PINNED proof id to have passed.
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  accountHome,
   CHECK_ENV,
   checkEnv,
+  DEPLOYMENT_RECORD,
   EXPECTED_PROOFS,
+  PINNED_PATH,
   passedProofs,
   proofCounts,
+  readDeploymentRecord,
+  refusal,
   SUBSTITUTE_ROOTS,
   verdict,
 } from "../../../scripts/check-reachy-isolation.mjs";
 import {
   PINNED_INSTALL_DIR,
+  PINNED_STATE_DIR,
   proofDisposition,
   REQUIRE_ENV,
   releaseRoots,
 } from "./isolation-gate.js";
 
+const SCRIPT = join(import.meta.dirname, "..", "..", "..", "scripts", "check-reachy-isolation.mjs");
 const report = (lines: string[], counts: { pass: number; skip: number; fail: number }) =>
   `${lines.join("\n")}\n\n ${counts.pass} pass\n ${counts.skip} skip\n ${counts.fail} fail\n`;
 const ALL = EXPECTED_PROOFS.map((id) => `(pass) isolation > [${id}] a proof [1.0ms]`);
@@ -57,33 +74,151 @@ describe("bob#356 — the isolation-proof release gate", () => {
     expect(declared.sort()).toEqual([...EXPECTED_PROOFS].sort());
   });
 
-  it("the proofs inherit only a minimal environment; substitute roots are never among it", () => {
-    const env = checkEnv({
-      PATH: "/usr/bin",
-      HOME: "/Users/a",
-      BOB_ISOLATION_AGENT: "rocky",
-      BOB_REACHY_VOICE_DIR: "/tmp/fake-install",
-      BOB_ISOLATION_AGENTS_ROOT: "/tmp/fake-agents",
-      TPS_VAULT_KEY: "secret",
-    });
+  // A fake account database for the pure checks: bob (uid 501), another
+  // account (502) and root; and fake deployment records.
+  const db = (n: string) =>
+    ({
+      bob: { uid: 501, home: "/Users/bob" },
+      "501": { uid: 501, home: "/Users/bob" },
+      other: { uid: 502, home: "/Users/other" },
+      "502": { uid: 502, home: "/Users/other" },
+      root: { uid: 0, home: "/var/root" },
+      "0": { uid: 0, home: "/var/root" },
+    })[n];
+  const names = (user: string) => () => ({ user });
+  const RECORD_BOB = names("bob");
+
+  it("the proofs inherit only a minimal environment: PATH pinned, HOME the account's, roots never", () => {
+    const env = checkEnv(
+      {
+        PATH: "/private/tmp/poison:/usr/bin",
+        HOME: "/private/tmp/substitute",
+        BOB_ISOLATION_AGENT: "rocky",
+        BOB_REACHY_VOICE_DIR: "/tmp/fake-install",
+        BOB_ISOLATION_AGENTS_ROOT: "/tmp/fake-agents",
+        TPS_VAULT_KEY: "secret",
+      },
+      "/Users/bob",
+    );
     expect(env).toEqual({
       BOB_REQUIRE_ISOLATION_PROOFS: "1",
-      PATH: "/usr/bin",
-      HOME: "/Users/a",
+      PATH: PINNED_PATH,
+      HOME: "/Users/bob",
       BOB_ISOLATION_AGENT: "rocky",
     });
     for (const k of SUBSTITUTE_ROOTS) expect(CHECK_ENV).not.toContain(k);
   });
 
+  it("the gate never starts as root, and only with the running account's own HOME", () => {
+    expect(refusal({ HOME: "/Users/bob" }, 501, db)).toBe("");
+    // root naming itself, with root's own HOME: refused
+    expect(refusal({ HOME: "/var/root" }, 0, db)).toContain("never runs as root");
+    expect(refusal({ HOME: "/Users/bob" }, 777, db)).toContain("not in the OS account database");
+    expect(refusal({ HOME: "/private/tmp/substitute" }, 501, db)).toContain("conflicts");
+    expect(refusal({ HOME: "/Users/bob", BOB_REACHY_VOICE_DIR: "/x" }, 501, db)).toContain(
+      "substitute root",
+    );
+  });
+
   it("in required mode the roots are PINNED and a substitute root makes the proofs that read it fail", () => {
     const sub = { BOB_REACHY_VOICE_DIR: "/tmp/fake", BOB_ISOLATION_AGENTS_ROOT: "/tmp/agents" };
-    const dev = releaseRoots(sub);
+    const dev = releaseRoots({ ...sub, HOME: "/Users/bob" }, 501, db, RECORD_BOB);
     expect(dev).toMatchObject({ installDir: "/tmp/fake", agentsRoot: "/tmp/agents", skip: "" });
-    const required = releaseRoots({ ...sub, [REQUIRE_ENV]: "1" });
+    const bob = { HOME: "/Users/bob", [REQUIRE_ENV]: "1" };
+    const required = releaseRoots({ ...sub, ...bob }, 501, db, RECORD_BOB);
     expect(required.installDir).toBe(PINNED_INSTALL_DIR);
-    expect(required.agentsRoot).not.toBe("/tmp/agents");
+    expect(required.agentsRoot).toBe("/Users/bob/agents");
     expect(required.skip).toContain("BOB_REACHY_VOICE_DIR, BOB_ISOLATION_AGENTS_ROOT");
     expect(proofDisposition(required.skip, { [REQUIRE_ENV]: "1" })).toBe("fail");
-    expect(releaseRoots({ [REQUIRE_ENV]: "1" }).skip).toBe("");
+    expect(releaseRoots(bob, 501, db, RECORD_BOB).skip).toBe("");
+  });
+
+  it("in required mode bob's account comes from the DEPLOYMENT RECORD: root, another account naming itself, or no record fails", () => {
+    const req = { [REQUIRE_ENV]: "1" };
+    const fails = (skip: string) =>
+      expect(proofDisposition(skip, { [REQUIRE_ENV]: "1" })).toBe("fail");
+    // root, even with a record naming root and root's own HOME
+    const root = releaseRoots({ ...req, HOME: "/var/root" }, 0, db, names("root"));
+    expect(root.skip).toBe("the proofs never run as root");
+    fails(root.skip);
+    // a record that names root is refused for any runner
+    expect(releaseRoots({ ...req, HOME: "/Users/bob" }, 501, db, names("root")).skip).toContain(
+      "names root",
+    );
+    // ANOTHER account, with its own HOME: the record names bob, so it fails
+    const other = releaseRoots({ ...req, HOME: "/Users/other" }, 502, db, RECORD_BOB);
+    expect(other.skip).toContain(
+      "must run as bob's account bob (uid 501, from the deployment record), not uid 502",
+    );
+    expect(other.agentsRoot).toBe("/Users/bob/agents"); // never the runner's tree
+    fails(other.skip);
+    // no (or an untrusted) record
+    const missing = () => ({ reason: "the deployment record /x is missing (RUNBOOK step 4)" });
+    expect(releaseRoots({ ...req, HOME: "/Users/bob" }, 501, db, missing).skip).toContain(
+      "missing",
+    );
+    expect(releaseRoots({ ...req, HOME: "/Users/bob" }, 501, db, names("ghost")).skip).toContain(
+      "not in the OS account database",
+    );
+    // the right account, a poisoned HOME
+    const poisoned = releaseRoots({ ...req, HOME: "/private/tmp/substitute" }, 501, db, RECORD_BOB);
+    expect(poisoned.agentsRoot).toBe("/Users/bob/agents");
+    expect(poisoned.skip).toContain(
+      "HOME (/private/tmp/substitute) conflicts with the account home",
+    );
+    fails(poisoned.skip);
+  });
+
+  it("the deployment record is trusted only when it and every directory above it are root-owned and not group/other-writable", () => {
+    expect(DEPLOYMENT_RECORD).toBe(join(PINNED_STATE_DIR, "agent-user"));
+    const dir = mkdtempSync(join(tmpdir(), "rv-record-"));
+    try {
+      const mine = join(dir, "agent-user");
+      writeFileSync(mine, "bob\n");
+      // a record this (non-root) user wrote is untrusted
+      expect(readDeploymentRecord(mine).reason).toContain("is not root-owned");
+      const link = join(dir, "link");
+      symlinkSync(mine, link);
+      expect(readDeploymentRecord(link).reason).toContain("not a regular file");
+      expect(readDeploymentRecord(join(dir, "absent")).reason).toContain("is missing");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // a root-owned chain passes the trust checks, and the content is then
+    // checked: /private/etc/shells (or /etc/shells) holds many lines, not one name
+    const rootOwned = existsSync("/private/etc/shells") ? "/private/etc/shells" : "/etc/shells";
+    if (existsSync(rootOwned) && !lstatSync(dirname(rootOwned)).isSymbolicLink()) {
+      expect(readDeploymentRecord(rootOwned).reason).toContain(
+        "does not hold exactly one account name",
+      );
+    }
+  });
+
+  it("accountHome reads the OS account database, unmoved by HOME, USER or PATH", () => {
+    const home = accountHome();
+    expect(home).toBeDefined();
+    // the same lookup in a child whose HOME/USER/PATH are poisoned
+    const r = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `import(${JSON.stringify(SCRIPT)}).then((m) => process.stdout.write(String(m.accountHome())))`,
+      ],
+      {
+        env: { HOME: "/private/tmp/substitute", USER: "nobody", PATH: "/nonexistent" },
+        encoding: "utf8",
+      },
+    );
+    expect(r.stdout).toBe(String(home));
+  });
+
+  it("the proofs call sudo, id and sandbox-exec by ABSOLUTE path (the interpreter is pinned in required mode)", () => {
+    const src = readFileSync(join(import.meta.dirname, "isolation.test.ts"), "utf8");
+    expect(src).toContain('const SUDO = "/usr/bin/sudo";');
+    expect(src).toContain('const ID = "/usr/bin/id";');
+    expect(src).toContain('const SANDBOX_EXEC = "/usr/bin/sandbox-exec";');
+    // no bare command names handed to a spawn
+    expect(src).not.toMatch(/(spawn|spawnSync|execFileSync)\(\s*"(sudo|id|sandbox-exec)"/);
+    expect(src).not.toMatch(/\[\s*"sudo",/);
   });
 });

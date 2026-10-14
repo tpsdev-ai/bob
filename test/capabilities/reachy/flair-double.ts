@@ -7,8 +7,9 @@
 //   * the Memory OWNER guard: a non-admin agent may only write a Memory whose
 //     body `agentId` is itself (403 otherwise — what Flair's Memory.put does
 //     for a body owned by another agent).
-// Everything else is 404. It accepts no admin credential: every caller here is
-// an ordinary agent.
+// An unsigned or badly signed request gets 401 first, on any route; a signed
+// request to any other route gets 404. It accepts no admin credential: every
+// caller here is an ordinary agent.
 
 import { createPublicKey, type KeyObject, verify } from "node:crypto";
 import { createServer, type Server } from "node:http";

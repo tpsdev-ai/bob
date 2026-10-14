@@ -10,8 +10,9 @@
 //   * Every connection starts with the `reachy-voice/1` handshake (wire.ts):
 //     bob sends `configure`, the sidecar's health must match it exactly, and
 //     until it does the link is control/status only. A mismatch, a legacy
-//     health line or any other line first disconnects and raises ONE alarm
-//     (repeated only when the failure changes or after a good handshake).
+//     health line or any other line first disconnects and attempts ONE alarm
+//     per reason in each failure episode (see linkRefused: latched only once
+//     recorded in that episode; retried under a stable record id).
 //   * Effective mute = bob mute OR the sidecar-reported mute OR no ready link
 //     (unknown/disconnected is muted). No action is sent while muted. The V1
 //     sidecar does not read the hardware switch: it reports what its operator
@@ -20,7 +21,7 @@
 //     action is re-checked after its audit write: a link that reconnected or a
 //     mute that flipped during the await refuses the queued command (stale).
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
 import type { TurnOrigin } from "../../shell/turn-origin.js";
 import { PROFILE_TOOLS } from "./config.js";
@@ -173,7 +174,16 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     epoch: number;
     deviceMuted: boolean | undefined;
     health: SidecarHealth | null;
-    lastAlarm: string | undefined;
+    // The alarm reasons RECORDED in the current failure episode: each reason
+    // is alarmed at most once per episode once its write is recorded (a fixed,
+    // finite set of labels and health-field names, so it stays small).
+    alarmed: Set<string>;
+    // The current FAILURE EPISODE: the link generations since the last good
+    // handshake. A good handshake starts a new episode (new id). An alarm
+    // write latches only for the episode it was raised in, and its record id
+    // is stable within the episode, so a retried or uncertain write overwrites
+    // the same record instead of adding one.
+    episodeId: string;
     // A line that arrived before the `configure` write completed: held, and
     // judged only once that write succeeded (never accepted before it).
     held: { raw: unknown } | undefined;
@@ -183,7 +193,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     epoch: 0,
     deviceMuted: undefined,
     health: null,
-    lastAlarm: undefined,
+    alarmed: new Set(),
+    episodeId: uuid(),
     held: undefined,
   };
   const effectiveMuted = (): boolean =>
@@ -244,9 +255,15 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   }
 
   /** bob#356: the handshake failed (or the link broke protocol). Disconnect,
-   *  forget everything the connection said, and raise ONE bounded alarm: the
-   *  summary names only fields from a fixed set, never the sidecar's values,
-   *  and an identical failure repeats only in the log until a good handshake. */
+   *  forget everything the connection said, and attempt a bounded alarm: the
+   *  summary carries only fixed reason labels or the names of mismatched health
+   *  fields, never the sidecar's values. Within a failure episode (until a good
+   *  handshake) a reason whose alarm write was RECORDED in that episode repeats
+   *  only in the log — whatever other reasons came between (A, B, A writes two
+   *  alarms). A failed write is logged and retried on the next failure with
+   *  that reason, under the SAME record id (so an uncertain write that did
+   *  persist is overwritten, not duplicated). A write that completes after a
+   *  good handshake is recorded but latches nothing in the new episode. */
   async function linkRefused(fields: string[]): Promise<DecisionSummary> {
     link.phase = "disconnected";
     link.held = undefined;
@@ -261,11 +278,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
     const key = fields.join(", ");
     log(`reachy: sidecar handshake refused (${key}); disconnected`);
-    if (key !== link.lastAlarm) {
-      link.lastAlarm = key;
+    if (!link.alarmed.has(key)) {
       const tsMs = state.nowMs();
-      await audit({
-        id: `evt_reachy.link.refused_${uuid()}`,
+      const episode = link.episodeId;
+      const recorded = await audit({
+        // Stable per episode and reason: retries upsert one record.
+        id: `evt_reachy.link.refused_${episode}_${createHash("sha256").update(key).digest("hex").slice(0, 16)}`,
         kind: "reachy.link.refused",
         authorId: "jarvis",
         summary: `refused the sidecar link: ${key} did not match the reachy-voice/1 handshake; disconnected`,
@@ -274,6 +292,17 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         nonce: uuid(),
         tsMs,
       });
+      // Latch only a RECORDED alarm, and only for the episode it belongs to:
+      // a lost one is retried, never assumed; a late one latches nothing.
+      if (!recorded) {
+        log(`reachy: the link alarm (${key}) was not recorded; it is retried on the next failure`);
+      } else if (link.episodeId !== episode) {
+        log(
+          `reachy: the link alarm (${key}) was recorded after the link recovered; it latches nothing`,
+        );
+      } else {
+        link.alarmed.add(key);
+      }
     }
     return { kind: "refused", action: "handshake", reason: `handshake failed: ${key}` };
   }
@@ -463,9 +492,9 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     // dropped: nothing it says is current, and dropping it bounds the audit.
     if (link.phase === "disconnected") return { kind: "drop" };
 
-    // bob#356: nothing is judged before the `configure` write succeeded. The
-    // first early line is held for `connected()` to judge after the write; a
-    // second one fails the link.
+    // bob#356: the first line that arrives before the `configure` write
+    // succeeded is HELD, for `connected()` to judge after the write; a second
+    // such line is refused at once (it fails the link without waiting).
     if (link.phase === "configuring") {
       if (link.held !== undefined) return linkRefused(["lines before configure was written"]);
       link.held = { raw };
@@ -487,7 +516,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       const bad = checkHealth(decoded.health, expectation());
       if (bad.length > 0) return linkRefused(bad);
       link.phase = "ready";
-      link.lastAlarm = undefined;
+      link.alarmed = new Set();
+      link.episodeId = uuid(); // a good handshake ends the failure episode
       acceptHealth(decoded.health);
       log(`reachy: sidecar link ready (reachy-voice/1, generation ${link.generation})`);
       return { kind: "none" };
@@ -503,21 +533,19 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       return { kind: "none" };
     }
     if (decoded.kind === "malformed" && decoded.protocol) return linkRefused(["health"]);
+    // bob#356 (Sherlock 9): a presence claim under the voice profile, which has
+    // no camera, is refused and audited on EVERY ready link — muted or not —
+    // content-free: the line's count and ids are never echoed.
+    if (decoded.kind === "presence" && state.profile !== "reachy") {
+      return malformed("a presence line under the voice profile (no camera)");
+    }
     // The sidecar-reported mute drops transcripts and proposals, like bob's own.
     if (effectiveMuted()) return { kind: "drop" };
 
     if (decoded.kind === "malformed") {
       return malformed(decoded.reason);
     }
-    if (decoded.kind === "presence") {
-      // bob#356 (Sherlock 9): a presence claim under the voice profile, which
-      // has no camera, is refused and audited — content-free: the line's count
-      // and ids are never echoed.
-      if (state.profile !== "reachy") {
-        return malformed("a presence line under the voice profile (no camera)");
-      }
-      return { kind: "none" };
-    }
+    if (decoded.kind === "presence") return { kind: "none" }; // the body profile
 
     if (decoded.kind === "transcript") {
       lastTranscript = decoded.transcript;

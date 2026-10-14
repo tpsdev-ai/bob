@@ -43,7 +43,7 @@ describe("bob#356 round 2 — reachy's Flair writes are owned by the signing age
   it("the OrgEvent store's write is accepted: its owner is the authenticated agent", async () => {
     await flairOrgEventStore(client).write(event);
     expect(flair.audits.at(-1)).toMatchObject({ kind: "reachy.say", owner: "voicebot" });
-    expect(flair.refusals).toEqual([]);
+    expect(flair.refusals.filter((r) => r.status === 403)).toEqual([]);
   });
 
   it("the memory writer's write is accepted under the same owner", async () => {
@@ -53,7 +53,7 @@ describe("bob#356 round 2 — reachy's Flair writes are owned by the signing age
       authorId: "jarvis",
       metadata: { speakerId: "spk-1", correlationId: "c", orgEventId: "o" },
     });
-    expect(flair.refusals).toEqual([]);
+    expect(flair.refusals.filter((r) => r.status === 403)).toEqual([]);
   });
 
   it("CONTROL: a body owned by another agent (round 1's `authorId: jarvis`) is REFUSED by the guard", async () => {

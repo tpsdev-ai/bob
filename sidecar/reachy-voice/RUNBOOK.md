@@ -1,6 +1,7 @@
 # reachy-voice sidecar — operator runbook (bob#356 V1, "mouth")
 
-The voice sidecar speaks for a jarvis-class agent through a USB speakerphone. In
+The voice sidecar speaks for a jarvis-class agent; its intended output is a USB
+speakerphone, which is unverified until the step 7 playback check passes. In
 V1 it only **speaks**: it has no microphone code, no wake model and no
 speech-to-text, and it reports wake mode `off`. It is untrusted (bob#180 §3.2):
 it runs as its own unprivileged macOS user, under the deny-default seatbelt
@@ -28,8 +29,9 @@ sidecar speak without bob's policy or audit. Keep that group to bob's user.
 
 ## 0. Set the names once
 
-Run every block below in one admin shell (`zsh`) after setting these. The agent
-user is the macOS account the jarvis-class bob runs as.
+Run steps 1–7 in one admin shell (`zsh`) after setting these. Step 8 (the
+release-host check) is the exception: it runs in bob's own account session,
+never as root. The agent user is the macOS account the jarvis-class bob runs as.
 
 ```sh
 AGENT_USER=<the macOS user bob runs as>   # e.g. rocky
@@ -120,15 +122,27 @@ is the voice model's: the sidecar refuses to start when the model differs.
 
 ## 4. State directories
 
-The work directory holds only ephemeral 0600 speech files while they play; the
-socket directory lets the `jarvis-voice` group reach the socket.
+The sidecar's speech files go in the work directory: each is 0600, removed
+after playback, and any it left behind (named `tts-*`) is removed at startup —
+or the sidecar refuses to start. The sidecar enforces nothing about other
+files there; keep the directory to the sidecar user. The socket directory
+lets the `jarvis-voice` group reach the socket.
 
 ```sh
 sudo install -d -o root -g wheel -m 0755 $STATE
 sudo install -d -o $SIDECAR_USER -g staff -m 0700 $STATE/work
 sudo install -d -o $SIDECAR_USER -g $VOICE_GROUP -m 0750 $STATE/run
 sudo install -d -o $SIDECAR_USER -g staff -m 0700 $STATE/log
+# The deployment record: bob's account, root-owned. The release check (step 8)
+# binds to the account this names, never to one its caller names.
+printf '%s\n' "$AGENT_USER" | sudo tee $STATE/agent-user >/dev/null
+sudo chown root:wheel $STATE/agent-user && sudo chmod 0644 $STATE/agent-user
 ```
+
+The record is trusted only while it and every directory above it
+(`$STATE`, `/usr/local/var/bob`, `/usr/local/var`, `/usr/local`, `/usr`, `/`) are
+root-owned and writable by no group or other; on a host where any is not (for
+example an Intel Homebrew `/usr/local/var`), step 8 fails until it is.
 
 ## 5. The launch job
 
@@ -241,31 +255,52 @@ speakerphone (the job's default output device), not another output.
 ## 8. The release-host check (manual prerequisite)
 
 No CI workflow runs this (CI is Linux; the seatbelt proofs are macOS-only). Run
-it on this host, from the reviewed checkout, before the sidecar ships. Name the
-AGENT only — the credential files are derived from its own `bob.yaml`:
+it on this host, from the reviewed checkout, before the sidecar ships, in bob's
+account session ($AGENT_USER logged in, with its own HOME; never as root and
+never from the admin shell). The admin shell's variables do not carry over: set
+`REPO` and `PYTHON` again in this session. `PYTHON` must be the SAME absolute
+path that step 0 resolved and step 2's sudoers rule names (any other path is
+not in the rule, so the separate-user proofs fail). Name the agent and that
+interpreter — the account comes from the deployment record (step 4), and the
+credential files are derived from the agent's own `bob.yaml`:
 
 ```sh
-cd $REPO
+# in bob's own session ($AGENT_USER), not the admin shell
+REPO=<the reviewed bob checkout, readable by this account>
+PYTHON=<the absolute interpreter path from step 0, as written in the sudoers rule>
+cd "$REPO"
 BOB_ISOLATION_AGENT=<the agent's name> \
-BOB_REACHY_VOICE_PYTHON=$PYTHON \
+BOB_REACHY_VOICE_PYTHON="$PYTHON" \
 bun run check:reachy-isolation
 ```
 
 It runs `test/capabilities/reachy/isolation.test.ts` with
-`BOB_REQUIRE_ISOLATION_PROOFS=1`, with a minimal environment and the PINNED
-roots (it refuses to start when `BOB_REACHY_VOICE_DIR` or
-`BOB_ISOLATION_AGENTS_ROOT` is set), and requires all eight pinned proofs to
-pass:
-[P1]/[P3] deny-default confinement (network, child, exec, service and file
-egress denied) as this user and as `jarvis-sidecar`, each probed denial shown
+`BOB_REQUIRE_ISOLATION_PROOFS=1`, with a minimal environment: PATH is pinned
+(`/usr/bin:/bin:/usr/sbin:/sbin`; wherever a proof calls `sudo`, `id` or
+`sandbox-exec`, it calls it by absolute path), and HOME is bob's home as the OS account
+database records it (`id -P`), never the inherited one. It refuses to start
+as root, when the inherited HOME differs from the running account's home, or
+when `BOB_REACHY_VOICE_DIR` or `BOB_ISOLATION_AGENTS_ROOT` is set. Every proof
+that reads bob's tree FAILS unless the deployment record (step 4) is trusted,
+names a non-root account, and that account is the one running (same uid in the
+account database); the agents root is `<that account's home>/agents`. It requires all eight pinned proofs to pass:
+[P1]/[P3] deny-default confinement, as this user and as `jarvis-sidecar`: the
+probed operations are each denied — TCP (IPv4, IPv6), UDP, mDNS and
+other-UNIX-socket connects, a forked child's TCP connect, an exec of
+`/usr/bin/true`, the probed mach service lookups, and a file read and a write
+outside the sidecar's directories (the profile allows fork and its named exec
+paths, so a child is not itself denied; its network call is) — each probed denial shown
 to succeed unconfined first — as THIS user, since the sudo rule allows no
 unconfined probe; [P2]/[P4] the real sidecar's handshake and `say` over the
 authorized socket with no audio left — [P4] as `jarvis-sidecar` on a SCRATCH
 socket with the deployed mode and group (0660, `jarvis-voice`), with an
 outsider refused; [P5] #180 S1's key-read proof
-on fixtures; [P6] the same on bob's active credentials (the provider stores
-and every key file the agent's `bob.yaml` names, plus bob's admin-password
-path): each 0600, owned by the agent, and refused to the sidecar user — this
+on fixtures; [P6] the same on bob's active credentials: every key or token
+file the agent's `bob.yaml` names must be an ABSOLUTE path (or `~/`; a relative
+one fails the proof, since the capability opens it against its own working
+directory) and must EXIST, as must bob's admin-password path (a missing one
+fails the proof), and those plus whichever provider stores exist
+are each a regular file, 0600, owned by the agent, and refused to the sidecar user — this
 process only `stat`s them, and the sidecar user's attempt only opens; [P7] the
 installed files at the pinned install root match the checkout; [P8] the
 DEPLOYED socket at `/usr/local/var/bob/reachy-voice/run/voice.sock` is 0660

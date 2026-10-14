@@ -1,7 +1,8 @@
 // bob#356 V1 — the REAL reachy-voice sidecar (sidecar/reachy-voice/sidecar.py),
 // unconfined, on any host with python3: the reachy-voice/1 handshake against
-// bob's real client and core, and local text-to-speech that leaves nothing
-// behind. Piper and the OS player are stand-ins (test/fixtures/reachy-voice):
+// bob's real client and core, and local text-to-speech after which no speech
+// artifact remains (the stand-in player's own observation record is the only
+// file it leaves). Piper and the OS player are stand-ins (test/fixtures/reachy-voice):
 // what is under test is the sidecar's artifact handling, not the voice.
 // The same sidecar under the deny-default profile, and as its own user, is
 // isolation.test.ts.

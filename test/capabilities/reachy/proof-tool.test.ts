@@ -5,7 +5,7 @@
 // from bob's own resolution of the agent, never supplied.
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -152,6 +152,126 @@ describe("bob#356 — the key-read proof's credentials are DERIVED, not supplied
     expect(creds.derived).toContain(adminPass);
     expect(creds.agentKeys).toEqual([keyPath]);
     expect(creds.present).toContain(keyPath);
+    // a SECOND configured key — identity.key_file, which initAgent names but
+    // (skipFlair) never wrote — is reported missing, so P6 would fail on it
+    expect(creds.missingKeys).toHaveLength(1);
+    expect(creds.missingKeys[0]).toMatch(/voicebot\.key$/);
+    expect(creds.missingKeys[0]).not.toBe(keyPath);
     expect(creds.present).not.toContain(adminPass); // absent on disk: reported, not invented
+  });
+
+  it("a configured key whose path IS a provider store's path is still required: absent, it is missing", () => {
+    const root = mkdtempSync(join(tmpdir(), "rvp-agent-"));
+    scratch.push(root);
+    const { agentDir } = initAgent({
+      name: "collider",
+      role: "custom",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+      agentsRoot: join(root, "agents"),
+      flairKeysDir: join(root, ".flair", "keys"),
+      skipFlair: true,
+    });
+    // The flair key is configured AT the provider login store's path (absent);
+    // another configured key exists, so "at least one key" alone would pass.
+    const storePath = join(agentDir, ".pi-agent", "auth.json");
+    rmSync(storePath, { force: true }); // initAgent writes a placeholder: make it ABSENT
+    const identityKey = join(root, "identity.key");
+    writeFileSync(identityKey, "fixture-not-a-real-key");
+    chmodSync(identityKey, 0o600);
+    const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8")
+      .replace(/^ {2}key_file: .*$/m, `  key_file: ${identityKey}`)
+      .replace(/^capabilities:.*$/m, "capabilities:\n  - flair");
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      `${yaml}\nflair:\n  url: http://127.0.0.1:9\n  agentId: collider\n  keyFile: ${storePath}\n`,
+    );
+    const creds = deriveActiveCredentials({
+      name: "collider",
+      agentsRoot: join(root, "agents"),
+      adminPass: join(root, "admin-pass"),
+    });
+    expect(creds.agentKeys).toEqual([identityKey]);
+    expect(creds.missingKeys).toEqual([storePath]); // NOT reclassified as an optional store
+  });
+
+  it("a configured key given as a RELATIVE path is refused: a decoy at one reading does not satisfy it", () => {
+    const root = mkdtempSync(join(tmpdir(), "rvp-agent-"));
+    scratch.push(root);
+    const { agentDir } = initAgent({
+      name: "relkey",
+      role: "custom",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+      agentsRoot: join(root, "agents"),
+      flairKeysDir: join(root, ".flair", "keys"),
+      skipFlair: true,
+    });
+    const identityKey = join(root, "identity.key");
+    writeFileSync(identityKey, "fixture-not-a-real-key");
+    chmodSync(identityKey, 0o600);
+    // a DECOY only in the workspace reading of the relative path; the runtime
+    // (Flair client) would open it against its own cwd, where nothing exists
+    mkdirSync(join(agentDir, "work", "keys"), { recursive: true });
+    const decoy = join(agentDir, "work", "keys", "relkey.key");
+    writeFileSync(decoy, "decoy");
+    chmodSync(decoy, 0o600);
+    const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8")
+      .replace(/^ {2}key_file: .*$/m, `  key_file: ${identityKey}`)
+      .replace(/^capabilities:.*$/m, "capabilities:\n  - flair");
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      `${yaml}\nflair:\n  url: http://127.0.0.1:9\n  agentId: relkey\n  keyFile: keys/relkey.key\n`,
+    );
+    const creds = deriveActiveCredentials({
+      name: "relkey",
+      agentsRoot: join(root, "agents"),
+      adminPass: join(root, "admin-pass"),
+    });
+    expect(creds.relativeKeys).toEqual(["flair.keyFile"]);
+    expect(creds.agentKeys).toEqual([identityKey]); // the decoy is NOT counted
+    expect(creds.present).not.toContain(decoy); // nor checked as present
+    expect(creds.missingKeys).toEqual([]);
+  });
+
+  it("a configured key path that is a 0600 DIRECTORY is not a key: reported, never counted", () => {
+    const root = mkdtempSync(join(tmpdir(), "rvp-agent-"));
+    scratch.push(root);
+    const { agentDir } = initAgent({
+      name: "dirkey",
+      role: "custom",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      contextWindow: 200_000,
+      agentsRoot: join(root, "agents"),
+      flairKeysDir: join(root, ".flair", "keys"),
+      skipFlair: true,
+    });
+    const identityKey = join(root, "identity.key");
+    writeFileSync(identityKey, "fixture-not-a-real-key");
+    chmodSync(identityKey, 0o600);
+    const dirKey = join(root, "dir.key");
+    mkdirSync(dirKey);
+    chmodSync(dirKey, 0o600); // agent-owned, 0600 — and not a file
+    const yaml = readFileSync(join(agentDir, "bob.yaml"), "utf8")
+      .replace(/^ {2}key_file: .*$/m, `  key_file: ${identityKey}`)
+      .replace(/^capabilities:.*$/m, "capabilities:\n  - flair");
+    writeFileSync(
+      join(agentDir, "bob.yaml"),
+      `${yaml}\nflair:\n  url: http://127.0.0.1:9\n  agentId: dirkey\n  keyFile: ${dirKey}\n`,
+    );
+    try {
+      const creds = deriveActiveCredentials({
+        name: "dirkey",
+        agentsRoot: join(root, "agents"),
+        adminPass: join(root, "admin-pass"),
+      });
+      expect(creds.agentKeys).toEqual([identityKey]);
+      expect(creds.notFiles).toEqual([dirKey]); // P6 fails on it
+    } finally {
+      chmodSync(dirKey, 0o700); // let the scratch cleanup remove it
+    }
   });
 });

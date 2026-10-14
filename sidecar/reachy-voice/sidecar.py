@@ -6,7 +6,8 @@ microphone code at all — no capture, no wake model, no speech-to-text — so i
 health reports mode "off". It is UNTRUSTED by design (bob#180 §3.2): it runs as
 its own unprivileged OS user under the deny-default sandbox profile beside it
 (reachy-voice.sb), and it listens on one UNIX socket. bob applies its policy
-and audit to every command bob SENDS; this process cannot tell bob's commands
+and writes its audit record before each `say` it SENDS (`configure` and state
+requests are not audited actions); this process cannot tell bob's commands
 from another client's, so the socket's permissions (0660, group jarvis-voice)
 are what keep other clients out.
 
@@ -27,7 +28,8 @@ Speech (local text-to-speech with Piper):
     file created 0600 before Piper opens it (and the process umask is 077);
   - the OS player plays that file; then the sidecar removes the file and its
     directory. If that removal FAILS, the artifact can remain on disk: the
-    sidecar then fails closed (below). It writes nothing else of its own.
+    sidecar then fails closed (below). Those speech files are the only audio
+    it writes; it also creates its socket and writes its (content-free) log.
   - Nothing captured: this process never opens an input device.
   - FAIL CLOSED (bob#356 round 1): leftover artifacts from a crash are removed
     at startup, and a sidecar that cannot remove them refuses to start. A
@@ -62,7 +64,7 @@ import tempfile
 
 SIDECAR_VERSION = "0.1.0"
 PROTOCOL = "reachy-voice/1"
-PROFILE = "voice"  # the hardware this sidecar drives: a mic + a speaker, no body
+PROFILE = "voice"  # the device profile: a speakerphone, no body (V1 drives only the speaker)
 MAX_LINE_BYTES = 64 * 1024
 WAKE_NAME = re.compile(r"^[a-z]+(?:[ -][a-z]+)*$")
 PLAYBACK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")

@@ -72,10 +72,10 @@ const PROPOSAL_LINE = Type.Object(
   },
   { additionalProperties: false },
 );
-// bob#356: the strict `reachy-voice/1` health line. Every field is REQUIRED (a
-// legacy `{type:"health",ok:true}` is malformed), every string and number is
-// bounded, and an unknown field is malformed. `replayEnd` is the stub's
-// end-of-replay marker.
+// bob#356: the strict `reachy-voice/1` health line. Every field except the
+// OPTIONAL `replayEnd` (the stub's end-of-replay marker) is REQUIRED (a legacy
+// `{type:"health",ok:true}` is malformed), every string and number is bounded,
+// and an unknown field is malformed.
 export const HEALTH_LINE = Type.Object(
   {
     type: Type.Literal("health"),

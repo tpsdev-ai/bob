@@ -100,8 +100,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   commands.onLine((line) => {
-    // Never fire-and-forget: a rejected handler would be an unhandled
-    // rejection. Log it; the run continues.
+    // Detached on purpose (lines are handled as they arrive), but never
+    // unobserved: a rejected handler is caught and logged — no unhandled
+    // rejection — and the run continues.
     void wired.handleLine(line).catch((err: unknown) => {
       console.error(`reachy: line handler failed: ${err instanceof Error ? err.message : err}`);
     });

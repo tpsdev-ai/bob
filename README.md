@@ -945,34 +945,47 @@ naming its test (`test/capabilities/reachy/`):
   taken before any awaited audit write (and rolled back if the audit fails) — two
   visitor lines arriving while the store is slow cannot both acknowledge.
   (`round5.test.ts`: concurrent reservation AND the rollback; `reachy.test.ts`.)
-- **A DIFFERENT OS user cannot read the 0600 key fixtures.** As
+- **The sidecar user (`jarvis-sidecar`) cannot read the 0600 key fixtures.** As
   `jarvis-sidecar`, opening the 0600 fixtures fails while a 0644 control opens;
   on the release host the same holds for bob's ACTIVE credentials, derived from
-  the agent's own `bob.yaml`. The proof skips (visibly, reason in the name) when
+  the agent's own `bob.yaml` (each configured key must be an absolute or `~/`
+  path that exists as a regular file; a relative one fails the proof). The proof skips (visibly, reason in the name) when
   the user or its `sudo -n` path is missing, and fails instead under the
   release-host check. `isolation.test.ts`.
 
 #### Voice V1 — the mouth (bob#356)
 
 One capability, two bob-owned **profiles**: `voice` (the default: a speakerphone,
-tools `reachy_say` and `reachy_state`) and `reachy` (adds the body tools
-`reachy_look` and `reachy_frame`). An unknown profile is refused when `bob.yaml`
-loads, and an allowlist naming a tool the configured profile does not register
-is refused by name before any session. Under `voice`, body proposals refuse and
-a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
+of which V1 drives only the speaker; tools `reachy_say` and `reachy_state`) and
+`reachy` (adds the body tools `reachy_look` and `reachy_frame`). An unknown
+profile is refused whenever bob loads the `reachy` capability (a capability the
+position's override layer disables is not loaded, and not validated), and an
+allowlist naming a tool the configured profile does not register is refused by
+name before any session. Under `voice`, a body proposal is refused on an
+unmuted link (a muted link drops every proposal), and a `presence` line on any
+READY link, muted or not, is a content-free `reachy.malformed` (before the
+handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
 `voice-session.test.ts`; `test/shell/voice-origin-356.test.ts`.)
 
-- **The `reachy-voice/1` handshake.** On every connection bob first sends one
+- **The `reachy-voice/1` handshake.** On every connection bob makes, it first sends one
   control command, `configure` (protocol, profile, the wake name from
   `voice.wakeName` — default `jarvis`, the only source of the name — and a fresh
-  generation), and judges nothing until that write SUCCEEDED (a line that
-  arrives earlier is held; a failed write refuses the link). The sidecar's
+  generation). The first line that arrives before that write SUCCEEDED is held
+  and judged only after it; a second such line refuses the link at once, and so
+  does a failed write. The sidecar's
   strict health line must repeat all four, carry the exact `sidecarVersion`
   bob pins, and report its wake mode with a consistent trained-artifact pair
   (`off`: none; `gate-only`: none for this name; `trained`: this name's) and
   its mute. Until it matches, nothing but control/status traffic moves; a
-  mismatch, a legacy health line or any other line disconnects and raises ONE
-  `reachy.link.refused` alarm naming only the fields. bob reconnects with a
+  mismatch, a legacy health line or any other line disconnects and attempts a
+  `reachy.link.refused` alarm. Within a failure episode (until a good
+  handshake) each reason is alarmed once its audit write is RECORDED in that
+  episode, whatever other reasons came between (A, B, A writes two alarms). A
+  failed write is logged and retried on that reason's next failure under the
+  same record id (so an uncertain write is overwritten, not duplicated), and a
+  write that completes after a good handshake latches nothing. Alarms carry
+  only fixed reason labels or the names of mismatched health fields (never the
+  sidecar's values). bob reconnects with a
   doubling backoff; every reconnect is a fresh handshake.
 - **Speech is split by caller, and bound by the runtime.** `reachy_say` speaks
   without any transcript only for the origin the runtime BINDS the call to —
@@ -983,7 +996,7 @@ a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
   nothing (a persistent prompt outside every admission, a mail turn) is
   refused, never treated as `run`; so are a voice-origin call, an ungranted
   turn and every sidecar proposal, and a room transcript authorizes nothing.
-  All speech needs a ready, unmuted link (bob mute OR the sidecar-reported mute
+  All speech bob sends needs a ready, unmuted link (bob mute OR the sidecar-reported mute
   OR no link = muted), one line of at most 500 characters, no memory
   reference, and a successful audit BEFORE the send; a reconnect or ANY mute
   transition during that audit refuses the queued line (`stale`), and a failed
@@ -1014,7 +1027,11 @@ a `presence` line is a content-free `reachy.malformed`. (`voice-v1.test.ts`;
   must have working controls), and the real sidecar round-tripping the
   handshake and a `say` under the profile with no audio left behind.
   `bun run check:reachy-isolation` is a MANUAL release-host prerequisite (no CI
-  workflow runs it): it fails on any skipped, failed or missing pinned proof.
+  workflow runs it): it fails on any skipped, failed or missing pinned proof,
+  runs with a pinned PATH, refuses to start as root or with a HOME other than
+  the running account's, and fails every proof that reads bob's tree unless it
+  runs AS the account the host's root-owned deployment record names (RUNBOOK
+  step 4; matched by uid in the OS account database).
   (`isolation.test.ts`; `voice-sidecar.test.ts`; `handshake-socket.test.ts`.)
 
 What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147),

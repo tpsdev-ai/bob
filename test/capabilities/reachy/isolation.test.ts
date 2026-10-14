@@ -24,8 +24,13 @@
 //        0600 and agent-owned, and a 0644 control in the same traversable
 //        directory opens — so the denial is the file mode, not the directory.
 //   [P6] The same on bob's ACTIVE credentials, DERIVED from the agent's bob.yaml
-//        under the pinned agents root and bob's own admin-password path
-//        (isolation-credentials.ts) — the release host names only the agent.
+//        under the pinned agents root (of the account the root-owned
+//        deployment record names) and bob's own admin-password path
+//        (isolation-credentials.ts) — the release host names the agent, never
+//        the files or the account. Every key or token file bob.yaml names must
+//        be an absolute (or `~/`) path — a relative one fails — and must exist,
+//        as must the admin password; the provider stores are checked when
+//        present. Every one present must be a regular file.
 //   [P7] The INSTALLED sidecar, profile and proof tooling (at the pinned
 //        install root) are the reviewed files (sha256 equal to this checkout's)
 //        and root-owned, not writable by anyone else.
@@ -57,7 +62,7 @@ import {
 } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   type OrgEventStore,
   orgEventRecordId,
@@ -73,7 +78,14 @@ import { PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR_SRC = join(REPO, "sidecar", "reachy-voice");
 const FIXTURES = join(REPO, "test", "fixtures", "reachy-voice");
+const REQUIRED = process.env.BOB_REQUIRE_ISOLATION_PROOFS === "1";
+// sudo, id and sandbox-exec by ABSOLUTE path, always. In required mode the
+// interpreter is the pinned absolute BOB_REACHY_VOICE_PYTHON too, so no
+// required proof depends on a command lookup (and the release-host check pins
+// PATH). Outside required mode the interpreter may be looked up as `python3`.
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
+const SUDO = "/usr/bin/sudo";
+const ID = "/usr/bin/id";
 const SIDECAR_USER = "jarvis-sidecar";
 const VOICE_GROUP = "jarvis-voice";
 const OUTSIDER = "nobody";
@@ -102,9 +114,15 @@ const AUDIO_EXT = /\.(wav|wave|ogg|oga|opus|flac|mp3|aif|aiff|caf|m4a|pcm|raw)$/
 const digest = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 16);
 
 // The interpreter, RESOLVED (the profile's paths and the sudoers rule name it).
+// In required mode it is ONLY the pinned absolute BOB_REACHY_VOICE_PYTHON:
+// nothing is looked up on PATH.
 function interpreter(): string {
   const configured = process.env.BOB_REACHY_VOICE_PYTHON;
-  if (configured) return configured;
+  if (configured) {
+    if (!isAbsolute(configured)) throw new Error("BOB_REACHY_VOICE_PYTHON must be absolute");
+    return configured;
+  }
+  if (REQUIRED) throw new Error("the interpreter is not pinned (BOB_REACHY_VOICE_PYTHON)");
   const r = spawnSync(
     "python3",
     ["-I", "-c", "import os,sys;print(os.path.realpath(sys.executable))"],
@@ -130,11 +148,13 @@ const seatbeltSkip = !DARWIN
   : !existsSync(SANDBOX_EXEC)
     ? "sandbox-exec is not installed"
     : !PY
-      ? "python3 is not available"
+      ? REQUIRED
+        ? "the interpreter is not pinned (BOB_REACHY_VOICE_PYTHON, absolute)"
+        : "python3 is not available"
       : "";
 const hasUser = (() => {
   try {
-    execFileSync("id", ["-u", SIDECAR_USER], { stdio: "ignore" });
+    execFileSync(ID, ["-u", SIDECAR_USER], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -147,7 +167,7 @@ const installedSkip =
 // installed (the release host); elsewhere (CI, whose runner sudo is broad) a
 // copy in each proof's world-readable scratch layout.
 const runAsUser = (user: string, proofPath: string, args: string[]) =>
-  spawnSync("sudo", ["-n", "-u", user, PY, "-I", proofPath, ...args], {
+  spawnSync(SUDO, ["-n", "-u", user, PY, "-I", proofPath, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -157,7 +177,8 @@ const sudoProof =
   PY !== "" &&
   (installed
     ? runAsUser(SIDECAR_USER, join(INSTALL_DIR, "proof.py"), ["open", "/dev/null"]).status === 0
-    : spawnSync("sudo", ["-n", "-u", SIDECAR_USER, "true"], { stdio: "ignore" }).status === 0);
+    : spawnSync(SUDO, ["-n", "-u", SIDECAR_USER, "/usr/bin/true"], { stdio: "ignore" }).status ===
+      0);
 const userSkip = !hasUser
   ? `the ${SIDECAR_USER} user is not provisioned (RUNBOOK step 1)`
   : !sudoProof
@@ -229,8 +250,10 @@ interface Layout {
 
 /** A fresh layout under /private/tmp/rv-* (a volume that keeps owners, that
  *  another user can traverse, and the only prefix proof.py accepts). With a
- *  `group`, the sidecar's directory belongs to it (0771: members create, an
- *  outsider may only traverse) — the deployed shape of the socket directory. */
+ *  `group`, the sidecar's SCRATCH directory belongs to it, mode 0771: members
+ *  create, an outsider may traverse to the socket and is refused by the
+ *  socket's own 0660 mode. That is NOT the deployed directory (0750, owned by
+ *  the sidecar user — checked by [P8]). */
 function layout(shared: { group?: number } | false): Layout {
   const base = mkdtempSync(join(DARWIN ? "/private/tmp" : tmpdir(), "rv-"));
   scratch.push(base);
@@ -284,7 +307,7 @@ function layout(shared: { group?: number } | false): Layout {
  *  installed one, through the exact sudoers rule). */
 function proofArgv(l: Layout, as: string | undefined, args: string[]): string[] {
   if (as === undefined) return [PY, "-I", join(l.sd, "proof.py"), ...args];
-  return ["sudo", "-n", "-u", as, PY, "-I", join(INSTALL_DIR, "proof.py"), ...args];
+  return [SUDO, "-n", "-u", as, PY, "-I", join(INSTALL_DIR, "proof.py"), ...args];
 }
 
 function run(argv: string[]) {
@@ -452,11 +475,11 @@ async function waitFor(cond: () => boolean, what: string, ms = 15_000): Promise<
 
 /** The REAL sidecar under the shipped profile, and bob's REAL client: the
  *  handshake and one `say` over the authorized socket, then the fs audit. As
- *  the sidecar user, the socket is the DEPLOYED 0660 in a jarvis-voice
- *  directory, and an outsider's connect is refused. */
+ *  the sidecar user, the SCRATCH socket gets the deployed mode and group (0660,
+ *  jarvis-voice), and an outsider's connect is refused by that mode. */
 async function proveRoundTrip(as: string | undefined) {
-  const deployed = as !== undefined;
-  const l = layout(deployed ? { group: must(voiceGid, "the voice group") } : false);
+  const separate = as !== undefined; // the separate user, on the group-shared SCRATCH socket
+  const l = layout(separate ? { group: must(voiceGid, "the voice group") } : false);
   const SECRET = `SAYWORD${randomBytes(4).toString("hex")}`;
   const argv = proofArgv(l, as, [
     "sidecar",
@@ -464,7 +487,7 @@ async function proveRoundTrip(as: string | undefined) {
     l.work,
     l.sock,
     l.modelSha,
-    deployed ? "0660" : "0600",
+    separate ? "0660" : "0600",
   ]);
   const proc = spawn(must(argv[0], "a command"), argv.slice(1), {
     stdio: ["ignore", "ignore", "pipe"],
@@ -474,7 +497,7 @@ async function proveRoundTrip(as: string | undefined) {
     log += b.toString();
   });
   cleanups.push(() => proc.kill());
-  if (deployed) {
+  if (separate) {
     // The work dir belongs to the sidecar user: it removes its own.
     const clean = proofArgv(l, as, ["clean", l.work]);
     cleanups.push(() =>
@@ -484,7 +507,7 @@ async function proveRoundTrip(as: string | undefined) {
   const client = new UnixSocketReachyClient({ socket: l.sock });
   try {
     await waitFor(() => log.includes("listening"), "the sidecar to listen");
-    if (deployed) {
+    if (separate) {
       const st = statSync(l.sock);
       expect((st.mode & 0o777).toString(8)).toBe("660");
       expect(st.gid).toBe(must(voiceGid, "the voice group"));
@@ -536,7 +559,7 @@ async function proveRoundTrip(as: string | undefined) {
     // Only the stand-in player's observation record remains — no speech artifact.
     expect(files.map((f) => f.slice(l.work.length + 1))).toEqual(["player-obs.jsonl"]);
     for (const f of files) expect(AUDIO_EXT.test(f), f).toBe(false);
-    if (!deployed) {
+    if (!separate) {
       for (const f of files) {
         const head = readFileSync(f).subarray(0, 4).toString("latin1");
         expect(
@@ -564,7 +587,7 @@ async function proveRoundTrip(as: string | undefined) {
 
 describe("reachy-voice isolation — deny-default confinement (seatbelt)", () => {
   proof(
-    "[P1] the shipped profile denies network, child, exec, service and file egress — each control succeeds unconfined",
+    "[P1] the shipped profile denies the probed TCP/UDP/mDNS/UNIX connects, a child's TCP connect, an exec, mach lookups and file read/write outside — each control succeeds unconfined",
     seatbeltSkip,
     () => proveConfinement(undefined),
     60_000,
@@ -579,7 +602,7 @@ describe("reachy-voice isolation — deny-default confinement (seatbelt)", () =>
 
 describe(`reachy-voice isolation — as the separate ${SIDECAR_USER} user`, () => {
   proof(
-    `[P3] as ${SIDECAR_USER}: the profile denies every egress (the controls run unconfined as bob's user)`,
+    `[P3] as ${SIDECAR_USER}: the profile denies the same probed operations (the controls run unconfined as bob's user)`,
     separateSkip,
     () => proveConfinement(SIDECAR_USER),
     60_000,
@@ -643,14 +666,26 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
     "[P6] bob's ACTIVE credentials, derived from the agent's bob.yaml: each 0600, agent-owned, and DENIED to the sidecar user (never read)",
     activeSkip,
     () => {
+      // HOME was checked against the account database (releaseRoots), so bob's
+      // own admin-pass path (homedir-based) is the account's.
       const creds = deriveActiveCredentials({
         name: must(AGENT, "agent"),
         agentsRoot: AGENTS_ROOT,
       });
+      expect(creds.adminPass).toBe(join(ROOTS.home, ".flair", "admin-pass"));
       expect(creds.agentKeys.length, "the agent's own key file must exist").toBeGreaterThan(0);
+      // every key or token file bob.yaml names must exist (only the provider
+      // stores may be absent): a missing one is a misconfigured host, not a pass
+      expect(creds.missingKeys, "configured key files that do not exist").toEqual([]);
+      // a relative key path is ambiguous (the capability opens it against its
+      // own cwd): refused — the host must configure the absolute path
+      expect(creds.relativeKeys, "configured key files given as relative paths").toEqual([]);
+      // each one present must be a REGULAR file (a 0600 directory is not a key)
+      expect(creds.notFiles, "credential paths that are not regular files").toEqual([]);
       expect(existsSync(creds.adminPass), `${creds.adminPass} must exist`).toBe(true);
       for (const f of creds.present) {
         const st = statSync(f); // metadata only: this process never opens it
+        expect(st.isFile(), `${f} is a regular file`).toBe(true);
         expect((st.mode & 0o777).toString(8), `${f} mode`).toBe("600");
         expect(st.uid, `${f} owner`).toBe(uid);
       }
@@ -684,7 +719,7 @@ describe("reachy-voice isolation — the deployed socket", () => {
     deployedSocketSkip,
     () => {
       const uidOf = (user: string) =>
-        Number(execFileSync("id", ["-u", user], { encoding: "utf8" }).trim());
+        Number(execFileSync(ID, ["-u", user], { encoding: "utf8" }).trim());
       const sidecarUid = uidOf(SIDECAR_USER);
       const gid = must(voiceGid, "the voice group");
       const sock = statSync(DEPLOYED_SOCKET);

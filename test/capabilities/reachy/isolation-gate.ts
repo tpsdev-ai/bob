@@ -8,8 +8,8 @@
 // check also fails on any pinned proof that did not pass.
 
 import { it } from "bun:test";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { accountOf, readDeploymentRecord } from "../../../scripts/check-reachy-isolation.mjs";
 
 export const REQUIRE_ENV = "BOB_REQUIRE_ISOLATION_PROOFS";
 
@@ -49,28 +49,54 @@ export const PINNED_STATE_DIR = "/usr/local/var/bob/reachy-voice";
 export const ROOT_OVERRIDES = ["BOB_REACHY_VOICE_DIR", "BOB_ISOLATION_AGENTS_ROOT"] as const;
 
 /** The roots the proofs read. Outside required mode a developer may point them
- *  elsewhere; in required mode they are the pinned ones, and a set override is
- *  a reason the proofs that read a root cannot run (so they FAIL). */
-export function releaseRoots(env: NodeJS.ProcessEnv = process.env): {
+ *  elsewhere. In required mode they belong to BOB'S account as the host's
+ *  root-owned DEPLOYMENT RECORD names it (never an account the caller names):
+ *  the record must be trusted (readDeploymentRecord), name a non-root account
+ *  in the OS account database, and that account must be the one running (same
+ *  uid), with its own HOME (never an inherited one). The agents root is <that
+ *  home>/agents and the install root is pinned. An override, root, or any
+ *  record, account or HOME mismatch is a reason the proofs that read a root
+ *  cannot run (so they FAIL). `selfUid`, `lookup` and `record` are test seams. */
+export function releaseRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  selfUid: number | undefined = process.getuid?.(),
+  lookup: (nameOrUid: string) => { uid: number; home: string } | undefined = accountOf,
+  record: () => { user?: string; reason?: string } = readDeploymentRecord,
+): {
   installDir: string;
   agentsRoot: string;
+  home: string;
   skip: string;
 } {
-  const pinnedAgents = join(homedir(), "agents");
   if (env[REQUIRE_ENV] !== "1") {
+    const home =
+      env.HOME ?? (selfUid === undefined ? undefined : lookup(String(selfUid))?.home) ?? "/";
     return {
       installDir: env.BOB_REACHY_VOICE_DIR ?? PINNED_INSTALL_DIR,
-      agentsRoot: env.BOB_ISOLATION_AGENTS_ROOT ?? pinnedAgents,
+      agentsRoot: env.BOB_ISOLATION_AGENTS_ROOT ?? join(home, "agents"),
+      home,
       skip: "",
     };
   }
   const set = ROOT_OVERRIDES.filter((k) => env[k] !== undefined);
-  return {
-    installDir: PINNED_INSTALL_DIR,
-    agentsRoot: pinnedAgents,
-    skip:
-      set.length > 0
-        ? `a substitute root is set (${set.join(", ")}); the release-host check uses only the pinned roots`
-        : "",
-  };
+  const rec = record();
+  const bob = rec.user ? lookup(rec.user) : undefined;
+  const home = bob?.home ?? "/nonexistent-account-home";
+  const skip =
+    set.length > 0
+      ? `a substitute root is set (${set.join(", ")}); the release-host check uses only the pinned roots`
+      : selfUid === 0
+        ? "the proofs never run as root"
+        : rec.reason
+          ? rec.reason
+          : !bob
+            ? `the account the deployment record names (${rec.user}) is not in the OS account database`
+            : bob.uid === 0
+              ? "the deployment record names root; it must name bob's own account"
+              : selfUid !== bob.uid
+                ? `the proofs must run as bob's account ${rec.user} (uid ${bob.uid}, from the deployment record), not uid ${selfUid}`
+                : env.HOME !== bob.home
+                  ? `HOME (${env.HOME ?? "unset"}) conflicts with the account home (${bob.home})`
+                  : "";
+  return { installDir: PINNED_INSTALL_DIR, agentsRoot: join(home, "agents"), home, skip };
 }

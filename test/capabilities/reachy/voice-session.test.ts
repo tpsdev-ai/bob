@@ -330,7 +330,9 @@ describe("bob#356 — the speech origin and the link lifecycle through the REAL 
       "the say audit",
     );
     expect(say.owner).toBe("voicerun"); // the authenticated agent owns the record
-    expect(flair.refusals).toEqual([]); // the owner guard refused nothing
+    // the owner guard refused nothing (403). An unsigned request from another
+    // test's lingering client on a reused port is a 401, not reachy's.
+    expect(flair.refusals.filter((r) => r.status === 403)).toEqual([]);
     expect(must(seen.active, "active tools").sort()).toEqual(["reachy_say", "reachy_state"]);
     expect(seen.registered).toContain("reachy_say");
     expect(seen.registered).not.toContain("reachy_look");
