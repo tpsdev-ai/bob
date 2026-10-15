@@ -13,6 +13,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -325,6 +326,42 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
       expect(readDeploymentRecord(record, seams).reason).toContain("a write-granting ACL entry");
     }
   });
+
+  it.skipIf(!DARWIN).each(["file", "symlink", "directory"])(
+    "the deployment record refuses a replacement %s between lstat and open",
+    (kind) => {
+      const { f } = fixture();
+      const record = join(f, "state/agent-user");
+      const replacement = join(f, "state/replacement");
+      const seams = { owners: [0, ME], from: f };
+      expect(readDeploymentRecord(record, seams)).toEqual({ user: "bob" });
+      writeFileSync(join(f, "state/other-user"), "other\n", { mode: 0o644 });
+      if (kind === "file") {
+        writeFileSync(replacement, "other\n", { mode: 0o644 });
+      } else if (kind === "symlink") {
+        symlinkSync("other-user", replacement);
+      } else {
+        mkdirSync(replacement, { mode: 0o755 });
+      }
+      seams.owners[Symbol.iterator] = function* () {
+        renameSync(record, join(f, "state/original"));
+        renameSync(replacement, record);
+        yield 0;
+        yield ME;
+        return undefined;
+      };
+      const result = readDeploymentRecord(record, seams);
+      expect(result).toEqual({
+        reason: `the deployment record ${record} ${
+          kind === "file"
+            ? "changed while checked"
+            : kind === "symlink"
+              ? "cannot be read"
+              : "is not a regular file"
+        }`,
+      });
+    },
+  );
 
   it("writeGrantingAcls reads only ALLOW entries that grant a write permission", () => {
     const ls = [

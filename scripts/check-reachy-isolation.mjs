@@ -33,7 +33,11 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  closeSync,
+  constants,
+  fstatSync,
   lstatSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -379,7 +383,19 @@ export function readDeploymentRecord(path = DEPLOYMENT_RECORD, { owners, from } 
   }
   let text;
   try {
-    text = readFileSync(path, "utf8");
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const opened = fstatSync(fd);
+      if (!opened.isFile()) {
+        return { reason: `the deployment record ${path} is not a regular file` };
+      }
+      if (opened.dev !== st.dev || opened.ino !== st.ino) {
+        return { reason: `the deployment record ${path} changed while checked` };
+      }
+      text = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     return { reason: `the deployment record ${path} cannot be read` };
   }
