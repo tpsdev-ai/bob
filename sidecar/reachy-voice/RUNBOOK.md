@@ -184,10 +184,10 @@ and bob refuses every `say`. V2 replaces this with the HID mute reader; a
 software-only mute does not qualify.
 
 The sidecar fails closed on its speech files: it refuses to start while a stale
-one cannot be removed, and after a removal fails it stops speaking and reports
-`ok: false` (bob refuses the link and attempts an alarm, retrying that reason
-after a failed write) until it is restarted
-cleanly. Its log names a digest of each playback id, never the id itself.
+one cannot be removed. After a playback cleanup failure, dirty state refuses
+later speech until a clean restart. It attempts an immediate `ok: false` health
+update on a live connection; a broken socket makes it fail. Its log names a
+digest of each playback id, never the id itself.
 
 The log is content-free (including event names, playback-id digests, error classes — never the
 spoken text). Core dumps are disabled in the process.
@@ -218,8 +218,8 @@ the sidecar speak directly, without bob.
 
 ## 7. TCC and the launcher (record; V1 needs no grant)
 
-V1 only plays audio, which needs no privacy (TCC) grant. Record the responsible
-binary of the launch job now, for V2's microphone grant:
+V1 only plays audio, which needs no privacy (TCC) grant. List and hash candidate
+binaries for V2's microphone grant:
 
 ```sh
 ls -l /usr/bin/sandbox-exec "$PYTHON"
@@ -233,8 +233,8 @@ on rocky today — installed root-owned under `/usr/local/libexec/bob/` with its
 path and sha256 recorded here, and any capture-helper redesign goes back to
 review.
 
-**The measurement V1 owes V2** (rev 2.1, strongest objection): whether the
-separate `jarvis-sidecar` user can obtain a microphone grant at all, since it
+**The measurement V1 owes V2** (rev 2.1, strongest objection): TCC attribution
+and whether the separate `jarvis-sidecar` user can obtain a microphone grant at all, since it
 has no desktop session. Measure it with the speakerphone attached and Nathan at
 the screen; if it cannot, V2 is blocked until a reviewed capture design exists.
 

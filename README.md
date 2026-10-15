@@ -1019,8 +1019,10 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   ephemeral 0600 file in a 0700 directory that it removes after playback (a
   removal that fails leaves it on disk, and the sidecar fails closed), under a
   deny-default seatbelt profile, as its own `jarvis-sidecar` user; it refuses to
-  start when a stale speech file cannot be removed, stops speaking and reports
-  `ok: false` when a removal fails after playback, and logs only a truncated
+  start when a stale speech file cannot be removed. After a playback cleanup
+  failure, dirty state refuses later speech and it attempts an immediate
+  `ok: false` health update on a live connection; a broken socket makes it fail.
+  It logs only a truncated
   sha256 digest of the (sender-chosen) playback id — which keeps the id out of
   the log but does not stop a guess of a short one. Its runbook gives the
   one-time admin steps.

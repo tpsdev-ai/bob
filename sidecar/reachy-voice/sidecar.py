@@ -34,8 +34,9 @@ Speech (local text-to-speech with Piper):
   - FAIL CLOSED (bob#356 round 1): leftover artifacts from a crash are removed
     at startup, and a sidecar that cannot remove them refuses to start. A
     removal that fails after playback is logged, the sidecar stops speaking,
-    and it reports ok=false at once (bob then refuses the link) until it is
-    restarted and its startup sweep succeeds.
+    and attempts an immediate ok=false health update on a live connection.
+    A broken socket makes the update fail; dirty state refuses later speech
+    until restart and a successful startup sweep.
 
 Logs are content-free, including event names, a DIGEST of the playback id (the id is
 sender-chosen, so it is never logged verbatim), and error CLASSES — never the
@@ -108,7 +109,7 @@ def private_dir(path):
 
 
 class Mouth:
-    """Piper -> an ephemeral 0600 waveform -> the OS player -> removed."""
+    """Piper -> an ephemeral 0600 waveform -> the OS player -> cleanup attempt."""
 
     def __init__(self, work_dir, piper, model, player):
         self.work_dir = work_dir
@@ -122,7 +123,7 @@ class Mouth:
     dirty = False  # set when an artifact could not be removed
 
     def sweep(self):
-        """Remove artifacts a crash left behind: speech is never kept. Raises
+        """Remove artifacts a crash left behind. Raises
         when one cannot be removed — the caller refuses to start."""
         for name in os.listdir(self.work_dir):
             if name.startswith(TTS_DIR_PREFIX):
@@ -218,7 +219,7 @@ class Session:
             "trainedPhrase": None,
             "modelHash": None,
             "muted": self.device_muted,
-            # False once an artifact could not be removed: bob refuses the link.
+            # False once an artifact could not be removed.
             "ok": not self.mouth.dirty,
         }
 
@@ -281,7 +282,7 @@ class Session:
                 return
             self.mouth.speak(text, playback_id)
             if self.mouth.dirty:
-                # Report at once: the next health bob reads must say so.
+                # Attempt an immediate health update on the live connection.
                 self.send(self.health())
             return
         log("command.unsupported")

@@ -66,6 +66,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   chainProblems,
+  checkLaunchJob,
   PINNED_DEVELOPER_DIR,
   PINNED_PYTHON,
   releaseTrustProblems,
@@ -747,12 +748,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
       const deployedPlist = "/Library/LaunchDaemons/dev.tps.reachy-voice.plist";
       expect(chainProblems(deployedPlist)).toEqual([]);
       expect(statSync(deployedPlist).isFile()).toBe(true);
-      const deployed = JSON.parse(
-        execFileSync(PINNED_PYTHON, ["-I", join(SIDECAR_SRC, "launch.py"), "--check"], {
-          env: { DEVELOPER_DIR: PINNED_DEVELOPER_DIR },
-          encoding: "utf8",
-        }),
-      );
+      const deployed = checkLaunchJob();
       expect(chainProblems(deployed.interpreter)).toEqual([]);
       expect(statSync(deployed.interpreter).isFile()).toBe(true);
       // sudo resets the environment: a caller's DEVELOPER_DIR (which steers the

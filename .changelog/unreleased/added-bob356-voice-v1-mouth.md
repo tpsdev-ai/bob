@@ -42,8 +42,10 @@
   that it removes after playback (a failed removal leaves it on disk and the
   sidecar fails closed), under a deny-default seatbelt profile as its own
   `jarvis-sidecar` user; it refuses to start when a stale speech file cannot be
-  removed, stops speaking and reports `ok: false` when a removal fails, and logs
-  only a truncated digest of each playback id. Its runbook gives the one-time admin steps,
+  removed. After a playback cleanup failure, dirty state refuses later speech
+  and it attempts an immediate `ok: false` health update on a live connection;
+  a broken socket makes it fail. It logs only a truncated digest of each
+  playback id. Its runbook gives the one-time admin steps,
   including a sudoers rule that names one installed proof command, and
   `bun run check:reachy-isolation` — a manual release-host prerequisite no CI
   workflow runs — fails on any skipped, failed or missing pinned isolation

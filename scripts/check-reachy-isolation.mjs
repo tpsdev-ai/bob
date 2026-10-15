@@ -60,6 +60,26 @@ export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT"];
 // shim, whose RESOLVED interpreter and import tree [P7] verifies.
 export const PINNED_PYTHON = "/usr/bin/python3";
 export const PINNED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools";
+
+export function checkLaunchJob({
+  python = PINNED_PYTHON,
+  launchPath = join(ROOT, "sidecar/reachy-voice/launch.py"),
+  plist = "/Library/LaunchDaemons/dev.tps.reachy-voice.plist",
+} = {}) {
+  return JSON.parse(
+    execFileSync(
+      python,
+      [
+        "-I",
+        "-c",
+        'import json,runpy,sys; launch=runpy.run_path(sys.argv[1]); json.dump({"interpreter":launch["check_job"](sys.argv[2])},sys.stdout)',
+        launchPath,
+        plist,
+      ],
+      { env: { DEVELOPER_DIR: PINNED_DEVELOPER_DIR }, encoding: "utf8" },
+    ),
+  );
+}
 // Substitute roots the release-host check refuses outright.
 export const SUBSTITUTE_ROOTS = ["BOB_REACHY_VOICE_DIR", "BOB_ISOLATION_AGENTS_ROOT"];
 // The command search path the proofs run with, whatever the caller's was.

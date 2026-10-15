@@ -295,7 +295,7 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     }
   }, 30_000);
 
-  it("FAIL CLOSED: a removal that fails after playback is logged, reported (ok=false), and stops all speech", async () => {
+  it("FAIL CLOSED: cleanup failure sends ok=false on this live connection and refuses later speech", async () => {
     const inst = install();
     const sc = start(inst, ["--device-mute", "absent"]);
     await waitFor(() => sc.log().includes("listening"), "listening");
@@ -308,7 +308,7 @@ describe("bob#356 V1 — the real voice sidecar", () => {
       });
       expect(out.content[0]?.text).toBe("say: hello");
       await waitFor(() => sc.log().includes("say.cleanup_failed"), "the cleanup failure");
-      // the sidecar reported it at once, and bob refused the link on it
+      // This live connection delivers the update; bob refuses the link.
       await waitFor(
         () => bob.store.all.some((e) => e.kind === "reachy.link.refused"),
         "bob's refusal",

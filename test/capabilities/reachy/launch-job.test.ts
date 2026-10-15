@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkLaunchJob } from "../../../scripts/check-reachy-isolation.mjs";
 
 const DARWIN = process.platform === "darwin";
 const scratch = mkdtempSync(join(tmpdir(), "rv-launch-"));
@@ -65,14 +66,50 @@ function check(mutation: string | number | null, poison = false) {
   );
 }
 
-describe.skipIf(!DARWIN)("P7 deployed-plist comparison", () => {
+describe("P7 fixture plist comparison through checkLaunchJob", () => {
+  const launchPath = join(scratch, "fixture-launch.py");
+  const plist = join(scratch, "fixture.plist");
+  const expected = { ProgramArguments: ["/fixture/python3", "-I", "/fixture/sidecar.py"] };
+  writeFileSync(
+    launchPath,
+    `${readFileSync(tool, "utf8")}\ndef launch_spec():\n    return ${JSON.stringify(expected)}\n`,
+  );
+
+  it("accepts a matching plist and refuses a changed fixture interpreter", () => {
+    for (const interpreter of ["/fixture/python3", "/different/python3"]) {
+      const result = spawnSync(
+        "python3",
+        [
+          "-I",
+          "-c",
+          'import json,plistlib,sys; job=json.loads(sys.argv[2]); plistlib.dump(job,open(sys.argv[1],"wb"),fmt=plistlib.FMT_BINARY)',
+          plist,
+          JSON.stringify({
+            ...expected,
+            ProgramArguments: [interpreter, "-I", "/fixture/sidecar.py"],
+          }),
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      const check = () => checkLaunchJob({ python: "/usr/bin/python3", launchPath, plist });
+      if (interpreter === "/fixture/python3") {
+        expect(check()).toEqual({ interpreter });
+      } else {
+        expect(check).toThrow("deployed LaunchDaemon differs");
+      }
+    }
+  });
+});
+
+describe.skipIf(!DARWIN)("macOS fixture plist comparison", () => {
   it("accepts the derived plist despite shell path overrides", () => {
     const result = check(null, true);
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout).ProgramArguments).toContain("-I");
   });
 
-  it("compares the deployed interpreter when proof.py reports the expected interpreter", () => {
+  it("compares the fixture plist interpreter when proof.py reports the expected interpreter", () => {
     const proof = join(import.meta.dirname, "../../../sidecar/reachy-voice/proof.py");
     const report = spawnSync("/usr/bin/python3", ["-I", proof, "interp"], {
       encoding: "utf8",
