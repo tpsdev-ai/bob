@@ -9,8 +9,7 @@ profile `reachy-voice.sb`, and listens on one UNIX socket. For every `say` bob
 SENDS, bob applies its policy and writes its audit record first; a process that
 reaches the socket directly bypasses both (see "What bob's audit covers").
 
-Everything below needs an administrator **once**, at the host. bob never creates
-users, edits sudoers or loads launchd jobs.
+Steps 1–7 need an administrator **once**, at the host; step 8 runs as bob.
 
 Files in this directory:
 
@@ -19,7 +18,7 @@ Files in this directory:
 | `sidecar.py` | The sidecar (Python 3.9+, standard library only). Reports version `0.1.0`. |
 | `reachy-voice.sb` | The deny-default seatbelt profile it runs under. |
 | `proof.py` | The ONE command the isolation proofs run as another user (step 2). |
-| `egress-probe.py` | The egress probe `proof.py` runs, confined and unconfined. |
+| `egress-probe.py` | Confined via `proof.py`; the test runs its source directly as bob with `PY -I -c <source> <spec-json>` for the unconfined control. |
 | `RUNBOOK.md` | This file. |
 
 **What bob's audit covers.** bob audits every `say` it sends. The socket below
@@ -46,22 +45,22 @@ PYTHON_REAL=$($PYTHON -I -c 'import os,sys;print(os.path.realpath(sys.executable
 PYTHON_PREFIX=$($PYTHON -I -c 'import os,sys;e=os.path.realpath(sys.executable);print(os.path.commonpath([e,os.path.realpath(sys.base_prefix)]))')
 ```
 
-The interpreter is pinned to `/usr/bin/python3`, run with `-I` (no `PYTHON*`
-environment, no user site, no script directory on `sys.path`); no Homebrew or
+The interpreter is pinned to `/usr/bin/python3`, run with `-I` (ignores `PYTHON*`
+variables; no user site or script directory on `sys.path`); no Homebrew or
 user-installed Python. On macOS it is the Command Line Tools shim: install them
 (`xcode-select --install`) and select them (`xcode-select -p` must print
 `/Library/Developer/CommandLineTools`; an Xcode.app under `/Applications` fails
 [P7], since `/Applications` is admin-group-writable). `PYTHON_REAL` is the
 interpreter the shim runs; the launch job (step 5) runs it directly, because the
-profile allows exec only under `PYTHON_PREFIX`. [P7] verifies the shim, the
+profile allows that exec under `PYTHON_PREFIX`. [P7] verifies the shim, the
 xcode-select link, `PYTHON_REAL`, the whole `PYTHON_PREFIX` tree and every
 `sys.path` entry along their full path chains. If neither is usable on this
 host, stop: do not substitute a user-writable interpreter.
 
 ## 1. Create the sidecar user and the socket group
 
-A hidden service account with no login shell, no home and no password, and a
-group whose members may connect to the sidecar's socket.
+A hidden service account with no login shell or password, a non-writable home
+at `/var/empty`, and a group whose members may connect to the sidecar's socket.
 
 ```sh
 SIDECAR_UID=$(dscl . -list /Users UniqueID | awk '$2>=400 && $2<500 {print $2}' | sort -n | tail -1)
@@ -88,8 +87,8 @@ as that user is unconfined and caller-chosen: `open` reports whether a path
 OPENS (it never reads), `connect` reports whether a socket accepts (and sends
 nothing), `probe` runs the installed egress probe ONLY under the installed
 profile with every spec field checked against a fixed whitelist (the one
-executable is `/usr/bin/true`), and `sidecar`/`clean` act only on a proof's
-scratch layout under `/private/tmp/rv-`. The unconfined controls run as bob's
+executable is `/usr/bin/true`); `probe`/`sidecar`/`clean` path arguments must
+resolve to paths beginning with `/private/tmp/rv-`. The unconfined controls run as bob's
 own user, without sudo. No other command, and never root:
 
 ```sh
@@ -111,14 +110,14 @@ The `nobody` line is the OUTSIDER: the proof shows a user outside
 deployed mode and group, [P8] on the deployed one).
 
 **Re-review this rule before V2 grants `jarvis-sidecar` the microphone.** The
-`sidecar` subcommand runs a proof's stand-in Piper and player (programs in the
-proof's scratch layout) as that user, confined by the profile — which allows
+`sidecar` subcommand runs a proof's stand-in Piper and player as that user,
+confined by the profile — which allows
 the audio HAL; once that user holds the microphone, that is a capture path
 around bob's gates.
 
 ## 3. Install the sidecar and Piper (root-owned, hash-recorded)
 
-The sidecar user can read and run these but never modify them.
+Once P7 establishes trusted ancestors and ACLs, the sidecar user cannot modify these files.
 
 ```sh
 sudo install -d -o root -g wheel -m 0755 $INSTALL $PIPER_DIR

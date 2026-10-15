@@ -4,7 +4,7 @@
 //   body tools absent under voice; the reachy-voice/1 handshake (mismatch,
 //   attempted bounded alarm, reconnect); mute (bob, device, unknown/disconnected);
 //   an audit failure blocks speech; a send failure is a linked refusal; a
-//   valid presence on a ready voice link with bob mute off is a content-free malformed audit.
+//   valid presence on a ready voice link with bob mute off attempts a content-free audit.
 // The isolation proofs are isolation.test.ts; the real sidecar's speech path is
 // voice-sidecar.test.ts.
 import { describe, expect, it } from "bun:test";
@@ -219,7 +219,7 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     expect(h.commands.sent).toEqual([]);
   });
 
-  it("with bob mute off, ready voice presence is audited despite sidecar mute; valid body proposals drop until unmuted", async () => {
+  it("with bob mute off, ready voice presence attempts audit despite sidecar mute; valid body proposals drop until unmuted", async () => {
     const h = harness({ profile: "voice" });
     await h.ready({ muted: true });
     expect(h.wired.link()).toMatchObject({ phase: "ready", effectiveMuted: true });

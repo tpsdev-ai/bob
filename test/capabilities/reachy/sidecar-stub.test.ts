@@ -32,8 +32,8 @@ const EVENTS_EXPECTED = 5; // the 5 event lines in the fixture, before the end m
 const EXPECTED_MEMORY_WRITES = 1; // one private memory, for the verified speaker
 const EXPECTED_VISITOR_MEMORIES = 0;
 const EXPECTED_MALFORMED = 0;
-// The same replay under the VOICE profile (bob#356): the presence line is a
-// content-free malformed audit and the look proposal a refusal.
+// The same replay under VOICE attempts a content-free presence audit and
+// refuses the look proposal.
 const VOICE_EXPECTED_MALFORMED = 1;
 const VOICE_EXPECTED_BODY_REFUSALS = 1;
 const STUB_VERSION = "reachy-stub-1";
@@ -194,7 +194,7 @@ describe("reachy S3 — the real stub sidecar over a UNIX socket", () => {
     }
   }, 30_000);
 
-  it("the same replay under the VOICE profile: presence is a content-free malformed audit, the look a refusal", async () => {
+  it("the same replay under the VOICE profile: presence attempts a content-free audit, the look a refusal", async () => {
     const h = await startReplay(EVENTS, { profile: "voice" });
     try {
       await h.waitFullReplay();

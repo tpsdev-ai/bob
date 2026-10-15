@@ -59,7 +59,7 @@ describe("bob#356 — proof.py, the one command the sudoers rule names", () => {
     }
   });
 
-  it("`probe`, `sidecar` and `clean` refuse any path outside a proof's /private/tmp/rv- scratch", () => {
+  it("`probe`, `sidecar` and `clean` refuse paths whose resolved names lack the /private/tmp/rv- prefix", () => {
     const spec = JSON.stringify({ tcp4: 9 });
     for (const args of [
       ["probe", "/tmp/x", "/tmp/y", "/tmp/z.sock", spec],

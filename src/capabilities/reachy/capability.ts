@@ -219,7 +219,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
   }
 
-  /** A refusal is itself audited as `reachy.refused`, FULL UUID id, optionally
+  /** Attempt a `reachy.refused` audit, FULL UUID id, optionally
    *  LINKED to the event it refuses (`refId`). */
   async function refuse(action: string, reason: string, refId?: string): Promise<DecisionSummary> {
     const tsMs = state.nowMs();
@@ -237,8 +237,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     return { kind: "refused", action, reason };
   }
 
-  /** A malformed line/proposal is itself audited as `reachy.malformed`, FULL
-   *  UUID id, and NEVER sent (round 6 item 2). */
+  /** Attempt a `reachy.malformed` audit; return malformed even if it fails. */
   async function malformed(reason: string): Promise<DecisionSummary> {
     const tsMs = state.nowMs();
     await audit({
@@ -533,9 +532,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       return { kind: "none" };
     }
     if (decoded.kind === "malformed" && decoded.protocol) return linkRefused(["health"]);
-    // bob#356 (Sherlock 9): a presence claim under the voice profile, which has
-    // no camera, is audited with bob mute off on a ready link, regardless of
-    // the sidecar-reported mute; the count and ids are never echoed.
+    // With bob mute off on a ready voice link, attempt a content-free presence
+    // audit and return malformed even if it fails, regardless of sidecar mute.
     if (decoded.kind === "presence" && state.profile !== "reachy") {
       return malformed("a presence line under the voice profile (no camera)");
     }

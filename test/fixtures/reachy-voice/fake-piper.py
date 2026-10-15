@@ -1,7 +1,6 @@
 # A stand-in for Piper (bob#356 tests): reads the text on stdin, writes a short
 # silent WAV to --output_file, prints nothing. The test installs it with a
-# shebang naming the resolved interpreter, so the sandbox's exec rules apply to
-# it exactly as to a real Piper binary under TTS_DIR.
+# shebang naming the resolved interpreter, exercising its configured exec path.
 import sys
 import wave
 

@@ -156,7 +156,7 @@ const PY = (() => {
 })();
 // What PY RESOLVES to (on macOS /usr/bin/python3 is a shim that execs the
 // Command Line Tools interpreter). Anything executed INSIDE the sandbox (the
-// stand-in Piper and player) names this one: the profile allows exec only
+// stand-in Piper and player) names this one: the profile allows that exec
 // under the interpreter's install root, which the shim is not.
 const PY_REAL = (() => {
   if (!PY) return "";
@@ -410,7 +410,7 @@ async function listeners(l: Layout) {
   return { p4, p6, pu, otherSock, close };
 }
 
-/** Every refusal, with its control: the full egress/escape matrix. */
+/** P1/P3 confinement refusals, with unconfined controls as bob. */
 async function proveConfinement(as: string | undefined) {
   const l = layout(as === undefined ? false : {});
   const net = await listeners(l);

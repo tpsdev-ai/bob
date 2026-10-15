@@ -1,10 +1,6 @@
 ;; reachy-voice.sb — the deny-default seatbelt profile for the reachy-voice
-;; sidecar (bob#356 V1; bob#180 §3.2). Everything not allowed below is denied:
-;; every network operation except the ONE authorized UNIX socket, every mach
-;; service except the audio HAL's, every exec except executables under the
-;; interpreter's install root and Piper's install root (TTS_DIR) and the one
-;; player binary, and every file write except the sidecar's own work directory
-;; and socket. Children inherit it.
+;; sidecar (bob#356 V1; bob#180 §3.2). Everything not allowed below is denied.
+;; Children inherit it.
 ;;
 ;; Parameters (sandbox-exec -D NAME=value; every path RESOLVED — /tmp is
 ;; /private/tmp, a Homebrew python is its Cellar path):
@@ -15,10 +11,9 @@
 ;;   WORK_DIR       the sidecar's private 0700 work directory (read, write)
 ;;   SOCKET         the one UNIX socket the sidecar listens on
 ;;
-;; Proven both ways by test/capabilities/reachy/isolation.test.ts: each probed
-;; denial is shown to SUCCEED without this profile first (a mach service this
-;; macOS does not register has no control and is excluded), and the authorized
-;; socket round-trips a handshake and a `say` under it.
+;; P1/P3 in test/capabilities/reachy/isolation.test.ts show each probed operation
+;; succeeding without this profile first (unregistered mach names are excluded).
+;; P2/P4 round-trip a handshake and a `say` over the authorized socket under it.
 
 (version 1)
 (deny default)
@@ -37,8 +32,7 @@
 (allow signal (target same-sandbox))
 
 ;; Reads: the system libraries and frameworks, the interpreter, the sidecar,
-;; Piper. stat() anywhere is allowed (path resolution needs it); the CONTENT of
-;; any other file is not.
+;; Piper. stat() anywhere is allowed (path resolution needs it).
 (allow file-read-metadata)
 (allow file-read*
        (subpath "/System")

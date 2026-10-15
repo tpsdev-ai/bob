@@ -3,8 +3,7 @@
 
 The ONE command the agent user may run as another user for the isolation
 proofs, through a sudoers rule that names exactly this file and interpreter
-(RUNBOOK step 2). Installed root-owned beside the sidecar and its profile, so
-what it does is fixed by the reviewed commit; the release-host check verifies
+(RUNBOOK step 2). The release-host check verifies
 the installed copy's sha256 against the checkout. Nothing here runs a program
 the caller chose outside the sandbox (bob#356 round 2):
 
@@ -18,9 +17,9 @@ the caller chose outside the sandbox (bob#356 round 2):
                             against a fixed whitelist (validate_spec): the one
                             executable is /usr/bin/true, the mach names and the
                             DNS socket are fixed, ports are integers aimed at
-                            loopback by the probe itself, and every path is in
-                            the proof's scratch layout. There is NO unconfined
-                            probe: the unconfined controls run as the caller's
+                            loopback by the probe itself, and every path's
+                            resolved name begins with /private/tmp/rv-.
+                            There is NO unconfined probe: the controls run as the caller's
                             own user, without sudo.
   sidecar <tts_dir> <work_dir> <socket> <model_sha256> <socket_mode>
                             run THIS directory's sidecar under THIS directory's
@@ -32,8 +31,8 @@ the caller chose outside the sandbox (bob#356 round 2):
                             base prefix, the isolated flag, and every sys.path
                             entry (for [P7] to verify, as run through sudo).
 
-The probe/sidecar/clean path arguments must resolve under /private/tmp/rv- (a
-proof's scratch layout), so those subcommands can never be pointed at the
+The probe/sidecar/clean path arguments must resolve to names beginning with
+/private/tmp/rv-, so those subcommands cannot be pointed at the
 deployed state directory; `open` and `connect` take any path. The interpreter
 prefix and the sidecar directory are derived here, never taken as arguments.
 Output: one JSON object on stdout.

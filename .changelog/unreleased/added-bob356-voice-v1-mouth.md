@@ -4,9 +4,10 @@
   `reachy_frame`; any other value is refused whenever bob loads the capability), and an
   allowlist naming a tool the configured profile does not register is refused by
   name before any session; under `voice`, a valid body proposal on a ready,
-  unmuted link is refused (a muted link drops it). With bob mute off, a valid
-  `presence` line on a ready link is a content-free `reachy.malformed`, regardless
-  of the sidecar-reported mute. The wake name comes only from the
+  unmuted link is refused (a muted link drops it). With bob mute off, for a valid
+  `presence` line on a ready link bob attempts a content-free audit and returns a
+  `malformed` decision even if the audit write fails, regardless of the
+  sidecar-reported mute. The wake name comes only from the
   agent's `voice.wakeName` (default `jarvis`); a `reachy:` block that sets one is
   refused. Every connection bob makes to the sidecar starts with its `configure` (protocol,
   profile, wake name, a fresh generation); the first line that arrives before

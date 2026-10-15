@@ -962,8 +962,9 @@ profile is refused whenever bob loads the `reachy` capability (a capability the
 position's override layer disables is not loaded, and not validated), and an
 allowlist naming a tool the configured profile does not register is refused by
 name before any session. Under `voice`, a valid body proposal on a ready, unmuted link is refused
-(a muted link drops it). With bob mute off, a valid `presence` line on a ready
-link is a content-free `reachy.malformed`, regardless of the sidecar-reported mute (before the
+(a muted link drops it). With bob mute off, for a valid `presence` line on a ready
+link bob attempts a content-free audit and returns a `malformed` decision even if
+the audit write fails, regardless of the sidecar-reported mute (before the
 handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
 `voice-session.test.ts`; `test/shell/voice-origin-356.test.ts`.)
 
@@ -1023,10 +1024,12 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   sha256 digest of the (sender-chosen) playback id — which keeps the id out of
   the log but does not stop a guess of a short one. Its runbook gives the
   one-time admin steps.
-  The isolation proofs show each probed refusal succeeding unconfined first (a
+  The P1/P3 confinement matrix shows each probed operation succeeding unconfined first (a
   mach service name this macOS does not register is excluded; at least two
-  must have working controls), and the real sidecar round-tripping the
-  handshake and a `say` under the profile with no audio left behind.
+  must have working controls). P5/P6 check denied opens as `jarvis-sidecar`
+  (P5 also opens a 0644 control); P4/P8 check denied connects as `nobody`
+  (P4 also round-trips bob's authorized connection). P2/P4 round-trip the real
+  sidecar's handshake and a `say` under the profile with no speech artifact left.
   `bun run check:reachy-isolation` is a MANUAL release-host prerequisite (no CI
   workflow runs it): it fails on any skipped, failed or missing pinned proof,
   runs with a pinned PATH, refuses to start as root or with a HOME other than

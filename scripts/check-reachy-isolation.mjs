@@ -51,7 +51,7 @@ export const EXPECTED_PROOFS = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"];
 // check, never inherited).
 export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT"];
 // The release host's interpreter: Apple's system python3, always run with -I
-// (no PYTHON* environment, no user site, no script directory on sys.path). The
+// (ignores PYTHON* variables; no user site or script directory on sys.path). The
 // sudoers rule names exactly this path; on macOS it is the Command Line Tools
 // shim, whose RESOLVED interpreter and import tree [P7] verifies.
 export const PINNED_PYTHON = "/usr/bin/python3";
