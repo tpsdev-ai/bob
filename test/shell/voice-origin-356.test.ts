@@ -179,11 +179,15 @@ describe("bob#356 — voice.wakeName, bob-owned and projected", () => {
     );
   });
 
+  it("bob.yaml refuses a V1 mail speech grant", () => {
+    expect(() => resolve(REACHY_YAML([], ["  roomSpeechOrigins: [mail:flint]"]))).toThrow(
+      /REACHY_V1_MAIL_SPEECH_UNSUPPORTED/,
+    );
+  });
+
   it("room-speech grants are exact origins; a voice grant is not expressible", () => {
     expect(() =>
-      resolve(
-        REACHY_YAML([], ["  roomSpeechOrigins: [run, cron:standup, discord:123, mail:flint]"]),
-      ),
+      resolve(REACHY_YAML([], ["  roomSpeechOrigins: [run, cron:standup, discord:123]"])),
     ).not.toThrow();
     for (const bad of ["voice", "cron:*", "discord:abc", "everyone"]) {
       expect(() => resolve(REACHY_YAML([], [`  roomSpeechOrigins: [${bad}]`]))).toThrow(

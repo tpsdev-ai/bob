@@ -993,11 +993,11 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   the admitted turn it runs inside (persistent runtime) or the `run` an
   operator's one-shot `bob run` declares — and only when
   `reachy.roomSpeechOrigins` grants that exact origin (`run`, `cron:<job>`,
-  `discord:<channelId>`, `mail:<sender>`; empty by default). A call bound to
+  `discord:<channelId>`; empty by default). A call bound to
   nothing (a persistent prompt outside every admission, a mail turn) is
   refused, never treated as `run`; so are a voice-origin call, an ungranted
   turn. A valid sidecar speech proposal on a ready, unmuted link is refused;
-  a room transcript authorizes nothing.
+  a room transcript authorizes nothing. Mail speech is V2; V1 mail has no bound origin.
   All speech bob sends needs a ready, unmuted link (bob mute OR the sidecar-reported mute
   OR no link = muted), one line of at most 500 characters, no memory
   reference, and a successful audit BEFORE the send; a reconnect or ANY mute
@@ -1042,7 +1042,7 @@ What S3 does NOT do: any turn injection into the pi session (S1, behind bob#147)
 any body/head motion on real hardware, or memory-backed speech. Voice V1 adds no
 microphone capture, no wake detection and no speech-to-text. **Trust model:** a
 sidecar `speakerId` is an UNTRUSTED assertion; bob verifies the id → enrolled-member
-mapping (empty in v1), and a forged id is bounded by the sidecar's isolation — not
+mapping (defaults to empty), and a forged id is bounded by the sidecar's isolation — not
 by bob's gate (bob#180 §4).
 
 ## Providers

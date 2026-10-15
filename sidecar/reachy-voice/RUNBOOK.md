@@ -17,6 +17,7 @@ Files in this directory:
 | --- | --- |
 | `sidecar.py` | The sidecar (Python 3.9+, standard library only). Reports version `0.1.0`. |
 | `reachy-voice.sb` | The deny-default seatbelt profile it runs under. |
+| `launch.py` | Fixed LaunchDaemon derivation and deployed-plist check. |
 | `proof.py` | The installed command for release-host separate-user proofs (step 2). |
 | `egress-probe.py` | Confined via `proof.py`; the test runs its source directly as bob with `PY -I -c <source> <spec-json>` for the unconfined control. |
 | `RUNBOOK.md` | This file. |
@@ -41,8 +42,6 @@ INSTALL=/usr/local/libexec/bob/reachy-voice
 PIPER_DIR=/usr/local/libexec/bob/piper
 STATE=/usr/local/var/bob/reachy-voice
 PYTHON=/usr/bin/python3   # PINNED: Apple's system python3, always run -I
-PYTHON_REAL=$($PYTHON -I -c 'import os,sys;print(os.path.realpath(sys.executable))')
-PYTHON_PREFIX=$($PYTHON -I -c 'import os,sys;e=os.path.realpath(sys.executable);print(os.path.commonpath([e,os.path.realpath(sys.base_prefix)]))')
 ```
 
 The interpreter is pinned to `/usr/bin/python3`, run with `-I` (ignores `PYTHON*`
@@ -50,12 +49,10 @@ variables; no user site or script directory on `sys.path`); no Homebrew or
 user-installed Python. On macOS it is the Command Line Tools shim: install them
 (`xcode-select --install`) and select them (`xcode-select -p` must print
 `/Library/Developer/CommandLineTools`; an Xcode.app under `/Applications` fails
-[P7], since `/Applications` is admin-group-writable). `PYTHON_REAL` is the
-interpreter the shim runs; the launch job (step 5) runs it directly, because the
-profile allows that exec under `PYTHON_PREFIX`. [P7] verifies the shim, the
-xcode-select link, `PYTHON_REAL`, the whole `PYTHON_PREFIX` tree and every
-`sys.path` entry along their full path chains. If neither is usable on this
-host, stop: do not substitute a user-writable interpreter.
+[P7], since `/Applications` is admin-group-writable). The fixed derivation in
+`launch.py` resolves the interpreter and path parameters
+with a fixed environment. [P7] checks the installed plist against that derivation,
+and verifies the interpreter, import trees and deployed plist's full path chains.
 
 ## 1. Create the sidecar user and the socket group
 
@@ -124,16 +121,20 @@ Once P7 establishes trusted ancestors and ACLs, the sidecar user cannot modify t
 sudo install -d -o root -g wheel -m 0755 $INSTALL $PIPER_DIR
 sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
   $REPO/sidecar/reachy-voice/reachy-voice.sb $REPO/sidecar/reachy-voice/proof.py \
-  $REPO/sidecar/reachy-voice/egress-probe.py $INSTALL/
+  $REPO/sidecar/reachy-voice/egress-probe.py $REPO/sidecar/reachy-voice/launch.py $INSTALL/
 # Piper: the build and voice measured in rocky:~/voice-prep (hash-listed there).
 sudo cp -R <piper build dir>/. $PIPER_DIR/
 sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR
-shasum -a 256 $INSTALL/* $PIPER_DIR/piper <voice>.onnx
+sudo cp <voice>.onnx $PIPER_DIR/voice.onnx
+sudo cp <voice>.onnx.json $PIPER_DIR/voice.onnx.json
+sudo chown root:wheel $PIPER_DIR/voice.onnx* && sudo chmod 0644 $PIPER_DIR/voice.onnx*
+shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
 ```
 
 Record those hashes in the host's install log. The release check (step 8)
-verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py` and
-`egress-probe.py` are byte-identical to the reviewed checkout and root-owned. `--piper-model-sha256` below
+verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py`,
+`egress-probe.py` and `launch.py` are byte-identical to the reviewed checkout
+and root-owned. `--piper-model-sha256`
 is the voice model's: the sidecar refuses to start when the model differs.
 
 ## 4. State directories
@@ -166,49 +167,10 @@ A LaunchDaemon running the sidecar as `jarvis-sidecar`, under the profile, with
 real paths for the profile parameters and sidecar arguments.
 
 ```sh
-realpath() { "$PYTHON" -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
-INSTALL=$(realpath "$INSTALL")
-PIPER_DIR=$(realpath "$PIPER_DIR")
-STATE=$(realpath "$STATE")
-PLAYER=$(realpath /usr/bin/afplay)
-PROFILE=$(realpath "$INSTALL/reachy-voice.sb")
-SIDECAR=$(realpath "$INSTALL/sidecar.py")
-PIPER=$(realpath "$PIPER_DIR/piper")
-WORK_DIR=$(realpath "$STATE/work")
-SOCKET=$(realpath "$STATE/run/voice.sock")
-MODEL=$(realpath "$PIPER_DIR/<voice>.onnx")
-MODEL_SHA=$(shasum -a 256 $MODEL | cut -d' ' -f1)
-sudo tee /Library/LaunchDaemons/dev.tps.reachy-voice.plist >/dev/null <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.tps.reachy-voice</string>
-  <key>UserName</key><string>$SIDECAR_USER</string>
-  <key>GroupName</key><string>$VOICE_GROUP</string>
-  <key>ProgramArguments</key><array>
-    <string>/usr/bin/sandbox-exec</string>
-    <string>-f</string><string>$PROFILE</string>
-    <string>-D</string><string>PYTHON_PREFIX=$PYTHON_PREFIX</string>
-    <string>-D</string><string>SIDECAR_DIR=$INSTALL</string>
-    <string>-D</string><string>TTS_DIR=$PIPER_DIR</string>
-    <string>-D</string><string>PLAYER=$PLAYER</string>
-    <string>-D</string><string>WORK_DIR=$WORK_DIR</string>
-    <string>-D</string><string>SOCKET=$SOCKET</string>
-    <string>$PYTHON_REAL</string><string>-I</string><string>$SIDECAR</string>
-    <string>--socket</string><string>$SOCKET</string>
-    <string>--work-dir</string><string>$WORK_DIR</string>
-    <string>--piper</string><string>$PIPER</string>
-    <string>--piper-model</string><string>$MODEL</string>
-    <string>--piper-model-sha256</string><string>$MODEL_SHA</string>
-    <string>--player</string><string>$PLAYER</string>
-    <string>--device-mute</string><string>absent</string>
-    <string>--socket-mode</string><string>0660</string>
-  </array>
-  <key>KeepAlive</key><true/>
-  <key>RunAtLoad</key><true/>
-  <key>StandardErrorPath</key><string>$STATE/log/sidecar.log</string>
-</dict></plist>
-EOF
+/usr/bin/env -i DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 -I \
+  /usr/local/libexec/bob/reachy-voice/launch.py | \
+  /usr/bin/plutil -convert xml1 -o - - | \
+  sudo tee /Library/LaunchDaemons/dev.tps.reachy-voice.plist >/dev/null
 sudo chmod 0644 /Library/LaunchDaemons/dev.tps.reachy-voice.plist
 sudo plutil -lint /Library/LaunchDaemons/dev.tps.reachy-voice.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.tps.reachy-voice.plist
@@ -248,8 +210,8 @@ reachy:
 
 `roomSpeechOrigins` names the authenticated turns whose `reachy_say` may speak
 in the room: `run` (an operator's one-shot `bob run`), `cron:<job>`,
-`discord:<channelId>`, `mail:<sender>`. Empty means bob speaks for nothing. A
-call bound to no admitted turn (a persistent prompt outside admission, a mail
+`discord:<channelId>`. Mail speech is V2; V1 mail has no bound origin.
+Empty means bob speaks for nothing. A call bound to no admitted turn (a persistent prompt outside admission, a mail
 turn) never speaks. No shipped role allows `reachy_say` yet; a role that does
 is a separate, reviewed change — and the socket's group (above) can still make
 the sidecar speak directly, without bob.

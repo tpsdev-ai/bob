@@ -15,7 +15,11 @@
 // and the extension lifecycle — no Bob-side tool/hook registry.
 
 import { Value } from "typebox/value";
-import { DEFAULT_WAKE_NAME, WAKE_NAME_SCHEMA } from "../capabilities/reachy/config.js";
+import {
+  assertV1SpeechOrigins,
+  DEFAULT_WAKE_NAME,
+  WAKE_NAME_SCHEMA,
+} from "../capabilities/reachy/config.js";
 import { BobYamlError, lineOf, readBlock, readCapabilities } from "./bob-yaml.js";
 import type { BobCapabilityManifest, CatalogEntry } from "./capability.js";
 import { lookupCapability as defaultLookup } from "./capability-catalog.js";
@@ -206,6 +210,7 @@ function projectAgentSettings(
   yamlText: string,
 ): Record<string, unknown> {
   if (name !== "reachy") return block;
+  assertV1SpeechOrigins(block);
   if (Object.hasOwn(block, "wakeName")) {
     throw new Error(
       'capability "reachy" config sets wakeName, but the wake name is bob-owned at the agent level: move it to `voice:` → `wakeName:` (bob#356).',

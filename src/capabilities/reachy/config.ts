@@ -48,10 +48,9 @@ export const WAKE_NAME_SCHEMA = Type.String({
 
 /** One room-publication grant (bob#356 Kern 5): the authenticated turn origins
  *  whose `reachy_say` call may speak in the room without a transcript. Each is
- *  an EXACT origin: `run` (an operator's run), `cron:<job>`, `discord:<channelId>`
- *  or `mail:<sender>`. A `voice` origin can never be granted here. */
-export const ROOM_SPEECH_GRANT_PATTERN =
-  "^(?:run|cron:[a-z0-9_-]{1,64}|discord:[0-9]{1,20}|mail:[a-z0-9-]{1,64})$";
+ *  an EXACT origin: `run` (an operator's run), `cron:<job>` or
+ *  `discord:<channelId>`. A `voice` origin can never be granted here. */
+export const ROOM_SPEECH_GRANT_PATTERN = "^(?:run|cron:[a-z0-9_-]{1,64}|discord:[0-9]{1,20})$";
 
 export const CONFIG_SCHEMA = Type.Object(
   {
@@ -81,14 +80,15 @@ export const CONFIG_SCHEMA = Type.Object(
       Type.Array(Type.String({ pattern: ROOM_SPEECH_GRANT_PATTERN }), {
         maxItems: 64,
         description:
-          "Turn origins allowed to speak in the room: run, cron:<job>, discord:<id>, mail:<agent>.",
+          "V1 speech origins: run, cron:<job>, discord:<id>. Mail speech is V2; V1 mail has no bound origin.",
       }),
     ),
-    // BOB-OWNED enrolment: speakerId → memberId. EMPTY by default in v1, so
-    // nothing is speakerVerified and `answer`/writes are OFF (spec §4).
+    // BOB-OWNED enrolment: speakerId → memberId; defaults to empty.
+    // The V1 sidecar emits no transcripts.
     enrolledSpeakers: Type.Optional(
       Type.Record(Type.String(), Type.String(), {
-        description: "BOB-owned speakerId → memberId map. Empty in v1 (nothing verified).",
+        description:
+          "BOB-owned speakerId → memberId map; defaults to empty. The V1 sidecar emits no transcripts.",
       }),
     ),
   },
@@ -108,8 +108,22 @@ export interface ReachyCapabilityConfig {
   enrolledSpeakers: Record<string, string>;
 }
 
+export function assertV1SpeechOrigins(config: unknown): void {
+  if (config === null || typeof config !== "object") return;
+  const origins = (config as Record<string, unknown>).roomSpeechOrigins;
+  if (
+    Array.isArray(origins) &&
+    origins.some((v) => typeof v === "string" && v.startsWith("mail:"))
+  ) {
+    throw new Error(
+      "REACHY_V1_MAIL_SPEECH_UNSUPPORTED: mail speech is V2; V1 mail has no bound origin",
+    );
+  }
+}
+
 /** Validate a config block and apply the defaults. Throws, naming the field. */
 export function parseConfig(parsed: unknown): ReachyCapabilityConfig {
+  assertV1SpeechOrigins(parsed);
   if (!Value.Check(CONFIG_SCHEMA, parsed)) {
     const first = [...Value.Errors(CONFIG_SCHEMA, parsed)][0];
     const where = first?.instancePath ? ` (at ${first.instancePath})` : "";

@@ -33,7 +33,8 @@
 //        present. Every one present must be a regular file.
 //   [P7] The INSTALLED sidecar, profile and proof tooling (at the pinned
 //        install root) are the reviewed files (sha256 equal to this checkout's)
-//        and root-owned, not writable by anyone else.
+//        and root-owned, not writable by anyone else. The installed plist
+//        must match launch.py's fixed V1 derivation.
 //   [P8] The DEPLOYED socket (the pinned state root): 0660, owner
 //        jarvis-sidecar, group jarvis-voice, in a 0750 directory of that owner
 //        and group; an outsider's connect is refused.
@@ -99,7 +100,13 @@ const VOICE_GROUP = "jarvis-voice";
 const OUTSIDER = "nobody";
 const DARWIN = process.platform === "darwin";
 // The files the release host installs (RUNBOOK step 3), compared by hash.
-const INSTALLED_FILES = ["sidecar.py", "reachy-voice.sb", "proof.py", "egress-probe.py"];
+const INSTALLED_FILES = [
+  "sidecar.py",
+  "reachy-voice.sb",
+  "proof.py",
+  "egress-probe.py",
+  "launch.py",
+];
 // The release-host roots, PINNED in required mode (isolation-gate.ts).
 const ROOTS = releaseRoots();
 const rootsSkip = ROOTS.skip;
@@ -711,7 +718,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
   );
 
   proof(
-    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write-granting ACL)",
+    "[P7] the deployed plist matches the fixed launch derivation; the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write-granting ACL)",
     installedSkip || userSkip,
     () => {
       for (const f of INSTALLED_FILES) {
@@ -737,6 +744,17 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
       const report = runAsUser(SIDECAR_USER, proofPy, ["interp"]);
       expect(report.status, report.stderr).toBe(0);
       const interp = JSON.parse(report.stdout);
+      const deployedPlist = "/Library/LaunchDaemons/dev.tps.reachy-voice.plist";
+      expect(chainProblems(deployedPlist)).toEqual([]);
+      expect(statSync(deployedPlist).isFile()).toBe(true);
+      const deployed = JSON.parse(
+        execFileSync(PINNED_PYTHON, ["-I", join(SIDECAR_SRC, "launch.py"), "--check"], {
+          env: { DEVELOPER_DIR: PINNED_DEVELOPER_DIR },
+          encoding: "utf8",
+        }),
+      );
+      expect(chainProblems(deployed.interpreter)).toEqual([]);
+      expect(statSync(deployed.interpreter).isFile()).toBe(true);
       // sudo resets the environment: a caller's DEVELOPER_DIR (which steers the
       // shim) cannot move what the rule runs
       const steered = spawnSync(SUDO, ["-n", "-u", SIDECAR_USER, PY, "-I", proofPy, "interp"], {

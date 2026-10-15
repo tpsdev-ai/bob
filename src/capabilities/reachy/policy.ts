@@ -7,9 +7,8 @@
 // OrgEvent that must be recorded for it.
 //
 // v1 fail-closed rules (spec §4, this slice S3):
-//   * `speakerVerified` requires speakerId ∈ bob's OWN enrolment. In v1 the
-//     enrolment is EMPTY by default, so nothing is verified and `answer`/writes
-//     are OFF.
+//   * `speakerVerified` requires speakerId ∈ bob's OWN enrolment (defaults
+//     to empty). The V1 sidecar emits no transcripts.
 //   * A memory is written ONLY when addressed AND speakerVerified — visibility
 //     `private`, author `jarvis`, speakerId in metadata. Non-member speech is
 //     EPHEMERAL (no write, never recallable).
@@ -126,14 +125,14 @@ export interface PolicyState {
   profile: ReachyProfile;
   // SSR "jarvis" — a string compare in bob, never the sidecar's flag.
   wakeName: string;
-  // speakerId → memberId. EMPTY by default in v1 (nothing is verified).
+  // speakerId → memberId; defaults to empty.
   enrolment: Record<string, string>;
   mute: boolean;
   // Rate-limit state for an unverified speaker's acknowledge (one per minute).
   nowMs: () => number;
   lastAcknowledgeAtMs?: number;
   // bob#356: the room-publication grants (`run`, `cron:<job>`,
-  // `discord:<channelId>`, `mail:<sender>`) a tool-path `say` is checked
+  // `discord:<channelId>`) a tool-path `say` is checked
   // against. Empty: no turn may speak in the room.
   roomSpeechOrigins: readonly string[];
 }
@@ -161,8 +160,6 @@ export function roomSpeechGrant(origin: TurnOrigin): string | null {
       return `cron:${origin.job}`;
     case "discord":
       return `discord:${origin.channelId}`;
-    case "mail":
-      return `mail:${origin.from}`;
     default:
       return null;
   }

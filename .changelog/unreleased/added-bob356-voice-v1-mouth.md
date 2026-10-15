@@ -26,10 +26,10 @@
   for the origin the runtime binds the call to — the admitted turn it runs in,
   or the `run` an operator's one-shot `bob run` declares — and only when
   `reachy.roomSpeechOrigins` grants that exact origin (`run`, `cron:<job>`,
-  `discord:<channelId>`, `mail:<sender>`; empty by default); a call bound to
+  `discord:<channelId>`; empty by default); a call bound to
   nothing, a voice-origin call and an ungranted turn are refused. A valid sidecar
   speech proposal on a ready, unmuted link is refused; a room transcript
-  authorizes no speech. All speech bob sends
+  authorizes no speech. Mail speech is V2; V1 mail has no bound origin. All speech bob sends
   needs a ready, unmuted link (bob mute, the sidecar-reported mute — V1 does not
   read the hardware switch — or no link all mute it), one line of at most 500
   characters with no memory reference, and a successful audit before the send,
