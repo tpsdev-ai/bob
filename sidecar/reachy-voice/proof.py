@@ -17,24 +17,21 @@ the caller chose outside the sandbox (bob#356 round 2):
                             against a fixed whitelist (validate_spec): the one
                             executable is /usr/bin/true, the mach names and the
                             DNS socket are fixed, ports are integers aimed at
-                            loopback by the probe itself, and every path's
-                            resolved name begins with /private/tmp/rv-.
+                            loopback by the probe itself.
                             There is NO unconfined probe: the controls run as the caller's
                             own user, without sudo.
   sidecar <tts_dir> <work_dir> <socket> <model_sha256> <socket_mode>
                             run THIS directory's sidecar under THIS directory's
                             profile, with a test's stand-in Piper and player
                             (executed confined, as the sidecar would run Piper).
-  clean <work_dir>          remove a proof's work directory.
   interp                    report the interpreter THIS process runs under:
                             sys.executable and its resolved path, the resolved
                             base prefix, the isolated flag, and every sys.path
                             entry (for [P7] to verify, as run through sudo).
 
-The probe/sidecar/clean path arguments must resolve to names beginning with
-/private/tmp/rv-, so those subcommands cannot be pointed at the
-deployed state directory; `open` and `connect` take any path. The interpreter
-prefix and the sidecar directory are derived here, never taken as arguments.
+The probe/sidecar paths are checked for a /private/tmp/rv- resolved prefix
+before launch; this does not pin their ancestors. `open` and `connect` take
+any path. The interpreter prefix and the sidecar directory are derived here.
 Output: one JSON object on stdout.
 
 Python 3.9+, standard library only.
@@ -201,13 +198,6 @@ def cmd_sidecar(tts_dir, work_dir, sock, model_sha, socket_mode):
     os.execv(argv[0], argv)
 
 
-def cmd_clean(work_dir):
-    import shutil
-
-    shutil.rmtree(scratch_path(work_dir), ignore_errors=True)
-    print(json.dumps({"clean": not os.path.lexists(work_dir)}))
-
-
 def cmd_interp():
     print(
         json.dumps(
@@ -235,8 +225,6 @@ def main(argv):
         cmd_probe(*rest)
     elif cmd == "sidecar" and len(rest) == 5:
         cmd_sidecar(*rest)
-    elif cmd == "clean" and len(rest) == 1:
-        cmd_clean(rest[0])
     elif cmd == "interp" and not rest:
         cmd_interp()
     else:

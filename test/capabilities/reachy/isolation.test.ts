@@ -286,6 +286,12 @@ function layout(shared: { group?: number } | false): Layout {
   if (shared && shared.group !== undefined) {
     chownSync(side, process.getuid?.() ?? -1, shared.group);
     chmodSync(side, 0o771);
+    // Let bob remove sidecar-owned scratch children without privileged cleanup.
+    execFileSync("/bin/chmod", [
+      "+a",
+      `user:${execFileSync(ID, ["-un"], { encoding: "utf8" }).trim()} allow list,search,delete,delete_child,file_inherit,directory_inherit`,
+      side,
+    ]);
   } else {
     chmodSync(side, shared ? 0o1777 : 0o700);
   }
@@ -514,13 +520,6 @@ async function proveRoundTrip(as: string | undefined) {
     log += b.toString();
   });
   cleanups.push(() => proc.kill());
-  if (separate) {
-    // The work dir belongs to the sidecar user: it removes its own.
-    const clean = proofArgv(l, as, ["clean", l.work]);
-    cleanups.push(() =>
-      spawnSync(must(clean[0], "a command"), clean.slice(1), { stdio: "ignore" }),
-    );
-  }
   const client = new UnixSocketReachyClient({ socket: l.sock });
   try {
     await waitFor(() => log.includes("listening"), "the sidecar to listen");

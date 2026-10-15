@@ -87,8 +87,9 @@ as that user is unconfined and caller-chosen: `open` reports whether a path
 OPENS (it never reads), `connect` reports whether a socket accepts (and sends
 nothing), `probe` runs the installed egress probe ONLY under the installed
 profile with every spec field checked against a fixed whitelist (the one
-executable is `/usr/bin/true`); `probe`/`sidecar`/`clean` path arguments must
-resolve to paths beginning with `/private/tmp/rv-`. The unconfined controls run as bob's
+executable is `/usr/bin/true`); `probe`/`sidecar` paths are checked for a
+`/private/tmp/rv-` resolved prefix before launch, without pinning ancestors.
+The unconfined controls run as bob's
 own user, without sudo. No other command, and never root:
 
 ```sh
@@ -162,10 +163,20 @@ example an Intel Homebrew `/usr/local/var`), step 8 fails until it is.
 ## 5. The launch job
 
 A LaunchDaemon running the sidecar as `jarvis-sidecar`, under the profile, with
-every path resolved (seatbelt matches real paths: `/tmp` is `/private/tmp`).
+real paths for the profile parameters and sidecar arguments.
 
 ```sh
-MODEL=$PIPER_DIR/<voice>.onnx
+realpath() { "$PYTHON" -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+INSTALL=$(realpath "$INSTALL")
+PIPER_DIR=$(realpath "$PIPER_DIR")
+STATE=$(realpath "$STATE")
+PLAYER=$(realpath /usr/bin/afplay)
+PROFILE=$(realpath "$INSTALL/reachy-voice.sb")
+SIDECAR=$(realpath "$INSTALL/sidecar.py")
+PIPER=$(realpath "$PIPER_DIR/piper")
+WORK_DIR=$(realpath "$STATE/work")
+SOCKET=$(realpath "$STATE/run/voice.sock")
+MODEL=$(realpath "$PIPER_DIR/<voice>.onnx")
 MODEL_SHA=$(shasum -a 256 $MODEL | cut -d' ' -f1)
 sudo tee /Library/LaunchDaemons/dev.tps.reachy-voice.plist >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -176,20 +187,20 @@ sudo tee /Library/LaunchDaemons/dev.tps.reachy-voice.plist >/dev/null <<EOF
   <key>GroupName</key><string>$VOICE_GROUP</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/sandbox-exec</string>
-    <string>-f</string><string>$INSTALL/reachy-voice.sb</string>
+    <string>-f</string><string>$PROFILE</string>
     <string>-D</string><string>PYTHON_PREFIX=$PYTHON_PREFIX</string>
     <string>-D</string><string>SIDECAR_DIR=$INSTALL</string>
     <string>-D</string><string>TTS_DIR=$PIPER_DIR</string>
-    <string>-D</string><string>PLAYER=/usr/bin/afplay</string>
-    <string>-D</string><string>WORK_DIR=$STATE/work</string>
-    <string>-D</string><string>SOCKET=$STATE/run/voice.sock</string>
-    <string>$PYTHON_REAL</string><string>-I</string><string>$INSTALL/sidecar.py</string>
-    <string>--socket</string><string>$STATE/run/voice.sock</string>
-    <string>--work-dir</string><string>$STATE/work</string>
-    <string>--piper</string><string>$PIPER_DIR/piper</string>
+    <string>-D</string><string>PLAYER=$PLAYER</string>
+    <string>-D</string><string>WORK_DIR=$WORK_DIR</string>
+    <string>-D</string><string>SOCKET=$SOCKET</string>
+    <string>$PYTHON_REAL</string><string>-I</string><string>$SIDECAR</string>
+    <string>--socket</string><string>$SOCKET</string>
+    <string>--work-dir</string><string>$WORK_DIR</string>
+    <string>--piper</string><string>$PIPER</string>
     <string>--piper-model</string><string>$MODEL</string>
     <string>--piper-model-sha256</string><string>$MODEL_SHA</string>
-    <string>--player</string><string>/usr/bin/afplay</string>
+    <string>--player</string><string>$PLAYER</string>
     <string>--device-mute</string><string>absent</string>
     <string>--socket-mode</string><string>0660</string>
   </array>
@@ -269,6 +280,10 @@ Also measure, from the running LaunchDaemon: that one `say` plays on the
 speakerphone (the job's default output device), not another output.
 
 ## 8. The release-host check (manual prerequisite)
+
+Scratch cleanup runs as bob (`rmSync(base, { recursive: true, force: true })`),
+without sudo. P4 grants bob inherited cleanup ACLs on its scratch directory;
+bob's OS permissions still apply outside scratch.
 
 No CI workflow runs this (CI is Linux; the seatbelt proofs are macOS-only). Run
 it on this host, from the reviewed checkout, before the sidecar ships, in bob's

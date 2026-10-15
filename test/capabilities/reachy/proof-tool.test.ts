@@ -1,11 +1,20 @@
 // Required release-host separate-user proofs run the installed command,
 // sidecar/reachy-voice/proof.py, through an exact sudoers rule. Its subcommands
-// are bounded; these tests run them as THIS user (no sudo) so the bounds hold
-// on every host, and check that the key-read proof's credential list is DERIVED
-// from bob's own resolution of the agent, never supplied.
+// are tested as THIS user (no sudo). The key-read proof's credentials are
+// derived from bob's own resolution of the agent.
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,16 +34,16 @@ describe("bob#356 — proof.py, the one command the sudoers rule names", () => {
     const dir = mkdtempSync(join(tmpdir(), "rvp-"));
     scratch.push(dir);
     const readable = join(dir, "readable");
-    const closed = join(dir, "closed");
+    const notDirectory = join(dir, "file");
+    const closed = join(notDirectory, "child");
     writeFileSync(readable, "CONTENT-MUST-NOT-APPEAR");
-    writeFileSync(closed, "x");
-    chmodSync(closed, 0o000);
+    writeFileSync(notDirectory, "x");
     const r = proof("open", readable, closed, join(dir, "absent"));
     expect(r.status).toBe(0);
     const out = JSON.parse(r.stdout);
     expect(out[readable]).toBe("OPENED");
     expect(out[join(dir, "absent")]).toBe("ENOENT");
-    if (process.getuid?.() !== 0) expect(out[closed]).toBe("EACCES");
+    expect(out[closed]).toBe("ENOTDIR");
     expect(r.stdout).not.toContain("CONTENT-MUST-NOT-APPEAR");
   });
 
@@ -47,10 +56,11 @@ describe("bob#356 — proof.py, the one command the sudoers rule names", () => {
     try {
       // spawnSync blocks the loop; the kernel completes the connect from the backlog
       expect(JSON.parse(proof("connect", sock).stdout)).toEqual({ connect: "CONNECTED" });
-      chmodSync(sock, 0o000);
-      if (process.getuid?.() !== 0) {
-        expect(JSON.parse(proof("connect", sock).stdout).connect).toMatch(/^(EACCES|EPERM)$/);
-      }
+      const notDirectory = join(dir, "file");
+      writeFileSync(notDirectory, "x");
+      expect(JSON.parse(proof("connect", join(notDirectory, "s.sock")).stdout)).toEqual({
+        connect: "ENOTDIR",
+      });
       expect(JSON.parse(proof("connect", join(dir, "none")).stdout)).toEqual({
         connect: "ENOENT",
       });
@@ -59,18 +69,45 @@ describe("bob#356 — proof.py, the one command the sudoers rule names", () => {
     }
   });
 
-  it("`probe`, `sidecar` and `clean` refuse paths whose resolved names lack the /private/tmp/rv- prefix", () => {
+  it("`probe` and `sidecar` refuse paths whose resolved names lack the /private/tmp/rv- prefix", () => {
     const spec = JSON.stringify({ tcp4: 9 });
     for (const args of [
       ["probe", "/tmp/x", "/tmp/y", "/tmp/z.sock", spec],
       ["probe", "/usr/local/var/bob/reachy-voice", "/x", "/y", spec],
       ["sidecar", "/tmp/x", "/tmp/y", "/tmp/z.sock", "0".repeat(64), "0660"],
-      ["clean", "/usr/local/var/bob/reachy-voice/work"],
     ]) {
       const r = proof(...args);
       expect(r.status, args.join(" ")).not.toBe(0);
       expect(r.stderr).toContain("is not under /private/tmp/rv-");
     }
+  });
+
+  it("`clean` is refused for scratch and deployed paths", () => {
+    for (const path of ["/private/tmp/rv-proof/work", "/usr/local/var/bob/reachy-voice/work"]) {
+      const r = proof("clean", path);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain("unknown subcommand or arguments");
+    }
+  });
+
+  it("bob's scratch-tree cleanup unlinks a swapped parent symlink and leaves the deployed fixture untouched", () => {
+    const root = mkdtempSync(join(tmpdir(), "rv-cleanup-"));
+    scratch.push(root);
+    const parent = join(root, "rv-proof");
+    const parked = join(root, "parked");
+    const deployed = join(root, "deployed");
+    mkdirSync(join(parent, "work"), { recursive: true });
+    mkdirSync(join(deployed, "work"), { recursive: true });
+    const marker = join(deployed, "work", "state");
+    writeFileSync(marker, "deployed-state");
+    renameSync(parent, parked);
+    symlinkSync(deployed, parent, "dir");
+
+    rmSync(parent, { recursive: true, force: true });
+
+    expect(existsSync(parent)).toBe(false);
+    expect(readFileSync(marker, "utf8")).toBe("deployed-state");
+    expect(existsSync(join(parked, "work"))).toBe(true);
   });
 
   it("there is NO unconfined probe: `probe open` (the round-1 control mode) is refused", () => {
@@ -102,8 +139,7 @@ describe("bob#356 — proof.py, the one command the sudoers rule names", () => {
   it.skipIf(process.platform !== "darwin")(
     "`sidecar` accepts only the deployed or the private socket mode",
     () => {
-      const dir = mkdtempSync("/private/tmp/rv-");
-      scratch.push(dir);
+      const dir = "/private/tmp/rv-never-created";
       const r = proof("sidecar", dir, join(dir, "w"), join(dir, "s.sock"), "0".repeat(64), "0666");
       expect(r.status).not.toBe(0);
       expect(r.stderr).toContain("socket mode is 0600 or 0660");

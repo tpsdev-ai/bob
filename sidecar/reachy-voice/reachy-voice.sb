@@ -2,8 +2,7 @@
 ;; sidecar (bob#356 V1; bob#180 §3.2). Everything not allowed below is denied.
 ;; Children inherit it.
 ;;
-;; Parameters (sandbox-exec -D NAME=value; every path RESOLVED — /tmp is
-;; /private/tmp, a Homebrew python is its Cellar path):
+;; Parameters (sandbox-exec -D NAME=value; pass real paths):
 ;;   PYTHON_PREFIX  the interpreter's install root (read, map, exec)
 ;;   SIDECAR_DIR    the directory holding sidecar.py (read)
 ;;   TTS_DIR        Piper's install: binary, libraries, voice model (read, map, exec)
