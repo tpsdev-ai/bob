@@ -109,9 +109,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   const supervisor = superviseLink({ client: commands, wired });
-  // The sidecar serves ONE connection at a time: when pi ends this session
-  // (shutdown, reload, a replacement session), release it, and stop retrying,
-  // so the next session's link can connect.
+  // session_shutdown is emitted by pi reload, runtime new/fork/resume and
+  // runtime dispose (quit). Plain AgentSession.dispose() does not emit it.
+  // Release the sidecar connection and stop retries on that event.
   pi.on("session_shutdown", () => {
     supervisor.stop();
     wired.disconnected();

@@ -385,8 +385,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       pi.registerTool({
         name: "reachy_look",
         label: "Reachy Look",
-        description:
-          "Turn the Reachy Mini's head to a yaw/pitch (degrees). Goes through the policy gate.",
+        description: "Request `look_at` with yaw/pitch in degrees through the policy gate.",
         // SAME definition as the runtime: the tool parameter schema IS
         // ACTION_ARG_SCHEMAS.look (round 10), so pi advertises the exact bounds
         // admitAndRun enforces (yaw [-180,180], pitch [-90,90]) and never presents
@@ -442,7 +441,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         async execute() {
           // A failed send is a sentence, not a thrown tool call: the tool stays
           // registered even when the sidecar is down (round 5 review). `state` is
-          // status traffic, allowed before the handshake.
+          // status traffic; the client waits for the configure write.
           try {
             const st = await commands.send("state");
             return ok(JSON.stringify(st ?? {}));
@@ -455,8 +454,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       pi.registerTool({
         name: "reachy_frame",
         label: "Reachy Frame",
-        description:
-          "Capture one JPEG frame (on demand only). Sends a `frame` command; goes through the gate.",
+        description: "Request `frame` through the policy gate.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
           const r = await admitAndRun("frame", {}, 1, [], { path: "tool", origin: callerOrigin() });
@@ -717,8 +715,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     lastTranscript = null;
     const epoch = link.epoch;
     try {
-      // The ONE control command before the handshake. Its write must SUCCEED
-      // before any health line is judged (bob#356 round 1).
+      // Configure is the first command; its write must succeed before health
+      // is judged. Status sends wait behind that write in the socket client.
       await commands.send("configure", configureArgs(expectation()));
     } catch (err) {
       if (link.epoch !== epoch) return;

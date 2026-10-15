@@ -1,4 +1,4 @@
-// bob#356 round 1: the separate-user proofs run ONE installed command,
+// Required release-host separate-user proofs run the installed command,
 // sidecar/reachy-voice/proof.py, through an exact sudoers rule. Its subcommands
 // are bounded; these tests run them as THIS user (no sudo) so the bounds hold
 // on every host, and check that the key-read proof's credential list is DERIVED

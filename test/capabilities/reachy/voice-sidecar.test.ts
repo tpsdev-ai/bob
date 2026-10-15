@@ -19,6 +19,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -363,9 +364,18 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     const sc = start(inst, ["--device-mute", "absent"]);
     await waitFor(() => sc.log().includes("listening"), "listening");
     const raw = new UnixSocketReachyClient({ socket: inst.sock });
-    await raw.connect();
     try {
-      await raw.send("say", { text: "before configure", playbackId: "play_0" });
+      const unconfigured = createConnection(inst.sock);
+      await new Promise<void>((resolve, reject) => {
+        unconfigured.once("error", reject);
+        unconfigured.once("connect", resolve);
+      });
+      unconfigured.end(
+        `${JSON.stringify({ command: "say", args: { text: "before configure", playbackId: "play_0" } })}\n`,
+      );
+      await waitFor(() => sc.log().includes("command.before_configure"), "unconfigured refusal");
+      await waitFor(() => sc.log().includes("disconnected"), "unconfigured client disconnect");
+      await raw.connect();
       await raw.send("configure", {
         protocol: "reachy-voice/1",
         profile: "voice",

@@ -38,12 +38,11 @@
 //        jarvis-sidecar, group jarvis-voice, in a 0750 directory of that owner
 //        and group; an outsider's connect is refused.
 //
-// Every separate-user step runs ONE installed command, `proof.py`, through the
-// runbook's exact sudoers rule (RUNBOOK step 2): never `sudo` with free
-// arguments, and never `sudo` at all unless the sidecar user exists. Locally
-// [P3]–[P8] SKIP with their reason; with BOB_REQUIRE_ISOLATION_PROOFS=1 (the
-// release-host check) a proof that would skip FAILS, and the roots are PINNED:
-// a substitute install root or agents root fails the proofs that read it.
+// Required release-host separate-user steps use the installed `proof.py` via
+// RUNBOOK step 2's sudoers rule. Local fallback checks sudo with `/usr/bin/true`
+// and can run a scratch proof copy. No sudo is attempted without the sidecar user.
+// Locally [P3]–[P8] can skip; BOB_REQUIRE_ISOLATION_PROOFS=1 makes skips fail
+// and pins the install and agents roots.
 import { afterAll, describe, expect } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -82,6 +81,7 @@ import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/pol
 import { must } from "./handshake.js";
 import { deriveActiveCredentials } from "./isolation-credentials.js";
 import { PINNED_PIPER_DIR, PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
+import { assertConfinementProbeKeys, MACH_SERVICES } from "./probe-keys.js";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR_SRC = join(REPO, "sidecar", "reachy-voice");
@@ -108,14 +108,6 @@ const DEPLOYED_SOCKET = join(PINNED_STATE_DIR, "run", "voice.sock");
 const SIDECAR_VERSION = /^SIDECAR_VERSION = "([^"]+)"$/m.exec(
   readFileSync(join(SIDECAR_SRC, "sidecar.py"), "utf8"),
 )?.[1];
-// Network-capable system services the sidecar must not reach (each needs a
-// working control: a name this macOS does not register proves nothing).
-const MACH_SERVICES = [
-  "com.apple.nsurlsessiond",
-  "com.apple.dnssd.service",
-  "com.apple.cfnetwork.cfnetworkagent",
-  "com.apple.analyticsd",
-];
 const MIN_MACH_CONTROLS = 2;
 const AUDIO_MAGIC = ["RIFF", "OggS", "fLaC", "ID3", "FORM"];
 const AUDIO_EXT = /\.(wav|wave|ogg|oga|opus|flac|mp3|aif|aiff|caf|m4a|pcm|raw)$/i;
@@ -429,6 +421,7 @@ async function proveConfinement(as: string | undefined) {
     };
     const control = await probe(l, undefined, false, spec); // this user, no sudo
     const confined = await probe(l, as, true, spec);
+    assertConfinementProbeKeys(control, confined);
     let machControls = 0;
     for (const [name, result] of Object.entries(control)) {
       if (name.startsWith("mach:")) {

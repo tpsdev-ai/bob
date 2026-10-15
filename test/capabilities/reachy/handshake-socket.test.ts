@@ -19,10 +19,10 @@ import {
   type PiLike,
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
-import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
+import { superviseLink, UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { VOICE_PROTOCOL } from "../../../src/capabilities/reachy/wire.js";
-import { TEST_SIDECAR_VERSION } from "./handshake.js";
+import { must, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 const scratch: string[] = [];
 const servers: Server[] = [];
@@ -65,7 +65,10 @@ async function socketServer(opts: { eager: boolean; read: boolean }) {
 }
 
 class NoPi implements PiLike {
-  registerTool(): void {}
+  readonly tools = new Map<string, Parameters<PiLike["registerTool"]>[0]>();
+  registerTool(tool: Parameters<PiLike["registerTool"]>[0]): void {
+    this.tools.set(tool.name, tool);
+  }
 }
 class Store implements OrgEventStore {
   readonly all: OrgEvent[] = [];
@@ -88,8 +91,9 @@ function core(client: UnixSocketReachyClient) {
     nowMs: () => Date.now(),
     roomSpeechOrigins: [],
   };
+  const pi = new NoPi();
   const wired = wireReachyCapability({
-    pi: new NoPi(),
+    pi,
     commands: client,
     memory: { writePrivate: async () => ({ id: "m" }) },
     store,
@@ -102,7 +106,7 @@ function core(client: UnixSocketReachyClient) {
     seen.push(l);
     void wired.handleLine(l);
   });
-  return { wired, store, seen };
+  return { wired, store, seen, pi };
 }
 
 async function until(cond: () => boolean, what: string): Promise<void> {
@@ -119,7 +123,7 @@ describe("bob#356 round 1 — send failures and the handshake races (a real UNIX
     const client = new UnixSocketReachyClient({ socket: srv.path });
     await client.connect();
     // 16 MiB to a peer that does not read: the write stays pending...
-    const pending = client.send("state", { blob: "x".repeat(16 * 1024 * 1024) });
+    const pending = client.send("configure", { blob: "x".repeat(16 * 1024 * 1024) });
     client.disconnect(); // ...and the socket is destroyed under it
     await expect(pending).rejects.toThrow();
   });
@@ -139,9 +143,79 @@ describe("bob#356 round 1 — send failures and the handshake races (a real UNIX
         return false;
       },
     };
-    (client as unknown as { socket: unknown }).socket = failing;
+    Object.assign(client, {
+      socket: failing,
+      configured: {
+        socket: failing,
+        wait: Promise.resolve(),
+        complete: () => {},
+        fail: () => {},
+        started: false,
+      },
+    });
     await expect(client.send("configure", {})).rejects.toThrow("EPIPE");
     expect(listeners.has("close")).toBe(false); // the close listener was released
+  });
+
+  it("reachy_state during reconnect cannot precede configure on the wire", async () => {
+    const srv = await socketServer({ eager: false, read: true });
+    const client = new UnixSocketReachyClient({ socket: srv.path });
+    const { wired, pi } = core(client);
+    let retry!: () => void;
+    const supervisor = superviseLink({
+      client,
+      wired,
+      schedule: (fn) => {
+        retry = fn;
+      },
+    });
+    try {
+      await supervisor.start();
+      await until(() => srv.conns.length === 1, "the first connection");
+      srv.conns[0]?.destroy();
+      await until(() => !!retry, "the reconnect timer");
+      const realConnect = client.connect.bind(client);
+      let stateDuringConnect!: Promise<unknown>;
+      let queuedState!: Promise<unknown>;
+      let resume!: () => void;
+      const held = new Promise<void>((r) => {
+        resume = r;
+      });
+      const wire: string[] = [];
+      client.connect = async () => {
+        const connecting = realConnect();
+        stateDuringConnect = must(pi.tools.get("reachy_state"), "reachy_state").execute(
+          "state",
+          {},
+        );
+        await connecting;
+        await until(() => srv.conns.length === 2, "the second connection");
+        let buffer = "";
+        srv.conns[1]?.on("data", (chunk) => {
+          buffer += chunk.toString();
+          for (;;) {
+            const nl = buffer.indexOf("\n");
+            if (nl < 0) break;
+            wire.push(JSON.parse(buffer.slice(0, nl)).command);
+            buffer = buffer.slice(nl + 1);
+          }
+        });
+        queuedState = must(pi.tools.get("reachy_state"), "reachy_state").execute("state", {});
+        await held;
+      };
+      retry();
+      await until(() => !!queuedState, "a state call on the reconnected socket");
+      expect(JSON.stringify(await stateDuringConnect)).toContain("state unavailable");
+      await Bun.sleep(20);
+      expect(wire).toEqual([]);
+      resume();
+      await queuedState;
+      await until(() => wire.length === 2, "configure and queued state");
+      expect(wire).toEqual(["configure", "state"]);
+    } finally {
+      supervisor.stop();
+      client.disconnect();
+    }
   });
 
   it("RACE 1: health arriving while `configure` is pending is held; ready only after the write succeeded", async () => {
@@ -175,14 +249,13 @@ describe("bob#356 round 1 — send failures and the handshake races (a real UNIX
     const client = new UnixSocketReachyClient({ socket: srv.path });
     const { wired, store, seen } = core(client);
     await client.connect();
-    // A large write the peer never reads keeps the socket's queue full, so
-    // the `configure` behind it is still pending when the socket dies.
-    const blocker = client.send("state", { blob: "x".repeat(16 * 1024 * 1024) });
+    const realSend = client.send.bind(client);
+    client.send = (command, args) =>
+      realSend(command, { ...args, blob: "x".repeat(16 * 1024 * 1024) });
     const connecting = wired.connected();
     await until(() => seen.length === 1, "the eager health line");
     expect(wired.link().phase).toBe("configuring");
     client.disconnect();
-    await expect(blocker).rejects.toThrow();
     await connecting;
     expect(wired.link().phase).toBe("disconnected");
     expect(store.all.find((e) => e.kind === "reachy.link.refused")?.summary).toContain(

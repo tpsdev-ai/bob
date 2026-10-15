@@ -17,7 +17,7 @@ Files in this directory:
 | --- | --- |
 | `sidecar.py` | The sidecar (Python 3.9+, standard library only). Reports version `0.1.0`. |
 | `reachy-voice.sb` | The deny-default seatbelt profile it runs under. |
-| `proof.py` | The ONE command the isolation proofs run as another user (step 2). |
+| `proof.py` | The installed command for release-host separate-user proofs (step 2). |
 | `egress-probe.py` | Confined via `proof.py`; the test runs its source directly as bob with `PY -I -c <source> <spec-json>` for the unconfined control. |
 | `RUNBOOK.md` | This file. |
 
@@ -81,7 +81,7 @@ id $SIDECAR_USER            # check: the uid, and the jarvis-voice group
 
 ## 2. The constrained `sudo -n` proof path
 
-The isolation proofs run ONE command as another user: the installed `proof.py`
+Required release-host isolation proofs run the installed `proof.py` as another user
 under the pinned interpreter (step 3 installs it root-owned). Nothing it runs
 as that user is unconfined and caller-chosen: `open` reports whether a path
 OPENS (it never reads), `connect` reports whether a socket accepts (and sends

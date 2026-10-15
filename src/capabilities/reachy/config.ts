@@ -18,9 +18,7 @@ import { Value } from "typebox/value";
 
 export const CONFIG_ENV_VAR = "BOB_CAP_REACHY";
 
-/** The device profiles (bob#356 delta 1). `voice` is a speakerphone — V1 drives
- *  only its speaker (the microphone is V2); `reachy` adds the head, the antennas
- *  and the camera. */
+/** `voice` registers speaker/status tools; `reachy` also registers look/frame. */
 export const PROFILES = ["voice", "reachy"] as const;
 export type ReachyProfile = (typeof PROFILES)[number];
 export const DEFAULT_PROFILE: ReachyProfile = "voice";
@@ -67,8 +65,7 @@ export const CONFIG_SCHEMA = Type.Object(
     // loaded, so its block is not validated.
     profile: Type.Optional(
       Type.Union([Type.Literal("voice"), Type.Literal("reachy")], {
-        description:
-          "Device profile: voice (a speakerphone; V1 drives only its speaker) or reachy (adds the body).",
+        description: "Device profile: voice (speaker/status tools) or reachy (also look/frame).",
       }),
     ),
     // The wake name — bob-owned, projected from `voice.wakeName`. A string
