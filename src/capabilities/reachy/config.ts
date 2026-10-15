@@ -9,8 +9,8 @@
 //
 // bob#356 V1: the device PROFILE and the wake name are BOB-OWNED. The sidecar
 // reports both in its `reachy-voice/1` health, and a report that differs from
-// this config is a handshake failure (disconnect and alarm), never a downgrade
-// or an upgrade. The wake name comes from the agent's `voice.wakeName`
+// this config disconnects and attempts an alarm, retrying that reason after a
+// failed write. The wake name comes from the agent's `voice.wakeName`
 // (capability-loader.ts projects it here); a `reachy:` block cannot set it.
 
 import { type Static, Type } from "typebox";

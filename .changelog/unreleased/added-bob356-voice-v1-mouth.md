@@ -3,9 +3,10 @@
   `reachy_say` and `reachy_state`; `reachy` adds `reachy_look` and
   `reachy_frame`; any other value is refused whenever bob loads the capability), and an
   allowlist naming a tool the configured profile does not register is refused by
-  name before any session; under `voice`, a body proposal is refused on an
-  unmuted link (a muted link drops it) and a `presence` line on any ready link,
-  muted or not, is a content-free `reachy.malformed`. The wake name comes only from the
+  name before any session; under `voice`, a valid body proposal on a ready,
+  unmuted link is refused (a muted link drops it). With bob mute off, a valid
+  `presence` line on a ready link is a content-free `reachy.malformed`, regardless
+  of the sidecar-reported mute. The wake name comes only from the
   agent's `voice.wakeName` (default `jarvis`); a `reachy:` block that sets one is
   refused. Every connection bob makes to the sidecar starts with its `configure` (protocol,
   profile, wake name, a fresh generation); the first line that arrives before
@@ -25,8 +26,9 @@
   or the `run` an operator's one-shot `bob run` declares — and only when
   `reachy.roomSpeechOrigins` grants that exact origin (`run`, `cron:<job>`,
   `discord:<channelId>`, `mail:<sender>`; empty by default); a call bound to
-  nothing, a voice-origin call, an ungranted turn and every sidecar proposal are
-  refused, and a room transcript authorizes no speech. All speech bob sends
+  nothing, a voice-origin call and an ungranted turn are refused. A valid sidecar
+  speech proposal on a ready, unmuted link is refused; a room transcript
+  authorizes no speech. All speech bob sends
   needs a ready, unmuted link (bob mute, the sidecar-reported mute — V1 does not
   read the hardware switch — or no link all mute it), one line of at most 500
   characters with no memory reference, and a successful audit before the send,

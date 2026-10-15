@@ -2,9 +2,9 @@
 // testable core (fakes; no socket, no sidecar):
 //   authorized say without a transcript; forbidden and stale callers refused;
 //   body tools absent under voice; the reachy-voice/1 handshake (mismatch,
-//   one bounded alarm, reconnect); mute (bob, device, unknown/disconnected);
+//   attempted bounded alarm, reconnect); mute (bob, device, unknown/disconnected);
 //   an audit failure blocks speech; a send failure is a linked refusal; a
-//   presence line under voice is a content-free malformed audit.
+//   valid presence on a ready voice link with bob mute off is a content-free malformed audit.
 // The isolation proofs are isolation.test.ts; the real sidecar's speech path is
 // voice-sidecar.test.ts.
 import { describe, expect, it } from "bun:test";
@@ -196,7 +196,7 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     }
   });
 
-  it("body PROPOSALS under voice refuse (look, frame, acknowledge) and send nothing", async () => {
+  it("valid body proposals under voice on a ready, unmuted link refuse and send nothing", async () => {
     const h = harness({ profile: "voice" });
     await h.ready();
     for (const [action, args] of [
@@ -219,7 +219,7 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     expect(h.commands.sent).toEqual([]);
   });
 
-  it("on a ready but MUTED voice link, presence is still audited (malformed); body proposals are dropped, and refused when unmuted", async () => {
+  it("with bob mute off, ready voice presence is audited despite sidecar mute; valid body proposals drop until unmuted", async () => {
     const h = harness({ profile: "voice" });
     await h.ready({ muted: true });
     expect(h.wired.link()).toMatchObject({ phase: "ready", effectiveMuted: true });
@@ -249,7 +249,21 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     });
   });
 
-  it("a presence line under voice is a bounded, content-free malformed audit (and ignored under reachy)", async () => {
+  it("bob mute drops presence and proposals after a ready handshake", async () => {
+    const h = harness({ profile: "voice" });
+    await h.ready();
+    h.state.mute = true;
+    for (const line of [
+      { type: "presence", count: 1, known: [] },
+      { type: "proposal", action: "frame", args: {}, confidence: 1, inputs: [] },
+    ]) {
+      expect(await h.wired.handleLine(line)).toEqual({ kind: "drop" });
+    }
+    expect(h.store.all).toEqual([]);
+    expect(h.commands.sent).toEqual([]);
+  });
+
+  it("valid presence on a ready link with bob mute off is malformed under voice and ignored under reachy", async () => {
     const h = harness({ profile: "voice" });
     await h.ready();
     const r = await h.wired.handleLine({ type: "presence", count: 7, known: ["spk-secret-id"] });
@@ -266,6 +280,22 @@ describe("bob#356 V1 — the bob-owned profile", () => {
     expect((await body.wired.handleLine({ type: "presence", count: 1, known: [] })).kind).toBe(
       "none",
     );
+  });
+
+  it("an invalid body proposal on a ready, unmuted voice link is malformed; sidecar mute drops it", async () => {
+    const h = harness({ profile: "voice" });
+    await h.ready();
+    const line = {
+      type: "proposal",
+      action: "look",
+      args: { yaw: "bad", pitch: 0 },
+      confidence: 1,
+      inputs: [],
+    };
+    expect((await h.wired.handleLine(line)).kind).toBe("malformed");
+    await h.wired.handleLine(healthLine(h.wired, h.state, { muted: true }));
+    expect((await h.wired.handleLine(line)).kind).toBe("drop");
+    expect(h.commands.sent).toEqual([]);
   });
 });
 
@@ -338,7 +368,7 @@ describe("bob#356 V1 — the strict reachy-voice/1 health line", () => {
   });
 });
 
-describe("bob#356 V1 — the handshake: control/status first, mismatch disconnects with one alarm, reconnect", () => {
+describe("bob#356 V1 — the handshake: control/status first, mismatch disconnects and attempts an alarm, reconnect", () => {
   it("connected() sends ONE control command, `configure`, carrying bob's protocol, profile, wake name and generation", async () => {
     const h = harness();
     await h.wired.connected();

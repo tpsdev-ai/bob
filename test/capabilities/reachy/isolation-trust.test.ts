@@ -7,7 +7,7 @@
 // and the walk starts at the fixture via `from`), and each rule is shown to
 // refuse what it must.
 import { afterAll, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -100,6 +100,7 @@ function fixture() {
     record: join(f, "state/agent-user"),
     pinnedPython: join(f, "usr/bin/python3"),
     xcodeSelectLink: null,
+    developerDir: null,
     owners: [0, ME],
     from: f,
   };
@@ -113,6 +114,21 @@ const addAcl = (path: string, entry: string) =>
 const myName = () => execFileSync("/usr/bin/id", ["-un"], { encoding: "utf8" }).trim();
 
 describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", () => {
+  it("the real proof command reports an isolated interpreter despite PYTHONPATH", () => {
+    const { f } = fixture();
+    const tool = join(import.meta.dirname, "../../../sidecar/reachy-voice/proof.py");
+    const r = spawnSync(DARWIN ? "/usr/bin/python3" : "python3", ["-I", tool, "interp"], {
+      encoding: "utf8",
+      env: { ...process.env, PYTHONPATH: f, PYTHONHOME: f },
+    });
+    expect(r.status, r.stderr).toBe(0);
+    const interp = JSON.parse(r.stdout);
+    expect(interp.isolated).toBe(1);
+    expect(interp.path).not.toContain(f);
+    expect(interp.path).not.toContain(dirname(tool));
+    expect(realpathSync(interp.executable)).toBe(interp.real);
+  });
+
   it("a clean tree is trusted (and off macOS the ACL check fails closed)", () => {
     const { args } = fixture();
     const problems = releaseTrustProblems(args);
@@ -120,9 +136,9 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
     if (!DARWIN) expect(problems).toContain(ACL_UNCHECKED);
   });
 
-  it("a USER-OWNED interpreter path is refused (only root may own the chain)", () => {
+  it("an interpreter with an untrusted owner is refused", () => {
     const { f, args } = fixture();
-    const problems = releaseTrustProblems({ ...args, owners: [0] });
+    const problems = releaseTrustProblems({ ...args, owners: [ME + 1] });
     expect(problems).toContain(`${f}/base/bin/python3.9 is not root-owned (uid ${ME})`);
     expect(problems).toContain(`${f}/usr/bin/python3 is not root-owned (uid ${ME})`);
     // and every entry of the base tree, not only the chains
@@ -144,6 +160,12 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
     expect(problems).toContain(`${f}/install/proof.py is writable by group or other`);
   });
 
+  it("a writable ancestor above otherwise protected install files is refused", () => {
+    const { f, args } = fixture();
+    chmodSync(f, 0o777);
+    expect(releaseTrustProblems(args)).toContain(`${f} is writable by group or other`);
+  });
+
   it("a deep FILE in the base tree that is other-writable is refused (the whole tree is walked)", () => {
     const { f, args } = fixture();
     chmodSync(join(f, "base/lib/python3.9/os.py"), 0o646);
@@ -161,12 +183,23 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
     }
     addAcl(join(f, "install"), `user:${myName()} allow add_file,delete_child`);
     addAcl(join(f, "base/lib/python3.9/os.py"), "group:everyone allow write");
+    writeFileSync(join(f, "external.py"), "x");
+    chmodSync(join(f, "external.py"), 0o644);
+    symlinkSync(join(f, "external.py"), join(f, "base/external.py"));
+    addAcl(join(f, "external.py"), "group:everyone allow append");
     addAcl(join(f, "piper"), "group:everyone deny delete"); // a DENY entry is fine
     const problems = releaseTrustProblems(args);
-    expect(problems).toContain(
-      `${f}/install: a write-granting ACL entry (user:${myName()} allow add_file,delete_child)`,
-    );
-    expect(problems.some((p) => p.includes("group:everyone allow write"))).toBe(true);
+    expect(
+      problems.some(
+        (p) =>
+          p.startsWith(`${f}/install: a write-granting ACL entry (`) &&
+          p.endsWith(" allow add_file,delete_child)"),
+      ),
+    ).toBe(true);
+    expect(problems.some((p) => p.endsWith(" allow write)"))).toBe(true);
+    expect(
+      problems.some((p) => p.startsWith(`${f}/external.py:`) && p.endsWith(" allow append)")),
+    ).toBe(true);
     expect(problems.some((p) => p.includes("deny"))).toBe(false);
   });
 
@@ -189,6 +222,66 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
     chmodSync(join(f, "drop/evil.py"), 0o644);
     symlinkSync(join(f, "drop/evil.py"), join(f, "base/lib/python3.9/evil.py"));
     expect(releaseTrustProblems(args)).toContain(`${f}/drop is writable by group or other`);
+  });
+
+  it("intermediate symlink targets retain their writable ancestors", () => {
+    const { f, args } = fixture();
+    mkdirSync(join(f, "drop"), { mode: 0o777 });
+    chmodSync(join(f, "drop"), 0o777);
+    symlinkSync(join(f, "base/bin/python3.9"), join(f, "drop/bridge"));
+    rmSync(join(f, "clt/usr/bin/python3"));
+    symlinkSync(join(f, "drop/bridge"), join(f, "clt/usr/bin/python3"));
+    expect(releaseTrustProblems(args)).toContain(`${f}/drop is writable by group or other`);
+  });
+
+  it("external directory symlink cycles terminate and check both trees", () => {
+    const { f, args } = fixture();
+    mkdirSync(join(f, "external"), { mode: 0o755 });
+    chmodSync(join(f, "external"), 0o755);
+    symlinkSync(join(f, "external"), join(f, "base/external"));
+    symlinkSync(join(f, "base"), join(f, "external/back"));
+    writeFileSync(join(f, "external/evil.py"), "x");
+    chmodSync(join(f, "external/evil.py"), 0o666);
+    expect(releaseTrustProblems(args)).toContain(
+      `${f}/external/evil.py is writable by group or other`,
+    );
+  });
+
+  it("the selected interpreter chain and execution prefix are checked independently of base", () => {
+    const { f, args, interp } = fixture();
+    chmodSync(join(f, "clt/usr/bin"), 0o775);
+    chmodSync(join(f, "piper/piper"), 0o777);
+    const problems = releaseTrustProblems({
+      ...args,
+      developerDir: join(f, "clt"),
+      piperDir: null,
+      interp: { ...interp, prefix: join(f, "piper") },
+    });
+    expect(problems).toContain(`${f}/clt/usr/bin is writable by group or other`);
+    expect(problems).toContain(`${f}/piper/piper is writable by group or other`);
+  });
+
+  it("an interpreter report naming another executable is refused", () => {
+    const { f, args, interp } = fixture();
+    expect(
+      releaseTrustProblems({
+        ...args,
+        developerDir: join(f, "clt"),
+        interp: { ...interp, real: join(f, "usr/bin/python3") },
+      }),
+    ).toContain("the proof interpreter differs from the selected Command Line Tools interpreter");
+  });
+
+  it("an interpreter directory and a base-prefix regular file are refused", () => {
+    const { f, args, interp } = fixture();
+    const problems = releaseTrustProblems({
+      ...args,
+      pinnedPython: join(f, "usr/bin"),
+      interp: { ...interp, real: join(f, "base/bin"), base: join(f, "base/Resources/Python") },
+    });
+    expect(problems).toContain(`${f}/usr/bin is not a regular file`);
+    expect(problems).toContain(`${f}/base/bin is not a regular file`);
+    expect(problems).toContain(`${f}/base/Resources/Python is not a directory`);
   });
 
   it("a MISSING sys.path entry outside the base tree is checked at its nearest ancestor", () => {
@@ -241,11 +334,15 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
       " 2: user:bob allow add_file,file_inherit",
       " 3: group:staff inherited allow write",
       " 4: user:eve allow writesecurity",
+      " 5: user:Full Name allow write",
+      " 6: unrecognized",
     ].join("\n");
     expect(writeGrantingAcls(ls)).toEqual([
       "user:bob allow add_file",
       "group:staff allow write",
       "user:eve allow writesecurity",
+      "user:Full Name allow write",
+      "unrecognized ACL entry",
     ]);
   });
 });

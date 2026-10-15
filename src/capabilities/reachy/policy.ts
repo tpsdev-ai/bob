@@ -19,8 +19,7 @@
 //     OrgEvents.
 //
 // bob#356 V1 (rev 2.1, "mouth first"):
-//   * The PROFILE is bob-owned: body actions (`look`, `frame`, `acknowledge`)
-//     exist only under `reachy`; under `voice` they refuse.
+//   * Under `voice`, valid body proposals on ready, unmuted links refuse.
 //   * Speech is split BY CALLER, and no caller inherits earlier speech. A
 //     tool-path `say` from an authenticated turn needs no transcript, only that
 //     turn's room-publication grant (`roomSpeechOrigins`). A voice-origin call

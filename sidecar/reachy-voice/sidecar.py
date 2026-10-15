@@ -37,7 +37,7 @@ Speech (local text-to-speech with Piper):
     and it reports ok=false at once (bob then refuses the link) until it is
     restarted and its startup sweep succeeds.
 
-Logs are content-free: event names, a DIGEST of the playback id (the id is
+Logs are content-free, including event names, a DIGEST of the playback id (the id is
 sender-chosen, so it is never logged verbatim), and error CLASSES — never the
 spoken text, never a path inside an artifact. Core dumps are disabled.
 
@@ -72,7 +72,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TTS_DIR_PREFIX = "tts-"
 SYNTH_TIMEOUT_S = 30
 PLAY_TIMEOUT_S = 60
-# The environment every child (Piper, the player) gets: nothing inherited.
+# Children (Piper, the player) inherit only LANG.
 CHILD_ENV_KEYS = ("LANG",)
 
 

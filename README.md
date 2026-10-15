@@ -961,9 +961,9 @@ of which V1 drives only the speaker; tools `reachy_say` and `reachy_state`) and
 profile is refused whenever bob loads the `reachy` capability (a capability the
 position's override layer disables is not loaded, and not validated), and an
 allowlist naming a tool the configured profile does not register is refused by
-name before any session. Under `voice`, a body proposal is refused on an
-unmuted link (a muted link drops every proposal), and a `presence` line on any
-READY link, muted or not, is a content-free `reachy.malformed` (before the
+name before any session. Under `voice`, a valid body proposal on a ready, unmuted link is refused
+(a muted link drops it). With bob mute off, a valid `presence` line on a ready
+link is a content-free `reachy.malformed`, regardless of the sidecar-reported mute (before the
 handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
 `voice-session.test.ts`; `test/shell/voice-origin-356.test.ts`.)
 
@@ -995,7 +995,8 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   `discord:<channelId>`, `mail:<sender>`; empty by default). A call bound to
   nothing (a persistent prompt outside every admission, a mail turn) is
   refused, never treated as `run`; so are a voice-origin call, an ungranted
-  turn and every sidecar proposal, and a room transcript authorizes nothing.
+  turn. A valid sidecar speech proposal on a ready, unmuted link is refused;
+  a room transcript authorizes nothing.
   All speech bob sends needs a ready, unmuted link (bob mute OR the sidecar-reported mute
   OR no link = muted), one line of at most 500 characters, no memory
   reference, and a successful audit BEFORE the send; a reconnect or ANY mute

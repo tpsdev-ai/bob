@@ -5,7 +5,7 @@
 //   [P1] DENY-DEFAULT CONFINEMENT (macOS seatbelt, the shipped
 //        sidecar/reachy-voice/reachy-voice.sb), as this user: TCP over IPv4 and
 //        IPv6, UDP, another UNIX socket, the DNS service socket, network-capable
-//        mach services, a child process's connect, exec of an arbitrary binary,
+//        mach services, a child process's connect, exec of `/usr/bin/true`,
 //        and reads/writes outside the allow-list are refused — each one first
 //        shown to SUCCEED unconfined (a mach service name this macOS does not
 //        register has no control and is excluded; at least two must have one).
@@ -56,14 +56,21 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
-import { PINNED_PYTHON, releaseTrustProblems } from "../../../scripts/check-reachy-isolation.mjs";
+import { dirname, isAbsolute, join } from "node:path";
+import {
+  chainProblems,
+  PINNED_DEVELOPER_DIR,
+  PINNED_PYTHON,
+  releaseTrustProblems,
+  treeProblems,
+} from "../../../scripts/check-reachy-isolation.mjs";
 import {
   type OrgEventStore,
   orgEventRecordId,
@@ -712,7 +719,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
   );
 
   proof(
-    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write ACL)",
+    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write-granting ACL)",
     installedSkip || userSkip,
     () => {
       for (const f of INSTALLED_FILES) {
@@ -724,6 +731,17 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
       // reports its own interpreter, as the sidecar user, through the rule.
       expect(PY).toBe(PINNED_PYTHON);
       const proofPy = join(INSTALL_DIR, "proof.py");
+      expect(
+        execFileSync("/usr/bin/xcode-select", ["-p"], { env: {}, encoding: "utf8" }).trim(),
+      ).toBe(PINNED_DEVELOPER_DIR);
+      const selected = join(PINNED_DEVELOPER_DIR, "usr/bin/python3");
+      expect([
+        ...chainProblems(PY),
+        ...chainProblems(proofPy),
+        ...chainProblems("/var/db/xcode_select_link"),
+        ...chainProblems(selected),
+        ...treeProblems(dirname(dirname(realpathSync(selected)))),
+      ]).toEqual([]);
       const report = runAsUser(SIDECAR_USER, proofPy, ["interp"]);
       expect(report.status, report.stderr).toBe(0);
       const interp = JSON.parse(report.stdout);
@@ -744,6 +762,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
         }),
       ).toEqual([]);
     },
+    120_000,
   );
 });
 

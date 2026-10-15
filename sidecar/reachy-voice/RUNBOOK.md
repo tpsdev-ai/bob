@@ -157,7 +157,7 @@ sudo chown root:wheel $STATE/agent-user && sudo chmod 0644 $STATE/agent-user
 
 The record is trusted only while it and every directory above it
 (`$STATE`, `/usr/local/var/bob`, `/usr/local/var`, `/usr/local`, `/usr`, `/`) are
-root-owned and writable by no group or other; on a host where any is not (for
+root-owned, not group- or other-writable, and without write-granting ACLs; on a host where any is not (for
 example an Intel Homebrew `/usr/local/var`), step 8 fails until it is.
 
 ## 5. The launch job
@@ -184,7 +184,7 @@ sudo tee /Library/LaunchDaemons/dev.tps.reachy-voice.plist >/dev/null <<EOF
     <string>-D</string><string>PLAYER=/usr/bin/afplay</string>
     <string>-D</string><string>WORK_DIR=$STATE/work</string>
     <string>-D</string><string>SOCKET=$STATE/run/voice.sock</string>
-    <string>$PYTHON</string><string>-I</string><string>$INSTALL/sidecar.py</string>
+    <string>$PYTHON_REAL</string><string>-I</string><string>$INSTALL/sidecar.py</string>
     <string>--socket</string><string>$STATE/run/voice.sock</string>
     <string>--work-dir</string><string>$STATE/work</string>
     <string>--piper</string><string>$PIPER_DIR/piper</string>
@@ -213,10 +213,11 @@ software-only mute does not qualify.
 
 The sidecar fails closed on its speech files: it refuses to start while a stale
 one cannot be removed, and after a removal fails it stops speaking and reports
-`ok: false` (bob refuses the link and raises one alarm) until it is restarted
+`ok: false` (bob refuses the link and attempts an alarm, retrying that reason
+after a failed write) until it is restarted
 cleanly. Its log names a digest of each playback id, never the id itself.
 
-The log is content-free (event names, playback-id digests, error classes — never the
+The log is content-free (including event names, playback-id digests, error classes — never the
 spoken text). Core dumps are disabled in the process.
 
 ## 6. The agent's bob.yaml
@@ -274,19 +275,15 @@ No CI workflow runs this (CI is Linux; the seatbelt proofs are macOS-only). Run
 it on this host, from the reviewed checkout, before the sidecar ships, in bob's
 account session ($AGENT_USER logged in, with its own HOME; never as root and
 never from the admin shell). The admin shell's variables do not carry over: set
-`REPO` and `PYTHON` again in this session. `PYTHON` must be the SAME absolute
-path that step 0 resolved and step 2's sudoers rule names (any other path is
-not in the rule, so the separate-user proofs fail). Name the agent and that
-interpreter — the account comes from the deployment record (step 4), and the
+`REPO` again in this session. The interpreter is pinned to `/usr/bin/python3 -I`,
+as in step 2's sudoers rule. Name the agent — the account comes from the deployment record (step 4), and the
 credential files are derived from the agent's own `bob.yaml`:
 
 ```sh
 # in bob's own session ($AGENT_USER), not the admin shell
 REPO=<the reviewed bob checkout, readable by this account>
-PYTHON=<the absolute interpreter path from step 0, as written in the sudoers rule>
 cd "$REPO"
 BOB_ISOLATION_AGENT=<the agent's name> \
-BOB_REACHY_VOICE_PYTHON="$PYTHON" \
 bun run check:reachy-isolation
 ```
 

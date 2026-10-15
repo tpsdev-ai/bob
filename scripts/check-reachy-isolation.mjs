@@ -32,7 +32,14 @@
 // on Linux, where the seatbelt proofs cannot exist).
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -48,6 +55,7 @@ export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT"];
 // sudoers rule names exactly this path; on macOS it is the Command Line Tools
 // shim, whose RESOLVED interpreter and import tree [P7] verifies.
 export const PINNED_PYTHON = "/usr/bin/python3";
+export const PINNED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools";
 // Substitute roots the release-host check refuses outright.
 export const SUBSTITUTE_ROOTS = ["BOB_REACHY_VOICE_DIR", "BOB_ISOLATION_AGENTS_ROOT"];
 // The command search path the proofs run with, whatever the caller's was.
@@ -78,7 +86,12 @@ const WRITE_PERMS = new Set([
 export function writeGrantingAcls(lsOutput) {
   const out = [];
   for (const line of lsOutput.split("\n")) {
-    const m = /^\s*\d+:\s+(\S+)\s+(?:inherited\s+)?(allow|deny)\s+(\S+)/.exec(line);
+    if (!/^\s*\d+:/.test(line)) continue;
+    const m = /^\s*\d+:\s+(.+?)\s+(?:inherited\s+)?(allow|deny)\s+(\S+)\s*$/.exec(line);
+    if (!m) {
+      out.push("unrecognized ACL entry");
+      continue;
+    }
     if (m?.[2] !== "allow") continue;
     const perms = m[3].split(",").filter((p) => WRITE_PERMS.has(p));
     if (perms.length > 0) out.push(`${m[1]} allow ${perms.join(",")}`);
@@ -122,10 +135,13 @@ function prefixesOf(path, from) {
  * checked; its directory and target are), and carries no write-granting ACL
  * entry. `owners` and `from` (where the walk starts) are seams for tests.
  */
-export function chainProblems(path, { owners = [0], from = "/" } = {}) {
+export function chainProblems(
+  path,
+  { owners = [0], from = "/", checked = new Set(), aclTrees = new Set() } = {},
+) {
   const allowed = new Set(owners);
   const acls = process.platform === "darwin";
-  const seen = new Set();
+  const seen = checked;
   const problems = [];
   const visit = (p) => {
     for (const q of prefixesOf(p, from)) {
@@ -142,7 +158,8 @@ export function chainProblems(path, { owners = [0], from = "/" } = {}) {
       if (st.isSymbolicLink()) {
         let target;
         try {
-          target = realpathSync(q);
+          realpathSync(q);
+          target = resolve(dirname(q), readlinkSync(q));
         } catch {
           problems.push(`${q} is a dangling symlink`);
           continue;
@@ -150,8 +167,13 @@ export function chainProblems(path, { owners = [0], from = "/" } = {}) {
         visit(target);
         continue;
       }
+      if (q !== p && !st.isDirectory()) problems.push(`${q} is not a directory`);
+      if (!st.isDirectory() && !st.isFile())
+        problems.push(`${q} is not a regular file or directory`);
       if ((st.mode & 0o022) !== 0) problems.push(`${q} is writable by group or other`);
-      if (acls) problems.push(...aclProblems(q));
+      if (acls && ![...aclTrees].some((tree) => q.startsWith(`${tree}/`))) {
+        problems.push(...aclProblems(q));
+      }
     }
   };
   visit(resolve(path));
@@ -164,9 +186,19 @@ export function chainProblems(path, { owners = [0], from = "/" } = {}) {
  * and every entry below it root-owned, not group- or other-writable, a regular
  * file, directory or symlink (a symlink's target checked as a chain, and as a
  * tree when it is a directory outside this one), with no write-granting ACL
- * entry anywhere (one `ls -leR`). Reports at most `limit` problems.
+ * entry anywhere (one `ls -leR`).
  */
-export function treeProblems(dir, { owners = [0], from = "/", limit = 20 } = {}) {
+export function treeProblems(
+  dir,
+  {
+    owners = [0],
+    from = "/",
+    limit = 20,
+    seen = new Set(),
+    checked = new Set(),
+    aclTrees = new Set(),
+  } = {},
+) {
   const allowed = new Set(owners);
   let root;
   try {
@@ -174,8 +206,11 @@ export function treeProblems(dir, { owners = [0], from = "/", limit = 20 } = {})
   } catch {
     return [`${dir} cannot be read`];
   }
-  const problems = [...chainProblems(resolve(dir), { owners, from })];
-  const outside = new Set();
+  const problems = [...chainProblems(resolve(dir), { owners, from, checked, aclTrees })];
+  if (!statSafe(root)?.isDirectory()) return [...problems, `${dir} is not a directory`];
+  if (seen.has(root)) return problems;
+  seen.add(root);
+  aclTrees.add(root);
   let found = 0;
   const walk = (d) => {
     let names;
@@ -192,6 +227,7 @@ export function treeProblems(dir, { owners = [0], from = "/", limit = 20 } = {})
       const st = lstatSync(p);
       if (!allowed.has(st.uid)) problems.push(`${p} is not root-owned (uid ${st.uid})`);
       if (st.isSymbolicLink()) {
+        problems.push(...chainProblems(p, { owners, from, checked, aclTrees }));
         let target;
         try {
           target = realpathSync(p);
@@ -199,12 +235,11 @@ export function treeProblems(dir, { owners = [0], from = "/", limit = 20 } = {})
           problems.push(`${p} is a dangling symlink`);
           continue;
         }
-        if (target !== root && !target.startsWith(`${root}/`) && !outside.has(target)) {
-          outside.add(target);
+        if (target !== root && !target.startsWith(`${root}/`)) {
           problems.push(
             ...(statSync(target).isDirectory()
-              ? treeProblems(target, { owners, from, limit })
-              : chainProblems(target, { owners, from })),
+              ? treeProblems(target, { owners, from, limit, seen, checked, aclTrees })
+              : chainProblems(target, { owners, from, checked, aclTrees })),
           );
         }
         continue;
@@ -244,11 +279,27 @@ export function releaseTrustProblems({
   record = DEPLOYMENT_RECORD,
   pinnedPython = PINNED_PYTHON,
   xcodeSelectLink = process.platform === "darwin" ? "/var/db/xcode_select_link" : null,
+  developerDir = process.platform === "darwin" ? PINNED_DEVELOPER_DIR : null,
   owners,
   from,
 }) {
   const o = { owners, from };
   const problems = [...chainProblems(pinnedPython, o)];
+  if (!statSafe(pinnedPython)?.isFile()) problems.push(`${pinnedPython} is not a regular file`);
+  if (developerDir) {
+    const selected = join(developerDir, "usr/bin/python3");
+    problems.push(...chainProblems(selected, o));
+    if (!statSafe(selected)?.isFile()) problems.push(`${selected} is not a regular file`);
+    try {
+      if (interp.real !== realpathSync(selected)) {
+        problems.push(
+          "the proof interpreter differs from the selected Command Line Tools interpreter",
+        );
+      }
+    } catch {
+      problems.push(`${selected} cannot be resolved`);
+    }
+  }
   if (xcodeSelectLink) {
     let linked = false;
     try {
@@ -259,7 +310,11 @@ export function releaseTrustProblems({
   }
   if (interp.isolated !== 1) problems.push("the proof interpreter did not run isolated (-I)");
   problems.push(...chainProblems(interp.executable, o), ...chainProblems(interp.real, o));
+  for (const p of [interp.executable, interp.real]) {
+    if (!statSafe(p)?.isFile()) problems.push(`${p} is not a regular file`);
+  }
   problems.push(...treeProblems(interp.base, o));
+  if (interp.prefix !== interp.base) problems.push(...treeProblems(interp.prefix, o));
   const base = interp.base;
   for (const entry of interp.path) {
     let st;
@@ -286,6 +341,7 @@ export function releaseTrustProblems({
   }
   if (piperDir) problems.push(...treeProblems(piperDir, o));
   problems.push(...chainProblems(record, o));
+  if (!statSafe(record)?.isFile()) problems.push(`${record} is not a regular file`);
   return [...new Set(problems)];
 }
 

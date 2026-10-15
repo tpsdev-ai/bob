@@ -182,14 +182,18 @@ describe("bob#356 — the isolation-proof release gate", () => {
     fails(poisoned.skip);
   });
 
-  it("the deployment record is trusted only when it and every directory above it are root-owned and not group/other-writable", () => {
+  it("the deployment record rejects an untrusted owner, symlink, missing file or invalid content", () => {
     expect(DEPLOYMENT_RECORD).toBe(join(PINNED_STATE_DIR, "agent-user"));
     const dir = mkdtempSync(join(tmpdir(), "rv-record-"));
     try {
       const mine = join(dir, "agent-user");
       writeFileSync(mine, "bob\n");
-      // a record this (non-root) user wrote is untrusted
-      expect(readDeploymentRecord(mine).reason).toContain("is not root-owned");
+      expect(
+        readDeploymentRecord(mine, {
+          owners: [(process.getuid?.() ?? 0) + 1],
+          from: dir,
+        }).reason,
+      ).toContain("is not root-owned");
       const link = join(dir, "link");
       symlinkSync(mine, link);
       expect(readDeploymentRecord(link).reason).toContain("not a regular file");

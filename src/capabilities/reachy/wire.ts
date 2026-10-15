@@ -16,8 +16,8 @@
 // a strict health line that must repeat all four exactly and carry the exact
 // version bob pins (`config.sidecarVersion`). Until that health line is
 // accepted, the connection carries control/status traffic only: bob sends no
-// action, and any other inbound line is a protocol failure (disconnect, one
-// bounded alarm). The comparison is `checkHealth` below.
+// action. A protocol failure disconnects and attempts an alarm, retrying that
+// reason after a failed write. The comparison is `checkHealth` below.
 
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
@@ -106,7 +106,7 @@ export type DecodedLine =
   | { kind: "presence"; presence: { count: number; known: string[] } }
   | { kind: "health"; health: SidecarHealth }
   // `protocol: true` marks a health line that failed the strict schema: a
-  // handshake failure (disconnect and one alarm), not a per-line audit.
+  // handshake failure (disconnect and an attempted alarm), not a per-line audit.
   | { kind: "malformed"; reason: string; protocol?: true };
 
 function safeJson(raw: string): unknown {

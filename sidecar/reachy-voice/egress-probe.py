@@ -7,9 +7,9 @@
 # whitelist). The caller supplies the targets: loopback ports, scratch paths,
 # fixed mach names and the DNS service socket. A mach name this macOS does not
 # register has no working control and proves nothing, so the proofs exclude it.
-# Prints one JSON object: {probe: {"ok": bool, "err": str}}. Network probes
-# connect and close (or send 5 bytes of UDP) to loopback only; the mach probes
-# only LOOK UP a service name.
+# Prints one JSON object: {probe: {"ok": bool, "err": str}}. TCP/UDP probes
+# target loopback; UNIX probes target named socket paths. Mach probes only
+# LOOK UP a service name.
 import ctypes
 import json
 import os

@@ -524,8 +524,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
 
     // Ready. Every later health line must still match exactly; a mismatch, or a
-    // health line that is not reachy-voice/1, fails the link (one alarm, not
-    // one audit per line).
+    // health line that is not reachy-voice/1, fails the link and attempts an alarm,
+    // retrying that reason after a failed write.
     if (decoded.kind === "health") {
       const bad = checkHealth(decoded.health, expectation());
       if (bad.length > 0) return linkRefused(bad);
@@ -534,8 +534,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     }
     if (decoded.kind === "malformed" && decoded.protocol) return linkRefused(["health"]);
     // bob#356 (Sherlock 9): a presence claim under the voice profile, which has
-    // no camera, is refused and audited on EVERY ready link — muted or not —
-    // content-free: the line's count and ids are never echoed.
+    // no camera, is audited with bob mute off on a ready link, regardless of
+    // the sidecar-reported mute; the count and ids are never echoed.
     if (decoded.kind === "presence" && state.profile !== "reachy") {
       return malformed("a presence line under the voice profile (no camera)");
     }
