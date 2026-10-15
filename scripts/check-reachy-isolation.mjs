@@ -5,11 +5,12 @@
 // jarvis-sidecar user, its group, its constrained `sudo -n` path, the installed
 // sidecar and its running launch job — see sidecar/reachy-voice/RUNBOOK.md),
 // from a checkout of the reviewed commit, in bob's account session, naming the
-// agent and the pinned interpreter:
+// agent:
 //
-//   BOB_ISOLATION_AGENT=<the agent's name> \
-//   BOB_REACHY_VOICE_PYTHON=<the interpreter the sudoers rule names> \
-//   bun run check:reachy-isolation
+//   BOB_ISOLATION_AGENT=<the agent's name> bun run check:reachy-isolation
+//
+// The interpreter is PINNED to /usr/bin/python3 -I (PINNED_PYTHON); a caller's
+// BOB_REACHY_VOICE_PYTHON naming anything else is refused.
 //
 // It runs the isolation proofs with BOB_REQUIRE_ISOLATION_PROOFS=1, under which
 // a proof that cannot run FAILS instead of skipping; it fails again on any skip
@@ -31,8 +32,8 @@
 // on Linux, where the seatbelt proofs cannot exist).
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstatSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
@@ -41,7 +42,12 @@ export const PROOFS = ["test/capabilities/reachy/isolation.test.ts"];
 export const EXPECTED_PROOFS = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"];
 // The only caller variables the proofs inherit (PATH and HOME are SET by the
 // check, never inherited).
-export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT", "BOB_REACHY_VOICE_PYTHON"];
+export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT"];
+// The release host's interpreter: Apple's system python3, always run with -I
+// (no PYTHON* environment, no user site, no script directory on sys.path). The
+// sudoers rule names exactly this path; on macOS it is the Command Line Tools
+// shim, whose RESOLVED interpreter and import tree [P7] verifies.
+export const PINNED_PYTHON = "/usr/bin/python3";
 // Substitute roots the release-host check refuses outright.
 export const SUBSTITUTE_ROOTS = ["BOB_REACHY_VOICE_DIR", "BOB_ISOLATION_AGENTS_ROOT"];
 // The command search path the proofs run with, whatever the caller's was.
@@ -51,13 +57,254 @@ export const PINNED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 export const DEPLOYMENT_RECORD = "/usr/local/var/bob/reachy-voice/agent-user";
 const ACCOUNT_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,254}$/;
 
+// ─── Trusted paths (owner, mode, write ACLs) ────────────────────────────────
+
+// ACL permissions that let someone change a file or a directory's entries
+// (macOS `ls -le` names). An `allow` entry naming any of them is refused.
+const WRITE_PERMS = new Set([
+  "write",
+  "append",
+  "delete",
+  "delete_child",
+  "add_file",
+  "add_subdirectory",
+  "writeattr",
+  "writeextattr",
+  "writesecurity",
+  "chown",
+]);
+
+/** The write-granting `allow` entries in `ls -le` output (pure). */
+export function writeGrantingAcls(lsOutput) {
+  const out = [];
+  for (const line of lsOutput.split("\n")) {
+    const m = /^\s*\d+:\s+(\S+)\s+(?:inherited\s+)?(allow|deny)\s+(\S+)/.exec(line);
+    if (m?.[2] !== "allow") continue;
+    const perms = m[3].split(",").filter((p) => WRITE_PERMS.has(p));
+    if (perms.length > 0) out.push(`${m[1]} allow ${perms.join(",")}`);
+  }
+  return out;
+}
+
+// Elsewhere than macOS the ACL check cannot run, and every trust check FAILS
+// with this one line (fail closed; the release host is macOS).
+export const ACL_UNCHECKED = "write ACLs are checked only on macOS";
+
+/** The write-granting ACL entries on one path (not followed), or why they
+ *  cannot be read (macOS; see ACL_UNCHECKED elsewhere). */
+function aclProblems(path, recursive = false) {
+  let out;
+  try {
+    out = execFileSync("/bin/ls", [recursive ? "-leRA" : "-lde", path], {
+      env: {},
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+    });
+  } catch {
+    return [`${path}: its ACLs cannot be read`];
+  }
+  return writeGrantingAcls(out).map((e) => `${path}: a write-granting ACL entry (${e})`);
+}
+
+function prefixesOf(path, from) {
+  const out = [];
+  for (let q = path; ; q = dirname(q)) {
+    out.push(q);
+    if (q === from || q === dirname(q)) break;
+  }
+  return out.reverse();
+}
+
+/**
+ * Why `path` is not trusted, or [] when it is: EVERY component from / down to
+ * it — and, for a symlink component, every component of its target — is owned
+ * by root, is not group- or other-writable (a symlink's own mode is not
+ * checked; its directory and target are), and carries no write-granting ACL
+ * entry. `owners` and `from` (where the walk starts) are seams for tests.
+ */
+export function chainProblems(path, { owners = [0], from = "/" } = {}) {
+  const allowed = new Set(owners);
+  const acls = process.platform === "darwin";
+  const seen = new Set();
+  const problems = [];
+  const visit = (p) => {
+    for (const q of prefixesOf(p, from)) {
+      if (seen.has(q)) continue;
+      seen.add(q);
+      let st;
+      try {
+        st = lstatSync(q);
+      } catch {
+        problems.push(`${q} cannot be read`);
+        return;
+      }
+      if (!allowed.has(st.uid)) problems.push(`${q} is not root-owned (uid ${st.uid})`);
+      if (st.isSymbolicLink()) {
+        let target;
+        try {
+          target = realpathSync(q);
+        } catch {
+          problems.push(`${q} is a dangling symlink`);
+          continue;
+        }
+        visit(target);
+        continue;
+      }
+      if ((st.mode & 0o022) !== 0) problems.push(`${q} is writable by group or other`);
+      if (acls) problems.push(...aclProblems(q));
+    }
+  };
+  visit(resolve(path));
+  if (!acls) problems.push(ACL_UNCHECKED); // fail closed, after the real findings
+  return problems;
+}
+
+/**
+ * Why the tree under `dir` is not trusted, or []: its chain (chainProblems),
+ * and every entry below it root-owned, not group- or other-writable, a regular
+ * file, directory or symlink (a symlink's target checked as a chain, and as a
+ * tree when it is a directory outside this one), with no write-granting ACL
+ * entry anywhere (one `ls -leR`). Reports at most `limit` problems.
+ */
+export function treeProblems(dir, { owners = [0], from = "/", limit = 20 } = {}) {
+  const allowed = new Set(owners);
+  let root;
+  try {
+    root = realpathSync(resolve(dir));
+  } catch {
+    return [`${dir} cannot be read`];
+  }
+  const problems = [...chainProblems(resolve(dir), { owners, from })];
+  const outside = new Set();
+  let found = 0;
+  const walk = (d) => {
+    let names;
+    try {
+      names = readdirSync(d);
+    } catch {
+      problems.push(`${d} cannot be listed`);
+      return;
+    }
+    for (const name of names) {
+      if (found >= limit) return;
+      const before = problems.length;
+      const p = join(d, name);
+      const st = lstatSync(p);
+      if (!allowed.has(st.uid)) problems.push(`${p} is not root-owned (uid ${st.uid})`);
+      if (st.isSymbolicLink()) {
+        let target;
+        try {
+          target = realpathSync(p);
+        } catch {
+          problems.push(`${p} is a dangling symlink`);
+          continue;
+        }
+        if (target !== root && !target.startsWith(`${root}/`) && !outside.has(target)) {
+          outside.add(target);
+          problems.push(
+            ...(statSync(target).isDirectory()
+              ? treeProblems(target, { owners, from, limit })
+              : chainProblems(target, { owners, from })),
+          );
+        }
+        continue;
+      }
+      if ((st.mode & 0o022) !== 0) problems.push(`${p} is writable by group or other`);
+      if (!st.isDirectory() && !st.isFile()) {
+        problems.push(`${p} is not a regular file or directory`);
+      }
+      found += problems.length - before;
+      if (st.isDirectory()) walk(p);
+    }
+  };
+  walk(root);
+  if (process.platform === "darwin") problems.push(...aclProblems(root, true));
+  return [...new Set(problems)].slice(0, limit * 2);
+}
+
+/**
+ * [P7] What must be trusted on the release host, and why it is not ([] when it
+ * is). Each is checked along its FULL path chain (chainProblems/treeProblems):
+ *   - the pinned interpreter (/usr/bin/python3) and, on macOS, the
+ *     xcode-select link that decides what it runs;
+ *   - what it RESOLVED to, as the proof command reported it through sudo
+ *     (`proof.py interp`): the executable, the real interpreter, the whole
+ *     base-prefix tree (stdlib, lib-dynload, site-packages, binaries), and
+ *     every sys.path entry (a tree; a missing entry's nearest existing
+ *     ancestor); it must have run isolated (-I);
+ *   - the install directory and each installed file (a regular file);
+ *   - the Piper directory tree, and the deployment record.
+ * `owners`, `from` and `xcodeSelectLink` are seams for tests.
+ */
+export function releaseTrustProblems({
+  interp,
+  installDir,
+  installedFiles,
+  piperDir,
+  record = DEPLOYMENT_RECORD,
+  pinnedPython = PINNED_PYTHON,
+  xcodeSelectLink = process.platform === "darwin" ? "/var/db/xcode_select_link" : null,
+  owners,
+  from,
+}) {
+  const o = { owners, from };
+  const problems = [...chainProblems(pinnedPython, o)];
+  if (xcodeSelectLink) {
+    let linked = false;
+    try {
+      lstatSync(xcodeSelectLink);
+      linked = true;
+    } catch {}
+    if (linked) problems.push(...chainProblems(xcodeSelectLink, o));
+  }
+  if (interp.isolated !== 1) problems.push("the proof interpreter did not run isolated (-I)");
+  problems.push(...chainProblems(interp.executable, o), ...chainProblems(interp.real, o));
+  problems.push(...treeProblems(interp.base, o));
+  const base = interp.base;
+  for (const entry of interp.path) {
+    let st;
+    try {
+      st = statSync(entry);
+    } catch {}
+    // inside the base tree: verified by its walk (a missing entry's ancestor too)
+    if (entry === base || entry.startsWith(`${base}/`)) continue;
+    if (st === undefined) {
+      let ancestor = dirname(entry);
+      while (!statSafe(ancestor) && ancestor !== dirname(ancestor)) ancestor = dirname(ancestor);
+      problems.push(...chainProblems(ancestor, o));
+    } else if (st.isDirectory()) {
+      problems.push(...treeProblems(entry, o));
+    } else {
+      problems.push(...chainProblems(entry, o));
+    }
+  }
+  problems.push(...chainProblems(installDir, o));
+  for (const f of installedFiles) {
+    const p = join(installDir, f);
+    problems.push(...chainProblems(p, o));
+    if (!statSafe(p)?.isFile()) problems.push(`${p} is not a regular file`);
+  }
+  if (piperDir) problems.push(...treeProblems(piperDir, o));
+  problems.push(...chainProblems(record, o));
+  return [...new Set(problems)];
+}
+
+function statSafe(p) {
+  try {
+    return statSync(p);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * bob's account from the deployment record, or why it cannot be trusted: the
- * record must be a regular file (not a symlink), and it and EVERY directory
- * above it must be root-owned and writable by no group or other — so only root
- * can have written or swapped it. Its content is exactly one account name.
+ * record must be a regular file, no component of its path a symlink, and its
+ * whole chain trusted (chainProblems: root-owned, not group- or other-writable,
+ * no write-granting ACL) — so only root can have written or swapped it. Its
+ * content is exactly one account name. `owners` and `from` are test seams.
  */
-export function readDeploymentRecord(path = DEPLOYMENT_RECORD) {
+export function readDeploymentRecord(path = DEPLOYMENT_RECORD, { owners, from } = {}) {
   let st;
   try {
     st = lstatSync(path);
@@ -65,22 +312,14 @@ export function readDeploymentRecord(path = DEPLOYMENT_RECORD) {
     return { reason: `the deployment record ${path} is missing (RUNBOOK step 4)` };
   }
   if (!st.isFile()) return { reason: `the deployment record ${path} is not a regular file` };
-  for (let p = path; ; p = dirname(p)) {
-    let s;
-    try {
-      s = lstatSync(p);
-    } catch {
-      return { reason: `${p} cannot be read` };
+  for (const q of prefixesOf(resolve(path), from ?? "/")) {
+    if (lstatSync(q).isSymbolicLink()) {
+      return { reason: `${q} (on the deployment record's path) is a symlink` };
     }
-    if (s.isSymbolicLink()) return { reason: `${p} (above the deployment record) is a symlink` };
-    if (s.uid !== 0)
-      return { reason: `${p} is not root-owned, so the deployment record is untrusted` };
-    if ((s.mode & 0o022) !== 0) {
-      return {
-        reason: `${p} is writable by group or other, so the deployment record is untrusted`,
-      };
-    }
-    if (p === dirname(p)) break;
+  }
+  const problems = chainProblems(path, { owners, from });
+  if (problems.length > 0) {
+    return { reason: `${problems[0]}, so the deployment record is untrusted` };
   }
   let text;
   try {
@@ -133,14 +372,18 @@ export function accountHome(uid = process.getuid?.()) {
 }
 
 /** Why the release-host check must not start, or "" (the caller's env): a
- *  substitute root, running as root, an account the database cannot read, or a
- *  HOME other than the running account's. Which account is bob's is decided by
+ *  substitute root, an interpreter other than the pinned one, running as root,
+ *  an account the database cannot read, or a HOME other than the running
+ *  account's. Which account is bob's is decided by
  *  the deployment record (releaseRoots), never by the caller. `selfUid` and
  *  `lookup` are seams for tests. */
 export function refusal(env, selfUid = process.getuid?.(), lookup = accountOf) {
   const substitutes = SUBSTITUTE_ROOTS.filter((k) => env[k] !== undefined);
   if (substitutes.length > 0)
     return `a substitute root is set (${substitutes.join(", ")}); unset it`;
+  if (env.BOB_REACHY_VOICE_PYTHON !== undefined && env.BOB_REACHY_VOICE_PYTHON !== PINNED_PYTHON) {
+    return `the release host's interpreter is pinned to ${PINNED_PYTHON}; unset BOB_REACHY_VOICE_PYTHON`;
+  }
   if (selfUid === undefined) return "the running uid cannot be read";
   if (selfUid === 0) return "the check never runs as root; run it in bob's account session";
   const self = lookup(String(selfUid));

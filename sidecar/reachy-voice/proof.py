@@ -27,6 +27,10 @@ the caller chose outside the sandbox (bob#356 round 2):
                             profile, with a test's stand-in Piper and player
                             (executed confined, as the sidecar would run Piper).
   clean <work_dir>          remove a proof's work directory.
+  interp                    report the interpreter THIS process runs under:
+                            sys.executable and its resolved path, the resolved
+                            base prefix, the isolated flag, and every sys.path
+                            entry (for [P7] to verify, as run through sudo).
 
 The probe/sidecar/clean path arguments must resolve under /private/tmp/rv- (a
 proof's scratch layout), so those subcommands can never be pointed at the
@@ -205,6 +209,21 @@ def cmd_clean(work_dir):
     print(json.dumps({"clean": not os.path.lexists(work_dir)}))
 
 
+def cmd_interp():
+    print(
+        json.dumps(
+            {
+                "executable": sys.executable,
+                "real": os.path.realpath(sys.executable),
+                "base": os.path.realpath(sys.base_prefix),
+                "prefix": python_prefix(),
+                "isolated": sys.flags.isolated,
+                "path": [os.path.abspath(p) for p in sys.path if p],
+            }
+        )
+    )
+
+
 def main(argv):
     if not argv:
         raise SystemExit(__doc__)
@@ -219,6 +238,8 @@ def main(argv):
         cmd_sidecar(*rest)
     elif cmd == "clean" and len(rest) == 1:
         cmd_clean(rest[0])
+    elif cmd == "interp" and not rest:
+        cmd_interp()
     else:
         raise SystemExit("proof: unknown subcommand or arguments")
     return 0

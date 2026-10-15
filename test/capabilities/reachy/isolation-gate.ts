@@ -46,6 +46,7 @@ export function proof(
 /** The release-host roots, PINNED (RUNBOOK step 0). */
 export const PINNED_INSTALL_DIR = "/usr/local/libexec/bob/reachy-voice";
 export const PINNED_STATE_DIR = "/usr/local/var/bob/reachy-voice";
+export const PINNED_PIPER_DIR = "/usr/local/libexec/bob/piper";
 export const ROOT_OVERRIDES = ["BOB_REACHY_VOICE_DIR", "BOB_ISOLATION_AGENTS_ROOT"] as const;
 
 /** The roots the proofs read. Outside required mode a developer may point them

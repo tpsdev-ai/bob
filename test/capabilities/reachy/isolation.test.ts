@@ -63,6 +63,7 @@ import {
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { PINNED_PYTHON, releaseTrustProblems } from "../../../scripts/check-reachy-isolation.mjs";
 import {
   type OrgEventStore,
   orgEventRecordId,
@@ -73,16 +74,16 @@ import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { must } from "./handshake.js";
 import { deriveActiveCredentials } from "./isolation-credentials.js";
-import { PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
+import { PINNED_PIPER_DIR, PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const SIDECAR_SRC = join(REPO, "sidecar", "reachy-voice");
 const FIXTURES = join(REPO, "test", "fixtures", "reachy-voice");
 const REQUIRED = process.env.BOB_REQUIRE_ISOLATION_PROOFS === "1";
 // sudo, id and sandbox-exec by ABSOLUTE path, always. In required mode the
-// interpreter is the pinned absolute BOB_REACHY_VOICE_PYTHON too, so no
-// required proof depends on a command lookup (and the release-host check pins
-// PATH). Outside required mode the interpreter may be looked up as `python3`.
+// interpreter is PINNED to Apple's /usr/bin/python3 (run -I), so no required
+// proof depends on a command lookup (and the release-host check pins PATH).
+// Outside required mode it may be BOB_REACHY_VOICE_PYTHON or `python3`.
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const SUDO = "/usr/bin/sudo";
 const ID = "/usr/bin/id";
@@ -113,16 +114,21 @@ const AUDIO_MAGIC = ["RIFF", "OggS", "fLaC", "ID3", "FORM"];
 const AUDIO_EXT = /\.(wav|wave|ogg|oga|opus|flac|mp3|aif|aiff|caf|m4a|pcm|raw)$/i;
 const digest = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 16);
 
-// The interpreter, RESOLVED (the profile's paths and the sudoers rule name it).
-// In required mode it is ONLY the pinned absolute BOB_REACHY_VOICE_PYTHON:
-// nothing is looked up on PATH.
+// The interpreter the sudoers rule names. In required mode it is ONLY
+// PINNED_PYTHON (/usr/bin/python3): nothing is looked up on PATH, and a
+// BOB_REACHY_VOICE_PYTHON naming another is refused.
 function interpreter(): string {
   const configured = process.env.BOB_REACHY_VOICE_PYTHON;
+  if (REQUIRED) {
+    if (configured !== undefined && configured !== PINNED_PYTHON) {
+      throw new Error(`the interpreter is pinned to ${PINNED_PYTHON}`);
+    }
+    return PINNED_PYTHON;
+  }
   if (configured) {
     if (!isAbsolute(configured)) throw new Error("BOB_REACHY_VOICE_PYTHON must be absolute");
     return configured;
   }
-  if (REQUIRED) throw new Error("the interpreter is not pinned (BOB_REACHY_VOICE_PYTHON)");
   const r = spawnSync(
     "python3",
     ["-I", "-c", "import os,sys;print(os.path.realpath(sys.executable))"],
@@ -141,15 +147,26 @@ const PY = (() => {
     return "";
   }
 })();
+// What PY RESOLVES to (on macOS /usr/bin/python3 is a shim that execs the
+// Command Line Tools interpreter). Anything executed INSIDE the sandbox (the
+// stand-in Piper and player) names this one: the profile allows exec only
+// under the interpreter's install root, which the shim is not.
+const PY_REAL = (() => {
+  if (!PY) return "";
+  const r = spawnSync(PY, ["-I", "-c", "import os,sys;print(os.path.realpath(sys.executable))"], {
+    encoding: "utf8",
+  });
+  return r.status === 0 ? r.stdout.trim() : "";
+})();
 
 // ── what this host can prove ────────────────────────────────────────────────
 const seatbeltSkip = !DARWIN
   ? "sandbox-exec (seatbelt) is macOS-only"
   : !existsSync(SANDBOX_EXEC)
     ? "sandbox-exec is not installed"
-    : !PY
+    : !PY || !PY_REAL
       ? REQUIRED
-        ? "the interpreter is not pinned (BOB_REACHY_VOICE_PYTHON, absolute)"
+        ? `the interpreter is pinned to ${PINNED_PYTHON} (BOB_REACHY_VOICE_PYTHON names another, or it does not run)`
         : "python3 is not available"
       : "";
 const hasUser = (() => {
@@ -283,7 +300,7 @@ function layout(shared: { group?: number } | false): Layout {
     ["player", "fake-player.py"],
   ] as const) {
     const body = readFileSync(join(FIXTURES, src), "utf8");
-    writeFileSync(join(tts, name), `#!${PY} -I\n${body}`);
+    writeFileSync(join(tts, name), `#!${PY_REAL} -I\n${body}`);
     chmodSync(join(tts, name), 0o755);
   }
   const model = randomBytes(64);
@@ -695,20 +712,37 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
   );
 
   proof(
-    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's, root-owned and writable by no one else",
-    installedSkip,
+    "[P7] the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write ACL)",
+    installedSkip || userSkip,
     () => {
-      const dirSt = statSync(INSTALL_DIR);
-      expect(dirSt.uid).toBe(0);
-      expect(dirSt.mode & 0o022).toBe(0);
       for (const f of INSTALLED_FILES) {
         const path = join(INSTALL_DIR, f);
-        const st = statSync(path);
-        expect(st.uid, `${f} owner`).toBe(0);
-        expect(st.mode & 0o022, `${f} writable by group/other`).toBe(0);
         const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
         expect(sha(path), `${f} is not the reviewed file`).toBe(sha(join(SIDECAR_SRC, f)));
       }
+      // What the sudoers path actually runs: the installed proof command
+      // reports its own interpreter, as the sidecar user, through the rule.
+      expect(PY).toBe(PINNED_PYTHON);
+      const proofPy = join(INSTALL_DIR, "proof.py");
+      const report = runAsUser(SIDECAR_USER, proofPy, ["interp"]);
+      expect(report.status, report.stderr).toBe(0);
+      const interp = JSON.parse(report.stdout);
+      // sudo resets the environment: a caller's DEVELOPER_DIR (which steers the
+      // shim) cannot move what the rule runs
+      const steered = spawnSync(SUDO, ["-n", "-u", SIDECAR_USER, PY, "-I", proofPy, "interp"], {
+        encoding: "utf8",
+        env: { ...process.env, DEVELOPER_DIR: "/nonexistent-developer-dir" },
+      });
+      expect(steered.status, steered.stderr).toBe(0);
+      expect(JSON.parse(steered.stdout)).toEqual(interp);
+      expect(
+        releaseTrustProblems({
+          interp,
+          installDir: INSTALL_DIR,
+          installedFiles: INSTALLED_FILES,
+          piperDir: PINNED_PIPER_DIR,
+        }),
+      ).toEqual([]);
     },
   );
 });

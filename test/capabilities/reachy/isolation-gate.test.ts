@@ -15,12 +15,14 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  ACL_UNCHECKED,
   accountHome,
   CHECK_ENV,
   checkEnv,
   DEPLOYMENT_RECORD,
   EXPECTED_PROOFS,
   PINNED_PATH,
+  PINNED_PYTHON,
   passedProofs,
   proofCounts,
   readDeploymentRecord,
@@ -111,6 +113,17 @@ describe("bob#356 — the isolation-proof release gate", () => {
 
   it("the gate never starts as root, and only with the running account's own HOME", () => {
     expect(refusal({ HOME: "/Users/bob" }, 501, db)).toBe("");
+    // the interpreter is pinned: naming another is refused, naming it is not
+    expect(
+      refusal(
+        { HOME: "/Users/bob", BOB_REACHY_VOICE_PYTHON: "/opt/homebrew/bin/python3" },
+        501,
+        db,
+      ),
+    ).toContain("pinned to /usr/bin/python3");
+    expect(refusal({ HOME: "/Users/bob", BOB_REACHY_VOICE_PYTHON: PINNED_PYTHON }, 501, db)).toBe(
+      "",
+    );
     // root naming itself, with root's own HOME: refused
     expect(refusal({ HOME: "/var/root" }, 0, db)).toContain("never runs as root");
     expect(refusal({ HOME: "/Users/bob" }, 777, db)).toContain("not in the OS account database");
@@ -189,7 +202,7 @@ describe("bob#356 — the isolation-proof release gate", () => {
     const rootOwned = existsSync("/private/etc/shells") ? "/private/etc/shells" : "/etc/shells";
     if (existsSync(rootOwned) && !lstatSync(dirname(rootOwned)).isSymbolicLink()) {
       expect(readDeploymentRecord(rootOwned).reason).toContain(
-        "does not hold exactly one account name",
+        process.platform === "darwin" ? "does not hold exactly one account name" : ACL_UNCHECKED, // elsewhere the ACL check cannot run: untrusted
       );
     }
   });

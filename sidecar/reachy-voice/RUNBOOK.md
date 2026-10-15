@@ -41,9 +41,22 @@ REPO=<a checkout of the reviewed bob commit>
 INSTALL=/usr/local/libexec/bob/reachy-voice
 PIPER_DIR=/usr/local/libexec/bob/piper
 STATE=/usr/local/var/bob/reachy-voice
-PYTHON=$(python3 -c 'import os,sys;print(os.path.realpath(sys.executable))')
-PYTHON_PREFIX=$(python3 -c 'import os,sys;e=os.path.realpath(sys.executable);print(os.path.commonpath([e,os.path.realpath(sys.base_prefix)]))')
+PYTHON=/usr/bin/python3   # PINNED: Apple's system python3, always run -I
+PYTHON_REAL=$($PYTHON -I -c 'import os,sys;print(os.path.realpath(sys.executable))')
+PYTHON_PREFIX=$($PYTHON -I -c 'import os,sys;e=os.path.realpath(sys.executable);print(os.path.commonpath([e,os.path.realpath(sys.base_prefix)]))')
 ```
+
+The interpreter is pinned to `/usr/bin/python3`, run with `-I` (no `PYTHON*`
+environment, no user site, no script directory on `sys.path`); no Homebrew or
+user-installed Python. On macOS it is the Command Line Tools shim: install them
+(`xcode-select --install`) and select them (`xcode-select -p` must print
+`/Library/Developer/CommandLineTools`; an Xcode.app under `/Applications` fails
+[P7], since `/Applications` is admin-group-writable). `PYTHON_REAL` is the
+interpreter the shim runs; the launch job (step 5) runs it directly, because the
+profile allows exec only under `PYTHON_PREFIX`. [P7] verifies the shim, the
+xcode-select link, `PYTHON_REAL`, the whole `PYTHON_PREFIX` tree and every
+`sys.path` entry along their full path chains. If neither is usable on this
+host, stop: do not substitute a user-writable interpreter.
 
 ## 1. Create the sidecar user and the socket group
 
@@ -89,6 +102,9 @@ sudo chmod 0440 /etc/sudoers.d/bob-reachy-voice-proofs
 sudo visudo -cf /etc/sudoers.d/bob-reachy-voice-proofs
 sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER $PYTHON -I $INSTALL/proof.py open /dev/null
 ```
+
+Add no `env_keep` for this rule: sudo's default `env_reset` is what keeps a
+caller's `DEVELOPER_DIR` from steering the shim ([P7] checks that it does not).
 
 The `nobody` line is the OUTSIDER: the proof shows a user outside
 `jarvis-voice` cannot connect to the socket ([P4] on a scratch socket with the

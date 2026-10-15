@@ -25,16 +25,6 @@ afterAll(() => {
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
-function python(): string {
-  return spawnSync(
-    "python3",
-    ["-I", "-c", "import os,sys;print(os.path.realpath(sys.executable))"],
-    {
-      encoding: "utf8",
-    },
-  ).stdout.trim();
-}
-
 function gate(env: Record<string, string>) {
   return spawnSync(process.execPath, [GATE], {
     cwd: REPO,
@@ -77,7 +67,6 @@ describe("bob#356 round 3 — the actual release-host gate under a poisoned envi
       HOME: String(home),
       PATH: `${poison}:/usr/bin:/bin:/usr/sbin:/sbin`,
       TMPDIR: tmpdir(),
-      BOB_REACHY_VOICE_PYTHON: python(),
     });
     expect(r.stdout).toContain("Ran "); // the proofs did run
     expect(existsSync(marker) ? readFileSync(marker, "utf8") : "").toBe(""); // nothing planted ran
@@ -85,11 +74,19 @@ describe("bob#356 round 3 — the actual release-host gate under a poisoned envi
     expect(r.status).toBe(1); // here: the separate-user proofs cannot run
   }, 120_000);
 
-  it("without a pinned interpreter the proofs refuse to look one up on PATH", () => {
-    const r = gate({ HOME: String(accountHome()), PATH: "/usr/bin:/bin", TMPDIR: tmpdir() });
-    expect(r.stdout).toContain("the interpreter is not pinned (BOB_REACHY_VOICE_PYTHON, absolute)");
+  it("an interpreter other than the pinned /usr/bin/python3 is refused before any proof runs", () => {
+    const r = gate({
+      HOME: String(accountHome()),
+      PATH: "/usr/bin:/bin",
+      TMPDIR: tmpdir(),
+      BOB_REACHY_VOICE_PYTHON: "/opt/homebrew/bin/python3", // any other interpreter
+    });
+    expect(r.stdout).toContain(
+      "the release host's interpreter is pinned to /usr/bin/python3; unset BOB_REACHY_VOICE_PYTHON",
+    );
+    expect(r.stdout).not.toContain("Ran ");
     expect(r.status).toBe(1);
-  }, 120_000);
+  });
 
   it("without a trusted deployment record naming the running account, the proofs that read bob's tree FAIL", () => {
     // A caller cannot name an account: the gate has no such input. Here (no
@@ -101,7 +98,6 @@ describe("bob#356 round 3 — the actual release-host gate under a poisoned envi
       TMPDIR: tmpdir(),
       BOB_ISOLATION_AGENT: "rocky",
       BOB_ISOLATION_AGENT_USER: "root", // an attempt to name an account: ignored
-      BOB_REACHY_VOICE_PYTHON: python(),
     });
     expect(r.status).toBe(1);
     const why = existsSync(DEPLOYMENT_RECORD)
