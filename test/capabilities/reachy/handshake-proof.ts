@@ -130,8 +130,9 @@ export async function probeVoiceHandshake(
     });
     timer = setTimeout(deliverTimeout, timeoutMs);
 
-    // The write also races the connection closing: a peer that closes before or
-    // during the write is reported at once, never as the limit elapsing.
+    // Race the configure write against observed connection closure and the
+    // shared deadline. Report a failed write or observed close directly;
+    // otherwise the deadline bounds an unsettled write.
     const sent = await Promise.race([
       client.send("configure", configureArgs(expect)).then(
         () => "ok" as const,
