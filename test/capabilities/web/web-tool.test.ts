@@ -196,6 +196,27 @@ describe("web_fetch — the success path", () => {
     expect(second.calls.urls).toEqual([]);
   });
 
+  it("records no link from a result the text allowance refuses", async () => {
+    const state = newTurnState("https://host.test/a", RUN);
+    const cfg = settings({ textPerTurn: 5 });
+    // An injected fetch can return more text than the limit it was given.
+    const tool = toolFor(
+      state,
+      cfg,
+      () => RUN,
+      async () => result({ text: "abcdefgh", links: ["https://host.test/new"] }),
+    );
+    expect(await codeOf(run(tool, "https://host.test/a"))).toBe("budget-text");
+    const next = toolFor(
+      state,
+      settings({ textPerTurn: 1000 }),
+      () => RUN,
+      async () => result({ finalUrl: "https://host.test/new" }),
+    );
+    expect(await codeOf(run(next, "https://host.test/new"))).toBe("url-unrecorded");
+    expect(next.calls.urls).toEqual([]);
+  });
+
   it("allows a caller to lower the limit but never above the operator ceiling", async () => {
     const state = newTurnState("https://host.test/a", RUN);
     const cfg = settings({ fetchMaxChars: 100 });

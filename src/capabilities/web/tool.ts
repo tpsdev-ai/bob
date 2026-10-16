@@ -118,11 +118,12 @@ export function createWebFetchTool(
           admitCandidate(state, redirect.href);
         },
       });
-      recordPageLinks(state, result.links);
       // The allowance covers the extracted document text; the metadata line the
       // tool renders alongside it (final URL, status, content type) is not
-      // charged.
+      // charged. It is charged before the page's links are recorded, so a
+      // result refused for the text allowance records none of its links.
       chargeText(state, deps.settings, result.text.length);
+      recordPageLinks(state, result.links);
 
       return {
         content: [{ type: "text", text: renderFetchResult(result) }],
