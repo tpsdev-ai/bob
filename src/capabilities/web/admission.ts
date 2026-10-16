@@ -1,11 +1,12 @@
 // Admission state for the `web_fetch` tool (bob#152, spec v3, slice R1c).
 //
 // The unit of state is one ADMITTED PROMPT, including its retries and automatic
-// continuations: the extension seeds one state at `before_agent_start` and
-// clears it on a full `agent_settled` and on session close. A tool call outside
-// that window finds no state and is refused. Budgets are charged before any
-// I/O, so a call that throws or aborts still consumes; a repeated seed cannot
-// replenish them, because the seed replaces the state with a fresh object.
+// continuations: the extension seeds one state at `before_agent_start` (which
+// pi fires once per prompt, after expansion) and clears it on a full
+// `agent_settled` and on session close. A tool call outside that window finds no
+// state and is refused. Budgets are charged before any I/O, so a call that
+// throws or aborts still consumes. The seed REPLACES the state with a fresh
+// object, so a missed clear cannot carry state forward into the next prompt.
 //
 // This module owns URLs (provenance.ts) and the two budgets: fetch attempts and
 // the shared fetch/search text allowance.

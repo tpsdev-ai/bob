@@ -1,13 +1,13 @@
 // URL provenance for the `web_fetch` tool (bob#152, spec v3, slice R1c).
 //
 // This is a NAVIGATION rule, not an egress control: it stops the model from
-// composing a URL. A URL is recorded only after it has been resolved against
-// the page it came from and parsed with WHATWG URL; fragments are stripped from
-// both the recorded URL and the candidate. A candidate matches when its
-// serialized scheme, host, effective port, path and complete query equal a
-// recorded URL's — nothing is decoded, reordered, dropped or appended during
-// the comparison, and there is no host-only grant. The caller dispatches the
-// parsed candidate itself.
+// composing a URL. A URL is recorded only after it has been parsed with WHATWG
+// URL (resolved against its page when it came from one), with its fragment
+// stripped from both the recorded URL and the candidate. A candidate matches
+// when its serialized scheme, host, effective port, path and complete query
+// equal a recorded URL's — nothing is decoded, reordered, dropped or appended
+// during the comparison, and there is no host-only grant. The caller dispatches
+// the parsed candidate itself.
 
 // The serialized form that is compared and dispatched: `scheme://host path
 // query`, where `host` carries the effective port (WHATWG URL omits a default
