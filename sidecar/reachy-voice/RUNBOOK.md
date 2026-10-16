@@ -250,7 +250,9 @@ bob's OS permissions still apply outside scratch.
 No CI workflow runs this (CI is Linux; the seatbelt proofs are macOS-only). Run
 it on this host, from the reviewed checkout, before the sidecar ships, in bob's
 account session ($AGENT_USER logged in, with its own HOME; never as root and
-never from the admin shell). The admin shell's variables do not carry over: set
+never from the admin shell). **Stop bob's reachy capability first**: [P9] speaks
+to the sidecar, which serves one connection at a time, and a link that is still
+up is what [P9] reports as `busy`. The admin shell's variables do not carry over: set
 `REPO` again in this session. The interpreter is pinned to `/usr/bin/python3 -I`,
 as in step 2's sudoers rule. Name the agent — the account comes from the deployment record (step 4), and the
 credential files are derived from the agent's own `bob.yaml`:
@@ -272,7 +274,7 @@ as root, when the inherited HOME differs from the running account's home, or
 when `BOB_REACHY_VOICE_DIR` or `BOB_ISOLATION_AGENTS_ROOT` is set. Every proof
 that reads bob's tree FAILS unless the deployment record (step 4) is trusted,
 names a non-root account, and that account is the one running (same uid in the
-account database); the agents root is `<that account's home>/agents`. It requires all eight pinned proofs to pass:
+account database); the agents root is `<that account's home>/agents`. It requires all nine pinned proofs to pass:
 [P1]/[P3] deny-default confinement, as this user and as `jarvis-sidecar`: the
 probed operations are each denied — TCP (IPv4, IPv6), UDP, mDNS and
 other-UNIX-socket connects, a forked child's TCP connect, an exec of
@@ -294,5 +296,9 @@ process only `stat`s them, and the sidecar user's attempt only opens; [P7] the
 installed files at the pinned install root match the checkout; [P8] the
 DEPLOYED socket at `/usr/local/var/bob/reachy-voice/run/voice.sock` is 0660
 `jarvis-sidecar:jarvis-voice` in a 0750 directory of that owner and group, and
-an outsider's connect is refused. **A proof that is skipped, fails or is
+an outsider's connect is refused; [P9] the socket the agent's `bob.yaml` names
+(`reachy.socket`) completes the `reachy-voice/1` handshake against the
+configured `sidecarVersion` within a fixed limit, as bob's own account — it
+fails by name when nothing is listening, when the listener is busy or does not
+answer in time, or on another version. **A proof that is skipped, fails or is
 missing fails the check.**

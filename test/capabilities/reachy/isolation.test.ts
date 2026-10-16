@@ -38,11 +38,17 @@
 //   [P8] The DEPLOYED socket (the pinned state root): 0660, owner
 //        jarvis-sidecar, group jarvis-voice, in a 0750 directory of that owner
 //        and group; an outsider's connect is refused.
+//   [P9] The DEPLOYED socket the agent's `bob.yaml` names (`reachy.socket`), as
+//        bob's own account: a completed `reachy-voice/1` handshake reporting the
+//        configured `sidecarVersion`, within a fixed limit. Fails by name on no
+//        listener, a busy listener (the sidecar serves one connection at a time),
+//        a listener that does not answer in time, or another version. Run with
+//        bob's reachy capability STOPPED: it holds the sidecar's one connection.
 //
 // Required release-host separate-user steps use the installed `proof.py` via
 // RUNBOOK step 2's sudoers rule. Local fallback checks sudo with `/usr/bin/true`
 // and can run a scratch proof copy. No sudo is attempted without the sidecar user.
-// Locally [P3]–[P8] can skip; BOB_REQUIRE_ISOLATION_PROOFS=1 makes skips fail
+// Locally [P3]–[P9] can skip; BOB_REQUIRE_ISOLATION_PROOFS=1 makes skips fail
 // and pins the install and agents roots.
 import { afterAll, describe, expect } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -79,8 +85,11 @@ import {
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
+import { parseConfig } from "../../../src/capabilities/reachy/config.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
+import { resolveRunConfig } from "../../../src/shell/run.js";
 import { must } from "./handshake.js";
+import { probeVoiceHandshake } from "./handshake-proof.js";
 import { deriveActiveCredentials } from "./isolation-credentials.js";
 import { PINNED_PIPER_DIR, PINNED_STATE_DIR, proof, releaseRoots } from "./isolation-gate.js";
 import { assertConfinementProbeKeys, MACH_SERVICES } from "./probe-keys.js";
@@ -246,6 +255,23 @@ const activeSkip =
   rootsSkip ||
   userSkip ||
   (!AGENT ? "the agent whose credentials to check is not named (BOB_ISOLATION_AGENT)" : "");
+// [P9] the deployed socket the agent's own `bob.yaml` names, and the version it
+// pins. Derived through the agent's own resolution (never a caller-named file).
+const handshakeTarget: { socket?: string; version?: string; skip?: string } = (() => {
+  if (!AGENT) return { skip: "the agent whose socket to check is not named (BOB_ISOLATION_AGENT)" };
+  try {
+    const resolved = resolveRunConfig({ name: AGENT, agentsRoot: AGENTS_ROOT });
+    const reachy = resolved.capabilities.find((c) => c.name === "reachy");
+    if (!reachy) return { skip: `${AGENT} does not configure the reachy capability` };
+    const cfg = parseConfig(reachy.config);
+    return { socket: cfg.socket, version: cfg.sidecarVersion };
+  } catch (err) {
+    return {
+      skip: `the agent's reachy config cannot be read: ${err instanceof Error ? err.message : err}`,
+    };
+  }
+})();
+const handshakeSkip = rootsSkip || handshakeTarget.skip || "";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 const scratch: string[] = [];
@@ -793,5 +819,22 @@ describe("reachy-voice isolation — the deployed socket", () => {
       const r = runAsUser(OUTSIDER, join(INSTALL_DIR, "proof.py"), ["connect", DEPLOYED_SOCKET]);
       expect(JSON.parse(r.stdout).connect).toMatch(/^(EACCES|EPERM)$/);
     },
+  );
+});
+
+describe("reachy-voice isolation — the handshake on the deployed socket", () => {
+  proof(
+    "[P9] as bob's own account, the socket the agent's bob.yaml names completes the reachy-voice/1 handshake against its configured sidecarVersion within the limit; a listener that is absent, busy, wedged or on another version fails with its named reason (run with bob's reachy capability stopped)",
+    handshakeSkip,
+    async () => {
+      const socket = must(handshakeTarget.socket, "the agent's reachy socket");
+      const version = must(handshakeTarget.version, "the agent's sidecarVersion");
+      const result = await probeVoiceHandshake(socket, version, {
+        timeoutMs: 5_000,
+        connectMs: 2_000,
+      });
+      expect(result, result.detail).toEqual({ ok: true, version });
+    },
+    30_000,
   );
 });
