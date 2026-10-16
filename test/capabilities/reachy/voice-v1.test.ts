@@ -914,7 +914,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
     wroteNothing(h);
   });
 
-  it("a mute turned ON and back OFF during the audit (mute clear again, epoch advanced) still writes no memory", async () => {
+  it("a sidecar-reported mute turned ON and back OFF during the audit (mute clear again, epoch advanced) still writes no memory", async () => {
     const h = harness(enrolled);
     await h.ready();
     h.store.during = (e) => {
