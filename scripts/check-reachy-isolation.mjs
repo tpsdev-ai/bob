@@ -387,7 +387,7 @@ function statSafe(p) {
 export function readDeploymentRecord(path = DEPLOYMENT_RECORD, { owners, from } = {}) {
   let text;
   try {
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const opened = fstatSync(fd);
       if (!opened.isFile()) {

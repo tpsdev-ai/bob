@@ -327,6 +327,31 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
     }
   });
 
+  it("a deployment-record FIFO with no writer is promptly refused as not a regular file", () => {
+    const f = mkdtempSync(join(tmpdir(), "rv-record-fifo-"));
+    scratch.push(f);
+    const record = join(f, "agent-user");
+    execFileSync("mkfifo", [record], { timeout: 2_000 });
+    const reader = new URL("../../../scripts/check-reachy-isolation.mjs", import.meta.url).href;
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { readDeploymentRecord } from ${JSON.stringify(reader)};
+console.log(JSON.stringify(readDeploymentRecord(process.argv[1])));`,
+        record,
+      ],
+      { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL" },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      reason: `the deployment record ${record} is not a regular file`,
+    });
+  });
+
   it.skipIf(!DARWIN).each(["file", "symlink", "directory"])(
     "the deployment record refuses a replacement %s between open and the final path check",
     (kind) => {

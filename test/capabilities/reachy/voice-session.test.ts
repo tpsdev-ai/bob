@@ -9,7 +9,7 @@
 // no shipped role allows a reachy tool yet, so the factory is handed the reachy
 // tools (as the anchored-edit integration test does).
 //
-//   * `bob run` (the CLI entry declares `run`): a `run` grant speaks; the
+//   * direct runAgent call with the CLI's declared `run` origin: a `run` grant speaks; the
 //     session's effective tools under the voice profile are reachy_say and
 //     reachy_state, and no body tool is even registered;
 //   * a PROMPTED `bob launch` declares nothing: refused, even with `run` granted;
@@ -310,7 +310,7 @@ async function spokenReaches(n: number): Promise<void> {
 const audits = () => flair.audits;
 
 describe("bob#356 — the speech origin and the link lifecycle through the REAL session path", () => {
-  it("`bob run` (the CLI entry declares `run`): a `run` grant speaks, owned by the agent; the voice registry has no body tool", async () => {
+  it("direct runAgent call with the CLI's declared `run` origin: a `run` grant speaks, owned by the agent; the voice registry has no body tool", async () => {
     expect(existsSync(BUILT), "the reachy extension must be built (bun run build)").toBe(true);
     const agentsRoot = agentOnDisk("voicerun", ["run"], await startSidecar("run"));
     const seen: { active?: string[]; registered?: string[] } = {};

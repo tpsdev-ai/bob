@@ -1,8 +1,8 @@
 // bob#356 V1 — the REAL reachy-voice sidecar (sidecar/reachy-voice/sidecar.py),
-// unconfined, on any host with python3: the reachy-voice/1 handshake against
-// bob's real client and core, and local text-to-speech after which no speech
-// artifact remains (the stand-in player's own observation record is the only
-// file it leaves). Piper and the OS player are stand-ins (test/fixtures/reachy-voice):
+// unconfined, on a supported Unix host with python3: the reachy-voice/1 handshake against
+// bob's real client and core, and local text-to-speech after which the work
+// directory contains only the stand-in player's observation record.
+// Piper and the OS player are stand-ins (test/fixtures/reachy-voice):
 // what is under test is the sidecar's artifact handling, not the voice.
 // The same sidecar under the deny-default profile, and as its own user, is
 // isolation.test.ts.
@@ -335,28 +335,19 @@ describe("bob#356 V1 — the real voice sidecar", () => {
       raw.close();
     } finally {
       bob.client.close();
-      for (const d of readdirSync(inst.work)) {
-        if (d.startsWith("tts-")) chmodSync(join(inst.work, d), 0o700); // let afterAll remove it
-      }
     }
   }, 30_000);
 
   it("FAIL CLOSED: a stale artifact that cannot be removed refuses startup", async () => {
     const inst = install();
     const stale = join(inst.work, "tts-stale");
-    mkdirSync(stale, { recursive: true });
-    chmodSync(inst.work, 0o700);
-    writeFileSync(join(stale, "speech.wav"), "RIFF....");
-    chmodSync(stale, 0o500); // its entries cannot be unlinked
-    try {
-      const sc = start(inst, ["--device-mute", "absent"]);
-      await waitFor(() => sc.exit() !== undefined, "the refusal");
-      expect(sc.exit()).not.toBe(0);
-      expect(sc.log()).toContain("cannot be removed; refusing to start");
-      expect(existsSync(inst.sock)).toBe(false); // it never listened
-    } finally {
-      chmodSync(stale, 0o700);
-    }
+    mkdirSync(inst.work, { mode: 0o700 });
+    writeFileSync(stale, "RIFF....");
+    const sc = start(inst, ["--device-mute", "absent"]);
+    await waitFor(() => sc.exit() !== undefined, "the refusal");
+    expect(sc.exit()).not.toBe(0);
+    expect(sc.log()).toContain("cannot be removed; refusing to start");
+    expect(existsSync(inst.sock)).toBe(false); // it never listened
   }, 30_000);
 
   it("the sidecar re-checks every say: a multi-line or extra-field say, or one before configure, is not spoken", async () => {

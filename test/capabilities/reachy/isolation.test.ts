@@ -576,11 +576,10 @@ async function proveRoundTrip(as: string | undefined) {
     );
     await waitFor(() => log.includes(`say.spoken playback=${digest(playbackId)}`), "the playback");
 
-    // The fs audit of everything the sidecar may write (its work dir; the
-    // socket is not a file), read AS the sidecar's user, under the profile.
+    // Scan the work directory as the sidecar's user, under the profile.
     const audit = await probe(l, as, true, { listAudio: [l.work] });
     const files = audit.listAudio?.files ?? [];
-    // Only the stand-in player's observation record remains — no speech artifact.
+    // Only the stand-in player's observation record remains in the work directory.
     expect(files.map((f) => f.slice(l.work.length + 1))).toEqual(["player-obs.jsonl"]);
     for (const f of files) expect(AUDIO_EXT.test(f), f).toBe(false);
     if (!separate) {
@@ -600,7 +599,7 @@ async function proveRoundTrip(as: string | undefined) {
       expect(obs.uid).toBe(process.getuid?.());
       expect((statSync(l.work).mode & 0o777).toString(8)).toBe("700");
     }
-    // Content-free logs: neither the spoken text nor the playback id appears.
+    // Separately check stderr for raw text and playback id.
     expect(log).not.toContain(SECRET);
     expect(log).not.toContain(playbackId);
   } finally {
@@ -617,7 +616,7 @@ describe("reachy-voice isolation — deny-default confinement (seatbelt)", () =>
     60_000,
   );
   proof(
-    "[P2] the REAL sidecar under the profile round-trips the handshake and a `say` over the authorized socket; no audio, text or id remains",
+    "[P2] the REAL sidecar under the profile round-trips the handshake and a `say`; no speech artifact remains in the work directory or raw text/ID in sidecar stderr; the tool result and audit retain data",
     seatbeltSkip,
     () => proveRoundTrip(undefined),
     60_000,
@@ -632,7 +631,7 @@ describe(`reachy-voice isolation — as the separate ${SIDECAR_USER} user`, () =
     60_000,
   );
   proof(
-    `[P4] as ${SIDECAR_USER}, on a SCRATCH socket with the deployed mode and group (0660, ${VOICE_GROUP}): bob's user round-trips a \`say\`, an outsider is refused, no audio remains`,
+    `[P4] as ${SIDECAR_USER}, on a SCRATCH socket with the deployed mode and group (0660, ${VOICE_GROUP}): bob's user round-trips a \`say\`, an outsider is refused; no speech artifact remains in the work directory or raw text/ID in sidecar stderr; the tool result and audit retain data`,
     scratchSocketSkip,
     () => proveRoundTrip(SIDECAR_USER),
     60_000,

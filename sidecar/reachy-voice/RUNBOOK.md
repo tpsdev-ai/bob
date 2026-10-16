@@ -281,7 +281,7 @@ outside the sidecar's directories (the profile allows fork and its named exec
 paths, so a child is not itself denied; its network call is) — each probed denial shown
 to succeed unconfined first — as THIS user, since the sudo rule allows no
 unconfined probe; [P2]/[P4] the real sidecar's handshake and `say` over the
-authorized socket with no audio left — [P4] as `jarvis-sidecar` on a SCRATCH
+authorized socket with no speech artifact left in the work directory — [P4] as `jarvis-sidecar` on a SCRATCH
 socket with the deployed mode and group (0660, `jarvis-voice`), with an
 outsider refused; [P5] #180 S1's key-read proof
 on fixtures; [P6] the same on bob's active credentials: every key or token

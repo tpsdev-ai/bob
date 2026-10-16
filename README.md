@@ -1031,7 +1031,7 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   must have working controls). P5/P6 check denied opens as `jarvis-sidecar`
   (P5 also opens a 0644 control); P4/P8 check denied connects as `nobody`
   (P4 also round-trips bob's authorized connection). P2/P4 round-trip the real
-  sidecar's handshake and a `say` under the profile with no speech artifact left.
+  sidecar's handshake and a `say` under the profile with no speech artifact left in the work directory.
   `bun run check:reachy-isolation` is a MANUAL release-host prerequisite (no CI
   workflow runs it): it fails on any skipped, failed or missing pinned proof,
   runs with a pinned PATH, refuses to start as root or with a HOME other than

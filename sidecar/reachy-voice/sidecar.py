@@ -73,7 +73,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TTS_DIR_PREFIX = "tts-"
 SYNTH_TIMEOUT_S = 30
 PLAY_TIMEOUT_S = 60
-# Children (Piper, the player) inherit only LANG.
+# Piper/player environment: inherited LANG, fixed PATH, work-directory HOME.
 CHILD_ENV_KEYS = ("LANG",)
 
 
