@@ -12,7 +12,9 @@
 //   busy               the listener is already serving its one connection, so a
 //                      further connect is refused (the sidecar serves ONE
 //                      connection at a time: `server.listen(1)` + `accept()`);
-//   handshake-timeout  a listener accepted but did not answer within the limit;
+//   handshake-timeout  the handshake did not complete within the limit (no
+//                      health line, a dropped connection, or a configure write
+//                      that did not complete);
 //   version-mismatch   a health line arrived naming another version.
 //
 // The `busy` probe keys on the sidecar's single-session design: while it serves
