@@ -544,6 +544,13 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     if (decoded.kind === "presence") return { kind: "none" }; // the body profile
 
     if (decoded.kind === "transcript") {
+      // bob#361: the connection epoch this transcript was accepted on. The
+      // memory-attempt audit is awaited below; a link that reconnects, or a
+      // sidecar-reported mute transition (even on and back off), advances the
+      // epoch and makes the accepted transcript stale; bob's own mute is read as
+      // the effective mute at the recheck. Both are rechecked after the audit,
+      // before the memory write.
+      const epoch = link.epoch;
       lastTranscript = decoded.transcript;
       const decision = decideTranscript(decoded.transcript, state);
       if (decision.kind === "drop") return { kind: "drop" };
@@ -563,6 +570,18 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         const attemptId = orgEventRecordId(attempt);
         const persisted = await audit(attempt);
         if (!persisted) return refuse("memory", "audit write failed — memory NOT written");
+        // bob#361: the attempt audit was awaited. If the epoch advanced or the
+        // link is effectively muted now, this transcript belongs to a state that
+        // is gone: write no memory and attempt a refusal linked to the attempt
+        // event (the same stale rule the action path applies after its audit);
+        // `refused` is returned even if that refusal's audit write fails.
+        if (link.epoch !== epoch || effectiveMuted()) {
+          return refuse(
+            "memory",
+            "stale: the sidecar link or the mute changed during the memory attempt audit",
+            attemptId,
+          );
+        }
 
         // Pre-generate the OUTCOME event so the memory can carry ITS record id: a
         // memory must resolve to a `written` event, never the attempt.

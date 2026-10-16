@@ -76,6 +76,7 @@ class FakeCommands implements ReachyCommands {
 }
 class FakeStore implements OrgEventStore {
   readonly all: OrgEvent[] = [];
+  readonly byId = new Map<string, OrgEvent>();
   fail = false;
   /** Runs inside a write, before it completes (to change state mid-await). */
   during?: (event: OrgEvent) => void;
@@ -86,12 +87,32 @@ class FakeStore implements OrgEventStore {
   async write(event: OrgEvent): Promise<{ id: string }> {
     this.during?.(event);
     if (this.fail) throw new Error("event store unavailable");
+    const id = orgEventRecordId(event);
+    this.byId.set(id, event);
     this.all.push(event);
     this.order.push(`audit:${event.kind}`);
-    return { id: orgEventRecordId(event) };
+    return { id };
   }
-  async getById(): Promise<OrgEvent | null> {
-    return null;
+  async getById(id: string): Promise<OrgEvent | null> {
+    return this.byId.get(id) ?? null;
+  }
+}
+/** The private memory seam: records each write and reports one id. */
+class FakeMemory {
+  readonly writes: Array<{
+    content: string;
+    visibility: "private";
+    authorId: string;
+    metadata: { speakerId: string; correlationId: string; orgEventId: string };
+  }> = [];
+  async writePrivate(w: {
+    content: string;
+    visibility: "private";
+    authorId: string;
+    metadata: { speakerId: string; correlationId: string; orgEventId: string };
+  }): Promise<{ id: string }> {
+    this.writes.push(w);
+    return { id: "mem-361" };
   }
 }
 
@@ -103,6 +124,7 @@ function harness(
     // no origin reader at all (nothing bound: everything refuses)
     noReader?: boolean;
     mute?: boolean;
+    enrolment?: Record<string, string>;
   } = {},
 ) {
   const order: string[] = [];
@@ -119,16 +141,17 @@ function harness(
   const state: PolicyState = {
     profile: opts.profile ?? "voice",
     wakeName: "jarvis",
-    enrolment: {},
+    enrolment: opts.enrolment ?? {},
     mute: opts.mute ?? false,
     nowMs: () => 1_000,
     roomSpeechOrigins: opts.roomSpeechOrigins ?? ["run"],
   };
   let origin: TurnOrigin | undefined = "origin" in opts ? opts.origin : { kind: "run" };
+  const memory = new FakeMemory();
   const wired = wireReachyCapability({
     pi,
     commands,
-    memory: { writePrivate: async () => ({ id: "m" }) },
+    memory,
     store,
     state,
     sidecarVersion: TEST_SIDECAR_VERSION,
@@ -141,6 +164,7 @@ function harness(
     store,
     state,
     wired,
+    memory,
     logs,
     order,
     setOrigin: (o: TurnOrigin | undefined) => {
@@ -804,6 +828,119 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
     expect(await h.pi.call("reachy_say", { text: "x".repeat(501) })).toContain("refused");
     expect(await h.pi.call("reachy_say", { text: "hi", memoryId: "m" })).toContain("refused");
     expect(said(h)).toEqual([]);
+  });
+});
+
+// ── the transcript memory path: stale recheck (bob#361) ─────────────────────
+describe("bob#361 — the transcript path rechecks the link epoch and the mute after the attempt audit", () => {
+  const enrolled = { enrolment: { "spk-1": "member-1" } };
+  const speakerLine = {
+    type: "transcript",
+    text: "jarvis, remember the drill",
+    ts: "t",
+    wakeHeard: true,
+    speakerId: "spk-1",
+  };
+  const attemptOf = (h: ReturnType<typeof harness>) =>
+    must(
+      h.store.all.find((e) => e.kind === "reachy.memory.attempt"),
+      "the memory attempt",
+    );
+  const refusalOf = (h: ReturnType<typeof harness>) =>
+    must(
+      h.store.all.find((e) => e.kind === "reachy.refused"),
+      "the refusal",
+    );
+  const wroteNothing = (h: ReturnType<typeof harness>) => {
+    expect(h.memory.writes).toEqual([]);
+    expect(h.store.all.some((e) => e.kind === "reachy.memory.written")).toBe(false);
+    expect(refusalOf(h).refId).toBe(orgEventRecordId(attemptOf(h)));
+  };
+
+  it("CONTROL: with nothing changing, the memory IS written and the linked written event targets it", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "memory", memoryId: "mem-361" });
+    expect(h.memory.writes.length).toBe(1);
+    const written = must(
+      h.store.all.find((e) => e.kind === "reachy.memory.written"),
+      "the written event",
+    );
+    expect(written.targetIds).toContain("mem-361");
+    expect(written.refId).toBe(orgEventRecordId(attemptOf(h)));
+    expect(h.store.all.some((e) => e.kind === "reachy.refused")).toBe(false);
+  });
+
+  it("a DISCONNECT during the audit writes no memory and records the linked refusal", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.memory.attempt") return;
+      h.store.during = undefined;
+      h.wired.disconnected();
+    };
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "refused", action: "memory" });
+    expect((r as { reason: string }).reason).toContain("stale");
+    wroteNothing(h);
+  });
+
+  it("a RECONNECT during the audit writes no memory and records the linked refusal", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.memory.attempt") return;
+      h.store.during = undefined;
+      h.wired.disconnected();
+      void h.wired.connected();
+      void h.wired.handleLine(healthLine(h.wired, h.state));
+    };
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "refused", action: "memory" });
+    wroteNothing(h);
+  });
+
+  it("a sidecar-reported MUTE during the audit writes no memory and records the linked refusal", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.memory.attempt") return;
+      h.store.during = undefined;
+      void h.wired.handleLine(healthLine(h.wired, h.state, { muted: true }));
+    };
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "refused", action: "memory" });
+    wroteNothing(h);
+  });
+
+  it("a sidecar-reported mute turned ON and back OFF during the audit (mute clear again, epoch advanced) still writes no memory", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.memory.attempt") return;
+      h.store.during = undefined;
+      void h.wired.handleLine(healthLine(h.wired, h.state, { muted: true }));
+      void h.wired.handleLine(healthLine(h.wired, h.state, { muted: false }));
+    };
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "refused", action: "memory" });
+    expect(h.wired.link().effectiveMuted).toBe(false); // unmuted again...
+    wroteNothing(h); // ...and the epoch advance alone refused it
+  });
+
+  it("an effective mute that is still ON at the recheck but did not advance the epoch (bob's own mute) also writes no memory", async () => {
+    const h = harness(enrolled);
+    await h.ready();
+    h.store.during = (e) => {
+      if (e.kind !== "reachy.memory.attempt") return;
+      h.store.during = undefined;
+      h.state.mute = true; // bob's own mute: no mute transition, so no epoch advance
+    };
+    const r = await h.wired.handleLine(speakerLine);
+    expect(r).toMatchObject({ kind: "refused", action: "memory" });
+    expect(h.wired.link().effectiveMuted).toBe(true);
+    wroteNothing(h);
   });
 });
 
