@@ -689,20 +689,21 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
     ["an ungranted discord channel", { kind: "discord", channelId: "222" }],
     ["an ungranted mail sender", { kind: "mail", from: "mallory" }],
     ["a run when only others are granted", { kind: "run" }],
-  ] as Array<
-    [string, TurnOrigin]
-  >)("FORBIDDEN: %s is refused, audited, and nothing is spoken", async (_n, origin) => {
-    const h = harness({
-      roomSpeechOrigins: ["cron:standup", "discord:111"],
-      origin,
-    });
-    await h.ready();
-    const out = await h.pi.call("reachy_say", { text: "hello" });
-    expect(out).toContain("refused");
-    expect(out).toContain("no room-publication grant");
-    expect(said(h)).toEqual([]);
-    expect(h.store.all.some((e) => e.kind === "reachy.refused")).toBe(true);
-  });
+  ] as Array<[string, TurnOrigin]>)(
+    "FORBIDDEN: %s is refused, audited, and nothing is spoken",
+    async (_n, origin) => {
+      const h = harness({
+        roomSpeechOrigins: ["cron:standup", "discord:111"],
+        origin,
+      });
+      await h.ready();
+      const out = await h.pi.call("reachy_say", { text: "hello" });
+      expect(out).toContain("refused");
+      expect(out).toContain("no room-publication grant");
+      expect(said(h)).toEqual([]);
+      expect(h.store.all.some((e) => e.kind === "reachy.refused")).toBe(true);
+    },
+  );
 
   it("FORBIDDEN: a voice-origin call is refused even when every config grant exists (V1 has no utterance)", async () => {
     const h = harness({
