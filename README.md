@@ -1017,7 +1017,8 @@ handshake, any line but the health reply refuses the link). (`voice-v1.test.ts`;
   disposable session are V2).
 - **The sidecar** (`sidecar/reachy-voice/`) speaks with local Piper through an
   ephemeral 0600 file in a 0700 directory that it removes after playback (a
-  removal that fails leaves it on disk, and the sidecar fails closed), under a
+  failed cleanup may leave it on disk, and the sidecar then refuses later
+  speech), under a
   deny-default seatbelt profile, as its own `jarvis-sidecar` user; it refuses to
   start when a stale speech file cannot be removed. After a playback cleanup
   failure, dirty state refuses later speech and it attempts an immediate
