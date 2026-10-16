@@ -1,32 +1,50 @@
-// Bob capability: web — a pi extension (bob#152, spec v3, slice R1a).
+// Bob capability: web — a pi extension (bob#152, spec v3, slices R1a–R1c).
 //
 // A Bob capability IS a pi extension: a default-export factory
 // `(pi: ExtensionAPI) => void`. The extension validates the resolved config
 // block Bob hands it in BOB_CAP_WEB, against the same schema the catalog
-// validated bob.yaml with, and REGISTERS NO TOOL. The fetch core (address
-// policy, redirects, limits, extraction) is slice R1b and lives in fetch.ts; it
-// is an internal module, exported here for `web_fetch` (R1c) and its tests, and
-// nothing wires it to a session's config yet.
+// validated bob.yaml with, and REGISTERS THE `web_fetch` TOOL. The fetch core
+// (address policy, redirects, limits, extraction) is slice R1b (fetch.ts); URL
+// provenance and the admission budgets are slice R1c (provenance.ts,
+// admission.ts, tool.ts).
+//
+// ADMISSION. The tool's provenance and budgets belong to one ADMITTED PROMPT.
+// The extension seeds a fresh state at `before_agent_start` (the event after
+// prompt expansion and before the agent loop) and clears it on a full
+// `agent_settled` and on session close — never on `turn_start`/`turn_end`/
+// `agent_end`, which fire mid-prompt. The state is bound to the runtime's turn
+// admission: with no admission (a direct prompt that the runtime did not route
+// through one), nothing is seeded and `web_fetch` is refused.
 //
 // A session that holds this capability (or allows an egress tool) is a WEB
-// session. bob refuses to compose one with anything private beyond its
-// admitted prompt (data-class.ts): at YAML load over the capability set, in the
-// session factory before pi's runtime is built, and on the composed session at
+// session. bob refuses to compose one with anything private beyond its admitted
+// prompt (data-class.ts): at YAML load over the capability set, in the session
+// factory before pi's runtime is built, and on the composed session at
 // creation, after the mode binds extensions and after every reload. A web
 // session sends bob's reviewed system prompt in place of pi's template and has
 // no agent workspace (pi's working directory is "/").
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getTurnAdmission } from "../../shell/turn-admission.js";
+import { type WebPiLike, wireWebCapability } from "./capability.js";
 import { loadConfigFromEnv } from "./config.js";
+import { resolveWebSettings } from "./core.js";
 
-export default function (_pi: ExtensionAPI): void {
+export default function (pi: ExtensionAPI): void {
   // A bad block fails the extension load, which bob turns into a named
   // session refusal (session.ts assertCapabilitiesLoaded).
-  loadConfigFromEnv();
+  const settings = resolveWebSettings(loadConfigFromEnv());
+  // The runtime's turn admission, when the session has one. Without it, a
+  // prompt was not routed through admission, so no state is seeded and the
+  // tool is refused.
+  wireWebCapability({
+    pi: pi as unknown as WebPiLike,
+    settings,
+    admission: getTurnAdmission(pi),
+  });
 }
 
-// Slice R1b — the fetch core and the pieces it is built from. Internal: no tool
-// is registered from these, and R1c is what will call fetchDocument.
+// Slice R1b — the fetch core and the pieces it is built from.
 export {
   ADDRESS_POLICY_VERSION,
   type AddressPolicy,
@@ -42,6 +60,23 @@ export {
   publicUnicastPolicy,
   type RegistryRow,
 } from "./address.js";
+export {
+  admitCandidate,
+  chargeFetchAttempt,
+  chargeText,
+  newTurnState,
+  originKey,
+  recordPageLinks,
+  textAllowanceRemaining,
+  type WebTurnState,
+} from "./admission.js";
+// Slice R1c — URL provenance, the admission state and the tool.
+export {
+  type WebCapabilityDeps,
+  type WebCapabilityHandle,
+  type WebPiLike,
+  wireWebCapability,
+} from "./capability.js";
 export {
   CONFIG_ENV_VAR,
   CONFIG_SCHEMA,
@@ -81,6 +116,20 @@ export {
   vettedLookup,
 } from "./fetch.js";
 export { webManifest } from "./manifest.js";
+export {
+  extractUrls,
+  parseAbsolute,
+  recordUrl,
+  recordUrls,
+  urlKey,
+} from "./provenance.js";
+export {
+  createWebFetchTool,
+  WEB_FETCH_PARAMS,
+  WEB_FETCH_TOOL_NAME,
+  type WebFetchFn,
+  type WebFetchToolDeps,
+} from "./tool.js";
 export {
   type AdmitOptions,
   addressRefused,

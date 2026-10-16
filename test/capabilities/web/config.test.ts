@@ -193,7 +193,7 @@ describe("BOB_CAP_WEB ingestion", () => {
   });
 });
 
-describe("the extension registers no tool and validates its block at load", () => {
+describe("the extension registers web_fetch and validates its block at load", () => {
   let cwd: string;
   let agentDir: string;
   let saved: string | undefined;
@@ -223,12 +223,12 @@ describe("the extension registers no tool and validates its block at load", () =
     return loader.getExtensions();
   }
 
-  it("a valid block loads, with no tool registered", async () => {
+  it("a valid block loads, with the web_fetch tool registered", async () => {
     const exts = await load('{"fetch_per_turn":3}');
     expect(exts.errors ?? []).toEqual([]);
     const web = exts.extensions.find((e) => e.path.endsWith("/dist/capabilities/web/index.js"));
     expect(web).toBeDefined();
-    expect([...(web?.tools.keys() ?? [])]).toEqual([]);
+    expect([...(web?.tools.keys() ?? [])]).toEqual(["web_fetch"]);
   });
 
   it("an invalid block fails the load, naming the field", async () => {

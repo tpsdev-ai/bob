@@ -1,6 +1,6 @@
 // The web fetch core's runtime-independent pieces (bob#245 — web spec v3, slice
 // R1b): the DNS-answer vetting wrapper, the fixed User-Agent, the character
-// limit, and the fact that the capability still registers no tool. The
+// limit, and the capability surface (R1c registers the `web_fetch` tool). The
 // transport itself is exercised under Node in fetch-core-node.test.ts.
 
 import { describe, expect, it } from "bun:test";
@@ -306,7 +306,7 @@ describe("the fixed User-Agent and the character limit", () => {
 });
 
 describe("the capability surface", () => {
-  it("registers no tool", async () => {
+  it("registers the web_fetch tool (R1c)", async () => {
     const previous = process.env.BOB_CAP_WEB;
     process.env.BOB_CAP_WEB = "{}";
     try {
@@ -315,11 +315,15 @@ describe("the capability surface", () => {
       ) => void;
       const registered: string[] = [];
       extension({
+        on: () => {},
         registerTool: (tool: { name: string }) => {
           registered.push(tool.name);
         },
+        // No turn admission: getTurnAdmission finds none, so the tool refuses
+        // every call, but it is still registered.
+        events: { emit: () => {} },
       } as unknown as ExtensionAPI);
-      expect(registered).toEqual([]);
+      expect(registered).toEqual(["web_fetch"]);
     } finally {
       if (previous === undefined) delete process.env.BOB_CAP_WEB;
       else process.env.BOB_CAP_WEB = previous;

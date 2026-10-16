@@ -62,6 +62,11 @@ import {
   validateTpsMailConfig,
 } from "../capabilities/tps-mail/config.js";
 import { REFUSAL_REASONS } from "../capabilities/tps-mail/envelope.js";
+import { publicUnicastPolicy } from "../capabilities/web/address.js";
+import { validateWebConfig } from "../capabilities/web/config.js";
+import { resolveWebSettings, type WebSettings } from "../capabilities/web/core.js";
+import { isWebFetchError } from "../capabilities/web/errors.js";
+import { admitUrl, WEB_PORTS } from "../capabilities/web/url-admission.js";
 import {
   type ProviderLimitsBlock,
   parseBobYamlBlock,
@@ -539,6 +544,11 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       }
     }
   }
+  // bob#246 (web spec v3, slice R1c): when the agent declares the web
+  // capability, doctor checks its policy, the two address refusals the issue
+  // names, and the fetch path itself — all without network I/O.
+  checks.push(...webChecks(yamlText));
+
   const mail = tpsMailChecks({
     name: opts.name,
     yamlText,
@@ -595,6 +605,124 @@ const INBOUND_CHAT_CAPABILITIES: ReadonlySet<string> = new Set(["discord", "tps-
 // bob.yaml or an unparseable provider: block FAILS first; only a readable file
 // whose provider: block parses reaches the model (SKIP when none) and then the
 // window (FAIL when none, else OK).
+// bob#246 (web spec v3, slice R1c): the checks doctor runs for the web
+// capability, when the agent declares it. Nothing here touches the network: the
+// fetch health check drives the fetch path's own admission on a loopback
+// literal and a public URL and observes the refusal rule, without dispatching.
+const WEB_PRIVATE_PROBES: readonly string[] = Object.freeze([
+  "127.0.0.1",
+  "10.0.0.1",
+  "169.254.169.254",
+  "100.64.0.1",
+]);
+const WEB_NAT64_PROBES: readonly string[] = Object.freeze(["64:ff9b::1", "64:ff9b:1::1"]);
+
+export function webChecks(yamlText: string | undefined): DoctorCheck[] {
+  if (yamlText === undefined || !readCapabilities(yamlText).includes("web")) return [];
+  const checks: DoctorCheck[] = [];
+
+  // Policy: the web: block validates against the shared schema, and the
+  // resolved settings are shown.
+  let settings: WebSettings | undefined;
+  try {
+    settings = resolveWebSettings(validateWebConfig(readBlock(yamlText, "web") ?? {}));
+  } catch (err) {
+    checks.push({
+      name: "web policy",
+      status: "fail",
+      detail: err instanceof Error ? err.message : String(err),
+      fix: "fix the web: block in bob.yaml",
+    });
+  }
+  if (settings !== undefined) {
+    checks.push({
+      name: "web policy",
+      status: "ok",
+      detail: `allow_http=${settings.allowHttp}, fetch_max_chars=${settings.fetchMaxChars}, fetch_per_turn=${settings.fetchPerTurn}, text_per_turn=${settings.textPerTurn}`,
+    });
+  }
+
+  // The address policy refuses a known-private address and the NAT64 prefixes.
+  const policy = publicUnicastPolicy();
+  const allowedPrivate = WEB_PRIVATE_PROBES.filter((address) => policy.classify(address).allowed);
+  checks.push(
+    allowedPrivate.length === 0
+      ? {
+          name: "web address refusal",
+          status: "ok",
+          detail: `refuses ${WEB_PRIVATE_PROBES.join(", ")}`,
+        }
+      : {
+          name: "web address refusal",
+          status: "fail",
+          detail: `the address policy allows ${allowedPrivate.join(", ")}`,
+          fix: "this is a bug in the web address policy; reinstall bob",
+        },
+  );
+  const allowedNat64 = WEB_NAT64_PROBES.filter((address) => policy.classify(address).allowed);
+  checks.push(
+    allowedNat64.length === 0
+      ? {
+          name: "web NAT64 refusal",
+          status: "ok",
+          detail: `refuses ${WEB_NAT64_PROBES.join(", ")}`,
+        }
+      : {
+          name: "web NAT64 refusal",
+          status: "fail",
+          detail: `the address policy allows ${allowedNat64.join(", ")}`,
+          fix: "this is a bug in the web address policy; reinstall bob",
+        },
+  );
+
+  // Fetch health: the fetch path's admission refuses a loopback literal with the
+  // address rule and admits a public URL, without dispatching a request.
+  checks.push(webFetchHealth());
+  return checks;
+}
+
+function webFetchHealth(): DoctorCheck {
+  const name = "web fetch health";
+  const policy = { allowHttp: true, ports: WEB_PORTS, address: publicUnicastPolicy() };
+  try {
+    admitUrl("http://127.0.0.1/", policy);
+    return {
+      name,
+      status: "fail",
+      detail: "the fetch path admitted a loopback URL",
+      fix: "this is a bug in the web fetch path; reinstall bob",
+    };
+  } catch (err) {
+    if (!isWebFetchError(err) || err.code !== "address") {
+      return {
+        name,
+        status: "fail",
+        detail: `the fetch path did not refuse a loopback URL with the address rule (${
+          err instanceof Error ? err.message : String(err)
+        })`,
+        fix: "this is a bug in the web fetch path; reinstall bob",
+      };
+    }
+  }
+  try {
+    admitUrl("https://example.invalid/", policy);
+  } catch (err) {
+    return {
+      name,
+      status: "fail",
+      detail: `the fetch path refused a public URL (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+      fix: "this is a bug in the web fetch path; reinstall bob",
+    };
+  }
+  return {
+    name,
+    status: "ok",
+    detail: "the fetch path refuses a loopback literal and admits a public URL (no network I/O)",
+  };
+}
+
 function contextWindowCheck(yamlPath: string, registry?: ProviderRegistry): DoctorCheck {
   const name = "provider.context_window";
   let yamlText: string;

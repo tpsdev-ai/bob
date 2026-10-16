@@ -1,8 +1,9 @@
-// A fetch refusal (bob#245 — web spec v3, slice R1b). One error type for every
-// rule the fetch core enforces: each refusal names the rule (code) and the
-// specific thing it saw (detail), so a caller can report it and a test can pin
-// it. Nothing here carries a response body, a request header or a URL the
-// caller did not already hold.
+// A web fetch refusal (bob#245 — web spec v3, slice R1b; extended by R1c). One
+// error type for every rule the web fetch path enforces — the fetch core's, the
+// URL provenance's and the admission budgets' — so a caller can report it and a
+// test can pin it. Each refusal names the rule (code) and the specific thing it
+// saw (detail). Nothing here carries a response body, a request header or a URL
+// the caller did not already hold.
 
 export type WebFetchRefusalCode =
   // The URL could not be parsed, or is not http/https on an allowed port.
@@ -26,7 +27,17 @@ export type WebFetchRefusalCode =
   // The 15-second total deadline elapsed.
   | "deadline"
   // The connection failed (DNS, refused, TLS, reset).
-  | "network";
+  | "network"
+  // The tool ran outside an admitted prompt: no state was seeded.
+  | "no-admission"
+  // The running admission does not match the state's seeded admission.
+  | "admission-mismatch"
+  // The candidate URL was not recorded from the message or a fetched page.
+  | "url-unrecorded"
+  // The prompt's fetch-attempt budget is spent.
+  | "budget-fetch"
+  // The shared fetch/search text allowance would be exceeded.
+  | "budget-text";
 
 export interface WebFetchRefusal {
   code: WebFetchRefusalCode;
