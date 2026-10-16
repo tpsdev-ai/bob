@@ -28,14 +28,14 @@ export type WebFetchRefusalCode =
   | "deadline"
   // The connection failed (DNS, refused, TLS, reset).
   | "network"
-  // The tool ran outside an admitted prompt: no state was seeded.
+  // The tool ran outside an admitted operation.
   | "no-admission"
   // The running turn's origin does not match the origin the state was seeded
   // for.
   | "admission-mismatch"
   // The candidate URL was not recorded from the message or a fetched page.
   | "url-unrecorded"
-  // The prompt's fetch-attempt budget is spent.
+  // The operation's fetch-attempt budget is spent.
   | "budget-fetch"
   // The shared fetch/search text allowance would be exceeded.
   | "budget-text";

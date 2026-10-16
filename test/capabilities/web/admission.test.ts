@@ -88,7 +88,7 @@ describe("URL provenance — the exact rule", () => {
     expect(codeOf(() => admitCandidate(state, "https://host.test/ab"))).toBe("url-unrecorded");
   });
 
-  it("refuses a recorded URL from a previous prompt (fresh state per admission)", () => {
+  it("refuses a recorded URL from a previous admission", () => {
     const first = stateFor("https://host.test/a");
     expect(admitCandidate(first, "https://host.test/a").href).toBe("https://host.test/a");
     const second = stateFor("nothing relevant here");
@@ -98,15 +98,9 @@ describe("URL provenance — the exact rule", () => {
   it("keeps an empty query distinct from no query (probe)", () => {
     const noQuery = stateFor("https://host.test/p");
     expect(codeOf(() => admitCandidate(noQuery, "https://host.test/p?"))).toBe("url-unrecorded");
-    const emptyQuery = stateFor("https://host.test/p?");
+    const emptyQuery = stateFor("<https://host.test/p?>");
     expect(admitCandidate(emptyQuery, "https://host.test/p?").href).toBe("https://host.test/p?");
     expect(codeOf(() => admitCandidate(emptyQuery, "https://host.test/p"))).toBe("url-unrecorded");
-  });
-
-  it("does not grant a shortened spelling of the message URL (punctuation probe)", () => {
-    const state = stateFor("read https://host.test/p?x=1!");
-    expect(admitCandidate(state, "https://host.test/p?x=1!").href).toBe("https://host.test/p?x=1!");
-    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=1"))).toBe("url-unrecorded");
   });
 
   it("refuses a relative or non-http(s) candidate as unparseable", () => {
@@ -138,8 +132,7 @@ describe("URL provenance — recording sources", () => {
     expect(admitCandidate(state, "https://host.test/next").href).toBe("https://host.test/next");
   });
 
-  it("extractUrls takes the absolute URL whole, keeping punctuation in the reference", () => {
-    expect(extractUrls("read https://host.test/p?x=1!")).toEqual(["https://host.test/p?x=1!"]);
+  it("extractUrls records separate whitespace-delimited references", () => {
     expect(extractUrls("see http://a.test/x and https://b.test/y")).toEqual([
       "http://a.test/x",
       "https://b.test/y",
@@ -152,57 +145,72 @@ describe("URL provenance — recording sources", () => {
   });
 });
 
-describe("URL provenance — markup delimiters versus a bare reference", () => {
-  // A quote or backtick immediately before the URL opens a markup reference and
-  // delimits it at its matching close; inside a bare reference it is an ordinary
-  // character. The scanner must never grant a prefix of a longer reference.
-  it("takes an enclosed reference up to its matching quote or backtick", () => {
-    expect(extractUrls("see `https://host.test/a?x=1` now")).toEqual(["https://host.test/a?x=1"]);
-    expect(extractUrls('see "https://host.test/a?x=1" now')).toEqual(["https://host.test/a?x=1"]);
-    expect(extractUrls("see 'https://host.test/a?x=1' now")).toEqual(["https://host.test/a?x=1"]);
+describe("URL provenance — whitespace tokens", () => {
+  const url = "https://host.test/p?x=one";
+  const cases: Array<{ token: string; recorded: string[] }> = [];
+  for (const character of ['"', "'", "`", "<", ">", "(", ")", "[", "]"]) {
+    const token = `${url}${character}two`;
+    cases.push({ token, recorded: [new URL(token).href] });
+    cases.push({ token: `${character}${url}`, recorded: [] });
+  }
+  for (const [open, close] of [
+    ['"', '"'],
+    ["'", "'"],
+    ["`", "`"],
+    ["<", ">"],
+    ["(", ")"],
+    ["[", "]"],
+  ]) {
+    cases.push({ token: `${open}${url}${close}`, recorded: [url] });
+    cases.push({ token: `${open}${url}${close}tail`, recorded: [] });
+    cases.push({ token: `${open}${url}${close}.,;:!?`, recorded: [url] });
+  }
+  for (const punctuation of [".", ",", ";", ":", "!", "?"]) {
+    cases.push({ token: `${url}${punctuation}`, recorded: [url] });
+  }
+  cases.push(
+    { token: "https://host.test/one`two", recorded: ["https://host.test/one%60two"] },
+    { token: "https://host.test/p?x=1!", recorded: ["https://host.test/p?x=1"] },
+    { token: "https://host.test/p?", recorded: ["https://host.test/p"] },
+    { token: "<https://host.test/p?>", recorded: ["https://host.test/p?"] },
+    { token: "https://[invalid/path", recorded: [] },
+    { token: `prefix${url}`, recorded: [] },
+    { token: `(${url}]`, recorded: [] },
+    { token: `\`${url}\`tail\``, recorded: [] },
+    { token: `""${url}""`, recorded: [] },
+  );
+
+  for (const source of ["prompt", "fetched text"] as const) {
+    for (const { token, recorded } of cases) {
+      it(`${source} records the exact set for ${JSON.stringify(token)}`, () => {
+        const state = stateFor(source === "prompt" ? `read ${token} now` : "");
+        if (source === "fetched text") {
+          const doc = extractDocument("text/plain", `read ${token} now`, "https://host.test/page");
+          recordPageLinks(state, doc.links);
+        }
+        expect([...state.recorded.keys()]).toEqual(recorded);
+        expect([...state.recorded.values()]).toEqual(recorded);
+      });
+    }
+  }
+
+  it("splits tokens on whitespace", () => {
+    expect(extractUrls("http://a.test/x\thttps://b.test/y\nhttps://c.test/z")).toEqual([
+      "http://a.test/x",
+      "https://b.test/y",
+      "https://c.test/z",
+    ]);
   });
 
-  it("records a bare reference whose query holds an apostrophe, not its prefix (prompt probe)", () => {
-    const state = stateFor("see https://host.test/p?x=one'two here");
-    // WHATWG URL percent-encodes the query apostrophe on both sides.
-    expect(admitCandidate(state, "https://host.test/p?x=one'two").href).toBe(
-      "https://host.test/p?x=one%27two",
-    );
-    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=one"))).toBe("url-unrecorded");
-  });
-
-  it("records a bare reference whose path holds a backtick, not its prefix (prompt probe)", () => {
-    const state = stateFor("see https://host.test/one`two here");
-    // The path backtick is canonicalized by WHATWG URL for both sides.
-    expect(admitCandidate(state, "https://host.test/one`two").href).toBe(
-      "https://host.test/one%60two",
-    );
-    expect(codeOf(() => admitCandidate(state, "https://host.test/one"))).toBe("url-unrecorded");
-  });
-
-  it("records the same probes from a fetched non-HTML body (fetched-text case)", () => {
+  it("records retained HTML anchor hrefs through the real extractor", () => {
     const doc = extractDocument(
-      "text/plain",
-      "mirror https://host.test/p?x=one'two and https://host.test/one`two",
+      "text/html",
+      '<a href="/one`two?x=one&lt;two!">next</a><div hidden><a href="/hidden">hidden</a></div>',
       "https://host.test/page",
     );
-    const state = stateFor("https://host.test/page");
+    const state = stateFor("");
     recordPageLinks(state, doc.links);
-    expect(admitCandidate(state, "https://host.test/p?x=one'two").href).toBe(
-      "https://host.test/p?x=one%27two",
-    );
-    expect(admitCandidate(state, "https://host.test/one`two").href).toBe(
-      "https://host.test/one%60two",
-    );
-    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=one"))).toBe("url-unrecorded");
-    expect(codeOf(() => admitCandidate(state, "https://host.test/one"))).toBe("url-unrecorded");
-  });
-
-  it("drops an ambiguous enclosed token entirely rather than granting its prefix", () => {
-    // An opening backtick with no close: the reference is ambiguous, so neither
-    // the whole token nor a prefix of it is recorded.
-    const state = stateFor("see `https://host.test/amb");
-    expect(codeOf(() => admitCandidate(state, "https://host.test/amb"))).toBe("url-unrecorded");
+    expect([...state.recorded.values()]).toEqual(["https://host.test/one%60two?x=one%3Ctwo!"]);
   });
 });
 
@@ -238,7 +246,7 @@ describe("admission budgets", () => {
     expect(codeOf(() => chargeFetchAttempt(state, cfg))).toBe("budget-fetch");
   });
 
-  it("charges the returned text against the shared allowance and reports what remains", () => {
+  it("charges extracted document text and reports the remaining allowance", () => {
     const state = stateFor("x");
     const cfg = settings({ textPerTurn: 100 });
     chargeText(state, cfg, 60);

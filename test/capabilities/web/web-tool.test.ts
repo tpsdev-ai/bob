@@ -104,7 +104,7 @@ describe("web_fetch — the success path", () => {
     );
   });
 
-  it("records the complete links on the fetched page so a later call can follow them", async () => {
+  it("records a fetched-page link for a later call", async () => {
     const state = newTurnState("go to https://host.test/a", RUN);
     const tool = toolFor(
       state,
@@ -124,7 +124,7 @@ describe("web_fetch — the success path", () => {
     expect(follow.calls.urls).toEqual(["https://host.test/next"]);
   });
 
-  it("vets every redirect target against provenance before it is followed", async () => {
+  it("refuses the injected unrecorded redirect target", async () => {
     const state = newTurnState("go to https://host.test/a", RUN);
     const tool = toolFor(
       state,
@@ -241,7 +241,7 @@ describe("web_fetch — refusals", () => {
     expect(await codeOf(run(tool, "example.test/a"))).toBe("url-invalid");
   });
 
-  it("refuses absent state (no admitted prompt)", async () => {
+  it("refuses absent operation state", async () => {
     const tool = toolFor(
       undefined,
       settings(),
@@ -251,7 +251,7 @@ describe("web_fetch — refusals", () => {
     expect(await codeOf(run(tool, "https://host.test/a"))).toBe("no-admission");
   });
 
-  it("refuses when the running admission does not match the seeded one", async () => {
+  it("refuses when the running origin differs from the seeded origin", async () => {
     const state = newTurnState("https://host.test/a", { kind: "cron", job: "brief" });
     const tool = toolFor(
       state,
@@ -275,7 +275,7 @@ describe("web_fetch — refusals", () => {
 });
 
 describe("web_fetch — the attempt budget charges before I/O", () => {
-  it("charges a failed call (the attempt still counts)", async () => {
+  it("charges a recorded attempt whose fetch fails", async () => {
     const state = newTurnState("https://host.test/a", RUN);
     const tool = toolFor(
       state,

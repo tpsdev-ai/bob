@@ -212,12 +212,11 @@ function absoluteHttpLinks(hrefs: readonly string[]): string[] {
   return out;
 }
 
-// A document's returned text and the complete links it carries.
+// A document's returned text and recorded URLs.
 export interface ExtractedDocument {
   text: string;
-  // Complete absolute http(s) URLs: for HTML, the anchors resolved against the
-  // page; for any other type, the absolute URLs in the text. Never rebuilt from
-  // the returned (and possibly truncated) display text.
+  // Retained, resolvable HTTP(S) anchors for HTML; scanned absolute URLs for
+  // other media. Extracted before display-text truncation.
   links: string[];
 }
 

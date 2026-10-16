@@ -2,7 +2,7 @@
 //
 // The unit of state is one ADMITTED OPERATION — a single runtime turn
 // admission, including its retries and automatic continuations. The extension
-// seeds one state on the operation's first prompt and keeps it, unchanged, for
+// seeds one state on the operation's first prompt and reuses it for
 // every later prompt the operation sends (pi fires `before_agent_start` once per
 // prompt, so a continuation must NOT reseed). The runtime's admission token
 // tells those apart: the same token continues, a new one replaces, and no token
@@ -10,7 +10,7 @@
 // prompt chain has settled) seeds nothing. A call outside a live admitted
 // operation finds no state and is refused. An attempt is charged for a
 // RECORDED candidate before its fetch (so a failed fetch still counts); the
-// returned text is charged after the response, against the same operation's
+// extracted document text is charged after the response, against the operation's
 // allowance.
 //
 // This module owns URLs (provenance.ts) and the two budgets: fetch attempts and
@@ -47,8 +47,8 @@ export function newTurnState(prompt: string, origin: TurnOrigin): WebTurnState {
   return { id: nextStateId++, origin, recorded, fetchAttempts: 0, textChars: 0 };
 }
 
-// Record the complete links a fetched page carried (extract.ts), already
-// resolved against the page. Nothing is rebuilt from the returned display text.
+// Record extractor results: retained, resolvable HTTP(S) anchors for HTML,
+// scanned absolute URLs for other media.
 export function recordPageLinks(state: WebTurnState, links: readonly string[]): void {
   recordLinks(state.recorded, links);
 }
@@ -82,7 +82,7 @@ export function admitCandidate(state: WebTurnState, candidate: string): URL {
   if (!state.recorded.has(urlKey(url))) {
     throw new WebFetchError(
       "url-unrecorded",
-      "this URL did not appear in the message or on a fetched page; search for it or ask for the link",
+      "this URL was not recorded from the message or a fetched page; search for it or ask for the link",
     );
   }
   return url;
@@ -107,7 +107,7 @@ export function textAllowanceRemaining(state: WebTurnState, settings: WebSetting
   return Math.max(0, settings.textPerTurn - state.textChars);
 }
 
-// Charge returned text against the shared allowance. Refused when it would
+// Charge extracted document text against the shared allowance. Refused when it would
 // exceed the allowance; the caller caps the text to what remains first.
 export function chargeText(state: WebTurnState, settings: WebSettings, chars: number): void {
   if (chars > textAllowanceRemaining(state, settings)) {

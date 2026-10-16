@@ -93,7 +93,7 @@ describe("web extension — per-operation state", () => {
     expect(w.fetchCalls).toEqual(["https://a.test/x"]);
   });
 
-  it("keeps the state across a continuation (same token): provenance and budgets survive", async () => {
+  it("keeps recorded URLs and fetch-attempt spend across a continuation", async () => {
     const w = wire(() => ADMISSION_A);
     w.fire("before_agent_start", { prompt: "read https://a.test/x" });
     await w.tools[0].execute("id", { url: "https://a.test/x" });
@@ -147,7 +147,7 @@ describe("web extension — per-operation state", () => {
     expect(w.handle.currentState()).toBeUndefined();
   });
 
-  it("refuses with no state before any before_agent_start (a failed preflight seeds nothing)", async () => {
+  it("refuses before the first before_agent_start", async () => {
     const w = wire(() => ADMISSION_A);
     expect(await codeOf(w.tools[0].execute("id", { url: "https://a.test/x" }))).toBe(
       "no-admission",

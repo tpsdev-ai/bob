@@ -12,7 +12,7 @@
 // OPERATION: the runtime turn admission the prompt runs inside, including its
 // automatic continuations. The extension seeds a fresh state on the operation's
 // first `before_agent_start` (the event after prompt expansion and before the
-// agent loop) and keeps it, unchanged, for the operation's later prompts; a
+// agent loop) and reuses it for the operation's later prompts; a
 // prompt outside any admission (a bare prompt that the runtime did not route
 // through one) seeds nothing and `web_fetch` is refused. Session close drops
 // the state.

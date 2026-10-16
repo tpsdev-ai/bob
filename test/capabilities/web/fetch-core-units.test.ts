@@ -122,7 +122,7 @@ it("refuses when the deadline fires during extraction after the body is read", a
   }
 });
 
-it("reports the complete page links even when the display text is cut", async () => {
+it("reports a resolved HTML anchor before display-text truncation", async () => {
   const body = '<p>intro</p><a href="/deep/next?x=1">go</a>';
   const response = {
     headers: { "content-type": "text/html" },

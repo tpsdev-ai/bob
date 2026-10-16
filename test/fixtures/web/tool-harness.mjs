@@ -56,9 +56,6 @@ server.on("connection", () => {
 await new Promise((resolve) => server.listen(0, LOOPBACK, resolve));
 const port = server.address().port;
 
-// The seams a loopback case needs: add 127.0.0.1 to public-unicast
-// classification, use the peer's ephemeral port, and answer DNS with the
-// loopback address so the connector's lookup vets and returns it.
 const base = publicUnicastPolicy({ own: [] });
 const addressPolicy = {
   version: base.version,

@@ -171,9 +171,8 @@ export interface FetchResult {
   text: string;
   // True when the text was cut.
   truncated: boolean;
-  // The complete absolute http(s) links the document carries, from the full
-  // body (never from the cut display text): the anchors resolved against the
-  // page for HTML, the absolute URLs in the text otherwise.
+  // Retained, resolvable HTTP(S) anchors for HTML; scanned absolute URLs for
+  // other media. Extracted from the full body before display-text truncation.
   links: readonly string[];
 }
 

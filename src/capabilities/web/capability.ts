@@ -9,7 +9,7 @@
 // before_agent_start/agent_settled pair: pi fires those once per prompt, and
 // bob's automatic continuations (turn-admission's reasoning retries) send more
 // prompts inside the same admission. The state is seeded on the first prompt of
-// an operation and kept, unchanged, for the rest of it (same token), so
+// an operation and reused for the rest of it (same token), so
 // provenance and spend survive the operation's continuations. A prompt outside
 // any admission (a bare prompt) seeds nothing.
 

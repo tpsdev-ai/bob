@@ -83,7 +83,7 @@ test(
     expect(unrecorded.code).toBe("url-unrecorded");
 
     // A redirect to an unrecorded destination is refused before dispatch: the
-    // peer received the redirect response but NO request for the destination.
+    // peer sent the redirect response and received no request for the destination.
     const redirect = report.cases.redirect;
     expect(redirect.ok).toBe(false);
     expect(redirect.code).toBe("url-unrecorded");

@@ -2,7 +2,7 @@
 // core with URL provenance and the admission budgets: it admits the URL against
 // the operation's recorded URLs, charges a fetch attempt before the fetch,
 // calls the fetch core (vetting every redirect target against provenance before
-// it is followed), records the complete links the returned page carried, and
+// it is followed), records the extractor's URLs, and
 // charges the extracted document text against the shared allowance.
 //
 // It registers nothing here; index.ts wires this definition to pi. `fetch` is a
@@ -74,7 +74,7 @@ export function createWebFetchTool(
     name: WEB_FETCH_TOOL_NAME,
     label: "Web Fetch",
     description:
-      "Fetch a URL and return its readable text, final URL, HTTP status and content type. The URL must be one that appeared in the message the operation started from or on a page already fetched in the same operation; a composed URL is refused. Plain HTTP is allowed only when the operator enables it.",
+      "Fetch a URL and return its readable text, final URL, HTTP status and content type. The URL must match one recorded from the operation's triggering message or a fetched page. Plain HTTP is allowed only when the operator enables it.",
     parameters: WEB_FETCH_PARAMS,
     async execute(_toolCallId: string, params: WebFetchParams) {
       const state = deps.currentState();
@@ -88,7 +88,7 @@ export function createWebFetchTool(
       if (origin === undefined || originKey(origin) !== originKey(state.origin)) {
         throw new WebFetchError(
           "admission-mismatch",
-          "the running turn's origin does not match the one this prompt's state was seeded for",
+          "the running turn's origin does not match the one this operation's state was seeded for",
         );
       }
 

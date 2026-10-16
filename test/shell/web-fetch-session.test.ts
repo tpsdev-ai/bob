@@ -1,16 +1,6 @@
-// The web_fetch tool on a REAL pi session, through bob's ONE session factory,
-// with the REAL turn admission and pi's real lifecycle and tool-parameter
-// validator (bob#152, spec v3, slice R1c; round 2). Only the model transport
-// and the network fetch are scripted: the session, the admission, the extension
-// wiring (`wireWebCapability`), tool registration, argument validation and the
-// agent loop are the ones production uses. No event is hand-fired and no
-// `readOrigin` is faked.
-//
-// It covers: a bare prompt outside any admission (refused), an admitted call
-// (allowed), bob's automatic continuation (provenance survives; the fetch and
-// text budgets do not replenish), settlement (the token is revoked, so neither a
-// later call nor a captured descendant context can fetch), and an invalid tool
-// argument (refused by pi's validator before execution).
+// The web_fetch tool through bob's session factory, real turn admission,
+// pi lifecycle and tool-parameter validator, with a synthetic extension
+// entrypoint, scripted model transport and injected fetch.
 
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -274,8 +264,7 @@ test("an admitted call fetches a URL recorded from the admitted prompt", async (
 
 test("provenance survives bob's automatic continuation (reasoning-only re-prompt)", async () => {
   const live = await webSession([
-    // 1. a tool call before the reasoning-only ending: it records the URL and
-    //    spends both budgets.
+    // 1. a tool call spends both budgets; the admission seed recorded the URL.
     { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
     // 2. reasoning-only ending: bob re-prompts the SAME admission.
     { thinking: "let me consider" },
