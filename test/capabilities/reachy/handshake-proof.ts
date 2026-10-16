@@ -118,7 +118,7 @@ export async function probeVoiceHandshake(
       return {
         ok: false,
         reason: "no-listener",
-        detail: `no listener on ${socket} (the connect was ${opened === "refused" ? "refused" : "not completed"})`,
+        detail: `no listener on ${socket} accepted the connect (it was ${opened === "refused" ? "refused" : "not completed"}); a sidecar busy with another session can also refuse it, so stop bob's reachy capability before this proof`,
       };
     }
 

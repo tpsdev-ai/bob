@@ -453,11 +453,14 @@ describe("bob#356 V1 — the real voice sidecar", () => {
       expect(timed.reason).toBe("handshake-timeout");
 
       // Take the sidecar's one pending slot as well: a further connect is refused,
-      // and the probe reports the refused connect, not a guessed diagnosis.
+      // and the probe reports the refused connect, not a guessed diagnosis. How
+      // many pending connects the listen backlog admits is platform behaviour: on
+      // Linux this connect takes the slot; on macOS the backlog can already be
+      // full and refuse it. Either way the probe's own connect is refused next.
       const queued = createConnection(inst.sock);
-      await new Promise<void>((resolve, reject) => {
-        queued.once("error", reject);
-        queued.once("connect", resolve);
+      await new Promise<void>((resolve) => {
+        queued.once("error", () => resolve());
+        queued.once("connect", () => resolve());
       });
       const refused = await probeVoiceHandshake(
         inst.sock,
