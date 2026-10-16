@@ -385,28 +385,28 @@ function statSafe(p) {
  * content is exactly one account name. `owners` and `from` are test seams.
  */
 export function readDeploymentRecord(path = DEPLOYMENT_RECORD, { owners, from } = {}) {
-  let st;
-  try {
-    st = lstatSync(path);
-  } catch {
-    return { reason: `the deployment record ${path} is missing (RUNBOOK step 4)` };
-  }
-  if (!st.isFile()) return { reason: `the deployment record ${path} is not a regular file` };
-  for (const q of prefixesOf(resolve(path), from ?? "/")) {
-    if (lstatSync(q).isSymbolicLink()) {
-      return { reason: `${q} (on the deployment record's path) is a symlink` };
-    }
-  }
-  const problems = chainProblems(path, { owners, from });
-  if (problems.length > 0) {
-    return { reason: `${problems[0]}, so the deployment record is untrusted` };
-  }
   let text;
   try {
     const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const opened = fstatSync(fd);
       if (!opened.isFile()) {
+        return { reason: `the deployment record ${path} is not a regular file` };
+      }
+      for (const q of prefixesOf(resolve(path), from ?? "/")) {
+        if (lstatSync(q).isSymbolicLink()) {
+          return { reason: `${q} (on the deployment record's path) is a symlink` };
+        }
+      }
+      const problems = chainProblems(path, { owners, from });
+      if (problems.length > 0) {
+        return { reason: `${problems[0]}, so the deployment record is untrusted` };
+      }
+      const st = lstatSync(path);
+      if (st.isSymbolicLink()) {
+        return { reason: `${path} (on the deployment record's path) is a symlink` };
+      }
+      if (!st.isFile()) {
         return { reason: `the deployment record ${path} is not a regular file` };
       }
       if (opened.dev !== st.dev || opened.ino !== st.ino) {
@@ -416,7 +416,13 @@ export function readDeploymentRecord(path = DEPLOYMENT_RECORD, { owners, from } 
     } finally {
       closeSync(fd);
     }
-  } catch {
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { reason: `the deployment record ${path} is missing (RUNBOOK step 4)` };
+    }
+    if (error.code === "ELOOP") {
+      return { reason: `${path} (on the deployment record's path) is a symlink` };
+    }
     return { reason: `the deployment record ${path} cannot be read` };
   }
   const user = text.endsWith("\n") ? text.slice(0, -1) : text;

@@ -196,7 +196,7 @@ describe("bob#356 — the isolation-proof release gate", () => {
       ).toContain("is not root-owned");
       const link = join(dir, "link");
       symlinkSync(mine, link);
-      expect(readDeploymentRecord(link).reason).toContain("not a regular file");
+      expect(readDeploymentRecord(link).reason).toContain("is a symlink");
       expect(readDeploymentRecord(join(dir, "absent")).reason).toContain("is missing");
     } finally {
       rmSync(dir, { recursive: true, force: true });

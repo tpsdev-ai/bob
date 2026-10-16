@@ -328,7 +328,7 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
   });
 
   it.skipIf(!DARWIN).each(["file", "symlink", "directory"])(
-    "the deployment record refuses a replacement %s between lstat and open",
+    "the deployment record refuses a replacement %s between open and the final path check",
     (kind) => {
       const { f } = fixture();
       const record = join(f, "state/agent-user");
@@ -352,13 +352,12 @@ describe("bob#356 [P7] — the release host's trusted paths, on fixture trees", 
       };
       const result = readDeploymentRecord(record, seams);
       expect(result).toEqual({
-        reason: `the deployment record ${record} ${
-          kind === "file"
-            ? "changed while checked"
-            : kind === "symlink"
-              ? "cannot be read"
-              : "is not a regular file"
-        }`,
+        reason:
+          kind === "symlink"
+            ? `${record} (on the deployment record's path) is a symlink`
+            : `the deployment record ${record} ${
+                kind === "file" ? "changed while checked" : "is not a regular file"
+              }`,
       });
     },
   );
