@@ -59,8 +59,9 @@ export interface HandshakeProofOptions {
 const CLOSED = Symbol("closed");
 const TIMED_OUT = Symbol("timed-out");
 
-/** Connect bob's real client within `ms`; "refused" is any connect failure
- *  (including a connect that never completes — both mean nothing accepted us). */
+/** Connect bob's real client within `ms`. Returns "refused" when the connect
+ *  fails and "timeout" when it does not complete within `ms`; the probe maps
+ *  both outcomes to `no-listener`. */
 async function connectClient(
   client: UnixSocketReachyClient,
   ms: number,

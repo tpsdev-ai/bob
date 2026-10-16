@@ -441,8 +441,9 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     const bob = await connectBob(inst);
     try {
       await waitFor(() => bob.wired.link().phase === "ready", "the handshake");
-      // The live session holds the sidecar in `accept()`; the probe's connect is
-      // queued and its `configure` is never read, so no line arrives in the limit.
+      // The live session holds the sidecar in `Session.serve()`; the probe's
+      // connection queues until that session ends, its `configure` is never read,
+      // so no line arrives in the limit.
       const timed = await probeVoiceHandshake(
         inst.sock,
         { version: SIDECAR_VERSION, profile: "voice", wakeName: "jarvis", generation: 1 },
