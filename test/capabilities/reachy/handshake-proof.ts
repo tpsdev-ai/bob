@@ -140,17 +140,29 @@ export async function probeVoiceHandshake(
     };
   }
 
-  try {
-    await client.send(
-      "configure",
-      configureArgs({
-        version: expectedVersion,
-        profile: opts.profile ?? "voice",
-        wakeName: opts.wakeName ?? "jarvis",
-        generation: opts.generation ?? 1,
-      }),
-    );
-  } catch {
+  let sendTimer: ReturnType<typeof setTimeout> | undefined;
+  const sendTimedOut = new Promise<typeof TIMED_OUT>((resolve) => {
+    sendTimer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
+  });
+  const sent = await Promise.race([
+    client
+      .send(
+        "configure",
+        configureArgs({
+          version: expectedVersion,
+          profile: opts.profile ?? "voice",
+          wakeName: opts.wakeName ?? "jarvis",
+          generation: opts.generation ?? 1,
+        }),
+      )
+      .then(
+        () => "ok" as const,
+        () => "failed" as const,
+      ),
+    sendTimedOut,
+  ]);
+  if (sendTimer !== undefined) clearTimeout(sendTimer);
+  if (sent !== "ok") {
     client.disconnect();
     return {
       ok: false,
@@ -186,7 +198,8 @@ export async function probeVoiceHandshake(
 
   // No health line within the limit. A listener already serving its one
   // connection refuses a further connect; a listener that accepted and never
-  // answered accepts it. That is the only observable distinguishing them.
+  // answered accepts it. That refusal is what separates a busy listener from a
+  // wedged one.
   const canary = await connectRaw(socket, connectMs);
   client.disconnect();
   if (canary.kind === "open") {
