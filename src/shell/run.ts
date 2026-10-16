@@ -65,6 +65,7 @@ import {
   readTools,
 } from "./bob-yaml.js";
 import {
+  assertConditionalTools,
   capabilityConfigEnv,
   type ResolvedCapability,
   resolveCapabilities,
@@ -149,7 +150,7 @@ import {
   ToolLoopError,
 } from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
-import { originValidationError } from "./turn-origin.js";
+import { originValidationError, type TurnOrigin } from "./turn-origin.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -612,6 +613,11 @@ export interface RunSessionConfig {
   persistent?: boolean;
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
+  // bob#356: the origin the runtime DECLARES for a session no admission serves:
+  // `{kind:"run"}` only for an operator's one-shot `bob run` (the CLI entry
+  // passes RunOptions.sessionOrigin); absent for `bob launch`, a mail turn and
+  // every other caller. Never read from bob.yaml or a prompt.
+  sessionOrigin?: TurnOrigin;
   // The tool policy resolved from bob.yaml's `tools:` block + top-level
   // `resident:` flag, with role.json as the ceiling (see tool-allowlist.ts).
   // `tools` is pi's STRICT allowlist and is REQUIRED: the type says so, and
@@ -697,6 +703,11 @@ export type RunSessionFactory = (config: RunSessionConfig) => Promise<RunSession
 export interface RunOptions {
   // Agent name. Config lives at ~/agents/<name>/.
   name: string;
+  // bob#356: the origin the RUNTIME declares for this one-shot session. Only
+  // the `bob run <name> "<task>"` CLI entry passes it (an operator's run); a
+  // prompted `bob launch`, a mail turn and every other caller leave it unset,
+  // so their tool calls are bound to nothing.
+  sessionOrigin?: { kind: "run" };
   // The validated provider selection this run resolves against. Loaded ONCE by
   // the caller (the CLI) and threaded here; it defaults to the built-in table
   // for tests. Never re-loaded per call.
@@ -933,6 +944,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.noProgressMs !== undefined ? { noProgressMs: opts.noProgressMs } : {}),
     ...(opts.turnTimeoutMs !== undefined ? { turnTimeoutMs: opts.turnTimeoutMs } : {}),
   });
+  // bob#356: only the session the `bob run` CLI entry declares an operator's
+  // run binds the `run` origin (never a mail turn, whatever the caller passes).
+  if (opts.sessionOrigin?.kind === "run" && opts.mailTurn !== true) {
+    resolved.config.sessionOrigin = { kind: "run" };
+  }
   const bounds = createRunBounds(limits, opts.timer);
   try {
     return await runBoundedSession(opts, opts.prompt, taskContract, resolved, bounds);
@@ -2511,6 +2527,12 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilityEnv = capabilityConfigEnv(resolution);
     capabilities = resolution.capabilities;
   }
+
+  // bob#356: a capability whose tools depend on its config (reachy's device
+  // profile) registers only the configured row. An allowlist naming a tool that
+  // row lacks is refused HERE, by name, for both branches — before the
+  // session's registry audit would refuse it only as "not active".
+  assertConditionalTools(toolPolicy, capabilities);
 
   // bob#214: the session budget (bob.yaml `session:` over role.json `session`),
   // resolved after the tool policy so a config the policy already refuses is

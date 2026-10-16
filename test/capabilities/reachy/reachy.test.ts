@@ -17,6 +17,7 @@ import {
 } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
 import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { readyLink, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class FakePi implements PiLike {
   readonly tools = new Map<
@@ -93,7 +94,7 @@ class FakeStore implements OrgEventStore {
   }
 }
 
-function harness(
+async function harness(
   enrolment: Record<string, string>,
   opts: { mute?: boolean; store?: FakeStore } = {},
 ) {
@@ -101,12 +102,16 @@ function harness(
   const commands = new FakeCommands();
   const memory = new FakeMemory();
   const store = opts.store ?? new FakeStore();
+  // bob#356: the S3 suite runs the BODY profile (it exercises look/frame) and
+  // grants room speech to an operator's run, so the tool path can speak.
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment,
     mute: opts.mute ?? false,
     nowMs: () => Date.now(),
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: ["run"],
   };
   const wired: WiredReachy = wireReachyCapability({
     pi,
@@ -114,8 +119,12 @@ function harness(
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: () => {},
   });
+  // A ready reachy-voice/1 link (bob mute drops the health line, as it drops
+  // every line, so a muted harness stays unready — and muted).
+  if (!state.mute) await readyLink(wired, state, commands);
   return { pi, commands, memory, store, wired, state };
 }
 const transcriptLine = (over: Record<string, unknown> = {}) => ({
@@ -129,7 +138,7 @@ const transcriptLine = (over: Record<string, unknown> = {}) => ({
 
 describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   it("(a) addressed + speakerVerified => ONE private memory with speakerId, and explainMemory answers 'why' by EXACT id", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     const r = await h.wired.handleLine(transcriptLine());
     expect(r).toEqual({ kind: "memory", memoryId: "mem_1" });
     expect(h.memory.writes.length).toBe(1);
@@ -148,7 +157,7 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   });
 
   it("(b) addressed but NOT verified => no write, at most one acknowledge per minute", async () => {
-    const h = harness({});
+    const h = await harness({});
     const t = transcriptLine({ speakerId: "spk-visitor" });
     expect(await h.wired.handleLine(t)).toEqual({ kind: "ephemeral", acknowledged: true });
     expect(await h.wired.handleLine(t)).toEqual({ kind: "ephemeral", acknowledged: false });
@@ -157,7 +166,7 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   });
 
   it("(c) not addressed => nothing at all", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     expect(await h.wired.handleLine(transcriptLine({ text: "what time is standup" }))).toEqual({
       kind: "none",
     });
@@ -166,7 +175,7 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   });
 
   it("(d) egress: EVERY memory jarvis wrote is private", async () => {
-    const h = harness({ "spk-1": "member-1", "spk-2": "member-2" });
+    const h = await harness({ "spk-1": "member-1", "spk-2": "member-2" });
     await h.wired.handleLine(transcriptLine({ text: "jarvis, note A", speakerId: "spk-1" }));
     await h.wired.handleLine(transcriptLine({ text: "jarvis, note B", speakerId: "spk-2" }));
     expect(h.memory.writes.length).toBe(2);
@@ -174,7 +183,7 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   });
 
   it("(e) proposal{answer} is NOT executed; a prose-only proposal is rejected", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     await h.wired.handleLine(transcriptLine());
     const r = await h.wired.handleLine({
       type: "proposal",
@@ -190,7 +199,7 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
   });
 
   it("(f) mute: true => events dropped, no OrgEvents", async () => {
-    const h = harness({ "spk-1": "member-1" }, { mute: true });
+    const h = await harness({ "spk-1": "member-1" }, { mute: true });
     expect(await h.wired.handleLine(transcriptLine())).toEqual({ kind: "drop" });
     expect(h.memory.writes.length).toBe(0);
     expect(h.store.all.length).toBe(0);
@@ -199,13 +208,13 @@ describe("reachy S3 policy (bob#180 §3.3/§4)", () => {
 
 describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", () => {
   it("item 2: a failing event store leaves NO memory; after restart explainMemory still answers by id", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     h.store.fail = true;
     expect((await h.wired.handleLine(transcriptLine())).kind).toBe("refused");
     expect(h.memory.writes.length).toBe(0);
     h.store.fail = false;
     await h.wired.handleLine(transcriptLine({ text: "jarvis, note persist" }));
-    const h2 = harness({ "spk-1": "member-1" }, { store: h.store }); // fresh instance, same store
+    const h2 = await harness({ "spk-1": "member-1" }, { store: h.store }); // fresh instance, same store
     const why = await explainMemory("mem_1", {
       getMemory: (id) => Promise.resolve(h.memory.metadata(id)),
       store: h2.store,
@@ -217,7 +226,7 @@ describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", ()
   });
 
   it("item 2a: reachy_say refuses ANY memory reference (any name), and audits reachy.refused", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     await h.wired.handleLine(transcriptLine());
     for (const bad of [{ memoryId: "private-record-42" }, { memory: "x" }, { recallId: "mem_1" }]) {
       const before = h.commands.sent.length;
@@ -229,7 +238,7 @@ describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", ()
   });
 
   it("item 2b: reachy_frame sends a `frame` command with its own audit event", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     await h.wired.handleLine(transcriptLine());
     const out = await h.pi.call("reachy_frame", {});
     expect(out).toContain("frame");
@@ -238,7 +247,7 @@ describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", ()
   });
 
   it("item 4: an oversized line is malformed (never buffered) and an extra wire field is malformed", async () => {
-    const h = harness({});
+    const h = await harness({});
     expect(decodeLine({ type: "__oversized__" }).kind).toBe("malformed");
     expect(MAX_LINE_BYTES).toBe(64 * 1024);
     // unknown field on a transcript → malformed (strict trust boundary)
@@ -258,7 +267,7 @@ describe("reachy S3 round 3 — durable exact-id audit, gated tools, bounds", ()
   });
 
   it("item 3: ten unverified look proposals admit exactly one (the rate limit advances)", async () => {
-    const h = harness({});
+    const h = await harness({});
     let admitted = 0;
     for (let i = 0; i < 10; i++) {
       const r = await h.wired.handleLine({

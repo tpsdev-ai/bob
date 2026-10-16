@@ -479,6 +479,9 @@ async function run(
     prompt,
     model,
     registry,
+    // bob#356: this — the operator's own `bob run` — is the one entry that
+    // declares the `run` origin for its session (a `run` room-speech grant).
+    sessionOrigin: { kind: "run" },
     captureStdout: true,
     ...(wallClockMs !== undefined ? { wallClockMs } : {}),
     ...(noProgressMs !== undefined ? { noProgressMs } : {}),

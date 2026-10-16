@@ -30,7 +30,15 @@ function wire() {
     commands: { send: async () => null },
     memory: { writePrivate: async () => ({ id: "mem-1" }) },
     store: { write: async () => ({ id: "e" }), getById: async () => null },
-    state: { wakeName: "jarvis", enrolment: {}, mute: false, nowMs: () => 1 },
+    state: {
+      profile: "reachy",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => 1,
+      roomSpeechOrigins: [],
+    },
+    sidecarVersion: "test-sidecar-1",
     log: () => {},
   });
   return pi;
