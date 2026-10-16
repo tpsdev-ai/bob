@@ -65,7 +65,6 @@ class FakeCommands implements ReachyCommands {
   readonly sent: Array<{ command: string; args?: Record<string, unknown> }> = [];
   failOn = new Set<string>();
   disconnects = 0;
-  /** Called when the store's write starts, to interleave events (stale tests). */
   async send(command: string, args?: Record<string, unknown>): Promise<unknown> {
     if (this.failOn.has(command)) throw new Error(`send of ${command} failed`);
     this.sent.push({ command, args });
