@@ -31,6 +31,7 @@ import {
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { must } from "./handshake.js";
+import { probeVoiceHandshake } from "./handshake-proof.js";
 
 const digest = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 16);
 
@@ -431,6 +432,47 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     const sc = start(inst, ["--device-mute", "absent"]);
     await waitFor(() => sc.log().includes("listening"), "listening");
     expect(existsSync(join(inst.work, "tts-crashed"))).toBe(false);
+  }, 30_000);
+
+  it("the handshake proof against the REAL sidecar: a live session answers nothing, so the probe reports handshake-timeout; with the sidecar's one pending slot also taken, the connect is refused and the probe reports no-listener", async () => {
+    const inst = install();
+    const sc = start(inst, ["--device-mute", "absent"]);
+    await waitFor(() => sc.log().includes("listening"), "listening");
+    const bob = await connectBob(inst);
+    try {
+      await waitFor(() => bob.wired.link().phase === "ready", "the handshake");
+      // The live session holds the sidecar in `Session.serve()`; the probe's
+      // connection queues until that session ends, its `configure` is never read,
+      // so no line arrives in the limit.
+      const timed = await probeVoiceHandshake(
+        inst.sock,
+        { version: SIDECAR_VERSION, profile: "voice", wakeName: "jarvis", generation: 1 },
+        { timeoutMs: 800, connectMs: 1_000 },
+      );
+      expect(timed.ok).toBe(false);
+      expect(timed.reason).toBe("handshake-timeout");
+
+      // Take the sidecar's one pending slot as well: a further connect is refused,
+      // and the probe reports the refused connect, not a guessed diagnosis. How
+      // many pending connects the listen backlog admits is platform behaviour: on
+      // Linux this connect takes the slot; on macOS the backlog can already be
+      // full and refuse it. Either way the probe's own connect is refused next.
+      const queued = createConnection(inst.sock);
+      await new Promise<void>((resolve) => {
+        queued.once("error", () => resolve());
+        queued.once("connect", () => resolve());
+      });
+      const refused = await probeVoiceHandshake(
+        inst.sock,
+        { version: SIDECAR_VERSION, profile: "voice", wakeName: "jarvis", generation: 1 },
+        { timeoutMs: 800, connectMs: 1_000 },
+      );
+      expect(refused.ok).toBe(false);
+      expect(refused.reason).toBe("no-listener");
+      queued.destroy();
+    } finally {
+      bob.client.close();
+    }
   }, 30_000);
 
   it("contains no audio-capture code path (V1 has no ears)", () => {

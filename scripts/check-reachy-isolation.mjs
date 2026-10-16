@@ -50,7 +50,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
 export const PROOFS = ["test/capabilities/reachy/isolation.test.ts"];
 // The pinned proof set (isolation.test.ts names each with its id).
-export const EXPECTED_PROOFS = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"];
+export const EXPECTED_PROOFS = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"];
 // The only caller variables the proofs inherit (PATH and HOME are SET by the
 // check, never inherited).
 export const CHECK_ENV = ["TMPDIR", "LANG", "BOB_ISOLATION_AGENT"];
@@ -538,6 +538,12 @@ if (import.meta.main) {
     process.stdout.write(`reachy-voice isolation release check: FAIL — ${refused}\n`);
     process.exit(1);
   }
+  // [P9] speaks to the deployed sidecar, which serves ONE connection at a time.
+  // A link bob's reachy capability still holds consumes the answer, so stop that
+  // capability first; the proof then reports what the connect and the wire show.
+  process.stdout.write(
+    "reachy-voice isolation release check: [P9] run with bob's reachy capability STOPPED (its live link consumes the sidecar's answer).\n",
+  );
   const r = spawnSync(process.execPath, ["test", ...PROOFS], {
     cwd: ROOT,
     env: checkEnv(process.env),
