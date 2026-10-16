@@ -25,7 +25,8 @@
     "typecheck": "tsc -p . --noEmit && tsc -p test/types --noEmit",
     "test": "bun run build && bun test",
     "lint": "biome check .",
-    "lint:fix": "biome check --write ."
+    "lint:fix": "biome check --write .",
+    "check:reachy-isolation": "bun scripts/check-reachy-isolation.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",

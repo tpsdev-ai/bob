@@ -33,6 +33,11 @@ export interface TurnAdmission {
   // the operation's retries and automatic continuations — so a lifecycle hook
   // can tell a continuation of the same operation from a new admission.
   activeAdmission(): AdmissionToken | undefined;
+  // bob#356: the same binding, WITHOUT the default. The origin of the admitted
+  // turn the caller runs inside, or undefined anywhere else — a prompt outside
+  // every admission, or a turn whose prompt has settled. A gate that grants by
+  // origin reads this, so a missing admission can never pass as `run`.
+  readAdmittedOrigin(): TurnOrigin | undefined;
 }
 
 // One runtime owns one FIFO. Async context binds the origin to the actual
@@ -65,6 +70,8 @@ export function createTurnAdmission(
   const agentName = opts.name ?? "agent";
   type Turn = {
     origin: TurnOrigin;
+    // Set when the prompt settled and the origin binding was released.
+    released?: boolean;
     messages: unknown[];
     detector: ToolLoopDetector;
     token: AdmissionToken;
@@ -127,6 +134,23 @@ export function createTurnAdmission(
         approved = approvedOrigin(origin);
       } catch (err) {
         return Promise.reject(err);
+      }
+      // bob#356 V1: the `voice` kind exists so the union, its validation, its
+      // projection and its label land together, but no voice-origin turn is
+      // admitted yet. A voice turn needs the tool admission that leaves it only
+      // `reachy_say` (D1) and the fresh, allowlisted session it runs in (D2);
+      // neither ships in V1, and the resident session holds every other tool
+      // and the private context. Refused before queuing, so nothing is prompted.
+      // Pinned for V2 (Sherlock NEW-7): that disposable session REPLACES pi's
+      // assembled system prompt — `systemPromptOverride` set to bob's fixed
+      // voice instruction, as the web session does (session.ts, bob#244) —
+      // because pi's own template names workspace paths.
+      if (approved.kind === "voice") {
+        return Promise.reject(
+          new Error(
+            "bob: voice-origin turns are not admitted yet: they need the voice tool admission and disposable session of bob#356 V2",
+          ),
+        );
       }
       const run = async (): Promise<unknown[]> => {
         await bound;
@@ -192,6 +216,7 @@ export function createTurnAdmission(
           const release = (): void => {
             turn.live = false;
             turn.origin = { kind: "run" };
+            turn.released = true;
             if (active === turn) active = undefined;
           };
           if (await settledWithin(prompt, graceMs)) {
@@ -225,6 +250,11 @@ export function createTurnAdmission(
       // inherited the turn before release.
       const turn = context.getStore();
       return turn?.live ? turn.token : undefined;
+    },
+    readAdmittedOrigin(): TurnOrigin | undefined {
+      const turn = context.getStore();
+      if (!turn || turn.released) return undefined;
+      return { ...turn.origin };
     },
     close(): void {
       closed = true;
@@ -278,11 +308,35 @@ async function settledWithin(p: Promise<void>, ms: number): Promise<boolean> {
 // runtime-owned service at extension load, never per-turn metadata. No module
 // singleton, environment payload, or prompt tag crosses the loader boundary.
 const SERVICE = "bob:turn-admission";
+// bob#356: the origin the RUNTIME declares for a session no admission serves —
+// today only an operator's one-shot `bob run` ({kind:"run"}). Absent for every
+// other session (a mail turn, an interactive launch), so nothing defaults to it.
+const SESSION_ORIGIN_SERVICE = "bob:session-origin";
+
 export function admissionEventBus(admission: TurnAdmission): EventBus {
+  return runtimeEventBus({ admission });
+}
+
+/** The loader's event bus carrying whichever runtime services this session has:
+ *  the turn admission (persistent runtime) and/or the declared session origin
+ *  (one-shot run). */
+export function runtimeEventBus(services: {
+  admission?: TurnAdmission;
+  sessionOrigin?: TurnOrigin;
+}): EventBus {
   const bus = createEventBus();
-  bus.on(SERVICE, (receive) => {
-    (receive as (value: TurnAdmission) => void)(admission);
-  });
+  const { admission, sessionOrigin } = services;
+  if (admission) {
+    bus.on(SERVICE, (receive) => {
+      (receive as (value: TurnAdmission) => void)(admission);
+    });
+  }
+  if (sessionOrigin) {
+    const frozen = approvedOrigin(sessionOrigin);
+    bus.on(SESSION_ORIGIN_SERVICE, (receive) => {
+      (receive as (value: TurnOrigin) => void)({ ...frozen });
+    });
+  }
   return bus;
 }
 
@@ -294,4 +348,28 @@ export function getTurnAdmission(pi: {
     admission = value;
   });
   return admission;
+}
+
+/** The runtime-declared origin of this session, when the runtime declared one. */
+export function getSessionOrigin(pi: { events: Pick<EventBus, "emit"> }): TurnOrigin | undefined {
+  let origin: TurnOrigin | undefined;
+  pi.events.emit(SESSION_ORIGIN_SERVICE, (value: TurnOrigin) => {
+    origin = value;
+  });
+  return origin;
+}
+
+/**
+ * bob#356: the origin a tool call is BOUND to, or undefined. In a session an
+ * admission serves (the persistent runtime), only an admitted turn binds one:
+ * a call outside every admission gets nothing, never `run`. Otherwise only an
+ * origin the runtime declared for the whole session binds (an operator's
+ * one-shot run). No service at all — undefined.
+ */
+export function boundOrigin(services: {
+  admission?: Pick<TurnAdmission, "readAdmittedOrigin">;
+  sessionOrigin?: TurnOrigin;
+}): TurnOrigin | undefined {
+  if (services.admission) return services.admission.readAdmittedOrigin();
+  return services.sessionOrigin ? { ...services.sessionOrigin } : undefined;
 }

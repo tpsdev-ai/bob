@@ -96,7 +96,7 @@ import {
   createContractGuardExtension,
 } from "./system-prompt-contract.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
-import { admissionEventBus } from "./turn-admission.js";
+import { runtimeEventBus } from "./turn-admission.js";
 import { createWriteSoulExtension } from "./write-soul.js";
 
 // pi does not export DefaultResourceLoaderOptions at the package root, so
@@ -1018,6 +1018,7 @@ export function isolatedLoaderOptions(
   > & {
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
+    sessionOrigin?: RunSessionConfig["sessionOrigin"];
   },
   extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[]; webSession?: boolean },
 ): LoaderOptions {
@@ -1036,7 +1037,16 @@ export function isolatedLoaderOptions(
     // noExtensions the loader uses exactly these (temporary CLI scope) and
     // nothing else.
     additionalExtensionPaths: [...config.extensionSources],
-    ...(config.turnAdmission ? { eventBus: admissionEventBus(config.turnAdmission) } : {}),
+    // bob#356: the runtime services a capability may read at load — the turn
+    // admission (persistent) and the declared session origin (one-shot run).
+    ...(config.turnAdmission || config.sessionOrigin
+      ? {
+          eventBus: runtimeEventBus({
+            ...(config.turnAdmission ? { admission: config.turnAdmission } : {}),
+            ...(config.sessionOrigin ? { sessionOrigin: config.sessionOrigin } : {}),
+          }),
+        }
+      : {}),
     // No ambient discovery of anything.
     noExtensions: true,
     noSkills: true,

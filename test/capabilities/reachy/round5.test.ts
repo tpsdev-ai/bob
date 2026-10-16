@@ -12,6 +12,7 @@ import {
 import { MAX_LINE_BYTES, UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { readyLink, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -58,7 +59,7 @@ class RecordingMemory implements MemoryWriter {
   }
 }
 
-function harness(opts: {
+async function harness(opts: {
   memory?: MemoryWriter;
   store?: OrgEventStore;
   uuid?: () => string;
@@ -69,11 +70,13 @@ function harness(opts: {
   const memory = opts.memory ?? new RecordingMemory();
   const store = opts.store ?? new SlowStore();
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment: opts.enrolment ?? { "spk-1": "member-1" },
     mute: false,
     nowMs: opts.nowMs ?? (() => 1),
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: [],
   };
   const wired = wireReachyCapability({
     pi: new NoPi(),
@@ -81,9 +84,11 @@ function harness(opts: {
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: (m) => opts.logs?.push(m),
     ...(opts.uuid ? { uuid: opts.uuid } : {}),
   });
+  await readyLink(wired, state);
   return { wired, memory, store, state };
 }
 
@@ -143,7 +148,7 @@ describe("reachy round 5 item 2: two concurrent visitor lines cannot both acknow
     const store = new SlowStore();
     store.delayMs = 30; // the audit write is slow enough to interleave
     // An empty enrolment makes the speaker UNVERIFIED → the ephemeral/acknowledge path.
-    const h = harness({ store, enrolment: {} }); // no visitor enrolment
+    const h = await harness({ store, enrolment: {} }); // no visitor enrolment
     const [a, b] = await Promise.all([
       h.wired.handleLine(visitorLine),
       h.wired.handleLine(visitorLine),
@@ -155,7 +160,7 @@ describe("reachy round 5 item 2: two concurrent visitor lines cannot both acknow
 
   it("a FAILED audit write ROLLS THE SLOT BACK, so the next visitor line can acknowledge", async () => {
     const store = new SlowStore();
-    const h = harness({ store, enrolment: {} });
+    const h = await harness({ store, enrolment: {} });
     // The reservation is taken synchronously; the audit then FAILS.
     store.fail = true;
     const first = await h.wired.handleLine(visitorLine);
@@ -182,7 +187,7 @@ describe("reachy round 5 item 3: a memory write is audited as intent then outcom
 
   it("a SUCCESSFUL write leaves attempt + written (with the memory id), correlated", async () => {
     const memory = new RecordingMemory();
-    const h = harness({ memory });
+    const h = await harness({ memory });
     const r = await h.wired.handleLine(speakerLine);
     expect(r).toEqual({ kind: "memory", memoryId: "mem-written-1" });
     const attempt = h.store.all.find((e) => e.kind === "reachy.memory.attempt");
@@ -198,7 +203,7 @@ describe("reachy round 5 item 3: a memory write is audited as intent then outcom
     const memory = new RecordingMemory();
     memory.fail = true;
     const logs: string[] = [];
-    const h = harness({ memory, logs });
+    const h = await harness({ memory, logs });
     const r = await h.wired.handleLine(speakerLine);
     expect(r.kind).toBe("refused");
     const attempt = h.store.all.find((e) => e.kind === "reachy.memory.attempt");
@@ -217,33 +222,40 @@ describe("reachy round 5 item 3: a memory write is audited as intent then outcom
 
 // ── round 5 review: a failed sidecar SEND after the audit is a refusal, not a reject ──
 describe("reachy round 5 review: a failed commands.send is handled, never swallowed", () => {
+  // The handshake's `configure` goes through (bob#356); every ACTION send fails.
   class FailingCommands implements ReachyCommands {
-    async send(): Promise<unknown> {
+    async send(command: string): Promise<unknown> {
+      if (command === "configure") return null;
       throw new Error("sidecar not connected");
     }
   }
-  function wiredWithFailingSend() {
+  async function wiredWithFailingSend() {
     const store = new SlowStore();
     const logs: string[] = [];
+    const state: PolicyState = {
+      profile: "reachy",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => 1,
+      lastAcknowledgeAtMs: undefined,
+      roomSpeechOrigins: [],
+    };
     const wired = wireReachyCapability({
       pi: new NoPi(),
       commands: new FailingCommands(),
       memory: new RecordingMemory(),
       store,
-      state: {
-        wakeName: "jarvis",
-        enrolment: {},
-        mute: false,
-        nowMs: () => 1,
-        lastAcknowledgeAtMs: undefined,
-      },
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
       log: (m) => logs.push(m),
     });
+    await readyLink(wired, state);
     return { wired, store, logs };
   }
 
   it("an admitted command whose send fails returns a LINKED refusal and is logged", async () => {
-    const { wired, store, logs } = wiredWithFailingSend();
+    const { wired, store, logs } = await wiredWithFailingSend();
     const r = await wired.handleLine(
       JSON.stringify({
         type: "proposal",
@@ -268,13 +280,13 @@ describe("reachy round 5 item 4: event ids are full UUIDs, not a time + short su
     // suffix (the old shape) would make every id identical at a fixed clock.
     let n = 0;
     const uuid = () => `aaaaaaaa-0000-4000-8000-${String(++n).padStart(12, "0")}`;
-    const h = harness({
+    const h = await harness({
       uuid,
       nowMs: () => 1,
       memory: { writePrivate: async () => ({ id: "m" }) } as MemoryWriter,
     });
     // Two refusals at the SAME fixed clock (a valid `say` shape, refused because
-    // the transcript is not addressed).
+    // a sidecar proposal cannot speak — bob#356).
     await h.wired.handleLine(
       JSON.stringify({
         type: "proposal",
@@ -297,7 +309,7 @@ describe("reachy round 5 item 4: event ids are full UUIDs, not a time + short su
     expect(refused.length).toBe(2);
     expect(refused[0]).not.toBe(refused[1]);
     // And two malformed lines likewise, at the same fixed clock.
-    const h3 = harness({ uuid, nowMs: () => 1 });
+    const h3 = await harness({ uuid, nowMs: () => 1 });
     await h3.wired.handleLine("not json");
     await h3.wired.handleLine("not json either");
     const malformed = h3.store.all.filter((e) => e.kind === "reachy.malformed").map((e) => e.id);

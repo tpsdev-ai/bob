@@ -67,6 +67,18 @@ export interface BobCapabilityManifest {
     // A session that holds `web` may compose only `public` capabilities until
     // the participation ledger lands (data-class.ts).
     dataClass?: DataClass;
+    // bob#356: a capability whose tools depend on ONE config value (reachy's
+    // device profile). `tools` above stays the union; this map names, per
+    // value of `field` in the capability's config block (`default` when the
+    // block omits it), the tools the extension registers. The tool policy is
+    // checked against the configured row before the session's registry audit
+    // (capability-loader.ts `conditionalToolRefusals`), so an allowlist naming
+    // a tool the configured value does not register fails by name.
+    toolsByConfig?: {
+      field: string;
+      default: string;
+      values: Readonly<Record<string, readonly string[]>>;
+    };
   };
 }
 

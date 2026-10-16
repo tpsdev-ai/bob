@@ -1,0 +1,74 @@
+;; reachy-voice.sb — the deny-default seatbelt profile for the reachy-voice
+;; sidecar (bob#356 V1; bob#180 §3.2). Everything not allowed below is denied.
+;; Children inherit it.
+;;
+;; Parameters (sandbox-exec -D NAME=value; pass real paths):
+;;   PYTHON_PREFIX  the interpreter's install root (read, map, exec)
+;;   SIDECAR_DIR    the directory holding sidecar.py (read)
+;;   TTS_DIR        Piper's install: binary, libraries, voice model (read, map, exec)
+;;   PLAYER         the audio player binary, e.g. /usr/bin/afplay (exec)
+;;   WORK_DIR       the sidecar's private 0700 work directory (read, write)
+;;   SOCKET         the one UNIX socket the sidecar listens on
+;;
+;; P1/P3 in test/capabilities/reachy/isolation.test.ts show each probed operation
+;; succeeding without this profile first (unregistered mach names are excluded).
+;; P2/P4 round-trip a handshake and a `say` over the authorized socket under it.
+
+(version 1)
+(deny default)
+
+;; The dynamic loader's own needs (Apple's support profile; it grants no
+;; network, no mach service and no write).
+(import "dyld-support.sb")
+
+;; Processes: fork, and exec only executables under these two install roots
+;; and the one player binary.
+(allow process-fork)
+(allow process-exec
+       (subpath (param "PYTHON_PREFIX"))
+       (subpath (param "TTS_DIR"))
+       (literal (param "PLAYER")))
+(allow signal (target same-sandbox))
+
+;; Reads: the system libraries and frameworks, the interpreter, the sidecar,
+;; Piper. stat() anywhere is allowed (path resolution needs it).
+(allow file-read-metadata)
+(allow file-read*
+       (subpath "/System")
+       (subpath "/usr/lib")
+       (subpath "/usr/share")
+       (subpath "/private/var/db/dyld")
+       (literal "/dev/null")
+       (literal "/dev/urandom")
+       (literal "/dev/random")
+       ;; its own open descriptors (subprocess closes them by listing /dev/fd;
+       ;; without it, it closes every possible descriptor one by one)
+       (literal "/dev/fd")
+       (subpath "/dev/fd")
+       (subpath (param "PYTHON_PREFIX"))
+       (subpath (param "SIDECAR_DIR"))
+       (subpath (param "TTS_DIR")))
+(allow file-map-executable
+       (subpath "/System")
+       (subpath "/usr/lib")
+       (subpath (param "PYTHON_PREFIX"))
+       (subpath (param "TTS_DIR")))
+(allow sysctl-read)
+
+;; Writes: the work directory (ephemeral 0600 speech artifacts) and /dev/null.
+(allow file-read* file-write* (subpath (param "WORK_DIR")))
+(allow file-write-data (literal "/dev/null"))
+
+;; Network: the ONE authorized UNIX socket, listened on. Nothing outbound.
+(allow network-bind network-inbound
+       (local unix-socket (path-literal (param "SOCKET"))))
+(allow file-read* file-write-create file-write-unlink file-write-mode
+       (literal (param "SOCKET")))
+
+;; Audio OUTPUT for the player: the HAL and the component registrar only (no
+;; analytics, no preferences daemon, no network-capable service). Nothing here
+;; opens an input device; capture is out of V1 entirely.
+(allow mach-lookup
+       (global-name "com.apple.audio.audiohald")
+       (global-name "com.apple.audio.coreaudiod")
+       (global-name "com.apple.audio.AudioComponentRegistrar"))

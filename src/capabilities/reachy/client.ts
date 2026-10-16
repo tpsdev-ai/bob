@@ -1,7 +1,8 @@
 // reachy/client.ts — the real UNIX-socket command channel + the durable OrgEvent
 // store and memory writer over the flair capability client (spec §3.2/§3.4).
-// Kept thin; the policy lives in policy.ts and the wiring in capability.ts, so
-// tests drive a fake and never open a socket or touch a real Flair.
+// Kept thin; the policy lives in policy.ts and the wiring in capability.ts. The
+// policy tests drive fakes; the socket client is also tested against real
+// local UNIX sockets (sidecar-stub, handshake-socket, voice-sidecar tests).
 
 import { createConnection, type Socket } from "node:net";
 import {
@@ -9,6 +10,7 @@ import {
   type OrgEventStore,
   orgEventRecordId,
   type ReachyCommands,
+  type WiredReachy,
 } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
 
@@ -20,6 +22,67 @@ export interface SidecarLine {
   [k: string]: unknown;
 }
 
+/** Reconnect backoff (bob#356): 1 s doubling to a 60 s cap, reset by a good
+ *  handshake. A refused sidecar is retried, never spun on. */
+export const RECONNECT_MIN_MS = 1_000;
+export const RECONNECT_MAX_MS = 60_000;
+
+/**
+ * Keep the sidecar link up (bob#356 V1): connect, run the handshake, and on a
+ * failed connect or a closed connection retry after a backoff that doubles to
+ * a cap. Only a connection that reached a READY handshake resets the backoff,
+ * so a sidecar that keeps failing the handshake is retried slowly, and every
+ * retry is a fresh handshake (a new generation).
+ */
+export function superviseLink(deps: {
+  client: { connect(): Promise<void>; onClose(listener: () => void): void };
+  wired: Pick<WiredReachy, "connected" | "disconnected" | "link">;
+  /** Timer seam (tests). Default: an unref'd setTimeout. */
+  schedule?: (fn: () => void, ms: number) => void;
+  log?: (m: string) => void;
+}): { start(): Promise<void>; stop(): void; nextDelayMs(): number } {
+  const log = deps.log ?? ((m: string) => console.error(m));
+  const schedule =
+    deps.schedule ??
+    ((fn: () => void, ms: number) => {
+      // unref: a pending reconnect never keeps the process alive on its own.
+      setTimeout(fn, ms).unref();
+    });
+  let delay = RECONNECT_MIN_MS;
+  let stopped = false;
+  const later = (): void => {
+    if (stopped) return;
+    const wait = delay;
+    delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+    schedule(() => void start(), wait);
+  };
+  deps.client.onClose(() => {
+    const wasReady = deps.wired.link().phase === "ready";
+    deps.wired.disconnected();
+    if (wasReady) delay = RECONNECT_MIN_MS;
+    later();
+  });
+  async function start(): Promise<void> {
+    if (stopped) return;
+    try {
+      await deps.client.connect();
+    } catch (err) {
+      log(
+        `reachy capability: sidecar connect failed (tools still registered; retrying): ${err instanceof Error ? err.message : err}`,
+      );
+      later();
+      return;
+    }
+    // A refused handshake closes the socket; the close listener retries.
+    await deps.wired.connected();
+  }
+  // The session is over: no further connect, no pending retry acts.
+  const stop = (): void => {
+    stopped = true;
+  };
+  return { start, stop, nextDelayMs: () => delay };
+}
+
 /**
  * A JSON-lines client for the sidecar's UNIX socket. `send` writes one command
  * object; inbound lines are delivered to `onLine` as the RAW parsed objects, for
@@ -27,24 +90,92 @@ export interface SidecarLine {
  */
 export class UnixSocketReachyClient implements ReachyCommands {
   private socket: Socket | null = null;
+  private connectingSocket: Socket | null = null;
+  private configured: {
+    socket: Socket;
+    wait: Promise<void>;
+    complete: () => void;
+    fail: (err: Error) => void;
+    started: boolean;
+  } | null = null;
   private buffer = Buffer.alloc(0);
   private discarding = false;
   private listeners: Array<(line: unknown) => void> = [];
+  private closeListeners: Array<() => void> = [];
 
   constructor(private readonly opts: { socket: string }) {}
 
+  /** Open a NEW connection. bob#356: the raw buffer belongs to one connection
+   *  only — it is cleared here and on close, and bytes from a socket that is no
+   *  longer the current one are never ingested, so a partial line from a
+   *  dropped connection cannot prefix the next connection's first line. */
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.resetBuffer();
       const sock = createConnection(this.opts.socket);
-      sock.once("connect", () => resolve());
-      sock.once("error", reject);
-      // A socket error AFTER connect must not become an unhandled 'error' event.
-      sock.on("error", (err: Error) => console.error(`reachy: socket error: ${err.message}`));
+      this.connectingSocket = sock;
+      let opened = false;
+      sock.once("connect", () => {
+        opened = true;
+        this.connectingSocket = null;
+        let complete!: () => void;
+        let fail!: (err: Error) => void;
+        const wait = new Promise<void>((r, j) => {
+          complete = r;
+          fail = j;
+        });
+        void wait.catch(() => {});
+        this.configured = { socket: sock, wait, complete, fail, started: false };
+        this.socket = sock;
+        resolve();
+      });
+      sock.once("error", (err: Error) => {
+        if (!opened) reject(err);
+      });
+      // A socket error AFTER connect must not become an unhandled 'error' event
+      // (a failed connect is the caller's rejection, not a log line).
+      sock.on("error", (err: Error) => {
+        if (opened) console.error(`reachy: socket error: ${err.message}`);
+      });
       // Feed RAW BYTES: the bound is counted in UTF-8 bytes, and a line is
       // decoded only once it is complete AND under the bound (round 5 item 1).
-      sock.on("data", (chunk: Buffer) => this.ingest(chunk));
-      this.socket = sock;
+      sock.on("data", (chunk: Buffer) => {
+        if (this.socket === sock) this.ingest(chunk);
+      });
+      sock.on("close", () => {
+        if (this.connectingSocket === sock) {
+          this.connectingSocket = null;
+          reject(new Error("reachy: the sidecar socket closed before connecting"));
+        }
+        if (this.configured?.socket === sock) {
+          this.configured.fail(
+            new Error("reachy: the sidecar socket closed before configure completed"),
+          );
+          this.configured = null;
+        }
+        if (this.socket !== sock) return;
+        this.socket = null;
+        this.resetBuffer();
+        if (opened) for (const l of this.closeListeners) l();
+      });
     });
+  }
+
+  private resetBuffer(): void {
+    this.buffer = Buffer.alloc(0);
+    this.discarding = false;
+  }
+
+  /** Called once per connection that opened and then closed (either side). */
+  onClose(listener: () => void): void {
+    this.closeListeners.push(listener);
+  }
+
+  /** bob#356: drop the current connection (a failed handshake). The close
+   *  listeners run, so a reconnect starts a fresh handshake. */
+  disconnect(): void {
+    this.connectingSocket?.destroy();
+    this.socket?.destroy();
   }
 
   /** The bound applies PER COMPLETE LINE (round 4 item 2): an oversized line is
@@ -112,23 +243,72 @@ export class UnixSocketReachyClient implements ReachyCommands {
     this.listeners.push(listener);
   }
 
+  /** Write one command. Resolves only when the socket ACCEPTED the write; a
+   *  write error REJECTS, and so does the socket closing before the write
+   *  completed, so the caller's refusal path runs instead of a false "sent"
+   *  (bob#356). The close case matters on its own: Node reports a destroyed
+   *  socket's pending write to its callback (ECANCELED), but Bun never calls
+   *  that callback at all — without it, the send would never settle. */
   async send(command: string, args?: Record<string, unknown>): Promise<unknown> {
-    if (!this.socket) throw new Error("reachy: not connected to the sidecar socket");
-    return new Promise((resolve) => {
-      this.socket?.write(`${JSON.stringify({ command, args: args ?? {} })}\n`, () => resolve(null));
+    const sock = this.socket;
+    if (!sock || sock.destroyed) throw new Error("reachy: not connected to the sidecar socket");
+    const gate = this.configured;
+    if (!gate || gate.socket !== sock) throw new Error("reachy: no configure gate for this socket");
+    if (command === "configure") {
+      if (gate.started) throw new Error("reachy: configure already started for this socket");
+      gate.started = true;
+      try {
+        const result = await this.write(sock, command, args);
+        gate.complete();
+        return result;
+      } catch (err) {
+        gate.fail(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+    }
+    await gate.wait;
+    if (this.socket !== sock || sock.destroyed) {
+      throw new Error("reachy: the sidecar connection changed before the write");
+    }
+    return this.write(sock, command, args);
+  }
+
+  private write(sock: Socket, command: string, args?: Record<string, unknown>): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onClose = (): void => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("reachy: the sidecar socket closed before the write completed"));
+      };
+      sock.once("close", onClose);
+      sock.write(`${JSON.stringify({ command, args: args ?? {} })}\n`, (err?: Error | null) => {
+        sock.off("close", onClose);
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(null);
+      });
     });
   }
 
   close(): void {
-    this.socket?.end();
+    this.connectingSocket?.destroy();
+    const sock = this.socket;
+    this.configured?.fail(new Error("reachy: the sidecar client closed"));
+    this.configured = null;
     this.socket = null;
+    this.resetBuffer();
+    sock?.end();
   }
 }
 
 /**
  * The memory-writer seam over the flair capability client. A memory jarvis writes
- * is ALWAYS `private`, authored by `jarvis`, with the speakerId AND the audit
- * correlation id in metadata (spec §3.4).
+ * is ALWAYS `private`, with the speakerId AND the audit correlation id in
+ * metadata (spec §3.4). Its Flair OWNER is the client's authenticated agent
+ * (bob#356 round 2): Flair's Memory owner guard refuses a body whose agentId is
+ * not the signing agent, so no `authorId` label is sent as the owner.
  */
 export function flairMemoryWriter(client: {
   write(
@@ -146,7 +326,6 @@ export function flairMemoryWriter(client: {
       return client.write(write.content, {
         durability: "standard",
         visibility: "private",
-        authorId: write.authorId,
         metadata: write.metadata,
       });
     },
@@ -179,7 +358,8 @@ export function flairOrgEventStore(client: {
         id: recordId,
         durability: "persistent",
         visibility: "private",
-        authorId: "jarvis",
+        // No authorId: the record's owner is the authenticated agent (round 2).
+        // The event's own `authorId` label travels inside its content.
         metadata: { kind: event.kind, orgEventId: recordId },
       });
       return { id };

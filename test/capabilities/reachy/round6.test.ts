@@ -12,6 +12,7 @@ import {
 } from "../../../src/capabilities/reachy/capability.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { explainMemory } from "../../../src/capabilities/reachy/query.js";
+import { readyLink, TEST_SIDECAR_VERSION } from "./handshake.js";
 
 class NoPi implements PiLike {
   registerTool(): void {}
@@ -66,7 +67,7 @@ class SelectiveStore implements OrgEventStore {
   }
 }
 
-function harness(
+async function harness(
   enrolment: Record<string, string>,
   opts: { store?: SelectiveStore; logs?: string[] } = {},
 ) {
@@ -74,11 +75,13 @@ function harness(
   const memory = new RecordingMemory();
   const store = opts.store ?? new SelectiveStore();
   const state: PolicyState = {
+    profile: "reachy",
     wakeName: "jarvis",
     enrolment,
     mute: false,
     nowMs: () => 1,
     lastAcknowledgeAtMs: undefined,
+    roomSpeechOrigins: [],
   };
   const wired = wireReachyCapability({
     pi: new NoPi(),
@@ -86,8 +89,10 @@ function harness(
     memory,
     store,
     state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
     log: (m) => opts.logs?.push(m),
   });
+  await readyLink(wired, state, commands);
   return { commands, memory, store, state, wired };
 }
 
@@ -101,7 +106,7 @@ const speakerLine = {
 
 describe("reachy round 6 item 1: a memory resolves to its `written` event, never the attempt", () => {
   it("a persisted memory carries the `written` event's id and explainMemory reads that event", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     const r = await h.wired.handleLine(speakerLine);
     expect(r).toEqual({ kind: "memory", memoryId: "mem-written-1" });
     const attempt = h.store.all.find((e) => e.kind === "reachy.memory.attempt");
@@ -129,7 +134,7 @@ describe("reachy round 6 item 1: a memory resolves to its `written` event, never
     const store = new SelectiveStore();
     store.failKind = "reachy.memory.written";
     const logs: string[] = [];
-    const h = harness({ "spk-1": "member-1" }, { store, logs });
+    const h = await harness({ "spk-1": "member-1" }, { store, logs });
     const r = await h.wired.handleLine(speakerLine);
     // NOT a success: the memory exists but its `written` event does not.
     expect(r.kind).toBe("refused");
@@ -153,7 +158,7 @@ describe("reachy round 6 item 1: a memory resolves to its `written` event, never
 
 describe("reachy round 6 item 2: args validated by action; the speech gate applies to `ask`", () => {
   it("an `ask` proposal carrying a memory input is refused by the speech gate — no `say` is sent", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     await h.wired.handleLine(speakerLine); // a transcript exists
     const withMemory = await h.wired.handleLine({
       type: "proposal",
@@ -162,9 +167,14 @@ describe("reachy round 6 item 2: args validated by action; the speech gate appli
       confidence: 0.9,
       inputs: ["mem_9"],
     });
-    expect(withMemory.kind).toBe("refused");
+    expect(withMemory).toMatchObject({
+      kind: "refused",
+      reason: "memory-backed speech is off in v1 (fail closed)",
+    });
     expect(h.commands.sent.some((c) => c.command === "say")).toBe(false);
-    // CONTROL: the same `ask` with NO memory input is admitted (sent as a `say`).
+    // bob#356 rev 2.1: the same `ask` with NO memory input is ALSO refused — but
+    // by the caller rule (a sidecar proposal never speaks before enrolment), a
+    // different gate, so the memory refusal above is the memory gate's own.
     const plain = await h.wired.handleLine({
       type: "proposal",
       action: "ask",
@@ -172,12 +182,13 @@ describe("reachy round 6 item 2: args validated by action; the speech gate appli
       confidence: 0.9,
       inputs: [],
     });
-    expect(plain.kind).toBe("admitted");
-    expect(h.commands.sent.at(-1)?.command).toBe("say");
+    expect(plain).toMatchObject({ kind: "refused" });
+    expect((plain as { reason: string }).reason).toContain("a sidecar proposal cannot speak");
+    expect(h.commands.sent.some((c) => c.command === "say")).toBe(false);
   });
 
   it("a `look` proposal with a string yaw or an extra field is malformed and sends no `look_at`", async () => {
-    const h = harness({ "spk-1": "member-1" });
+    const h = await harness({ "spk-1": "member-1" });
     await h.wired.handleLine(speakerLine);
     const stringYaw = await h.wired.handleLine({
       type: "proposal",
