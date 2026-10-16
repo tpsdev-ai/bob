@@ -152,6 +152,60 @@ describe("URL provenance — recording sources", () => {
   });
 });
 
+describe("URL provenance — markup delimiters versus a bare reference", () => {
+  // A quote or backtick immediately before the URL opens a markup reference and
+  // delimits it at its matching close; inside a bare reference it is an ordinary
+  // character. The scanner must never grant a prefix of a longer reference.
+  it("takes an enclosed reference up to its matching quote or backtick", () => {
+    expect(extractUrls("see `https://host.test/a?x=1` now")).toEqual(["https://host.test/a?x=1"]);
+    expect(extractUrls('see "https://host.test/a?x=1" now')).toEqual(["https://host.test/a?x=1"]);
+    expect(extractUrls("see 'https://host.test/a?x=1' now")).toEqual(["https://host.test/a?x=1"]);
+  });
+
+  it("records a bare reference whose query holds an apostrophe, not its prefix (prompt probe)", () => {
+    const state = stateFor("see https://host.test/p?x=one'two here");
+    // WHATWG URL percent-encodes the query apostrophe on both sides.
+    expect(admitCandidate(state, "https://host.test/p?x=one'two").href).toBe(
+      "https://host.test/p?x=one%27two",
+    );
+    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=one"))).toBe("url-unrecorded");
+  });
+
+  it("records a bare reference whose path holds a backtick, not its prefix (prompt probe)", () => {
+    const state = stateFor("see https://host.test/one`two here");
+    // The path backtick is canonicalized by WHATWG URL for both sides.
+    expect(admitCandidate(state, "https://host.test/one`two").href).toBe(
+      "https://host.test/one%60two",
+    );
+    expect(codeOf(() => admitCandidate(state, "https://host.test/one"))).toBe("url-unrecorded");
+  });
+
+  it("records the same probes from a fetched non-HTML body (fetched-text case)", () => {
+    const doc = extractDocument(
+      "text/plain",
+      "mirror https://host.test/p?x=one'two and https://host.test/one`two",
+      "https://host.test/page",
+    );
+    const state = stateFor("https://host.test/page");
+    recordPageLinks(state, doc.links);
+    expect(admitCandidate(state, "https://host.test/p?x=one'two").href).toBe(
+      "https://host.test/p?x=one%27two",
+    );
+    expect(admitCandidate(state, "https://host.test/one`two").href).toBe(
+      "https://host.test/one%60two",
+    );
+    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=one"))).toBe("url-unrecorded");
+    expect(codeOf(() => admitCandidate(state, "https://host.test/one"))).toBe("url-unrecorded");
+  });
+
+  it("drops an ambiguous enclosed token entirely rather than granting its prefix", () => {
+    // An opening backtick with no close: the reference is ambiguous, so neither
+    // the whole token nor a prefix of it is recorded.
+    const state = stateFor("see `https://host.test/amb");
+    expect(codeOf(() => admitCandidate(state, "https://host.test/amb"))).toBe("url-unrecorded");
+  });
+});
+
 describe("urlKey and parseAbsolute", () => {
   it("keeps an empty query delimiter and drops the default port (effective port)", () => {
     expect(urlKey(new URL("https://host.test:443/a"))).toBe("https://host.test/a");

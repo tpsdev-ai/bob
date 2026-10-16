@@ -11,8 +11,9 @@
 //
 // A recorded reference is never rebuilt from display text: the fetch core
 // reports the complete links a page carries (extract.ts), and a message is
-// scanned for the absolute URLs it holds verbatim. A reference that does not
-// parse as an absolute http(s) URL records nothing.
+// scanned for the absolute URLs it carries, recorded as their parsed
+// serialization. A reference that does not parse as an absolute http(s) URL
+// records nothing.
 
 // The serialized form that is compared and dispatched. WHATWG `search` is ""
 // for both no query and an empty query (`?`), so this is the URL's own
@@ -40,18 +41,37 @@ export function parseAbsolute(raw: string): URL | undefined {
   return url;
 }
 
-// The run of non-space characters that starts at an absolute http(s) URL in
-// text, as it appears. It is taken whole: prose punctuation that is part of the
-// reference stays in it, so a shortened spelling of it is NOT recorded and a
-// fetch of that spelling is refused (never granted).
-const ABSOLUTE_URL_IN_TEXT = /https?:\/\/[^\s<>"'`]+/gi;
+// Quote characters that can open a markup reference — an HTML attribute or a
+// Markdown code span. Immediately before a URL they delimit it; inside a bare
+// reference they are ordinary characters (a single quote or backtick in a query
+// or path is not a terminator).
+const QUOTE_CHARS = new Set(['"', "'", "`"]);
 
-// The absolute http(s) URLs that appear in text, each parsed (so an
-// unparseable match is dropped) and serialized.
+// The run of non-space characters that starts at an absolute http(s) URL in
+// text, as it appears. Quote characters are taken as part of the run, so a bare
+// reference that contains one is captured whole; `extractUrls` decides whether a
+// leading quote instead delimits a markup reference.
+const ABSOLUTE_URL_IN_TEXT = /https?:\/\/[^\s<>]+/gi;
+
+// The absolute http(s) URLs that appear in text, each parsed (so an unparseable
+// match is dropped) and serialized. When a quote character immediately precedes
+// the URL it opens a markup reference, which ends at its matching close; a
+// missing close is ambiguous and the whole token is dropped rather than cut to a
+// prefix. Otherwise the run is the bare reference and any quote in it is part of
+// the URL.
 export function extractUrls(text: string): string[] {
   const out: string[] = [];
   for (const match of text.matchAll(ABSOLUTE_URL_IN_TEXT)) {
-    const parsed = parseAbsolute(match[0]);
+    const raw = match[0];
+    const index = match.index ?? 0;
+    const open = index > 0 ? text[index - 1] : "";
+    let candidate = raw;
+    if (QUOTE_CHARS.has(open)) {
+      const close = raw.indexOf(open);
+      if (close === -1) continue;
+      candidate = raw.slice(0, close);
+    }
+    const parsed = parseAbsolute(candidate);
     if (parsed !== undefined) out.push(parsed.href);
   }
   return out;

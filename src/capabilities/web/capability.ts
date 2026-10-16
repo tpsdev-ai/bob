@@ -72,14 +72,25 @@ export function wireWebCapability(deps: WebCapabilityDeps): WebCapabilityHandle 
     seededFor = undefined;
   });
 
+  // Expose the state only while the operation that seeded it is the LIVE
+  // admission. A call after the operation settles, or from a different
+  // admission, finds no state even though the last state is retained for the
+  // operation's own continuations: `activeAdmission()` is undefined for a
+  // settled token, so a retained state is never handed out again.
+  const currentState = (): WebTurnState | undefined => {
+    const token = admission?.activeAdmission();
+    if (token === undefined || token !== seededFor) return undefined;
+    return state;
+  };
+
   pi.registerTool(
     createWebFetchTool({
       settings: deps.settings,
-      currentState: () => state,
+      currentState,
       currentOrigin: () => admission?.readOrigin(),
       ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
     }),
   );
 
-  return { currentState: () => state };
+  return { currentState };
 }

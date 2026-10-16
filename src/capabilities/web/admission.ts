@@ -6,8 +6,9 @@
 // every later prompt the operation sends (pi fires `before_agent_start` once per
 // prompt, so a continuation must NOT reseed). The runtime's admission token
 // tells those apart: the same token continues, a new one replaces, and no token
-// at all (a bare prompt outside any admission) seeds nothing. A call outside an
-// admitted operation finds no state and is refused. An attempt is charged for a
+// at all (a bare prompt outside any admission, or any call once the operation's
+// prompt chain has settled) seeds nothing. A call outside a live admitted
+// operation finds no state and is refused. An attempt is charged for a
 // RECORDED candidate before its fetch (so a failed fetch still counts); the
 // returned text is charged after the response, against the same operation's
 // allowance.
@@ -95,7 +96,7 @@ export function chargeFetchAttempt(state: WebTurnState, settings: WebSettings): 
   if (state.fetchAttempts >= settings.fetchPerTurn) {
     throw new WebFetchError(
       "budget-fetch",
-      `the fetch budget for this prompt (${settings.fetchPerTurn}) is spent`,
+      `the fetch budget for this operation (${settings.fetchPerTurn}) is spent`,
     );
   }
   state.fetchAttempts += 1;
@@ -112,7 +113,7 @@ export function chargeText(state: WebTurnState, settings: WebSettings, chars: nu
   if (chars > textAllowanceRemaining(state, settings)) {
     throw new WebFetchError(
       "budget-text",
-      `this call would return more text than the prompt's remaining allowance (${textAllowanceRemaining(
+      `this call would return more text than the operation's remaining allowance (${textAllowanceRemaining(
         state,
         settings,
       )} characters)`,

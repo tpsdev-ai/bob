@@ -7,8 +7,9 @@
 // `readOrigin` is faked.
 //
 // It covers: a bare prompt outside any admission (refused), an admitted call
-// (allowed), bob's automatic continuation (provenance and spend survive),
-// settlement (the state does not carry to a later prompt), and an invalid tool
+// (allowed), bob's automatic continuation (provenance survives; the fetch and
+// text budgets do not replenish), settlement (the token is revoked, so neither a
+// later call nor a captured descendant context can fetch), and an invalid tool
 // argument (refused by pi's validator before execution).
 
 import { expect, test } from "bun:test";
@@ -106,7 +107,10 @@ interface Live {
 
 const WIRE_HOOK = "__bobWebSessionTestWire";
 
-async function webSession(steps: Step[]): Promise<Live> {
+async function webSession(
+  steps: Step[],
+  web: Parameters<typeof resolveWebSettings>[0] = {},
+): Promise<Live> {
   const scratch = mkdtempSync(join(tmpdir(), "bob-web-session-"));
   const cwd = join(scratch, "workspace");
   const piAgentDir = join(scratch, "pi-agent");
@@ -126,7 +130,7 @@ async function webSession(steps: Step[]): Promise<Live> {
     if (!service) throw new Error("the web session has no admission service");
     wireWebCapability({
       pi: pi as never,
-      settings: resolveWebSettings({}),
+      settings: resolveWebSettings(web),
       admission: service,
       fetch: async (url): Promise<FetchResult> => {
         fetched.push(url);
@@ -268,21 +272,73 @@ test("an admitted call fetches a URL recorded from the admitted prompt", async (
   }
 });
 
-test("provenance and spend survive bob's automatic continuation (reasoning-only re-prompt)", async () => {
+test("provenance survives bob's automatic continuation (reasoning-only re-prompt)", async () => {
   const live = await webSession([
-    // 1. reasoning-only ending: bob re-prompts the SAME admission.
+    // 1. a tool call before the reasoning-only ending: it records the URL and
+    //    spends both budgets.
+    { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
+    // 2. reasoning-only ending: bob re-prompts the SAME admission.
     { thinking: "let me consider" },
-    // 2. the tool call, carrying a URL only the FIRST prompt recorded.
+    // 3. the continuation's tool call, carrying a URL only the FIRST prompt
+    //    recorded.
     { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
     { text: "done" },
   ]);
   try {
     await live.admission.admitTurn({ kind: "cron", job: "brief" }, "read https://host-a.test/x");
     // The continuation prompt carries no URL, so a re-seeded state would refuse
-    // this fetch; it succeeds only because the first prompt's state survived.
-    expect(live.calls.length).toBe(3);
-    expect(live.results).toHaveLength(1);
+    // the second fetch; it succeeds only because the first prompt's state
+    // survived the continuation.
+    expect(live.results).toHaveLength(2);
+    expect(live.results.map((r) => r.isError)).toEqual([false, false]);
+    expect(live.fetched).toEqual(["https://host-a.test/x", "https://host-a.test/x"]);
+  } finally {
+    await live.cleanup();
+  }
+});
+
+test("the fetch-attempt budget does not replenish across a continuation", async () => {
+  const live = await webSession(
+    [
+      { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
+      { thinking: "let me consider" },
+      { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
+      { text: "done" },
+    ],
+    { fetch_per_turn: 1 },
+  );
+  try {
+    await live.admission.admitTurn({ kind: "cron", job: "brief" }, "read https://host-a.test/x");
+    // The first prompt spent the single attempt; the continuation's call must
+    // be refused for the spent budget, not served by a replenished one.
+    expect(live.results).toHaveLength(2);
     expect(live.results[0].isError).toBe(false);
+    expect(live.results[1].isError).toBe(true);
+    expect(live.results[1].text).toContain("budget-fetch");
+    expect(live.fetched).toEqual(["https://host-a.test/x"]);
+  } finally {
+    await live.cleanup();
+  }
+});
+
+test("the text allowance does not replenish across a continuation", async () => {
+  const live = await webSession(
+    [
+      { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
+      { thinking: "let me consider" },
+      { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
+      { text: "done" },
+    ],
+    { text_per_turn: "page body".length },
+  );
+  try {
+    await live.admission.admitTurn({ kind: "cron", job: "brief" }, "read https://host-a.test/x");
+    // The first prompt's fetch returned the whole allowance; the continuation's
+    // call must find none left.
+    expect(live.results).toHaveLength(2);
+    expect(live.results[0].isError).toBe(false);
+    expect(live.results[1].isError).toBe(true);
+    expect(live.results[1].text).toContain("budget-text");
     expect(live.fetched).toEqual(["https://host-a.test/x"]);
   } finally {
     await live.cleanup();
@@ -293,8 +349,10 @@ test("settlement ends the operation: a later bare prompt carries no state", asyn
   const live = await webSession([
     { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
     { text: "done" },
-    // The bare prompt's call (same URL) must be refused: the admitted
-    // operation's state did not carry past its settlement.
+    // The bare prompt's call is refused. This prompt runs outside any admission
+    // AND after the admitted operation SETTLED (its token revoked), so the
+    // settled operation's state is not exposed to it — a distinction the
+    // captured-context cases in web-extension.test.ts pin without a new prompt.
     { tool: "web_fetch", args: { url: "https://host-a.test/x" } },
     { text: "done" },
   ]);

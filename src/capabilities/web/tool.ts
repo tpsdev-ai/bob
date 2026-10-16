@@ -29,12 +29,14 @@ export const WEB_FETCH_TOOL_NAME = "web_fetch";
 export const WEB_FETCH_PARAMS = Type.Object({
   url: Type.String({
     minLength: 1,
-    description: "The URL to fetch. It must be one recorded from the message or a fetched page.",
+    description:
+      "The URL to fetch. It must be one recorded from the operation's message or a fetched page.",
   }),
   maxChars: Type.Optional(
     Type.Integer({
       minimum: 1,
-      description: "Lower the returned text limit. It cannot exceed the operator's ceiling.",
+      description:
+        "Lower the limit on the returned extracted text. It cannot exceed the operator's ceiling.",
     }),
   ),
 });
@@ -48,9 +50,10 @@ export type WebFetchFn = (
 
 export interface WebFetchToolDeps {
   settings: WebSettings;
-  // The state seeded for the admitted prompt in flight, or undefined outside it.
+  // The state seeded for the live admitted operation, or undefined outside one.
   currentState: () => WebTurnState | undefined;
-  // The current admission's origin, or undefined outside an admission.
+  // The running turn's origin, for the mismatch check. `run` outside an
+  // admission; undefined only when the session has no admission service.
   currentOrigin: () => TurnOrigin | undefined;
   // The fetch core. Defaults to the R1b fetchDocument.
   fetch?: WebFetchFn;
@@ -71,14 +74,14 @@ export function createWebFetchTool(
     name: WEB_FETCH_TOOL_NAME,
     label: "Web Fetch",
     description:
-      "Fetch a URL and return its readable text, final URL, HTTP status and content type. The URL must be one that appeared in the current message or on a page already fetched this prompt; a composed URL is refused. Plain HTTP is allowed only when the operator enables it.",
+      "Fetch a URL and return its readable text, final URL, HTTP status and content type. The URL must be one that appeared in the message the operation started from or on a page already fetched in the same operation; a composed URL is refused. Plain HTTP is allowed only when the operator enables it.",
     parameters: WEB_FETCH_PARAMS,
     async execute(_toolCallId: string, params: WebFetchParams) {
       const state = deps.currentState();
       if (state === undefined) {
         throw new WebFetchError(
           "no-admission",
-          "web_fetch ran outside an admitted prompt; there is no provenance or budget state",
+          "web_fetch ran outside an admitted operation; there is no provenance or budget state",
         );
       }
       const origin = deps.currentOrigin();
@@ -98,7 +101,7 @@ export function createWebFetchTool(
       if (remaining <= 0) {
         throw new WebFetchError(
           "budget-text",
-          "the shared text allowance for this prompt is spent",
+          "the shared text allowance for this operation is spent",
         );
       }
       const maxChars = Math.min(

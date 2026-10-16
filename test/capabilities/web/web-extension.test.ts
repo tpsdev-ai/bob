@@ -1,6 +1,6 @@
 // The web extension's per-operation state wiring (bob#152, spec v3, slice R1c),
-// driven through wireWebCapability with a fake pi, a fake admission token and an
-// injected fetch.
+// driven through wireWebCapability with a fake pi and an injected fetch. The
+// token-lifetime cases use the REAL turn admission.
 
 import { describe, expect, it } from "bun:test";
 import { type WebPiLike, wireWebCapability } from "../../../src/capabilities/web/capability.js";
@@ -8,6 +8,7 @@ import type { WebSettings } from "../../../src/capabilities/web/core.js";
 import { isWebFetchError } from "../../../src/capabilities/web/errors.js";
 import type { FetchResult } from "../../../src/capabilities/web/fetch.js";
 import type { AdmissionToken } from "../../../src/shell/turn-admission.js";
+import { createTurnAdmission } from "../../../src/shell/turn-admission.js";
 import type { TurnOrigin } from "../../../src/shell/turn-origin.js";
 
 const RUN: TurnOrigin = { kind: "run" };
@@ -178,5 +179,73 @@ describe("web extension — per-operation state", () => {
     expect(await codeOf(w.tools[0].execute("id", { url: "https://a.test/x" }))).toBe(
       "admission-mismatch",
     );
+  });
+});
+
+describe("web extension — admission token lifetime (real turn admission)", () => {
+  // The REAL turn admission drives the REAL capability wiring. The minimal
+  // session fires `before_agent_start` (pi's event) from INSIDE the admitted
+  // prompt and settles at once; the late calls under test start no prompt.
+  function bind() {
+    return createTurnAdmission({ log: () => {} });
+  }
+
+  function sessionWith(
+    admission: ReturnType<typeof createTurnAdmission>,
+    onPrompt: (event: { prompt: string }) => void,
+  ) {
+    const session = {
+      subscribe: () => () => {},
+      waitForIdle: async () => {},
+      async prompt(text: string) {
+        onPrompt({ prompt: text });
+      },
+    };
+    admission.bind(session as never);
+  }
+
+  it("refuses a call after settlement, from outside any admission context", async () => {
+    const admission = bind();
+    const w = fakePi();
+    sessionWith(admission, (event) => w.fire("before_agent_start", event));
+    const handle = wireWebCapability({
+      pi: w.pi,
+      settings: settings(),
+      admission,
+      fetch: async (url) => ok(url, "page text"),
+    });
+    await admission.admitTurn({ kind: "run" }, "https://a.test/x");
+    // The operation has settled. The tool is called directly, outside any
+    // admission context and without starting another prompt: no state is
+    // exposed, though the settled operation's state was retained.
+    expect(handle.currentState()).toBeUndefined();
+    expect(await codeOf(w.tools[0].execute("id", { url: "https://a.test/x" }))).toBe(
+      "no-admission",
+    );
+  });
+
+  it("refuses a call after settlement from a captured descendant async context", async () => {
+    const admission = bind();
+    const w = fakePi();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Registered while the admission is live, so the continuation inherits the
+    // turn's async context; it runs only after the operation settles.
+    let late: Promise<unknown> | undefined;
+    sessionWith(admission, (event) => {
+      w.fire("before_agent_start", event);
+      late = gate.then(() => w.tools[0].execute("late", { url: "https://a.test/x" }));
+    });
+    wireWebCapability({
+      pi: w.pi,
+      settings: settings(),
+      admission,
+      fetch: async (url) => ok(url, "page text"),
+    });
+    await admission.admitTurn({ kind: "run" }, "https://a.test/x");
+    release();
+    expect(await codeOf(late as Promise<unknown>)).toBe("no-admission");
   });
 });

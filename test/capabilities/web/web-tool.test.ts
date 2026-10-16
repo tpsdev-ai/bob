@@ -274,7 +274,7 @@ describe("web_fetch — refusals", () => {
   });
 });
 
-describe("web_fetch — budgets charge before I/O", () => {
+describe("web_fetch — the attempt budget charges before I/O", () => {
   it("charges a failed call (the attempt still counts)", async () => {
     const state = newTurnState("https://host.test/a", RUN);
     const tool = toolFor(
@@ -303,7 +303,7 @@ describe("web_fetch — budgets charge before I/O", () => {
     expect(tool.calls.urls).toEqual(["https://host.test/a"]);
   });
 
-  it("keeps the same budgets across calls in one admitted prompt (retries/continuations)", async () => {
+  it("keeps the same attempt budget across calls in one state (the lifecycle cases are in web-fetch-session.test.ts)", async () => {
     const state = newTurnState("https://host.test/a", RUN);
     const cfg = settings({ fetchPerTurn: 2 });
     const tool = toolFor(

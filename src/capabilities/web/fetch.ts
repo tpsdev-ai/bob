@@ -17,10 +17,10 @@
 //
 // REDIRECTS. Followed here, by hand, at most five, each target re-admitted
 // through admitUrl (scheme, port, userinfo, zone, downgrade, canonical literal)
-// and vetted by the caller's onRedirect hook before it is dispatched, and each
-// named hop uses a new connection with a fresh vetted DNS lookup. Canonical
-// literals are vetted at admission. A redirect status without a Location is
-// returned as the final response.
+// and vetted by the caller's onRedirect hook, when supplied, before it is
+// dispatched, and each named hop uses a new connection with a fresh vetted DNS
+// lookup. Canonical literals are vetted at admission. A redirect status without
+// a Location is returned as the final response.
 //
 // LIMITS. One 15-second deadline covers every hop, the body read, decoding,
 // extraction, and the final success path. Bodies skipped on redirects or
@@ -380,8 +380,8 @@ export async function fetchDocument(
             );
           }
           const next = admitUrl(location, policy, { from: current });
-          // The caller's veto (URL provenance): run it BEFORE the target is
-          // dispatched, so an unrecorded destination is never requested.
+          // The caller's veto (URL provenance), when supplied: run it BEFORE the
+          // target is dispatched, so an unrecorded destination is never requested.
           options.onRedirect?.(next);
           current = next;
           continue;
