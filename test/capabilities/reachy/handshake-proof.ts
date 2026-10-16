@@ -130,18 +130,26 @@ export async function probeVoiceHandshake(
     });
     timer = setTimeout(deliverTimeout, timeoutMs);
 
+    // The write also races the connection closing: a peer that closes before or
+    // during the write is reported at once, never as the limit elapsing.
     const sent = await Promise.race([
       client.send("configure", configureArgs(expect)).then(
         () => "ok" as const,
         () => "failed" as const,
       ),
+      closed,
       timedOut,
     ]);
     if (sent !== "ok") {
       return {
         ok: false,
         reason: "handshake-timeout",
-        detail: `the configure write on ${socket} did not complete within ${timeoutMs} ms`,
+        detail:
+          sent === TIMED_OUT
+            ? `the configure write on ${socket} did not complete within ${timeoutMs} ms`
+            : sent === CLOSED
+              ? `the sidecar on ${socket} closed the connection during the configure write`
+              : `the configure write on ${socket} failed (the connection closed or errored)`,
       };
     }
 
