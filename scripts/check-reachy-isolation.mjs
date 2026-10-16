@@ -539,10 +539,10 @@ if (import.meta.main) {
     process.exit(1);
   }
   // [P9] speaks to the deployed sidecar, which serves ONE connection at a time.
-  // bob's reachy capability holds that connection, so it must be stopped first;
-  // a link that is still up is reported as the busy reason and fails the proof.
+  // A link bob's reachy capability still holds consumes the answer, so stop that
+  // capability first; the proof then reports what the connect and the wire show.
   process.stdout.write(
-    "reachy-voice isolation release check: [P9] requires bob's reachy capability STOPPED (it holds the sidecar's one connection; a running link is reported busy).\n",
+    "reachy-voice isolation release check: [P9] run with bob's reachy capability STOPPED (its live link consumes the sidecar's answer).\n",
   );
   const r = spawnSync(process.execPath, ["test", ...PROOFS], {
     cwd: ROOT,

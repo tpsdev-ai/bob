@@ -252,7 +252,7 @@ it on this host, from the reviewed checkout, before the sidecar ships, in bob's
 account session ($AGENT_USER logged in, with its own HOME; never as root and
 never from the admin shell). **Stop bob's reachy capability first**: [P9] speaks
 to the sidecar, which serves one connection at a time, and a link that is still
-up is what [P9] reports as `busy`. The admin shell's variables do not carry over: set
+up consumes the answer. The admin shell's variables do not carry over: set
 `REPO` again in this session. The interpreter is pinned to `/usr/bin/python3 -I`,
 as in step 2's sudoers rule. Name the agent — the account comes from the deployment record (step 4), and the
 credential files are derived from the agent's own `bob.yaml`:
@@ -297,8 +297,8 @@ installed files at the pinned install root match the checkout; [P8] the
 DEPLOYED socket at `/usr/local/var/bob/reachy-voice/run/voice.sock` is 0660
 `jarvis-sidecar:jarvis-voice` in a 0750 directory of that owner and group, and
 an outsider's connect is refused; [P9] the socket the agent's `bob.yaml` names
-(`reachy.socket`) completes the `reachy-voice/1` handshake against the
-configured `sidecarVersion` within a fixed limit, as bob's own account — it
-fails by name when nothing is listening, when the listener is busy or does not
-answer in time, or on another version. **A proof that is skipped, fails or is
+(`reachy.socket`) completes the `reachy-voice/1` handshake, its first line judged
+by bob's own handshake rules, as bob's own account — it fails by name when
+nothing accepts the connect, when no line arrives within the limit, or when the
+reply is one bob refuses. **A proof that is skipped, fails or is
 missing fails the check.**

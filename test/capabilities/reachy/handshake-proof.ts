@@ -1,43 +1,44 @@
 // Refs #360 — the release-host handshake proof helper. As bob's own account,
 // open the socket the agent's `bob.yaml` names (`reachy.socket`), send the
-// `reachy-voice/1` `configure`, and read the strict health line back; it
-// PASSES only when that line reports the configured `sidecarVersion`, within a
-// fixed time limit. Every wait is bounded, and each failure carries a NAMED
-// reason:
+// `reachy-voice/1` `configure`, and read the health line back. The proof PASSES
+// only when that line passes bob's OWN handshake rules — the shared `checkHealth`
+// (version, profile, wake name, generation, `ok`, and the trained-artifact pair)
+// applied to the FIRST line, exactly as the capability judges a live link. Every
+// wait is bounded, and each failure carries a NAMED reason:
 //
-//   no-listener        nothing accepted the connect (a refused connect or a
-//                      missing path — Bun reports a refused UNIX-socket connect
-//                      as ENOENT where Node reports ECONNREFUSED, so the
-//                      reasons are classified by BEHAVIOUR, never by errno);
-//   busy               the listener is already serving its one connection, so a
-//                      further connect is refused (the sidecar serves ONE
-//                      connection at a time: `server.listen(1)` + `accept()`);
-//   handshake-timeout  the handshake did not complete within the limit (no
-//                      health line, a dropped connection, or a configure write
-//                      that did not complete);
-//   version-mismatch   a health line arrived naming another version.
+//   no-listener         nothing accepted the connect (a refused connect or a
+//                       missing path — Bun reports a refused UNIX-socket connect
+//                       as ENOENT where Node reports ECONNREFUSED, so the
+//                       reasons are classified by BEHAVIOUR, never by errno);
+//   handshake-timeout   no line arrived within the handshake limit (the connect
+//                       was accepted but the sidecar answered nothing, or it
+//                       dropped the connection);
+//   handshake-rejected  a line arrived that bob's rules refuse — a first line
+//                       that is not a `reachy-voice/1` health line, or a health
+//                       line whose fields do not match (`detail` names them).
 //
-// The `busy` probe keys on the sidecar's single-session design: while it serves
-// a client it is not calling `accept()`, so a second connect is refused rather
-// than answered. That is why the proof requires bob's reachy capability —
-// which holds that one connection — to be STOPPED while it runs.
+// The limit is ONE budget covering the `configure` write plus its health reply.
+// The probe reports what a connect and the wire show; it does not diagnose WHY a
+// listener answered nothing. The sidecar serves one connection at a time, so a
+// link bob's reachy capability still holds consumes the answer — stop that
+// capability before this proof runs.
 
-import { createConnection } from "node:net";
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
-import type { ReachyProfile } from "../../../src/capabilities/reachy/config.js";
 import {
+  checkHealth,
   configureArgs,
+  type DecodedLine,
   decodeLine,
-  type SidecarHealth,
+  type HandshakeExpectation,
 } from "../../../src/capabilities/reachy/wire.js";
 
-/** The fixed limit on a completed handshake (the configure write plus its
- *  health line). */
+/** The one budget a completed handshake gets: the `configure` write plus its
+ *  health reply. */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 3_000;
 /** The bound on one connect attempt. */
 export const DEFAULT_CONNECT_TIMEOUT_MS = 1_500;
 
-export type HandshakeFailure = "no-listener" | "busy" | "handshake-timeout" | "version-mismatch";
+export type HandshakeFailure = "no-listener" | "handshake-timeout" | "handshake-rejected";
 
 export interface HandshakeProof {
   ok: boolean;
@@ -48,13 +49,11 @@ export interface HandshakeProof {
 }
 
 export interface HandshakeProofOptions {
-  /** The fixed handshake limit (default DEFAULT_HANDSHAKE_TIMEOUT_MS). */
+  /** The one budget for the `configure` write plus its health reply (default
+   *  DEFAULT_HANDSHAKE_TIMEOUT_MS). */
   timeoutMs?: number;
   /** The bound on each connect (default DEFAULT_CONNECT_TIMEOUT_MS). */
   connectMs?: number;
-  profile?: ReachyProfile;
-  wakeName?: string;
-  generation?: number;
 }
 
 const CLOSED = Symbol("closed");
@@ -79,142 +78,110 @@ async function connectClient(
   return result;
 }
 
-type RawConnect = { kind: "refused" } | { kind: "timeout" } | { kind: "open"; close: () => void };
-
-/** A bare connect, used only to see whether a SECOND connection is accepted. */
-function connectRaw(socket: string, ms: number): Promise<RawConnect> {
-  return new Promise((resolve) => {
-    const sock = createConnection(socket);
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const finish = (result: RawConnect): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    timer = setTimeout(() => {
-      sock.destroy();
-      finish({ kind: "timeout" });
-    }, ms);
-    sock.once("connect", () => finish({ kind: "open", close: () => sock.destroy() }));
-    sock.once("error", () => {
-      sock.destroy();
-      finish({ kind: "refused" });
-    });
-  });
-}
-
 /**
  * Complete the `reachy-voice/1` handshake with the listener on `socket` and
- * check its version against `expectedVersion`. Never throws and never hangs:
+ * judge its reply by bob's own rules (`expect`). Never throws and never hangs:
  * every wait is bounded, and the result names the failure.
  */
 export async function probeVoiceHandshake(
   socket: string,
-  expectedVersion: string,
+  expect: HandshakeExpectation,
   opts: HandshakeProofOptions = {},
 ): Promise<HandshakeProof> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const connectMs = opts.connectMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   const client = new UnixSocketReachyClient({ socket });
-  let deliverHealth: (health: SidecarHealth) => void = () => {};
-  const health = new Promise<SidecarHealth>((resolve) => {
-    deliverHealth = resolve;
+  // The FIRST line decides the handshake, as the capability's `handleLine` does
+  // while handshaking: a health line is judged by `checkHealth`, anything else
+  // is refused.
+  let deliverLine: (line: DecodedLine) => void = () => {};
+  const firstLine = new Promise<DecodedLine>((resolve) => {
+    let seen = false;
+    deliverLine = (line) => {
+      if (seen) return;
+      seen = true;
+      resolve(line);
+    };
   });
+  client.onLine((line) => deliverLine(decodeLine(line)));
   let deliverClosed: () => void = () => {};
   const closed = new Promise<typeof CLOSED>((resolve) => {
     deliverClosed = () => resolve(CLOSED);
   });
-  client.onLine((line) => {
-    const decoded = decodeLine(line);
-    if (decoded.kind === "health") deliverHealth(decoded.health);
-  });
   client.onClose(deliverClosed);
 
-  const opened = await connectClient(client, connectMs);
-  if (opened !== "ok") {
-    client.disconnect();
-    return {
-      ok: false,
-      reason: "no-listener",
-      detail: `no listener on ${socket} (the connect was ${opened === "refused" ? "refused" : "not completed"})`,
-    };
-  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const opened = await connectClient(client, connectMs);
+    if (opened !== "ok") {
+      return {
+        ok: false,
+        reason: "no-listener",
+        detail: `no listener on ${socket} (the connect was ${opened === "refused" ? "refused" : "not completed"})`,
+      };
+    }
 
-  let sendTimer: ReturnType<typeof setTimeout> | undefined;
-  const sendTimedOut = new Promise<typeof TIMED_OUT>((resolve) => {
-    sendTimer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
-  });
-  const sent = await Promise.race([
-    client
-      .send(
-        "configure",
-        configureArgs({
-          version: expectedVersion,
-          profile: opts.profile ?? "voice",
-          wakeName: opts.wakeName ?? "jarvis",
-          generation: opts.generation ?? 1,
-        }),
-      )
-      .then(
+    // ONE deadline for the whole handshake. Both waits race the same timer, so
+    // the total is bounded by `timeoutMs`, never by twice it.
+    let deliverTimeout: () => void = () => {};
+    const timedOut = new Promise<typeof TIMED_OUT>((resolve) => {
+      deliverTimeout = () => resolve(TIMED_OUT);
+    });
+    timer = setTimeout(deliverTimeout, timeoutMs);
+
+    const sent = await Promise.race([
+      client.send("configure", configureArgs(expect)).then(
         () => "ok" as const,
         () => "failed" as const,
       ),
-    sendTimedOut,
-  ]);
-  if (sendTimer !== undefined) clearTimeout(sendTimer);
-  if (sent !== "ok") {
-    client.disconnect();
-    return {
-      ok: false,
-      reason: "handshake-timeout",
-      detail: `the configure write on ${socket} did not complete`,
-    };
-  }
+      timedOut,
+    ]);
+    if (sent !== "ok") {
+      return {
+        ok: false,
+        reason: "handshake-timeout",
+        detail: `the configure write on ${socket} did not complete within ${timeoutMs} ms`,
+      };
+    }
 
-  const result = await Promise.race([
-    health,
-    closed,
-    new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), timeoutMs)),
-  ]);
-
-  if (result !== CLOSED && result !== TIMED_OUT) {
+    const result = await Promise.race([firstLine, closed, timedOut]);
+    if (result === CLOSED) {
+      return {
+        ok: false,
+        reason: "handshake-timeout",
+        detail: `the sidecar on ${socket} closed the connection before its health line`,
+      };
+    }
+    if (result === TIMED_OUT) {
+      return {
+        ok: false,
+        reason: "handshake-timeout",
+        detail: `no reachy-voice/1 health line on ${socket} within ${timeoutMs} ms`,
+      };
+    }
+    if (result.kind !== "health") {
+      return {
+        ok: false,
+        reason: "handshake-rejected",
+        detail: `the sidecar on ${socket} sent ${
+          result.kind === "malformed"
+            ? `a line bob refuses before the handshake (${result.reason})`
+            : `a ${result.kind} line before the handshake`
+        }`,
+      };
+    }
+    const bad = checkHealth(result.health, expect);
+    if (bad.length > 0) {
+      return {
+        ok: false,
+        reason: "handshake-rejected",
+        version: result.health.version,
+        detail: `the sidecar on ${socket} reported a health line bob's rules refuse: ${bad.join(", ")}`,
+      };
+    }
+    return { ok: true, version: result.health.version };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
     client.disconnect();
-    if (result.version === expectedVersion) return { ok: true, version: result.version };
-    return {
-      ok: false,
-      reason: "version-mismatch",
-      version: result.version,
-      detail: `the sidecar on ${socket} reports version ${result.version}, not the configured ${expectedVersion}`,
-    };
   }
-  if (result === CLOSED) {
-    client.disconnect();
-    return {
-      ok: false,
-      reason: "handshake-timeout",
-      detail: `the sidecar on ${socket} closed the connection before its health line`,
-    };
-  }
-
-  // No health line within the limit. A listener already serving its one
-  // connection refuses a further connect; a listener that accepted and never
-  // answered accepts it. That refusal is what separates a busy listener from a
-  // wedged one.
-  const canary = await connectRaw(socket, connectMs);
-  client.disconnect();
-  if (canary.kind === "open") {
-    canary.close();
-    return {
-      ok: false,
-      reason: "handshake-timeout",
-      detail: `no reachy-voice/1 health line on ${socket} within ${timeoutMs} ms`,
-    };
-  }
-  return {
-    ok: false,
-    reason: "busy",
-    detail: `${socket} is already serving a connection (a further connect was ${canary.kind === "refused" ? "refused" : "not accepted"}); stop bob's reachy capability before this proof runs`,
-  };
 }

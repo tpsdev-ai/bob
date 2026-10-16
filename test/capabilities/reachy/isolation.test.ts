@@ -1,5 +1,5 @@
 // bob#356 V1 — the reachy-voice sidecar's isolation proofs. Each proof carries a
-// stable id [P1]…[P8]; scripts/check-reachy-isolation.mjs pins that set, so a
+// stable id [P1]…[P9]; scripts/check-reachy-isolation.mjs pins that set, so a
 // missing proof fails the release-host check even when nothing was skipped.
 //
 //   [P1] DENY-DEFAULT CONFINEMENT (macOS seatbelt, the shipped
@@ -39,11 +39,12 @@
 //        jarvis-sidecar, group jarvis-voice, in a 0750 directory of that owner
 //        and group; an outsider's connect is refused.
 //   [P9] The DEPLOYED socket the agent's `bob.yaml` names (`reachy.socket`), as
-//        bob's own account: a completed `reachy-voice/1` handshake reporting the
-//        configured `sidecarVersion`, within a fixed limit. Fails by name on no
-//        listener, a busy listener (the sidecar serves one connection at a time),
-//        a listener that does not answer in time, or another version. Run with
-//        bob's reachy capability STOPPED: it holds the sidecar's one connection.
+//        bob's own account: a completed `reachy-voice/1` handshake whose first
+//        line passes bob's own handshake rules (the shared `checkHealth`). Fails
+//        by name when nothing accepts the connect (`no-listener`), when no line
+//        arrives within the limit (`handshake-timeout`), or when the reply is one
+//        bob refuses (`handshake-rejected`). Run with bob's reachy capability
+//        STOPPED: its live link consumes the answer.
 //
 // Required release-host separate-user steps use the installed `proof.py` via
 // RUNBOOK step 2's sudoers rule. Local fallback checks sudo with `/usr/bin/true`
@@ -255,16 +256,28 @@ const activeSkip =
   rootsSkip ||
   userSkip ||
   (!AGENT ? "the agent whose credentials to check is not named (BOB_ISOLATION_AGENT)" : "");
-// [P9] the deployed socket the agent's own `bob.yaml` names, and the version it
-// pins. Derived through the agent's own resolution (never a caller-named file).
-const handshakeTarget: { socket?: string; version?: string; skip?: string } = (() => {
+// [P9] the deployed socket the agent's own `bob.yaml` names, the version it pins,
+// and the profile and wake name bob would push. Derived through the agent's own
+// resolution (never a caller-named file).
+const handshakeTarget: {
+  socket?: string;
+  version?: string;
+  profile?: "voice" | "reachy";
+  wakeName?: string;
+  skip?: string;
+} = (() => {
   if (!AGENT) return { skip: "the agent whose socket to check is not named (BOB_ISOLATION_AGENT)" };
   try {
     const resolved = resolveRunConfig({ name: AGENT, agentsRoot: AGENTS_ROOT });
     const reachy = resolved.capabilities.find((c) => c.name === "reachy");
     if (!reachy) return { skip: `${AGENT} does not configure the reachy capability` };
     const cfg = parseConfig(reachy.config);
-    return { socket: cfg.socket, version: cfg.sidecarVersion };
+    return {
+      socket: cfg.socket,
+      version: cfg.sidecarVersion,
+      profile: cfg.profile,
+      wakeName: cfg.wakeName,
+    };
   } catch (err) {
     return {
       skip: `the agent's reachy config cannot be read: ${err instanceof Error ? err.message : err}`,
@@ -824,15 +837,21 @@ describe("reachy-voice isolation — the deployed socket", () => {
 
 describe("reachy-voice isolation — the handshake on the deployed socket", () => {
   proof(
-    "[P9] as bob's own account, the socket the agent's bob.yaml names completes the reachy-voice/1 handshake against its configured sidecarVersion within the limit; a listener that is absent, busy, wedged or on another version fails with its named reason (run with bob's reachy capability stopped)",
+    "[P9] as bob's own account, the socket the agent's bob.yaml names completes the reachy-voice/1 handshake, and its first line passes bob's own handshake rules; a listener that does not accept the connect, does not answer in time, or answers with a line bob refuses fails with its named reason (run with bob's reachy capability stopped)",
     handshakeSkip,
     async () => {
       const socket = must(handshakeTarget.socket, "the agent's reachy socket");
       const version = must(handshakeTarget.version, "the agent's sidecarVersion");
-      const result = await probeVoiceHandshake(socket, version, {
-        timeoutMs: 5_000,
-        connectMs: 2_000,
-      });
+      const result = await probeVoiceHandshake(
+        socket,
+        {
+          version,
+          profile: must(handshakeTarget.profile, "the agent's reachy profile"),
+          wakeName: must(handshakeTarget.wakeName, "the agent's wake name"),
+          generation: 1,
+        },
+        { timeoutMs: 5_000, connectMs: 2_000 },
+      );
       expect(result, result.detail).toEqual({ ok: true, version });
     },
     30_000,
