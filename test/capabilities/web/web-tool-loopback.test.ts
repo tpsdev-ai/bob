@@ -81,6 +81,13 @@ test(
     const unrecorded = report.cases.unrecorded;
     expect(unrecorded.ok).toBe(false);
     expect(unrecorded.code).toBe("url-unrecorded");
+
+    // A redirect to an unrecorded destination is refused before dispatch: the
+    // peer received the redirect response but NO request for the destination.
+    const redirect = report.cases.redirect;
+    expect(redirect.ok).toBe(false);
+    expect(redirect.code).toBe("url-unrecorded");
+    expect(redirect.requests).toEqual(["GET /start", "GET /next", "GET /redirect"]);
   },
   TIMEOUT_MS,
 );

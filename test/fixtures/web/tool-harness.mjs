@@ -34,6 +34,18 @@ const server = createServer((req, res) => {
     res.end("linked page");
     return;
   }
+  if (req.url === "/redirect") {
+    // A redirect to a destination the caller never recorded. The tool must
+    // refuse it before this server sees a request for the destination.
+    res.writeHead(302, { location: "/elsewhere" });
+    res.end();
+    return;
+  }
+  if (req.url === "/elsewhere") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("the unrecorded destination");
+    return;
+  }
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found");
 });
@@ -78,15 +90,19 @@ const settings = resolveWebSettings({
   fetch_per_turn: 10,
   text_per_turn: 100_000,
 });
+// One admitted operation for the whole run: a stable token, as a real turn
+// admission returns for its prompt chain.
+const token = {};
 wireWebCapability({
   pi,
   settings,
-  admission: { readOrigin: () => ({ kind: "run" }) },
+  admission: { activeAdmission: () => token, readOrigin: () => ({ kind: "run" }) },
   fetch: (url, options) => fetchDocument(url, options, coreDeps),
 });
 
 const start = `http://peer.test:${port}/start`;
-fire("before_agent_start", { prompt: `please read ${start}` });
+const redirect = `http://peer.test:${port}/redirect`;
+fire("before_agent_start", { prompt: `please read ${start} and ${redirect}` });
 
 const tool = tools[0];
 const call = async (url) => {
@@ -108,6 +124,10 @@ const startRequests = requests.map((r) => `${r.method} ${r.url}`);
 const startConnections = connections;
 const fetchLink = await call(`http://peer.test:${port}/next`);
 const fetchUnrecorded = await call(`http://peer.test:${port}/other`);
+// A redirect to an unrecorded destination: provenance refuses the target
+// before the core dispatches it, so the peer sees no request for /elsewhere.
+const fetchRedirect = await call(redirect);
+const redirectRequests = requests.map((r) => `${r.method} ${r.url}`);
 
 const report = {
   cases: {
@@ -118,6 +138,7 @@ const report = {
     },
     follow: fetchLink,
     unrecorded: fetchUnrecorded,
+    redirect: { ...fetchRedirect, requests: redirectRequests },
   },
 };
 

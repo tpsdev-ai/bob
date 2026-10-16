@@ -14,7 +14,7 @@ import {
 } from "../../../src/capabilities/web/admission.js";
 import type { WebSettings } from "../../../src/capabilities/web/core.js";
 import { isWebFetchError } from "../../../src/capabilities/web/errors.js";
-import { extractText } from "../../../src/capabilities/web/extract.js";
+import { extractDocument } from "../../../src/capabilities/web/extract.js";
 import {
   extractUrls,
   parseAbsolute,
@@ -95,6 +95,20 @@ describe("URL provenance — the exact rule", () => {
     expect(codeOf(() => admitCandidate(second, "https://host.test/a"))).toBe("url-unrecorded");
   });
 
+  it("keeps an empty query distinct from no query (probe)", () => {
+    const noQuery = stateFor("https://host.test/p");
+    expect(codeOf(() => admitCandidate(noQuery, "https://host.test/p?"))).toBe("url-unrecorded");
+    const emptyQuery = stateFor("https://host.test/p?");
+    expect(admitCandidate(emptyQuery, "https://host.test/p?").href).toBe("https://host.test/p?");
+    expect(codeOf(() => admitCandidate(emptyQuery, "https://host.test/p"))).toBe("url-unrecorded");
+  });
+
+  it("does not grant a shortened spelling of the message URL (punctuation probe)", () => {
+    const state = stateFor("read https://host.test/p?x=1!");
+    expect(admitCandidate(state, "https://host.test/p?x=1!").href).toBe("https://host.test/p?x=1!");
+    expect(codeOf(() => admitCandidate(state, "https://host.test/p?x=1"))).toBe("url-unrecorded");
+  });
+
   it("refuses a relative or non-http(s) candidate as unparseable", () => {
     const state = stateFor("https://host.test/a");
     expect(codeOf(() => admitCandidate(state, "/a"))).toBe("url-invalid");
@@ -111,22 +125,24 @@ describe("URL provenance — recording sources", () => {
 
   it("records a link on a fetched page, resolved against that page (real extractor)", () => {
     // The R1b extractor renders a link as `text (resolved url)`, resolving a
-    // relative href against the page URL; recordPageLinks reads that back.
-    const page = extractText(
+    // relative href against the page URL, AND reports the resolved link itself.
+    const doc = extractDocument(
       "text/html",
       '<a href="/next">next</a>',
       "https://host.test/deep/page",
     );
-    expect(page).toBe("next (https://host.test/next)");
+    expect(doc.text).toBe("next (https://host.test/next)");
+    expect(doc.links).toEqual(["https://host.test/next"]);
     const state = stateFor("https://host.test/deep/page");
-    recordPageLinks(state, page, "https://host.test/deep/page");
+    recordPageLinks(state, doc.links);
     expect(admitCandidate(state, "https://host.test/next").href).toBe("https://host.test/next");
   });
 
-  it("extractUrls trims the extractor's wrapping punctuation but keeps the URL bytes", () => {
-    expect(extractUrls("next (https://host.test/next), and (https://host.test/x).")).toEqual([
-      "https://host.test/next",
-      "https://host.test/x",
+  it("extractUrls takes the absolute URL whole, keeping punctuation in the reference", () => {
+    expect(extractUrls("read https://host.test/p?x=1!")).toEqual(["https://host.test/p?x=1!"]);
+    expect(extractUrls("see http://a.test/x and https://b.test/y")).toEqual([
+      "http://a.test/x",
+      "https://b.test/y",
     ]);
   });
 
@@ -137,9 +153,11 @@ describe("URL provenance — recording sources", () => {
 });
 
 describe("urlKey and parseAbsolute", () => {
-  it("drops the default port from the key (effective port) and keeps a non-default one", () => {
+  it("keeps an empty query delimiter and drops the default port (effective port)", () => {
     expect(urlKey(new URL("https://host.test:443/a"))).toBe("https://host.test/a");
     expect(urlKey(new URL("https://host.test:8443/a"))).toBe("https://host.test:8443/a");
+    expect(urlKey(new URL("https://host.test/p?"))).toBe("https://host.test/p?");
+    expect(urlKey(new URL("https://host.test/p"))).toBe("https://host.test/p");
   });
 
   it("parseAbsolute refuses a relative string and a non-http scheme", () => {

@@ -103,7 +103,7 @@ it("refuses when the deadline fires during extraction after the body is read", a
     async () => {
       extractionStarted();
       await held;
-      return "late text";
+      return { text: "late text", links: [] };
     },
   );
   await started;
@@ -120,6 +120,26 @@ it("refuses when the deadline fires during extraction after the body is read", a
     clearTimeout(timer);
     releaseExtraction();
   }
+});
+
+it("reports the complete page links even when the display text is cut", async () => {
+  const body = '<p>intro</p><a href="/deep/next?x=1">go</a>';
+  const response = {
+    headers: { "content-type": "text/html" },
+    body: Readable.from([Buffer.from(body)]),
+  } as unknown as Parameters<typeof readResult>[0];
+  const result = await readResult(
+    response,
+    200,
+    new URL("https://host.test/page"),
+    5,
+    new AbortController().signal,
+    () => {},
+  );
+  expect(result.truncated).toBe(true);
+  expect(result.text.length).toBeLessThanOrEqual(5);
+  // The complete link is reported, not a prefix cut out of the display text.
+  expect(result.links).toEqual(["https://host.test/deep/next?x=1"]);
 });
 
 interface Recorded {

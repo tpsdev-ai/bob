@@ -28,6 +28,7 @@ function result(over: Partial<FetchResult> = {}): FetchResult {
     contentType: "text/plain",
     text: "hello",
     truncated: false,
+    links: [],
     ...over,
   };
 }
@@ -103,14 +104,13 @@ describe("web_fetch — the success path", () => {
     );
   });
 
-  it("records the links on the fetched page so a later call can follow them", async () => {
+  it("records the complete links on the fetched page so a later call can follow them", async () => {
     const state = newTurnState("go to https://host.test/a", RUN);
     const tool = toolFor(
       state,
       settings(),
       () => RUN,
-      async () =>
-        result({ text: "next (https://host.test/next)", finalUrl: "https://host.test/a" }),
+      async () => result({ finalUrl: "https://host.test/a", links: ["https://host.test/next"] }),
     );
     await run(tool, "https://host.test/a");
     // The recorded link is now fetchable without a second seed.
@@ -122,6 +122,43 @@ describe("web_fetch — the success path", () => {
     );
     await run(follow, "https://host.test/next");
     expect(follow.calls.urls).toEqual(["https://host.test/next"]);
+  });
+
+  it("vets every redirect target against provenance before it is followed", async () => {
+    const state = newTurnState("go to https://host.test/a", RUN);
+    const tool = toolFor(
+      state,
+      settings(),
+      () => RUN,
+      async (url, options) => {
+        // The injected core plays a redirect to an unrecorded destination: it
+        // must pass the target through onRedirect, which refuses it.
+        options.onRedirect?.(new URL("https://host.test/elsewhere"));
+        return result({ finalUrl: url });
+      },
+    );
+    expect(await codeOf(run(tool, "https://host.test/a"))).toBe("url-unrecorded");
+  });
+
+  it("accounts for the extracted document text, not the metadata line, in the allowance", async () => {
+    // The advertised ceiling covers the extracted document text; the metadata
+    // line the tool renders alongside it is not charged (blocker 5).
+    const state = newTurnState("https://host.test/a", RUN);
+    const cfg = settings({ textPerTurn: 5 });
+    const tool = toolFor(
+      state,
+      cfg,
+      () => RUN,
+      async () => result({ text: "abcde", finalUrl: "https://host.test/a" }),
+    );
+    const out = (await run(tool, "https://host.test/a")) as {
+      content: Array<{ text: string }>;
+    };
+    expect(state.textChars).toBe(5);
+    // The returned content is the metadata line plus the five document
+    // characters: the ceiling did not cover the metadata.
+    expect(out.content[0].text.endsWith("\n\nabcde")).toBe(true);
+    expect(out.content[0].text.length).toBeGreaterThan(5);
   });
 
   it("reports truncation in the meta line", async () => {
