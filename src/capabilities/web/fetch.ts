@@ -17,9 +17,10 @@
 //
 // REDIRECTS. Followed here, by hand, at most five, each target re-admitted
 // through admitUrl (scheme, port, userinfo, zone, downgrade, canonical literal)
-// and each named hop uses a new connection with a fresh vetted DNS lookup.
-// Canonical literals are vetted at admission. A redirect status without a
-// Location is returned as the final response.
+// and vetted by the caller's onRedirect hook, when supplied, before it is
+// dispatched, and each named hop uses a new connection with a fresh vetted DNS
+// lookup. Canonical literals are vetted at admission. A redirect status without
+// a Location is returned as the final response.
 //
 // LIMITS. One 15-second deadline covers every hop, the body read, decoding,
 // extraction, and the final success path. Bodies skipped on redirects or
@@ -41,7 +42,8 @@ import { isWebFetchError, WebFetchError } from "./errors.js";
 import {
   ALLOWED_CONTENT_TYPES,
   allowedContentType,
-  extractText,
+  type ExtractedDocument,
+  extractDocument,
   mediaTypeOf,
   truncateText,
 } from "./extract.js";
@@ -139,6 +141,10 @@ export interface FetchOptions {
   // A lower character limit than the operator's ceiling. The model may lower
   // the limit and never raise it.
   maxChars?: number;
+  // A veto the caller may apply to every resolved redirect target before it is
+  // followed (the tool admits it against URL provenance here). Throw to refuse
+  // the redirect; the thrown refusal is what the caller receives.
+  onRedirect?: (target: URL) => void;
 }
 
 // Test seams. R1c passes neither: production callers get the public-unicast
@@ -165,6 +171,9 @@ export interface FetchResult {
   text: string;
   // True when the text was cut.
   truncated: boolean;
+  // Retained, resolvable HTTP(S) anchors for HTML; scanned absolute URLs for
+  // other media. Extracted from the full body before display-text truncation.
+  links: readonly string[];
 }
 
 function headerValue(value: string | string[] | undefined): string | undefined {
@@ -369,7 +378,11 @@ export async function fetchDocument(
               `the response redirects more than ${MAX_REDIRECTS} times`,
             );
           }
-          current = admitUrl(location, policy, { from: current });
+          const next = admitUrl(location, policy, { from: current });
+          // The caller's veto (URL provenance), when supplied: run it BEFORE the
+          // target is dispatched, so an unrecorded destination is never requested.
+          options.onRedirect?.(next);
+          current = next;
           continue;
         }
 
@@ -405,7 +418,11 @@ export async function readResult(
   maxChars: number,
   signal: AbortSignal,
   checkDeadline: () => void,
-  extract: (media: string, body: string, url: string) => string | Promise<string> = extractText,
+  extract: (
+    media: string,
+    body: string,
+    url: string,
+  ) => ExtractedDocument | Promise<ExtractedDocument> = extractDocument,
 ): Promise<FetchResult> {
   const media = mediaTypeOf(headerValue(response.headers["content-type"]));
   if (media === undefined || !allowedContentType(media)) {
@@ -423,14 +440,15 @@ export async function readResult(
     signal,
   );
   checkDeadline();
-  const text = await extract(media, decoded.toString("utf8"), url.href);
+  const document = await extract(media, decoded.toString("utf8"), url.href);
   checkDeadline();
-  const cut = truncateText(text, maxChars);
+  const cut = truncateText(document.text, maxChars);
   return {
     finalUrl: url.href,
     status,
     contentType: media,
     text: cut.text,
     truncated: cut.truncated,
+    links: document.links,
   };
 }

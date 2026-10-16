@@ -13,6 +13,11 @@ import {
 } from "./tool-loop.js";
 import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
 
+// Identifies one admitted operation: one `admitTurn` call. Opaque, compared by
+// identity. The same token is returned for the whole operation, including every
+// prompt its automatic continuations send; two admissions never share one.
+export type AdmissionToken = object;
+
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
   admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]>;
@@ -20,6 +25,14 @@ export interface TurnAdmission {
   // admission until that prompt settles — never cleared mid-prompt by an
   // agent_end, a loop break, or a later admission. Elsewhere: run.
   readOrigin(): TurnOrigin;
+  // The admission the caller's prompt belongs to, from admission until that
+  // operation's prompt chain SETTLES. Undefined outside any admission (a bare
+  // prompt), and undefined from the instant the operation settles — including
+  // from a descendant async context that inherited the caller's turn before the
+  // settle. One `admitTurn` call yields one token, returned unchanged across
+  // the operation's retries and automatic continuations — so a lifecycle hook
+  // can tell a continuation of the same operation from a new admission.
+  activeAdmission(): AdmissionToken | undefined;
   // bob#356: the same binding, WITHOUT the default. The origin of the admitted
   // turn the caller runs inside, or undefined anywhere else — a prompt outside
   // every admission, or a turn whose prompt has settled. A gate that grants by
@@ -61,6 +74,10 @@ export function createTurnAdmission(
     released?: boolean;
     messages: unknown[];
     detector: ToolLoopDetector;
+    token: AdmissionToken;
+    // False once the operation's prompt chain settles; the token is absent
+    // from then on, even to a context that inherited this turn earlier.
+    live: boolean;
     abort?: (err: Error) => void;
   };
   const context = new AsyncLocalStorage<Turn>();
@@ -146,6 +163,8 @@ export function createTurnAdmission(
           origin: approved,
           messages: [],
           detector: new ToolLoopDetector(limit),
+          token: {},
+          live: true,
         };
         let abortTurn!: (err: Error) => void;
         const loopAbort = new Promise<never>((_resolve, reject) => {
@@ -195,6 +214,7 @@ export function createTurnAdmission(
           // it, and releases it when the prompt settles. The binding belongs to
           // the turn (readOrigin), so a queued admission cannot replace it.
           const release = (): void => {
+            turn.live = false;
             turn.origin = { kind: "run" };
             turn.released = true;
             if (active === turn) active = undefined;
@@ -220,6 +240,16 @@ export function createTurnAdmission(
       // starts. A settled turn's origin was reset to run.
       const turn = context.getStore();
       return turn ? { ...turn.origin } : { kind: "run" };
+    },
+    activeAdmission(): AdmissionToken | undefined {
+      // Keyed on the caller's own turn, like readOrigin, and gated on the turn
+      // still being live: the token is present only while the operation's prompt
+      // chain is in flight. A loop-broken prompt that outlives its admission
+      // keeps it — release runs when that prompt settles — but a settled
+      // operation returns nothing here, even from a descendant context that
+      // inherited the turn before release.
+      const turn = context.getStore();
+      return turn?.live ? turn.token : undefined;
     },
     readAdmittedOrigin(): TurnOrigin | undefined {
       const turn = context.getStore();

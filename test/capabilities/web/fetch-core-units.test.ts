@@ -1,6 +1,6 @@
 // The web fetch core's runtime-independent pieces (bob#245 — web spec v3, slice
 // R1b): the DNS-answer vetting wrapper, the fixed User-Agent, the character
-// limit, and the fact that the capability still registers no tool. The
+// limit, and the capability surface (R1c registers the `web_fetch` tool). The
 // transport itself is exercised under Node in fetch-core-node.test.ts.
 
 import { describe, expect, it } from "bun:test";
@@ -103,7 +103,7 @@ it("refuses when the deadline fires during extraction after the body is read", a
     async () => {
       extractionStarted();
       await held;
-      return "late text";
+      return { text: "late text", links: [] };
     },
   );
   await started;
@@ -120,6 +120,26 @@ it("refuses when the deadline fires during extraction after the body is read", a
     clearTimeout(timer);
     releaseExtraction();
   }
+});
+
+it("reports a resolved HTML anchor before display-text truncation", async () => {
+  const body = '<p>intro</p><a href="/deep/next?x=1">go</a>';
+  const response = {
+    headers: { "content-type": "text/html" },
+    body: Readable.from([Buffer.from(body)]),
+  } as unknown as Parameters<typeof readResult>[0];
+  const result = await readResult(
+    response,
+    200,
+    new URL("https://host.test/page"),
+    5,
+    new AbortController().signal,
+    () => {},
+  );
+  expect(result.truncated).toBe(true);
+  expect(result.text.length).toBeLessThanOrEqual(5);
+  // The complete link is reported, not a prefix cut out of the display text.
+  expect(result.links).toEqual(["https://host.test/deep/next?x=1"]);
 });
 
 interface Recorded {
@@ -306,7 +326,7 @@ describe("the fixed User-Agent and the character limit", () => {
 });
 
 describe("the capability surface", () => {
-  it("registers no tool", async () => {
+  it("registers the web_fetch tool (R1c)", async () => {
     const previous = process.env.BOB_CAP_WEB;
     process.env.BOB_CAP_WEB = "{}";
     try {
@@ -315,11 +335,15 @@ describe("the capability surface", () => {
       ) => void;
       const registered: string[] = [];
       extension({
+        on: () => {},
         registerTool: (tool: { name: string }) => {
           registered.push(tool.name);
         },
+        // No turn admission: getTurnAdmission finds none, so the tool refuses
+        // every call, but it is still registered.
+        events: { emit: () => {} },
       } as unknown as ExtensionAPI);
-      expect(registered).toEqual([]);
+      expect(registered).toEqual(["web_fetch"]);
     } finally {
       if (previous === undefined) delete process.env.BOB_CAP_WEB;
       else process.env.BOB_CAP_WEB = previous;

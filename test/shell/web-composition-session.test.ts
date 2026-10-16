@@ -174,7 +174,7 @@ function probe(name: string, body: string): string {
 }
 
 describe("the control: a web session with only public-class inputs is composed", () => {
-  it("web + fixture, no soul, the admitted task, fresh history: created, and the web extension loads with no tool", async () => {
+  it("web + fixture, no soul, the admitted task, fresh history: created, and the web extension loads with its tool registered", async () => {
     const agent = scaffold();
     const built = await build(
       agent,
@@ -189,7 +189,7 @@ describe("the control: a web session with only public-class inputs is composed",
       const loaded = built.loader.getExtensions().extensions;
       const web = loaded.find((e) => e.path.endsWith("/dist/capabilities/web/index.js"));
       expect(web, "the real web extension loaded").toBeDefined();
-      expect([...(web?.tools.keys() ?? [])], "web registers no tool in R1a").toEqual([]);
+      expect([...(web?.tools.keys() ?? [])], "web registers web_fetch").toEqual(["web_fetch"]);
       // The contract guard (bob's own, public row) is in the session too.
       expect(loaded.map((e) => e.path)).toContain("<inline:bob-contract-guard>");
       // A bind and a reload of the same session pass the rule as well.
