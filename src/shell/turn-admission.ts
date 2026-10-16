@@ -13,6 +13,11 @@ import {
 } from "./tool-loop.js";
 import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
 
+// Identifies one admitted operation: one `admitTurn` call. Opaque, compared by
+// identity. The same token is returned for the whole operation, including every
+// prompt its automatic continuations send; two admissions never share one.
+export type AdmissionToken = object;
+
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
   admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]>;
@@ -20,6 +25,12 @@ export interface TurnAdmission {
   // admission until that prompt settles — never cleared mid-prompt by an
   // agent_end, a loop break, or a later admission. Elsewhere: run.
   readOrigin(): TurnOrigin;
+  // The admission the caller's prompt belongs to, from admission until that
+  // operation's prompt chain settles; undefined outside any admission (a bare
+  // prompt). One `admitTurn` call yields one token, returned unchanged across
+  // the operation's retries and automatic continuations — so a lifecycle hook
+  // can tell a continuation of the same operation from a new admission.
+  activeAdmission(): AdmissionToken | undefined;
 }
 
 // One runtime owns one FIFO. Async context binds the origin to the actual
@@ -54,6 +65,7 @@ export function createTurnAdmission(
     origin: TurnOrigin;
     messages: unknown[];
     detector: ToolLoopDetector;
+    token: AdmissionToken;
     abort?: (err: Error) => void;
   };
   const context = new AsyncLocalStorage<Turn>();
@@ -122,6 +134,7 @@ export function createTurnAdmission(
           origin: approved,
           messages: [],
           detector: new ToolLoopDetector(limit),
+          token: {},
         };
         let abortTurn!: (err: Error) => void;
         const loopAbort = new Promise<never>((_resolve, reject) => {
@@ -195,6 +208,11 @@ export function createTurnAdmission(
       // starts. A settled turn's origin was reset to run.
       const turn = context.getStore();
       return turn ? { ...turn.origin } : { kind: "run" };
+    },
+    activeAdmission(): AdmissionToken | undefined {
+      // Keyed on the caller's own turn, like readOrigin: the token is absent
+      // once the operation's prompt chain has left this async context.
+      return context.getStore()?.token;
     },
     close(): void {
       closed = true;

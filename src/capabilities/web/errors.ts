@@ -30,7 +30,8 @@ export type WebFetchRefusalCode =
   | "network"
   // The tool ran outside an admitted prompt: no state was seeded.
   | "no-admission"
-  // The running admission does not match the state's seeded admission.
+  // The running turn's origin does not match the origin the state was seeded
+  // for.
   | "admission-mismatch"
   // The candidate URL was not recorded from the message or a fetched page.
   | "url-unrecorded"

@@ -1,8 +1,9 @@
 // The `web_fetch` tool (bob#152, spec v3, slice R1c). It combines the R1b fetch
 // core with URL provenance and the admission budgets: it admits the URL against
-// the prompt's recorded URLs, charges a fetch attempt before any I/O, calls the
-// fetch core, records the links on the returned page, and charges the returned
-// text against the shared allowance.
+// the operation's recorded URLs, charges a fetch attempt before the fetch,
+// calls the fetch core (vetting every redirect target against provenance before
+// it is followed), records the complete links the returned page carried, and
+// charges the extracted document text against the shared allowance.
 //
 // It registers nothing here; index.ts wires this definition to pi. `fetch` is a
 // seam: production uses the R1b `fetchDocument`; a test can inject one.
@@ -42,7 +43,7 @@ type WebFetchParams = Static<typeof WEB_FETCH_PARAMS>;
 
 export type WebFetchFn = (
   url: string,
-  options: { settings: WebSettings; maxChars: number },
+  options: { settings: WebSettings; maxChars: number; onRedirect?: (target: URL) => void },
 ) => Promise<FetchResult>;
 
 export interface WebFetchToolDeps {
@@ -84,12 +85,13 @@ export function createWebFetchTool(
       if (origin === undefined || originKey(origin) !== originKey(state.origin)) {
         throw new WebFetchError(
           "admission-mismatch",
-          "the running admission does not match the one this prompt's state was seeded for",
+          "the running turn's origin does not match the one this prompt's state was seeded for",
         );
       }
 
       const target = admitCandidate(state, params.url);
-      // Charge the attempt before any I/O: a call that fails still counts.
+      // Charge the attempt before the fetch begins: a fetch that then fails
+      // still counts.
       chargeFetchAttempt(state, deps.settings);
 
       const remaining = textAllowanceRemaining(state, deps.settings);
@@ -104,8 +106,19 @@ export function createWebFetchTool(
         remaining,
       );
 
-      const result = await fetch(target.href, { settings: deps.settings, maxChars });
-      recordPageLinks(state, result.text, result.finalUrl);
+      const result = await fetch(target.href, {
+        settings: deps.settings,
+        maxChars,
+        // Vet every redirect target against provenance BEFORE it is followed,
+        // so an unrecorded destination is never requested.
+        onRedirect: (redirect) => {
+          admitCandidate(state, redirect.href);
+        },
+      });
+      recordPageLinks(state, result.links);
+      // The allowance covers the extracted document text; the metadata line the
+      // tool renders alongside it (final URL, status, content type) is not
+      // charged.
       chargeText(state, deps.settings, result.text.length);
 
       return {

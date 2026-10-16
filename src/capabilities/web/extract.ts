@@ -19,6 +19,7 @@
 // cut. It never ends on half of a surrogate pair.
 
 import { ElementType, parseDocument } from "htmlparser2";
+import { extractUrls } from "./provenance.js";
 
 // The subset of htmlparser2's parsed node shape this file walks. Declared here
 // rather than imported from domhandler (htmlparser2's own dependency, which
@@ -147,9 +148,10 @@ function resolveLink(href: string | undefined, baseUrl: string): string | undefi
   }
 }
 
-function htmlToText(html: string, baseUrl: string): string {
+function htmlToDocument(html: string, baseUrl: string): ExtractedDocument {
   const document = parseDocument(html) as unknown as HtmlNode;
   const parts: string[] = [];
+  const resolvedLinks: string[] = [];
 
   const walk = (element: HtmlNode): void => {
     for (const child of element.children ?? []) {
@@ -163,6 +165,7 @@ function htmlToText(html: string, baseUrl: string): string {
       if (tag === "a") {
         const text = textOf(child);
         const resolved = resolveLink(child.attribs?.href, baseUrl);
+        if (resolved !== undefined) resolvedLinks.push(resolved);
         parts.push(resolved === undefined ? text : `${text} (${resolved})`);
         continue;
       }
@@ -185,13 +188,49 @@ function htmlToText(html: string, baseUrl: string): string {
     kept.push(line);
   }
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
-  return kept.join("\n");
+  return { text: kept.join("\n"), links: absoluteHttpLinks(resolvedLinks) };
+}
+
+// The complete absolute http(s) links in a set of resolved hrefs, fragment
+// stripped and de-duplicated in first-seen order.
+function absoluteHttpLinks(hrefs: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const href of hrefs) {
+    let url: URL;
+    try {
+      url = new URL(href);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    url.hash = "";
+    if (seen.has(url.href)) continue;
+    seen.add(url.href);
+    out.push(url.href);
+  }
+  return out;
+}
+
+// A document's returned text and the complete links it carries.
+export interface ExtractedDocument {
+  text: string;
+  // Complete absolute http(s) URLs: for HTML, the anchors resolved against the
+  // page; for any other type, the absolute URLs in the text. Never rebuilt from
+  // the returned (and possibly truncated) display text.
+  links: string[];
+}
+
+// The text of an allowed body and the links it carries. `media` has already
+// passed allowedContentType.
+export function extractDocument(media: string, body: string, baseUrl: string): ExtractedDocument {
+  if (media === "text/html") return htmlToDocument(body, baseUrl);
+  return { text: body.trim(), links: extractUrls(body) };
 }
 
 // The text of an allowed body. `media` has already passed allowedContentType.
 export function extractText(media: string, body: string, baseUrl: string): string {
-  if (media === "text/html") return htmlToText(body, baseUrl);
-  return body.trim();
+  return extractDocument(media, body, baseUrl).text;
 }
 
 export interface TruncatedText {

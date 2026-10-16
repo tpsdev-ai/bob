@@ -1,12 +1,16 @@
 // Admission state for the `web_fetch` tool (bob#152, spec v3, slice R1c).
 //
-// The unit of state is one ADMITTED PROMPT, including its retries and automatic
-// continuations: the extension seeds one state at `before_agent_start` (which
-// pi fires once per prompt, after expansion) and clears it on a full
-// `agent_settled` and on session close. A tool call outside that window finds no
-// state and is refused. Budgets are charged before any I/O, so a call that
-// throws or aborts still consumes. The seed REPLACES the state with a fresh
-// object, so a missed clear cannot carry state forward into the next prompt.
+// The unit of state is one ADMITTED OPERATION — a single runtime turn
+// admission, including its retries and automatic continuations. The extension
+// seeds one state on the operation's first prompt and keeps it, unchanged, for
+// every later prompt the operation sends (pi fires `before_agent_start` once per
+// prompt, so a continuation must NOT reseed). The runtime's admission token
+// tells those apart: the same token continues, a new one replaces, and no token
+// at all (a bare prompt outside any admission) seeds nothing. A call outside an
+// admitted operation finds no state and is refused. An attempt is charged for a
+// RECORDED candidate before its fetch (so a failed fetch still counts); the
+// returned text is charged after the response, against the same operation's
+// allowance.
 //
 // This module owns URLs (provenance.ts) and the two budgets: fetch attempts and
 // the shared fetch/search text allowance.
@@ -14,10 +18,10 @@
 import type { TurnOrigin } from "../../shell/turn-origin.js";
 import type { WebSettings } from "./core.js";
 import { WebFetchError } from "./errors.js";
-import { parseAbsolute, recordUrls, urlKey } from "./provenance.js";
+import { parseAbsolute, recordLinks, recordUrls, urlKey } from "./provenance.js";
 
 export interface WebTurnState {
-  // A fresh counter per seeded prompt, so two states are never confused.
+  // A fresh counter per seeded operation, so two states are never confused.
   readonly id: number;
   // The admission origin recorded when the state was seeded. A tool call whose
   // current origin differs is running in a different admission.
@@ -25,25 +29,27 @@ export interface WebTurnState {
   // Recorded URLs, keyed by their serialized form (provenance.ts), value the
   // canonical href recorded.
   readonly recorded: Map<string, string>;
-  // Fetch attempts charged for this prompt.
+  // Fetch attempts charged for this operation.
   fetchAttempts: number;
-  // Characters of text returned by web calls in this prompt.
+  // Characters of extracted document text returned by web calls in this
+  // operation.
   textChars: number;
 }
 
 let nextStateId = 1;
 
-// A fresh state for one admitted prompt: the URLs in the triggering message are
-// recorded, and both budgets start spent at zero.
+// A fresh state for one admitted operation: the URLs in the triggering message
+// are recorded, and both budgets start spent at zero.
 export function newTurnState(prompt: string, origin: TurnOrigin): WebTurnState {
   const recorded = new Map<string, string>();
   recordUrls(recorded, prompt);
   return { id: nextStateId++, origin, recorded, fetchAttempts: 0, textChars: 0 };
 }
 
-// Record the links on a fetched page, resolved against the page they came from.
-export function recordPageLinks(state: WebTurnState, text: string, pageUrl?: string): void {
-  recordUrls(state.recorded, text, pageUrl);
+// Record the complete links a fetched page carried (extract.ts), already
+// resolved against the page. Nothing is rebuilt from the returned display text.
+export function recordPageLinks(state: WebTurnState, links: readonly string[]): void {
+  recordLinks(state.recorded, links);
 }
 
 // A stable key for an origin, so two origins compare by value.
@@ -81,8 +87,10 @@ export function admitCandidate(state: WebTurnState, candidate: string): URL {
   return url;
 }
 
-// Charge one fetch attempt. Refused once the prompt's attempt budget is spent.
-// Called before any I/O, so a call that fails still counts.
+// Charge one fetch attempt for a recorded candidate. Refused once the
+// operation's attempt budget is spent. Called before the fetch begins, so a
+// fetch that then fails still counts; a candidate refused by provenance first
+// charges nothing.
 export function chargeFetchAttempt(state: WebTurnState, settings: WebSettings): void {
   if (state.fetchAttempts >= settings.fetchPerTurn) {
     throw new WebFetchError(
@@ -93,7 +101,7 @@ export function chargeFetchAttempt(state: WebTurnState, settings: WebSettings): 
   state.fetchAttempts += 1;
 }
 
-// The characters of text the prompt may still return.
+// The characters of extracted document text the operation may still return.
 export function textAllowanceRemaining(state: WebTurnState, settings: WebSettings): number {
   return Math.max(0, settings.textPerTurn - state.textChars);
 }
