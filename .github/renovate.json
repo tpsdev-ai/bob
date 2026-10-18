@@ -19,6 +19,14 @@
       "matchManagers": ["github-actions"],
       "matchPackageNames": ["github/codeql-action", "github/codeql-action/**"],
       "groupName": "codeql-action"
+    },
+    {
+      "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": ["bun"],
+      "groupName": "bun runtime"
     }
   ]
 }
