@@ -33,7 +33,7 @@
     "@earendil-works/pi-tui": "0.84.3",
     "brace-expansion": "^5.0.12",
     "protobufjs": "^7.6.5",
-    "undici": "^8.10.2",
+    "undici": "8.10.2",
     "ws": "^8.21.0",
   },
   "packages": {

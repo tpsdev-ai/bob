@@ -1,0 +1,1 @@
+- **Bun runtime updates are grouped in Renovate** Engine updates are disabled, and Bun's `packageManager` and setup-bun `bun-version` updates share a group. The lockfile's undici override matches `package.json` exactly.
