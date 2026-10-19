@@ -7,7 +7,7 @@
   with the fixed `You announced a step but made no tool call. Continue the task; end only with your final
   message.`, up to three re-prompts (`DEFAULT_MAX_NARRATION_REPROMPTS`, its own budget, one per run, the
   compaction retry included). A turn still narrating after that fails the run with the named outcome
-  `narration_only` (exit 1, `failed`), and its outcome record carries the reason and the re-prompt count,
+  `narration_only` (exit 1, `failed`); if run logging succeeds, its outcome record carries the reason and the re-prompt count,
   no model text. With markers declared, final text read from session state with no observed assistant
   ending is never a final report: it is re-prompted the same way and fails as `narration_only` past the
   bound. A run that declares no markers is unchanged, mail turns are exempt from the narration re-prompt
