@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseFinalMarkers } from "./compaction-contract.js";
 import { ExplorationBudgetError, parseExplorationBudget } from "./exploration-budget.js";
 import type { BobRole } from "./index.js";
 import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
@@ -25,6 +26,15 @@ export interface RoleTemplate {
   exploration_budget?: number;
   // Completion gate for bob run and launch with a prompt; mail turns are exempt.
   require_edit_or_blocked?: boolean;
+  // bob#365: the markers a final report begins with (e.g. ["DONE", "BLOCKED"]).
+  // Declared, a one-shot run's turn with text and no tool call whose trimmed
+  // text does not start with one is narration, not a final report: bob
+  // re-prompts it, bounded; final text read from session state with no observed
+  // assistant ending is never a final report. Absent: the plain final-message
+  // rule. Mail turns are exempt from this narration re-prompt. Validated at
+  // load: a non-empty list of non-empty strings without surrounding whitespace
+  // (runAgent checks the resolved list again before the session starts).
+  final_markers?: string[];
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think
   // (off | low | high). bob.yaml's `session:` block overrides either key for
@@ -50,10 +60,20 @@ const CANDIDATE_PATHS = [join(__dirname, "..", "..", "roles")];
 const ROLE_NAME = /^[a-z0-9-]+$/;
 
 export function loadRole(role: BobRole): RoleTemplate {
+  return loadRoleFrom(CANDIDATE_PATHS, role);
+}
+
+/**
+ * loadRole over the given roles directories, searched in order. loadRole is
+ * this over bob's shipped roles directory, the only roots any launch path
+ * uses. Tests pass a temporary directory so a fixture role.json goes through
+ * the same parse and validation. Not re-exported from the package index.
+ */
+export function loadRoleFrom(roots: readonly string[], role: BobRole): RoleTemplate {
   if (!ROLE_NAME.test(role)) {
     throw new Error(`invalid role name: ${role} (must match ${ROLE_NAME})`);
   }
-  for (const base of CANDIDATE_PATHS) {
+  for (const base of roots) {
     const dir = join(base, role);
     if (!existsSync(dir)) continue;
     const soulPath = join(dir, "soul.md");
@@ -94,6 +114,15 @@ export function loadRole(role: BobRole): RoleTemplate {
       }
       requireEditOrBlocked = config.require_edit_or_blocked;
     }
+    let finalMarkers: string[] | undefined;
+    if (config.final_markers !== undefined) {
+      finalMarkers = parseFinalMarkers(config.final_markers);
+      if (finalMarkers === undefined) {
+        throw new Error(
+          `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace.`,
+        );
+      }
+    }
     return {
       role,
       soul,
@@ -103,7 +132,8 @@ export function loadRole(role: BobRole): RoleTemplate {
       ...(requireEditOrBlocked !== undefined
         ? { require_edit_or_blocked: requireEditOrBlocked }
         : {}),
+      ...(finalMarkers !== undefined ? { final_markers: finalMarkers } : {}),
     } as RoleTemplate;
   }
-  throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);
+  throw new Error(`unknown role: ${role}. Looked in: ${roots.join(", ")}`);
 }

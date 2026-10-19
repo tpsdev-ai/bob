@@ -250,6 +250,15 @@ describe("resolveRequireEditOrBlocked", () => {
 });
 
 describe("builder-local runAgent: an edit or a BLOCKED report", () => {
+  // builder-local declares the final markers DONE and BLOCKED (bob#365). Its
+  // narration check is a case-sensitive prefix test on the trimmed final text:
+  // text that begins with neither is re-prompted before this gate runs
+  // (narration-turn.test.ts). So each builder-local fixture below begins with
+  // DONE or BLOCKED as a plain prefix ("BLOCKEDNESS ..." included); the
+  // coder-role fixture declares no markers. This gate judges only an accepted
+  // completion and does not read the DONE marker: it passes a run with a
+  // verified edit, or one whose final text opens with a standalone BLOCKED
+  // token (/^BLOCKED(?=$|\s|:)/), and fails any other as no_edit_no_blocked.
   let agentsRoot: string;
 
   const mkAgent = (name: string, role: string, tool: string): void => {
@@ -304,7 +313,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
           { toolName: "read_lines", result: READ_LINES_OK },
           { toolName, isError, result },
         ],
-        finalText: "Here is the final report.",
+        finalText: "DONE: here is the final report.",
       });
       const res = await runAgent({
         name,
@@ -325,7 +334,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     mkAgent("planner", "builder-local", "read_lines");
     const fake = makeSession({
       calls: [{ toolName: "read_lines", result: READ_LINES_OK }],
-      finalText: "Here is the plan: I will edit f0.ts in the next turn.",
+      finalText: "DONE: here is the plan: I will edit f0.ts in the next turn.",
     });
     const res = await runAgent({
       name: "planner",
@@ -343,7 +352,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     mkAgent("editor", "builder-local", "edit_lines");
     const fake = makeSession({
       calls: [{ toolName: "edit_lines", result: EDIT_LINES_OK }],
-      finalText: "Edited f0.ts and it passes.",
+      finalText: "DONE: edited f0.ts and it passes.",
     });
     const res = await runAgent({
       name: "editor",
@@ -409,9 +418,9 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
   );
 
   it.each([
-    ["plan", "I will edit next.", false, 1],
+    ["plan", "DONE: I will edit next.", false, 1],
     ["blocked", "BLOCKED: missing input.", false, 0],
-    ["edited", "Edited f0.ts.", true, 0],
+    ["edited", "DONE: edited f0.ts.", true, 0],
   ] as const)(
     "launch with a prompt applies the gate: %s",
     async (name, finalText, edited, code) => {
@@ -454,12 +463,12 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
 
   it("preserves an earlier completion failure", async () => {
     mkAgent("shape", "builder-local", "read_lines");
-    const fake = makeSession({ finalText: "Here is the plan." });
+    const fake = makeSession({ finalText: "DONE here is the plan." });
     const res = await runAgent({
       name: "shape",
       prompt: "do the task",
       agentsRoot,
-      expectedFinal: (text) => text.startsWith("DONE"),
+      expectedFinal: (text) => text.startsWith("DONE:"),
       sessionFactory: factoryReturning(fake.session),
     });
     expect(res.exitCode).toBe(1);
@@ -472,7 +481,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     mkAgent("unlogged", "builder-local", "read_lines");
     const runsPath = join(agentsRoot, "unlogged", "runs");
     writeFileSync(runsPath, "not a directory");
-    const fake = makeSession({ finalText: "Here is the plan." });
+    const fake = makeSession({ finalText: "DONE: here is the plan." });
     const res = await runAgent({
       name: "unlogged",
       prompt: "do the task",
@@ -497,7 +506,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
           isError: true,
         },
       ],
-      finalText: "Here is the plan: I will re-read and retarget the edit.",
+      finalText: "DONE: here is the plan: I will re-read and retarget the edit.",
     });
     const res = await runAgent({
       name: "refused",
@@ -530,7 +539,7 @@ describe("builder-local runAgent: an edit or a BLOCKED report", () => {
     mkAgent("doctorrun", "builder-local", "read_lines");
     const fake = makeSession({
       calls: [{ toolName: "read_lines", result: READ_LINES_OK }],
-      finalText: "Here is the plan.",
+      finalText: "DONE: here is the plan.",
     });
     await runAgent({
       name: "doctorrun",

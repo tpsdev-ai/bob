@@ -73,8 +73,11 @@ import {
 import {
   CONTINUE_TURN,
   createCompactionObserver,
+  DEFAULT_MAX_NARRATION_REPROMPTS,
   DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
+  isNarrationEnding,
+  parseFinalMarkers,
   readWorktreeStatus,
   readWorktreeStatusResult,
   type SilenceReason,
@@ -100,6 +103,7 @@ import {
   flairBootstrapTarget as resolveFlairBootstrapTarget,
 } from "./flair-bootstrap.js";
 import type { BobRole, CronEntry } from "./index.js";
+import { repromptWhileNarrating } from "./narration-retry.js";
 import { resolveAdoptedConfig } from "./position-runtime.js";
 import {
   editToolFilePath,
@@ -781,6 +785,15 @@ export interface RunOptions {
   explorationBudget?: number;
   // Overrides the role's `require_edit_or_blocked` completion gate.
   requireEditOrBlocked?: boolean;
+  // bob#365: the markers this run's final report begins with (e.g. ["DONE",
+  // "BLOCKED"]). Overrides the role's role.json `final_markers`. Declared, a turn
+  // with text and no tool call whose trimmed text does not start with one is
+  // narration: bob re-prompts it (DEFAULT_MAX_NARRATION_REPROMPTS) and fails the
+  // run with `narration_only` past the bound. Final text read from session state
+  // with no observed assistant ending is treated the same way. Neither declared:
+  // the plain final-message rule. Mail turns are exempt from this narration
+  // re-prompt. A malformed list is refused before the session starts.
+  finalMarkers?: readonly string[];
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
   // Tests pass small values.
@@ -802,8 +815,9 @@ export interface RunResult {
   // Undefined otherwise.
   stdout?: string;
   // #145: the named reason a one-shot run refused to report success
-  // (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`).
-  // Undefined on exit 0.
+  // (`settled_after_compaction` / `no_final_message` / `final_shape_mismatch`,
+  // or `reasoning_only` / `narration_only` past a re-prompt bound — bob#256,
+  // bob#365). Undefined on exit 0.
   reason?: SilenceReason;
   // True when the run FAILED rather than settled: the prompt threw, or the last
   // assistant message ended on an error/abort. Undefined otherwise — a run with
@@ -920,6 +934,13 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   if (taskContract.trim().length === 0) {
     throw new Error("runAgent: refusing to start a session with a blank task contract");
   }
+  // bob#365: a malformed final-marker list is refused here, before the session
+  // starts, rather than silently disabling (or narrowing) the narration check.
+  if (opts.finalMarkers !== undefined && parseFinalMarkers(opts.finalMarkers) === undefined) {
+    throw new Error(
+      "runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace",
+    );
+  }
 
   const root = opts.agentsRoot ?? join(homedir(), "agents");
   const resolved = resolveRunConfig({
@@ -932,6 +953,18 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
     ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
   });
+  // bob#365: the role's markers were validated when its role.json loaded. They
+  // are checked again here with the SAME validator as the option, so a list
+  // that reaches the run by any other path is refused before the session
+  // starts, whether or not the option overrides it or the run is a mail turn.
+  if (
+    resolved.finalMarkers !== undefined &&
+    parseFinalMarkers(resolved.finalMarkers) === undefined
+  ) {
+    throw new Error(
+      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace`,
+    );
+  }
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. The wall clock and the watchdog start HERE, once the
   // configuration is resolved and before the Flair bootstrap and the session
@@ -974,6 +1007,12 @@ async function runBoundedSession(
   // Applies to bob run and launch with a prompt; mail turns are exempt.
   const requireEditOrBlocked =
     opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
+  // bob#365: the run's declared final-report markers (the run option over the
+  // role's). A mail turn's final message is the reply, never a report, so it is
+  // exempt from the NARRATION re-prompt, like the edit-or-blocked gate; its
+  // reasoning-only re-prompt (bob#256) still runs. Undefined: no narration check.
+  const finalMarkers =
+    opts.mailTurn === true ? undefined : (opts.finalMarkers ?? resolved.finalMarkers);
   const repositoryAtLaunch: RepositoryState =
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
@@ -1504,13 +1543,60 @@ async function runBoundedSession(
       });
       reasoningReprompts += spent.reprompts;
     };
+    // bob#365: the narration budget — its OWN, separate from the reasoning-only
+    // one, and likewise ONE for the whole run, shared across the compaction
+    // retry. Only a run that declares final markers spends it.
+    let narrationReprompts = 0;
+    const narrationBudgetLeft = (): number => DEFAULT_MAX_NARRATION_REPROMPTS - narrationReprompts;
+    // The ONE narration classifier, used by the re-prompt loop and by the
+    // outcome below, and it reads the SAME source the run reports
+    // (finalTextNow): an observed assistant ending when one ended since the
+    // boundary; otherwise finalTextNow falls back to session state, which has no
+    // observed ending to classify, so with markers declared any such text is
+    // never a final report — it is re-prompted, then fails as narration_only.
+    const narrating = (): boolean => {
+      if (finalMarkers === undefined) return false;
+      if (observer.assistantEnded()) return isNarrationEnding(observer.lastEnding(), finalMarkers);
+      return finalTextNow().trim().length > 0;
+    };
+    // What the operator is told about a narrating ending: which of the two
+    // shapes `narrating` matched. Names the markers, never the model's text.
+    const narrationShape = (): string =>
+      observer.assistantEnded()
+        ? `text that does not begin with a declared final marker (${(finalMarkers ?? []).join(", ")}) and no tool call`
+        : "text read from session state with no observed assistant message ending, which is never a final report when final markers are declared";
+    // The two endings the run re-prompts: a reasoning-only ending first
+    // (exactly as above), then a narration ending, whose continuation turns
+    // drain their own reasoning-only endings on the SAME reasoning budget.
+    // Silence and a shape mismatch are not re-prompted here; they are judged
+    // below as before (silence after a compaction keeps its one continue turn).
+    // Bounded by the two constants together. With no declared markers this is
+    // drainReasoningOnly.
+    const drainNonFinal = async (): Promise<void> => {
+      await drainReasoningOnly();
+      if (finalMarkers === undefined || narrationBudgetLeft() <= 0) return;
+      const spent = await repromptWhileNarrating({
+        session,
+        // The SAME bounded sender as the first prompt and the reasoning re-prompts.
+        send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
+        narrating,
+        beginTurn: () => observer.startTurn(),
+        afterTurn: drainReasoningOnly,
+        maxReprompts: narrationBudgetLeft(),
+        onReprompt: (n) =>
+          process.stderr.write(
+            `bob run ${opts.name}: the turn ended with ${narrationShape()} — re-prompting (${narrationReprompts + n}/${DEFAULT_MAX_NARRATION_REPROMPTS})\n`,
+          ),
+      });
+      narrationReprompts += spent.reprompts;
+    };
 
     observer.startTurn();
     // bob's own runner: the text IS the prompt (no command/template/skill
     // expansion — see session.ts promptSession). Both bounds and loop breaker
     // observe the turn; every send goes through the single bounded sender.
     await raceLoop(boundedPrompt(session, prompt, bounds, loopController.signal));
-    await raceLoop(bounds.guard(drainReasoningOnly()));
+    await raceLoop(bounds.guard(drainNonFinal()));
 
     // #145: the completion contract. Before this, a run settled `exitCode 0`
     // whenever the prompt promise resolved — including after a compaction that
@@ -1523,6 +1609,13 @@ async function runBoundedSession(
       // compaction; it is not a fourth reasoning turn, and a
       // text reply to it must never turn the run green.
       outcome = { ok: false, reason: "reasoning_only" };
+    } else if (narrating()) {
+      // bob#365: still narrating once the narration budget is spent — the run
+      // ended without a final report. The judge accepts any non-empty text that
+      // matches the declared shape (if any), so this is decided before its
+      // verdict counts, by the loop's own classifier: a narrating ending, or
+      // text with no observed ending, is never reported as success.
+      outcome = { ok: false, reason: "narration_only" };
     } else if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
       // explicit "continue from the state above" turn. This retry is meaningful
@@ -1535,7 +1628,7 @@ async function runBoundedSession(
         // Through the one non-interactive prompt entry point, so template and
         // command expansion stay off by construction (not because of the text).
         await raceLoop(boundedPrompt(session, CONTINUE_TURN, bounds, loopController.signal));
-        await raceLoop(bounds.guard(drainReasoningOnly())); // shared re-prompt budget
+        await raceLoop(bounds.guard(drainNonFinal())); // shared re-prompt budgets
       } catch (err) {
         // Every turn-level stop must fail the whole run.
         if (
@@ -1553,11 +1646,13 @@ async function runBoundedSession(
       if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
         outcome = { ok: false, reason: "reasoning_only" };
       }
+      // bob#365: still narrating after the retry is likewise a failure.
+      if (narrating()) outcome = { ok: false, reason: "narration_only" };
     }
     // A run with no final message whose last message ended on an error or an
     // abort FAILED; one that ended cleanly with nothing to say did not.
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
-    if (outcome.reason === "reasoning_only") failed = true;
+    if (outcome.reason === "reasoning_only" || outcome.reason === "narration_only") failed = true;
     if (!outcome.ok) {
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
@@ -1574,6 +1669,16 @@ async function runBoundedSession(
           },
           false,
         );
+      } else if (reason === "narration_only") {
+        // The same honest record (bob#365): the reason and the re-prompt count,
+        // and no model text.
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: { reason: "narration_only", reprompts: narrationReprompts },
+          },
+          false,
+        );
       }
       process.stderr.write(
         `bob run ${opts.name}: REFUSING to report success — ${reason}` +
@@ -1583,7 +1688,9 @@ async function runBoundedSession(
               ? " (the final message did not match the declared shape)"
               : reason === "reasoning_only"
                 ? ` (the session ended without a final report — its last turn carried reasoning only, no text beyond whitespace and no tool call, after ${reasoningReprompts} re-prompt(s))`
-                : " (the session settled without a final message)") +
+                : reason === "narration_only"
+                  ? ` (the session ended without a final report — its last turn carried ${narrationShape()}, after ${narrationReprompts} re-prompt(s))`
+                  : " (the session settled without a final message)") +
           "\n",
       );
       reportWorktreeStatus(opts.name, config.cwd, true);
@@ -1927,6 +2034,9 @@ export interface ResolvedRunConfig {
   // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
   // when the role does not; used by bob run and launch with a prompt.
   requireEditOrBlocked?: true;
+  // bob#365 — the role's declared final-report markers (role.json
+  // `final_markers`). Absent when the role declares none: no narration check.
+  finalMarkers?: readonly string[];
   // bob#135 — the agent's bob.yaml `run:` bounds (seconds), parsed and
   // validated for every caller. A one-shot `bob run` overlays its per-invocation
   // flags on these to arm the run.
@@ -2440,6 +2550,13 @@ export function resolveRequireEditOrBlocked(yamlText: string): boolean {
   return loadRole(readAgentRole(yamlText) as BobRole).require_edit_or_blocked === true;
 }
 
+// bob#365: the role's declared final-report markers (role.json `final_markers`,
+// validated when the role loads), or undefined when it declares none.
+// `builder-local` ships ["DONE", "BLOCKED"].
+export function resolveFinalMarkers(yamlText: string): readonly string[] | undefined {
+  return loadRole(readAgentRole(yamlText) as BobRole).final_markers;
+}
+
 export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConfig {
   const taskBinding =
     opts.taskBinding === undefined ? undefined : parseTaskBinding(JSON.stringify(opts.taskBinding));
@@ -2543,6 +2660,8 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   const explorationBudget = resolveExplorationBudget(yamlText);
   // bob#283: the role's edit-or-blocked opt-in.
   const requireEditOrBlocked = resolveRequireEditOrBlocked(yamlText);
+  // bob#365: the role's final-report markers, if it declares any.
+  const finalMarkers = resolveFinalMarkers(yamlText);
 
   // bob#200: a mail turn narrows the resolved policy to the mail allowlist. It is
   // applied HERE, after both branches, so it binds an ADOPTED agent's grant
@@ -2624,6 +2743,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     runLimits: readRunLimits(yamlText),
     ...(explorationBudget !== undefined ? { explorationBudget } : {}),
     ...(requireEditOrBlocked ? { requireEditOrBlocked: true as const } : {}),
+    ...(finalMarkers !== undefined ? { finalMarkers } : {}),
     ...(flairBootstrapTarget !== undefined ? { flairBootstrapTarget } : {}),
   };
 }

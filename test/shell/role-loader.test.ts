@@ -1,5 +1,8 @@
-import { describe, expect, it } from "bun:test";
-import { loadRole } from "../../src/shell/role-loader.js";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadRole, loadRoleFrom } from "../../src/shell/role-loader.js";
 import { resolveToolNames } from "../../src/shell/tool-allowlist.js";
 
 describe("role-loader", () => {
@@ -95,5 +98,70 @@ describe("role-loader", () => {
     expect(() => loadRole("ea/../../../etc")).toThrow(/invalid role name/);
     // @ts-expect-error — intentionally bad role
     expect(() => loadRole("ea\\..\\etc")).toThrow(/invalid role name/);
+  });
+});
+
+// bob#365: role.json `final_markers` is validated when the role loads. A
+// fixture role in a temporary roles directory goes through loadRole's own
+// parse and validation (loadRoleFrom is loadRole over the given roots).
+describe("role.json final_markers validation (#365)", () => {
+  let rolesRoot: string;
+
+  beforeEach(() => {
+    rolesRoot = mkdtempSync(join(tmpdir(), "bob-role-markers-"));
+  });
+
+  afterEach(() => {
+    rmSync(rolesRoot, { recursive: true, force: true });
+  });
+
+  /** Write a fixture role named "custom" whose role.json carries `extra`, and
+   *  return its role.json path. */
+  const writeRole = (extra: Record<string, unknown>): string => {
+    const dir = join(rolesRoot, "custom");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "soul.md"), "You are a fixture role.");
+    const configPath = join(dir, "role.json");
+    writeFileSync(configPath, JSON.stringify({ tools: { allow: ["read"] }, ...extra }));
+    return configPath;
+  };
+
+  it.each([
+    ["an empty list", []],
+    ["an empty marker", [""]],
+    ["a whitespace-only marker", [" "]],
+    ["a marker with leading whitespace", [" DONE"]],
+    ["a marker with trailing whitespace", ["DONE "]],
+    ["a marker with a trailing newline", ["DONE\n"]],
+    ["an empty marker after a valid one", ["DONE", ""]],
+    ["a string instead of a list", "DONE"],
+    ["a number element", [1]],
+    ["a non-string element after a valid one", ["DONE", 1]],
+    ["a nested list", [["DONE"]]],
+    ["an object", { DONE: true }],
+    ["null", null],
+    ["true", true],
+  ] as const)("refuses %s, naming the file and the key", (_label, value) => {
+    const configPath = writeRole({ final_markers: value });
+    expect(() => loadRoleFrom([rolesRoot], "custom")).toThrow(
+      `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace.`,
+    );
+  });
+
+  it.each([[["DONE"]], [["DONE", "BLOCKED"]]] as const)(
+    "loads a valid list exactly as declared: %j",
+    (markers) => {
+      writeRole({ final_markers: markers });
+      expect(loadRoleFrom([rolesRoot], "custom").final_markers).toEqual([...markers]);
+    },
+  );
+
+  it("a role that declares no final_markers loads without them", () => {
+    writeRole({});
+    expect(loadRoleFrom([rolesRoot], "custom").final_markers).toBeUndefined();
+  });
+
+  it("loadRole is the same loader over the shipped roles: builder-local loads its declared list", () => {
+    expect(loadRole("builder-local").final_markers).toEqual(["DONE", "BLOCKED"]);
   });
 });

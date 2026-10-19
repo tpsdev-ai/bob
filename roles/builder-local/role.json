@@ -23,6 +23,7 @@
   "default_model": "claude-sonnet-4-6",
   "exploration_budget": 20,
   "require_edit_or_blocked": true,
+  "final_markers": ["DONE", "BLOCKED"],
   "session": {
     "compaction_threshold": 0.5,
     "thinking": "low"

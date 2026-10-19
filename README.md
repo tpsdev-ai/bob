@@ -333,19 +333,41 @@ change one, the named test is what tells you.
   paths, a session replaced through the runtime factory, and the persistent
   runtime's standing contract after a compaction, `run.test.ts`)*
 - **A one-shot run reports success only with a real final message.** `bob run`
-  settles exit 0 only when the last assistant message that ENDED after the last
-  compaction carries text — exactly the text of that message, never rebuilt from
-  streamed deltas; a message that ended empty or on an error is no final
-  message. A turn that ends with reasoning only (no text beyond whitespace, no tool call, and
+  settles exit 0 only with a final message: the text of the last assistant
+  message that ENDED after the last compaction, exactly as it ended and never
+  rebuilt from streamed deltas (a message that ended empty or on an error is no
+  final message); the one exception is a compaction that ends without a retry
+  after the run already ended on a final message (stop reason `stop`, no tool
+  call, non-empty text that the completion check accepts), where that earlier
+  message is kept as the final message; or, when no assistant message ended
+  since the current turn began and no compaction was observed (a transport that ends no message), the
+  text of the last assistant message in the session's message list. A turn
+  that ends with reasoning only (no text beyond whitespace, no tool call, and
   actual thinking content) is re-prompted with a short continuation, up to three
   re-prompts — one budget for the whole run — and a still-reasoning-only ending
-  after them ends the run, with no further turn; a silent settlement
+  after them ends the run, with no further turn. A run that declares final
+  markers (`final_markers` in the role's `role.json`, or the run's `finalMarkers`
+  option; `builder-local` declares `["DONE", "BLOCKED"]`) also re-prompts a turn
+  that ends with text and no tool call when that text, trimmed, does not start
+  with a marker (the narration check is a case-sensitive prefix test and reads
+  nothing past the marker; a separately declared final shape, `runAgent`'s
+  `expectedFinal`, may still inspect the rest of the text): the fixed
+  continuation is "You announced a step but made no tool call. Continue
+  the task; end only with your final message.", up to three re-prompts — its own
+  budget, one for the whole run — and a turn still narrating after them fails
+  the run as `narration_only`, with no further turn. With markers declared,
+  final text read from session state with no observed assistant ending is never
+  a final report: it is re-prompted the same way and fails as `narration_only`
+  past the bound. A run that declares no markers keeps the plain final-message
+  rule, and a mail turn is exempt from the narration re-prompt (its
+  reasoning-only re-prompt still runs). A silent settlement
   after a compaction retries ONCE with an explicit continue turn; if it is
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
-  `final_shape_mismatch` / `reasoning_only`).
+  `final_shape_mismatch` / `reasoning_only` / `narration_only`).
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
-  `reasoning-only-turn.test.ts`)*
+  `reasoning-only-turn.test.ts`, `narration-turn.test.ts`,
+  `narration-turn-live.test.ts` — a real pi session on a scripted provider)*
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.

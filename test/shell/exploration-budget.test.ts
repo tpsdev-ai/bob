@@ -131,7 +131,7 @@ function makeSession(opts: {
           type: "message_end",
           message: {
             role: "assistant",
-            content: [{ type: "text", text: "done" }],
+            content: [{ type: "text", text: "DONE" }],
             stopReason: "stop",
           },
         });
