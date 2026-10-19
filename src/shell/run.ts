@@ -789,9 +789,10 @@ export interface RunOptions {
   // "BLOCKED"]). Overrides the role's role.json `final_markers`. Declared, a turn
   // with text and no tool call whose trimmed text does not start with one is
   // narration: bob re-prompts it (DEFAULT_MAX_NARRATION_REPROMPTS) and fails the
-  // run with `narration_only` past the bound. Neither declared: the plain
-  // final-message rule. Mail turns are exempt. A malformed list is refused
-  // before the session starts.
+  // run with `narration_only` past the bound. Final text read from session state
+  // with no observed assistant ending is treated the same way. Neither declared:
+  // the plain final-message rule. Mail turns are exempt from this narration
+  // re-prompt. A malformed list is refused before the session starts.
   finalMarkers?: readonly string[];
   // bob#135 — the one-shot run's bounds, in milliseconds. Each overrides the
   // agent's bob.yaml `run:` block, which overrides run-bounds.ts's default.
@@ -996,7 +997,8 @@ async function runBoundedSession(
     opts.mailTurn !== true && (opts.requireEditOrBlocked ?? resolved.requireEditOrBlocked === true);
   // bob#365: the run's declared final-report markers (the run option over the
   // role's). A mail turn's final message is the reply, never a report, so it is
-  // exempt like the edit-or-blocked gate. Undefined: no narration check.
+  // exempt from the NARRATION re-prompt, like the edit-or-blocked gate; its
+  // reasoning-only re-prompt (bob#256) still runs. Undefined: no narration check.
   const finalMarkers =
     opts.mailTurn === true ? undefined : (opts.finalMarkers ?? resolved.finalMarkers);
   const repositoryAtLaunch: RepositoryState =
@@ -1534,26 +1536,44 @@ async function runBoundedSession(
     // retry. Only a run that declares final markers spends it.
     let narrationReprompts = 0;
     const narrationBudgetLeft = (): number => DEFAULT_MAX_NARRATION_REPROMPTS - narrationReprompts;
-    const narrating = (): boolean => isNarrationEnding(observer.lastEnding(), finalMarkers);
-    // Every non-final ending the run re-prompts: reasoning-only first (exactly
-    // as above), then narration, whose continuation turns drain their own
-    // reasoning-only endings on the SAME reasoning budget. Bounded by the two
-    // constants together. With no declared markers this is drainReasoningOnly.
+    // The ONE narration classifier, used by the re-prompt loop and by the
+    // outcome below, and it reads the SAME source the run reports
+    // (finalTextNow): an observed assistant ending when one ended since the
+    // boundary; otherwise finalTextNow falls back to session state, which has no
+    // observed ending to classify, so with markers declared any such text is
+    // never a final report — it is re-prompted, then fails as narration_only.
+    const narrating = (): boolean => {
+      if (finalMarkers === undefined) return false;
+      if (observer.assistantEnded()) return isNarrationEnding(observer.lastEnding(), finalMarkers);
+      return finalTextNow().trim().length > 0;
+    };
+    // What the operator is told about a narrating ending: which of the two
+    // shapes `narrating` matched. Names the markers, never the model's text.
+    const narrationShape = (): string =>
+      observer.assistantEnded()
+        ? `text that does not begin with a declared final marker (${(finalMarkers ?? []).join(", ")}) and no tool call`
+        : "text read from session state with no observed assistant message ending, which is never a final report when final markers are declared";
+    // The two endings the run re-prompts: a reasoning-only ending first
+    // (exactly as above), then a narration ending, whose continuation turns
+    // drain their own reasoning-only endings on the SAME reasoning budget.
+    // Silence and a shape mismatch are not re-prompted here; they are judged
+    // below as before (silence after a compaction keeps its one continue turn).
+    // Bounded by the two constants together. With no declared markers this is
+    // drainReasoningOnly.
     const drainNonFinal = async (): Promise<void> => {
       await drainReasoningOnly();
       if (finalMarkers === undefined || narrationBudgetLeft() <= 0) return;
       const spent = await repromptWhileNarrating({
         session,
-        finalMarkers,
         // The SAME bounded sender as the first prompt and the reasoning re-prompts.
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
-        readEnding: () => observer.lastEnding(),
+        narrating,
         beginTurn: () => observer.startTurn(),
         afterTurn: drainReasoningOnly,
         maxReprompts: narrationBudgetLeft(),
         onReprompt: (n) =>
           process.stderr.write(
-            `bob run ${opts.name}: the turn ended with text that does not begin with a final marker (${finalMarkers.join(", ")}) and no tool call — re-prompting (${narrationReprompts + n}/${DEFAULT_MAX_NARRATION_REPROMPTS})\n`,
+            `bob run ${opts.name}: the turn ended with ${narrationShape()} — re-prompting (${narrationReprompts + n}/${DEFAULT_MAX_NARRATION_REPROMPTS})\n`,
           ),
       });
       narrationReprompts += spent.reprompts;
@@ -1579,9 +1599,10 @@ async function runBoundedSession(
       outcome = { ok: false, reason: "reasoning_only" };
     } else if (narrating()) {
       // bob#365: still narrating once the narration budget is spent — the run
-      // ended without a final report. The judge accepts any text, so this is
-      // decided before it counts, and on the ENDING alone: no path reports a
-      // narrating ending as a success.
+      // ended without a final report. The judge accepts any non-empty text that
+      // matches the declared shape (if any), so this is decided before its
+      // verdict counts, by the loop's own classifier: a narrating ending, or
+      // text with no observed ending, is never reported as success.
       outcome = { ok: false, reason: "narration_only" };
     } else if (!outcome.ok && outcome.reason === "settled_after_compaction") {
       // Settled after a compaction with no final message: retry ONCE with an
@@ -1656,7 +1677,7 @@ async function runBoundedSession(
               : reason === "reasoning_only"
                 ? ` (the session ended without a final report — its last turn carried reasoning only, no text beyond whitespace and no tool call, after ${reasoningReprompts} re-prompt(s))`
                 : reason === "narration_only"
-                  ? ` (the session ended without a final report — its last turn carried text that does not begin with a declared final marker (${(finalMarkers ?? []).join(", ")}) and no tool call, after ${narrationReprompts} re-prompt(s))`
+                  ? ` (the session ended without a final report — its last turn carried ${narrationShape()}, after ${narrationReprompts} re-prompt(s))`
                   : " (the session settled without a final message)") +
           "\n",
       );

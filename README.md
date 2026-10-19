@@ -347,14 +347,19 @@ change one, the named test is what tells you.
   fixed continuation is "You announced a step but made no tool call. Continue
   the task; end only with your final message.", up to three re-prompts — its own
   budget, one for the whole run — and a turn still narrating after them fails
-  the run as `narration_only`, with no further turn. A run that declares no
-  markers keeps the plain final-message rule, and a mail turn is exempt. A silent settlement
+  the run as `narration_only`, with no further turn. With markers declared,
+  final text read from session state with no observed assistant ending is never
+  a final report: it is re-prompted the same way and fails as `narration_only`
+  past the bound. A run that declares no markers keeps the plain final-message
+  rule, and a mail turn is exempt from the narration re-prompt (its
+  reasoning-only re-prompt still runs). A silent settlement
   after a compaction retries ONCE with an explicit continue turn; if it is
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
   `final_shape_mismatch` / `reasoning_only` / `narration_only`).
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
-  `reasoning-only-turn.test.ts`, `narration-turn.test.ts`)*
+  `reasoning-only-turn.test.ts`, `narration-turn.test.ts`,
+  `narration-turn-live.test.ts` — a real pi session on a scripted provider)*
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.

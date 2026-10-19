@@ -50,9 +50,10 @@ export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
 
 /** The continuation sent when a run that declares final markers ends a turn with
  *  text, no tool call, and text that does not begin with one of those markers
- *  (bob#365): the model announced a step instead of reporting. FIXED text — it
- *  carries nothing from the model's output — so the re-prompt cannot be steered
- *  by what the model wrote. Bounded by DEFAULT_MAX_NARRATION_REPROMPTS. */
+ *  (bob#365): the model announced a step instead of reporting. Also sent when
+ *  such a run's final text comes from session state with no observed assistant
+ *  ending. FIXED text: it does not interpolate any model output. Bounded by
+ *  DEFAULT_MAX_NARRATION_REPROMPTS. */
 export const NARRATION_CONTINUE_TURN =
   "You announced a step but made no tool call. Continue the task; end only with your final message.";
 
@@ -84,7 +85,8 @@ export type SilenceReason =
   // up to the bound and still reasoning-only — "ended without a final report".
   | "reasoning_only"
   // The run declares final markers and ended with a turn that has text, no tool
-  // call, and text that does not begin with a marker, re-prompted up to the
+  // call, and text that does not begin with a marker, or with final text read
+  // from session state with no observed assistant ending, re-prompted up to the
   // bound and still so — "ended without a final report" (bob#365).
   | "narration_only";
 
@@ -252,10 +254,9 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
 
 /**
  * Validate a declared list of final-report markers (bob#365): a non-empty list
- * of non-empty strings, each without leading or trailing whitespace (the text
- * it is compared with is trimmed, so such a marker could never match). Returns
- * a copy, or undefined when the value is not such a list — the caller names
- * where it came from in its own error.
+ * of non-empty strings, each without leading or trailing whitespace. Returns a
+ * copy, or undefined when the value is not such a list — the caller names where
+ * it came from in its own error.
  */
 export function parseFinalMarkers(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;

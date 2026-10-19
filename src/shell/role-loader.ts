@@ -29,9 +29,10 @@ export interface RoleTemplate {
   // bob#365: the markers a final report begins with (e.g. ["DONE", "BLOCKED"]).
   // Declared, a one-shot run's turn with text and no tool call whose trimmed
   // text does not start with one is narration, not a final report: bob
-  // re-prompts it, bounded. Absent: the plain final-message rule. Mail turns are
-  // exempt. Validated at load: a non-empty list of non-empty strings without
-  // surrounding whitespace.
+  // re-prompts it, bounded; final text read from session state with no observed
+  // assistant ending is never a final report. Absent: the plain final-message
+  // rule. Mail turns are exempt from this narration re-prompt. Validated at
+  // load: a non-empty list of non-empty strings without surrounding whitespace.
   final_markers?: string[];
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think

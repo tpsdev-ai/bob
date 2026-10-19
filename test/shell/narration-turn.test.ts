@@ -38,7 +38,10 @@ import {
   REASONING_CONTINUE_TURN,
   startsWithFinalMarker,
 } from "../../src/shell/compaction-contract.js";
-import { resolveMaxNarrationReprompts } from "../../src/shell/narration-retry.js";
+import {
+  repromptWhileNarrating,
+  resolveMaxNarrationReprompts,
+} from "../../src/shell/narration-retry.js";
 import { loadRole } from "../../src/shell/role-loader.js";
 import {
   type RunSession,
@@ -252,7 +255,7 @@ describe("narration turn (#365)", () => {
     expect(res.stdout).toBe("The spec says to change it. Let me fix lines 282-284:");
   }, 10_000);
 
-  it("e: a mail turn is exempt — its reply is never re-prompted, whatever the markers", async () => {
+  it("e: a mail turn is exempt from the narration re-prompt — its unmarked reply ends the turn, whatever the markers", async () => {
     const stub = stubSession(() => [TEXT_FINAL("Sure, I will look at it tomorrow.")]);
     const res = await runAgent({
       name: "testbot",
@@ -265,6 +268,25 @@ describe("narration turn (#365)", () => {
       sessionFactory: factoryReturning(stub.session),
     });
     expect(stub.promptCalls).toHaveLength(1);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("Sure, I will look at it tomorrow.");
+  }, 10_000);
+
+  it("e2: a mail turn's reasoning-only ending is still re-prompted (#256); only the narration re-prompt is skipped", async () => {
+    const stub = stubSession((call) =>
+      call === 1 ? [REASONING_ONLY] : [TEXT_FINAL("Sure, I will look at it tomorrow.")],
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "a mail body",
+      taskContract: "Answer the mail.",
+      mailTurn: true,
+      finalMarkers: MARKERS,
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factoryReturning(stub.session),
+    });
+    expect(stub.promptCalls).toEqual(["a mail body", REASONING_CONTINUE_TURN]);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toBe("Sure, I will look at it tomorrow.");
   }, 10_000);
@@ -370,6 +392,126 @@ describe("narration turn (#365)", () => {
     },
     10_000,
   );
+});
+
+/**
+ * A stub RunSession whose turns put the assistant message in SESSION STATE
+ * (`messages`, which the run reads as its fallback final text) and, per turn,
+ * either emit its `message_end` (`observed: true`, the way pi does) or emit
+ * nothing at all (`observed: false`, a transport that ends no message).
+ * `maxCalls` is the stop for a broken bound: a call past it THROWS, because
+ * returning would leave the same text in session state and a loop that keeps
+ * re-reading it would never stop.
+ */
+function stateSession(
+  script: (call: number) => { text: string; observed: boolean },
+  opts: { maxCalls?: number } = {},
+): { session: RunSession; promptCalls: string[] } {
+  const promptCalls: string[] = [];
+  const listeners: Array<(event: unknown) => void> = [];
+  const messages: unknown[] = [];
+  const maxCalls = opts.maxCalls ?? 1000;
+  const session: RunSession = {
+    subscribe(listener) {
+      listeners.push(listener);
+      return () => {};
+    },
+    get messages() {
+      return messages;
+    },
+    async steer() {},
+    async prompt(text: string, options?: unknown) {
+      const streaming = (options as { streamingBehavior?: string } | undefined)?.streamingBehavior;
+      if (streaming !== undefined) return;
+      promptCalls.push(text);
+      if (promptCalls.length > maxCalls) throw new Error("stub: maxCalls exceeded");
+      const turn = script(promptCalls.length);
+      const message = {
+        role: "assistant",
+        content: [{ type: "text", text: turn.text }],
+        stopReason: "stop",
+      };
+      messages.push({ role: "user", content: text }, message);
+      if (turn.observed) {
+        for (const listener of listeners) listener({ type: "message_end", message });
+      }
+    },
+    dispose() {},
+  };
+  return { session, promptCalls };
+}
+
+describe("final text with no observed assistant ending (#365)", () => {
+  let agentsRoot: string;
+
+  beforeEach(() => {
+    agentsRoot = mkdtempSync(join(tmpdir(), "bob-narration-state-"));
+    writeAgent(agentsRoot, "testbot", "reviewer", "read");
+  });
+
+  afterEach(() => {
+    rmSync(agentsRoot, { recursive: true, force: true });
+  });
+
+  it.each(["Let me verify they're pre-existing:", "DONE: looks fine."])(
+    "with markers declared, text read only from session state is never a final report — re-prompted to the bound, then narration_only: %j",
+    async (text) => {
+      const stub = stateSession(() => ({ text, observed: false }), { maxCalls: 20 });
+      const res = await runAgent({
+        name: "testbot",
+        prompt: "do the thing",
+        finalMarkers: MARKERS,
+        captureStdout: true,
+        agentsRoot,
+        sessionFactory: factoryReturning(stub.session),
+      });
+      expect(stub.promptCalls).toEqual([
+        "do the thing",
+        ...Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(NARRATION_CONTINUE_TURN),
+      ]);
+      expect(res.exitCode).toBe(1);
+      expect(res.reason).toBe("narration_only");
+      expect(res.failed).toBe(true);
+      expect(outcomeRecord(agentsRoot, "testbot")).toEqual({
+        reason: "narration_only",
+        reprompts: DEFAULT_MAX_NARRATION_REPROMPTS,
+      });
+    },
+    10_000,
+  );
+
+  it("an observed DONE ending after a state-only turn completes the run", async () => {
+    const stub = stateSession((call) =>
+      call === 1
+        ? { text: "Let me verify they're pre-existing:", observed: false }
+        : { text: "DONE: they are pre-existing.", observed: true },
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      finalMarkers: MARKERS,
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factoryReturning(stub.session),
+    });
+    expect(stub.promptCalls).toEqual(["do the thing", NARRATION_CONTINUE_TURN]);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("DONE: they are pre-existing.");
+  }, 10_000);
+
+  it("with no declared markers, text read from session state is still the final message (unchanged)", async () => {
+    const stub = stateSession(() => ({ text: "Let me verify:", observed: false }));
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factoryReturning(stub.session),
+    });
+    expect(stub.promptCalls).toHaveLength(1);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("Let me verify:");
+  }, 10_000);
 });
 
 describe("builder-local declares DONE and BLOCKED (#365)", () => {
@@ -495,4 +637,27 @@ describe("the final-report decision is structural (#365)", () => {
       expect(() => resolveMaxNarrationReprompts(bad)).toThrow(/invalid maxReprompts/);
     }
   });
+
+  it.each([
+    [undefined, DEFAULT_MAX_NARRATION_REPROMPTS],
+    [2, 2],
+    [99, DEFAULT_MAX_NARRATION_REPROMPTS],
+  ])(
+    "repromptWhileNarrating stops at its bound even when the caller's classifier never stops matching (maxReprompts %p → %p sends)",
+    async (maxReprompts, expected) => {
+      const sent: string[] = [];
+      const res = await repromptWhileNarrating({
+        session: {} as RunSession,
+        narrating: () => true,
+        ...(maxReprompts !== undefined ? { maxReprompts } : {}),
+        send: async (text) => {
+          sent.push(text);
+          // A runaway loop stops here instead of spinning, so the assertion fails.
+          if (sent.length > 20) throw new Error("unbounded narration loop");
+        },
+      });
+      expect(sent).toEqual(Array(expected).fill(NARRATION_CONTINUE_TURN));
+      expect(res).toEqual({ reprompts: expected, endedNarrating: true });
+    },
+  );
 });
