@@ -333,18 +333,23 @@ change one, the named test is what tells you.
   paths, a session replaced through the runtime factory, and the persistent
   runtime's standing contract after a compaction, `run.test.ts`)*
 - **A one-shot run reports success only with a real final message.** `bob run`
-  settles exit 0 only when the last assistant message that ENDED after the last
-  compaction carries text — exactly the text of that message, never rebuilt from
-  streamed deltas; a message that ended empty or on an error is no final
-  message. A turn that ends with reasoning only (no text beyond whitespace, no tool call, and
+  settles exit 0 only with a final message: the text of the last assistant
+  message that ENDED after the last compaction, exactly as it ended and never
+  rebuilt from streamed deltas (a message that ended empty or on an error is no
+  final message), or, when no assistant message ended since the current turn
+  began and no compaction was observed (a transport that ends no message), the
+  text of the last assistant message in the session's message list. A turn
+  that ends with reasoning only (no text beyond whitespace, no tool call, and
   actual thinking content) is re-prompted with a short continuation, up to three
   re-prompts — one budget for the whole run — and a still-reasoning-only ending
   after them ends the run, with no further turn. A run that declares final
   markers (`final_markers` in the role's `role.json`, or the run's `finalMarkers`
   option; `builder-local` declares `["DONE", "BLOCKED"]`) also re-prompts a turn
   that ends with text and no tool call when that text, trimmed, does not start
-  with a marker (a case-sensitive prefix test, nothing judged beyond it): the
-  fixed continuation is "You announced a step but made no tool call. Continue
+  with a marker (the narration check is a case-sensitive prefix test and reads
+  nothing past the marker; a separately declared final shape, `runAgent`'s
+  `expectedFinal`, may still inspect the rest of the text): the fixed
+  continuation is "You announced a step but made no tool call. Continue
   the task; end only with your final message.", up to three re-prompts — its own
   budget, one for the whole run — and a turn still narrating after them fails
   the run as `narration_only`, with no further turn. With markers declared,

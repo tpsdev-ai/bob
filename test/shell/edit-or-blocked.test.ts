@@ -250,10 +250,15 @@ describe("resolveRequireEditOrBlocked", () => {
 });
 
 describe("builder-local runAgent: an edit or a BLOCKED report", () => {
-  // builder-local declares the final markers DONE and BLOCKED (bob#365), so a
-  // final report begins with one of them; text that begins with neither is
-  // re-prompted as narration before this gate (narration-turn.test.ts). The
-  // reports below begin with DONE, which is what this gate then judges.
+  // builder-local declares the final markers DONE and BLOCKED (bob#365). Its
+  // narration check is a case-sensitive prefix test on the trimmed final text:
+  // text that begins with neither is re-prompted before this gate runs
+  // (narration-turn.test.ts). So each builder-local fixture below begins with
+  // DONE or BLOCKED as a plain prefix ("BLOCKEDNESS ..." included); the
+  // coder-role fixture declares no markers. This gate judges only an accepted
+  // completion and does not read the DONE marker: it passes a run with a
+  // verified edit, or one whose final text opens with a standalone BLOCKED
+  // token (/^BLOCKED(?=$|\s|:)/), and fails any other as no_edit_no_blocked.
   let agentsRoot: string;
 
   const mkAgent = (name: string, role: string, tool: string): void => {

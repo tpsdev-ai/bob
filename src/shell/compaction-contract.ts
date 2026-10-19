@@ -269,8 +269,10 @@ export function parseFinalMarkers(value: unknown): string[] | undefined {
 }
 
 /** True when `text`, trimmed, STARTS WITH one of `markers` (case-sensitive,
- *  a plain prefix). This is the structural test for "a final report": bob
- *  never judges the prose that follows the marker. */
+ *  a plain prefix). This is the narration check's structural test for "a final
+ *  report", and it reads nothing past the marker. The separate completion
+ *  predicate (the run's `expectedFinal`, see evaluateCompletion) may still
+ *  inspect the whole text. */
 export function startsWithFinalMarker(text: string, markers: readonly string[]): boolean {
   const trimmed = text.trim();
   return markers.some((m) => trimmed.startsWith(m));
