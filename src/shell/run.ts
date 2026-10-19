@@ -953,6 +953,18 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     ...(opts.positionsRoot !== undefined ? { positionsRoot: opts.positionsRoot } : {}),
     ...(opts.taskBinding !== undefined ? { taskBinding: opts.taskBinding } : {}),
   });
+  // bob#365: the role's markers were validated when its role.json loaded. They
+  // are checked again here with the SAME validator as the option, so a list
+  // that reaches the run by any other path is refused before the session
+  // starts, whether or not the option overrides it or the run is a mail turn.
+  if (
+    resolved.finalMarkers !== undefined &&
+    parseFinalMarkers(resolved.finalMarkers) === undefined
+  ) {
+    throw new Error(
+      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace`,
+    );
+  }
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
   // per-invocation flags. The wall clock and the watchdog start HERE, once the
   // configuration is resolved and before the Flair bootstrap and the session

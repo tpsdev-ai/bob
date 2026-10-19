@@ -12,5 +12,7 @@
   ending is never a final report: it is re-prompted the same way and fails as `narration_only` past the
   bound. A run that declares no markers is unchanged, mail turns are exempt from the narration re-prompt
   (their reasoning-only re-prompt still runs), and the reasoning-only re-prompt (#256) keeps its own
-  budget and behaviour. A malformed marker list is refused when the role loads or before the session
-  starts. (`test/shell/narration-turn.test.ts`, `test/shell/narration-turn-live.test.ts`)
+  budget and behaviour. A malformed marker list in `role.json` is refused when the role loads, naming the
+  file and the key, and `runAgent` checks the role's resolved list and the `finalMarkers` option with the
+  same validator before the session starts. (`test/shell/narration-turn.test.ts`,
+  `test/shell/narration-turn-live.test.ts`, `test/shell/role-loader.test.ts`)

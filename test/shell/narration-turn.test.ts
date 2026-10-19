@@ -15,7 +15,7 @@
 // stub `prompt()` calls. The stub's `maxCalls` guard is the demonstrated stop
 // for a BROKEN bound (it caps a runaway loop, so the suite fails an assertion
 // instead of spinning); the explicit per-test timeout is a backstop behind it.
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +42,7 @@ import {
   repromptWhileNarrating,
   resolveMaxNarrationReprompts,
 } from "../../src/shell/narration-retry.js";
+import * as roleLoader from "../../src/shell/role-loader.js";
 import { loadRole } from "../../src/shell/role-loader.js";
 import {
   type RunSession,
@@ -388,6 +389,48 @@ describe("narration turn (#365)", () => {
           },
         }),
       ).rejects.toThrow(/finalMarkers must be a non-empty list/);
+      expect(factoryCalls).toBe(0);
+    },
+    10_000,
+  );
+
+  // The role's list is validated when role.json loads (role-loader.test.ts)
+  // AND again by runAgent. To reach runAgent's check, these tests hand the run
+  // a role list that never passed through role.json validation: loadRole is
+  // replaced by one that returns the real role with `final_markers` overridden.
+  it.each([
+    ["an empty marker", [""], {}],
+    ["a string instead of a list", "DONE", {}],
+    ["an empty marker under a valid finalMarkers option", [""], { finalMarkers: MARKERS }],
+    ["an empty marker on a mail turn", [""], { mailTurn: true }],
+  ] as const)(
+    "a malformed role list that bypassed role.json validation is refused by runAgent before the session starts: %s",
+    async (_label, markers, extra) => {
+      const realLoadRole = roleLoader.loadRole;
+      const spy = spyOn(roleLoader, "loadRole").mockImplementation(
+        (role) => ({ ...realLoadRole(role), final_markers: markers }) as never,
+      );
+      let factoryCalls = 0;
+      try {
+        await expect(
+          runAgent({
+            name: "testbot",
+            prompt: "do the thing",
+            agentsRoot,
+            ...extra,
+            sessionFactory: async () => {
+              factoryCalls += 1;
+              return stubSession(() => [TEXT_FINAL("DONE")]).session;
+            },
+          }),
+        ).rejects.toThrow(
+          'runAgent: the final_markers of role "reviewer" (its role.json) must be a non-empty list',
+        );
+        // The replacement was what the run resolved (so the refusal is runAgent's).
+        expect(spy).toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
       expect(factoryCalls).toBe(0);
     },
     10_000,
