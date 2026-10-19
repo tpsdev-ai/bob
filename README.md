@@ -339,13 +339,22 @@ change one, the named test is what tells you.
   message. A turn that ends with reasoning only (no text beyond whitespace, no tool call, and
   actual thinking content) is re-prompted with a short continuation, up to three
   re-prompts — one budget for the whole run — and a still-reasoning-only ending
-  after them ends the run, with no further turn; a silent settlement
+  after them ends the run, with no further turn. A run that declares final
+  markers (`final_markers` in the role's `role.json`, or the run's `finalMarkers`
+  option; `builder-local` declares `["DONE", "BLOCKED"]`) also re-prompts a turn
+  that ends with text and no tool call when that text, trimmed, does not start
+  with a marker (a case-sensitive prefix test, nothing judged beyond it): the
+  fixed continuation is "You announced a step but made no tool call. Continue
+  the task; end only with your final message.", up to three re-prompts — its own
+  budget, one for the whole run — and a turn still narrating after them fails
+  the run as `narration_only`, with no further turn. A run that declares no
+  markers keeps the plain final-message rule, and a mail turn is exempt. A silent settlement
   after a compaction retries ONCE with an explicit continue turn; if it is
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
-  `final_shape_mismatch` / `reasoning_only`).
+  `final_shape_mismatch` / `reasoning_only` / `narration_only`).
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
-  `reasoning-only-turn.test.ts`)*
+  `reasoning-only-turn.test.ts`, `narration-turn.test.ts`)*
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.

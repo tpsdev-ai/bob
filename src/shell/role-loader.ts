@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseFinalMarkers } from "./compaction-contract.js";
 import { ExplorationBudgetError, parseExplorationBudget } from "./exploration-budget.js";
 import type { BobRole } from "./index.js";
 import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
@@ -25,6 +26,13 @@ export interface RoleTemplate {
   exploration_budget?: number;
   // Completion gate for bob run and launch with a prompt; mail turns are exempt.
   require_edit_or_blocked?: boolean;
+  // bob#365: the markers a final report begins with (e.g. ["DONE", "BLOCKED"]).
+  // Declared, a one-shot run's turn with text and no tool call whose trimmed
+  // text does not start with one is narration, not a final report: bob
+  // re-prompts it, bounded. Absent: the plain final-message rule. Mail turns are
+  // exempt. Validated at load: a non-empty list of non-empty strings without
+  // surrounding whitespace.
+  final_markers?: string[];
   // bob#214: the role's session budget — when to compact (a fraction of the
   // model's context window, checked between model calls) and how much to think
   // (off | low | high). bob.yaml's `session:` block overrides either key for
@@ -94,6 +102,15 @@ export function loadRole(role: BobRole): RoleTemplate {
       }
       requireEditOrBlocked = config.require_edit_or_blocked;
     }
+    let finalMarkers: string[] | undefined;
+    if (config.final_markers !== undefined) {
+      finalMarkers = parseFinalMarkers(config.final_markers);
+      if (finalMarkers === undefined) {
+        throw new Error(
+          `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace.`,
+        );
+      }
+    }
     return {
       role,
       soul,
@@ -103,6 +120,7 @@ export function loadRole(role: BobRole): RoleTemplate {
       ...(requireEditOrBlocked !== undefined
         ? { require_edit_or_blocked: requireEditOrBlocked }
         : {}),
+      ...(finalMarkers !== undefined ? { final_markers: finalMarkers } : {}),
     } as RoleTemplate;
   }
   throw new Error(`unknown role: ${role}. Looked in: ${CANDIDATE_PATHS.join(", ")}`);

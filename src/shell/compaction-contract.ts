@@ -12,7 +12,10 @@
 //     compaction, the single retry with an explicit continue turn is meaningful.
 //     Silence names whether a compaction was seen (`settled_after_compaction`)
 //     or not (`no_final_message`); a message that exists but misses a declared
-//     shape gets its own reason (`final_shape_mismatch`);
+//     shape gets its own reason (`final_shape_mismatch`); a turn that ends
+//     reasoning-only, or (when the run declares final markers) with narration
+//     that is not a final report, is re-prompted, bounded, and fails the run
+//     as `reasoning_only` / `narration_only` past the bound (bob#256, bob#365);
 //   * an attempt to send a BEST-EFFORT "what remains" note after non-aborted compactions, except
 //     after `agent_end` with stopReason "stop", no tool calls, willRetry false,
 //     and final text satisfying the completion contract: the text survives
@@ -45,6 +48,20 @@ export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give 
  *  a still-reasoning-only ending fails the run, or rejects that admitted turn. */
 export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
 
+/** The continuation sent when a run that declares final markers ends a turn with
+ *  text, no tool call, and text that does not begin with one of those markers
+ *  (bob#365): the model announced a step instead of reporting. FIXED text — it
+ *  carries nothing from the model's output — so the re-prompt cannot be steered
+ *  by what the model wrote. Bounded by DEFAULT_MAX_NARRATION_REPROMPTS. */
+export const NARRATION_CONTINUE_TURN =
+  "You announced a step but made no tool call. Continue the task; end only with your final message.";
+
+/** The most narration re-prompts in one one-shot run (the compaction retry
+ *  included). Its own budget, separate from the reasoning-only one. A CONSTANT,
+ *  not a function of the model's output: after this many re-prompts a
+ *  still-narrating ending fails the run with `narration_only`. */
+export const DEFAULT_MAX_NARRATION_REPROMPTS = 3;
+
 /** How many recent tool calls the generated worktree note lists. */
 export const DEFAULT_RECENT_TOOL_CALLS = 5;
 
@@ -65,7 +82,11 @@ export type SilenceReason =
   | "final_shape_mismatch"
   // The run ended with a reasoning-only turn (no text beyond whitespace, no tool call), re-prompted
   // up to the bound and still reasoning-only — "ended without a final report".
-  | "reasoning_only";
+  | "reasoning_only"
+  // The run declares final markers and ended with a turn that has text, no tool
+  // call, and text that does not begin with a marker, re-prompted up to the
+  // bound and still so — "ended without a final report" (bob#365).
+  | "narration_only";
 
 /** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
  *  less yields "" — never the untruncated text. */
@@ -227,6 +248,48 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
     // substantive thinking and no tool call is silence, not reasoning-only (bob#256).
     reasoningOnly: !hasToolCall && text.trim().length === 0 && reasoning.trim().length > 0,
   };
+}
+
+/**
+ * Validate a declared list of final-report markers (bob#365): a non-empty list
+ * of non-empty strings, each without leading or trailing whitespace (the text
+ * it is compared with is trimmed, so such a marker could never match). Returns
+ * a copy, or undefined when the value is not such a list — the caller names
+ * where it came from in its own error.
+ */
+export function parseFinalMarkers(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const markers: string[] = [];
+  for (const m of value) {
+    if (typeof m !== "string" || m.length === 0 || m.trim() !== m) return undefined;
+    markers.push(m);
+  }
+  return markers;
+}
+
+/** True when `text`, trimmed, STARTS WITH one of `markers` (case-sensitive,
+ *  a plain prefix). This is the structural test for "a final report": bob
+ *  never judges the prose that follows the marker. */
+export function startsWithFinalMarker(text: string, markers: readonly string[]): boolean {
+  const trimmed = text.trim();
+  return markers.some((m) => trimmed.startsWith(m));
+}
+
+/**
+ * True when an ending is narration, not a final report (bob#365): the run
+ * declares final markers, the message has text beyond whitespace and no tool
+ * call, and its trimmed text does not start with a marker. pi treats a turn
+ * with no tool call as the agent being finished, so without this check a turn
+ * like "Let me verify they're pre-existing:" ended the run. No declared markers
+ * (undefined) is never narration: the run keeps the plain final-message rule.
+ */
+export function isNarrationEnding(
+  ending: AssistantEnding | undefined,
+  markers: readonly string[] | undefined,
+): boolean {
+  if (markers === undefined || ending === undefined) return false;
+  if (ending.hasToolCall || ending.text.trim().length === 0) return false;
+  return !startsWithFinalMarker(ending.text, markers);
 }
 
 /** Tracks the LAST assistant message that ended (an `AssistantEnding`), from the
