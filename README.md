@@ -336,8 +336,11 @@ change one, the named test is what tells you.
   settles exit 0 only with a final message: the text of the last assistant
   message that ENDED after the last compaction, exactly as it ended and never
   rebuilt from streamed deltas (a message that ended empty or on an error is no
-  final message), or, when no assistant message ended since the current turn
-  began and no compaction was observed (a transport that ends no message), the
+  final message); the one exception is a compaction that ends without a retry
+  after the run already ended on a final message (stop reason `stop`, no tool
+  call, non-empty text that the completion check accepts), where that earlier
+  message is kept as the final message; or, when no assistant message ended
+  since the current turn began and no compaction was observed (a transport that ends no message), the
   text of the last assistant message in the session's message list. A turn
   that ends with reasoning only (no text beyond whitespace, no tool call, and
   actual thinking content) is re-prompted with a short continuation, up to three
