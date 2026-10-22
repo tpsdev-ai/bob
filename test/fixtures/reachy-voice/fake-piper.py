@@ -1,6 +1,6 @@
 # A stand-in for Piper (bob#356 tests): reads the text on stdin, writes a short
-# silent WAV to --output_file, prints nothing. The test installs it with a
-# shebang naming the resolved interpreter, exercising its configured exec path.
+# silent WAV to --output_file, prints nothing. The sidecar runs it under its own
+# interpreter (-I <this file>), so tests install it 0644 with no shebang.
 import sys
 import wave
 

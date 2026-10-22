@@ -92,13 +92,13 @@ async function startSidecar(tag: string): Promise<string> {
   const py = python();
   const tts = join(root, `tts-${tag}`);
   mkdirSync(tts);
-  for (const [name, src] of [
-    ["piper", "fake-piper.py"],
-    ["player", "fake-player.py"],
-  ] as const) {
-    writeFileSync(join(tts, name), `#!${py} -I\n${readFileSync(join(FIXTURES, src), "utf8")}`);
-    chmodSync(join(tts, name), 0o755);
-  }
+  writeFileSync(join(tts, "piper"), readFileSync(join(FIXTURES, "fake-piper.py")));
+  chmodSync(join(tts, "piper"), 0o644);
+  writeFileSync(
+    join(tts, "player"),
+    `#!${py} -I\n${readFileSync(join(FIXTURES, "fake-player.py"), "utf8")}`,
+  );
+  chmodSync(join(tts, "player"), 0o755);
   const model = randomBytes(64);
   writeFileSync(join(tts, "model.onnx"), model);
   const sock = join(root, `${tag}.sock`);
