@@ -460,8 +460,8 @@ function recordProblems(lib, distInfo) {
     .split("\n")
     .filter((line) => line.trim())
     .map((line) => recordFields(line));
-  // A path listed without a hash on any line is bytecode pip compiled at
-  // install, so no line naming that path is compared.
+  // A path that some RECORD line lists without a hash is skipped in full;
+  // pip writes such a line for the bytecode it compiled at install.
   const generated = new Set();
   for (const [rel, hash] of lines) if (!hash) generated.add(resolve(lib, rel));
   const problems = [];
