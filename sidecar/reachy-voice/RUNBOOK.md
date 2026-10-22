@@ -130,19 +130,45 @@ sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
 # into a fresh $PIPER_DIR/lib.new (wheels only, no dependency resolution), plus
 # the entry script the sidecar runs under its own interpreter. PIPER_INSTALL
 # records the outcome; the install commands after this block run only when it
-# is "ok", and a failed swap restores the lib it moved aside before it stops.
+# is "ok". A failed swap attempts to move the old lib back and reports a failed
+# restore; it does not delete the only copy.
 sudo rm -rf "${PIPER_DIR:?}/lib.new"
 PIPER_INSTALL=failed
-if sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
+if sudo test -e "$PIPER_DIR/lib.new" || sudo test -L "$PIPER_DIR/lib.new" ||
+  sudo test -e "$PIPER_DIR/lib.old" || sudo test -L "$PIPER_DIR/lib.old"; then
+  PIPER_INSTALL=swap-dir-present
+elif sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
   --target "$PIPER_DIR/lib.new" -r $REPO/sidecar/reachy-voice/piper-requirements.txt; then
   PIPER_INSTALL=ok
-  if sudo test -d "$PIPER_DIR/lib" && ! sudo mv "$PIPER_DIR/lib" "$PIPER_DIR/lib.old"; then
-    PIPER_INSTALL=move-failed
+  # Absent is fine; any other inspection failure is a distinct state and stops.
+  PIPER_LIB_STATE=$(sudo /usr/bin/python3 -I -c '
+import os, sys
+try:
+    os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("absent")
+except OSError:
+    print("cannot-inspect")
+else:
+    print("directory" if os.path.isdir(sys.argv[1]) else "cannot-inspect")
+' "$PIPER_DIR/lib") || PIPER_LIB_STATE=cannot-inspect
+  if [ "$PIPER_LIB_STATE" = directory ]; then
+    if ! sudo /usr/bin/python3 -I -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \
+      "$PIPER_DIR/lib" "$PIPER_DIR/lib.old"; then
+      PIPER_INSTALL=move-failed
+    fi
+  elif [ "$PIPER_LIB_STATE" != absent ]; then
+    PIPER_INSTALL=inspect-failed
   fi
-  if [ "$PIPER_INSTALL" = ok ] && ! sudo mv "$PIPER_DIR/lib.new" "$PIPER_DIR/lib"; then
+  # os.rename(2) refuses an occupied target instead of nesting a directory.
+  if [ "$PIPER_INSTALL" = ok ] && ! sudo /usr/bin/python3 -I -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \
+    "$PIPER_DIR/lib.new" "$PIPER_DIR/lib"; then
     PIPER_INSTALL=swap-failed
-    if sudo test -d "$PIPER_DIR/lib.old"; then
-      sudo mv "$PIPER_DIR/lib.old" "$PIPER_DIR/lib" || PIPER_INSTALL=restore-failed
+    if [ "$PIPER_LIB_STATE" = directory ] && sudo test -d "$PIPER_DIR/lib.old"; then
+      if ! sudo /usr/bin/python3 -I -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \
+        "$PIPER_DIR/lib.old" "$PIPER_DIR/lib"; then
+        PIPER_INSTALL=restore-failed
+      fi
     fi
   fi
   if [ "$PIPER_INSTALL" = ok ]; then
@@ -157,7 +183,11 @@ if [ "$PIPER_INSTALL" = ok ]; then
   sudo cp <voice>.onnx.json $PIPER_DIR/voice.onnx.json
   sudo chown root:wheel $PIPER_DIR/voice.onnx* && sudo chmod 0644 $PIPER_DIR/voice.onnx*
 fi
-if [ "$PIPER_INSTALL" != ok ]; then
+if [ "$PIPER_INSTALL" = swap-dir-present ]; then
+  echo "reachy-voice: $PIPER_DIR/lib.new or $PIPER_DIR/lib.old exists after the cleanup step; refusing to start the swap. Remove or inspect it and rerun this step." >&2
+elif [ "$PIPER_INSTALL" = restore-failed ]; then
+  echo "reachy-voice: the swap failed and the previous $PIPER_DIR/lib could not be moved back from $PIPER_DIR/lib.old (PIPER_INSTALL=restore-failed). $PIPER_DIR/lib may be missing. Stop here: inspect both directories and move the good one to $PIPER_DIR/lib by hand before rerunning this step; the entry install did not run." >&2
+elif [ "$PIPER_INSTALL" != ok ]; then
   echo "reachy-voice: the Piper install did not complete ($PIPER_INSTALL). Stop here and rerun this step; the entry install did not run." >&2
 fi
 shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
@@ -168,12 +198,14 @@ verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py`,
 `egress-probe.py` and `launch.py` are byte-identical to the reviewed checkout
 and root-owned, and that `$PIPER_DIR/piper` is byte-identical to
 `sidecar/reachy-voice/piper-entry.py` and root-owned. Under `$PIPER_DIR/lib` it
-requires the distributions `piper-requirements.txt` pins, at those versions,
-and the hashes each distribution's `RECORD` gives its files to match those
-files. Compiled bytecode pip generated at install is not hash-checked: pip
-appends a hashless `RECORD` line for each `.pyc` it recompiles, so a path
-`RECORD` lists without a hash is skipped. The `.py` sources and every other
-file are checked. `--piper-model-sha256`
+parses every `<name>-<version>.dist-info`, requires its METADATA `Name` and
+`Version` to match the directory name and the pin in `piper-requirements.txt`,
+requires the pinned set and no other distribution, and compares each hashed
+`RECORD` entry that resolves inside `lib` with its file. A hashless `RECORD`
+line is accepted only for the distribution's own `RECORD` and for a `.pyc` under
+`__pycache__` that pip recompiled at install (its bytes can differ from the
+wheel's copy, so a path listed both ways is not compared). A file `RECORD` does
+not list is not enumerated. `--piper-model-sha256`
 is the voice model's: the sidecar refuses to start when the model differs, and
 when `--work-dir` is not an absolute path.
 

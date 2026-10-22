@@ -559,6 +559,74 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
   });
 
+  it("a hashless line does not exempt a source file from its hashed line", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    writeFileSync(join(f, "piper/lib/numpy/__init__.py"), "tampered\n");
+    appendFileSync(record, "numpy/__init__.py,,\n");
+    const problems = piperInstallProblems(args(f)).join("\n");
+    expect(problems).toContain(
+      `${f}/piper/lib/numpy/__init__.py is listed in ${record} without a hash`,
+    );
+    expect(problems).toContain(
+      `${f}/piper/lib/numpy/__init__.py does not match the hash in ${record}`,
+    );
+  });
+
+  it("a hashless .pyc outside __pycache__ is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/conv_template.cpython-39.pyc";
+    writeFileSync(join(f, "piper/lib", rel), "bytecode\n");
+    appendFileSync(record, `${rel},,\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/${rel} is listed in ${record} without a hash`,
+    );
+  });
+
+  it("an empty RECORD is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    writeFileSync(record, "");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(`${record} is empty`);
+  });
+
+  it("a RECORD line that is not path,hash,size is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "numpy/extra.py,sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a line that is not path,hash,size`,
+    );
+  });
+
+  it("a dist-info whose METADATA names another distribution is refused", () => {
+    const { f } = fixture();
+    writeFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/METADATA"),
+      "Name: six\nVersion: 2.0.2\n",
+    );
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/numpy-2.0.2.dist-info/METADATA names six, not numpy-2.0.2.dist-info`,
+    );
+  });
+
+  it("an unversioned dist-info is refused", () => {
+    const { f } = fixture();
+    mkdirSync(join(f, "piper/lib/extra.dist-info"), { mode: 0o755 });
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib holds extra.dist-info, which is not <name>-<version>.dist-info`,
+    );
+  });
+
+  it("a pinned distribution that is missing is refused", () => {
+    const { f } = fixture();
+    rmSync(join(f, "piper/lib/numpy-2.0.2.dist-info"), { recursive: true, force: true });
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib does not hold the pinned numpy 2.0.2`,
+    );
+  });
+
   it("a missing lib tree is refused", () => {
     const { f } = fixture();
     rmSync(join(f, "piper/lib"), { recursive: true, force: true });
