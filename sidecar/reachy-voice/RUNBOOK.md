@@ -169,7 +169,10 @@ verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py`,
 and root-owned, and that `$PIPER_DIR/piper` is byte-identical to
 `sidecar/reachy-voice/piper-entry.py` and root-owned. Under `$PIPER_DIR/lib` it
 requires the distributions `piper-requirements.txt` pins, at those versions,
-and every hash in each distribution's `RECORD` to match the file it names. `--piper-model-sha256`
+and every hash in each distribution's `RECORD` to match the file it names.
+Compiled bytecode pip generated at install is not hash-checked: pip appends a
+hashless `RECORD` line for each `.pyc` it recompiles, so a path `RECORD` lists
+without a hash is skipped. The `.py` sources and every other file are checked. `--piper-model-sha256`
 is the voice model's: the sidecar refuses to start when the model differs, and
 when `--work-dir` is not an absolute path.
 

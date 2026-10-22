@@ -10,6 +10,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -84,6 +85,19 @@ function installDistribution(f: string, name: string, version: string) {
   const recordPath = join(distInfo, "RECORD");
   writeFileSync(join(lib, recordPath), `${record.join("\n")}\n${recordPath},,\n`);
   chmodSync(join(lib, recordPath), 0o644);
+}
+
+/** The RECORD lines a `--target` install of the numpy 2.0.2 wheel leaves for
+ *  the .pyc pip recompiles: the wheel's hashed line and pip's hashless one.
+ *  `hashlessFirst` picks the order. The file on disk is the recompiled one. */
+function installRecompiledBytecode(f: string, hashlessFirst: boolean) {
+  const rel = "numpy/distutils/__pycache__/conv_template.cpython-39.pyc";
+  mkdirSync(join(f, "piper/lib", dirname(rel)), { recursive: true, mode: 0o755 });
+  writeFileSync(join(f, "piper/lib", rel), "recompiled bytecode\n");
+  const hashed = `${rel},sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y,8325`;
+  const hashless = `${rel},,`;
+  const lines = hashlessFirst ? [hashless, hashed] : [hashed, hashless];
+  appendFileSync(join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"), `${lines.join("\n")}\n`);
 }
 
 /** A clean release-host stand-in: every directory 0755, every file 0644/0755. */
@@ -509,6 +523,39 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     installDistribution(f, "six", "1.16.0");
     expect(piperInstallProblems(args(f)).join("\n")).toContain(
       `${f}/piper/lib holds six 1.16.0, which is not pinned`,
+    );
+  });
+
+  it("bytecode pip recompiled at install is not hash-checked, whichever line comes first", () => {
+    for (const hashlessFirst of [true, false]) {
+      const { f } = fixture();
+      installRecompiledBytecode(f, hashlessFirst);
+      expect(piperInstallProblems(args(f))).toEqual([]);
+    }
+  });
+
+  it("an installed file listed only with a hash is still checked", () => {
+    const { f } = fixture();
+    const rel = "numpy/distutils/conv_template.py";
+    mkdirSync(join(f, "piper/lib", dirname(rel)), { recursive: true, mode: 0o755 });
+    writeFileSync(join(f, "piper/lib", rel), "tampered\n");
+    appendFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"),
+      `${rel},sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y,8325\n`,
+    );
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/${rel} does not match the hash in ` +
+        `${f}/piper/lib/numpy-2.0.2.dist-info/RECORD`,
+    );
+  });
+
+  it("a mismatched source file beside recompiled bytecode is still refused", () => {
+    const { f } = fixture();
+    installRecompiledBytecode(f, true);
+    writeFileSync(join(f, "piper/lib/numpy/__init__.py"), "tampered\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/numpy/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/numpy-2.0.2.dist-info/RECORD`,
     );
   });
 

@@ -443,8 +443,10 @@ function recordFields(line) {
 /**
  * A distribution's RECORD hashes against the files on disk, as
  * `pip install --target` leaves them: paths relative to the target, sha256 in
- * base64url. pip records RECORD itself and the bytecode it compiled without a
- * hash, so those entries are skipped.
+ * base64url. Compiled bytecode pip generated at install is not hash-checked:
+ * pip appends a hashless line naming the .pyc it recompiled, while the wheel's
+ * own line for that path carries a hash of the wheel's copy. Both lines are
+ * skipped, in either order; the .py sources and every other file are checked.
  */
 function recordProblems(lib, distInfo) {
   const record = join(lib, distInfo, "RECORD");
@@ -454,12 +456,19 @@ function recordProblems(lib, distInfo) {
   } catch {
     return [`${record} cannot be read`];
   }
+  const lines = body
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => recordFields(line));
+  // A path listed without a hash on any line is bytecode pip compiled at
+  // install, so no line naming that path is compared.
+  const generated = new Set();
+  for (const [rel, hash] of lines) if (!hash) generated.add(resolve(lib, rel));
   const problems = [];
-  for (const line of body.split("\n")) {
-    if (!line.trim()) continue;
-    const [rel, hash] = recordFields(line);
+  for (const [rel, hash] of lines) {
     if (!hash) continue;
     const p = resolve(lib, rel);
+    if (generated.has(p)) continue;
     // A `--target` install records its console script as ../../bin/<name>,
     // outside the lib: that script is not part of the tree checked here.
     if (p !== lib && !p.startsWith(lib + sep)) continue;
@@ -486,8 +495,9 @@ function recordProblems(lib, distInfo) {
  * [P7] The installed Piper: `$PIPER_DIR/piper` is byte-identical to the
  * reviewed entry script and root-owned, the piper-tts distribution under
  * `$PIPER_DIR/lib` reports the pinned version, the distributions there are
- * the pinned set, and every hash in each distribution's RECORD matches the
- * file it names. `owners` is a seam for tests.
+ * the pinned set, and each hash in every distribution's RECORD matches the
+ * file it names — compiled bytecode pip generated at install excepted.
+ * `owners` is a seam for tests.
  */
 export function piperInstallProblems({
   piperDir = "/usr/local/libexec/bob/piper",
