@@ -118,6 +118,8 @@ around bob's gates.
 ## 3. Install the sidecar and Piper (root-owned, hash-recorded)
 
 Once P7 establishes trusted ancestors and ACLs, the sidecar user cannot modify these files.
+On a host where the launch job is already loaded, boot it out before re-running
+this step and bootstrap it again with step 5.
 
 ```sh
 sudo install -d -o root -g wheel -m 0755 $INSTALL $PIPER_DIR
@@ -125,10 +127,17 @@ sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
   $REPO/sidecar/reachy-voice/reachy-voice.sb $REPO/sidecar/reachy-voice/proof.py \
   $REPO/sidecar/reachy-voice/egress-probe.py $REPO/sidecar/reachy-voice/launch.py $INSTALL/
 # Piper: piper-tts and its dependencies from the pinned wheel set, installed
-# into $PIPER_DIR/lib (wheels only, no dependency resolution), plus the entry
-# script the sidecar runs under its own interpreter.
-sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
-  --target $PIPER_DIR/lib -r $REPO/sidecar/reachy-voice/piper-requirements.txt
+# into a fresh $PIPER_DIR/lib.new (wheels only, no dependency resolution), plus
+# the entry script the sidecar runs under its own interpreter.
+sudo rm -rf "${PIPER_DIR:?}/lib.new"
+if sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
+  --target "$PIPER_DIR/lib.new" -r $REPO/sidecar/reachy-voice/piper-requirements.txt; then
+  if sudo test -d "$PIPER_DIR/lib"; then
+    sudo mv "$PIPER_DIR/lib" "$PIPER_DIR/lib.old"
+  fi
+  sudo mv "$PIPER_DIR/lib.new" "$PIPER_DIR/lib"
+  sudo rm -rf "${PIPER_DIR:?}/lib.old"
+fi
 sudo install -o root -g wheel -m 0644 \
   $REPO/sidecar/reachy-voice/piper-entry.py $PIPER_DIR/piper
 sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR
