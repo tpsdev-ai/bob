@@ -56,7 +56,12 @@ while [ $# -gt 0 ]; do
 done
 [ $# -gt 0 ] || exit 0
 if [ "$1" = chown ]; then exit 0; fi
+if [ "$1" = cp ]; then
+  if [ "\${SHIM_FAIL_VOICE:-0}" = 1 ]; then exit 1; fi
+  exec "$@"
+fi
 if [ "$1" = install ]; then
+  if [ "\${SHIM_FAIL_ENTRY:-0}" = 1 ]; then exit 1; fi
   args=()
   skip=0
   for arg in "$@"; do
@@ -90,6 +95,10 @@ if [ "$1" = /usr/bin/python3 ]; then
       *os.rename*)
         src=\${5:-}
         dst=\${6:-}
+        if [ "$(basename "$src")" = lib ] && [ "$(basename "$dst")" = lib.old ] &&
+          [ "\${SHIM_FAIL_MOVE:-0}" = 1 ]; then
+          exit 1
+        fi
         if [ "$(basename "$src")" = lib.new ] && [ "$(basename "$dst")" = lib ] &&
           [ "\${SHIM_FAIL_SWAP:-0}" = 1 ]; then
           if [ "\${SHIM_SWAP_TARGET:-0}" = occupied ]; then mkdir -p "$dst/inside"; fi
@@ -110,8 +119,11 @@ exec "$@"
 type Injection = {
   pip?: boolean;
   inspect?: boolean;
+  move?: boolean;
   swap?: "fail" | "occupied";
   restore?: boolean;
+  entry?: boolean;
+  voice?: boolean;
 };
 
 function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
@@ -142,8 +154,11 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     REPO: ROOT,
     SHIM_FAIL_PIP: inject.pip ? "1" : "0",
     SHIM_FAIL_INSPECT: inject.inspect ? "1" : "0",
+    SHIM_FAIL_MOVE: inject.move ? "1" : "0",
     SHIM_FAIL_SWAP: inject.swap ? "1" : "0",
     SHIM_FAIL_RESTORE: inject.restore ? "1" : "0",
+    SHIM_FAIL_ENTRY: inject.entry ? "1" : "0",
+    SHIM_FAIL_VOICE: inject.voice ? "1" : "0",
     SHIM_SWAP_TARGET: inject.swap === "occupied" ? "occupied" : "0",
   };
   const r = spawnSync(
@@ -169,6 +184,8 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     libNew: existsSync(join(piper, "lib.new/installed.txt")),
     libOld: existsSync(join(piper, "lib.old/old.txt")),
     entry: read(join(piper, "piper")),
+    voice: read(join(piper, "voice.onnx")),
+    voiceJson: read(join(piper, "voice.onnx.json")),
     nestedInLib: existsSync(join(piper, "lib/lib")),
     nestedInOld: existsSync(join(piper, "lib.old/lib")),
   };
@@ -215,6 +232,38 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.entry).toBe("old entry\n");
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("refusing to start the swap");
+  });
+
+  it("a move-aside rename that fails leaves the old lib in place", () => {
+    const r = run({ move: true });
+    expect(r.state).toBe("move-failed");
+    expect(r.status).not.toBe(0);
+    expect(r.lib).toBe(true);
+    expect(r.libNew).toBe(true);
+    expect(r.libOld).toBe(false);
+    expect(r.entry).toBe("old entry\n");
+    expect(r.nestedInLib || r.nestedInOld).toBe(false);
+  });
+
+  it("a failed entry install sets install-failed and skips the rest of the install", () => {
+    const r = run({ entry: true });
+    expect(r.state).toBe("install-failed");
+    expect(r.status).not.toBe(0);
+    expect(r.installed).toBe(true);
+    expect(r.entry).toBe("old entry\n");
+    expect(r.voice).toBe("old voice\n");
+    expect(r.voiceJson).toBe("{}\n");
+    expect(r.output).toContain("PIPER_INSTALL=install-failed");
+  });
+
+  it("a failed voice copy sets voice-failed and fails the block", () => {
+    const r = run({ voice: true });
+    expect(r.state).toBe("voice-failed");
+    expect(r.status).not.toBe(0);
+    expect(r.entry).toBe(readFileSync(join(ROOT, "sidecar/reachy-voice/piper-entry.py"), "utf8"));
+    expect(r.voice).toBe("old voice\n");
+    expect(r.voiceJson).toBe("{}\n");
+    expect(r.output).toContain("PIPER_INSTALL=voice-failed");
   });
 
   it("a swap rename that fails restores the old lib", () => {
