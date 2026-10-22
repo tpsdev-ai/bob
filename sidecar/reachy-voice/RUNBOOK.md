@@ -225,8 +225,8 @@ and root-owned, and that `$PIPER_DIR/piper` is byte-identical to
 parses every `<name>-<version>.dist-info`, requires its METADATA `Name` and
 `Version` to match the directory name and the pin in `piper-requirements.txt`,
 requires the pinned set and no other distribution, and compares each hashed
-`RECORD` entry whose real path resolves inside `lib` with its file; an entry
-inside `lib` whose real path resolves outside it is refused. A hashless `RECORD`
+`RECORD` entry inside `lib` whose real path resolves inside it with its file;
+an entry inside `lib` whose real path resolves outside it is refused. A hashless `RECORD`
 line is accepted only for the distribution's own `RECORD` and for a `.pyc` under
 `__pycache__` that pip recompiled at install (its bytes can differ from the
 wheel's copy, so a path listed both ways is not compared). A file `RECORD` does

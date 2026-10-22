@@ -446,9 +446,9 @@ function recordFields(line) {
 /**
  * A distribution's RECORD hashes against the files on disk, as
  * `pip install --target` leaves them: paths relative to the target, sha256 in
- * base64url. Every hashed line whose real path resolves inside `lib` is
- * compared; a symlink inside `lib` that resolves outside it is refused. A file
- * RECORD does not list is not enumerated. Two hashless lines are
+ * base64url. Every hashed line inside `lib` whose real path stays inside it
+ * is compared; a symlink inside `lib` that resolves outside it is refused. A
+ * file RECORD does not list is not enumerated. Two hashless lines are
  * accepted: the distribution's own RECORD, and a `.pyc` under `__pycache__`
  * that pip recompiled at install (its bytes can differ from the wheel's copy,
  * so a path listed both ways is not hash-compared). Any other hashless line is
@@ -573,8 +573,8 @@ function recordProblems(lib, distInfo) {
  * under `$PIPER_DIR/lib` is parsed, its METADATA Name and Version are held to
  * the directory name (PEP 503 normalization), the set is held to the pins in
  * piper-requirements.txt in both directions, and each hashed RECORD entry
- * whose real path resolves inside `lib` is compared with the file, except a
- * `.pyc` under `__pycache__` that also has an accepted hashless row — a path
+ * inside `lib` whose real path resolves inside it is compared with the file,
+ * except a `.pyc` under `__pycache__` that also has an accepted hashless row — a path
  * listed there without a hash is accepted only for the distribution's own
  * RECORD or for that bytecode. A RECORD entry lexically inside `lib` whose
  * real path resolves outside it is refused. `owners` is a seam for tests.
