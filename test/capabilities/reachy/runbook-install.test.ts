@@ -151,6 +151,7 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     lib: existsSync(join(piper, "lib/old.txt")),
     libNew: existsSync(join(piper, "lib.new/installed.txt")),
     libOld: existsSync(join(piper, "lib.old/old.txt")),
+    entry: existsSync(join(piper, "piper")),
     nestedInLib: existsSync(join(piper, "lib/lib")),
     nestedInOld: existsSync(join(piper, "lib.old/lib")),
   };
@@ -170,6 +171,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(true);
     expect(r.libNew).toBe(false);
     expect(r.libOld).toBe(false);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("the Piper install did not complete (failed)");
   });
@@ -180,6 +182,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(true);
     expect(r.libNew).toBe(false);
     expect(r.libOld).toBe(true);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("refusing to start the swap");
   });
@@ -190,6 +193,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(true);
     expect(r.libNew).toBe(true);
     expect(r.libOld).toBe(false);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
   });
 
@@ -199,6 +203,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(false);
     expect(r.libNew).toBe(true);
     expect(r.libOld).toBe(true);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
   });
 
@@ -208,6 +213,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(false);
     expect(r.libNew).toBe(true);
     expect(r.libOld).toBe(true);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("could not be moved back");
     expect(r.output).toContain("move the good one to");
@@ -219,6 +225,7 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.lib).toBe(true);
     expect(r.libNew).toBe(true);
     expect(r.libOld).toBe(false);
+    expect(r.entry).toBe(false);
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("the Piper install did not complete (inspect-failed)");
   });
