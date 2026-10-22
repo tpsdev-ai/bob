@@ -8,6 +8,7 @@
 // refuse what it must.
 import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -32,6 +33,20 @@ import {
 const DARWIN = process.platform === "darwin";
 const ME = process.getuid?.() ?? -1;
 const INSTALLED = ["sidecar.py", "reachy-voice.sb", "proof.py", "egress-probe.py"];
+// The pinned wheel set, as piper-requirements.txt names it.
+const PINNED: Array<[string, string]> = [
+  ["piper-tts", "1.8.0"],
+  ["coloredlogs", "15.0.1"],
+  ["flatbuffers", "25.12.19"],
+  ["humanfriendly", "10.0"],
+  ["mpmath", "1.3.0"],
+  ["numpy", "2.0.2"],
+  ["onnxruntime", "1.19.2"],
+  ["packaging", "26.3"],
+  ["pathvalidate", "3.3.1"],
+  ["protobuf", "6.33.6"],
+  ["sympy", "1.14.0"],
+];
 const scratch: string[] = [];
 afterAll(() => {
   for (const d of scratch) {
@@ -43,6 +58,33 @@ afterAll(() => {
     rmSync(d, { recursive: true, force: true });
   }
 });
+
+/** One installed distribution, as `pip install --target` leaves it: the files,
+ *  a METADATA header, and a RECORD of sha256 hashes in base64url. */
+function installDistribution(f: string, name: string, version: string) {
+  const lib = join(f, "piper", "lib");
+  const module = name.replace(/-/g, "_");
+  const distInfo = `${module}-${version}.dist-info`;
+  for (const d of [join(lib, module), join(lib, distInfo)]) {
+    mkdirSync(d, { recursive: true, mode: 0o755 });
+    chmodSync(d, 0o755);
+  }
+  const files = new Map<string, string>([
+    [`${module}/__init__.py`, `# ${name} ${version}\n`],
+    [`${distInfo}/METADATA`, `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n`],
+    [`${distInfo}/WHEEL`, "Wheel-Version: 1.0\n"],
+  ]);
+  const record: string[] = [];
+  for (const [rel, body] of files) {
+    writeFileSync(join(lib, rel), body);
+    chmodSync(join(lib, rel), 0o644);
+    const digest = createHash("sha256").update(body).digest("base64url");
+    record.push(`${rel},sha256=${digest},${Buffer.byteLength(body)}`);
+  }
+  const recordPath = join(distInfo, "RECORD");
+  writeFileSync(join(lib, recordPath), `${record.join("\n")}\n${recordPath},,\n`);
+  chmodSync(join(lib, recordPath), 0o644);
+}
 
 /** A clean release-host stand-in: every directory 0755, every file 0644/0755. */
 function fixture() {
@@ -64,12 +106,8 @@ function fixture() {
   for (const n of INSTALLED) file(join(f, "install", n));
   file(join(f, "piper/piper"), 0o755);
   file(join(f, "source/piper-entry.py"));
-  file(
-    join(f, "piper/lib/piper_tts-1.8.0.dist-info/METADATA"),
-    0o644,
-    "Metadata-Version: 2.1\nName: piper-tts\nVersion: 1.8.0\n",
-  );
   file(join(f, "state/agent-user"), 0o644, "bob\n");
+  for (const [name, version] of PINNED) installDistribution(f, name, version);
   // mkdir's mode is masked by umask: set every directory explicitly
   for (const d of [
     "usr",
@@ -86,7 +124,6 @@ function fixture() {
     "install",
     "piper",
     "piper/lib",
-    "piper/lib/piper_tts-1.8.0.dist-info",
     "source",
     "state",
   ]) {
@@ -455,6 +492,23 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
     expect(piperInstallProblems(args(f)).join("\n")).toContain(
       "the installed piper-tts 1.7.0 is not the pinned 1.8.0",
+    );
+  });
+
+  it("an installed file that differs from its RECORD hash is refused", () => {
+    const { f } = fixture();
+    writeFileSync(join(f, "piper/lib/piper_tts/__init__.py"), "tampered\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/piper_tts/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/piper_tts-1.8.0.dist-info/RECORD`,
+    );
+  });
+
+  it("a distribution outside the pinned set is refused", () => {
+    const { f } = fixture();
+    installDistribution(f, "six", "1.16.0");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib holds six 1.16.0, which is not pinned`,
     );
   });
 

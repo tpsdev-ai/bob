@@ -410,7 +410,7 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     }
   }, 30_000);
 
-  it("refuses to start on a model that does not match its pinned sha256, or a work dir that is not 0700", async () => {
+  it("refuses to start on a model that does not match its pinned sha256, a work dir that is not 0700, or a relative work dir", async () => {
     const inst = install();
     const bad = start(inst, [], { sha: "0".repeat(64) });
     await waitFor(() => bad.exit() !== undefined, "the refusal");
@@ -424,6 +424,11 @@ describe("bob#356 V1 — the real voice sidecar", () => {
     await waitFor(() => loose.exit() !== undefined, "the refusal");
     expect(loose.exit()).not.toBe(0);
     expect(loose.log()).toContain("must be a 0700 directory");
+
+    const relative = start(inst, [], { work: "rv-relative-work" });
+    await waitFor(() => relative.exit() !== undefined, "the refusal");
+    expect(relative.exit()).not.toBe(0);
+    expect(relative.log()).toContain("--work-dir must be an absolute path");
   }, 30_000);
 
   it("sweeps speech a crash left behind, at startup", async () => {

@@ -32,6 +32,7 @@
 // on Linux, where the seatbelt proofs cannot exist).
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -44,7 +45,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
@@ -396,10 +397,97 @@ export function pinnedPiperVersion(requirements = PIPER_REQUIREMENTS) {
   return undefined;
 }
 
+/** The pinned distributions from the requirements file: PEP 503 name -> version. */
+export function pinnedPiperDistributions(requirements = PIPER_REQUIREMENTS) {
+  let text;
+  try {
+    text = readFileSync(requirements, "utf8");
+  } catch {
+    return undefined;
+  }
+  const pins = new Map();
+  for (const line of text.split("\n")) {
+    const m = /^([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][^\s\\;]*)/.exec(line.trim());
+    if (m) pins.set(normalizeDistributionName(m[1]), m[2]);
+  }
+  return pins;
+}
+
+function normalizeDistributionName(name) {
+  return name.toLowerCase().replace(/[-_.]+/g, "-");
+}
+
+/** One RECORD line's fields: path, hash and size, with double quotes honoured. */
+function recordFields(line) {
+  const fields = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch !== '"') field += ch;
+      else if (line[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      fields.push(field);
+      field = "";
+    } else field += ch;
+  }
+  fields.push(field);
+  return fields;
+}
+
+/**
+ * A distribution's RECORD hashes against the files on disk, as
+ * `pip install --target` leaves them: paths relative to the target, sha256 in
+ * base64url. pip records RECORD itself and the bytecode it compiled without a
+ * hash, so those entries are skipped.
+ */
+function recordProblems(lib, distInfo) {
+  const record = join(lib, distInfo, "RECORD");
+  let body;
+  try {
+    body = readFileSync(record, "utf8");
+  } catch {
+    return [`${record} cannot be read`];
+  }
+  const problems = [];
+  for (const line of body.split("\n")) {
+    if (!line.trim()) continue;
+    const [rel, hash] = recordFields(line);
+    if (!hash) continue;
+    const p = resolve(lib, rel);
+    // A `--target` install records its console script as ../../bin/<name>,
+    // outside the lib: that script is not part of the tree checked here.
+    if (p !== lib && !p.startsWith(lib + sep)) continue;
+    const m = /^sha256=(.+)$/.exec(hash);
+    if (!m) {
+      problems.push(`${p} has an unsupported RECORD hash`);
+      continue;
+    }
+    let file;
+    try {
+      file = readFileSync(p);
+    } catch {
+      problems.push(`${p} cannot be read`);
+      continue;
+    }
+    if (createHash("sha256").update(file).digest("base64url") !== m[1]) {
+      problems.push(`${p} does not match the hash in ${record}`);
+    }
+  }
+  return problems;
+}
+
 /**
  * [P7] The installed Piper: `$PIPER_DIR/piper` is byte-identical to the
- * reviewed entry script and root-owned, and the piper-tts distribution under
- * `$PIPER_DIR/lib` reports the pinned version. `owners` is a seam for tests.
+ * reviewed entry script and root-owned, the piper-tts distribution under
+ * `$PIPER_DIR/lib` reports the pinned version, the distributions there are
+ * the pinned set, and every hash in each distribution's RECORD matches the
+ * file it names. `owners` is a seam for tests.
  */
 export function piperInstallProblems({
   piperDir = "/usr/local/libexec/bob/piper",
@@ -463,6 +551,34 @@ export function piperInstallProblems({
         `the installed piper-tts ${version ?? "has no version"} is not the pinned ${want}`,
       );
     }
+  }
+  const pins = pinnedPiperDistributions(requirements);
+  if (!pins) {
+    problems.push(`the pinned distributions cannot be read from ${requirements}`);
+  } else if (names) {
+    const installed = new Map();
+    for (const name of names) {
+      const m = /^(.+)-([^-]+)\.dist-info$/.exec(name);
+      if (!m) continue;
+      const key = normalizeDistributionName(m[1]);
+      if (installed.has(key)) {
+        problems.push(`${lib} holds more than one ${key} distribution`);
+        continue;
+      }
+      installed.set(key, { dir: name, version: m[2] });
+    }
+    for (const [key, { version }] of installed) {
+      const pinnedVersion = pins.get(key);
+      if (pinnedVersion === undefined) {
+        problems.push(`${lib} holds ${key} ${version}, which is not pinned`);
+      } else if (pinnedVersion !== version) {
+        problems.push(`${lib} holds ${key} ${version}, not the pinned ${pinnedVersion}`);
+      }
+    }
+    for (const [key, version] of pins) {
+      if (!installed.has(key)) problems.push(`${lib} does not hold the pinned ${key} ${version}`);
+    }
+    for (const { dir } of installed.values()) problems.push(...recordProblems(lib, dir));
   }
   return problems;
 }
