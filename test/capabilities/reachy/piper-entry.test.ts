@@ -13,12 +13,13 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
 const ENTRY = join(REPO, "sidecar", "reachy-voice", "piper-entry.py");
@@ -121,8 +122,11 @@ describe("bob#356 — the installed Piper entry script", () => {
     expect(r.status, r.stderr).toBe(0);
     const seen = JSON.parse(readFileSync(obs, "utf8"));
     expect(seen.argv).toEqual(["-m", model, "-f", out]);
-    expect(seen.cwd).toBe(work);
-    expect(seen.path0).toBe(join(base, "lib"));
+    // macOS temp dirs sit under /var, a symlink to /private/var: the child
+    // reports its cwd resolved. realpathSync is a no-op on Linux.
+    expect(seen.cwd).toBe(realpathSync(work));
+    // The entry puts its own realpath's lib on sys.path, so this is resolved too.
+    expect(seen.path0).toBe(join(realpathSync(base), "lib"));
     expect(seen.isolated).toBe(1);
     expect(seen.executable).toBe(python());
     expect(seen.text).toBe("hello");
@@ -251,8 +255,11 @@ describe("bob#356 — the sidecar's synthesis call", () => {
     const seen = JSON.parse(readFileSync(join(work, "piper-obs.json"), "utf8"));
     expect(seen.argv.slice(0, 2)).toEqual(["--model", join(tts, "model.onnx")]);
     expect(seen.argv[2]).toBe("--output_file");
-    expect(seen.cwd.startsWith(`${work}/tts-`)).toBe(true);
-    expect(seen.argv[3]).toBe(join(seen.cwd, "speech.wav"));
+    const resolvedWork = realpathSync(work);
+    expect(seen.cwd.startsWith(`${resolvedWork}/tts-`)).toBe(true);
+    // The speech file sits in the cwd's directory, which is work/tts-*: name it
+    // from the unresolved work dir, since the child reports cwd resolved.
+    expect(seen.argv[3]).toBe(join(work, basename(seen.cwd), "speech.wav"));
     expect(seen.isolated).toBe(1);
     expect(seen.executable).toBe(py);
   }, 30_000);
