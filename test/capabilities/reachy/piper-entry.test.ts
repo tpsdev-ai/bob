@@ -43,7 +43,7 @@ function python(): string {
 /** The stub piper-tts package: it records what the entry handed it — argv, cwd,
  *  `sys.path[0]`, the isolated flag and the output file's mode/owner/type
  *  before and after writing — in $PIPER_OBS, and reads the text from stdin. It
- *  writes through the EXISTING file (r+b), so a replacement would fail. */
+ *  writes through the EXISTING file (r+b). */
 const STUB = `
 import json, os, stat, sys
 
@@ -104,6 +104,34 @@ function runEntry(
   });
 }
 
+/** Runs the entry in this process, under an isolated interpreter, and prints
+ *  its cwd before and after main, then exits with the entry's status. */
+const IN_PROCESS = `
+import os, sys
+path = sys.argv[1]
+ns = {"__name__": "entry", "__file__": path}
+with open(path, "rb") as fh:
+    exec(compile(fh.read(), path, "exec"), ns)
+before = os.getcwd()
+status = ns["main"](sys.argv[2:])
+sys.stdout.write(before + "\\n" + os.getcwd() + "\\n")
+raise SystemExit(status)
+`;
+
+function runEntryInProcess(
+  entry: string,
+  args: string[],
+  cwd: string,
+  env: Record<string, string> = {},
+) {
+  return spawnSync(python(), ["-I", "-c", IN_PROCESS, entry, ...args], {
+    cwd,
+    input: "hello",
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+}
+
 const SHAPES = [
   [],
   ["--model", "voice.onnx"],
@@ -122,8 +150,7 @@ describe("bob#356 — the installed Piper entry script", () => {
     expect(r.status, r.stderr).toBe(0);
     const seen = JSON.parse(readFileSync(obs, "utf8"));
     expect(seen.argv).toEqual(["-m", model, "-f", out]);
-    // macOS temp dirs sit under /var, a symlink to /private/var: the child
-    // reports its cwd resolved. realpathSync is a no-op on Linux.
+    // Compare the reported cwd with the resolved work directory.
     expect(seen.cwd).toBe(realpathSync(work));
     // The entry puts its own realpath's lib on sys.path, so this is resolved too.
     expect(seen.path0).toBe(join(realpathSync(base), "lib"));
@@ -161,6 +188,35 @@ describe("bob#356 — the installed Piper entry script", () => {
     },
     30_000,
   );
+
+  it("refuses a relative --model path without calling piper or changing cwd", () => {
+    const { base, entry, out, obs } = layout();
+    const r = runEntryInProcess(entry, ["--model", "voice.onnx", "--output_file", out], base, {
+      PIPER_OBS: obs,
+    });
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.stderr).toContain("must be absolute paths");
+    expect(existsSync(obs)).toBe(false);
+    const [before, after] = r.stdout.trim().split("\n");
+    expect(before).toBe(realpathSync(base));
+    expect(after).toBe(before);
+  }, 30_000);
+
+  it("refuses a relative --output_file path without calling piper or changing cwd", () => {
+    const { base, entry, obs } = layout();
+    const r = runEntryInProcess(
+      entry,
+      ["--model", join(base, "voice.onnx"), "--output_file", join("work", "speech.wav")],
+      base,
+      { PIPER_OBS: obs },
+    );
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.stderr).toContain("must be absolute paths");
+    expect(existsSync(obs)).toBe(false);
+    const [before, after] = r.stdout.trim().split("\n");
+    expect(before).toBe(realpathSync(base));
+    expect(after).toBe(before);
+  }, 30_000);
 });
 
 /** A stand-in for the entry as the sidecar runs it: it records the argv, cwd,

@@ -26,6 +26,9 @@ def main(argv):
         sys.stderr.write("usage: piper --model MODEL --output_file OUTPUT\n")
         return 2
     model, output = argv[1], argv[3]
+    if not os.path.isabs(model) or not os.path.isabs(output):
+        sys.stderr.write("piper: --model and --output_file must be absolute paths\n")
+        return 2
     directory = os.path.dirname(os.path.realpath(__file__))
     sys.path.insert(0, os.path.join(directory, "lib"))
     os.chdir(os.path.dirname(os.path.abspath(output)))
