@@ -20,7 +20,7 @@ Files in this directory:
 | `launch.py` | Fixed LaunchDaemon derivation and deployed-plist check. |
 | `piper-entry.py` | Installed as `$PIPER_DIR/piper`: runs piper-tts's CLI under the sidecar's interpreter (step 3). |
 | `piper-requirements.txt` | The pinned wheel set piper-tts is installed from, with a sha256 per wheel (step 3). |
-| `proof.py` | The installed command for release-host separate-user proofs (step 2). |
+| `proof.py` | The installed command for release-host separate-user proofs (steps 2–3). |
 | `egress-probe.py` | Confined via `proof.py`; the test runs its source directly as bob with `PY -I -c <source> <spec-json>` for the unconfined control. |
 | `RUNBOOK.md` | This file. |
 
@@ -99,7 +99,6 @@ $AGENT_USER ALL=(nobody) NOPASSWD: $PYTHON -I $INSTALL/proof.py connect *
 EOF
 sudo chmod 0440 /etc/sudoers.d/bob-reachy-voice-proofs
 sudo visudo -cf /etc/sudoers.d/bob-reachy-voice-proofs
-sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER $PYTHON -I $INSTALL/proof.py open /dev/null
 ```
 
 Add no `env_keep` for this rule: sudo's default `env_reset` is what keeps a
@@ -178,16 +177,31 @@ else:
 fi
 if [ "$PIPER_INSTALL" = ok ]; then
   sudo install -o root -g wheel -m 0644 \
-    $REPO/sidecar/reachy-voice/piper-entry.py $PIPER_DIR/piper
-  sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR
-  sudo cp <voice>.onnx $PIPER_DIR/voice.onnx
-  sudo cp <voice>.onnx.json $PIPER_DIR/voice.onnx.json
-  sudo chown root:wheel $PIPER_DIR/voice.onnx* && sudo chmod 0644 $PIPER_DIR/voice.onnx*
+    $REPO/sidecar/reachy-voice/piper-entry.py $PIPER_DIR/piper ||
+    PIPER_INSTALL=install-failed
+  if [ "$PIPER_INSTALL" = ok ]; then
+    sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR ||
+      PIPER_INSTALL=install-failed
+  fi
+  if [ "$PIPER_INSTALL" = ok ]; then
+    sudo cp <voice>.onnx $PIPER_DIR/voice.onnx || PIPER_INSTALL=voice-failed
+  fi
+  if [ "$PIPER_INSTALL" = ok ]; then
+    sudo cp <voice>.onnx.json $PIPER_DIR/voice.onnx.json || PIPER_INSTALL=voice-failed
+  fi
+  if [ "$PIPER_INSTALL" = ok ]; then
+    sudo chown root:wheel $PIPER_DIR/voice.onnx* && sudo chmod 0644 $PIPER_DIR/voice.onnx* ||
+      PIPER_INSTALL=voice-failed
+  fi
 fi
 if [ "$PIPER_INSTALL" = swap-dir-present ]; then
   echo "reachy-voice: $PIPER_DIR/lib.new or $PIPER_DIR/lib.old exists after the cleanup step; refusing to start the swap. Remove or inspect it and rerun this step." >&2
 elif [ "$PIPER_INSTALL" = restore-failed ]; then
   echo "reachy-voice: the swap failed and the previous $PIPER_DIR/lib could not be moved back from $PIPER_DIR/lib.old (PIPER_INSTALL=restore-failed). $PIPER_DIR/lib may be missing. Stop here: inspect both directories and move the good one to $PIPER_DIR/lib by hand before rerunning this step; the entry install did not run." >&2
+elif [ "$PIPER_INSTALL" = install-failed ]; then
+  echo "reachy-voice: installing the entry script or setting its ownership and permissions did not complete (PIPER_INSTALL=install-failed). Stop here and rerun this step." >&2
+elif [ "$PIPER_INSTALL" = voice-failed ]; then
+  echo "reachy-voice: installing the voice model did not complete (PIPER_INSTALL=voice-failed). Stop here and rerun this step." >&2
 elif [ "$PIPER_INSTALL" != ok ]; then
   echo "reachy-voice: the Piper install did not complete ($PIPER_INSTALL). Stop here and rerun this step; the entry install did not run." >&2
 fi
@@ -195,6 +209,12 @@ if [ "$PIPER_INSTALL" = ok ]; then
   shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
 fi
 [ "$PIPER_INSTALL" = ok ]
+```
+
+Step 2's rule admits the installed proof command; check that once:
+
+```sh
+sudo -u $AGENT_USER sudo -n -u $SIDECAR_USER $PYTHON -I $INSTALL/proof.py open /dev/null
 ```
 
 Record those hashes in the host's install log. The release check (step 8)
@@ -205,10 +225,12 @@ and root-owned, and that `$PIPER_DIR/piper` is byte-identical to
 parses every `<name>-<version>.dist-info`, requires its METADATA `Name` and
 `Version` to match the directory name and the pin in `piper-requirements.txt`,
 requires the pinned set and no other distribution, and compares each hashed
-`RECORD` entry that resolves inside `lib` with its file. A hashless `RECORD`
+`RECORD` entry inside `lib` whose real path resolves inside it with its file;
+an entry inside `lib` whose real path resolves outside it is refused, and so is
+a `RECORD` that resolves outside `lib` or has no line for its own path. A hashless `RECORD`
 line is accepted only for the distribution's own `RECORD` and for a `.pyc` under
 `__pycache__` that pip recompiled at install (its bytes can differ from the
-wheel's copy, so a path listed both ways is not compared). A file `RECORD` does
+wheel's copy, so the hashed line for that same path is not compared). A file `RECORD` does
 not list is not enumerated. `--piper-model-sha256`
 is the voice model's: the sidecar refuses to start when the model differs, and
 when `--work-dir` is not an absolute path.
