@@ -8,7 +8,9 @@
 // refuse what it must.
 import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -19,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import {
   ACL_UNCHECKED,
   pinnedPiperVersion,
@@ -32,6 +34,20 @@ import {
 const DARWIN = process.platform === "darwin";
 const ME = process.getuid?.() ?? -1;
 const INSTALLED = ["sidecar.py", "reachy-voice.sb", "proof.py", "egress-probe.py"];
+// The pinned wheel set, as piper-requirements.txt names it.
+const PINNED: Array<[string, string]> = [
+  ["piper-tts", "1.8.0"],
+  ["coloredlogs", "15.0.1"],
+  ["flatbuffers", "25.12.19"],
+  ["humanfriendly", "10.0"],
+  ["mpmath", "1.3.0"],
+  ["numpy", "2.0.2"],
+  ["onnxruntime", "1.19.2"],
+  ["packaging", "26.3"],
+  ["pathvalidate", "3.3.1"],
+  ["protobuf", "6.33.6"],
+  ["sympy", "1.14.0"],
+];
 const scratch: string[] = [];
 afterAll(() => {
   for (const d of scratch) {
@@ -43,6 +59,48 @@ afterAll(() => {
     rmSync(d, { recursive: true, force: true });
   }
 });
+
+/** One installed distribution, as `pip install --target` leaves it: the files,
+ *  a METADATA header, and a RECORD of sha256 hashes in base64url. pip writes
+ *  RECORD through Python's csv module, so its line ending is CRLF; `eol`
+ *  picks LF for the test that covers that ending. */
+function installDistribution(f: string, name: string, version: string, eol = "\r\n") {
+  const lib = join(f, "piper", "lib");
+  const module = name.replace(/-/g, "_");
+  const distInfo = `${module}-${version}.dist-info`;
+  for (const d of [join(lib, module), join(lib, distInfo)]) {
+    mkdirSync(d, { recursive: true, mode: 0o755 });
+    chmodSync(d, 0o755);
+  }
+  const files = new Map<string, string>([
+    [`${module}/__init__.py`, `# ${name} ${version}\n`],
+    [`${distInfo}/METADATA`, `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n`],
+    [`${distInfo}/WHEEL`, "Wheel-Version: 1.0\n"],
+  ]);
+  const record: string[] = [];
+  for (const [rel, body] of files) {
+    writeFileSync(join(lib, rel), body);
+    chmodSync(join(lib, rel), 0o644);
+    const digest = createHash("sha256").update(body).digest("base64url");
+    record.push(`${rel},sha256=${digest},${Buffer.byteLength(body)}`);
+  }
+  const recordPath = join(distInfo, "RECORD");
+  writeFileSync(join(lib, recordPath), `${record.join(eol)}${eol}${recordPath},,${eol}`);
+  chmodSync(join(lib, recordPath), 0o644);
+}
+
+/** The RECORD lines a `--target` install of the numpy 2.0.2 wheel leaves for
+ *  the .pyc pip recompiles: the wheel's hashed line and pip's hashless one.
+ *  `hashlessFirst` picks the order. The file on disk is the recompiled one. */
+function installRecompiledBytecode(f: string, hashlessFirst: boolean) {
+  const rel = "numpy/distutils/__pycache__/conv_template.cpython-39.pyc";
+  mkdirSync(join(f, "piper/lib", dirname(rel)), { recursive: true, mode: 0o755 });
+  writeFileSync(join(f, "piper/lib", rel), "recompiled bytecode\n");
+  const hashed = `${rel},sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y,8325`;
+  const hashless = `${rel},,`;
+  const lines = hashlessFirst ? [hashless, hashed] : [hashed, hashless];
+  appendFileSync(join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"), `${lines.join("\r\n")}\r\n`);
+}
 
 /** A clean release-host stand-in: every directory 0755, every file 0644/0755. */
 function fixture() {
@@ -64,12 +122,8 @@ function fixture() {
   for (const n of INSTALLED) file(join(f, "install", n));
   file(join(f, "piper/piper"), 0o755);
   file(join(f, "source/piper-entry.py"));
-  file(
-    join(f, "piper/lib/piper_tts-1.8.0.dist-info/METADATA"),
-    0o644,
-    "Metadata-Version: 2.1\nName: piper-tts\nVersion: 1.8.0\n",
-  );
   file(join(f, "state/agent-user"), 0o644, "bob\n");
+  for (const [name, version] of PINNED) installDistribution(f, name, version);
   // mkdir's mode is masked by umask: set every directory explicitly
   for (const d of [
     "usr",
@@ -86,7 +140,6 @@ function fixture() {
     "install",
     "piper",
     "piper/lib",
-    "piper/lib/piper_tts-1.8.0.dist-info",
     "source",
     "state",
   ]) {
@@ -455,6 +508,247 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
     expect(piperInstallProblems(args(f)).join("\n")).toContain(
       "the installed piper-tts 1.7.0 is not the pinned 1.8.0",
+    );
+  });
+
+  it("an installed file that differs from its RECORD hash is refused", () => {
+    const { f } = fixture();
+    writeFileSync(join(f, "piper/lib/piper_tts/__init__.py"), "tampered\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/piper_tts/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/piper_tts-1.8.0.dist-info/RECORD`,
+    );
+  });
+
+  it("a relative piper dir still reports a tampered hashed file", () => {
+    const { f } = fixture();
+    writeFileSync(join(f, "piper/lib/piper_tts/__init__.py"), "tampered\n");
+    const piperDir = relative(process.cwd(), join(f, "piper"));
+    expect(isAbsolute(piperDir)).toBe(false);
+    expect(piperInstallProblems({ ...args(f), piperDir }).join("\n")).toContain(
+      `${f}/piper/lib/piper_tts/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/piper_tts-1.8.0.dist-info/RECORD`,
+    );
+    const { f: clean } = fixture();
+    expect(
+      piperInstallProblems({
+        ...args(clean),
+        piperDir: relative(process.cwd(), join(clean, "piper")),
+      }),
+    ).toEqual([]);
+  });
+
+  it("a distribution outside the pinned set is refused", () => {
+    const { f } = fixture();
+    installDistribution(f, "six", "1.16.0");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib holds six 1.16.0, which is not pinned`,
+    );
+  });
+
+  it("bytecode pip recompiled at install is not hash-checked, whichever line comes first", () => {
+    for (const hashlessFirst of [true, false]) {
+      const { f } = fixture();
+      installRecompiledBytecode(f, hashlessFirst);
+      expect(piperInstallProblems(args(f))).toEqual([]);
+    }
+  });
+
+  it("an installed file listed only with a hash is still checked", () => {
+    const { f } = fixture();
+    const rel = "numpy/distutils/conv_template.py";
+    mkdirSync(join(f, "piper/lib", dirname(rel)), { recursive: true, mode: 0o755 });
+    writeFileSync(join(f, "piper/lib", rel), "tampered\n");
+    appendFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"),
+      `${rel},sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y,8325\n`,
+    );
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/${rel} does not match the hash in ` +
+        `${f}/piper/lib/numpy-2.0.2.dist-info/RECORD`,
+    );
+  });
+
+  it("a mismatched source file beside recompiled bytecode is still refused", () => {
+    const { f } = fixture();
+    installRecompiledBytecode(f, true);
+    writeFileSync(join(f, "piper/lib/numpy/__init__.py"), "tampered\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/numpy/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/numpy-2.0.2.dist-info/RECORD`,
+    );
+  });
+
+  it("a hashless line does not exempt a source file from its hashed line", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    writeFileSync(join(f, "piper/lib/numpy/__init__.py"), "tampered\n");
+    appendFileSync(record, "numpy/__init__.py,,\n");
+    const problems = piperInstallProblems(args(f)).join("\n");
+    expect(problems).toContain(
+      `${f}/piper/lib/numpy/__init__.py is listed in ${record} without a hash`,
+    );
+    expect(problems).toContain(
+      `${f}/piper/lib/numpy/__init__.py does not match the hash in ${record}`,
+    );
+  });
+
+  it("a hashless .pyc outside __pycache__ is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/conv_template.cpython-39.pyc";
+    writeFileSync(join(f, "piper/lib", rel), "bytecode\n");
+    appendFileSync(record, `${rel},,\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/${rel} is listed in ${record} without a hash`,
+    );
+  });
+
+  it("an empty RECORD is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    writeFileSync(record, "");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(`${record} is empty`);
+  });
+
+  it("a RECORD line that is not path,hash,size is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "numpy/extra.py,sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a line that is not path,hash,size`,
+    );
+  });
+
+  it("a RECORD line whose quoting does not close is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/__init__.py";
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    appendFileSync(record, `${rel},sha256=${digest},"8\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a field whose quoting does not close`,
+    );
+  });
+
+  it("a RECORD line with a non-empty size that is not a decimal integer is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/__init__.py";
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    appendFileSync(record, `${rel},sha256=${digest},not-a-size\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a size that is not a decimal integer`,
+    );
+  });
+
+  it("a CRLF RECORD, as pip writes it, is accepted line for line", () => {
+    const { f } = fixture();
+    const lib = join(f, "piper/lib");
+    const record = join(lib, "numpy-2.0.2.dist-info/RECORD");
+    const hashed: Array<[string, string]> = [
+      ["numpy/__init__.py", "# numpy 2.0.2\n"],
+      ["numpy/core.py", "# core\n"],
+      ["numpy/version.py", "__version__ = '2.0.2'\n"],
+    ];
+    const lines: string[] = [];
+    for (const [rel, body] of hashed) {
+      writeFileSync(join(lib, rel), body);
+      const digest = createHash("sha256").update(body).digest("base64url");
+      lines.push(`${rel},sha256=${digest},${Buffer.byteLength(body)}`);
+    }
+    const pyc = "numpy/__pycache__/core.cpython-39.pyc";
+    mkdirSync(join(lib, dirname(pyc)), { recursive: true, mode: 0o755 });
+    writeFileSync(join(lib, pyc), "recompiled\n");
+    lines.push(`${pyc},,`, "numpy-2.0.2.dist-info/RECORD,,");
+    writeFileSync(record, `${lines.join("\r\n")}\r\n`);
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
+  it("a carriage return inside a size is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    writeFileSync(record, `numpy/__init__.py,sha256=${digest},12\r3\r\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a stray carriage return after the final CRLF is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "\r");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a stray carriage return on a whitespace-only line is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "\r\t\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a plain CRLF RECORD with a trailing CRLF is accepted", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const body = "# numpy 2.0.2\n";
+    const digest = createHash("sha256").update(body).digest("base64url");
+    writeFileSync(
+      record,
+      `numpy/__init__.py,sha256=${digest},${Buffer.byteLength(body)}\r\n` +
+        "numpy-2.0.2.dist-info/RECORD,,\r\n",
+    );
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
+  it("a RECORD written with LF line endings is accepted", () => {
+    const { f } = fixture();
+    installDistribution(f, "numpy", "2.0.2", "\n");
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
+  it("a quoted path that contains a comma is accepted", () => {
+    const { f } = fixture();
+    const rel = "numpy/quoted,path.py";
+    const body = "quoted\n";
+    writeFileSync(join(f, "piper/lib", rel), body);
+    const digest = createHash("sha256").update(body).digest("base64url");
+    appendFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"),
+      `"${rel}",sha256=${digest},${Buffer.byteLength(body)}\n`,
+    );
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
+  it("a dist-info whose METADATA names another distribution is refused", () => {
+    const { f } = fixture();
+    writeFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/METADATA"),
+      "Name: six\nVersion: 2.0.2\n",
+    );
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib/numpy-2.0.2.dist-info/METADATA names six, not numpy-2.0.2.dist-info`,
+    );
+  });
+
+  it("an unversioned dist-info is refused", () => {
+    const { f } = fixture();
+    mkdirSync(join(f, "piper/lib/extra.dist-info"), { mode: 0o755 });
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib holds extra.dist-info, which is not <name>-<version>.dist-info`,
+    );
+  });
+
+  it("a pinned distribution that is missing is refused", () => {
+    const { f } = fixture();
+    rmSync(join(f, "piper/lib/numpy-2.0.2.dist-info"), { recursive: true, force: true });
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${f}/piper/lib does not hold the pinned numpy 2.0.2`,
     );
   });
 

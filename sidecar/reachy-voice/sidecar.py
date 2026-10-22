@@ -356,6 +356,8 @@ def main(argv=None):
 
     if not SHA256.match(opts.piper_model_sha256):
         raise SystemExit("reachy-voice: --piper-model-sha256 must be 64 lowercase hex characters")
+    if not os.path.isabs(opts.work_dir):
+        raise SystemExit("reachy-voice: --work-dir must be an absolute path")
     if not (os.path.isfile(opts.piper) and os.access(opts.piper, os.R_OK)):
         raise SystemExit("reachy-voice: --piper must be a readable file")
     if not (os.path.isfile(opts.player) and os.access(opts.player, os.X_OK)):

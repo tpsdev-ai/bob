@@ -32,6 +32,7 @@
 // on Linux, where the seatbelt proofs cannot exist).
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -44,7 +45,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
@@ -396,10 +397,153 @@ export function pinnedPiperVersion(requirements = PIPER_REQUIREMENTS) {
   return undefined;
 }
 
+/** The pinned distributions from the requirements file: PEP 503 name -> version. */
+export function pinnedPiperDistributions(requirements = PIPER_REQUIREMENTS) {
+  let text;
+  try {
+    text = readFileSync(requirements, "utf8");
+  } catch {
+    return undefined;
+  }
+  const pins = new Map();
+  for (const line of text.split("\n")) {
+    const m = /^([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][^\s\\;]*)/.exec(line.trim());
+    if (m) pins.set(normalizeDistributionName(m[1]), m[2]);
+  }
+  return pins;
+}
+
+function normalizeDistributionName(name) {
+  return name.toLowerCase().replace(/[-_.]+/g, "-");
+}
+
+/**
+ * One RECORD line's fields — path, hash and size, with double quotes honoured —
+ * and whether every quoted field closed.
+ */
+function recordFields(line) {
+  const fields = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch !== '"') field += ch;
+      else if (line[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      fields.push(field);
+      field = "";
+    } else field += ch;
+  }
+  fields.push(field);
+  return { fields, closed: !quoted };
+}
+
+/**
+ * A distribution's RECORD hashes against the files on disk, as
+ * `pip install --target` leaves them: paths relative to the target, sha256 in
+ * base64url. Every hashed line whose path resolves inside `lib` is compared;
+ * a file RECORD does not list is not enumerated. Two hashless lines are
+ * accepted: the distribution's own RECORD, and a `.pyc` under `__pycache__`
+ * that pip recompiled at install (its bytes can differ from the wheel's copy,
+ * so a path listed both ways is not hash-compared). Any other hashless line is
+ * a problem, as is an empty RECORD, a line that does not hold path, hash and
+ * size as three fields, a field whose quoting does not close, or a non-empty size
+ * that is not a decimal integer. pip writes RECORD through Python's csv module,
+ * whose line terminator is CRLF: a line ends in CRLF or LF, and a carriage return
+ * anywhere else makes the line malformed.
+ */
+function recordProblems(lib, distInfo) {
+  const record = join(lib, distInfo, "RECORD");
+  let body;
+  try {
+    body = readFileSync(record, "utf8");
+  } catch {
+    return [`${record} cannot be read`];
+  }
+  const problems = [];
+  const lines = [];
+  for (const line of body.split(/\r\n|\n/)) {
+    // Split has consumed a CRLF terminator, so a CR left in the line is not
+    // one: check it before dropping whitespace-only lines.
+    if (line.includes("\r")) {
+      problems.push(`${record} holds a carriage return that is not a line ending`);
+      continue;
+    }
+    if (line.trim()) lines.push(line);
+  }
+  if (lines.length === 0 && problems.length === 0) return [`${record} is empty`];
+  const entries = [];
+  for (const line of lines) {
+    const { fields, closed } = recordFields(line);
+    if (!closed) {
+      problems.push(`${record} holds a field whose quoting does not close`);
+      continue;
+    }
+    if (fields.length !== 3) {
+      problems.push(`${record} holds a line that is not path,hash,size`);
+      continue;
+    }
+    const [rel, hash, size] = fields;
+    if (size !== "" && !/^\d+$/.test(size)) {
+      problems.push(`${record} holds a size that is not a decimal integer`);
+      continue;
+    }
+    const p = resolve(lib, rel);
+    // A `--target` install records its console script as ../../bin/<name>,
+    // outside the lib: that script is not part of the tree checked here.
+    const inside = p === lib || p.startsWith(lib + sep);
+    if (hash) {
+      entries.push({ hash, inside, p });
+      continue;
+    }
+    if (p === record) continue;
+    if (p.endsWith(".pyc") && p.includes(`${sep}__pycache__${sep}`)) {
+      entries.push({ hash, inside, p });
+      continue;
+    }
+    problems.push(`${p} is listed in ${record} without a hash`);
+  }
+  // An accepted hashless bytecode entry — a `__pycache__/*.pyc` — suppresses
+  // the hash comparison for that path: pip appends such a line for the bytecode
+  // it compiled at install.
+  const generated = new Set();
+  for (const { hash, p } of entries) if (!hash) generated.add(p);
+  for (const { hash, inside, p } of entries) {
+    if (!hash || !inside || generated.has(p)) continue;
+    const m = /^sha256=(.+)$/.exec(hash);
+    if (!m) {
+      problems.push(`${p} has an unsupported RECORD hash`);
+      continue;
+    }
+    let file;
+    try {
+      file = readFileSync(p);
+    } catch {
+      problems.push(`${p} cannot be read`);
+      continue;
+    }
+    if (createHash("sha256").update(file).digest("base64url") !== m[1]) {
+      problems.push(`${p} does not match the hash in ${record}`);
+    }
+  }
+  return problems;
+}
+
 /**
  * [P7] The installed Piper: `$PIPER_DIR/piper` is byte-identical to the
- * reviewed entry script and root-owned, and the piper-tts distribution under
- * `$PIPER_DIR/lib` reports the pinned version. `owners` is a seam for tests.
+ * reviewed entry script and root-owned. Every `<name>-<version>.dist-info`
+ * under `$PIPER_DIR/lib` is parsed, its METADATA Name and Version are held to
+ * the directory name (PEP 503 normalization), the set is held to the pins in
+ * piper-requirements.txt in both directions, and each hashed RECORD entry that
+ * resolves inside `lib` is compared with the file, except a `.pyc` under
+ * `__pycache__` that also has an accepted hashless row — a path listed there
+ * without a hash is accepted only for the distribution's own RECORD or for that
+ * bytecode. `owners` is a seam for tests.
  */
 export function piperInstallProblems({
   piperDir = "/usr/local/libexec/bob/piper",
@@ -407,9 +551,13 @@ export function piperInstallProblems({
   requirements = PIPER_REQUIREMENTS,
   owners = [0],
 } = {}) {
+  // Resolve once: a relative piperDir would leave `lib` relative while every
+  // RECORD path resolves absolute, so the inside-lib test would exclude every
+  // hashed entry and no file would be compared.
+  const root = resolve(piperDir);
   const allowed = new Set(owners);
   const problems = [];
-  const entry = join(piperDir, "piper");
+  const entry = join(root, "piper");
   let installed;
   let reviewed;
   try {
@@ -436,33 +584,68 @@ export function piperInstallProblems({
     if (!st.isFile()) problems.push(`${entry} is not a regular file`);
   }
   const want = pinnedPiperVersion(requirements);
-  if (!want) problems.push(`the pinned piper-tts version cannot be read from ${requirements}`);
-  const lib = join(piperDir, "lib");
+  const lib = join(root, "lib");
   let names;
   try {
     names = readdirSync(lib);
   } catch {
     problems.push(`${lib} cannot be listed`);
   }
-  const dists = (names ?? []).filter((n) => /^piper_tts-.+\.dist-info$/.test(n));
-  if (dists.length !== 1) {
-    problems.push(`${lib} holds ${dists.length} piper-tts distributions, not one`);
+  const pins = pinnedPiperDistributions(requirements);
+  if (!pins) {
+    problems.push(`the pinned distributions cannot be read from ${requirements}`);
   }
-  for (const dist of dists) {
-    const metadata = join(lib, dist, "METADATA");
-    let body;
-    try {
-      body = readFileSync(metadata, "utf8");
-    } catch {
-      problems.push(`${metadata} cannot be read`);
-      continue;
+  if (names) {
+    const installedDists = new Map();
+    for (const name of names) {
+      if (!name.endsWith(".dist-info")) continue;
+      const m = /^(.+)-([^-]+)\.dist-info$/.exec(name);
+      if (!m) {
+        problems.push(`${lib} holds ${name}, which is not <name>-<version>.dist-info`);
+        continue;
+      }
+      const key = normalizeDistributionName(m[1]);
+      if (installedDists.has(key)) {
+        problems.push(`${lib} holds more than one ${key} distribution`);
+        continue;
+      }
+      installedDists.set(key, { dir: name, version: m[2] });
     }
-    const version = /^Version:\s*(\S+)\s*$/m.exec(body)?.[1];
-    if (version !== want) {
-      problems.push(
-        `the installed piper-tts ${version ?? "has no version"} is not the pinned ${want}`,
-      );
+    for (const [key, { dir, version }] of installedDists) {
+      const metadata = join(lib, dir, "METADATA");
+      let body;
+      try {
+        body = readFileSync(metadata, "utf8");
+      } catch {
+        problems.push(`${metadata} cannot be read`);
+        continue;
+      }
+      const name = /^Name:\s*(\S+)\s*$/m.exec(body)?.[1];
+      const found = /^Version:\s*(\S+)\s*$/m.exec(body)?.[1];
+      if (name === undefined) problems.push(`${metadata} has no Name`);
+      else if (normalizeDistributionName(name) !== key)
+        problems.push(`${metadata} names ${name}, not ${dir}`);
+      if (found === undefined) problems.push(`${metadata} has no Version`);
+      else if (found !== version)
+        problems.push(`${metadata} reports version ${found}, not ${version}`);
+      if (key === "piper-tts" && found !== undefined && want && found !== want) {
+        problems.push(`the installed piper-tts ${found} is not the pinned ${want}`);
+      }
+      if (!pins) continue;
+      const pinnedVersion = pins.get(key);
+      if (pinnedVersion === undefined) {
+        problems.push(`${lib} holds ${key} ${version}, which is not pinned`);
+      } else if (pinnedVersion !== version) {
+        problems.push(`${lib} holds ${key} ${version}, not the pinned ${pinnedVersion}`);
+      }
     }
+    if (pins) {
+      for (const [key, version] of pins) {
+        if (!installedDists.has(key))
+          problems.push(`${lib} does not hold the pinned ${key} ${version}`);
+      }
+    }
+    for (const { dir } of installedDists.values()) problems.push(...recordProblems(lib, dir));
   }
   return problems;
 }

@@ -9,10 +9,12 @@ interpreter, with the text to speak on stdin, as
 
 It accepts exactly that argv shape, with absolute paths in both values. It puts
 the piper-tts install in <this file's real directory>/lib first on sys.path,
-changes to the output file's directory (piper's CLI reads Path.cwd() at startup,
-and the seatbelt profile lets it read the work directory), and calls piper-tts's
-CLI with -m MODEL -f OUTPUT. Its exit status is Piper's, or 2 when it refuses
-the arguments.
+changes to the output file's directory (piper-tts 1.8.0 reads Path.cwd() in
+main(), and the seatbelt profile lets it read the work directory), and calls
+piper-tts's CLI with -m MODEL -f OUTPUT. piper-tts 1.8.0's main() returns on
+success and raises on failure, so the status is 0 or non-zero rather than a code
+Piper chooses: 2, this script's own refusal, is the only non-zero status it
+sets.
 
 This file is GPL-3.0-or-later because it imports piper-tts. bob's npm package
 does not include sidecar/, so it does not ship in the package.

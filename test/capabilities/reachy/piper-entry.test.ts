@@ -47,6 +47,10 @@ function python(): string {
 const STUB = `
 import json, os, stat, sys
 
+# Recorded at import, before main() runs: the entry must have changed directory
+# before importing piper.
+IMPORT_CWD = os.getcwd()
+
 def main():
     args = sys.argv[1:]
     out = args[args.index("-f") + 1]
@@ -63,6 +67,7 @@ def main():
         json.dump({
             "argv": args,
             "cwd": os.getcwd(),
+            "import_cwd": IMPORT_CWD,
             "isolated": sys.flags.isolated,
             "executable": os.path.realpath(sys.executable),
             "path0": sys.path[0],
@@ -152,6 +157,8 @@ describe("bob#356 — the installed Piper entry script", () => {
     expect(seen.argv).toEqual(["-m", model, "-f", out]);
     // Compare the reported cwd with the resolved work directory.
     expect(seen.cwd).toBe(realpathSync(work));
+    // Recorded when the stub was imported, so the chdir precedes the import.
+    expect(seen.import_cwd).toBe(realpathSync(work));
     // The entry puts its own realpath's lib on sys.path, so this is resolved too.
     expect(seen.path0).toBe(join(realpathSync(base), "lib"));
     expect(seen.isolated).toBe(1);
@@ -185,6 +192,32 @@ describe("bob#356 — the installed Piper entry script", () => {
       expect(r.status).not.toBe(0);
       expect(existsSync(obs)).toBe(false);
       expect(r.stderr).toContain("usage: piper --model MODEL --output_file OUTPUT");
+    },
+    30_000,
+  );
+
+  it.each([
+    ["an abbreviated flag", (m: string, o: string) => ["--mod", m, "--output_file", o]],
+    ["the = form", (m: string, o: string) => [`--model=${m}`, "--output_file", o]],
+    [
+      "an extra trailing argument",
+      (m: string, o: string) => ["--model", m, "--output_file", o, "extra"],
+    ],
+    ["reversed flags", (m: string, o: string) => ["--output_file", o, "--model", m]],
+    ["a duplicated flag", (m: string, o: string) => ["--model", m, "--model", m]],
+    ["a missing value", (m: string, o: string) => ["--model", m, "--output_file"]],
+  ])(
+    "refuses %s: exit 2, no piper call, cwd unchanged",
+    (_, argv) => {
+      const { base, entry, out, obs } = layout();
+      const r = runEntryInProcess(entry, argv(join(base, "voice.onnx"), out), base, {
+        PIPER_OBS: obs,
+      });
+      expect(r.status, r.stderr).toBe(2);
+      expect(existsSync(obs)).toBe(false);
+      const [before, after] = r.stdout.trim().split("\n");
+      expect(before).toBe(realpathSync(base));
+      expect(after).toBe(before);
     },
     30_000,
   );
