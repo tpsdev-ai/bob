@@ -452,9 +452,9 @@ function recordFields(line) {
  * that pip recompiled at install (its bytes can differ from the wheel's copy,
  * so a path listed both ways is not hash-compared). Any other hashless line is
  * a problem, as is an empty RECORD, a line that does not hold path, hash and
- * size as three fields, a field whose quoting does not close, or a size that is
- * not a decimal integer. pip writes RECORD through Python's csv module, whose
- * line terminator is CRLF: a line ends in CRLF or LF, and a carriage return
+ * size as three fields, a field whose quoting does not close, or a non-empty size
+ * that is not a decimal integer. pip writes RECORD through Python's csv module,
+ * whose line terminator is CRLF: a line ends in CRLF or LF, and a carriage return
  * anywhere else makes the line malformed.
  */
 function recordProblems(lib, distInfo) {
@@ -465,15 +465,20 @@ function recordProblems(lib, distInfo) {
   } catch {
     return [`${record} cannot be read`];
   }
-  const lines = body.split(/\r\n|\n/).filter((line) => line.trim());
-  if (lines.length === 0) return [`${record} is empty`];
   const problems = [];
-  const entries = [];
-  for (const line of lines) {
+  const lines = [];
+  for (const line of body.split(/\r\n|\n/)) {
+    // Split has consumed a CRLF terminator, so a CR left in the line is not
+    // one: check it before dropping whitespace-only lines.
     if (line.includes("\r")) {
       problems.push(`${record} holds a carriage return that is not a line ending`);
       continue;
     }
+    if (line.trim()) lines.push(line);
+  }
+  if (lines.length === 0 && problems.length === 0) return [`${record} is empty`];
+  const entries = [];
+  for (const line of lines) {
     const { fields, closed } = recordFields(line);
     if (!closed) {
       problems.push(`${record} holds a field whose quoting does not close`);

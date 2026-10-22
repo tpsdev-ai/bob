@@ -613,7 +613,7 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
   });
 
-  it("a RECORD size that is not a decimal integer is refused", () => {
+  it("a RECORD line with a non-empty size that is not a decimal integer is refused", () => {
     const { f } = fixture();
     const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
     const rel = "numpy/__init__.py";
@@ -655,6 +655,37 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     expect(piperInstallProblems(args(f)).join("\n")).toContain(
       `${record} holds a carriage return that is not a line ending`,
     );
+  });
+
+  it("a stray carriage return after the final CRLF is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "\r");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a stray carriage return on a whitespace-only line is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    appendFileSync(record, "\r\t\n");
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a plain CRLF RECORD with a trailing CRLF is accepted", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const body = "# numpy 2.0.2\n";
+    const digest = createHash("sha256").update(body).digest("base64url");
+    writeFileSync(
+      record,
+      `numpy/__init__.py,sha256=${digest},${Buffer.byteLength(body)}\r\n` +
+        "numpy-2.0.2.dist-info/RECORD,,\r\n",
+    );
+    expect(piperInstallProblems(args(f))).toEqual([]);
   });
 
   it("a RECORD written with LF line endings is accepted", () => {
