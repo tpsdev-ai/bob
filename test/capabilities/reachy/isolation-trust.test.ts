@@ -549,6 +549,31 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
   });
 
+  it("the distribution's own RECORD line is refused when its real path resolves outside lib", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const outside = join(f, "outside-RECORD");
+    renameSync(record, outside);
+    symlinkSync(outside, record);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} resolves outside ${f}/piper/lib`,
+    );
+  });
+
+  it("a hashless bytecode line exempts only its own path from the hash comparison", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const source = join(f, "piper/lib/numpy/__init__.py");
+    writeFileSync(source, "tampered\n");
+    const rel = "numpy/__pycache__/__init__.cpython-39.pyc";
+    mkdirSync(join(f, "piper/lib", dirname(rel)), { recursive: true, mode: 0o755 });
+    symlinkSync(source, join(f, "piper/lib", rel));
+    appendFileSync(record, `${rel},,\r\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${source} does not match the hash in ${record}`,
+    );
+  });
+
   it("a RECORD entry whose path resolves inside lib still passes", () => {
     const { f } = fixture();
     const rel = "numpy/extra.py";
