@@ -600,6 +600,41 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
   });
 
+  it("a RECORD line whose quoting does not close is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/__init__.py";
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    appendFileSync(record, `${rel},sha256=${digest},"8\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a field whose quoting does not close`,
+    );
+  });
+
+  it("a RECORD size that is not a decimal integer is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const rel = "numpy/__init__.py";
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    appendFileSync(record, `${rel},sha256=${digest},not-a-size\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a size that is not a decimal integer`,
+    );
+  });
+
+  it("a quoted path that contains a comma is accepted", () => {
+    const { f } = fixture();
+    const rel = "numpy/quoted,path.py";
+    const body = "quoted\n";
+    writeFileSync(join(f, "piper/lib", rel), body);
+    const digest = createHash("sha256").update(body).digest("base64url");
+    appendFileSync(
+      join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"),
+      `"${rel}",sha256=${digest},${Buffer.byteLength(body)}\n`,
+    );
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
   it("a dist-info whose METADATA names another distribution is refused", () => {
     const { f } = fixture();
     writeFileSync(

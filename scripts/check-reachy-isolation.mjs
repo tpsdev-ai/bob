@@ -417,7 +417,10 @@ function normalizeDistributionName(name) {
   return name.toLowerCase().replace(/[-_.]+/g, "-");
 }
 
-/** One RECORD line's fields: path, hash and size, with double quotes honoured. */
+/**
+ * One RECORD line's fields — path, hash and size, with double quotes honoured —
+ * and whether every quoted field closed.
+ */
 function recordFields(line) {
   const fields = [];
   let field = "";
@@ -437,7 +440,7 @@ function recordFields(line) {
     } else field += ch;
   }
   fields.push(field);
-  return fields;
+  return { fields, closed: !quoted };
 }
 
 /**
@@ -448,8 +451,9 @@ function recordFields(line) {
  * accepted: the distribution's own RECORD, and a `.pyc` under `__pycache__`
  * that pip recompiled at install (its bytes can differ from the wheel's copy,
  * so a path listed both ways is not hash-compared). Any other hashless line is
- * a problem, as is an empty RECORD or a line that does not hold path, hash and
- * size.
+ * a problem, as is an empty RECORD, a line that does not hold path, hash and
+ * size as three fields, a field whose quoting does not close, or a size that is
+ * not a decimal integer.
  */
 function recordProblems(lib, distInfo) {
   const record = join(lib, distInfo, "RECORD");
@@ -466,12 +470,20 @@ function recordProblems(lib, distInfo) {
   if (lines.length === 0) return [`${record} is empty`];
   const problems = [];
   const entries = [];
-  for (const fields of lines) {
+  for (const { fields, closed } of lines) {
+    if (!closed) {
+      problems.push(`${record} holds a field whose quoting does not close`);
+      continue;
+    }
     if (fields.length !== 3) {
       problems.push(`${record} holds a line that is not path,hash,size`);
       continue;
     }
-    const [rel, hash] = fields;
+    const [rel, hash, size] = fields;
+    if (size !== "" && !/^\d+$/.test(size)) {
+      problems.push(`${record} holds a size that is not a decimal integer`);
+      continue;
+    }
     const p = resolve(lib, rel);
     // A `--target` install records its console script as ../../bin/<name>,
     // outside the lib: that script is not part of the tree checked here.
@@ -487,8 +499,9 @@ function recordProblems(lib, distInfo) {
     }
     problems.push(`${p} is listed in ${record} without a hash`);
   }
-  // A path some RECORD line lists without a hash is skipped in full: pip
-  // appends such a line for the bytecode it compiled at install.
+  // An accepted hashless bytecode entry — a `__pycache__/*.pyc` — suppresses
+  // the hash comparison for that path: pip appends such a line for the bytecode
+  // it compiled at install.
   const generated = new Set();
   for (const { hash, p } of entries) if (!hash) generated.add(p);
   for (const { hash, inside, p } of entries) {
@@ -518,9 +531,10 @@ function recordProblems(lib, distInfo) {
  * under `$PIPER_DIR/lib` is parsed, its METADATA Name and Version are held to
  * the directory name (PEP 503 normalization), the set is held to the pins in
  * piper-requirements.txt in both directions, and each hashed RECORD entry that
- * resolves inside `lib` is compared with the file — a path listed there without
- * a hash is accepted only for the distribution's own RECORD or for bytecode
- * under `__pycache__`. `owners` is a seam for tests.
+ * resolves inside `lib` is compared with the file, except a `.pyc` under
+ * `__pycache__` that also has an accepted hashless row — a path listed there
+ * without a hash is accepted only for the distribution's own RECORD or for that
+ * bytecode. `owners` is a seam for tests.
  */
 export function piperInstallProblems({
   piperDir = "/usr/local/libexec/bob/piper",

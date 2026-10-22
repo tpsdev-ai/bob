@@ -160,7 +160,8 @@ else:
   elif [ "$PIPER_LIB_STATE" != absent ]; then
     PIPER_INSTALL=inspect-failed
   fi
-  # os.rename(2) refuses an occupied target instead of nesting a directory.
+  # os.rename(2) refuses a non-empty destination directory (an empty one can be
+  # replaced) and never nests the source inside the destination.
   if [ "$PIPER_INSTALL" = ok ] && ! sudo /usr/bin/python3 -I -c 'import os,sys; os.rename(sys.argv[1], sys.argv[2])' \
     "$PIPER_DIR/lib.new" "$PIPER_DIR/lib"; then
     PIPER_INSTALL=swap-failed
