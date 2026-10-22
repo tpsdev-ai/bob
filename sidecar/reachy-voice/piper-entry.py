@@ -7,11 +7,12 @@ interpreter, with the text to speak on stdin, as
 
     python3 -I <this file> --model MODEL --output_file OUTPUT
 
-It accepts exactly that argv shape. It puts the piper-tts install in
-<this file's real directory>/lib first on sys.path, changes to the output
-file's directory (piper's CLI reads Path.cwd() at startup, and the seatbelt
-profile lets it read the work directory), and calls piper-tts's CLI with
--m MODEL -f OUTPUT. Its exit status is Piper's.
+It accepts exactly that argv shape, with absolute paths in both values. It puts
+the piper-tts install in <this file's real directory>/lib first on sys.path,
+changes to the output file's directory (piper's CLI reads Path.cwd() at startup,
+and the seatbelt profile lets it read the work directory), and calls piper-tts's
+CLI with -m MODEL -f OUTPUT. Its exit status is Piper's, or 2 when it refuses
+the arguments.
 
 This file is GPL-3.0-or-later because it imports piper-tts. bob's npm package
 does not include sidecar/, so it does not ship in the package.
