@@ -61,8 +61,10 @@ afterAll(() => {
 });
 
 /** One installed distribution, as `pip install --target` leaves it: the files,
- *  a METADATA header, and a RECORD of sha256 hashes in base64url. */
-function installDistribution(f: string, name: string, version: string) {
+ *  a METADATA header, and a RECORD of sha256 hashes in base64url. pip writes
+ *  RECORD through Python's csv module, so its line ending is CRLF; `eol`
+ *  picks LF for the test that covers that ending. */
+function installDistribution(f: string, name: string, version: string, eol = "\r\n") {
   const lib = join(f, "piper", "lib");
   const module = name.replace(/-/g, "_");
   const distInfo = `${module}-${version}.dist-info`;
@@ -83,7 +85,7 @@ function installDistribution(f: string, name: string, version: string) {
     record.push(`${rel},sha256=${digest},${Buffer.byteLength(body)}`);
   }
   const recordPath = join(distInfo, "RECORD");
-  writeFileSync(join(lib, recordPath), `${record.join("\n")}\n${recordPath},,\n`);
+  writeFileSync(join(lib, recordPath), `${record.join(eol)}${eol}${recordPath},,${eol}`);
   chmodSync(join(lib, recordPath), 0o644);
 }
 
@@ -97,7 +99,7 @@ function installRecompiledBytecode(f: string, hashlessFirst: boolean) {
   const hashed = `${rel},sha256=Fg-ISft5iXtE3zLEg8La579iR6l-Vm_Uq8EEjqbWm8Y,8325`;
   const hashless = `${rel},,`;
   const lines = hashlessFirst ? [hashless, hashed] : [hashed, hashless];
-  appendFileSync(join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"), `${lines.join("\n")}\n`);
+  appendFileSync(join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD"), `${lines.join("\r\n")}\r\n`);
 }
 
 /** A clean release-host stand-in: every directory 0755, every file 0644/0755. */
@@ -620,6 +622,45 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     expect(piperInstallProblems(args(f)).join("\n")).toContain(
       `${record} holds a size that is not a decimal integer`,
     );
+  });
+
+  it("a CRLF RECORD, as pip writes it, is accepted line for line", () => {
+    const { f } = fixture();
+    const lib = join(f, "piper/lib");
+    const record = join(lib, "numpy-2.0.2.dist-info/RECORD");
+    const hashed: Array<[string, string]> = [
+      ["numpy/__init__.py", "# numpy 2.0.2\n"],
+      ["numpy/core.py", "# core\n"],
+      ["numpy/version.py", "__version__ = '2.0.2'\n"],
+    ];
+    const lines: string[] = [];
+    for (const [rel, body] of hashed) {
+      writeFileSync(join(lib, rel), body);
+      const digest = createHash("sha256").update(body).digest("base64url");
+      lines.push(`${rel},sha256=${digest},${Buffer.byteLength(body)}`);
+    }
+    const pyc = "numpy/__pycache__/core.cpython-39.pyc";
+    mkdirSync(join(lib, dirname(pyc)), { recursive: true, mode: 0o755 });
+    writeFileSync(join(lib, pyc), "recompiled\n");
+    lines.push(`${pyc},,`, "numpy-2.0.2.dist-info/RECORD,,");
+    writeFileSync(record, `${lines.join("\r\n")}\r\n`);
+    expect(piperInstallProblems(args(f))).toEqual([]);
+  });
+
+  it("a carriage return inside a size is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const digest = createHash("sha256").update("# numpy 2.0.2\n").digest("base64url");
+    writeFileSync(record, `numpy/__init__.py,sha256=${digest},12\r3\r\n`);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} holds a carriage return that is not a line ending`,
+    );
+  });
+
+  it("a RECORD written with LF line endings is accepted", () => {
+    const { f } = fixture();
+    installDistribution(f, "numpy", "2.0.2", "\n");
+    expect(piperInstallProblems(args(f))).toEqual([]);
   });
 
   it("a quoted path that contains a comma is accepted", () => {

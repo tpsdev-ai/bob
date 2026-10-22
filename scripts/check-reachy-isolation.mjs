@@ -453,7 +453,9 @@ function recordFields(line) {
  * so a path listed both ways is not hash-compared). Any other hashless line is
  * a problem, as is an empty RECORD, a line that does not hold path, hash and
  * size as three fields, a field whose quoting does not close, or a size that is
- * not a decimal integer.
+ * not a decimal integer. pip writes RECORD through Python's csv module, whose
+ * line terminator is CRLF: one trailing carriage return on a line is its
+ * ending, and a carriage return anywhere else makes the line malformed.
  */
 function recordProblems(lib, distInfo) {
   const record = join(lib, distInfo, "RECORD");
@@ -465,12 +467,17 @@ function recordProblems(lib, distInfo) {
   }
   const lines = body
     .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => recordFields(line));
+    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
+    .filter((line) => line.trim());
   if (lines.length === 0) return [`${record} is empty`];
   const problems = [];
   const entries = [];
-  for (const { fields, closed } of lines) {
+  for (const line of lines) {
+    if (line.includes("\r")) {
+      problems.push(`${record} holds a carriage return that is not a line ending`);
+      continue;
+    }
+    const { fields, closed } = recordFields(line);
     if (!closed) {
       problems.push(`${record} holds a field whose quoting does not close`);
       continue;
