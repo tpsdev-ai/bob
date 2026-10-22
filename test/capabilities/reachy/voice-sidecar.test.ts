@@ -64,13 +64,15 @@ function install() {
   scratch.push(base);
   const tts = join(base, "tts");
   mkdirSync(tts, { mode: 0o755 });
-  for (const [name, src] of [
-    ["piper", "fake-piper.py"],
-    ["player", "fake-player.py"],
-  ] as const) {
-    writeFileSync(join(tts, name), `#!${py} -I\n${readFileSync(join(FIXTURES, src), "utf8")}`);
-    chmodSync(join(tts, name), 0o755);
-  }
+  // Piper is a Python stand-in: the sidecar runs it under its own interpreter,
+  // so the installed file is 0644 and carries no shebang. The player is exec'd.
+  writeFileSync(join(tts, "piper"), readFileSync(join(FIXTURES, "fake-piper.py")));
+  chmodSync(join(tts, "piper"), 0o644);
+  writeFileSync(
+    join(tts, "player"),
+    `#!${py} -I\n${readFileSync(join(FIXTURES, "fake-player.py"), "utf8")}`,
+  );
+  chmodSync(join(tts, "player"), 0o755);
   const model = randomBytes(64);
   writeFileSync(join(tts, "model.onnx"), model);
   return {

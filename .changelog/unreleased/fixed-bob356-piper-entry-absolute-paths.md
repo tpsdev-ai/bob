@@ -1,0 +1,1 @@
+- **The Piper entry refuses a `--model` or `--output_file` value that is not an absolute path.** It exits non-zero before changing directory or importing piper-tts; the fixed LaunchDaemon supplies absolute model and output paths. (`test/capabilities/reachy/piper-entry.test.ts`)

@@ -377,6 +377,96 @@ function statSafe(p) {
   }
 }
 
+// The reviewed Piper entry script and its pinned wheel set.
+export const PIPER_ENTRY_SOURCE = join(ROOT, "sidecar/reachy-voice/piper-entry.py");
+export const PIPER_REQUIREMENTS = join(ROOT, "sidecar/reachy-voice/piper-requirements.txt");
+
+/** The pinned piper-tts version from the requirements file, or undefined. */
+export function pinnedPiperVersion(requirements = PIPER_REQUIREMENTS) {
+  let text;
+  try {
+    text = readFileSync(requirements, "utf8");
+  } catch {
+    return undefined;
+  }
+  for (const line of text.split("\n")) {
+    const m = /^piper-tts==([0-9][^\s\\;]*)/.exec(line.trim());
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+/**
+ * [P7] The installed Piper: `$PIPER_DIR/piper` is byte-identical to the
+ * reviewed entry script and root-owned, and the piper-tts distribution under
+ * `$PIPER_DIR/lib` reports the pinned version. `owners` is a seam for tests.
+ */
+export function piperInstallProblems({
+  piperDir = "/usr/local/libexec/bob/piper",
+  entrySource = PIPER_ENTRY_SOURCE,
+  requirements = PIPER_REQUIREMENTS,
+  owners = [0],
+} = {}) {
+  const allowed = new Set(owners);
+  const problems = [];
+  const entry = join(piperDir, "piper");
+  let installed;
+  let reviewed;
+  try {
+    installed = readFileSync(entry);
+  } catch {
+    problems.push(`${entry} cannot be read`);
+  }
+  try {
+    reviewed = readFileSync(entrySource);
+  } catch {
+    problems.push(`${entrySource} cannot be read`);
+  }
+  if (installed && reviewed && !installed.equals(reviewed)) {
+    problems.push(`${entry} is not byte-identical to ${entrySource}`);
+  }
+  let st;
+  try {
+    st = lstatSync(entry);
+  } catch {
+    problems.push(`${entry} cannot be read`);
+  }
+  if (st) {
+    if (!allowed.has(st.uid)) problems.push(`${entry} is not root-owned (uid ${st.uid})`);
+    if (!st.isFile()) problems.push(`${entry} is not a regular file`);
+  }
+  const want = pinnedPiperVersion(requirements);
+  if (!want) problems.push(`the pinned piper-tts version cannot be read from ${requirements}`);
+  const lib = join(piperDir, "lib");
+  let names;
+  try {
+    names = readdirSync(lib);
+  } catch {
+    problems.push(`${lib} cannot be listed`);
+  }
+  const dists = (names ?? []).filter((n) => /^piper_tts-.+\.dist-info$/.test(n));
+  if (dists.length !== 1) {
+    problems.push(`${lib} holds ${dists.length} piper-tts distributions, not one`);
+  }
+  for (const dist of dists) {
+    const metadata = join(lib, dist, "METADATA");
+    let body;
+    try {
+      body = readFileSync(metadata, "utf8");
+    } catch {
+      problems.push(`${metadata} cannot be read`);
+      continue;
+    }
+    const version = /^Version:\s*(\S+)\s*$/m.exec(body)?.[1];
+    if (version !== want) {
+      problems.push(
+        `the installed piper-tts ${version ?? "has no version"} is not the pinned ${want}`,
+      );
+    }
+  }
+  return problems;
+}
+
 /**
  * bob's account from the deployment record, or why it cannot be trusted: the
  * record must be a regular file, no component of its path a symlink, and its

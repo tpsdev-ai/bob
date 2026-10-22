@@ -22,6 +22,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   ACL_UNCHECKED,
+  pinnedPiperVersion,
+  piperInstallProblems,
   readDeploymentRecord,
   releaseTrustProblems,
   writeGrantingAcls,
@@ -61,6 +63,12 @@ function fixture() {
   symlinkSync("../../../base/bin/python3.9", join(f, "clt/usr/bin/python3"));
   for (const n of INSTALLED) file(join(f, "install", n));
   file(join(f, "piper/piper"), 0o755);
+  file(join(f, "source/piper-entry.py"));
+  file(
+    join(f, "piper/lib/piper_tts-1.8.0.dist-info/METADATA"),
+    0o644,
+    "Metadata-Version: 2.1\nName: piper-tts\nVersion: 1.8.0\n",
+  );
   file(join(f, "state/agent-user"), 0o644, "bob\n");
   // mkdir's mode is masked by umask: set every directory explicitly
   for (const d of [
@@ -77,6 +85,9 @@ function fixture() {
     "clt/usr/bin",
     "install",
     "piper",
+    "piper/lib",
+    "piper/lib/piper_tts-1.8.0.dist-info",
+    "source",
     "state",
   ]) {
     chmodSync(join(f, d), 0o755);
@@ -405,5 +416,51 @@ console.log(JSON.stringify(readDeploymentRecord(process.argv[1])));`,
       "user:Full Name allow write",
       "unrecognized ACL entry",
     ]);
+  });
+});
+
+describe("bob#356 [P7] — the installed Piper entry and its pinned version", () => {
+  const args = (f: string) => ({
+    piperDir: join(f, "piper"),
+    entrySource: join(f, "source/piper-entry.py"),
+    owners: [0, ME],
+  });
+
+  it("the reviewed entry script and the pinned distribution pass", () => {
+    const { f } = fixture();
+    expect(piperInstallProblems(args(f))).toEqual([]);
+    expect(pinnedPiperVersion()).toBe("1.8.0");
+  });
+
+  it("an entry that differs from the reviewed script is refused", () => {
+    const { f } = fixture();
+    writeFileSync(join(f, "piper/piper"), "other");
+    expect(piperInstallProblems(args(f))).toContain(
+      `${f}/piper/piper is not byte-identical to ${f}/source/piper-entry.py`,
+    );
+  });
+
+  it("an entry that is not root-owned is refused", () => {
+    const { f } = fixture();
+    expect(piperInstallProblems({ ...args(f), owners: [ME + 1] })).toContain(
+      `${f}/piper/piper is not root-owned (uid ${ME})`,
+    );
+  });
+
+  it("a distribution that is not the pinned version is refused", () => {
+    const { f } = fixture();
+    writeFileSync(
+      join(f, "piper/lib/piper_tts-1.8.0.dist-info/METADATA"),
+      "Name: piper-tts\nVersion: 1.7.0\n",
+    );
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      "the installed piper-tts 1.7.0 is not the pinned 1.8.0",
+    );
+  });
+
+  it("a missing lib tree is refused", () => {
+    const { f } = fixture();
+    rmSync(join(f, "piper/lib"), { recursive: true, force: true });
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(`${f}/piper/lib cannot be listed`);
   });
 });

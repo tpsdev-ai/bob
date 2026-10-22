@@ -24,7 +24,9 @@ Protocol (reachy-voice/1, one JSON object per line, bob -> sidecar commands
 
 Speech (local text-to-speech with Piper):
   - the text is validated again here (one line, 1-500 characters);
-  - Piper writes the waveform into a fresh 0700 directory under --work-dir, to a
+  - Piper is the entry script at --piper, run as sys.executable -I <--piper>
+    --model M --output_file W from the speech file's directory; it writes the
+    waveform into a fresh 0700 directory under --work-dir, to a
     file created 0600 before Piper opens it (and the process umask is 077);
   - the OS player plays that file; then the sidecar removes the file and its
     directory. If that removal FAILS, the artifact can remain on disk: the
@@ -153,11 +155,12 @@ class Mouth:
             fd = os.open(wav, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.close(fd)
             synth = subprocess.run(
-                [self.piper, "--model", self.model, "--output_file", wav],
+                [sys.executable, "-I", self.piper, "--model", self.model, "--output_file", wav],
                 input=text.encode("utf-8"),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=self.env,
+                cwd=tts_dir,
                 timeout=SYNTH_TIMEOUT_S,
                 check=False,
             )
@@ -353,9 +356,10 @@ def main(argv=None):
 
     if not SHA256.match(opts.piper_model_sha256):
         raise SystemExit("reachy-voice: --piper-model-sha256 must be 64 lowercase hex characters")
-    for path in (opts.piper, opts.player):
-        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
-            raise SystemExit("reachy-voice: --piper and --player must be executable files")
+    if not (os.path.isfile(opts.piper) and os.access(opts.piper, os.R_OK)):
+        raise SystemExit("reachy-voice: --piper must be a readable file")
+    if not (os.path.isfile(opts.player) and os.access(opts.player, os.X_OK)):
+        raise SystemExit("reachy-voice: --player must be an executable file")
     if sha256_file(opts.piper_model) != opts.piper_model_sha256:
         raise SystemExit("reachy-voice: the Piper model does not match its pinned sha256")
     private_dir(opts.work_dir)

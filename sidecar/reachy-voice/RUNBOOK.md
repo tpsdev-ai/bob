@@ -18,6 +18,8 @@ Files in this directory:
 | `sidecar.py` | The sidecar (Python 3.9+, standard library only). Reports version `0.1.0`. |
 | `reachy-voice.sb` | The deny-default seatbelt profile it runs under. |
 | `launch.py` | Fixed LaunchDaemon derivation and deployed-plist check. |
+| `piper-entry.py` | Installed as `$PIPER_DIR/piper`: runs piper-tts's CLI under the sidecar's interpreter (step 3). |
+| `piper-requirements.txt` | The pinned wheel set piper-tts is installed from, with a sha256 per wheel (step 3). |
 | `proof.py` | The installed command for release-host separate-user proofs (step 2). |
 | `egress-probe.py` | Confined via `proof.py`; the test runs its source directly as bob with `PY -I -c <source> <spec-json>` for the unconfined control. |
 | `RUNBOOK.md` | This file. |
@@ -116,14 +118,28 @@ around bob's gates.
 ## 3. Install the sidecar and Piper (root-owned, hash-recorded)
 
 Once P7 establishes trusted ancestors and ACLs, the sidecar user cannot modify these files.
+On a host where the launch job is already loaded, boot it out before re-running
+this step and bootstrap it again with step 5.
 
 ```sh
 sudo install -d -o root -g wheel -m 0755 $INSTALL $PIPER_DIR
 sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
   $REPO/sidecar/reachy-voice/reachy-voice.sb $REPO/sidecar/reachy-voice/proof.py \
   $REPO/sidecar/reachy-voice/egress-probe.py $REPO/sidecar/reachy-voice/launch.py $INSTALL/
-# Piper: the build and voice measured in rocky:~/voice-prep (hash-listed there).
-sudo cp -R <piper build dir>/. $PIPER_DIR/
+# Piper: piper-tts and its dependencies from the pinned wheel set, installed
+# into a fresh $PIPER_DIR/lib.new (wheels only, no dependency resolution), plus
+# the entry script the sidecar runs under its own interpreter.
+sudo rm -rf "${PIPER_DIR:?}/lib.new"
+if sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
+  --target "$PIPER_DIR/lib.new" -r $REPO/sidecar/reachy-voice/piper-requirements.txt; then
+  if sudo test -d "$PIPER_DIR/lib"; then
+    sudo mv "$PIPER_DIR/lib" "$PIPER_DIR/lib.old"
+  fi
+  sudo mv "$PIPER_DIR/lib.new" "$PIPER_DIR/lib"
+  sudo rm -rf "${PIPER_DIR:?}/lib.old"
+fi
+sudo install -o root -g wheel -m 0644 \
+  $REPO/sidecar/reachy-voice/piper-entry.py $PIPER_DIR/piper
 sudo chown -R root:wheel $PIPER_DIR && sudo chmod -R go-w $PIPER_DIR
 sudo cp <voice>.onnx $PIPER_DIR/voice.onnx
 sudo cp <voice>.onnx.json $PIPER_DIR/voice.onnx.json
@@ -134,7 +150,10 @@ shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
 Record those hashes in the host's install log. The release check (step 8)
 verifies the installed `sidecar.py`, `reachy-voice.sb`, `proof.py`,
 `egress-probe.py` and `launch.py` are byte-identical to the reviewed checkout
-and root-owned. `--piper-model-sha256`
+and root-owned, and that `$PIPER_DIR/piper` is byte-identical to
+`sidecar/reachy-voice/piper-entry.py` and root-owned. It also reads the
+installed `piper-tts` version from `$PIPER_DIR/lib` and requires the pinned
+`1.8.0`. `--piper-model-sha256`
 is the voice model's: the sidecar refuses to start when the model differs.
 
 ## 4. State directories

@@ -76,6 +76,7 @@ import {
   checkLaunchJob,
   PINNED_DEVELOPER_DIR,
   PINNED_PYTHON,
+  piperInstallProblems,
   releaseTrustProblems,
   treeProblems,
 } from "../../../scripts/check-reachy-isolation.mjs";
@@ -347,14 +348,13 @@ function layout(shared: { group?: number } | false): Layout {
     copyFileSync(join(SIDECAR_SRC, f), join(sd, f));
     chmodSync(join(sd, f), 0o644);
   }
-  for (const [name, src] of [
-    ["piper", "fake-piper.py"],
-    ["player", "fake-player.py"],
-  ] as const) {
-    const body = readFileSync(join(FIXTURES, src), "utf8");
-    writeFileSync(join(tts, name), `#!${PY_REAL} -I\n${body}`);
-    chmodSync(join(tts, name), 0o755);
-  }
+  // Piper is a Python stand-in the sidecar runs under its own interpreter:
+  // installed 0644, no shebang. The player is exec'd directly.
+  writeFileSync(join(tts, "piper"), readFileSync(join(FIXTURES, "fake-piper.py")));
+  chmodSync(join(tts, "piper"), 0o644);
+  const playerBody = readFileSync(join(FIXTURES, "fake-player.py"), "utf8");
+  writeFileSync(join(tts, "player"), `#!${PY_REAL} -I\n${playerBody}`);
+  chmodSync(join(tts, "player"), 0o755);
   const model = randomBytes(64);
   writeFileSync(join(tts, "model.onnx"), model);
   chmodSync(join(tts, "model.onnx"), 0o644);
@@ -757,7 +757,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
   );
 
   proof(
-    "[P7] the deployed plist matches the fixed launch derivation; the INSTALLED sidecar, profile and proof tooling equal this checkout's; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write-granting ACL)",
+    "[P7] the deployed plist matches the fixed launch derivation; the INSTALLED sidecar, profile and proof tooling equal this checkout's; the installed Piper entry equals `piper-entry.py`, is root-owned, and its piper-tts is the pinned version; they, the pinned /usr/bin/python3 and what it resolves to (interpreter, base-prefix tree, every sys.path entry), the Piper directory and the deployment record are trusted along their FULL path chains (root-owned, not group/other-writable, no write-granting ACL)",
     installedSkip || userSkip,
     () => {
       for (const f of INSTALLED_FILES) {
@@ -805,6 +805,7 @@ describe("reachy-voice isolation — #180 S1 key-read proof", () => {
           piperDir: PINNED_PIPER_DIR,
         }),
       ).toEqual([]);
+      expect(piperInstallProblems({ piperDir: PINNED_PIPER_DIR })).toEqual([]);
     },
     120_000,
   );
