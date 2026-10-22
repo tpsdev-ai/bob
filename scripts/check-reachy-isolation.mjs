@@ -454,8 +454,8 @@ function recordFields(line) {
  * a problem, as is an empty RECORD, a line that does not hold path, hash and
  * size as three fields, a field whose quoting does not close, or a size that is
  * not a decimal integer. pip writes RECORD through Python's csv module, whose
- * line terminator is CRLF: one trailing carriage return on a line is its
- * ending, and a carriage return anywhere else makes the line malformed.
+ * line terminator is CRLF: a line ends in CRLF or LF, and a carriage return
+ * anywhere else makes the line malformed.
  */
 function recordProblems(lib, distInfo) {
   const record = join(lib, distInfo, "RECORD");
@@ -465,10 +465,7 @@ function recordProblems(lib, distInfo) {
   } catch {
     return [`${record} cannot be read`];
   }
-  const lines = body
-    .split("\n")
-    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
-    .filter((line) => line.trim());
+  const lines = body.split(/\r\n|\n/).filter((line) => line.trim());
   if (lines.length === 0) return [`${record} is empty`];
   const problems = [];
   const entries = [];
