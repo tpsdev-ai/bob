@@ -551,9 +551,13 @@ export function piperInstallProblems({
   requirements = PIPER_REQUIREMENTS,
   owners = [0],
 } = {}) {
+  // Resolve once: a relative piperDir would leave `lib` relative while every
+  // RECORD path resolves absolute, so the inside-lib test would exclude every
+  // hashed entry and no file would be compared.
+  const root = resolve(piperDir);
   const allowed = new Set(owners);
   const problems = [];
-  const entry = join(piperDir, "piper");
+  const entry = join(root, "piper");
   let installed;
   let reviewed;
   try {
@@ -580,7 +584,7 @@ export function piperInstallProblems({
     if (!st.isFile()) problems.push(`${entry} is not a regular file`);
   }
   const want = pinnedPiperVersion(requirements);
-  const lib = join(piperDir, "lib");
+  const lib = join(root, "lib");
   let names;
   try {
     names = readdirSync(lib);

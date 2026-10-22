@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import {
   ACL_UNCHECKED,
   pinnedPiperVersion,
@@ -518,6 +518,24 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
       `${f}/piper/lib/piper_tts/__init__.py does not match the hash in ` +
         `${f}/piper/lib/piper_tts-1.8.0.dist-info/RECORD`,
     );
+  });
+
+  it("a relative piper dir still reports a tampered hashed file", () => {
+    const { f } = fixture();
+    writeFileSync(join(f, "piper/lib/piper_tts/__init__.py"), "tampered\n");
+    const piperDir = relative(process.cwd(), join(f, "piper"));
+    expect(isAbsolute(piperDir)).toBe(false);
+    expect(piperInstallProblems({ ...args(f), piperDir }).join("\n")).toContain(
+      `${f}/piper/lib/piper_tts/__init__.py does not match the hash in ` +
+        `${f}/piper/lib/piper_tts-1.8.0.dist-info/RECORD`,
+    );
+    const { f: clean } = fixture();
+    expect(
+      piperInstallProblems({
+        ...args(clean),
+        piperDir: relative(process.cwd(), join(clean, "piper")),
+      }),
+    ).toEqual([]);
   });
 
   it("a distribution outside the pinned set is refused", () => {

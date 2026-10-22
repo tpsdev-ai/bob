@@ -191,7 +191,10 @@ elif [ "$PIPER_INSTALL" = restore-failed ]; then
 elif [ "$PIPER_INSTALL" != ok ]; then
   echo "reachy-voice: the Piper install did not complete ($PIPER_INSTALL). Stop here and rerun this step; the entry install did not run." >&2
 fi
-shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
+if [ "$PIPER_INSTALL" = ok ]; then
+  shasum -a 256 $INSTALL/* $PIPER_DIR/piper $PIPER_DIR/voice.onnx
+fi
+[ "$PIPER_INSTALL" = ok ]
 ```
 
 Record those hashes in the host's install log. The release check (step 8)
