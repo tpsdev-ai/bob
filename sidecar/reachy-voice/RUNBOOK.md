@@ -226,8 +226,8 @@ parses every `<name>-<version>.dist-info`, requires its METADATA `Name` and
 `Version` to match the directory name and the pin in `piper-requirements.txt`,
 requires the pinned set and no other distribution, and compares each hashed
 `RECORD` entry inside `lib` whose real path resolves inside it with its file;
-an entry inside `lib` whose real path resolves outside it is refused, the
-distribution's own `RECORD` line included. A hashless `RECORD`
+an entry inside `lib` whose real path resolves outside it is refused, and so is
+a `RECORD` that resolves outside `lib` or has no line for its own path. A hashless `RECORD`
 line is accepted only for the distribution's own `RECORD` and for a `.pyc` under
 `__pycache__` that pip recompiled at install (its bytes can differ from the
 wheel's copy, so the hashed line for that same path is not compared). A file `RECORD` does

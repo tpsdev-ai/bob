@@ -560,6 +560,29 @@ describe("bob#356 [P7] — the installed Piper entry and its pinned version", ()
     );
   });
 
+  it("a RECORD with no line for its own path is refused when its real path resolves outside lib", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const outside = join(f, "outside-RECORD");
+    const body = "# numpy 2.0.2\n";
+    const digest = createHash("sha256").update(body).digest("base64url");
+    writeFileSync(outside, `numpy/__init__.py,sha256=${digest},${Buffer.byteLength(body)}\r\n`);
+    rmSync(record);
+    symlinkSync(outside, record);
+    expect(piperInstallProblems(args(f)).join("\n")).toContain(
+      `${record} resolves outside ${f}/piper/lib`,
+    );
+  });
+
+  it("a RECORD with no line for its own path is refused", () => {
+    const { f } = fixture();
+    const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");
+    const body = "# numpy 2.0.2\n";
+    const digest = createHash("sha256").update(body).digest("base64url");
+    writeFileSync(record, `numpy/__init__.py,sha256=${digest},${Buffer.byteLength(body)}\r\n`);
+    expect(piperInstallProblems(args(f))).toEqual([`${record} has no line for its own path`]);
+  });
+
   it("a hashless bytecode line exempts only its own path from the hash comparison", () => {
     const { f } = fixture();
     const record = join(f, "piper/lib/numpy-2.0.2.dist-info/RECORD");

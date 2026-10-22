@@ -446,14 +446,15 @@ function recordFields(line) {
 /**
  * A distribution's RECORD hashes against the files on disk, as
  * `pip install --target` leaves them: paths relative to the target, sha256 in
- * base64url. A line inside `lib` whose real path resolves outside it is
- * refused, the distribution's own RECORD line included. Each other hashed line
- * inside `lib` is compared, except the bytecode line described below. A file
- * RECORD does not list is not enumerated. Two hashless lines are accepted: the
- * distribution's own RECORD, and a `.pyc` under `__pycache__` that pip
- * recompiled at install (its bytes can differ from the wheel's copy, so the
- * hashed line for that same path is not hash-compared). Any other hashless line is
- * a problem, as is an empty RECORD, a line that does not hold path, hash and
+ * base64url. A RECORD whose real path resolves outside `lib` is refused before
+ * its lines are read, and so is a line inside `lib` whose real path resolves
+ * outside it. Each other hashed line inside `lib` is compared, except the
+ * bytecode line described below. A file RECORD does not list is not enumerated.
+ * Two hashless lines are accepted: the distribution's own RECORD, and a `.pyc`
+ * under `__pycache__` that pip recompiled at install (its bytes can differ from
+ * the wheel's copy, so the hashed line for that same path is not hash-compared).
+ * Any other hashless line is a problem, as is a RECORD with no line for its own
+ * path, an empty RECORD, a line that does not hold path, hash and
  * size as three fields, a field whose quoting does not close, or a non-empty size
  * that is not a decimal integer. pip writes RECORD through Python's csv module,
  * whose line terminator is CRLF: a line ends in CRLF or LF, and a carriage return
@@ -461,9 +462,27 @@ function recordFields(line) {
  */
 function recordProblems(lib, distInfo) {
   const record = join(lib, distInfo, "RECORD");
+  // RECORD paths are lexical. Resolve the library root, and RECORD's real path
+  // before its lines are trusted, so neither RECORD nor a listed path inside lib
+  // can stand for a file outside it.
+  let realLib;
+  try {
+    realLib = realpathSync(lib);
+  } catch {
+    return [`${lib} cannot be resolved`];
+  }
+  let realRecord;
+  try {
+    realRecord = realpathSync(record);
+  } catch {
+    return [`${record} cannot be read`];
+  }
+  if (realRecord !== realLib && !realRecord.startsWith(realLib + sep)) {
+    return [`${record} resolves outside ${lib} (${realRecord})`];
+  }
   let body;
   try {
-    body = readFileSync(record, "utf8");
+    body = readFileSync(realRecord, "utf8");
   } catch {
     return [`${record} cannot be read`];
   }
@@ -479,16 +498,8 @@ function recordProblems(lib, distInfo) {
     if (line.trim()) lines.push(line);
   }
   if (lines.length === 0 && problems.length === 0) return [`${record} is empty`];
-  // RECORD paths are lexical. Resolve the library root and the real path of
-  // each entry inside it, so a listed path inside lib cannot stand for a file
-  // outside it.
-  let realLib;
-  try {
-    realLib = realpathSync(lib);
-  } catch {
-    return [`${lib} cannot be resolved`];
-  }
   const entries = [];
+  let ownLine = false;
   for (const line of lines) {
     const { fields, closed } = recordFields(line);
     if (!closed) {
@@ -505,6 +516,7 @@ function recordProblems(lib, distInfo) {
       continue;
     }
     const p = resolve(lib, rel);
+    if (p === record) ownLine = true;
     // A `--target` install records its console script as ../../bin/<name>,
     // outside the lib: that script is not part of the tree checked here.
     const inside = p === lib || p.startsWith(lib + sep);
@@ -532,6 +544,7 @@ function recordProblems(lib, distInfo) {
     }
     problems.push(`${p} is listed in ${record} without a hash`);
   }
+  if (!ownLine) problems.push(`${record} has no line for its own path`);
   // An accepted hashless bytecode entry — a `__pycache__/*.pyc` — suppresses
   // the hash comparison for that path: pip appends such a line for the bytecode
   // it compiled at install.
@@ -567,9 +580,9 @@ function recordProblems(lib, distInfo) {
  * inside `lib` whose real path resolves inside it is compared with the file,
  * except a `.pyc` under `__pycache__` whose same path also has an accepted
  * hashless row — a path listed there without a hash is accepted only for the
- * distribution's own RECORD or for that bytecode. A RECORD entry inside `lib`
- * whose real path resolves outside it is refused, the distribution's own RECORD
- * row included. `owners` is a seam for tests.
+ * distribution's own RECORD or for that bytecode. A RECORD that resolves
+ * outside `lib` or has no line for its own path is refused, as is a RECORD entry
+ * inside `lib` whose real path resolves outside it. `owners` is a seam for tests.
  */
 export function piperInstallProblems({
   piperDir = "/usr/local/libexec/bob/piper",
