@@ -5,6 +5,7 @@
 // PIPER_INSTALL state are asserted for every order.
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -16,7 +17,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+import { piperInstallProblems } from "../../../scripts/check-reachy-isolation.mjs";
 
 const ROOT = realpathSync(join(import.meta.dirname, "../../.."));
 const RUNBOOK = join(ROOT, "sidecar/reachy-voice/RUNBOOK.md");
@@ -75,6 +77,19 @@ fi
 if [ "$1" = /usr/bin/python3 ]; then
   if [ "\${2:-}" = "-I" ] && [ "\${3:-}" = "-m" ] && [ "\${4:-}" = pip ]; then
     shift 4
+    if [ -n "\${SHIM_PIP_ARGS:-}" ]; then printf "%s\\n" "$@" > "$SHIM_PIP_ARGS"; fi
+    if [ -n "\${SHIM_REAL_PYTHON:-}" ]; then
+      # Real pip with the block's own arguments, except -r, which names the
+      # fixture requirements; the bytecode cache is forced outside the target.
+      args=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -r) args+=(-r "$SHIM_PIP_REQUIREMENTS"); shift 2 ;;
+          *) args+=("$1"); shift ;;
+        esac
+      done
+      exec "$SHIM_REAL_PYTHON" -I -X "pycache_prefix=$SHIM_PYCACHE_PREFIX" -m pip "\${args[@]}"
+    fi
     target=
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -126,7 +141,11 @@ type Injection = {
   voice?: boolean;
 };
 
-function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
+function run(
+  inject: Injection = {},
+  seed: { libOld?: boolean } = {},
+  opts: { block?: string; env?: Record<string, string> } = {},
+) {
   const d = realpathSync(mkdtempSync(join(tmpdir(), "rv-step3-")));
   scratch.push(d);
   const piper = join(d, "piper");
@@ -160,10 +179,15 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     SHIM_FAIL_ENTRY: inject.entry ? "1" : "0",
     SHIM_FAIL_VOICE: inject.voice ? "1" : "0",
     SHIM_SWAP_TARGET: inject.swap === "occupied" ? "occupied" : "0",
+    SHIM_PIP_ARGS: join(d, "pip-args"),
+    ...opts.env,
   };
   const r = spawnSync(
     "bash",
-    ["-c", `${BLOCK}\nstatus=$?\nprintf '\\nPIPER_INSTALL=%s\\n' "$PIPER_INSTALL"\nexit $status`],
+    [
+      "-c",
+      `${opts.block ?? BLOCK}\nstatus=$?\nprintf '\\nPIPER_INSTALL=%s\\n' "$PIPER_INSTALL"\nexit $status`,
+    ],
     { cwd: d, env, encoding: "utf8", timeout: 60_000 },
   );
   expect(r.error).toBeUndefined();
@@ -176,6 +200,7 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     }
   };
   return {
+    piper,
     status: r.status,
     output: `${r.stdout ?? ""}${r.stderr ?? ""}`,
     state,
@@ -188,6 +213,7 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     voiceJson: read(join(piper, "voice.onnx.json")),
     nestedInLib: existsSync(join(piper, "lib/lib")),
     nestedInOld: existsSync(join(piper, "lib.old/lib")),
+    pipArgs: read(join(d, "pip-args"))?.split("\n") ?? null,
   };
 }
 
@@ -208,6 +234,10 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.libOld).toBe(false);
     expect(r.entry).toBe(readFileSync(join(ROOT, "sidecar/reachy-voice/piper-entry.py"), "utf8"));
     expect(r.output).toMatch(/[0-9a-f]{64} {2}.*\/piper\/piper/);
+  });
+
+  it("runs pip with --no-compile", () => {
+    expect(run().pipArgs).toContain("--no-compile");
   });
 
   it("a failed pip install leaves lib and the entry install alone", () => {
@@ -312,4 +342,134 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.nestedInLib || r.nestedInOld).toBe(false);
     expect(r.output).toContain("the Piper install did not complete (inspect-failed)");
   });
+});
+
+// RUNBOOK step 3's block with REAL pip: the `sudo` stand-in hands the pip call
+// to a python3 that has pip, with the block's own flags. Only `-r` is
+// redirected, to a requirements file pinning a wheel built here (one Python
+// module), and `-X pycache_prefix` puts any compiled bytecode in a cache
+// outside the target (`-I` ignores PYTHON* variables, `-X` still applies).
+// pip reads no index, config file or cache. The block's own renames leave the
+// install in `$PIPER_DIR/lib`, and piperInstallProblems verifies it.
+function pythonWithPip(): string | undefined {
+  const probe = join(tmpdir(), "rv-pip-probe-prefix");
+  for (const py of ["/usr/bin/python3", "python3"]) {
+    const r = spawnSync(
+      py,
+      [
+        "-I",
+        "-B",
+        "-X",
+        `pycache_prefix=${probe}`,
+        "-c",
+        `import sys, pip; assert sys.pycache_prefix == ${JSON.stringify(probe)}`,
+      ],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    if (r.status === 0) return py;
+  }
+  return undefined;
+}
+
+const PY = pythonWithPip();
+const NO_PY =
+  " (skipped: neither /usr/bin/python3 nor python3 on PATH imports pip and honours -X pycache_prefix)";
+const ME = process.getuid?.() ?? -1;
+
+// A wheel holding one module, its METADATA, WHEEL and a hashed RECORD.
+const WHEEL_PY = `
+import base64, hashlib, sys, zipfile
+info = "fixture_pkg-1.0.dist-info"
+files = {
+    "fixture_pkg/__init__.py": b"VALUE = 1\\n",
+    info + "/METADATA": b"Metadata-Version: 2.1\\nName: fixture-pkg\\nVersion: 1.0\\n",
+    info + "/WHEEL": b"Wheel-Version: 1.0\\nGenerator: bob-test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n",
+}
+def digest(b):
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+record = "".join("%s,%s,%d\\n" % (p, digest(b), len(b)) for p, b in files.items())
+record += info + "/RECORD,,\\n"
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    for p, b in files.items():
+        z.writestr(p, b)
+    z.writestr(info + "/RECORD", record)
+`;
+
+function realPip() {
+  const f = realpathSync(mkdtempSync(join(tmpdir(), "rv-pip-")));
+  scratch.push(f);
+  for (const sub of ["wheels", "pycache", "tmp", "home"]) mkdirSync(join(f, sub));
+  const wheel = join(f, "wheels/fixture_pkg-1.0-py3-none-any.whl");
+  const built = spawnSync(PY as string, ["-I", "-B", "-c", WHEEL_PY, wheel], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  expect(built.status).toBe(0);
+  const sha = createHash("sha256").update(readFileSync(wheel)).digest("hex");
+  const requirements = join(f, "requirements.txt");
+  writeFileSync(
+    requirements,
+    `--no-index\n--find-links ${join(f, "wheels")}\nfixture-pkg==1.0 \\\n    --hash=sha256:${sha}\n`,
+  );
+  const env = {
+    SHIM_REAL_PYTHON: PY as string,
+    SHIM_PIP_REQUIREMENTS: requirements,
+    SHIM_PYCACHE_PREFIX: join(f, "pycache"),
+    PIP_NO_INDEX: "1",
+    PIP_CONFIG_FILE: "/dev/null",
+    PIP_DISABLE_PIP_VERSION_CHECK: "1",
+    PIP_NO_CACHE_DIR: "1",
+    TMPDIR: join(f, "tmp"),
+    HOME: join(f, "home"),
+  };
+  return { requirements, env };
+}
+
+describe("bob#356 — RUNBOOK step 3 with real pip, verified by piperInstallProblems", () => {
+  it.skipIf(!PY)(
+    `the block's install passes the verifier${PY ? "" : NO_PY}`,
+    () => {
+      const { requirements, env } = realPip();
+      const r = run({}, {}, { env });
+      expect(r.state).toBe("ok");
+      expect(r.status).toBe(0);
+      expect(piperInstallProblems({ piperDir: r.piper, requirements, owners: [ME] })).toEqual([]);
+    },
+    120_000,
+  );
+
+  it.skipIf(!PY)(
+    `without --no-compile the external bytecode is refused as a hashless RECORD line outside lib${PY ? "" : NO_PY}`,
+    () => {
+      const { requirements, env } = realPip();
+      const block = BLOCK.replace(/[ \t]--no-compile\b/g, "");
+      expect(block).not.toContain("--no-compile");
+      const r = run({}, {}, { block, env });
+      expect(r.state).toBe("ok");
+      expect(r.status).toBe(0);
+      const lib = join(r.piper, "lib");
+      const problems = piperInstallProblems({ piperDir: r.piper, requirements, owners: [ME] });
+      expect(problems).toHaveLength(1);
+      const m = /^(.+) is listed in (.+) without a hash$/.exec(problems[0] ?? "");
+      expect(m?.[1]).toEndWith(".pyc");
+      expect(m?.[1].startsWith(lib + sep)).toBe(false);
+      expect(m?.[2]).toBe(join(lib, "fixture_pkg-1.0.dist-info/RECORD"));
+    },
+    120_000,
+  );
+
+  it.skipIf(!PY)(
+    `an installed source file changed after the install is refused by its RECORD hash${PY ? "" : NO_PY}`,
+    () => {
+      const { requirements, env } = realPip();
+      const r = run({}, {}, { env });
+      expect(r.state).toBe("ok");
+      const source = join(r.piper, "lib/fixture_pkg/__init__.py");
+      writeFileSync(source, readFileSync(source, "utf8").replace("VALUE = 1", "VALUE = 2"));
+      expect(piperInstallProblems({ piperDir: r.piper, requirements, owners: [ME] })).toEqual([
+        `${source} does not match the hash in ${join(r.piper, "lib/fixture_pkg-1.0.dist-info/RECORD")}`,
+      ]);
+    },
+    120_000,
+  );
 });
