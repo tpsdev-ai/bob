@@ -126,7 +126,8 @@ sudo install -o root -g wheel -m 0644 $REPO/sidecar/reachy-voice/sidecar.py \
   $REPO/sidecar/reachy-voice/reachy-voice.sb $REPO/sidecar/reachy-voice/proof.py \
   $REPO/sidecar/reachy-voice/egress-probe.py $REPO/sidecar/reachy-voice/launch.py $INSTALL/
 # Piper: piper-tts and its dependencies from the pinned wheel set, installed
-# into a fresh $PIPER_DIR/lib.new (wheels only, no dependency resolution), plus
+# into a fresh $PIPER_DIR/lib.new (wheels only, no dependency resolution, no
+# bytecode compiled), plus
 # the entry script the sidecar runs under its own interpreter. PIPER_INSTALL
 # records the outcome; the install commands after this block run only when it
 # is "ok". A failed swap attempts to move the old lib back and reports a failed
@@ -137,7 +138,7 @@ if sudo test -e "$PIPER_DIR/lib.new" || sudo test -L "$PIPER_DIR/lib.new" ||
   sudo test -e "$PIPER_DIR/lib.old" || sudo test -L "$PIPER_DIR/lib.old"; then
   PIPER_INSTALL=swap-dir-present
 elif sudo /usr/bin/python3 -I -m pip install --no-deps --only-binary=:all: --require-hashes \
-  --target "$PIPER_DIR/lib.new" -r $REPO/sidecar/reachy-voice/piper-requirements.txt; then
+  --no-compile --target "$PIPER_DIR/lib.new" -r $REPO/sidecar/reachy-voice/piper-requirements.txt; then
   PIPER_INSTALL=ok
   # Absent is fine; any other inspection failure is a distinct state and stops.
   PIPER_LIB_STATE=$(sudo /usr/bin/python3 -I -c '

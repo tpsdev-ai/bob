@@ -75,6 +75,7 @@ fi
 if [ "$1" = /usr/bin/python3 ]; then
   if [ "\${2:-}" = "-I" ] && [ "\${3:-}" = "-m" ] && [ "\${4:-}" = pip ]; then
     shift 4
+    if [ -n "\${SHIM_PIP_ARGS:-}" ]; then printf "%s\\n" "$@" > "$SHIM_PIP_ARGS"; fi
     target=
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -160,6 +161,7 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     SHIM_FAIL_ENTRY: inject.entry ? "1" : "0",
     SHIM_FAIL_VOICE: inject.voice ? "1" : "0",
     SHIM_SWAP_TARGET: inject.swap === "occupied" ? "occupied" : "0",
+    SHIM_PIP_ARGS: join(d, "pip-args"),
   };
   const r = spawnSync(
     "bash",
@@ -188,6 +190,7 @@ function run(inject: Injection = {}, seed: { libOld?: boolean } = {}) {
     voiceJson: read(join(piper, "voice.onnx.json")),
     nestedInLib: existsSync(join(piper, "lib/lib")),
     nestedInOld: existsSync(join(piper, "lib.old/lib")),
+    pipArgs: read(join(d, "pip-args"))?.split("\n") ?? null,
   };
 }
 
@@ -208,6 +211,10 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
     expect(r.libOld).toBe(false);
     expect(r.entry).toBe(readFileSync(join(ROOT, "sidecar/reachy-voice/piper-entry.py"), "utf8"));
     expect(r.output).toMatch(/[0-9a-f]{64} {2}.*\/piper\/piper/);
+  });
+
+  it("runs pip with --no-compile", () => {
+    expect(run().pipArgs).toContain("--no-compile");
   });
 
   it("a failed pip install leaves lib and the entry install alone", () => {
