@@ -1,0 +1,1 @@
+- **The declared bun build toolchain moves to 1.4.4.** `package.json` and every CI and release setup-bun pin now name 1.4.4; run `bun install --frozen-lockfile` in a checkout with that bun before building.

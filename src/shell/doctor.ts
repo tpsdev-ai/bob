@@ -152,7 +152,7 @@ export interface DoctorOptions {
 export const BUN_VERSION_CHECK = "bun version";
 export const BUN_PROBE_TIMEOUT_MS = 5_000;
 
-// package.json's packageManager pin, as npm writes it: "bun@1.3.10".
+// package.json's packageManager pin, in the form npm writes: "bun@<version>".
 const BUN_PACKAGE_MANAGER = /^bun@(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/;
 
 // A whole version, the shape `bun --version` prints. Anything else — extra
