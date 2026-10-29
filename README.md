@@ -563,12 +563,7 @@ One package. The CLI, the shell runtime, the role templates and every blessed
 capability ship together — there is nothing else to install to get a working
 agent, and no way to end up with half of one.
 
-The committed `bun.lock` is written with bun **1.3.10**, declared in
-`package.json` as `packageManager: "bun@1.3.10"` and matched by CI's setup-bun
-pin. Build from a checkout with that bun: a bun other than 1.3.10 may fail
-`bun install --frozen-lockfile` with "overrides in package.json changed since
-bun.lock was saved". Use `npx -y bun@1.3.10 install --frozen-lockfile`, or install
-that bun. `bob doctor` reports a host whose bun differs.
+bob builds with the bun version that `package.json` declares in `packageManager`; CI's setup-bun pins match it, and `scripts/check-bun-version.mjs` fails CI when one drifts. Build from a checkout with that bun: another bun may fail `bun install --frozen-lockfile` with "overrides in package.json changed since bun.lock was saved". Run `npx -y "$(node -p 'require("./package.json").packageManager')" install --frozen-lockfile`, or install that bun. `bob doctor` reports a host whose bun differs.
 
 ## Repo layout
 
