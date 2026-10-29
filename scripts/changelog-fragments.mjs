@@ -994,7 +994,7 @@ export function promote(
 // requires a git work tree and refuses while CHANGELOG.md or any fragment is
 // untracked (not in the index) or differs from the index, naming each: git could
 // not restore those as they are, and a deleted untracked fragment would be gone.
-// Explicit `env`: without it, a child spawned under bun (seen on 1.3.10) does not
+// Explicit `env`: under Bun 1.3.10, a child spawned without it did not
 // see process.env changes made after startup.
 function git(cwd, args) {
   const r = spawnSync("git", ["-C", cwd, ...args], {
