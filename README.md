@@ -365,9 +365,13 @@ change one, the named test is what tells you.
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
   `final_shape_mismatch` / `reasoning_only` / `narration_only`).
+  An assistant message with no content blocks and zero output tokens is not an
+  ending: the SAME request is re-issued up to three times, and a still-empty
+  answer fails the run as `empty_response`, naming the provider and the model.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`, `narration-turn.test.ts`,
-  `narration-turn-live.test.ts` — a real pi session on a scripted provider)*
+  `narration-turn-live.test.ts` — a real pi session on a scripted provider,
+  `empty-response-381.test.ts` — the same, plus a real mid-run compaction)*
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.

@@ -88,7 +88,12 @@ export type SilenceReason =
   // call, and text that does not begin with a marker, or with final text read
   // from session state with no observed assistant ending, re-prompted up to the
   // bound and still so — "ended without a final report" (bob#365).
-  | "narration_only";
+  | "narration_only"
+  // The provider answered a request with no content blocks and zero output
+  // tokens, and the same request was re-issued up to the bound and still came
+  // back empty (bob#381). It is a failed run naming the provider and the model,
+  // never a completion.
+  | "empty_response";
 
 /** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
  *  less yields "" — never the untruncated text. */
@@ -178,7 +183,12 @@ export interface SessionEventLike {
   willRetry?: boolean;
   result?: unknown;
   reason?: string;
-  message?: { role?: string; content?: unknown; stopReason?: string } | null;
+  message?: {
+    role?: string;
+    content?: unknown;
+    stopReason?: string;
+    errorMessage?: unknown;
+  } | null;
   assistantMessageEvent?: { type?: string; delta?: string } | null;
   toolName?: string;
   args?: unknown;
@@ -361,6 +371,10 @@ export interface CompactionObserver {
   /** The classification of the LAST assistant message that ended since the
    *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
+  /** The `errorMessage` the LAST assistant message that ended since the boundary
+   *  carried, when it carried one (bob#381). It is what names an empty-response
+   *  bound an attempt's own error ended with. */
+  lastError(): string | undefined;
 }
 
 /**
@@ -389,6 +403,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
+  let lastError: string | undefined;
   let lastStopReason: string | undefined;
   let agentEnded = false;
 
@@ -397,6 +412,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     sawAssistantEnd = false;
     lastEndFailed = false;
     lastEnding = undefined;
+    lastError = undefined;
     lastStopReason = undefined;
     deltaBuffer = "";
     agentEnded = false;
@@ -419,6 +435,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
     lastEnding: () => lastEnding,
+    lastError: () => lastError,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -497,6 +514,8 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             lastEndFailed = failed;
             lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
+            lastError =
+              typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined;
           }
           deltaBuffer = "";
           return;
