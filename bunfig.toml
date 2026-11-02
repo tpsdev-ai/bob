@@ -29,7 +29,15 @@ minimumReleaseAge = 604800
 # if a linter is seven days old.
 #
 # Do not re-add biome -- or anything else -- without a written reason here.
-minimumReleaseAgeExcludes = ["@types/node", "typescript"]
+minimumReleaseAgeExcludes = ["@types/node", "typescript", "minimatch", "@isaacs/nonrecursive-glob-match"]
+# minimatch is excluded because GHSA-g3hv-75wg-m249 (moderate) is fixed only
+# in 11.x, and every 11.x release is younger than the 7-day gate at the time
+# of this fix. It reaches bob through @earendil-works/pi-coding-agent, which
+# pins 10.2.5. @isaacs/nonrecursive-glob-match is the matcher dependency that
+# minimatch 11.x adds; every published version of it is also younger than the
+# gate. This is the deliberate fresh-fix PR the Renovate note describes
+# (.github/renovate.json): the version bump (the `overrides` entry) travels
+# with the exclusions.
 
 [test]
 preload = ["./test/state-root.setup.ts"]
