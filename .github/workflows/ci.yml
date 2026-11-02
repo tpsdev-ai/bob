@@ -168,7 +168,7 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       # Frozen installs resolve nothing, so bunfig.toml's minimumReleaseAge is
-      # never applied to the committed lockfile. This checks the lock's pins
+      # not applied to the committed lockfile. This checks the lock's pins
       # against the registry's publish times instead.
       - name: Lockfile release-age bake
         run: node scripts/check-lockfile-release-age.mjs

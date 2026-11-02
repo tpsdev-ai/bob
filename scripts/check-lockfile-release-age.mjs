@@ -2,7 +2,7 @@
 /**
  * check-lockfile-release-age.mjs — enforce bunfig.toml's release-age bake on
  * the committed bun.lock, where `bun install --frozen-lockfile` resolves
- * nothing and therefore never applies `minimumReleaseAge`.
+ * nothing and therefore does not apply `minimumReleaseAge`.
  *
  * Every entry in bun.lock's `packages` map is read. The lock's resolution
  * string is parsed as package@version; the publish time comes from the npm
@@ -13,8 +13,9 @@
  * Non-registry entries are skipped by one explicit rule: the version part of
  * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`
  * or `github:`. Every other entry must parse as package@version; each unique
- * pair is looked up. A registry request that fails, times out, or returns no
- * publish time for that version fails the check; it never passes by default.
+ * pair not listed in `minimumReleaseAgeExcludes` is looked up. A registry
+ * request that fails, times out, or returns no publish time for that version
+ * fails the check; it never passes by default.
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
