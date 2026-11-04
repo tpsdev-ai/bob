@@ -228,7 +228,7 @@ async function startRecordingServer(
   };
 }
 
-// A dead loopback proxy keeps any request that escapes the local registry from
+// A dead loopback proxy keeps requests that escape the local registry from
 // leaving the host. NO_PROXY lets the loopback registry itself through.
 function isolatedEnv(root: string, extra: Record<string, string> = {}) {
   const env: Record<string, string | undefined> = { ...process.env };
