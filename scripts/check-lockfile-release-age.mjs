@@ -8,9 +8,9 @@
  * string is parsed as package@version.
  *
  * Non-registry entries are skipped by one explicit rule: the version part of
- * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`
- * or `github:`. Every other entry must parse as package@version; each unique
- * pair not listed in `minimumReleaseAgeExcludes` is looked up. A registry
+ * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`,
+ * `github:`, `http:` or `https:`. Every other entry must parse as package@version;
+ * each unique pair not listed in `minimumReleaseAgeExcludes` is looked up. A registry
  * request that fails, times out, or returns no publish time fails the check.
  *
  * Exit codes:
@@ -24,7 +24,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
-const NON_REGISTRY_PREFIXES = ["workspace:", "file:", "link:", "git:", "git+", "github:"];
+const NON_REGISTRY_PREFIXES = [
+  "workspace:",
+  "file:",
+  "link:",
+  "git:",
+  "git+",
+  "github:",
+  "http:",
+  "https:",
+];
 
 /** Encode a package name for a registry URL: `@scope/name` → `@scope%2fname`. */
 export function encodePackageName(name) {
@@ -191,7 +200,7 @@ export function collectLockEntries(lock) {
       );
     }
     const resolution = entry[0];
-    const at = resolution.lastIndexOf("@");
+    const at = resolution.indexOf("@", 1);
     if (at <= 0 || at === resolution.length - 1) {
       throw new Error(
         `bun.lock packages[${JSON.stringify(key)}] does not name a package and version`,
@@ -256,7 +265,7 @@ async function mapPool(items, limit, fn) {
     while (true) {
       const index = next++;
       if (index >= items.length) return;
-      results[index] = await fn(items[index], index);
+      results[index] = await fn(items[index]);
     }
   });
   await Promise.all(workers);

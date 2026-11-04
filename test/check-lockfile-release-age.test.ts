@@ -166,8 +166,29 @@ test("scoped package names are URL-encoded with a literal @ and %2f", async () =
   const result = await checkLockfileReleaseAge({ root, fetchImpl, now: NOW });
 
   expect(result.ok).toBe(true);
+  expect(result.checked).toBe(1);
+  expect(result.skipped).toEqual([]);
   expect(calls).toContain("https://registry.npmjs.org/@scope%2fpkg");
 }, 5000);
+
+test.each([
+  ["git-pkg", "git+ssh://git@host/repo.git#commit"],
+  ["tarball-pkg", "https://host/tarball-pkg-1.2.3.tgz"],
+  ["tarball-pkg", "http://host/tarball-pkg-1.2.3.tgz"],
+])("skips %s resolved from %s", async (name, version) => {
+  const root = fixture(lockText({ [name]: [`${name}@${version}`] }), undefined);
+  const calls = [];
+  const result = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({}, calls),
+    now: NOW,
+  });
+
+  expect(result.skipped).toEqual([{ key: name, name, version }]);
+  expect(result.checked).toBe(0);
+  expect(result.ok).toBe(true);
+  expect(calls).toEqual([]);
+});
 
 function cliScript(root) {
   mkdirSync(join(root, "scripts"), { recursive: true });
@@ -180,11 +201,12 @@ function runCli(root, published = new Date(NOW - 30 * 86_400_000).toISOString())
   const preload = join(root, "fetch.mjs");
   writeFileSync(
     preload,
-    `globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({time: {"1.2.3": ${JSON.stringify(published)}, "2.0.0": ${JSON.stringify(published)}}})});`,
+    'globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({time: {"1.2.3": process.env.BOB_TEST_PUBLISHED, "2.0.0": process.env.BOB_TEST_PUBLISHED}})});',
   );
   const cli = spawnSync(process.execPath, ["--no-install", "--preload", preload, cliScript(root)], {
     encoding: "utf8",
     timeout: 5000,
+    env: { ...process.env, BOB_TEST_PUBLISHED: published },
   });
   expect(cli.error).toBeUndefined();
   return cli;
