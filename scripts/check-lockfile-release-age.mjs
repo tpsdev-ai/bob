@@ -10,8 +10,7 @@
  * Non-registry entries are skipped by one explicit rule: the version part of
  * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`,
  * `github:`, `http:` or `https:`. Every other entry must parse as package@version;
- * each unique pair not listed in `minimumReleaseAgeExcludes` is looked up. A registry
- * request that fails, times out, or returns no publish time fails the check.
+ * each unique pair not listed in `minimumReleaseAgeExcludes` is looked up.
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
@@ -20,9 +19,150 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { parseArgs } from "node:util";
+import { parseArgs, parseEnv } from "node:util";
+
+const DEFAULT_REGISTRY = "https://registry.npmjs.org";
+const REGISTRY_ENV = ["BUN_CONFIG_REGISTRY", "NPM_CONFIG_REGISTRY", "npm_config_registry"];
+
+function namedError(name, message) {
+  return Object.assign(new Error(message), { name });
+}
+
+function requireNpmRegistry(value, source, tarball = false) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {}
+  if (
+    url?.protocol !== "https:" ||
+    url.hostname !== "registry.npmjs.org" ||
+    url.port ||
+    (!tarball && (url.pathname !== "/" || url.search || url.hash))
+  ) {
+    throw namedError("UnsupportedRegistry", `${source} must use the default npm registry`);
+  }
+}
+
+function optionalText(path) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function expandRegistry(value, env) {
+  return value.replace(
+    /\$\{([^}?]+)(\?)?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (match, key, optional, bare) => env[key ?? bare] ?? (optional ? "" : match),
+  );
+}
+
+function checkTomlRegistries(config, source, env) {
+  const check = (value, key, inheritDefault = false) => {
+    if (value === undefined) return;
+    const url = isPlainObject(value) ? value.url : value;
+    if (url === undefined && isPlainObject(value)) return;
+    const expanded = typeof url === "string" ? expandRegistry(url, env) : url;
+    if (inheritDefault && expanded === "") return;
+    requireNpmRegistry(expanded, `${source} ${key}`);
+  };
+  check(config.install?.registry, "install.registry");
+  const scopes = config.install?.scopes;
+  if (scopes !== undefined && !isPlainObject(scopes)) {
+    throw namedError("UnsupportedRegistry", `${source} install.scopes must be a table`);
+  }
+  for (const [scope, value] of Object.entries(scopes ?? {})) {
+    check(value, `install.scopes.${scope}`, true);
+  }
+}
+
+function checkNpmrcRegistries(text, source, env) {
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    const match = line.match(/^\s*([^=]+?)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1].replace(/^['"]|['"]$/g, "");
+    if (!/^(?:registry|@[^:]+:registry)$/i.test(key)) continue;
+    let value = match[2].trim();
+    if (value.startsWith('"') || value.startsWith("'")) {
+      const end = value.indexOf(value[0], 1);
+      value = end < 0 ? value : value.slice(1, end);
+    } else {
+      value = value.replace(/\\([;#])|[;#].*$/g, (_match, escaped) => escaped ?? "").trim();
+    }
+    const expanded = expandRegistry(value, env);
+    if (key.startsWith("@") && expanded === "") continue;
+    requireNpmRegistry(expanded, `${source} ${key}`);
+  }
+}
+
+function checkRegistryConfiguration(root, bunfigText, env) {
+  const config = bunTomlParser()(bunfigText);
+  const installEnv = { ...env };
+  if (config.env !== false && config.env?.file !== false) {
+    const mode = (env.BUN_ENV ?? env.NODE_ENV) === "development" ? "development" : "production";
+    for (const file of [`.env.${mode}.local`, ".env.local", `.env.${mode}`, ".env"]) {
+      const text = optionalText(join(root, file));
+      if (text === undefined) continue;
+      const values = parseEnv(text);
+      for (const [key, value] of Object.entries(values)) {
+        if (REGISTRY_ENV.includes(key)) {
+          requireNpmRegistry(expandRegistry(value, { ...values, ...installEnv }), `${file} ${key}`);
+        }
+        installEnv[key] ??= expandRegistry(value, { ...values, ...installEnv });
+      }
+    }
+  }
+  for (const key of REGISTRY_ENV) {
+    if (env[key] !== undefined) requireNpmRegistry(env[key], key);
+  }
+  const home = installEnv.HOME ?? homedir();
+  const xdg = installEnv.XDG_CONFIG_HOME;
+  const userconfig = installEnv.NPM_CONFIG_USERCONFIG ?? installEnv.npm_config_userconfig;
+  const xdgNpmrc = xdg ? join(xdg, ".npmrc") : undefined;
+  const userNpmrc = userconfig
+    ? resolve(root, userconfig.startsWith("~/") ? join(home, userconfig.slice(2)) : userconfig)
+    : xdgNpmrc && optionalText(xdgNpmrc) !== undefined
+      ? xdgNpmrc
+      : join(home, ".npmrc");
+  for (const path of new Set([userNpmrc, join(root, ".npmrc")])) {
+    const text = optionalText(path);
+    if (text !== undefined) checkNpmrcRegistries(text, path, installEnv);
+  }
+  const globalBunfig = join(xdg && isAbsolute(xdg) ? xdg : home, ".bunfig.toml");
+  const globalText = optionalText(globalBunfig);
+  if (globalText !== undefined) {
+    checkTomlRegistries(bunTomlParser()(globalText), globalBunfig, installEnv);
+  }
+  checkTomlRegistries(config, "bunfig.toml", installEnv);
+}
+
+function requireTestRegistry(registry, env) {
+  let url;
+  try {
+    url = new URL(registry);
+  } catch {}
+  if (
+    env.BOB_RELEASE_AGE_TEST_REGISTRY !== "1" ||
+    !url ||
+    !["http:", "https:"].includes(url.protocol) ||
+    !(url.hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(url.hostname)) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw namedError(
+      "TestRegistryOverrideRefused",
+      "--registry requires an enabled loopback test registry",
+    );
+  }
+}
 
 const NON_REGISTRY_PREFIXES = [
   "workspace:",
@@ -212,6 +352,9 @@ export function collectLockEntries(lock) {
       skipped.push({ key, name, version });
       continue;
     }
+    if (entry[1] !== undefined && entry[1] !== "") {
+      requireNpmRegistry(entry[1], `bun.lock packages[${JSON.stringify(key)}] resolution`, true);
+    }
     const id = `${name}\u0000${version}`;
     if (seen.has(id)) continue;
     seen.add(id);
@@ -224,11 +367,19 @@ async function lookupPublishTime(name, version, options) {
   const { fetchImpl, registry, timeoutMs } = options;
   const url = `${registry.replace(/\/+$/, "")}/${encodePackageName(name)}`;
   let response;
+  const totalSignal = AbortSignal.timeout(60_000);
   try {
-    response = await fetchImpl(url, {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      response = await fetchImpl(url, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.any([totalSignal, AbortSignal.timeout(timeoutMs)]),
+        redirect: "error",
+      });
+      if (attempt !== 0 || ![429, 503].includes(response?.status)) break;
+      const delayMs = retryAfterMs(response.headers?.get("retry-after"), Date.now());
+      await response.body?.cancel();
+      await sleep(delayMs, undefined, { signal: totalSignal });
+    }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     throw new Error(`registry request failed for ${name}@${version}: ${reason}`);
@@ -257,6 +408,12 @@ async function lookupPublishTime(name, version, options) {
   return publishedAt;
 }
 
+export function retryAfterMs(value, now) {
+  if (!value) return 1000;
+  const delay = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+  return Number.isNaN(delay) ? 1000 : Math.min(30_000, Math.max(0, delay));
+}
+
 /** Run fn over items with at most `limit` in flight; results keep input order. */
 async function mapPool(items, limit, fn) {
   const results = new Array(items.length);
@@ -280,7 +437,8 @@ export async function checkLockfileReleaseAge(options = {}) {
     root = join(dirname(fileURLToPath(import.meta.url)), ".."),
     fetchImpl = globalThis.fetch,
     now = Date.now(),
-    registry = "https://registry.npmjs.org",
+    registry,
+    env = process.env,
     concurrency = 8,
     timeoutMs = 15_000,
   } = options;
@@ -297,6 +455,8 @@ export async function checkLockfileReleaseAge(options = {}) {
 
   const bunfigText = readFileSync(join(root, "bunfig.toml"), "utf8");
   const policy = readBunfigPolicy(bunfigText);
+  checkRegistryConfiguration(root, bunfigText, env);
+  if (registry !== undefined) requireTestRegistry(registry, env);
   const lockText = readFileSync(join(root, "bun.lock"), "utf8");
   const lock = parseBunLock(lockText);
   const { entries, skipped } = collectLockEntries(lock);
@@ -308,6 +468,12 @@ export async function checkLockfileReleaseAge(options = {}) {
     if (excludedSet.has(entry.name)) excluded.push(entry);
     else toCheck.push(entry);
   }
+  if (toCheck.length === 0) {
+    throw namedError(
+      "EmptyCheckedSet",
+      "bun.lock has no registry versions to check after exclusions",
+    );
+  }
 
   const bakeMs = policy.bakeSeconds * 1000;
   const lookupFailures = [];
@@ -316,7 +482,7 @@ export async function checkLockfileReleaseAge(options = {}) {
     try {
       const publishedAt = await lookupPublishTime(entry.name, entry.version, {
         fetchImpl,
-        registry,
+        registry: registry ?? DEFAULT_REGISTRY,
         timeoutMs,
       });
       const ageMs = now - publishedAt;
@@ -331,7 +497,7 @@ export async function checkLockfileReleaseAge(options = {}) {
     }
   });
 
-  tooYoung.sort((a, b) => b.ageMs - a.ageMs);
+  tooYoung.sort((a, b) => a.ageMs - b.ageMs);
   return {
     ok: tooYoung.length === 0 && lookupFailures.length === 0,
     bakeSeconds: policy.bakeSeconds,

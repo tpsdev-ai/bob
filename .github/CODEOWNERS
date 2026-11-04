@@ -19,3 +19,4 @@
 /.github/                           @tps-sherlock @tps-kern @tps-flint
 /biome.json                         @tps-kern @tps-flint
 /package.json                       @tps-sherlock @tps-kern @tps-flint
+/bunfig.toml                        @tps-sherlock @tps-kern @tps-flint
