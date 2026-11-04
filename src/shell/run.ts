@@ -1456,10 +1456,9 @@ async function runBoundedSession(
     }
   });
 
-  // bob#214: one flat usage record per model request (prompt, cached-prompt,
-  // completion and thinking tokens, time to first token, model), written when
-  // the request's assistant message ends. A NON-delta record: the delta cap
-  // never drops it.
+  // bob#214: one flat usage record per ended assistant message (prompt, cached-prompt,
+  // completion and thinking tokens, time to first token, model). A NON-delta
+  // record: the delta cap never drops it.
   // bob#185 item 2: when the selected row declares a budget, a request whose
   // stopReason is "length" carries the output cap in the record. bob#306: that
   // is the session model's maxTokens, read once here when the run starts.
@@ -1505,14 +1504,14 @@ async function runBoundedSession(
     return lastAssistantText(session) ?? "";
   };
 
-  // The pair the session's model actually names, so a named failure reports who
-  // answered. The run's config pair is the fallback for a session that carries no
-  // model object.
-  const servedPair = (): { provider: string; model: string } => {
+  const emptyResponseFailure = (): { provider: string; model: string; retries: number } => {
+    const exhaustion = observer.emptyResponseExhaustion();
+    if (exhaustion !== undefined) return exhaustion;
     const m = (session as { model?: { provider?: unknown; id?: unknown } }).model;
     return {
       provider: typeof m?.provider === "string" ? m.provider : provider,
       model: typeof m?.id === "string" ? m.id : model,
+      retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
     };
   };
 
@@ -1678,6 +1677,7 @@ async function runBoundedSession(
     )
       failed = true;
     if (!outcome.ok) {
+      const emptyFailure = emptyResponseFailure();
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
       exitCode = 1;
@@ -1709,9 +1709,7 @@ async function runBoundedSession(
             t: now().toISOString(),
             outcome: {
               reason: "empty_response",
-              provider: servedPair().provider,
-              model: servedPair().model,
-              retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
+              ...emptyFailure,
             },
           },
           false,
@@ -1728,7 +1726,7 @@ async function runBoundedSession(
                 : reason === "narration_only"
                   ? ` (the session ended without a final report — its last turn carried ${narrationShape()}, after ${narrationReprompts} re-prompt(s))`
                   : reason === "empty_response"
-                    ? ` (the provider ${servedPair().provider} returned an empty response for model ${servedPair().model} — no content blocks and zero output tokens — after ${DEFAULT_MAX_EMPTY_RESPONSE_RETRIES} re-issued request(s))`
+                    ? ` (the provider ${emptyFailure.provider} returned an empty response for model ${emptyFailure.model} — no content blocks and zero output tokens — after ${emptyFailure.retries} re-issued request(s))`
                     : " (the session settled without a final message)") +
           "\n",
       );

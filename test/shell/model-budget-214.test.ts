@@ -9,8 +9,8 @@
 //      ended by bob's backstop after more streamed pieces than the cap (pieces,
 //      not tokens: never early, possibly late), and the cut message holds only
 //      the pieces bob accepted, even when later events are already queued;
-//   4. the run log carries one usage record per request (prompt, cached-prompt,
-//      completion and thinking tokens, time to first token, model);
+//   4. the run log carries one usage record per ended assistant message (prompt,
+//      cached-prompt, completion and thinking tokens, time to first token, model);
 //   5. the thinking level reaches the provider's request.
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -1003,9 +1003,9 @@ describe("bob#214 — a cut message holds only the pieces bob accepted, never pi
   });
 });
 
-// ─── 4. Per-request usage in the run log ────────────────────────────────────
+// ─── 4. Usage in the run log ────────────────────────────────────
 
-describe("bob#214 — the run log carries one usage record per model request", () => {
+describe("bob#214 — the run log carries one usage record per ended assistant message", () => {
   it("records prompt, cached-prompt, completion and thinking tokens, time to first token and the model", async () => {
     const T0 = Date.parse("2026-09-29T12:00:00.000Z");
     let clock = T0;

@@ -1,11 +1,10 @@
-// bob#214 — one usage record per model request, for the run log.
+// bob#214 — one usage record per ended assistant message, for the run log.
 //
 // The run log already carries every event, but reading token counts and timing
 // out of it meant reverse engineering: prompt tokens split across `input` and
 // `cacheRead`, time to first token only from the gap between the message's
 // timestamp and the first streamed delta, and thinking tokens reported as 0 by
-// servers that do not count them. This tracker turns each agent request into
-// one flat record when its assistant message ends.
+// servers that do not count them.
 //
 // Sources, stated so a reader knows what each number is:
 //   * start          — the assistant message's `timestamp`, which pi-ai sets

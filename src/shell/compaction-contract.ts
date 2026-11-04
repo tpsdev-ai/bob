@@ -24,7 +24,10 @@
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
 
 import { spawnSync } from "node:child_process";
-import { emptyResponseExhaustionOf } from "./empty-response-marker.js";
+import {
+  type EmptyResponseExhaustion,
+  emptyResponseExhaustionOf,
+} from "./empty-response-marker.js";
 import { gitEnvironment } from "./git-environment.js";
 
 /** The explicit continue turn sent as the single retry. */
@@ -376,6 +379,7 @@ export interface CompactionObserver {
    *  start of a new enclosing operation. It is never inferred from an error's
    *  text, which a provider also controls. */
   emptyResponseExhausted(): boolean;
+  emptyResponseExhaustion(): EmptyResponseExhaustion | undefined;
   /** Start a NEW enclosing operation (a fresh admitted turn): clear the capture
    *  and the exhaustion latch. Never call this at a turn boundary inside the
    *  operation the latch belongs to — that would let a later message replace an
@@ -397,7 +401,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
-  let emptyResponseExhausted = false;
+  let emptyResponseExhaustion: EmptyResponseExhaustion | undefined;
   let lastStopReason: string | undefined;
   let agentEnded = false;
 
@@ -428,10 +432,11 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
     lastEnding: () => lastEnding,
-    emptyResponseExhausted: () => emptyResponseExhausted,
+    emptyResponseExhausted: () => emptyResponseExhaustion !== undefined,
+    emptyResponseExhaustion: () => emptyResponseExhaustion,
     beginOperation: () => {
       clearCapture();
-      emptyResponseExhausted = false;
+      emptyResponseExhaustion = undefined;
     },
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
@@ -461,7 +466,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
           // run's final message. The exhaustion latch is deliberately NOT part
           // of the capture: a compaction cannot undo a failed request.
           clearCapture();
-          if (opts.inject !== undefined && emptyResponseExhausted) {
+          if (opts.inject !== undefined && emptyResponseExhaustion !== undefined) {
             log(
               'bob: the turn exhausted the empty-response bound before this compaction — not sending the "what remains" note',
             );
@@ -518,7 +523,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             lastEndFailed = failed;
             lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
-            if (emptyResponseExhaustionOf(e.message) !== undefined) emptyResponseExhausted = true;
+            emptyResponseExhaustion ??= emptyResponseExhaustionOf(e.message);
           }
           deltaBuffer = "";
           return;

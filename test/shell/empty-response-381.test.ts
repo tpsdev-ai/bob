@@ -16,7 +16,7 @@
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
 // over the same factory; the last block unit-tests the retry bound.
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -37,6 +37,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
+  type AgentSession,
   createAgentSessionRuntime,
   ModelRuntime,
   SessionManager,
@@ -47,6 +48,7 @@ import {
   DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
   EMPTY_RESPONSE_MARK,
   resolveMaxEmptyResponseRetries,
+  withEmptyResponseRetry,
 } from "../../src/shell/empty-response.js";
 import { startPersistent } from "../../src/shell/persistent.js";
 import { type RunSession, type RunSessionFactory, runAgent } from "../../src/shell/run.js";
@@ -249,6 +251,7 @@ afterEach(async () => {
 async function liveFactory(
   reply: (agentCall: number, request: SeenRequest) => Reply,
   seen: SeenRequest[],
+  maxRetries?: number,
 ): Promise<{
   factory: RunSessionFactory;
   sessions: RunSession[];
@@ -269,7 +272,10 @@ async function liveFactory(
     apiKey: "stub-key",
     api: STUB_API,
     baseUrl: "http://localhost:0",
-    streamSimple: scriptedProvider(reply, seen),
+    streamSimple:
+      maxRetries === undefined
+        ? scriptedProvider(reply, seen)
+        : withEmptyResponseRetry(scriptedProvider(reply, seen), { maxRetries }),
     models: [
       {
         id: STUB_MODEL,
@@ -444,6 +450,65 @@ describe("empty response after a compaction checkpoint (#381)", () => {
       retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
     });
     expect(records.at(-1)).toEqual({ done: true, exitCode: 1, reason: "empty_response" });
+  }, 30_000);
+
+  it("attributes exhaustion to the failed request after the real session changes model", async () => {
+    const seen: SeenRequest[] = [];
+    const retries = 1;
+    const laterModel = "later-model";
+    const live = await liveFactory(
+      (agentCall) =>
+        agentCall <= retries + 1
+          ? { kind: "empty", inputTokens: 1_000 }
+          : { kind: "text", text: "Late answer.", inputTokens: 1_000 },
+      seen,
+      retries,
+    );
+    const diagnostics: string[] = [];
+    const stderr = spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      diagnostics.push(String(chunk));
+      return true;
+    });
+    try {
+      const result = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "do the thing",
+        sessionFactory: async (config) => {
+          const session = (await live.factory(config)) as unknown as AgentSession;
+          const prompt = session.prompt.bind(session);
+          session.prompt = async (text, options) => {
+            await prompt(text, options);
+            expect(live.ended.at(-1)?.stopReason).toBe("error");
+            const model = session.model;
+            expect(model?.id).toBe(STUB_MODEL);
+            if (model === undefined) throw new Error("missing session model");
+            await session.setModel({ ...model, id: laterModel });
+            await prompt("deliver the late answer", options);
+            expect(session.model?.id).toBe(laterModel);
+          };
+          return session as unknown as RunSession;
+        },
+      });
+      expect(seen.filter((r) => !r.summarization)).toHaveLength(retries + 2);
+      expect(live.ended.at(-1)?.content).toEqual([{ type: "text", text: "Late answer." }]);
+      expect(result.exitCode).toBe(1);
+      expect(result.reason).toBe("empty_response");
+      expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
+        reason: "empty_response",
+        provider: STUB_PROVIDER,
+        model: STUB_MODEL,
+        retries,
+      });
+      const diagnostic = diagnostics.find((line) => line.includes("REFUSING to report success"));
+      expect(diagnostic).toContain(
+        `the provider ${STUB_PROVIDER} returned an empty response for model ${STUB_MODEL}`,
+      );
+      expect(diagnostic).toContain(`after ${retries} re-issued request(s)`);
+      expect(diagnostic).not.toContain(laterModel);
+    } finally {
+      stderr.mockRestore();
+    }
   }, 30_000);
 
   it("c: bob#256's reasoning-only turn is unchanged — re-prompted with a new continuation turn", async () => {
