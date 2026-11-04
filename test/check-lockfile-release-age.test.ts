@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkLockfileReleaseAge } from "../scripts/check-lockfile-release-age.mjs";
@@ -153,3 +154,73 @@ test("scoped package names are URL-encoded with a literal @ and %2f", async () =
   expect(result.ok).toBe(true);
   expect(calls).toContain("https://registry.npmjs.org/@scope%2fpkg");
 }, 5000);
+
+const malformedExcludes = [
+  [
+    "a non-array value before a later array",
+    '"fresh-pkg"\nother = ["fresh-pkg"]',
+    "must be an array of strings",
+  ],
+  ["an array with a non-string", '["fresh-pkg", 1]', "must be an array of strings"],
+  [
+    "an unterminated array before a later array",
+    '["fresh-pkg",\nother = ["fresh-pkg"]',
+    "must be an array of strings",
+  ],
+  [
+    "an omitted value before a later array",
+    '\nother = ["fresh-pkg"]',
+    "must be an array of strings",
+  ],
+  ["a missing comma", '["fresh-pkg" "other"]', "expected , or ]"],
+  ["a repeated comma", '["fresh-pkg",,]', "must be an array of strings"],
+  ["text after the array", '["fresh-pkg"] false', "has unexpected text after ]"],
+  ["an unclosed array", '["fresh-pkg",', "has no closing ]"],
+];
+
+test.each(malformedExcludes)(
+  "minimumReleaseAgeExcludes refuses %s",
+  async (_label, value, problem) => {
+    const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+    writeFileSync(
+      join(root, "bunfig.toml"),
+      `${bunfigText(undefined)}minimumReleaseAgeExcludes = ${value}\n`,
+    );
+    await expect(
+      checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW }),
+    ).rejects.toThrow(`bunfig.toml minimumReleaseAgeExcludes ${problem}`);
+
+    mkdirSync(join(root, "scripts"));
+    const script = join(root, "scripts", "check-lockfile-release-age.mjs");
+    copyFileSync(new URL("../scripts/check-lockfile-release-age.mjs", import.meta.url), script);
+    const cli = spawnSync("node", [realpathSync(script)], { encoding: "utf8" });
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain(`bunfig.toml minimumReleaseAgeExcludes ${problem}`);
+  },
+);
+
+test("omitted minimumReleaseAgeExcludes is an empty list", async () => {
+  const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+  const result = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({ "old-pkg": { "2.0.0": new Date(NOW - 30 * 86_400_000).toISOString() } }),
+    now: NOW,
+  });
+  expect(result.excludes).toEqual([]);
+  expect(result.excluded).toEqual([]);
+  expect(result.checked).toBe(1);
+  expect(result.ok).toBe(true);
+});
+
+test("minimumReleaseAgeExcludes accepts a multiline string array with a trailing comma", async () => {
+  const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+  writeFileSync(
+    join(root, "bunfig.toml"),
+    `${bunfigText(undefined)}minimumReleaseAgeExcludes = [\n  'fresh-pkg', # reason\n]\nother = []\n`,
+  );
+  const result = await checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW });
+  expect(result.excludes).toEqual(["fresh-pkg"]);
+  expect(result.checked).toBe(0);
+  expect(result.ok).toBe(true);
+});

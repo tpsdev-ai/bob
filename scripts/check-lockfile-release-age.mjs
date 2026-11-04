@@ -19,8 +19,8 @@
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
- *   1 — at least one package version is younger than the bake
- *   2 — a policy, lockfile or registry lookup could not be read (fail closed)
+ *   1 — at least one version is too young, even if a registry lookup also fails
+ *   2 — policy/lockfile error, or lookup failure with no too-young version
  */
 
 import { readFileSync } from "node:fs";
@@ -159,72 +159,44 @@ function installTableLines(text) {
 
 /** Parse a TOML array of strings starting at its opening bracket. */
 function parseTomlStringArray(text, start) {
-  let i = start + 1;
-  let quote = null;
-  let escaped = false;
-  for (; i < text.length; i++) {
-    const c = text[i];
-    if (quote !== null) {
-      if (quote === '"' && escaped) escaped = false;
-      else if (quote === '"' && c === "\\") escaped = true;
-      else if (c === quote) quote = null;
-      continue;
-    }
-    if (c === '"' || c === "'") quote = c;
-    else if (c === "]") break;
-  }
-  if (i >= text.length) throw new Error("bunfig.toml minimumReleaseAgeExcludes has no closing ]");
-  const body = text.slice(start + 1, i);
   const items = [];
-  let j = 0;
-  while (j < body.length) {
-    const c = body[j];
-    if (/\s/.test(c) || c === ",") {
-      j++;
-      continue;
+  let i = start + 1;
+  while (true) {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (i >= text.length) {
+      throw new Error("bunfig.toml minimumReleaseAgeExcludes has no closing ]");
     }
-    if (c === '"') {
-      let k = j + 1;
-      let esc = false;
-      for (; k < body.length; k++) {
-        const d = body[k];
-        if (esc) esc = false;
-        else if (d === "\\") esc = true;
-        else if (d === '"') break;
+    if (text[i] === "]") {
+      if (!/^[ \t]*(?:\r?\n|$)/.test(text.slice(i + 1))) {
+        throw new Error("bunfig.toml minimumReleaseAgeExcludes has unexpected text after ]");
       }
-      if (k >= body.length)
-        throw new Error("bunfig.toml minimumReleaseAgeExcludes has an unterminated string");
-      let value;
-      try {
-        value = JSON.parse(body.slice(j, k + 1));
-      } catch (err) {
-        throw new Error(
-          `bunfig.toml minimumReleaseAgeExcludes has an invalid string: ${err.message}`,
-        );
-      }
-      items.push(value);
-      j = k + 1;
-      continue;
+      return items;
     }
-    if (c === "'") {
-      const k = body.indexOf("'", j + 1);
-      if (k === -1)
-        throw new Error("bunfig.toml minimumReleaseAgeExcludes has an unterminated string");
-      items.push(body.slice(j + 1, k));
-      j = k + 1;
-      continue;
+    const token = /"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'/y;
+    token.lastIndex = i;
+    const match = token.exec(text);
+    if (!match) {
+      throw new Error("bunfig.toml minimumReleaseAgeExcludes must be an array of strings");
     }
-    throw new Error(
-      `bunfig.toml minimumReleaseAgeExcludes must be an array of strings; found ${JSON.stringify(c)}`,
-    );
+    try {
+      items.push(match[0][0] === '"' ? JSON.parse(match[0]) : match[0].slice(1, -1));
+    } catch (err) {
+      throw new Error(
+        `bunfig.toml minimumReleaseAgeExcludes has an invalid string: ${err.message}`,
+      );
+    }
+    i = token.lastIndex;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text[i] === ",") i++;
+    else if (text[i] !== "]") {
+      throw new Error("bunfig.toml minimumReleaseAgeExcludes expected , or ] after a string");
+    }
   }
-  return items;
 }
 
 /**
  * Read the release-age policy from bunfig.toml.
- * Returns { bakeSeconds, excludes }. A missing or malformed value throws: the
- * check has no default bake and no default exclusion list.
+ * Omitted minimumReleaseAgeExcludes is an empty list; malformed values throw.
  */
 export function readBunfigPolicy(text) {
   const install = installTableLines(text);
@@ -248,11 +220,11 @@ export function readBunfigPolicy(text) {
     throw new Error(`bunfig.toml minimumReleaseAge is out of range: ${bakeMatch[1]}`);
   }
 
-  const excludesKey = /^\s*minimumReleaseAgeExcludes\s*=/m.exec(install);
+  const excludesKey = /^[ \t]*minimumReleaseAgeExcludes[ \t]*=[ \t]*/m.exec(install);
   let excludes = [];
   if (excludesKey) {
-    const start = install.indexOf("[", excludesKey.index);
-    if (start === -1) {
+    const start = excludesKey.index + excludesKey[0].length;
+    if (install[start] !== "[") {
       throw new Error("bunfig.toml minimumReleaseAgeExcludes must be an array of strings");
     }
     excludes = parseTomlStringArray(install, start);
@@ -265,10 +237,11 @@ function isPlainObject(value) {
 }
 
 /**
- * Collect every installed copy in bun.lock's `packages` map.
- * Returns { entries, skipped }: entries are unique registry package versions,
- * in lock order, and skipped are explicit non-registry copies. A malformed
- * entry, an empty map, or a resolution without a version throws.
+ * Collect bun.lock's `packages` entries, including optional platform packages.
+ * Returns { entries, skipped }: unique registry pairs and non-registry entries.
+ * A missing/non-object or empty map, non-array entry, or missing/empty/non-string
+ * resolution throws, as does a resolution without a name or version.
+ * A one-element entry containing a name@version string is accepted.
  */
 export function collectLockEntries(lock) {
   const packages = lock?.packages;
@@ -363,7 +336,7 @@ async function mapPool(items, limit, fn) {
 }
 
 /**
- * Check every registry package version in bun.lock against bunfig.toml's bake.
+ * Filter out bunfig.toml exclusions before checking registry versions against its bake.
  * `fetchImpl` and `now` are injectable for tests; production uses node's fetch
  * and the current time.
  */
