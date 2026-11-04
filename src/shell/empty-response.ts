@@ -1,9 +1,9 @@
 // bob#381 — an empty model response is not the end of the task.
 //
-// A provider can answer a request with an assistant message that carries no
-// content blocks at all and reports zero output tokens. pi treats a turn with
-// no tool call as the agent being finished, so such a response ends a one-shot
-// run mid-task — as a missing final message, never a completion — and lets an
+// A provider can answer without an error or abort, with an assistant message
+// that carries no content blocks and reports zero output tokens. pi treats a
+// turn with no tool call as the agent being finished, so such a response ends a
+// one-shot run mid-task — as a missing final message, never a completion — and lets an
 // admitted persistent turn complete without a reply.
 //
 // bob#256's re-prompt does not cover it. That path is for a REASONING-ONLY
@@ -20,8 +20,9 @@
 // function: an inner wrapper may add its own per-call inputs (when the
 // output-cap wrapper applies a cap, model-budget.ts, it replaces the caller's
 // abort signal with its own), so the provider sees the same model and context,
-// not a promise of identical options objects. The empty attempt is dropped
-// before pi can see it, so it can never count as the turn that ended the run.
+// not a promise of identical options objects. Before the bound, an empty attempt
+// that starts no block and ends without an error or abort is dropped before
+// pi sees it.
 // The retry is BOUNDED by a constant, and past the bound the request ends with a
 // named error that names the provider, the model and the empty response.
 //
@@ -54,10 +55,7 @@ export {
   emptyResponseExhaustionOf,
 } from "./empty-response-marker.js";
 
-/** The most empty responses re-issued for one request: bob#256's reasoning-only
- *  bound (3), so a model that answers nothing is given the same number of
- *  chances whether it answers with thinking only or with nothing at all. A
- *  CONSTANT, never a function of the model's output. */
+/** The per-request retry ceiling, sharing bob#256's numeric bound. */
 export const DEFAULT_MAX_EMPTY_RESPONSE_RETRIES = DEFAULT_MAX_REASONING_REPROMPTS;
 
 /**
@@ -87,8 +85,7 @@ export function isEmptyResponse(message: AssistantMessage): boolean {
   return typeof output === "number" && output === 0;
 }
 
-/** True when an event introduces a content block. It is the moment the attempt
- *  stops being empty, and the point from which its events are forwarded. */
+/** True for a block-start event, which flushes held events and begins forwarding. */
 function startsBlock(event: AssistantMessageEvent): boolean {
   return (
     event.type === "text_start" ||
@@ -123,16 +120,13 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
 }
 
 /**
- * Wrap a stream function so an empty response is re-issued, bounded, instead of
- * ending the run.
+ * Re-issue a request only when its stream starts no content block and ends with
+ * no content blocks, zero output tokens, and neither an error nor an abort,
+ * while retries remain. Past the bound, pi receives an error naming the
+ * provider, model and empty response (`emptyResponseErrorText`).
  *
- * Each attempt's events are held until its first content block. An attempt that
- * ends with no content block and zero output tokens is discarded whole — pi
- * never sees its `start` or its end — and the same request is issued again. An
- * attempt that produces a block is forwarded from that block on, as the wrapped
- * stream sent it. Past the bound the request ends with an error message whose
- * `errorMessage` names the provider, the model and the empty response
- * (`emptyResponseErrorText`).
+ * On a block-start event, held events are flushed and forwarding begins.
+ * Content present only in the terminal message is forwarded at the end.
  */
 export function withEmptyResponseRetry(
   inner: StreamFunction,

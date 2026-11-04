@@ -9,8 +9,9 @@
 // (a) one empty response right after a compaction checkpoint, then a normal
 //     response: the run completes, and the provider sees the checkpoint request
 //     re-issued — the same context twice, no new user message;
-// (b) always empty: the named error after the bound, with the bound's number of
-//     provider calls, in the run log's final record and the exit code;
+// (b) always empty: the named error after the retry bound; the final log record
+//     carries the reason and exit code; the separate outcome record carries
+//     the reason, provider, model and retries;
 // (c) bob#256's reasoning-only case, unchanged: a thinking-only turn is still
 //     re-prompted with a new continuation turn.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -397,7 +398,7 @@ describe("empty response after a compaction checkpoint (#381)", () => {
     expect(res.stdout).toBe("DONE: the task is finished.");
   }, 20_000);
 
-  it("b: always empty ends with the named error after the bound, at the bound's number of calls", async () => {
+  it("b: always empty ends with the named error after the bound", async () => {
     const seen: SeenRequest[] = [];
     const live = await liveFactory(() => ({ kind: "empty", inputTokens: 1_000 }), seen);
     const errors: string[] = [];
