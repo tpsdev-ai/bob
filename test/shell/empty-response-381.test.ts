@@ -105,7 +105,7 @@ function lastUser(content: Context["messages"]): string {
 
 /**
  * A scripted provider. Each AGENT request is answered from `reply(agentCall,
- * lastUserText)`; pi's own summarization request (the compaction) is answered
+ * request)`; pi's own summarization request (the compaction) is answered
  * with a fixed summary. An `empty` reply streams no content block at all and
  * reports zero output tokens — the shape the issue names.
  */
@@ -567,6 +567,105 @@ describe("an exhausted empty response through the persistent admission (#381)", 
       await handle.shutdown();
     }
   }, 30_000);
+});
+
+/** The real session with one completed prior turn, so the automatic compaction
+ *  after the exhausted turn has history to compact. */
+async function seededLiveFactory(
+  reply: (agentCall: number, request: SeenRequest) => Reply,
+  seen: SeenRequest[],
+  seedText = "prior turn",
+) {
+  const live = await liveFactory(reply, seen);
+  const build = live.factory;
+  live.factory = async (config) => {
+    const session = await build(config);
+    await session.prompt(seedText, { expandPromptTemplates: false });
+    return session;
+  };
+  return live;
+}
+
+describe("an exhausted turn stays failed through automatic compaction (#381)", () => {
+  const PROMPT = "x".repeat(240_000);
+
+  it("the one-shot run fails with empty_response and sends no continuation", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await seededLiveFactory(
+      (agentCall) =>
+        agentCall === 1
+          ? { kind: "text", text: "PRIOR: done.", inputTokens: 1_000 }
+          : agentCall <= DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 2
+            ? { kind: "empty", inputTokens: 60_000 }
+            : { kind: "text", text: "DONE: answered after compaction.", inputTokens: 1_000 },
+      seen,
+    );
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: PROMPT,
+      captureStdout: true,
+      sessionFactory: live.factory,
+    });
+    const agentRequests = seen.filter((r) => !r.summarization);
+    // The prior turn plus the exhausted request and its bound's re-issues; the
+    // compaction runs, and no message follows it.
+    expect(agentRequests).toHaveLength(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 2);
+    expect(live.compactions).toHaveLength(1);
+    expect(live.compactions[0]?.result).toBeTruthy();
+    expect(agentRequests.some((r) => r.lastUserText.includes("[BOB CONTINUE"))).toBe(false);
+    expect(agentRequests.some((r) => r.messagesJson.includes("[BOB WHAT REMAINS"))).toBe(false);
+    expect(res.exitCode).toBe(1);
+    expect(res.reason).toBe("empty_response");
+  }, 60_000);
+
+  it("the persistent admission rejects the turn and the scheduler records a fire error", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await seededLiveFactory(
+      (agentCall) =>
+        agentCall === 1
+          ? { kind: "text", text: "PRIOR: done.", inputTokens: 1_000 }
+          : agentCall <= DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 2
+            ? { kind: "empty", inputTokens: 60_000 }
+            : { kind: "text", text: "DONE: answered after compaction.", inputTokens: 1_000 },
+      seen,
+    );
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot: root,
+      log: () => {},
+      sessionFactory: live.factory,
+    });
+    const fireLogs: string[] = [];
+    const timers: Array<() => void> = [];
+    const scheduler = startCronScheduler({
+      entries: [{ name: "nightly", schedule: "* * * * *", prompt: PROMPT }],
+      fire: (entry) => handle.admitTurn({ kind: "cron", job: entry.name }, entry.prompt ?? PROMPT),
+      log: (m) => fireLogs.push(m),
+      setTimer: (cb): TimerHandle => {
+        timers.push(cb);
+        return 0 as unknown as TimerHandle;
+      },
+      clearTimer: () => {},
+    });
+    try {
+      timers.splice(0).forEach((cb) => {
+        cb();
+      });
+      for (let i = 0; i < 600 && !fireLogs.some((l) => l.includes("fire error")); i += 1) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const agentRequests = seen.filter((r) => !r.summarization);
+      expect(fireLogs.some((l) => l.includes("fire error"))).toBe(true);
+      expect(fireLogs.some((l) => l.includes("empty response"))).toBe(true);
+      expect(agentRequests).toHaveLength(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 2);
+      expect(live.compactions).toHaveLength(1);
+      expect(agentRequests.some((r) => r.messagesJson.includes("[BOB WHAT REMAINS"))).toBe(false);
+    } finally {
+      scheduler.stop();
+      await handle.shutdown();
+    }
+  }, 60_000);
 });
 
 describe("the empty-response bound (#381)", () => {

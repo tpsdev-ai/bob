@@ -206,7 +206,13 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
   // the launcher, so the consumer above neither holds nor submits to it.
-  const admission = createTurnAdmission({ log, toolLoopLimit, name: opts.name });
+  let observer: ReturnType<typeof createCompactionObserver> | undefined;
+  const admission = createTurnAdmission({
+    log,
+    toolLoopLimit,
+    name: opts.name,
+    onTurnStart: () => observer?.beginOperation(),
+  });
   config.turnAdmission = admission;
   let session: RunSession;
   try {
@@ -229,7 +235,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   // in the system prompt, so a note that fails to send is logged and the
   // runtime keeps serving. The note uses pi's steer path; it does not
   // submit a new bob admission or supply an origin.
-  const observer = createCompactionObserver({
+  const compactionObserver = createCompactionObserver({
     worktreeStatus: () => readWorktreeStatus(config.cwd),
     // bob#244: refused in a web session (the note carries workspace data).
     inject: gatedNoteInjection(config, "compaction-note", (text) =>
@@ -237,7 +243,8 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     ),
     log,
   });
-  const unsubscribeContract = session.subscribe((event) => observer.observe(event));
+  observer = compactionObserver;
+  const unsubscribeContract = session.subscribe((event) => compactionObserver.observe(event));
 
   // Every scheduled turn goes through the same admission as inbound Discord.
   let cronScheduler: CronSchedulerHandle | undefined;

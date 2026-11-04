@@ -51,6 +51,9 @@ export interface NarrationRetryOptions {
    *  reasoning budget, so a continuation that ends reasoning-only is handled
    *  exactly as any other turn. */
   afterTurn?: () => Promise<void>;
+  /** Checked before every send. A true value ends the loop, so an exhausted
+   *  request can never be re-prompted by a continuation. */
+  shouldStop?: () => boolean;
   /** Test/log seam: called once per re-prompt with the 1-based count and max. */
   onReprompt?: (n: number, max: number) => void;
 }
@@ -83,7 +86,7 @@ export async function repromptWhileNarrating(
   const max = resolveMaxNarrationReprompts(opts.maxReprompts);
   const send = opts.send ?? ((text: string) => promptSession(opts.session, text));
   let reprompts = 0;
-  while (reprompts < max && opts.narrating()) {
+  while (reprompts < max && opts.shouldStop?.() !== true && opts.narrating()) {
     reprompts += 1;
     opts.onReprompt?.(reprompts, max);
     opts.beginTurn?.();

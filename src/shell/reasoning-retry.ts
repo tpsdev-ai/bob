@@ -62,6 +62,9 @@ export interface ReasoningRetryOptions {
    *  text)`. A one-shot caller passes its BOUNDED sender, so a stalled
    *  continuation is bounded exactly like the first prompt. */
   send?: (text: string) => Promise<void>;
+  /** Checked before every send. A true value ends the loop, so an exhausted
+   *  request can never be re-prompted by a continuation. */
+  shouldStop?: () => boolean;
   /** Test/log seam: called once per re-prompt with the 1-based count and max. */
   onReprompt?: (n: number, max: number) => void;
 }
@@ -93,7 +96,7 @@ export async function repromptWhileReasoningOnly(
   const send = opts.send ?? ((text: string) => promptSession(opts.session, text));
   let reprompts = 0;
   let ending = opts.readEnding();
-  while (reprompts < max && ending?.reasoningOnly === true) {
+  while (reprompts < max && opts.shouldStop?.() !== true && ending?.reasoningOnly === true) {
     reprompts += 1;
     opts.onReprompt?.(reprompts, max);
     opts.beginTurn?.();

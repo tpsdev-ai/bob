@@ -1,7 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createEventBus, type EventBus } from "@earendil-works/pi-coding-agent";
 import { createAssistantEndingTracker } from "./compaction-contract.js";
-import { EmptyResponseExhaustedError, emptyResponseExhaustionOf } from "./empty-response-marker.js";
+import {
+  EmptyResponseExhaustedError,
+  type EmptyResponseExhaustion,
+  emptyResponseExhaustionOf,
+} from "./empty-response-marker.js";
 import { ReasoningOnlyExhaustedError, repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
@@ -63,6 +67,10 @@ export function createTurnAdmission(
     // rejects anyway (test seam; default LOOP_ABORT_GRACE_MS). The binding is
     // kept until the prompt settles either way.
     loopAbortGraceMs?: number;
+    // The start of a NEW admitted turn. A persistent runtime uses it to open a
+    // fresh compaction boundary and clear its empty-response latch; the
+    // admission's own latch is per Turn and needs no reset.
+    onTurnStart?: () => void;
   } = {},
 ) {
   const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
@@ -79,6 +87,10 @@ export function createTurnAdmission(
     // False once the operation's prompt chain settles; the token is absent
     // from then on, even to a context that inherited this turn earlier.
     live: boolean;
+    // Set once ANY assistant message in this admitted operation carries the
+    // empty-response wrapper's typed exhaustion provenance. It is never cleared
+    // by a later message or compaction: the operation has failed.
+    exhaustion?: EmptyResponseExhaustion;
     abort?: (err: Error) => void;
   };
   const context = new AsyncLocalStorage<Turn>();
@@ -96,6 +108,13 @@ export function createTurnAdmission(
       session = value;
       value.subscribe((event) => {
         endings.observe(event);
+        if (event.type === "message_end" && event.message?.role === "assistant") {
+          const endingTurn = context.getStore();
+          if (endingTurn && endingTurn === active) {
+            const exhaustion = emptyResponseExhaustionOf(event.message);
+            if (exhaustion !== undefined) endingTurn.exhaustion = exhaustion;
+          }
+        }
         if (event.type === "tool_execution_start") {
           const turn = context.getStore();
           if (turn && turn === active) {
@@ -124,6 +143,16 @@ export function createTurnAdmission(
         // origin is cleared once, after the admitted prompt has resolved or
         // rejected (see admitTurn's finally).
         turn.messages = event.messages;
+        // The typed marker is copied onto the message; read every assistant
+        // message in the turn, not only the last one, so a later compaction or
+        // continuation cannot erase it.
+        for (const message of event.messages) {
+          const exhaustion = emptyResponseExhaustionOf(message);
+          if (exhaustion !== undefined) {
+            turn.exhaustion = exhaustion;
+            break;
+          }
+        }
       });
       ready();
     },
@@ -172,6 +201,7 @@ export function createTurnAdmission(
           abortTurn = reject;
         });
         turn.abort = (err) => abortTurn(err);
+        opts.onTurnStart?.();
         active = turn;
         // The prompt itself, tracked apart from the race and from the abort:
         // only its settlement releases the turn's origin binding.
@@ -190,6 +220,7 @@ export function createTurnAdmission(
                 session: target,
                 readEnding: () => endings.current(),
                 beginTurn: () => endings.reset(),
+                shouldStop: () => turn.exhaustion !== undefined,
                 onReprompt: (n, max) =>
                   log(
                     `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
@@ -207,12 +238,14 @@ export function createTurnAdmission(
           // bob#381: an admitted turn whose request exhausted the empty-response
           // bound must FAIL, not resolve as if the turn had completed: a cron
           // fire would otherwise record success and a Discord turn would return
-          // with no reply. The wrapper's typed provenance is the only signal
-          // read; a provider's error text is not.
+          // with no reply. The per-turn latch is read first, so a later
+          // compaction or answer cannot replace the failed request. The wrapper's
+          // typed provenance is the only signal read; a provider's error text is
+          // not.
           const lastAssistant = [...turn.messages]
             .reverse()
             .find((message) => (message as { role?: unknown }).role === "assistant");
-          const exhaustion = emptyResponseExhaustionOf(lastAssistant);
+          const exhaustion = turn.exhaustion ?? emptyResponseExhaustionOf(lastAssistant);
           if (exhaustion !== undefined) throw new EmptyResponseExhaustedError(exhaustion);
           return turn.messages;
         } finally {

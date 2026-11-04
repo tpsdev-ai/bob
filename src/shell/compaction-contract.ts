@@ -372,11 +372,18 @@ export interface CompactionObserver {
   /** The classification of the LAST assistant message that ended since the
    *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
-  /** True when the LAST assistant message that ended since the boundary carries
-   *  the typed exhaustion provenance from empty-response-marker.ts (bob#381),
-   *  set locally by the empty-response wrapper. It is never inferred from an error's text, which a
-   *  provider also controls. */
-  lastEmptyResponseExhausted(): boolean;
+  /** True when this run or admitted turn has seen the typed exhaustion
+   *  provenance from empty-response-marker.ts (bob#381), set locally by the
+   *  empty-response wrapper. The latch is set once and survives compaction and
+   *  every later message event; it is cleared only by `beginOperation` at the
+   *  start of a new enclosing operation. It is never inferred from an error's
+   *  text, which a provider also controls. */
+  emptyResponseExhausted(): boolean;
+  /** Start a NEW enclosing operation (a fresh admitted turn): clear the capture
+   *  and the exhaustion latch. Never call this at a turn boundary inside the
+   *  operation the latch belongs to — that would let a later message replace an
+   *  exhausted request's failure. */
+  beginOperation(): void;
 }
 
 /**
@@ -405,7 +412,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
-  let lastEmptyResponseExhausted = false;
+  let emptyResponseExhausted = false;
   let lastStopReason: string | undefined;
   let agentEnded = false;
 
@@ -414,7 +421,6 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     sawAssistantEnd = false;
     lastEndFailed = false;
     lastEnding = undefined;
-    lastEmptyResponseExhausted = false;
     lastStopReason = undefined;
     deltaBuffer = "";
     agentEnded = false;
@@ -437,7 +443,11 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
     lastEnding: () => lastEnding,
-    lastEmptyResponseExhausted: () => lastEmptyResponseExhausted,
+    emptyResponseExhausted: () => emptyResponseExhausted,
+    beginOperation: () => {
+      clearCapture();
+      emptyResponseExhausted = false;
+    },
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -463,8 +473,15 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             return;
           }
           // The boundary: everything streamed BEFORE this compaction is not the
-          // run's final message.
+          // run's final message. The exhaustion latch is deliberately NOT part
+          // of the capture: a compaction cannot undo a failed request.
           clearCapture();
+          if (opts.inject !== undefined && emptyResponseExhausted) {
+            log(
+              'bob: the turn exhausted the empty-response bound before this compaction — not sending the "what remains" note',
+            );
+            return;
+          }
           if (opts.inject === undefined) return;
           const note = noteFor();
           log(`bob: sending the best-effort "what remains" note (${note.length} chars)`);
@@ -516,7 +533,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             lastEndFailed = failed;
             lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
-            lastEmptyResponseExhausted = emptyResponseExhaustionOf(e.message) !== undefined;
+            if (emptyResponseExhaustionOf(e.message) !== undefined) emptyResponseExhausted = true;
           }
           deltaBuffer = "";
           return;

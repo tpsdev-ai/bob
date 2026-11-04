@@ -1539,7 +1539,7 @@ async function runBoundedSession(
     let reasoningReprompts = 0;
     const budgetLeft = (): number => DEFAULT_MAX_REASONING_REPROMPTS - reasoningReprompts;
     const drainReasoningOnly = async (): Promise<void> => {
-      if (budgetLeft() <= 0) return;
+      if (observer.emptyResponseExhausted() || budgetLeft() <= 0) return;
       const spent = await repromptWhileReasoningOnly({
         session,
         // Every re-prompt goes through the SAME bounded sender as the first
@@ -1547,6 +1547,7 @@ async function runBoundedSession(
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
+        shouldStop: () => observer.emptyResponseExhausted(),
         maxReprompts: budgetLeft(),
         onReprompt: (n) =>
           process.stderr.write(
@@ -1585,6 +1586,7 @@ async function runBoundedSession(
     // Bounded by the two constants together. With no declared markers this is
     // drainReasoningOnly.
     const drainNonFinal = async (): Promise<void> => {
+      if (observer.emptyResponseExhausted()) return;
       await drainReasoningOnly();
       if (finalMarkers === undefined || narrationBudgetLeft() <= 0) return;
       const spent = await repromptWhileNarrating({
@@ -1593,6 +1595,7 @@ async function runBoundedSession(
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         narrating,
         beginTurn: () => observer.startTurn(),
+        shouldStop: () => observer.emptyResponseExhausted(),
         afterTurn: drainReasoningOnly,
         maxReprompts: narrationBudgetLeft(),
         onReprompt: (n) =>
@@ -1615,12 +1618,13 @@ async function runBoundedSession(
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
     let outcome = judge();
-    if (observer.lastEmptyResponseExhausted()) {
+    if (observer.emptyResponseExhausted()) {
       // bob#381: the provider answered with no content and zero output tokens,
       // and re-issuing the SAME request up to the bound did not change that. The
-      // empty turn is a named failure, never a completion — and it is decided
-      // BEFORE the compaction continue turn, which is a NEW user message and not
-      // a re-issued request.
+      // latch outlives any later compaction and message event, so a text answer
+      // after the failed request cannot turn the run green. It is decided BEFORE
+      // the compaction continue turn, which is a NEW user message and not a
+      // re-issued request.
       outcome = { ok: false, reason: "empty_response" };
     } else if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
       // Budget exhausted on a reasoning-only ending: report the honest failure
@@ -1667,7 +1671,7 @@ async function runBoundedSession(
       }
       // bob#381: the continue turn's own request may be the one whose empty
       // responses outlasted the bound.
-      if (observer.lastEmptyResponseExhausted()) {
+      if (observer.emptyResponseExhausted()) {
         outcome = { ok: false, reason: "empty_response" };
       }
       // bob#365: still narrating after the retry is likewise a failure.
