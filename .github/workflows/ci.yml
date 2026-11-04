@@ -171,6 +171,6 @@ jobs:
       # not applied to the committed lockfile. This compares each checked registry
       # version with its npm publish time.
       - name: Lockfile release-age bake
-        run: node scripts/check-lockfile-release-age.mjs
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - name: Check for known vulnerabilities
         run: bun audit

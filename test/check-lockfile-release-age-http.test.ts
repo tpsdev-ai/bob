@@ -33,8 +33,9 @@ async function checkCli(delay: number, timeout: number, status: number) {
     const cli = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
       (resolve, reject) => {
         const child = spawn(
-          "node",
+          process.execPath,
           [
+            "--no-install",
             realpathSync(script),
             "--registry",
             `http://127.0.0.1:${address.port}`,
@@ -59,7 +60,7 @@ async function checkCli(delay: number, timeout: number, status: number) {
     expect(cli.code).toBe(status);
     if (status === 2) {
       expect(cli.stderr).toContain("registry request failed for old-pkg@1.0.0:");
-      expect(cli.stderr).toMatch(/timeout|aborted/i);
+      expect(cli.stderr).toMatch(/timeout|timed out|aborted/i);
     } else {
       expect(cli.stderr).toBe("");
       expect(cli.stdout).toContain("All 1 checked package version(s) are at least 7-day old.");
@@ -73,9 +74,9 @@ async function checkCli(delay: number, timeout: number, status: number) {
 }
 
 test(
-  "Node fetch: delayed publish-time lookup fails naming the package",
+  "Bun fetch: delayed publish-time lookup fails naming the package",
   () => checkCli(1500, 250, 2),
   15_000,
 );
 
-test("Node fetch: in-time publish-time lookup passes", () => checkCli(0, 5000, 0), 15_000);
+test("Bun fetch: in-time publish-time lookup passes", () => checkCli(0, 5000, 0), 15_000);

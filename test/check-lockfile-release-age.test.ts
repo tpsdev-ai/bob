@@ -3,7 +3,11 @@ import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkLockfileReleaseAge, parseBunLock } from "../scripts/check-lockfile-release-age.mjs";
+import {
+  checkLockfileReleaseAge,
+  parseBunLock,
+  readBunfigPolicy,
+} from "../scripts/check-lockfile-release-age.mjs";
 
 const NOW = Date.UTC(2026, 10, 2, 0, 0, 0);
 const BAKE_SECONDS = 7 * 24 * 60 * 60;
@@ -165,50 +169,121 @@ test("scoped package names are URL-encoded with a literal @ and %2f", async () =
   expect(calls).toContain("https://registry.npmjs.org/@scope%2fpkg");
 }, 5000);
 
-const malformedExcludes = [
-  [
-    "a non-array value before a later array",
-    '"fresh-pkg"\nother = ["fresh-pkg"]',
-    "must be an array of strings",
-  ],
-  ["an array with a non-string", '["fresh-pkg", 1]', "must be an array of strings"],
-  [
-    "an unterminated array before a later array",
-    '["fresh-pkg",\nother = ["fresh-pkg"]',
-    "must be an array of strings",
-  ],
-  [
-    "an omitted value before a later array",
-    '\nother = ["fresh-pkg"]',
-    "must be an array of strings",
-  ],
-  ["a missing comma", '["fresh-pkg" "other"]', "expected , or ]"],
-  ["a repeated comma", '["fresh-pkg",,]', "must be an array of strings"],
-  ["text after the array", '["fresh-pkg"] false', "has unexpected text after ]"],
-  ["an unclosed array", '["fresh-pkg",', "has no closing ]"],
-];
+function cliScript(root) {
+  mkdirSync(join(root, "scripts"), { recursive: true });
+  const script = join(root, "scripts", "check-lockfile-release-age.mjs");
+  copyFileSync(new URL("../scripts/check-lockfile-release-age.mjs", import.meta.url), script);
+  return realpathSync(script);
+}
 
-test.each(malformedExcludes)(
-  "minimumReleaseAgeExcludes refuses %s",
-  async (_label, value, problem) => {
+function runCli(root, published = new Date(NOW - 30 * 86_400_000).toISOString()) {
+  const preload = join(root, "fetch.mjs");
+  writeFileSync(
+    preload,
+    `globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({time: {"1.2.3": ${JSON.stringify(published)}, "2.0.0": ${JSON.stringify(published)}}})});`,
+  );
+  const cli = spawnSync(process.execPath, ["--no-install", "--preload", preload, cliScript(root)], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  expect(cli.error).toBeUndefined();
+  return cli;
+}
+
+test.each([
+  ['"fresh-pkg"\nother = ["fresh-pkg"]', "install.minimumReleaseAgeExcludes"],
+  ['["fresh-pkg", 1]', "install.minimumReleaseAgeExcludes"],
+  ['["fresh-pkg", ""]', "install.minimumReleaseAgeExcludes"],
+  ["false", "install.minimumReleaseAgeExcludes"],
+  ["42", "install.minimumReleaseAgeExcludes"],
+  ['{name = "fresh-pkg"}', "install.minimumReleaseAgeExcludes"],
+  ['["fresh-pkg",\nother = ["fresh-pkg"]', "is not parsable"],
+  ['\nother = ["fresh-pkg"]', "is not parsable"],
+  ['["fresh-pkg" "other"]', "is not parsable"],
+  ['["fresh-pkg",,]', "is not parsable"],
+  ['["fresh-pkg"] false', "is not parsable"],
+  ['["fresh-pkg",', "is not parsable"],
+])("minimumReleaseAgeExcludes refuses %s", async (value, problem) => {
+  const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+  writeFileSync(
+    join(root, "bunfig.toml"),
+    `${bunfigText(undefined)}minimumReleaseAgeExcludes = ${value}\n`,
+  );
+  await expect(
+    checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW }),
+  ).rejects.toThrow(`bunfig.toml ${problem}`);
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain(`bunfig.toml ${problem}`);
+});
+
+test.each(['"604800"', "true", "-1", "1.5", "nan", "inf", "[]", "{}"])(
+  "minimumReleaseAge refuses %s",
+  (value) => {
     const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
-    writeFileSync(
-      join(root, "bunfig.toml"),
-      `${bunfigText(undefined)}minimumReleaseAgeExcludes = ${value}\n`,
-    );
-    await expect(
-      checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW }),
-    ).rejects.toThrow(`bunfig.toml minimumReleaseAgeExcludes ${problem}`);
-
-    mkdirSync(join(root, "scripts"));
-    const script = join(root, "scripts", "check-lockfile-release-age.mjs");
-    copyFileSync(new URL("../scripts/check-lockfile-release-age.mjs", import.meta.url), script);
-    const cli = spawnSync("node", [realpathSync(script)], { encoding: "utf8" });
-    expect(cli.error).toBeUndefined();
+    writeFileSync(join(root, "bunfig.toml"), `[install]\nminimumReleaseAge = ${value}\n`);
+    const cli = runCli(root);
     expect(cli.status).toBe(2);
-    expect(cli.stderr).toContain(`bunfig.toml minimumReleaseAgeExcludes ${problem}`);
+    expect(cli.stderr).toContain("bunfig.toml install.minimumReleaseAge");
   },
 );
+
+test.each(["", "install = []\n", "install = false\n"])(
+  "refuses an invalid install table: %s",
+  (text) => {
+    const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+    writeFileSync(join(root, "bunfig.toml"), text);
+    const cli = runCli(root);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("bunfig.toml install must be a table");
+  },
+);
+
+test("refuses a missing minimumReleaseAge", () => {
+  const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+  writeFileSync(join(root, "bunfig.toml"), "[install]\n");
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("bunfig.toml install.minimumReleaseAge");
+});
+
+test("Node CLI refuses to run without Bun.TOML.parse", () => {
+  const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+  rmSync(join(root, "bunfig.toml"));
+  const cli = spawnSync("node", [cliScript(root)], { encoding: "utf8", timeout: 5000 });
+  expect(cli.error).toBeUndefined();
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("BunTOMLUnavailable");
+  expect(cli.stderr).toContain("bunfig.toml requires Bun.TOML.parse");
+});
+
+test.each(['"""', "'''"])("Bun TOML policy ignores decoys inside %s strings", (quote) => {
+  const text = `[install]
+notes = ${quote}
+minimumReleaseAge = 0
+minimumReleaseAgeExcludes = ["fresh-pkg"]
+${quote}
+minimumReleaseAge = ${BAKE_SECONDS}
+minimumReleaseAgeExcludes = ["other-pkg"]
+`;
+  const parsed = Bun.TOML.parse(text).install;
+  const root = fixture(
+    lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"], "other-pkg": ["other-pkg@2.0.0"] }),
+    undefined,
+  );
+  writeFileSync(join(root, "bunfig.toml"), text);
+  const cli = runCli(root, new Date(Date.now() - 3_600_000).toISOString());
+  expect(cli.status).toBe(1);
+  expect(cli.stdout).toContain(`(${parsed.minimumReleaseAge}s)`);
+  expect(cli.stdout).toContain(
+    `Excluded by bunfig.toml minimumReleaseAgeExcludes (1): ${parsed.minimumReleaseAgeExcludes[0]}@2.0.0`,
+  );
+  expect(cli.stderr).toContain("fresh-pkg@1.2.3");
+  expect(readBunfigPolicy(text)).toEqual({
+    bakeSeconds: parsed.minimumReleaseAge,
+    excludes: parsed.minimumReleaseAgeExcludes,
+  });
+});
 
 test("omitted minimumReleaseAgeExcludes is an empty list", async () => {
   const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
@@ -221,16 +296,47 @@ test("omitted minimumReleaseAgeExcludes is an empty list", async () => {
   expect(result.excluded).toEqual([]);
   expect(result.checked).toBe(1);
   expect(result.ok).toBe(true);
+  const cli = runCli(root);
+  expect(cli.status).toBe(0);
+  expect(cli.stdout).not.toContain("Excluded by");
 });
 
 test("minimumReleaseAgeExcludes accepts a multiline string array with a trailing comma", async () => {
   const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
   writeFileSync(
     join(root, "bunfig.toml"),
-    `${bunfigText(undefined)}minimumReleaseAgeExcludes = [\n  'fresh-pkg', # reason\n]\nother = []\n`,
+    `${bunfigText(undefined)}minimumReleaseAgeExcludes = [\n  'fresh-pkg', # reason\n  """\nother-pkg""",\n]\nother = []\n`,
   );
   const result = await checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW });
-  expect(result.excludes).toEqual(["fresh-pkg"]);
+  expect(result.excludes).toEqual(["fresh-pkg", "other-pkg"]);
   expect(result.checked).toBe(0);
   expect(result.ok).toBe(true);
+  const cli = runCli(root);
+  expect(cli.status).toBe(0);
+  expect(cli.stdout).toContain(
+    "Excluded by bunfig.toml minimumReleaseAgeExcludes (1): fresh-pkg@1.2.3",
+  );
 });
+
+test.each(["/*x*/", "/*x\ny*/", "//x\n", "//x\r", "//x\r\n"])(
+  "lock comments keep tokens separate: %s",
+  (comment) => {
+    expect(() => parseBunLock(`{"packages":{"x":["x@1.0.0"]},"meta":1${comment}2}`)).toThrow(
+      "bun.lock is not parsable",
+    );
+  },
+);
+
+test.each(["\n", "\r", "\r\n"])(
+  "lock comments preserve strings and allow trailing commas: %s",
+  (newline) => {
+    expect(
+      parseBunLock(
+        `{"packages":{"x":["x@1.0.0",/* c */]},"meta":"/*not a comment*/",// c${newline}}`,
+      ),
+    ).toEqual({
+      packages: { x: ["x@1.0.0"] },
+      meta: "/*not a comment*/",
+    });
+  },
+);

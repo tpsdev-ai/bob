@@ -1,21 +1,17 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * check-lockfile-release-age.mjs — enforce bunfig.toml's release-age bake on
  * the committed bun.lock, where `bun install --frozen-lockfile` resolves
  * nothing and therefore does not apply `minimumReleaseAge`.
  *
  * Every entry in bun.lock's `packages` map is read. The lock's resolution
- * string is parsed as package@version; the publish time comes from the npm
- * registry document's `time[version]`. The bake length and
- * `minimumReleaseAgeExcludes` are read from bunfig.toml on every run; neither
- * is hard-coded here.
+ * string is parsed as package@version.
  *
  * Non-registry entries are skipped by one explicit rule: the version part of
  * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`
  * or `github:`. Every other entry must parse as package@version; each unique
  * pair not listed in `minimumReleaseAgeExcludes` is looked up. A registry
- * request that fails, times out, or returns no publish time for that version
- * fails the check; it never passes by default.
+ * request that fails, times out, or returns no publish time fails the check.
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
@@ -39,9 +35,8 @@ export function encodePackageName(name) {
 
 /**
  * Parse bun.lock, a JSONC document Bun writes with trailing commas (and
- * optionally comments). Comments and trailing commas outside strings are
- * removed before JSON.parse; an unparsable lock throws rather than reading as
- * an empty tree.
+ * optionally comments). Comments become whitespace; trailing commas outside
+ * strings are removed before JSON.parse.
  */
 export function parseBunLock(text) {
   let out = "";
@@ -67,13 +62,18 @@ export function parseBunLock(text) {
       continue;
     }
     if (ch === "/" && text[i + 1] === "/") {
+      out += " ";
       i += 2;
-      while (i < text.length && text[i] !== "\n") i++;
+      while (i < text.length && text[i] !== "\n" && text[i] !== "\r") i++;
       continue;
     }
     if (ch === "/" && text[i + 1] === "*") {
+      out += " ";
       i += 2;
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) {
+        if (text[i] === "\n" || text[i] === "\r") out += text[i];
+        i++;
+      }
       if (i >= text.length) {
         throw new Error("bun.lock is not parsable: unterminated block comment");
       }
@@ -91,7 +91,7 @@ export function parseBunLock(text) {
         }
         if (text[j] === "/" && text[j + 1] === "/") {
           j += 2;
-          while (j < text.length && text[j] !== "\n") j++;
+          while (j < text.length && text[j] !== "\n" && text[j] !== "\r") j++;
           continue;
         }
         if (text[j] === "/" && text[j + 1] === "*") {
@@ -119,122 +119,43 @@ export function parseBunLock(text) {
   }
 }
 
-/** Remove a TOML comment, leaving '#' inside quoted strings alone. */
-function stripTomlComment(line) {
-  let out = "";
-  let quote = null;
-  let escaped = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (quote !== null) {
-      out += c;
-      if (quote === '"' && escaped) {
-        escaped = false;
-      } else if (quote === '"' && c === "\\") {
-        escaped = true;
-      } else if (c === quote) {
-        quote = null;
-      }
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      quote = c;
-      out += c;
-      continue;
-    }
-    if (c === "#") break;
-    out += c;
+function bunTomlParser() {
+  const parseToml = globalThis.Bun?.TOML?.parse;
+  if (typeof parseToml !== "function") {
+    const error = new Error("bunfig.toml requires Bun.TOML.parse; run with bun --no-install");
+    error.name = "BunTOMLUnavailable";
+    throw error;
   }
-  return out;
+  return parseToml;
 }
 
-/** The lines of bunfig.toml's [install] table, with comments removed. */
-function installTableLines(text) {
-  let section = "";
-  const lines = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = stripTomlComment(raw);
-    const header = /^\s*\[([^\]]+)\]\s*$/.exec(line);
-    if (header) {
-      section = header[1].trim();
-      continue;
-    }
-    if (section === "install") lines.push(line);
-  }
-  return lines.join("\n");
-}
-
-/** Parse a TOML array of strings starting at its opening bracket. */
-function parseTomlStringArray(text, start) {
-  const items = [];
-  let i = start + 1;
-  while (true) {
-    while (i < text.length && /\s/.test(text[i])) i++;
-    if (i >= text.length) {
-      throw new Error("bunfig.toml minimumReleaseAgeExcludes has no closing ]");
-    }
-    if (text[i] === "]") {
-      if (!/^[ \t]*(?:\r?\n|$)/.test(text.slice(i + 1))) {
-        throw new Error("bunfig.toml minimumReleaseAgeExcludes has unexpected text after ]");
-      }
-      return items;
-    }
-    const token = /"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'/y;
-    token.lastIndex = i;
-    const match = token.exec(text);
-    if (!match) {
-      throw new Error("bunfig.toml minimumReleaseAgeExcludes must be an array of strings");
-    }
-    try {
-      items.push(match[0][0] === '"' ? JSON.parse(match[0]) : match[0].slice(1, -1));
-    } catch (err) {
-      throw new Error(
-        `bunfig.toml minimumReleaseAgeExcludes has an invalid string: ${err.message}`,
-      );
-    }
-    i = token.lastIndex;
-    while (i < text.length && /\s/.test(text[i])) i++;
-    if (text[i] === ",") i++;
-    else if (text[i] !== "]") {
-      throw new Error("bunfig.toml minimumReleaseAgeExcludes expected , or ] after a string");
-    }
-  }
-}
-
-/**
- * Read the release-age policy from bunfig.toml.
- * Omitted minimumReleaseAgeExcludes is an empty list; malformed values throw.
- */
 export function readBunfigPolicy(text) {
-  const install = installTableLines(text);
-  if (install.trim() === "") {
-    throw new Error("bunfig.toml has no [install] table with minimumReleaseAge");
+  const parseToml = bunTomlParser();
+  let config;
+  try {
+    config = parseToml(text);
+  } catch (error) {
+    throw new Error(`bunfig.toml is not parsable: ${error.message}`);
   }
-  const bakeMatch = /^\s*minimumReleaseAge\s*=\s*(.+?)\s*$/m.exec(install);
-  if (!bakeMatch) {
-    throw new Error("bunfig.toml [install] has no minimumReleaseAge");
+  const install = config.install;
+  if (!isPlainObject(install)) {
+    throw new Error("bunfig.toml install must be a table");
   }
-  let raw = bakeMatch[1].trim();
-  if (raw.startsWith('"') || raw.startsWith("'")) {
-    throw new Error("bunfig.toml minimumReleaseAge must be a number of seconds");
+  const bakeSeconds = install.minimumReleaseAge;
+  if (!Number.isSafeInteger(bakeSeconds) || bakeSeconds < 0) {
+    throw new Error(
+      "bunfig.toml install.minimumReleaseAge must be a non-negative integer number of seconds",
+    );
   }
-  raw = raw.replace(/_/g, "");
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`bunfig.toml minimumReleaseAge is not a non-negative integer: ${bakeMatch[1]}`);
-  }
-  const bakeSeconds = Number(raw);
-  if (!Number.isSafeInteger(bakeSeconds)) {
-    throw new Error(`bunfig.toml minimumReleaseAge is out of range: ${bakeMatch[1]}`);
-  }
-
-  const excludesKey = /^[ \t]*minimumReleaseAgeExcludes[ \t]*=[ \t]*/m.exec(install);
-  let excludes = [];
-  if (excludesKey) {
-    const start = excludesKey.index + excludesKey[0].length;
-    if (install[start] !== "[") {
-      throw new Error("bunfig.toml minimumReleaseAgeExcludes must be an array of strings");
-    }
-    excludes = parseTomlStringArray(install, start);
+  const excludes =
+    install.minimumReleaseAgeExcludes === undefined ? [] : install.minimumReleaseAgeExcludes;
+  if (
+    !Array.isArray(excludes) ||
+    excludes.some((name) => typeof name !== "string" || name.length === 0)
+  ) {
+    throw new Error(
+      "bunfig.toml install.minimumReleaseAgeExcludes must be an array of non-empty strings",
+    );
   }
   return { bakeSeconds, excludes };
 }
@@ -344,8 +265,6 @@ async function mapPool(items, limit, fn) {
 
 /**
  * Filter out bunfig.toml exclusions before checking registry versions against its bake.
- * `fetchImpl` and `now` are injectable for tests; production uses node's fetch
- * and the current time.
  */
 export async function checkLockfileReleaseAge(options = {}) {
   const {
@@ -426,6 +345,7 @@ function formatDays(bakeSeconds) {
 async function main() {
   let result;
   try {
+    bunTomlParser();
     const { values } = parseArgs({
       options: { registry: { type: "string" }, "timeout-ms": { type: "string" } },
     });
@@ -435,7 +355,7 @@ async function main() {
     });
   } catch (err) {
     console.error(
-      `Lockfile release-age check could not run: ${err instanceof Error ? err.message : err}`,
+      `Lockfile release-age check could not run: ${err instanceof Error ? `${err.name}: ${err.message}` : err}`,
     );
     process.exit(2);
   }
