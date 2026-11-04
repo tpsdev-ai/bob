@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkLockfileReleaseAge } from "../scripts/check-lockfile-release-age.mjs";
+import { checkLockfileReleaseAge, parseBunLock } from "../scripts/check-lockfile-release-age.mjs";
 
 const NOW = Date.UTC(2026, 10, 2, 0, 0, 0);
 const BAKE_SECONDS = 7 * 24 * 60 * 60;
@@ -50,7 +50,7 @@ function stubFetch(timesByName, calls = []) {
   };
 }
 
-test("a too-young package fails naming it", async () => {
+test("a too-young checked registry version fails naming it", async () => {
   const root = fixture(
     lockText({ "fresh-pkg": ["fresh-pkg@1.2.3", "", {}, "sha512-fresh"] }),
     undefined,
@@ -137,6 +137,16 @@ test("a garbled lockfile fails", async () => {
     checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}), now: NOW }),
   ).rejects.toThrow(/not parsable/);
 }, 5000);
+
+test.each([
+  ['{"packages":{"x":["x@1.0.0"]}}/*', "unterminated block comment"],
+  ['{"packages":{"x":["x@1.0.0"],/*', "unterminated block comment"],
+  ['{"packages":{"x":["x@1.0.0"]}}"', "unterminated string"],
+  ['{"packages":{"x":["x@1.0.0', "unterminated string"],
+  ['{"packages":{"x":["x@1.0.0\\"', "unterminated string"],
+])("parseBunLock rejects %s (%s)", (text, reason) => {
+  expect(() => parseBunLock(text)).toThrow(`bun.lock is not parsable: ${reason}`);
+});
 
 test("scoped package names are URL-encoded with a literal @ and %2f", async () => {
   const root = fixture(

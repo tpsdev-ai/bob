@@ -19,13 +19,14 @@
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
- *   1 — at least one version is too young, even if a registry lookup also fails
+ *   1 — at least one checked registry version is too young, even if a lookup also fails
  *   2 — policy/lockfile error, or lookup failure with no too-young version
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
 
 const NON_REGISTRY_PREFIXES = ["workspace:", "file:", "link:", "git:", "git+", "github:"];
 
@@ -50,6 +51,7 @@ export function parseBunLock(text) {
     if (ch === '"') {
       out += ch;
       i++;
+      let closed = false;
       while (i < text.length) {
         const c = text[i];
         out += c;
@@ -57,9 +59,11 @@ export function parseBunLock(text) {
         if (c === "\\") {
           if (i < text.length) out += text[i++];
         } else if (c === '"') {
+          closed = true;
           break;
         }
       }
+      if (!closed) throw new Error("bun.lock is not parsable: unterminated string");
       continue;
     }
     if (ch === "/" && text[i + 1] === "/") {
@@ -70,7 +74,10 @@ export function parseBunLock(text) {
     if (ch === "/" && text[i + 1] === "*") {
       i += 2;
       while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
-      i = Math.min(i + 2, text.length);
+      if (i >= text.length) {
+        throw new Error("bun.lock is not parsable: unterminated block comment");
+      }
+      i += 2;
       continue;
     }
     if (ch === ",") {
@@ -356,6 +363,9 @@ export async function checkLockfileReleaseAge(options = {}) {
   if (!Number.isInteger(concurrency) || concurrency < 1) {
     throw new Error(`concurrency must be a positive integer: ${concurrency}`);
   }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new Error(`timeoutMs must be a positive integer: ${timeoutMs}`);
+  }
 
   const bunfigText = readFileSync(join(root, "bunfig.toml"), "utf8");
   const policy = readBunfigPolicy(bunfigText);
@@ -412,11 +422,17 @@ function formatDays(bakeSeconds) {
   return bakeSeconds % 86400 === 0 ? `${bakeSeconds / 86400}-day` : `${bakeSeconds}s`;
 }
 
-/** CLI: one line per failure, then a non-zero exit. */
+/** CLI: --registry and --timeout-ms override lookup defaults for local HTTP tests. */
 async function main() {
   let result;
   try {
-    result = await checkLockfileReleaseAge();
+    const { values } = parseArgs({
+      options: { registry: { type: "string" }, "timeout-ms": { type: "string" } },
+    });
+    result = await checkLockfileReleaseAge({
+      registry: values.registry,
+      timeoutMs: values["timeout-ms"] === undefined ? undefined : Number(values["timeout-ms"]),
+    });
   } catch (err) {
     console.error(
       `Lockfile release-age check could not run: ${err instanceof Error ? err.message : err}`,
@@ -438,7 +454,7 @@ async function main() {
 
   if (result.tooYoung.length > 0) {
     console.error("");
-    console.error("Package versions younger than the release-age bake:");
+    console.error("Checked registry versions younger than the release-age bake:");
     for (const entry of result.tooYoung) {
       const ageDays = (entry.ageMs / 86_400_000).toFixed(1);
       console.error(
