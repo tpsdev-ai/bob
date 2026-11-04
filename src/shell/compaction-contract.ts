@@ -373,8 +373,8 @@ export interface CompactionObserver {
    *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
   /** True when the LAST assistant message that ended since the boundary carries
-   *  this module's typed exhaustion provenance (bob#381), set locally by the
-   *  empty-response wrapper. It is never inferred from an error's text, which a
+   *  the typed exhaustion provenance from empty-response-marker.ts (bob#381),
+   *  set locally by the empty-response wrapper. It is never inferred from an error's text, which a
    *  provider also controls. */
   lastEmptyResponseExhausted(): boolean;
 }

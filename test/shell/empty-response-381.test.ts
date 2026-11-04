@@ -1,7 +1,7 @@
 // bob#381 — an empty model response after a compaction checkpoint must not end
 // the run.
 //
-// These tests drive `runAgent` through bob's ONE session factory
+// The run tests (a)-(d) drive `runAgent` through bob's ONE session factory
 // (createBobRuntimeFactory) and pi's own AgentSession runtime, with a scripted
 // PROVIDER (the fake-provider pattern of model-budget-214 / narration-turn-live:
 // a real pi session, its own events, its own turn boundaries; no network).
@@ -14,6 +14,11 @@
 //     the reason, provider, model and retries;
 // (c) bob#256's reasoning-only case, unchanged: a thinking-only turn is still
 //     re-prompted with a new continuation turn.
+// (d) a provider error whose text contains the empty-response phrase is not
+//     recorded as `empty_response` (classification reads only the typed marker).
+//
+// The admission tests drive `startPersistent` (and the real cron scheduler)
+// over the same factory; the last block unit-tests the retry bound.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   existsSync,

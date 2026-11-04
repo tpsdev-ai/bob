@@ -205,7 +205,7 @@ export function createTurnAdmission(
           // `bob run` ends on a repeated call.
           await Promise.race([prompt, loopAbort]);
           // bob#381: an admitted turn whose request exhausted the empty-response
-          // bound must FAIL, not resolve with a message pi never ended: a cron
+          // bound must FAIL, not resolve as if the turn had completed: a cron
           // fire would otherwise record success and a Discord turn would return
           // with no reply. The wrapper's typed provenance is the only signal
           // read; a provider's error text is not.

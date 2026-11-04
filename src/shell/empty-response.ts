@@ -73,9 +73,9 @@ export function resolveMaxEmptyResponseRetries(value?: number): number {
 
 /**
  * True when `message` is an empty response (bob#381): no content blocks at all
- * and zero output tokens. A message that ended on an error or an abort is a
- * failure the provider reported, not an empty response, and is left to the
- * caller's error handling.
+ * and zero output tokens. A message that ended on an error (reported by the
+ * provider) or an abort (by the caller) is not an empty response, and is left
+ * to the caller's error handling.
  */
 export function isEmptyResponse(message: AssistantMessage): boolean {
   if (message.stopReason === "error" || message.stopReason === "aborted") return false;
