@@ -143,9 +143,7 @@ export function createTurnAdmission(
         // origin is cleared once, after the admitted prompt has resolved or
         // rejected (see admitTurn's finally).
         turn.messages = event.messages;
-        // The typed marker is copied onto the message; read every assistant
-        // message in the turn, not only the last one, so a later compaction or
-        // continuation cannot erase it.
+        // The message_end latch above preserves exhaustion across compaction.
         for (const message of event.messages) {
           const exhaustion = emptyResponseExhaustionOf(message);
           if (exhaustion !== undefined) {

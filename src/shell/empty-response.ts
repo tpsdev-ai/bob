@@ -1,18 +1,6 @@
-// bob#381 — an empty model response is not the end of the task.
-//
-// A provider can answer without an error or abort, with an assistant message
-// that carries no content blocks and reports zero output tokens. pi treats a
-// turn with no tool call as the agent being finished, so such a response ends a
-// one-shot run mid-task — as a missing final message, never a completion — and lets an
-// admitted persistent turn complete without a reply.
-//
-// bob#256's re-prompt does not cover it. That path is for a REASONING-ONLY
-// ending, and `classifyAssistantEnding` requires substantive thinking content
+// bob#256's REASONING-ONLY re-prompt requires substantive thinking content
 // (compaction-contract.ts), so a message with nothing in it classifies as
 // plain silence: `reasoningOnly` is false and the re-prompt loop never fires.
-// The one continue turn after a compaction (run.ts) is a NEW user message,
-// sent once; when the model answers it empty too, the run ends without a final
-// report (`settled_after_compaction` when a compaction was seen).
 //
 // bob re-issues the SAME request instead, and this wrapper sits on pi's stream
 // function so the model and the context are handed to the provider again with
@@ -73,9 +61,7 @@ export function resolveMaxEmptyResponseRetries(value?: number): number {
 
 /**
  * True when `message` is an empty response (bob#381): no content blocks at all
- * and zero output tokens. A message that ended on an error (reported by the
- * provider) or an abort (by the caller) is not an empty response, and is left
- * to the caller's error handling.
+ * and zero output tokens, ending in neither an error nor an abort.
  */
 export function isEmptyResponse(message: AssistantMessage): boolean {
   if (message.stopReason === "error" || message.stopReason === "aborted") return false;

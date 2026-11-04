@@ -970,9 +970,6 @@ export function sessionModelLimits(
  * bob#214: install the model budget on a session pi just built — the
  * output-cap backstop on its stream function, bob#381's bounded re-issue of an
  * empty response, and the compaction check between model calls.
- * Both hook pi's PUBLIC agent surfaces (`agent.streamFunction`,
- * `agent.shouldStopAfterTurn`); a session without them cannot carry the budget
- * and is refused rather than run unbudgeted.
  */
 export function installSessionBudget(
   session: unknown,

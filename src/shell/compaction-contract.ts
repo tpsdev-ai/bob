@@ -16,10 +16,7 @@
 //     reasoning-only, or (when the run declares final markers) with narration
 //     that is not a final report, is re-prompted, bounded, and fails the run
 //     as `reasoning_only` / `narration_only` past the bound (bob#256, bob#365);
-//   * an attempt to send a BEST-EFFORT "what remains" note after non-aborted compactions, except
-//     after `agent_end` with stopReason "stop", no tool calls, willRetry false,
-//     and final text satisfying the completion contract: the text survives
-//     and no note is attempted (bob#179).
+//   * a BEST-EFFORT "what remains" note.
 //
 //     There is no direct success gate on note delivery.
 //
@@ -386,18 +383,6 @@ export interface CompactionObserver {
   beginOperation(): void;
 }
 
-/**
- * Observe the session event stream: track the compaction count and the final
- * message boundary, capture "what remains" as it goes (the agent's last stated
- * plan and the last few tool calls), and — when an `inject` seam is given —
- * attempt to send a best-effort note on non-aborted compaction, except after `agent_end`
- * with stopReason "stop", no tool calls, willRetry false, and final text satisfying
- * the completion contract.
- *
- * A failed note is LOGGED and nothing else happens. There is no verdict, no
- * refusal and no exit code attached to it: the contract it accompanies is in
- * the system prompt, so a lost note loses the plan's *reminder*, not the task.
- */
 export function createCompactionObserver(opts: CompactionObserverOptions = {}): CompactionObserver {
   const log = opts.log ?? (() => {});
   const recentToolCalls = opts.recentToolCalls ?? DEFAULT_RECENT_TOOL_CALLS;

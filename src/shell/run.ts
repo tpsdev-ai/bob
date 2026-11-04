@@ -820,10 +820,6 @@ export interface RunResult {
   // or `reasoning_only` / `narration_only` past a re-prompt bound — bob#256,
   // bob#365). Undefined on exit 0.
   reason?: SilenceReason;
-  // True when the run FAILED rather than settled: the prompt threw, or the last
-  // assistant message ended on an error/abort. Undefined otherwise — a run with
-  // no final message that did NOT fail simply had nothing to say. (A mail turn
-  // retries a failure and sends no reply for silence.)
   failed?: true;
   // bob#143 item 3: set when the loop breaker ended the run — the same tool call
   // repeated `toolLoopLimit` times in a row. The exit code is non-zero.
@@ -1483,9 +1479,6 @@ async function runBoundedSession(
   let failed = false;
   let aborted: TerminationReason | undefined;
 
-  // #145: Non-aborted compactions attempt a note unless a response after
-  // `agent_end` has stopReason "stop", no tool calls, compaction willRetry false,
-  // and final text satisfying the completion contract.
   // The observer also owns the final-message boundary the judge reads.
   const observer = createCompactionObserver({
     isComplete: (text) => judge(text).ok,
@@ -1669,16 +1662,14 @@ async function runBoundedSession(
       if (!outcome.ok && observer.lastEnding()?.reasoningOnly === true) {
         outcome = { ok: false, reason: "reasoning_only" };
       }
+      // bob#365: still narrating after the retry is likewise a failure.
+      if (narrating()) outcome = { ok: false, reason: "narration_only" };
       // bob#381: the continue turn's own request may be the one whose empty
       // responses outlasted the bound.
       if (observer.emptyResponseExhausted()) {
         outcome = { ok: false, reason: "empty_response" };
       }
-      // bob#365: still narrating after the retry is likewise a failure.
-      if (narrating()) outcome = { ok: false, reason: "narration_only" };
     }
-    // A run with no final message whose last message ended on an error or an
-    // abort FAILED; one that ended cleanly with nothing to say did not.
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
     if (
       outcome.reason === "reasoning_only" ||
@@ -1713,8 +1704,6 @@ async function runBoundedSession(
           false,
         );
       } else if (reason === "empty_response") {
-        // bob#381: the named empty-response failure. It names the pair that
-        // served the session and the bound; no model text exists to record.
         writeRunLog(
           {
             t: now().toISOString(),

@@ -1,6 +1,3 @@
-// bob#381 — an empty model response after a compaction checkpoint must not end
-// the run.
-//
 // The run tests (a)-(d) drive `runAgent` through bob's ONE session factory
 // (createBobRuntimeFactory) and pi's own AgentSession runtime, with a scripted
 // PROVIDER (the fake-provider pattern of model-budget-214 / narration-turn-live:
@@ -44,7 +41,7 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
+import { CONTINUE_TURN, REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
 import { startCronScheduler, type TimerHandle } from "../../src/shell/cron.js";
 import {
   DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
@@ -588,6 +585,51 @@ async function seededLiveFactory(
 
 describe("an exhausted turn stays failed through automatic compaction (#381)", () => {
   const PROMPT = "x".repeat(240_000);
+
+  it("continue-turn exhaustion takes precedence over late narration with final markers", async () => {
+    const seen: SeenRequest[] = [];
+    const latePrompt = "deliver the late narration";
+    const narration = "Still checking the work.";
+    const live = await seededLiveFactory((agentCall, request) => {
+      if (agentCall === 1) return { kind: "text", text: "PRIOR: done.", inputTokens: 1_000 };
+      if (agentCall === 2) return { kind: "text", text: "", inputTokens: 60_000 };
+      if (request.lastUserText === latePrompt) {
+        return { kind: "text", text: narration, inputTokens: 1_000 };
+      }
+      return request.lastUserText === CONTINUE_TURN
+        ? { kind: "empty", inputTokens: 1_000 }
+        : { kind: "text", text: "", inputTokens: 1_000 };
+    }, seen);
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: PROMPT,
+      finalMarkers: ["DONE:"],
+      captureStdout: true,
+      sessionFactory: async (config) => {
+        const session = await live.factory(config);
+        const prompt = session.prompt.bind(session);
+        session.prompt = async (text, options) => {
+          await prompt(text, options);
+          if (text === CONTINUE_TURN) await prompt(latePrompt, options);
+        };
+        return session;
+      },
+    });
+    const agentRequests = seen.filter((r) => !r.summarization);
+    expect(live.compactions).toHaveLength(1);
+    expect(live.compactions[0]?.result).toBeTruthy();
+    expect(agentRequests.filter((r) => r.lastUserText === CONTINUE_TURN)).toHaveLength(
+      DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1,
+    );
+    expect(agentRequests.at(-1)?.lastUserText).toBe(latePrompt);
+    expect(live.ended.at(-2)?.stopReason).toBe("error");
+    expect(live.ended.at(-1)?.content).toEqual([{ type: "text", text: narration }]);
+    expect(res.exitCode).toBe(1);
+    expect(res.failed).toBe(true);
+    expect(res.reason).toBe("empty_response");
+    expect(runLogRecords().at(-1)).toEqual({ done: true, exitCode: 1, reason: "empty_response" });
+  }, 60_000);
 
   it("the one-shot run fails with empty_response and sends no continuation", async () => {
     const seen: SeenRequest[] = [];

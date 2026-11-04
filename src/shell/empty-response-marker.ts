@@ -44,8 +44,7 @@ export function emptyResponseExhaustionOf(message: unknown): EmptyResponseExhaus
   return { provider: record.provider, model: record.model, retries: record.retries };
 }
 
-/** The typed failure an admitted turn rejects with when its last assistant
- *  message is the exhausted empty-response error. */
+/** The typed failure for any marked message in the admitted turn. */
 export class EmptyResponseExhaustedError extends Error {
   constructor(readonly exhaustion: EmptyResponseExhaustion) {
     super(emptyResponseErrorText(exhaustion.provider, exhaustion.model, exhaustion.retries));
