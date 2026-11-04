@@ -2,8 +2,9 @@
 //
 // A provider can answer a request with an assistant message that carries no
 // content blocks at all and reports zero output tokens. pi treats a turn with
-// no tool call as the agent being finished, so such a response ends the run
-// mid-task, with no error and nothing retried.
+// no tool call as the agent being finished, so such a response ends a one-shot
+// run mid-task — as a missing final message, never a completion — and lets an
+// admitted persistent turn complete without a reply.
 //
 // bob#256's re-prompt does not cover it. That path is for a REASONING-ONLY
 // ending, and `classifyAssistantEnding` requires substantive thinking content
@@ -14,16 +15,21 @@
 // report (`settled_after_compaction` when a compaction was seen).
 //
 // bob re-issues the SAME request instead, and this wrapper sits on pi's stream
-// function so that is literally what happens: the same model, context and
-// options are handed to the provider again, with nothing added to the
-// transcript. The empty attempt is dropped before pi can see it, so it can
-// never count as the turn that ended the run. The retry is BOUNDED by a
-// constant, and past the bound the request ends with a named error that names
-// the provider, the model and the empty response.
+// function so the model and the context are handed to the provider again with
+// nothing added to the transcript. Each attempt re-runs the wrapped stream
+// function: an inner wrapper may add its own per-call inputs (when the
+// output-cap wrapper applies a cap, model-budget.ts, it replaces the caller's
+// abort signal with its own), so the provider sees the same model and context,
+// not a promise of identical options objects. The empty attempt is dropped
+// before pi can see it, so it can never count as the turn that ended the run.
+// The retry is BOUNDED by a constant, and past the bound the request ends with a
+// named error that names the provider, the model and the empty response.
 //
-// The bound is DEFAULT_MAX_REASONING_REPROMPTS — the constant bob#256 uses for
-// its reasoning-only re-prompts. One constant for "the model answered but said
-// nothing"; the two paths cannot drift apart.
+// The bound is DEFAULT_MAX_REASONING_REPROMPTS — the number bob#256 uses for its
+// reasoning-only re-prompts. It bounds a different thing: the re-issues of ONE
+// provider request, reset for every request, while bob#256's budget bounds the
+// continuation turns of a whole run or admitted turn. The two budgets are
+// independent; they only share the number.
 
 import {
   type AssistantMessage,
@@ -32,30 +38,27 @@ import {
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_REASONING_REPROMPTS } from "./compaction-contract.js";
+import {
+  EMPTY_RESPONSE_EXHAUSTED,
+  type EmptyResponseExhaustion,
+  emptyResponseErrorText,
+} from "./empty-response-marker.js";
 import type { StreamFunction } from "./model-budget.js";
+
+export {
+  EMPTY_RESPONSE_EXHAUSTED,
+  EMPTY_RESPONSE_MARK,
+  EmptyResponseExhaustedError,
+  type EmptyResponseExhaustion,
+  emptyResponseErrorText,
+  emptyResponseExhaustionOf,
+} from "./empty-response-marker.js";
 
 /** The most empty responses re-issued for one request: bob#256's reasoning-only
  *  bound (3), so a model that answers nothing is given the same number of
  *  chances whether it answers with thinking only or with nothing at all. A
  *  CONSTANT, never a function of the model's output. */
 export const DEFAULT_MAX_EMPTY_RESPONSE_RETRIES = DEFAULT_MAX_REASONING_REPROMPTS;
-
-/** The phrase an exhausted request's error carries. It is produced only by this
- *  module, so a run can tell an empty-response failure from any other error
- *  ending, and nothing from the model is ever needed to name it. */
-export const EMPTY_RESPONSE_MARK =
-  "returned an empty response (no content blocks, zero output tokens)";
-
-/** True when an assistant message's error text says the empty-response bound was
- *  spent. */
-export function isEmptyResponseExhausted(errorText: string | undefined): boolean {
-  return typeof errorText === "string" && errorText.includes(EMPTY_RESPONSE_MARK);
-}
-
-/** The named error for a request whose empty responses outlasted the bound. */
-export function emptyResponseErrorText(provider: string, model: string, retries: number): string {
-  return `the provider ${provider} ${EMPTY_RESPONSE_MARK} for model ${model} after ${retries} retries`;
-}
 
 /**
  * Resolve the empty-response retry budget: a positive INTEGER, capped at the
@@ -126,8 +129,8 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
  * Each attempt's events are held until its first content block. An attempt that
  * ends with no content block and zero output tokens is discarded whole — pi
  * never sees its `start` or its end — and the same request is issued again. An
- * attempt that produces a block is forwarded from that block on, exactly as the
- * provider sent it. Past the bound the request ends with an error message whose
+ * attempt that produces a block is forwarded from that block on, as the wrapped
+ * stream sent it. Past the bound the request ends with an error message whose
  * `errorMessage` names the provider, the model and the empty response
  * (`emptyResponseErrorText`).
  */
@@ -182,12 +185,19 @@ export function withEmptyResponseRetry(
         }
         if (!forwarded && isEmptyResponse(terminal)) {
           if (retries >= maxRetries) {
-            const message: AssistantMessage = {
+            const message: AssistantMessage & {
+              [EMPTY_RESPONSE_EXHAUSTED]: EmptyResponseExhaustion;
+            } = {
               ...terminal,
               content: [],
               usage: zeroUsage(),
               stopReason: "error",
               errorMessage: emptyResponseErrorText(model.provider, model.id, retries),
+              [EMPTY_RESPONSE_EXHAUSTED]: {
+                provider: model.provider,
+                model: model.id,
+                retries,
+              },
             };
             out.push({ type: "error", reason: "error", error: message });
             out.end(message);

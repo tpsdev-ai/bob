@@ -90,7 +90,7 @@ import {
   isVerifiedEdit,
   type RepositoryState,
 } from "./edit-evidence.js";
-import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES, isEmptyResponseExhausted } from "./empty-response.js";
+import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES } from "./empty-response.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -1615,7 +1615,7 @@ async function runBoundedSession(
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
     let outcome = judge();
-    if (isEmptyResponseExhausted(observer.lastError())) {
+    if (observer.lastEmptyResponseExhausted()) {
       // bob#381: the provider answered with no content and zero output tokens,
       // and re-issuing the SAME request up to the bound did not change that. The
       // empty turn is a named failure, never a completion — and it is decided
@@ -1667,7 +1667,7 @@ async function runBoundedSession(
       }
       // bob#381: the continue turn's own request may be the one whose empty
       // responses outlasted the bound.
-      if (isEmptyResponseExhausted(observer.lastError())) {
+      if (observer.lastEmptyResponseExhausted()) {
         outcome = { ok: false, reason: "empty_response" };
       }
       // bob#365: still narrating after the retry is likewise a failure.

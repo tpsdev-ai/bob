@@ -365,9 +365,10 @@ change one, the named test is what tells you.
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
   `final_shape_mismatch` / `reasoning_only` / `narration_only`).
-  An assistant message with no content blocks and zero output tokens is not an
-  ending: the SAME request is re-issued up to three times, and a still-empty
-  answer fails the run as `empty_response`, naming the provider and the model.
+  An assistant message with no content blocks and zero output tokens is
+  re-issued as the SAME request up to three times; a still-empty answer ends
+  the request with an error naming the provider and the model, and a one-shot
+  run fails as `empty_response`.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`, `narration-turn.test.ts`,
   `narration-turn-live.test.ts` — a real pi session on a scripted provider,

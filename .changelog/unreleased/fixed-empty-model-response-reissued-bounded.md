@@ -1,8 +1,9 @@
-- **An empty model response is re-issued, bounded, instead of ending the run
-  mid-task.** A provider that answers a request with no content blocks and zero
-  output tokens used to end the run silently: such a turn carries no tool call,
-  so pi treats it as the agent being finished, and it carries no thinking, so
-  bob#256's reasoning-only re-prompt never sees it. bob now re-issues the same
-  request (the same context, with no message added) up to three times; still
-  empty, the run ends with the named `empty_response` failure, whose outcome
-  record names the provider, the model and the retries, and the run exits 1.
+- **An empty model response is re-issued, bounded, instead of ending the task
+  mid-turn.** A provider that answers a request with no content blocks and zero
+  output tokens ends a turn with no tool call — pi treats that as the agent
+  being finished — and carries no thinking, so bob#256's reasoning-only
+  re-prompt never sees it. bob now re-issues the same request up to three times;
+  still empty, the request ends with an error naming the provider and the model.
+  A one-shot run then fails as `empty_response` and exits 1; when run logging is
+  enabled and succeeds, its outcome record names the provider, the model and the
+  retries. An admitted persistent turn rejects as a failed turn.

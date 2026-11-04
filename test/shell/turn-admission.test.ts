@@ -6,6 +6,10 @@ import { wireDiscordCapability } from "../../src/capabilities/discord/capability
 import { wirePresence } from "../../src/capabilities/presence/capability.js";
 import type { CronSchedulerDeps } from "../../src/shell/cron.js";
 import type { DiscordMessage } from "../../src/shell/discord-types.js";
+import {
+  EMPTY_RESPONSE_EXHAUSTED,
+  EmptyResponseExhaustedError,
+} from "../../src/shell/empty-response-marker.js";
 import { startPersistent } from "../../src/shell/persistent.js";
 import { isolatedLoaderOptions } from "../../src/shell/session.js";
 import { type createTurnAdmission, getTurnAdmission } from "../../src/shell/turn-admission.js";
@@ -71,6 +75,10 @@ async function harness() {
   const starts: string[] = [];
   const ends: string[] = [];
   const origins: Array<{ text: string; origin: TurnOrigin }> = [];
+  // Prompts whose agent_end carries the empty-response wrapper's typed
+  // exhaustion provenance, instead of a normal assistant message.
+  const exhaustedTurns = new Set<string>();
+  const discordLogs: string[] = [];
   // The origin read at each agent_end, INSIDE the prompt: the admitted origin
   // must still be current there (agent_end fires mid-prompt).
   const postEndOrigins: Array<{ text: string; origin: TurnOrigin }> = [];
@@ -105,16 +113,30 @@ async function harness() {
       await emit("agent_start");
       await p.finish.promise;
       await emit("agent_end", {
-        messages: [
-          {
-            role: "assistant",
-            content: [
-              { type: "text", text: `${text}-model-secret` },
-              { type: "toolCall", name: "read", arguments: { secret: "tool-input-secret" } },
+        messages: exhaustedTurns.has(text)
+          ? [
+              {
+                role: "assistant",
+                content: [],
+                stopReason: "error",
+                errorMessage: "the provider fake returned an empty response after 3 retries",
+                [EMPTY_RESPONSE_EXHAUSTED]: {
+                  provider: "fake",
+                  model: "fake",
+                  retries: 3,
+                },
+              },
+            ]
+          : [
+              {
+                role: "assistant",
+                content: [
+                  { type: "text", text: `${text}-model-secret` },
+                  { type: "toolCall", name: "read", arguments: { secret: "tool-input-secret" } },
+                ],
+              },
+              { role: "toolResult", content: "tool-output-secret" },
             ],
-          },
-          { role: "toolResult", content: "tool-output-secret" },
-        ],
       });
       postEndOrigins.push({ text, origin: admission.readOrigin() });
       ends.push(text);
@@ -183,7 +205,7 @@ async function harness() {
           },
           async sendTyping() {},
         },
-        log: () => {},
+        log: (m) => discordLogs.push(m),
       });
       cleanups.push(() => discord.stop());
       return session;
@@ -209,6 +231,8 @@ async function harness() {
     summaries,
     beats,
     replies,
+    discordLogs,
+    setExhausted: (text: string) => exhaustedTurns.add(text),
     setIdle: (fn: () => Promise<void>) => {
       idle = fn;
     },
@@ -226,6 +250,39 @@ async function harness() {
 }
 
 describe("round 5 interleavings", () => {
+  it("an exhausted empty-response cron turn rejects instead of completing the fire", async () => {
+    const h = await harness();
+    h.setExhausted("cron-secret");
+    const cron = h.fireCron();
+    await h.turn("cron-secret").started.promise;
+    h.turn("cron-secret").before.resolve();
+    h.turn("cron-secret").finish.resolve();
+    await h.turn("cron-secret").ended.promise;
+    await expect(cron).rejects.toBeInstanceOf(EmptyResponseExhaustedError);
+    // The same rejection a fire reaches production's scheduler with; cron.ts
+    // logs it as a fire error rather than completing the fire.
+    expect(h.origins).toEqual([{ text: "cron-secret", origin: { kind: "cron", job: "brief" } }]);
+    expect(h.replies).toEqual([]);
+  });
+
+  it("an exhausted empty-response Discord turn reports the failure and sends no reply", async () => {
+    const h = await harness();
+    h.setExhausted("discord-secret");
+    h.discord("discord-secret");
+    await h.turn("discord-secret").started.promise;
+    h.turn("discord-secret").before.resolve();
+    h.turn("discord-secret").finish.resolve();
+    await h.turn("discord-secret").ended.promise;
+    // The inbound handler runs after the admission rejects.
+    for (let i = 0; i < 100 && h.discordLogs.length === 0; i += 1) await checkpoint();
+    expect(h.replies).toEqual([]);
+    expect(
+      h.discordLogs.some(
+        (line) => line.includes("inbound turn/reply failed") && line.includes("empty response"),
+      ),
+    ).toBe(true);
+  });
+
   it("(a) Discord paused before before_agent_start retains its origin while cron is admitted", async () => {
     const h = await harness();
     h.discord("discord-secret");

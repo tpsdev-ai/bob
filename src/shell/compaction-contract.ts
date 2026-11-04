@@ -27,6 +27,7 @@
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
 
 import { spawnSync } from "node:child_process";
+import { emptyResponseExhaustionOf } from "./empty-response-marker.js";
 import { gitEnvironment } from "./git-environment.js";
 
 /** The explicit continue turn sent as the single retry. */
@@ -371,10 +372,11 @@ export interface CompactionObserver {
   /** The classification of the LAST assistant message that ended since the
    *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
-  /** The `errorMessage` the LAST assistant message that ended since the boundary
-   *  carried, when it carried one (bob#381). It is what names an empty-response
-   *  bound an attempt's own error ended with. */
-  lastError(): string | undefined;
+  /** True when the LAST assistant message that ended since the boundary carries
+   *  this module's typed exhaustion provenance (bob#381), set locally by the
+   *  empty-response wrapper. It is never inferred from an error's text, which a
+   *  provider also controls. */
+  lastEmptyResponseExhausted(): boolean;
 }
 
 /**
@@ -403,7 +405,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
-  let lastError: string | undefined;
+  let lastEmptyResponseExhausted = false;
   let lastStopReason: string | undefined;
   let agentEnded = false;
 
@@ -412,7 +414,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     sawAssistantEnd = false;
     lastEndFailed = false;
     lastEnding = undefined;
-    lastError = undefined;
+    lastEmptyResponseExhausted = false;
     lastStopReason = undefined;
     deltaBuffer = "";
     agentEnded = false;
@@ -435,7 +437,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
     lastEnding: () => lastEnding,
-    lastError: () => lastError,
+    lastEmptyResponseExhausted: () => lastEmptyResponseExhausted,
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -514,8 +516,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             lastEndFailed = failed;
             lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
-            lastError =
-              typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined;
+            lastEmptyResponseExhausted = emptyResponseExhaustionOf(e.message) !== undefined;
           }
           deltaBuffer = "";
           return;

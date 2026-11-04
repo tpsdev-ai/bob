@@ -39,11 +39,13 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
+import { startCronScheduler, type TimerHandle } from "../../src/shell/cron.js";
 import {
   DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
   EMPTY_RESPONSE_MARK,
   resolveMaxEmptyResponseRetries,
 } from "../../src/shell/empty-response.js";
+import { startPersistent } from "../../src/shell/persistent.js";
 import { type RunSession, type RunSessionFactory, runAgent } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
 
@@ -61,6 +63,7 @@ type Reply = { inputTokens: number } & (
   | { kind: "text"; text: string }
   | { kind: "thinking"; thinking: string }
   | { kind: "toolRead"; path: string }
+  | { kind: "providerError"; message: string }
 );
 
 interface SeenRequest {
@@ -129,6 +132,22 @@ function scriptedProvider(
         const input = step.inputTokens;
         const content: AssistantMessage["content"] = [];
         let stopReason: AssistantMessage["stopReason"] = "stop";
+        if (step.kind === "providerError") {
+          const failed: AssistantMessage = {
+            role: "assistant",
+            content: [],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: usage(0, 0),
+            stopReason: "error",
+            errorMessage: step.message,
+            timestamp: Date.now(),
+          };
+          stream.push({ type: "error", reason: "error", error: failed as never });
+          stream.end(failed);
+          return;
+        }
         if (step.kind === "text") content.push({ type: "text", text: step.text });
         if (step.kind === "thinking") content.push({ type: "thinking", thinking: step.thinking });
         if (step.kind === "toolRead") {
@@ -232,10 +251,12 @@ async function liveFactory(
   sessions: RunSession[];
   logs: string[];
   ended: Array<{ content: unknown; stopReason?: string }>;
+  compactions: Array<{ result?: unknown; aborted?: boolean }>;
 }> {
   const logs: string[] = [];
   const sessions: RunSession[] = [];
   const ended: Array<{ content: unknown; stopReason?: string }> = [];
+  const compactions: Array<{ result?: unknown; aborted?: boolean }> = [];
   const modelRuntime = await ModelRuntime.create({
     authPath: join(root, "testbot", ".pi-agent", "auth.json"),
     modelsPath: null,
@@ -293,14 +314,20 @@ async function liveFactory(
     session.subscribe((event) => {
       const e = event as {
         type?: string;
+        result?: unknown;
+        aborted?: boolean;
         message?: { role?: string; content?: unknown; stopReason?: string };
       };
+      if (e.type === "compaction_end") {
+        compactions.push({ result: e.result, aborted: e.aborted });
+        return;
+      }
       if (e.type !== "message_end" || e.message?.role !== "assistant") return;
       ended.push({ content: e.message.content, stopReason: e.message.stopReason });
     });
     return session;
   };
-  return { factory, sessions, logs, ended };
+  return { factory, sessions, logs, ended, compactions };
 }
 
 /** Every record of the run log this run wrote. */
@@ -356,6 +383,11 @@ describe("empty response after a compaction checkpoint (#381)", () => {
     // message was added between them.
     expect(agentRequests[3]?.messagesJson).toContain("[BOB CONTEXT CHECKPOINT");
     expect(agentRequests[4]?.messagesJson).toBe(agentRequests[3]?.messagesJson);
+    // The compaction that produced the checkpoint COMPLETED: the empty response
+    // is answered after a successful compaction, not after a failed one.
+    expect(live.compactions).toHaveLength(1);
+    expect(live.compactions[0]?.aborted).toBe(false);
+    expect(live.compactions[0]?.result).toBeTruthy();
     expect(live.logs.some((l) => l.includes("re-issuing the same request (1/3)"))).toBe(true);
     // The empty turn never reached the run's judge: the compaction continue turn
     // (a NEW user message) was never sent.
@@ -435,6 +467,100 @@ describe("empty response after a compaction checkpoint (#381)", () => {
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toBe("DONE: all good.");
   }, 20_000);
+
+  it("d: a provider error whose message contains the phrase is NOT classified as empty_response", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(
+      () => ({ kind: "providerError", message: `upstream failed: ${EMPTY_RESPONSE_MARK}` }),
+      seen,
+    );
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: "do the thing",
+      sessionFactory: live.factory,
+    });
+    expect(res.exitCode).toBe(1);
+    // A provider sentence is not provenance: only the wrapper's own typed marker
+    // may name empty_response.
+    expect(res.reason).toBeDefined();
+    expect(res.reason).not.toBe("empty_response");
+    const records = runLogRecords();
+    const outcomes = records
+      .filter((record) => "outcome" in record)
+      .map((record) => record.outcome as { reason?: string });
+    expect(outcomes.some((outcome) => outcome.reason === "empty_response")).toBe(false);
+    expect(records.at(-1)).toMatchObject({ done: true, exitCode: 1, reason: res.reason });
+    // One request: no re-issue loop was entered for a provider error.
+    expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+  }, 20_000);
+});
+
+describe("an exhausted empty response through the persistent admission (#381)", () => {
+  it("rejects an admitted cron turn, so the scheduler records a fire error", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(() => ({ kind: "empty", inputTokens: 1_000 }), seen);
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot: root,
+      log: () => {},
+      sessionFactory: live.factory,
+    });
+    const fireLogs: string[] = [];
+    const timers: Array<() => void> = [];
+    const scheduler = startCronScheduler({
+      entries: [{ name: "nightly", schedule: "* * * * *", prompt: "do the thing" }],
+      // The same wiring the persistent runtime uses.
+      fire: (entry) =>
+        handle.admitTurn({ kind: "cron", job: entry.name }, entry.prompt ?? "do the thing"),
+      log: (m) => fireLogs.push(m),
+      setTimer: (cb): TimerHandle => {
+        timers.push(cb);
+        return 0 as unknown as TimerHandle;
+      },
+      clearTimer: () => {},
+    });
+    try {
+      timers.splice(0).forEach((cb) => {
+        cb();
+      });
+      for (let i = 0; i < 300 && !fireLogs.some((l) => l.includes("fire error")); i += 1) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(fireLogs.some((l) => l.includes("fire error"))).toBe(true);
+      expect(fireLogs.some((l) => l.includes("empty response"))).toBe(true);
+      expect(seen.filter((r) => !r.summarization)).toHaveLength(
+        DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1,
+      );
+    } finally {
+      scheduler.stop();
+      await handle.shutdown();
+    }
+  }, 30_000);
+
+  it("a recovered retry resolves the admitted turn", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(
+      (agentCall) =>
+        agentCall === 1
+          ? { kind: "empty", inputTokens: 1_000 }
+          : { kind: "text", text: "DONE: recovered", inputTokens: 1_000 },
+      seen,
+    );
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot: root,
+      log: () => {},
+      sessionFactory: live.factory,
+    });
+    try {
+      const messages = await handle.admitTurn({ kind: "cron", job: "nightly" }, "do the thing");
+      expect(messages.length).toBeGreaterThan(0);
+      expect(seen.filter((r) => !r.summarization)).toHaveLength(2);
+    } finally {
+      await handle.shutdown();
+    }
+  }, 30_000);
 });
 
 describe("the empty-response bound (#381)", () => {

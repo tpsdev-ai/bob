@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createEventBus, type EventBus } from "@earendil-works/pi-coding-agent";
 import { createAssistantEndingTracker } from "./compaction-contract.js";
+import { EmptyResponseExhaustedError, emptyResponseExhaustionOf } from "./empty-response-marker.js";
 import { ReasoningOnlyExhaustedError, repromptWhileReasoningOnly } from "./reasoning-retry.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
@@ -203,6 +204,16 @@ export function createTurnAdmission(
           // `loopAbort` rejects and the turn fails, the same way a one-shot
           // `bob run` ends on a repeated call.
           await Promise.race([prompt, loopAbort]);
+          // bob#381: an admitted turn whose request exhausted the empty-response
+          // bound must FAIL, not resolve with a message pi never ended: a cron
+          // fire would otherwise record success and a Discord turn would return
+          // with no reply. The wrapper's typed provenance is the only signal
+          // read; a provider's error text is not.
+          const lastAssistant = [...turn.messages]
+            .reverse()
+            .find((message) => (message as { role?: unknown }).role === "assistant");
+          const exhaustion = emptyResponseExhaustionOf(lastAssistant);
+          if (exhaustion !== undefined) throw new EmptyResponseExhaustedError(exhaustion);
           return turn.messages;
         } finally {
           // bob#143: the origin binding is released only when the PROMPT

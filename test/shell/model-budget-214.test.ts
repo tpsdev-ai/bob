@@ -29,6 +29,8 @@ import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/p
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { runAlign } from "../../src/shell/align.js";
 import { readProviderLimits, readSessionBudget } from "../../src/shell/bob-yaml.js";
+import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES } from "../../src/shell/empty-response.js";
+import { emptyResponseExhaustionOf } from "../../src/shell/empty-response-marker.js";
 import { initAgent } from "../../src/shell/init.js";
 import { checkpointText } from "../../src/shell/model-budget.js";
 import { hireAgent } from "../../src/shell/position-runtime.js";
@@ -769,6 +771,94 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent, a piece-co
       }
     }
   });
+
+  /** A valid OpenAI-compatible streamed completion: `"empty"` sends no content
+   *  and reports zero completion tokens; a string sends it as one content delta.
+   *  Each request takes the next entry; past the script it keeps sending empty. */
+  function sequencedServer(replies: Array<string | "empty">) {
+    const bodies: Array<Record<string, unknown>> = [];
+    let requests = 0;
+    const fetchImpl = (async (_url: unknown, init?: { body?: unknown }) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const reply = replies[requests] ?? "empty";
+      requests += 1;
+      const enc = new TextEncoder();
+      const chunk = (
+        delta: Record<string, unknown>,
+        finish: string | null,
+        usage?: Record<string, number>,
+      ) =>
+        enc.encode(
+          `data: ${JSON.stringify({
+            id: "1",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: FAKE_MODEL,
+            choices: [{ index: 0, delta, finish_reason: finish }],
+            ...(usage === undefined ? {} : { usage }),
+          })}\n\n`,
+        );
+      const parts: Uint8Array[] = [chunk({ role: "assistant" }, null)];
+      if (reply !== "empty") parts.push(chunk({ content: reply }, null));
+      const completionTokens = reply === "empty" ? 0 : reply.length;
+      parts.push(
+        chunk({}, "stop", {
+          prompt_tokens: 7,
+          completion_tokens: completionTokens,
+          total_tokens: completionTokens + 7,
+        }),
+      );
+      parts.push(enc.encode("data: [DONE]\n\n"));
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const part of parts) controller.enqueue(part);
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    return { bodies, fetchImpl, requests: () => requests };
+  }
+
+  it("bob#381: an empty streamed completion from the REAL adapter is re-issued through the real session, and the recovery completes", async () => {
+    const server = sequencedServer(["empty", "DONE: recovered"]);
+    const runtime = await fakeRuntime(server.fetchImpl);
+    const session = await cappedSession(runtime, 1_000);
+    try {
+      await session.prompt("go", { expandPromptTemplates: false });
+      // The first request carried no content and zero output tokens; the same
+      // request (a second one) recovered, and pi saw only the recovered message.
+      expect(server.requests()).toBe(2);
+      const message = lastAssistant(session);
+      expect(message?.stopReason).toBe("stop");
+      expect(textOf(message)).toBe("DONE: recovered");
+      expect(emptyResponseExhaustionOf(message)).toBeUndefined();
+    } finally {
+      session.dispose();
+    }
+  }, 20_000);
+
+  it("bob#381: an always-empty REAL adapter exhausts the bound and ends the session with the typed provenance", async () => {
+    const server = sequencedServer([]);
+    const runtime = await fakeRuntime(server.fetchImpl);
+    const session = await cappedSession(runtime, 1_000);
+    try {
+      // pi may surface the error ending as a rejected prompt; the message it
+      // stored is the contract either way.
+      await session.prompt("go", { expandPromptTemplates: false }).catch(() => {});
+      expect(server.requests()).toBe(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1);
+      const message = lastAssistant(session);
+      expect(message?.stopReason).toBe("error");
+      expect(message?.errorMessage ?? "").toContain("empty response");
+      expect(emptyResponseExhaustionOf(message)).toEqual({
+        provider: FAKE_PROVIDER,
+        model: FAKE_MODEL,
+        retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
+      });
+    } finally {
+      session.dispose();
+    }
+  }, 20_000);
 });
 
 // ─── 3b. A cut keeps only the pieces bob accepted ──────────────────────────
