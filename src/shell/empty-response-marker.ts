@@ -32,7 +32,7 @@ export function emptyResponseErrorText(provider: string, model: string, retries:
   return `the provider ${provider} ${EMPTY_RESPONSE_MARK} for model ${model} after ${retries} retries`;
 }
 
-/** The exhaustion provenance of `message`, when this module set it. */
+/** The exhaustion provenance on `message`, when present: the empty-response wrapper (empty-response.ts) sets it; this reads its shape only. */
 export function emptyResponseExhaustionOf(message: unknown): EmptyResponseExhaustion | undefined {
   if (typeof message !== "object" || message === null) return undefined;
   const value = (message as Record<string, unknown>)[EMPTY_RESPONSE_EXHAUSTED];
