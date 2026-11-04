@@ -326,6 +326,25 @@ const registrySources: RegistrySource[] = [
       ),
   },
   {
+    name: "repository bunfig install.registry object",
+    source: "bunfig.toml install.registry",
+    setup: ({ root, registry }) =>
+      writeFileSync(
+        join(root, "bunfig.toml"),
+        `[install]\nminimumReleaseAge = 604800\nregistry = { url = "${registry}", token = "$TOKEN" }\n`,
+      ),
+  },
+  {
+    name: "repository bunfig install.scopes object",
+    source: "bunfig.toml install.scopes.@probe",
+    pkg: "@probe/pkg",
+    setup: ({ root, registry }) =>
+      writeFileSync(
+        join(root, "bunfig.toml"),
+        `[install]\nminimumReleaseAge = 604800\n[install.scopes]\n"@probe" = { url = "${registry}", token = "$TOKEN" }\n`,
+      ),
+  },
+  {
     name: "environment BUN_CONFIG_REGISTRY",
     source: "BUN_CONFIG_REGISTRY",
     env: ({ registry }) => ({ BUN_CONFIG_REGISTRY: registry }),
