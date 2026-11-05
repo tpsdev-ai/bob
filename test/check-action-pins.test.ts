@@ -316,6 +316,20 @@ test("missing local action metadata is reported", async () => {
   expect(result.errors.join("\n")).toContain("./tools/local: missing local action.yml/action.yaml");
 });
 
+test("an oversized workflow file is reported", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), " ".repeat(1_048_577));
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors).toEqual([".github/workflows/ci.yml: action file exceeds scan limit"]);
+});
+
+test("a directory named action.yml is reported", async () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  mkdirSync(join(root, "tools/local/action.yml"), { recursive: true });
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors).toEqual(["tools/local/action.yml: action file is not a regular file"]);
+});
+
 test("local action.yaml references and cycles are followed once", async () => {
   const root = fixtureLines(["- uses: ./tools/local"]);
   writeAction(root, "tools/local", [

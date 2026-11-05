@@ -9,7 +9,7 @@
 // and bounded; missing metadata is an error. Docker refs require @sha256:<64-hex>.
 // The CLI requires GITHUB_TOKEN for tag lookups and refuses without it before scanning.
 
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -91,7 +91,8 @@ function localMetadata(root, value) {
   for (const name of ["action.yml", "action.yaml"]) {
     const file = join(directory, name);
     try {
-      if (statSync(file).isFile()) return file;
+      realpathSync(file);
+      return file;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
@@ -173,11 +174,18 @@ export async function checkActionPins({ root = ROOT, resolver }) {
       if (visited.has(canonical)) continue;
       visited.add(canonical);
       if (visited.size > MAX_ENTRIES) throw new Error("Too many action files to check");
-      if (statSync(file).size > MAX_FILE_BYTES) throw new Error("action file exceeds scan limit");
-      const text = readFileSync(file, "utf8");
-      const metadata = dirname(file) !== join(root, ".github/workflows");
-      refs = inventory(Bun.YAML.parse(text), metadata);
-      locations = locateReferences(text, metadata);
+      const fd = openSync(canonical, "r");
+      try {
+        const stats = fstatSync(fd);
+        if (!stats.isFile()) throw new Error("action file is not a regular file");
+        if (stats.size > MAX_FILE_BYTES) throw new Error("action file exceeds scan limit");
+        const text = readFileSync(fd, "utf8");
+        const metadata = dirname(file) !== join(root, ".github/workflows");
+        refs = inventory(Bun.YAML.parse(text), metadata);
+        locations = locateReferences(text, metadata);
+      } finally {
+        closeSync(fd);
+      }
     } catch (error) {
       errors.push(`${rel}: ${error.message}`);
       continue;
