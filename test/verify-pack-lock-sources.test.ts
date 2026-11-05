@@ -1,9 +1,16 @@
 // verify-pack installs the packed tarball's dependencies with npm. The lock npm
 // writes may name sources other than the registry: a git dependency, a link, a
-// second local file:, a tarball from another origin, or a non-exact version.
-// lockRegistryVersions refuses each one before npm ci can run, naming the lock
-// entry. The locks below are hand-built (npm's lockfileVersion 3 shape) and the
-// npm commands are a recording stub, so the test sees whether ci ran.
+// local file: tarball, or a tarball from another origin. lockRegistryVersions
+// refuses each one before npm ci can run, naming the lock entry.
+//
+// The four npm cases let the npm on PATH write the lock: the install
+// directory's package.json declares the dependency, npm resolves it offline
+// (a local bare Git repository, a local directory, a local tarball, a loopback
+// HTTP server), and the refusal runs against npm's own lock entry. A recording
+// shim logs each npm invocation and then execs the real npm, so "no ci" is the
+// log. The non-exact version is hand-built because npm does not write a range
+// as a resolved version. The control case uses a recording npm stub: an exact
+// registry entry needs a registry, and this file makes no external requests.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -18,16 +25,33 @@ const NOW = Date.parse("2026-11-05T16:23:34.927Z");
 const OLD = "2020-01-01T00:00:00.000Z";
 
 type Registry = { url: string; requests: string[]; close: () => Promise<void> };
+type LockEntry = {
+  version?: string;
+  resolved?: string;
+  link?: boolean;
+  dependencies?: Record<string, string>;
+};
+type Lock = { packages?: Record<string, LockEntry> };
+type Prepared = {
+  name: string;
+  spec: string;
+  close?: () => Promise<void>;
+};
 
-function makeTarball(root: string) {
-  const work = join(root, "app");
-  const packageDir = join(work, "package");
+function makePackage(root: string, dir: string, name: string) {
+  const packageDir = join(root, dir);
   mkdirSync(packageDir, { recursive: true });
   writeFileSync(
     join(packageDir, "package.json"),
-    `${JSON.stringify({ name: "app-fixture", version: "1.0.0" }, null, 2)}\n`,
+    `${JSON.stringify({ name, version: "1.0.0" }, null, 2)}\n`,
   );
   writeFileSync(join(packageDir, "index.js"), "module.exports = 1;\n");
+  return packageDir;
+}
+
+function makeTarball(root: string) {
+  const work = join(root, "app");
+  makePackage(root, "app/package", "app-fixture");
   const tarball = join(root, "app.tgz");
   const tar = spawnSync("tar", ["czf", tarball, "-C", work, "package"], { encoding: "utf8" });
   expect(tar.status).toBe(0);
@@ -37,6 +61,21 @@ function makeTarball(root: string) {
     bytes,
     integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
   };
+}
+
+async function listen(server: ReturnType<typeof createServer>): Promise<string> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("HTTP server has no port");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function closeServer(server: ReturnType<typeof createServer>) {
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 async function startRegistry(times: Record<string, Record<string, string>>): Promise<Registry> {
@@ -54,30 +93,37 @@ async function startRegistry(times: Record<string, Record<string, string>>): Pro
     response.writeHead(404);
     response.end();
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("HTTP server has no port");
+  const url = await listen(server);
   return {
-    url: `http://127.0.0.1:${address.port}`,
+    url,
     requests,
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: () => closeServer(server),
   };
 }
 
-function lockfile(packages: Record<string, unknown>) {
+async function startTarballServer(bytes: Buffer): Promise<Registry> {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? "");
+    response.writeHead(200, { "content-type": "application/octet-stream" });
+    response.end(bytes);
+  });
+  const url = await listen(server);
+  return {
+    url,
+    requests,
+    close: () => closeServer(server),
+  };
+}
+
+function lockfile(packages: Record<string, unknown>, dependencies: Record<string, string>) {
   return {
     name: "pack-probe",
     version: "0.0.0",
     lockfileVersion: 3,
     requires: true,
     packages: {
-      "": { name: "pack-probe", version: "0.0.0", dependencies: {} },
+      "": { name: "pack-probe", version: "0.0.0", dependencies },
       ...packages,
     },
   };
@@ -92,6 +138,26 @@ function baseEnv(root: string) {
   env.HOME = join(root, "home");
   mkdirSync(env.HOME, { recursive: true });
   return env;
+}
+
+function realNpmPath(): string {
+  const found = spawnSync("which", ["npm"], { encoding: "utf8" });
+  const path = found.stdout.trim();
+  if (found.status !== 0 || path === "") throw new Error("npm is not on PATH");
+  return path;
+}
+
+/** Log every npm invocation, then run the real npm with the same arguments. */
+function recordingShim(root: string, realNpm: string) {
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const log = join(root, "npm.log");
+  writeFileSync(
+    join(bin, "npm"),
+    ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$BOB_NPM_LOG"', `exec "${realNpm}" "$@"`, ""].join("\n"),
+    { mode: 0o755 },
+  );
+  return { bin, log };
 }
 
 function fakeNpm(root: string) {
@@ -121,13 +187,17 @@ function fakeNpm(root: string) {
 
 async function runLock(
   times: Record<string, Record<string, string>>,
+  rootDependencies: Record<string, string>,
   makePackages: (registryUrl: string) => Record<string, unknown>,
 ) {
   const root = mkdtempSync(join(tmpdir(), "bob-pack-lock-source-"));
   const registry = await startRegistry(times);
   const tarball = makeTarball(root);
   const npm = fakeNpm(root);
-  writeFileSync(npm.lockPath, JSON.stringify(lockfile(makePackages(registry.url)), null, 2));
+  writeFileSync(
+    npm.lockPath,
+    JSON.stringify(lockfile(makePackages(registry.url), rootDependencies), null, 2),
+  );
   const installDir = join(root, "install");
   mkdirSync(installDir);
   writeFileSync(
@@ -161,73 +231,168 @@ async function runLock(
   }
 }
 
-function expectRefusedBeforeCi(outcome: Awaited<ReturnType<typeof runLock>>, problem: string) {
+async function runRealNpmLock(
+  prepare: (root: string) => Prepared | Promise<Prepared>,
+  times: Record<string, Record<string, string>> = {},
+) {
+  const root = mkdtempSync(join(tmpdir(), "bob-pack-lock-source-"));
+  const realNpm = realNpmPath();
+  const registry = await startRegistry(times);
+  const tarball = makeTarball(root);
+  let prepared: Prepared | undefined;
+  try {
+    prepared = await prepare(root);
+    const shim = recordingShim(root, realNpm);
+    const installDir = join(root, "install");
+    mkdirSync(installDir);
+    writeFileSync(
+      join(installDir, "package.json"),
+      `${JSON.stringify(
+        {
+          name: "pack-probe",
+          version: "0.0.0",
+          private: true,
+          dependencies: { [prepared.name]: prepared.spec },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const env = releaseAgeInstallEnv(baseEnv(root), NOW, {
+      npm_config_cache: join(root, "cache"),
+    });
+    env.PATH = `${shim.bin}:${env.PATH ?? ""}`;
+    env.BOB_NPM_LOG = shim.log;
+    let result: Awaited<ReturnType<typeof installVerifiedTarball>> | undefined;
+    let error: Error | undefined;
+    try {
+      result = await installVerifiedTarball({
+        tarball: tarball.tarball,
+        installDir,
+        env,
+        now: NOW,
+        registry: registry.url,
+        timeoutMs: 5_000,
+        commandTimeoutMs: 60_000,
+      });
+    } catch (caught) {
+      error = caught as Error;
+    }
+    const log = existsSync(shim.log) ? readFileSync(shim.log, "utf8") : "";
+    const lockPath = join(installDir, "package-lock.json");
+    const lock = existsSync(lockPath)
+      ? (JSON.parse(readFileSync(lockPath, "utf8")) as Lock)
+      : undefined;
+    return { result, error, log, lock, requests: registry.requests };
+  } finally {
+    await prepared?.close?.();
+    await registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function expectRefusedBeforeCi(outcome: { error?: Error; log: string }, problem: string) {
   expect(outcome.error?.name).toBe("UnsupportedResolution");
   expect(outcome.error?.message).toContain(problem);
   expect(outcome.log).toContain("install ");
   expect(outcome.log).not.toMatch(/^ci /m);
 }
 
-test("a git dependency is refused, even when its name and version match an old registry entry", async () => {
-  const outcome = await runLock({ "host-b-lib": { "2.3.4": OLD } }, () => ({
-    "node_modules/host-b-lib": {
-      version: "2.3.4",
-      resolved:
-        "git+https://github.com/example/host-b-lib.git#0123456789abcdef0123456789abcdef01234567",
-      license: "MIT",
-    },
-  }));
-  expectRefusedBeforeCi(
-    outcome,
-    "host-b-lib@2.3.4: resolved from git+https://github.com/example/host-b-lib.git",
-  );
+function expectRealRefusal(outcome: Awaited<ReturnType<typeof runRealNpmLock>>, problem: string) {
+  expectRefusedBeforeCi(outcome, problem);
+  expect(outcome.result).toBeUndefined();
+}
+
+function gitDependency(root: string): Prepared {
+  const source = join(root, "host-b-git-src");
+  makePackage(root, "host-b-git-src", "host-b-git");
+  const runGit = (...args: string[]) => spawnSync("git", args, { cwd: source, encoding: "utf8" });
+  const identity = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.test"];
+  for (const args of [
+    ["init", "-q"],
+    [...identity, "add", "-A"],
+    [...identity, "commit", "-qm", "fixture"],
+  ]) {
+    const result = runGit(...args);
+    expect(result.status).toBe(0);
+  }
+  const head = runGit("rev-parse", "HEAD");
+  const sha = head.stdout.trim();
+  expect(sha).toMatch(/^[0-9a-f]{40}$/);
+  const bare = join(root, "host-b-git.git");
+  const clone = spawnSync("git", ["clone", "-q", "--bare", source, bare], { encoding: "utf8" });
+  expect(clone.status).toBe(0);
+  return { name: "host-b-git", spec: `git+file://${bare}#${sha}` };
+}
+
+function linkDependency(root: string): Prepared {
+  makePackage(root, "host-c-link", "host-c-link");
+  return { name: "host-c-link", spec: "file:../host-c-link" };
+}
+
+function fileTarballDependency(root: string): Prepared {
+  makePackage(root, "host-d-file", "host-d-file");
+  const tarball = join(root, "host-d-file-1.0.0.tgz");
+  const tar = spawnSync("tar", ["czf", tarball, "-C", root, "host-d-file"], { encoding: "utf8" });
+  expect(tar.status).toBe(0);
+  return { name: "host-d-file", spec: "file:../host-d-file-1.0.0.tgz" };
+}
+
+async function foreignTarballDependency(root: string): Promise<Prepared> {
+  makePackage(root, "host-e-tarball", "host-e-tarball");
+  const tarball = join(root, "host-e-tarball-1.0.0.tgz");
+  const tar = spawnSync("tar", ["czf", tarball, "-C", root, "host-e-tarball"], {
+    encoding: "utf8",
+  });
+  expect(tar.status).toBe(0);
+  const server = await startTarballServer(readFileSync(tarball));
+  return {
+    name: "host-e-tarball",
+    spec: `${server.url}/host-e-tarball-1.0.0.tgz`,
+    close: server.close,
+  };
+}
+
+test("a git dependency npm writes is refused before ci, even with an old registry entry", async () => {
+  const outcome = await runRealNpmLock(gitDependency, {
+    "host-b-git": { "1.0.0": OLD },
+  });
+  expect(outcome.lock?.packages?.[""]?.dependencies?.["host-b-git"]).toMatch(/^git\+file:\/\//);
+  const spec = outcome.lock?.packages?.["node_modules/host-b-git"]?.resolved ?? "";
+  expect(spec).toMatch(/^git\+file:\/\//);
+  expectRealRefusal(outcome, `host-b-git@1.0.0: resolved from ${spec}, not `);
   expect(outcome.requests).toEqual([]);
-}, 30_000);
+}, 60_000);
 
-test("a git dependency without a matching registry entry is refused", async () => {
-  const outcome = await runLock({}, () => ({
-    "node_modules/host-b-git": {
-      version: "1.0.0",
-      resolved:
-        "git+ssh://git@github.com/example/host-b-git.git#89abcdef0123456789abcdef0123456789abcdef",
-    },
-  }));
-  expectRefusedBeforeCi(
-    outcome,
-    "host-b-git@1.0.0: resolved from git+ssh://git@github.com/example/host-b-git.git",
+test("a link entry npm writes is refused before ci", async () => {
+  const outcome = await runRealNpmLock(linkDependency);
+  expect(outcome.lock?.packages?.["node_modules/host-c-link"]?.link).toBe(true);
+  expectRealRefusal(outcome, "node_modules/host-c-link: links a local path");
+}, 60_000);
+
+test("another local file: tarball npm writes is refused before ci", async () => {
+  const outcome = await runRealNpmLock(fileTarballDependency);
+  expect(outcome.lock?.packages?.["node_modules/app-fixture"]?.resolved).toBe("file:../app.tgz");
+  expect(outcome.lock?.packages?.["node_modules/host-d-file"]?.resolved).toBe(
+    "file:../host-d-file-1.0.0.tgz",
   );
-}, 30_000);
+  expectRealRefusal(outcome, "host-d-file@1.0.0: local source file:../host-d-file-1.0.0.tgz");
+}, 60_000);
 
-test("a link entry is refused", async () => {
-  const outcome = await runLock({}, () => ({
-    "node_modules/host-c-link": { resolved: "packages/host-c-link", link: true },
-  }));
-  expectRefusedBeforeCi(outcome, "node_modules/host-c-link: links a local path");
-}, 30_000);
+test("a tarball npm writes from a foreign origin is refused before ci", async () => {
+  let spec = "";
+  const outcome = await runRealNpmLock(async (root) => {
+    const prepared = await foreignTarballDependency(root);
+    spec = prepared.spec;
+    return prepared;
+  });
+  expect(outcome.lock?.packages?.["node_modules/host-e-tarball"]?.resolved).toBe(spec);
+  expectRealRefusal(outcome, `host-e-tarball@1.0.0: resolved from ${spec}, not `);
+  expect(outcome.requests).toEqual([]);
+}, 60_000);
 
-test("a second local file: source is refused", async () => {
-  const outcome = await runLock({}, () => ({
-    "node_modules/host-d-file": { version: "1.0.0", resolved: "file:../host-d-file" },
-  }));
-  expectRefusedBeforeCi(outcome, "host-d-file@1.0.0: local source file:../host-d-file");
-}, 30_000);
-
-test("a tarball from another origin is refused", async () => {
-  const outcome = await runLock({}, () => ({
-    "node_modules/host-e-tarball": {
-      version: "1.0.0",
-      resolved: "https://registry.example.test/host-e-tarball/-/host-e-tarball-1.0.0.tgz",
-      integrity: "sha512-fixture",
-    },
-  }));
-  expectRefusedBeforeCi(
-    outcome,
-    "host-e-tarball@1.0.0: resolved from https://registry.example.test/host-e-tarball/-/host-e-tarball-1.0.0.tgz",
-  );
-}, 30_000);
-
-test("a non-exact version is refused", async () => {
-  const outcome = await runLock({}, (registryUrl) => ({
+test("a hand-built non-exact version is refused", async () => {
+  const outcome = await runLock({}, { "host-f-range": "^1.0.0" }, (registryUrl) => ({
     "node_modules/host-f-range": {
       version: "^1.0.0",
       resolved: `${registryUrl}/host-f-range/-/host-f-range-1.0.0.tgz`,
@@ -237,14 +402,18 @@ test("a non-exact version is refused", async () => {
   expectRefusedBeforeCi(outcome, "host-f-range@^1.0.0: not an exact version");
 }, 30_000);
 
-test("an exact registry entry from the install registry still installs", async () => {
-  const outcome = await runLock({ "host-g-lib": { "1.0.0": OLD } }, (registryUrl) => ({
-    "node_modules/host-g-lib": {
-      version: "1.0.0",
-      resolved: `${registryUrl}/host-g-lib/-/host-g-lib-1.0.0.tgz`,
-      integrity: "sha512-fixture",
-    },
-  }));
+test("an exact registry entry from the install registry passes the source check and runs npm ci", async () => {
+  const outcome = await runLock(
+    { "host-g-lib": { "1.0.0": OLD } },
+    { "host-g-lib": "1.0.0" },
+    (registryUrl) => ({
+      "node_modules/host-g-lib": {
+        version: "1.0.0",
+        resolved: `${registryUrl}/host-g-lib/-/host-g-lib-1.0.0.tgz`,
+        integrity: "sha512-fixture",
+      },
+    }),
+  );
   expect(outcome.error).toBeUndefined();
   expect(outcome.result?.checked).toBe(1);
   expect(outcome.requests).toEqual(["/host-g-lib"]);

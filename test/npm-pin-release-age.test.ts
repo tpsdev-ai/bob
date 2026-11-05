@@ -17,6 +17,7 @@ const CLI = join(REPO, "scripts", "check-npm-pin-release-age.mjs");
 const NOW = Date.parse("2026-11-05T16:23:34.927Z");
 const OLD = "2020-01-01T00:00:00.000Z";
 const YOUNG = new Date(NOW - 60 * 60 * 1000).toISOString();
+const CUTOFF = new Date(NOW - 7 * 24 * 60 * 60 * 1000).toISOString();
 
 type Registry = { url: string; requests: string[]; close: () => Promise<void> };
 
@@ -75,8 +76,8 @@ async function checkWith(times: Record<string, string>, workflowPath = WORKFLOW)
   }
 }
 
-test("the published pin passes at 7 days old", async () => {
-  const { result, requests } = await checkWith({ "11.21.1": OLD, "11.99.0": YOUNG });
+test("a pin published at the cutoff passes", async () => {
+  const { result, requests } = await checkWith({ "11.21.1": CUTOFF, "11.99.0": YOUNG });
   expect(result.ok).toBe(true);
   expect(result.pin).toBe("11.21.1");
   expect(result.ageMs).toBeGreaterThanOrEqual(7 * 24 * 60 * 60 * 1000);
