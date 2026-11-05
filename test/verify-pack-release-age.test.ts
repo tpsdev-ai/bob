@@ -209,7 +209,7 @@ async function runInstall(
   }
 }
 
-test("the cutoff is exactly 7 days before `npm pack`", () => {
+test("the cutoff is exactly 7 days before the supplied NOW", () => {
   expect(RELEASE_AGE_MS).toBe(7 * 24 * 60 * 60 * 1000);
   expect(releaseAgeCutoff(NOW)).toBe(CUTOFF);
 });
@@ -379,7 +379,7 @@ test.each(["install", "home"] as const)(
   120_000,
 );
 
-test("an install refusal leaves no verify-pack scratch directory", () => {
+test("an install refusal removes scratch without --keep", () => {
   const root = mkdtempSync(join(tmpdir(), "bob-pack-refusal-"));
   try {
     const bin = join(root, "bin");

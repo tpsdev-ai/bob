@@ -54,8 +54,6 @@ const CAPABILITY_TOOLS = {
 };
 
 let failures = 0;
-// Unwinds through the scratch cleanup in `finally` instead of calling
-// process.exit, which would leave the scratch tree behind.
 const REFUSAL = Symbol("refusal");
 function check(name, fn) {
   try {
@@ -148,7 +146,8 @@ try {
   });
   if (packed.status !== 0) {
     console.error(packed.stderr);
-    process.exit(1);
+    failures++;
+    throw REFUSAL;
   }
   const tarball = join(scratch, packed.stdout.trim().split("\n").pop().trim());
   const bytes = run("wc", ["-c", tarball]).stdout.trim().split(/\s+/)[0];

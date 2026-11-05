@@ -2,7 +2,8 @@
   `scripts/verify-pack.mjs` installs the packed tarball's dependencies with
   npm, which reads neither `bun.lock` nor `bunfig.toml`. It now resolves the
   tarball's dependency tree into a lockfile with npm's `before` config set to
-  seven days before the run, then refuses any resolved registry version whose
+  seven days before `NOW` captured before `npm pack`, then refuses any resolved
+  registry version whose
   publish time is missing or after that cutoff, naming each version it refuses,
   before `npm ci` runs an install script. A version npm rejects during
   resolution, before a lock exists, gets the cutoff guidance instead, and a

@@ -1,104 +1,169 @@
-// The release pipeline upgrades npm before `npm stage publish`. That upgrade
-// must be exactly one command naming one exact version: a range would resolve
-// from the registry at run time with no release-age bake, and a second
-// appended global npm mutation would resolve or install one too.
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-const WORKFLOW = join(import.meta.dir, "..", ".github", "workflows", "release-publish.yml");
+const REPO = join(import.meta.dir, "..");
+const WORKFLOW = join(REPO, ".github", "workflows", "release-publish.yml");
+const UPGRADE = "Upgrade npm to a staging-capable version";
+const SELF_UPDATE = /^npm install -g npm@(\d+\.\d+\.\d+)$/;
+const PUBLISH = /^npm\s+(?:stage|publish)\b/;
 
 type Step = { name?: string; run?: string };
 type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
 
-// Anchored to a whole simple command, so `echo npm install -g npm@11.21.1`
-// and `npm install -g npm@11.21.1 --silent` are not the pin.
-const SELF_UPDATE = /^npm\s+install\s+-g\s+npm@(\d+\.\d+\.\d+)$/;
-
-// A global npm mutation is any of:
-//   - npm install/i/add with -g or --global
-//   - npm update/up/upgrade with -g or --global
-//   - npm uninstall/remove/rm/unlink with -g or --global
-//   - npm-check-updates, directly or through npx/bunx
-//   - npx/bunx npm@<version>
-//   - corepack preparing/enabling/using npm
-const NPM_MUTATIONS = new Set([
-  "install",
-  "i",
-  "add",
-  "update",
-  "up",
-  "upgrade",
-  "uninstall",
-  "remove",
-  "rm",
-  "unlink",
-]);
-const PACKAGE_RUNNERS = new Set(["npx", "bunx"]);
-
-function simpleCommands(run: string) {
-  return run
-    .split("\n")
-    .flatMap((line) => line.split(/&&|\|\||[;|]/))
-    .map((command) => command.trim())
-    .filter((command) => command !== "" && !command.startsWith("#"));
-}
-
-function globalNpmMutation(command: string): string | undefined {
-  const tokens = command.split(/\s+/);
-  const [head] = tokens;
-  if (head === "npm") {
-    const subcommand = tokens.slice(1).find((token) => !token.startsWith("-"));
-    const global = tokens.includes("-g") || tokens.includes("--global");
-    if (subcommand && global && NPM_MUTATIONS.has(subcommand)) {
-      return `npm ${subcommand} with a global flag`;
-    }
-  }
-  if (head === "npm-check-updates") return "npm-check-updates";
-  if (head && PACKAGE_RUNNERS.has(head)) {
-    const pkg = tokens.slice(1).find((token) => !token.startsWith("-"));
-    if (pkg === "npm-check-updates") return "npm-check-updates through a package runner";
-    if (pkg === "npm" || pkg?.startsWith("npm@")) return "npm through a package runner";
-  }
-  if (head === "corepack" && tokens.some((token) => token === "npm" || token.startsWith("npm@"))) {
-    return "corepack npm activation";
-  }
-  return undefined;
-}
-
-function scan(steps: Step[]) {
-  const allowed: { step: string; version: string }[] = [];
-  const refused: string[] = [];
-  for (const step of steps) {
-    for (const command of simpleCommands(step.run ?? "")) {
-      const mutation = globalNpmMutation(command);
-      if (mutation === undefined) continue;
-      const match = command.match(SELF_UPDATE);
-      if (match) allowed.push({ step: step.name ?? "(unnamed)", version: match[1] });
-      else refused.push(`${step.name ?? "(unnamed)"}: ${command} (${mutation})`);
-    }
-  }
-  return { allowed, refused };
-}
-
-test("the npm self-update is one command naming one exact version", () => {
+function loadSteps(): Step[] {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const steps = workflow.jobs?.["stage-publish"]?.steps ?? [];
-  const { allowed, refused } = scan(steps);
-  expect(refused).toEqual([]);
-  expect(allowed).toHaveLength(1);
-  const [{ version }] = allowed;
+  return workflow.jobs?.["stage-publish"]?.steps ?? [];
+}
+
+function assertion(version: string): string {
+  return `test "$(npm --version)" = "${version}" || { echo "npm is $(npm --version), expected the pinned ${version}" >&2; exit 1; }`;
+}
+
+function pinProblems(steps: Step[]): string[] {
+  const upgrades = steps.filter((step) => step.name === UPGRADE);
+  if (upgrades.length !== 1) return ["expected one named npm upgrade step"];
+  const upgrade = upgrades[0];
+  const match = SELF_UPDATE.exec(upgrade.run?.trim() ?? "");
+  if (!match) return ["npm upgrade must be exactly npm install -g npm@<x.y.z>"];
+  const version = match[1];
   const [major, minor] = version.split(".").map(Number);
-  expect(major > 11 || (major === 11 && minor >= 15)).toBe(true);
+  const problems: string[] = [];
+  if (!(major > 11 || (major === 11 && minor >= 15))) {
+    problems.push("npm pin must support staging (>=11.15.0)");
+  }
+  let commands = 0;
+  for (const [index, step] of steps.entries()) {
+    const lines = (step.run ?? "")
+      .trim()
+      .split("\n")
+      .map((line) => line.trim());
+    for (const [line, command] of lines.entries()) {
+      if (!PUBLISH.test(command)) continue;
+      commands++;
+      if (steps.indexOf(upgrade) >= index) {
+        problems.push(`${step.name}: npm upgrade must precede stage/publish`);
+      }
+      if (lines[line - 1] !== assertion(version)) {
+        problems.push(
+          `${step.name}: stage/publish must immediately follow the npm ${version} assertion`,
+        );
+      }
+    }
+  }
+  if (commands === 0) problems.push("expected a stage/publish command");
+  return problems;
+}
+
+test("the named npm upgrade pins an exact version before stage/publish, with matching assertions", () => {
+  expect(pinProblems(loadSteps())).toEqual([]);
 });
+
+test.each(["npm stage publish", "npm publish --access public"])(
+  "%s requires its own immediately preceding assertion",
+  (command) => {
+    const steps = loadSteps();
+    const version = SELF_UPDATE.exec(
+      steps.find((step) => step.name === UPGRADE)?.run?.trim() ?? "",
+    )?.[1];
+    expect(version).toBeDefined();
+    steps.push({ name: "Additional publish", run: `${assertion(version as string)}\n${command}` });
+    expect(pinProblems(steps)).toEqual([]);
+    steps[steps.length - 1].run = command;
+    expect(pinProblems(steps)).toContain(
+      `Additional publish: stage/publish must immediately follow the npm ${version} assertion`,
+    );
+  },
+);
 
 test.each([
-  ["an exact self-update", "npm install -g npm@11.21.1", true],
-  ["the echo form", 'echo "npm install -g npm@11.21.1"', false],
-  ["an appended range", "npm install -g npm@11.21.1\nnpm install -g npm@^11.15.0", false],
-  ["an appended update", "npm install -g npm@11.21.1\nnpm update -g npm", false],
-])("%s", (_name, run, expected) => {
-  const { allowed, refused } = scan([{ name: "synthetic", run }]);
-  expect(allowed.length === 1 && refused.length === 0).toBe(expected);
-});
+  [
+    "assertion removed",
+    (steps: Step[]) => {
+      const step = steps.find((step) => step.name === "Stage-publish");
+      if (step?.run)
+        step.run = step.run
+          .split("\n")
+          .filter((line) => !line.trim().startsWith("test "))
+          .join("\n");
+    },
+    "Stage-publish: stage/publish must immediately follow the npm 11.21.1 assertion",
+  ],
+  [
+    "assertion names a different version",
+    (steps: Step[]) => {
+      const step = steps.find((step) => step.name === "Stage-publish");
+      if (step?.run) step.run = step.run.replaceAll("11.21.1", "11.21.2");
+    },
+    "Stage-publish: stage/publish must immediately follow the npm 11.21.1 assertion",
+  ],
+  [
+    "upgrade moved after publish",
+    (steps: Step[]) => {
+      const index = steps.findIndex((step) => step.name === UPGRADE);
+      steps.push(...steps.splice(index, 1));
+    },
+    "Stage-publish: npm upgrade must precede stage/publish",
+  ],
+  [
+    "upgrade changed to a range",
+    (steps: Step[]) => {
+      const step = steps.find((step) => step.name === UPGRADE);
+      if (step) step.run = "npm install -g npm@^11.21.1";
+    },
+    "npm upgrade must be exactly npm install -g npm@<x.y.z>",
+  ],
+] satisfies [string, (steps: Step[]) => void, string][])(
+  "%s is refused",
+  (_name, mutate, problem) => {
+    const steps = loadSteps();
+    mutate(steps);
+    expect(pinProblems(steps)).toContain(problem);
+  },
+);
+
+test.each([true, false])(
+  "the workflow shell reaches staging only with the pinned npm: %s",
+  (matches) => {
+    const steps = loadSteps();
+    const version = SELF_UPDATE.exec(
+      steps.find((step) => step.name === UPGRADE)?.run?.trim() ?? "",
+    )?.[1];
+    expect(version).toBeDefined();
+    const script = steps.find((step) => step.name === "Stage-publish")?.run;
+    expect(script).toBeDefined();
+    const root = mkdtempSync(join(tmpdir(), "bob-npm-pin-"));
+    try {
+      const marker = join(root, "published");
+      writeFileSync(
+        join(root, "npm"),
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then echo "$BOB_TEST_NPM_VERSION"; exit 0; fi',
+          'if [ "$1" = "stage" ] && [ "$2" = "publish" ]; then touch "$BOB_TEST_PUBLISH_MARKER"; exit 0; fi',
+          "exit 2",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const result = spawnSync("bash", ["-euo", "pipefail", "-c", script as string], {
+        cwd: REPO,
+        env: {
+          ...process.env,
+          PATH: `${root}:${process.env.PATH ?? ""}`,
+          BOB_TEST_NPM_VERSION: matches ? version : "0.0.0",
+          BOB_TEST_PUBLISH_MARKER: marker,
+        },
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(matches ? 0 : 1);
+      expect(existsSync(marker)).toBe(matches);
+      if (!matches) expect(result.stderr).toContain(`expected the pinned ${version}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

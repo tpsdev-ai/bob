@@ -17,17 +17,17 @@ by commit SHA in the last section. The 7-day release-age bake is
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install --package-lock-only <tarball>` then `npm ci` into a scratch directory | `ci.yml` `pack`; the release Preflight | npm resolves the tarball's dependency ranges from the registry, not from `bun.lock`, and does not read `bunfig.toml`. `scripts/verify-pack-install.mjs` resolves with npm's `before` set to `now - 7 days`, then checks every resolved registry `name@version` against the registry's publish time. A missing publish time or a time after the cutoff refuses the install before `npm ci` runs an install script, and the message names each version it refused. A version npm rejects during resolution, before a lock exists, gets the cutoff and remedy instead, and a registry metadata lookup failure is reported as its own error. The helper refuses inherited `before`, `min-release-age`, `min-release-age-exclude`, `registry`, `replace-registry-host`, `userconfig`, `globalconfig`, `prefix` and any `@scope:registry` setting; it drops all other inherited `npm_config_*` keys. User and global config point at empty files in the scratch tree, and a `.npmrc` in the scratch install directory or HOME is refused. |
+| `npm install --package-lock-only <tarball>` then `npm ci` into a scratch directory | `ci.yml` `pack`; the release Preflight | npm resolves the tarball's dependency ranges from the registry, not from `bun.lock`, and does not read `bunfig.toml`. `scripts/verify-pack-install.mjs` resolves with npm's `before` set to `NOW - 7 days`, with `NOW` captured before `npm pack`, then checks every resolved registry `name@version` against the registry's publish time. A missing publish time or a time after the cutoff refuses the install before `npm ci` runs an install script, and the message names each version it refused. A version npm rejects during resolution, before a lock exists, gets the cutoff and remedy instead, and a registry metadata lookup failure is reported as its own error. The helper refuses inherited `before`, `min-release-age`, `min-release-age-exclude`, `registry`, `replace-registry-host`, `userconfig`, `globalconfig`, `prefix` and any `@scope:registry` setting; it drops all other inherited `npm_config_*` keys. User and global config point at empty files in the scratch tree, and a `.npmrc` in the scratch install directory or HOME is refused. |
 
 ## Release pipeline
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | The current pin is the exact version 11.21.1, published 2026-10-15. `test/release-publish-npm-pin.test.ts` requires this step to contain exactly one npm self-update command naming one exact version at least 11.15.0. CI does not check a future pin's publish age (follow-up). |
-| `npm stage publish` | `release-publish.yml` `stage-publish` | Publishes the tarball built from the verified checkout. |
+| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | `test/release-publish-npm-pin.test.ts` checks that the named upgrade step runs an exact `x.y.z` pin before the first stage/publish step, and that each stage/publish command has an immediately preceding version assertion for the same pin in its run script. |
+| `npm stage publish` | `release-publish.yml` `stage-publish` | The immediately preceding runtime assertion requires `npm --version` to match the upgrade pin before staging. |
 
 ## Actions
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| GitHub Actions `uses:` | every workflow | A full commit SHA, never a tag or branch; Renovate's `helpers:pinGitHubActionDigests`. |
+| GitHub Actions `uses:` | every workflow | A full commit SHA, never a tag or branch. |
