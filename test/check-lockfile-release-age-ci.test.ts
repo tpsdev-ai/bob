@@ -1,5 +1,5 @@
-// bob#390: in every job of every workflow under .github/workflows/, a dedicated
-// step whose trimmed `run` is exactly
+// bob#390: in every job that installs project dependencies or restores a
+// recognised package cache, a dedicated step whose trimmed `run` is exactly
 // `bun --no-install scripts/check-lockfile-release-age.mjs` must precede any
 // project dependency install and any package-cache restore. A global tool
 // install before it is allowed only where it is not a project install; none
@@ -13,8 +13,8 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
-// Project dependency installs resolve the committed lockfile. `bun --no-install`
-// and `bun run build` do not match.
+// These commands can fetch or change project dependencies before the bake check.
+// `bun --no-install` and `bun run build` do not match.
 const PROJECT_INSTALL = /^(?:npm\s+ci\b|npm\s+(?:install|i)\b|bun\s+(?:install|add)\b)/;
 const GLOBAL_TOOL = /^(?:npm\s+(?:install|i)|bun\s+add)\b/;
 const GLOBAL_FLAG = /(?:^|\s)(?:-g|--global)(?:\s|$)/;
