@@ -23,7 +23,7 @@ by commit SHA in the last section. The 7-day release-age bake is
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | `test/release-publish-npm-pin.test.ts` checks that the named upgrade step runs an exact `x.y.z` pin before the first direct `npm stage` / `npm publish` line, and that each such line has an immediately preceding version assertion for the same pin in its run script. `scripts/check-npm-pin-release-age.mjs`, run by `ci.yml` `action-pins`, reads that exact pin and refuses it when the registry has no valid UTC publish time for `npm@<pin>` or published it less than seven days ago. Its registry lookup is tested offline against a loopback registry in `test/npm-pin-release-age.test.ts`. |
+| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | `test/release-publish-npm-pin.test.ts` checks that the named upgrade step runs an exact `x.y.z` pin before the first direct `npm stage` / `npm publish` line, and that each such line has an immediately preceding version assertion for the same pin in its run script. `scripts/check-npm-pin-release-age.mjs`, run by `ci.yml` `action-pins`, reads that exact pin and refuses it when the registry has no valid publish time in `YYYY-MM-DDTHH:mm:ss[.sss]Z` format for `npm@<pin>` or published it less than seven days ago. Its registry lookup is tested offline against a loopback registry in `test/npm-pin-release-age.test.ts`. |
 | `npm stage publish` | `release-publish.yml` `stage-publish` | The immediately preceding runtime assertion requires `npm --version` to succeed and report the upgrade pin before staging. |
 
 ## Actions

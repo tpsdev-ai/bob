@@ -6,8 +6,8 @@
  * release-publish.yml installs an exact npm version before it stages a
  * release. That pin is a registry install like any other, but it happens in a
  * workflow that no lockfile covers. This checker reads the pin from
- * release-publish.yml and refuses it when the registry has no valid UTC publish time for
- * `npm@<pin>` or published it less than seven days ago.
+ * release-publish.yml and refuses it when the registry has no valid publish time in
+ * `YYYY-MM-DDTHH:mm:ss[.sss]Z` format for `npm@<pin>` or published it less than seven days ago.
  *
  * Exit codes:
  *   0 — the pinned npm version is at least the bake length old

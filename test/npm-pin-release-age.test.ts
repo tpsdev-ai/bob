@@ -115,15 +115,18 @@ test.each([
   "2020-01-01T00:00:00+00:00",
   "2020-01-01T01:00:00+01:00",
   "2020-01-01T24:00:00.000Z",
-])("invalid publish timestamp %j is refused by version and value", async (published) => {
-  const result = await checkNpmPinReleaseAge({
-    now: NOW,
-    fetchImpl: async () => Response.json({ time: { "11.21.1": published } }),
-  });
-  expect(result.ok).toBe(false);
-  expect(result.reason).toContain("npm@11.21.1");
-  expect(result.reason).toContain(JSON.stringify(published));
-});
+])(
+  "noncanonical or invalid publish timestamp %j is refused by version and value",
+  async (published) => {
+    const result = await checkNpmPinReleaseAge({
+      now: NOW,
+      fetchImpl: async () => Response.json({ time: { "11.21.1": published } }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("npm@11.21.1");
+    expect(result.reason).toContain(JSON.stringify(published));
+  },
+);
 
 test.each(["2020-02-29T12:34:56.789Z", "2020-02-29T12:34:56Z"])(
   "valid UTC publish timestamp %s passes the bake",
