@@ -38,6 +38,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isResolutionFailure, releaseAgeCutoff, releaseAgeInstallEnv } from "./release-age-env.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const KEEP = process.argv.includes("--keep");
@@ -90,14 +91,23 @@ const install = join(scratch, "install");
 const agents = join(home, "agents");
 for (const d of [home, cache, install, agents]) mkdirSync(d, { recursive: true });
 
-const ENV = {
-  ...process.env,
-  HOME: home,
-  npm_config_cache: cache,
-  npm_config_audit: "false",
-  npm_config_fund: "false",
-  npm_config_update_notifier: "false",
-};
+// npm resolves the tarball's dependency ranges from the registry, not from
+// bun.lock, and npm does not read bunfig.toml. Hold it to the same 7-day bake
+// with npm's `before` config: only versions published before the cutoff are
+// eligible.
+const NOW = Date.now();
+const CUTOFF = releaseAgeCutoff(NOW);
+const ENV = releaseAgeInstallEnv(
+  {
+    ...process.env,
+    HOME: home,
+    npm_config_cache: cache,
+    npm_config_audit: "false",
+    npm_config_fund: "false",
+    npm_config_update_notifier: "false",
+  },
+  NOW,
+);
 // This sandbox has no Flair instance, so it must carry no Flair credential
 // either. Otherwise the "refuses to half-provision" check below would pass or
 // fail on the RUNNER's ambient environment rather than on bob's behaviour —
@@ -106,7 +116,8 @@ delete ENV.FLAIR_ADMIN_PASS;
 delete ENV.FLAIR_OPS_TARGET;
 
 try {
-  console.log(`scratch: ${scratch}\n`);
+  console.log(`scratch: ${scratch}`);
+  console.log(`release-age cutoff: ${CUTOFF} (npm_config_before)\n`);
 
   // ---------------------------------------------------------------- pack ---
   console.log("pack");
@@ -169,7 +180,14 @@ try {
   );
   const installed = run("npm", ["install", "--no-save", tarball], { cwd: install, env: ENV });
   if (installed.status !== 0) {
-    console.error(installed.stderr || installed.stdout);
+    const output = installed.stderr || installed.stdout;
+    console.error(output);
+    if (isResolutionFailure(output)) {
+      console.error(
+        `\nNo version the tarball's dependency ranges allow was published before the release-age cutoff ${CUTOFF}.`,
+      );
+      console.error("Wait for the 7-day bake to pass, or pin the dependency to an older version.");
+    }
     process.exit(1);
   }
   const bob = join(install, "node_modules", ".bin", "bob");
