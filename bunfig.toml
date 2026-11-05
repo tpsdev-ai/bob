@@ -4,8 +4,8 @@
 # bun.com/docs/cli/install#minimum-release-age
 #
 # 7 days catches the "compromise published, not yet detected" window.
-# Newer versions are filtered at install time; the lockfile picks an
-# older, stability-verified version automatically.
+# Resolution filters newer versions; frozen installs do not.
+# scripts/check-lockfile-release-age.mjs gates the committed lockfile.
 #
 # Excludes: @types/node and typescript are too tied to the runtime
 # version we target — we want their newest releases on-demand. They're
