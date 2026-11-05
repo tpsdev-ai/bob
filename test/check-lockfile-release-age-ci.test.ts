@@ -4,7 +4,9 @@
 // contains .bun or .npm, and a uses step with an input named cache or install,
 // may not precede the checker.
 import { expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -17,22 +19,15 @@ const PACKAGE_CACHE_PATH = /(?:^|[/\\])(?:\.bun|\.npm)(?:[/\\]|$)/;
 const INSTALL_INPUT = /^(?:cache|install)$/;
 
 type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
+type Permissions = Record<string, string> | string;
 type Job = {
   needs?: string | string[];
-  permissions?: Record<string, string> | string;
+  permissions?: Permissions;
   steps?: Step[];
 };
-type Workflow = { jobs?: Record<string, Job> };
+type Workflow = { permissions?: Permissions; jobs?: Record<string, Job> };
 
-const ANCESTRY_CHECK = "git merge-base --is-ancestor";
-
-// The ancestry guard job runs no repository script, so it cannot also run the
-// checker. It is the one job the ordering rule skips.
-function isAncestryGuard(job: Job): boolean {
-  return (job.steps ?? []).some(
-    (step) => typeof step.run === "string" && step.run.includes(ANCESTRY_CHECK),
-  );
-}
+const ANCESTRY_JOB = "verify-ancestry";
 
 function needsOf(job: Job): string[] {
   if (job.needs === undefined) return [];
@@ -40,8 +35,10 @@ function needsOf(job: Job): string[] {
 }
 
 // Permissions that grant a write scope, including `id-token: write`.
-function writePermissions(job: Job): string[] {
-  const permissions = job.permissions;
+function writePermissions(job: Job, workflow: Workflow): string[] {
+  const permissions = job.permissions === undefined ? workflow.permissions : job.permissions;
+  if (permissions === undefined) return ["repository-default"];
+  if (permissions === "write-all") return ["write-all"];
   if (permissions === null || typeof permissions !== "object") return [];
   return Object.entries(permissions)
     .filter(([, value]) => value === "write")
@@ -69,12 +66,10 @@ function firstRunIndex(steps: Step[]): number {
   return steps.findIndex((step) => typeof step.run === "string");
 }
 
-// Jobs with no run step are exempt. Everywhere else the first run step must be
-// the checker, and nothing before it may fetch packages.
 function orderingProblems(workflow: Workflow, source: string): string[] {
   const problems: string[] = [];
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
-    if (isAncestryGuard(definition)) continue;
+    if (source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB) continue;
     const steps = definition.steps ?? [];
     const firstRun = firstRunIndex(steps);
     if (firstRun === -1) continue;
@@ -238,10 +233,9 @@ function loadWorkflow(name: string): Workflow {
 test("the release workflow's ancestry guard is read-only and checks out without credentials", () => {
   const workflow = loadWorkflow("release-publish.yml");
   const jobs = workflow.jobs ?? {};
-  const guards = Object.keys(jobs).filter((name) => isAncestryGuard(jobs[name]));
-  expect(guards).toHaveLength(1);
-  const guard = jobs[guards[0]];
-  expect(writePermissions(guard)).toEqual([]);
+  const guard = jobs[ANCESTRY_JOB];
+  expect(guard).toBeDefined();
+  expect(writePermissions(guard, workflow)).toEqual([]);
   expect(guard.permissions).not.toHaveProperty("id-token");
   const checkout = (guard.steps ?? []).find(
     (step) => typeof step.uses === "string" && /^actions\/checkout@/.test(step.uses),
@@ -252,16 +246,13 @@ test("the release workflow's ancestry guard is read-only and checks out without 
 test("every privileged job in the release workflow needs the ancestry guard", () => {
   const workflow = loadWorkflow("release-publish.yml");
   const jobs = workflow.jobs ?? {};
-  const guard = Object.keys(jobs).find((name) => isAncestryGuard(jobs[name]));
-  expect(guard).toBeDefined();
-  const privileged = Object.entries(jobs).filter(([, job]) => {
-    const permissions = job.permissions;
-    if (permissions === null || typeof permissions !== "object") return false;
-    return permissions["id-token"] === "write" || writePermissions(job).length > 0;
-  });
+  expect(jobs[ANCESTRY_JOB]).toBeDefined();
+  const privileged = Object.entries(jobs).filter(
+    ([, job]) => writePermissions(job, workflow).length > 0,
+  );
   expect(privileged.length).toBeGreaterThan(0);
   for (const [name] of privileged) {
-    expect(dependsOn(jobs, name, guard as string)).toBe(true);
+    expect(dependsOn(jobs, name, ANCESTRY_JOB)).toBe(true);
   }
 });
 
@@ -270,7 +261,7 @@ test("a job that holds a write permission needs a prerequisite before a reposito
   for (const source of workflowSources()) {
     const workflow = loadWorkflow(source);
     for (const [name, job] of Object.entries(workflow.jobs ?? {})) {
-      if (writePermissions(job).length === 0) continue;
+      if (writePermissions(job, workflow).length === 0) continue;
       const runsRepositoryScript = (job.steps ?? []).some(
         (step) => typeof step.run === "string" && /\bscripts\//.test(step.run),
       );
@@ -282,4 +273,76 @@ test("a job that holds a write permission needs a prerequisite before a reposito
     }
   }
   expect(problems).toEqual([]);
+});
+
+test.each([
+  ["job write-all", { permissions: "write-all" }, { permissions: { contents: "read" } }],
+  ["inherited write", {}, { permissions: { contents: "write" } }],
+  ["repository default", {}, {}],
+] satisfies [string, Job, Workflow][])("%s is counted as privileged", (_name, job, workflow) => {
+  expect(writePermissions(job, workflow).length).toBeGreaterThan(0);
+});
+
+test("job permissions override workflow permissions", () => {
+  expect(writePermissions({ permissions: {} }, { permissions: "write-all" })).toEqual([]);
+  expect(writePermissions({}, { permissions: "read-all" })).toEqual([]);
+  expect(writePermissions({}, { permissions: "write-all" })).toEqual(["write-all"]);
+});
+
+test("the release guard accepts a merged commit and refuses an unmerged commit", () => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const steps = workflow.jobs?.[ANCESTRY_JOB]?.steps ?? [];
+  const guards = steps.filter((step) => step.name === "Verify tagged commit is on main");
+  expect(guards).toHaveLength(1);
+  const script = guards[0].run;
+  expect(typeof script).toBe("string");
+  const root = mkdtempSync(join(tmpdir(), "bob-release-ancestry-"));
+  const checkout = join(root, "checkout");
+  const remote = join(root, "origin.git");
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "Release guard test",
+    GIT_AUTHOR_EMAIL: "guard@example.invalid",
+    GIT_COMMITTER_NAME: "Release guard test",
+    GIT_COMMITTER_EMAIL: "guard@example.invalid",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+  };
+  function git(...args: string[]): string {
+    const result = spawnSync("git", args, { cwd: root, env, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout.trim();
+  }
+  try {
+    git("init", "--bare", "--initial-branch=main", remote);
+    git("init", "--initial-branch=main", checkout);
+    git("-C", checkout, "remote", "add", "origin", remote);
+    git("-C", checkout, "commit", "--allow-empty", "-m", "base");
+    git("-C", checkout, "checkout", "-b", "merged");
+    git("-C", checkout, "commit", "--allow-empty", "-m", "merged change");
+    const merged = git("-C", checkout, "rev-parse", "HEAD");
+    git("-C", checkout, "checkout", "main");
+    git("-C", checkout, "merge", "--no-ff", "merged", "-m", "merge change");
+    git("-C", checkout, "push", "origin", "main");
+    git("-C", checkout, "checkout", "-b", "unmerged");
+    git("-C", checkout, "commit", "--allow-empty", "-m", "unmerged change");
+    const unmerged = git("-C", checkout, "rev-parse", "HEAD");
+    for (const [sha, accepted] of [
+      [merged, true],
+      [unmerged, false],
+    ] as const) {
+      const result = spawnSync("bash", ["-euo", "pipefail", "-c", script as string], {
+        cwd: checkout,
+        env: { ...env, GITHUB_SHA: sha },
+        encoding: "utf8",
+      });
+      if (accepted) expect(result.status, result.stderr).toBe(0);
+      else {
+        expect(result.status).not.toBeNull();
+        expect(result.status).not.toBe(0);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

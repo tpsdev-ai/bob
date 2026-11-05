@@ -60,10 +60,9 @@ jobs:
   verify-ancestry:
     name: Verify tagged commit is on main
     runs-on: ubuntu-latest
-    # This job holds no write permission and runs no repository script: it only
-    # fetches main and checks that the tagged commit is an ancestor. Every job
-    # that holds a write permission or id-token depends on it, so none of them
-    # starts unless the tag points at merged code.
+    # While this workflow file runs, every privileged job needs this read-only guard,
+    # which refuses a commit not on main. A tag's commit supplies the workflow;
+    # restricting who can create release tags needs a repository tag ruleset (#392).
     permissions:
       contents: read
     steps:
@@ -73,8 +72,6 @@ jobs:
           persist-credentials: false
 
       - name: Verify tagged commit is on main
-        # A tag can point at any commit; require it to be merged to main so a tag
-        # can never ship un-reviewed code past the npm staging gate.
         run: |
           set -euo pipefail
           git fetch --no-tags origin main

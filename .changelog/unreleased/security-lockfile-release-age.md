@@ -8,5 +8,4 @@
   job, which runs no repository script; an `actions/cache` step whose path
   contains `.bun` or `.npm`, and a `uses:` step with an input named `cache` or
   `install`, may not precede it.
-  `minimumReleaseAgeExcludes` is honoured as written; widening it is protected
-  by review (the main ruleset requires two approvals), not by the checker.
+  `minimumReleaseAgeExcludes` is honoured as written.
