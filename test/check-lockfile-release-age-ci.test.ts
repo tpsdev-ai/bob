@@ -1,7 +1,7 @@
 // bob#390: the checker is the first `run:` step in each job with a `run:` step,
-// except release-publish.yml's verify-ancestry job. Before it, reject an
-// actions/cache step whose path has a component exactly .bun or .npm, or a
-// `uses:` step with an input named cache or install.
+// except release-publish.yml's verify-ancestry job. Before the first run, allow only
+// actions/checkout {fetch-depth, persist-credentials}, oven-sh/setup-bun {bun-version},
+// actions/setup-node {node-version}, socketdev/action {mode}.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -12,8 +12,12 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
-const CACHE_PATH_COMPONENT = /(?:^|[/\\])(?:\.bun|\.npm)(?:[/\\]|$)/;
-const CACHE_OR_INSTALL_INPUT = /^(?:cache|install)$/;
+const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
+  ["actions/checkout", ["fetch-depth", "persist-credentials"]],
+  ["oven-sh/setup-bun", ["bun-version"]],
+  ["actions/setup-node", ["node-version"]],
+  ["socketdev/action", ["mode"]],
+]);
 
 type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
 type Permissions = Record<string, string> | string;
@@ -42,21 +46,70 @@ function writePermissions(job: Job, workflow: Workflow): string[] {
     .map(([name]) => name);
 }
 
-function hasCachePathComponent(step: Step): boolean {
-  if (typeof step.uses !== "string" || !/^actions\/cache@/.test(step.uses)) return false;
-  const declared = step.with?.path;
-  const paths = Array.isArray(declared) ? declared : String(declared ?? "").split(/\r?\n/);
-  return paths.some((path) => typeof path === "string" && CACHE_PATH_COMPONENT.test(path.trim()));
+function actionOf(step: Step): string | undefined {
+  if (typeof step.uses !== "string") return undefined;
+  const parts = step.uses.split("@");
+  return parts.length === 2 && parts[1] !== "" ? parts[0] : undefined;
 }
 
-function cacheOrInstallInput(step: Step): string | null {
-  if (typeof step.uses !== "string" || step.with === null || typeof step.with !== "object") {
-    return null;
+function actionProblems(step: Step, where: string): string[] {
+  const action = actionOf(step);
+  const inputs = action === undefined ? undefined : PRE_RUN_ACTIONS.get(action);
+  if (inputs === undefined) {
+    return [
+      `${where}: action "${step.uses ?? "<missing uses>"}" is not allowed before the first run step`,
+    ];
   }
-  for (const key of Object.keys(step.with)) {
-    if (CACHE_OR_INSTALL_INPUT.test(key)) return key;
+  if (step.with === undefined) return [];
+  if (step.with === null || typeof step.with !== "object" || Array.isArray(step.with)) {
+    return [`${where}: action "${step.uses}" has invalid with inputs`];
   }
-  return null;
+  return Object.keys(step.with)
+    .filter((input) => !inputs.includes(input))
+    .map(
+      (input) =>
+        `${where}: action "${step.uses}" input "${input}" is not allowed before the first run step`,
+    );
+}
+
+function ancestryProblems(steps: Step[], where: string): string[] {
+  const problems: string[] = [];
+  if (steps.length !== 2) {
+    problems.push(
+      `${where}: expected exactly 2 steps (checkout, ancestry guard), found ${steps.length}`,
+    );
+  }
+  const checkout = steps[0];
+  if (checkout === undefined || actionOf(checkout) !== "actions/checkout") {
+    problems.push(`${where} step 1: expected actions/checkout`);
+  } else {
+    problems.push(...actionProblems(checkout, `${where} step 1`));
+    if (checkout.with?.["persist-credentials"] !== false) {
+      problems.push(`${where} step 1: actions/checkout input "persist-credentials" must be false`);
+    }
+    for (const key of Object.keys(checkout)) {
+      if (key !== "uses" && key !== "with") {
+        problems.push(`${where} step 1: actions/checkout field "${key}" is not allowed`);
+      }
+    }
+  }
+  const guard = steps[1];
+  if (
+    guard === undefined ||
+    guard.name !== "Verify the run's commit is on main" ||
+    typeof guard.run !== "string" ||
+    guard.run.trim() === ""
+  ) {
+    problems.push(`${where} step 2: expected run step named "Verify the run's commit is on main"`);
+  }
+  if (guard !== undefined) {
+    for (const key of Object.keys(guard)) {
+      if (key !== "name" && key !== "run") {
+        problems.push(`${where} step 2: ancestry guard field "${key}" is not allowed`);
+      }
+    }
+  }
+  return problems;
 }
 
 function firstRunIndex(steps: Step[]): number {
@@ -66,32 +119,22 @@ function firstRunIndex(steps: Step[]): number {
 function orderingProblems(workflow: Workflow, source: string): string[] {
   const problems: string[] = [];
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
-    if (source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB) continue;
     const steps = definition.steps ?? [];
+    const where = `${source}: job "${job}"`;
+    const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
+    if (isAncestry) problems.push(...ancestryProblems(steps, where));
     const firstRun = firstRunIndex(steps);
     if (firstRun === -1) continue;
-    const where = `${source}: job "${job}"`;
-    if ((steps[firstRun].run ?? "").trim() !== CHECKER) {
+    if (!isAncestry && (steps[firstRun].run ?? "").trim() !== CHECKER) {
       problems.push(
         `${where} step ${firstRun + 1}: the first run step is not the ${CHECKER} checker`,
       );
     }
     for (let index = 0; index < firstRun; index += 1) {
-      const step = steps[index];
-      if (hasCachePathComponent(step)) {
-        problems.push(
-          `${where} step ${index + 1} (${step.name ?? step.uses}) is an actions/cache step whose path has a component exactly .bun or .npm before the first run step`,
-        );
-      }
-      const input = cacheOrInstallInput(step);
-      if (input !== null) {
-        problems.push(
-          `${where} step ${index + 1} (${step.uses}) sets input "${input}" before the first run step`,
-        );
-      }
+      problems.push(...actionProblems(steps[index], `${where} step ${index + 1}`));
     }
   }
-  return problems;
+  return [...new Set(problems)];
 }
 
 test("the checker is the first run step of each job with a run step, except release-publish.yml verify-ancestry", () => {
@@ -138,56 +181,109 @@ test("a first run step different from the checker is red", () => {
   ]);
 });
 
-test("an actions/cache step whose path has a component exactly .bun or .npm before the checker is red", () => {
-  const workflow = parseYaml(
-    [
-      "jobs:",
-      "  cache-before:",
-      "    steps:",
-      "      - name: Cache bun install",
-      "        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-      "        with:",
-      "          path: ~/.bun/install/cache",
-      `      - run: ${CHECKER}`,
-      "  cache-after:",
-      "    steps:",
-      `      - run: ${CHECKER}`,
-      "      - name: Cache npm",
-      "        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-      "        with:",
-      "          path: ~/.npm",
-    ].join("\n"),
-  ) as Workflow;
-  expect(orderingProblems(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "cache-before" step 1 (Cache bun install) is an actions/cache step whose path has a component exactly .bun or .npm before the first run step',
+test.each([
+  "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+  "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+  "unknown/action@main",
+])("%s before the first run step is red", (uses) => {
+  const workflow = loadWorkflow("ci.yml");
+  const steps = workflow.jobs?.build.steps;
+  expect(steps).toBeDefined();
+  steps?.splice(0, 0, { uses });
+  expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    `.github/workflows/ci.yml: job "build" step 1: action "${uses}" is not allowed before the first run step`,
   ]);
 });
 
-test("a uses step with an input named cache or install before the checker is red", () => {
-  const workflow = parseYaml(
-    [
-      "jobs:",
-      "  cache-input:",
-      "    steps:",
-      "      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
-      "        with:",
-      '          node-version: "22"',
-      "          cache: npm",
-      `      - run: ${CHECKER}`,
-      "  version-only:",
-      "    steps:",
-      "      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
-      "        with:",
-      '          node-version: "22"',
-      `      - run: ${CHECKER}`,
-    ].join("\n"),
-  ) as Workflow;
-  expect(orderingProblems(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "cache-input" step 1 (actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1) sets input "cache" before the first run step',
+test.each([...PRE_RUN_ACTIONS.keys()])(
+  "%s with an unlisted input before the first run step is red",
+  (action) => {
+    const workflow = loadWorkflow("ci.yml");
+    const steps = workflow.jobs?.build.steps ?? [];
+    const step = steps.find((candidate) => actionOf(candidate) === action);
+    expect(step).toBeDefined();
+    if (step === undefined) throw new Error(`Missing ${action}`);
+    step.with = { ...step.with, cache: "bun" };
+    expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+      `.github/workflows/ci.yml: job "build" step ${steps.indexOf(step) + 1}: action "${step.uses}" input "cache" is not allowed before the first run step`,
+    ]);
+  },
+);
+
+test("a step with neither uses nor run before the first run step is red", () => {
+  const workflow = loadWorkflow("ci.yml");
+  workflow.jobs?.build.steps?.splice(0, 0, { name: "empty" });
+  expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    '.github/workflows/ci.yml: job "build" step 1: action "<missing uses>" is not allowed before the first run step',
   ]);
 });
 
-test("a job with only uses steps is exempt", () => {
+test.each(['git update-ref refs/remotes/origin/main "$GITHUB_SHA"', "bun install"])(
+  "%s before the ancestry guard is red",
+  (run) => {
+    const workflow = loadWorkflow("release-publish.yml");
+    workflow.jobs?.[ANCESTRY_JOB].steps?.splice(1, 0, { run });
+    expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
+      '.github/workflows/release-publish.yml: job "verify-ancestry": expected exactly 2 steps (checkout, ancestry guard), found 3',
+      '.github/workflows/release-publish.yml: job "verify-ancestry" step 2: expected run step named "Verify the run\'s commit is on main"',
+    ]);
+  },
+);
+
+test.each([
+  ["extra action", (steps: Step[]) => steps.push({ uses: "unknown/action@main" })],
+  ["reordered steps", (steps: Step[]) => steps.reverse()],
+  [
+    "extra checkout input",
+    (steps: Step[]) => {
+      steps[0].with = { ...steps[0].with, ref: "main" };
+    },
+  ],
+  [
+    "persisted credentials",
+    (steps: Step[]) => {
+      steps[0].with = { "persist-credentials": true };
+    },
+  ],
+  [
+    "missing persist-credentials",
+    (steps: Step[]) => {
+      steps[0].with = {};
+    },
+  ],
+  [
+    "extra guard input",
+    (steps: Step[]) => {
+      steps[1].with = { cache: "bun" };
+    },
+  ],
+  [
+    "renamed guard",
+    (steps: Step[]) => {
+      steps[1].name = "other";
+    },
+  ],
+  [
+    "missing guard run",
+    (steps: Step[]) => {
+      delete steps[1].run;
+    },
+  ],
+  [
+    "extra checkout run",
+    (steps: Step[]) => {
+      steps[0].run = "bun install";
+    },
+  ],
+] satisfies [string, (steps: Step[]) => unknown][])("ancestry %s is red", (_name, mutate) => {
+  const workflow = loadWorkflow("release-publish.yml");
+  mutate(workflow.jobs?.[ANCESTRY_JOB].steps ?? []);
+  expect(
+    orderingProblems(workflow, ".github/workflows/release-publish.yml").length,
+  ).toBeGreaterThan(0);
+});
+
+test("a job with no run step is exempt from the ordering rule", () => {
   const workflow = parseYaml(
     [
       "jobs:",
@@ -287,9 +383,10 @@ test("job permissions override workflow permissions", () => {
 test("the release guard accepts a merged commit and refuses an unmerged commit", () => {
   const workflow = loadWorkflow("release-publish.yml");
   const steps = workflow.jobs?.[ANCESTRY_JOB]?.steps ?? [];
-  const guards = steps.filter((step) => step.name === "Verify the run's commit is on main");
-  expect(guards).toHaveLength(1);
-  const script = guards[0].run;
+  expect(
+    ancestryProblems(steps, '.github/workflows/release-publish.yml: job "verify-ancestry"'),
+  ).toEqual([]);
+  const script = steps[1].run;
   expect(typeof script).toBe("string");
   const root = mkdtempSync(join(tmpdir(), "bob-release-ancestry-"));
   const checkout = join(root, "checkout");

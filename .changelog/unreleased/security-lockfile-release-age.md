@@ -5,7 +5,5 @@
   and fails on each checked registry version younger than the bake or a registry
   lookup it cannot complete. The checker is the first `run:` step of each
   workflow job with a `run:` step, except release-publish.yml's verify-ancestry
-  job; an `actions/cache` step whose path has a component exactly `.bun` or
-  `.npm`, and a `uses:` step with an input named `cache` or `install`, may not
-  precede it.
+  job. Before the first `run:` step, only `actions/checkout` (`fetch-depth`, `persist-credentials`), `oven-sh/setup-bun` (`bun-version`), `actions/setup-node` (`node-version`), and `socketdev/action` (`mode`) are allowed, with only those inputs.
   `minimumReleaseAgeExcludes` filters entries by exact package name before registry lookup.
