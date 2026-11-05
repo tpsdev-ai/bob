@@ -189,9 +189,45 @@ test("scoped package names are URL-encoded with a literal @ and %2f", async () =
 
 test.each([
   ["git-pkg", "git+ssh://git@host/repo.git#commit"],
+  ["git-pkg", "git+https://host/repo.git#commit"],
+  ["git-pkg", "git://host/repo.git#commit"],
+  ["git-pkg", "github:owner/repo#commit"],
   ["tarball-pkg", "https://host/tarball-pkg-1.2.3.tgz"],
   ["tarball-pkg", "http://host/tarball-pkg-1.2.3.tgz"],
-])("skips %s resolved from %s", async (name, version) => {
+  ["odd-pkg", "1.2"],
+  ["odd-pkg", "^1.2.3"],
+])("refuses %s resolved from %s before any lookup", async (name, version) => {
+  const root = fixture(
+    lockText({
+      [name]: [`${name}@${version}`],
+      "old-pkg": ["old-pkg@2.0.0", "", {}, "sha512-old"],
+    }),
+    undefined,
+  );
+  const calls = [];
+  const error = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch(
+      { "old-pkg": { "2.0.0": new Date(NOW - 30 * 86_400_000).toISOString() } },
+      calls,
+    ),
+    now: NOW,
+  }).catch((thrown) => thrown);
+  expect(error.name).toBe("NonRegistryDependency");
+  expect(error.message).toContain(`packages[${JSON.stringify(name)}] resolves to version`);
+  expect(calls).toEqual([]);
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("NonRegistryDependency");
+  expect(cli.stderr).toContain(`bun.lock packages[${JSON.stringify(name)}]`);
+  expect(cli.stderr).toContain(version);
+});
+
+test.each([
+  ["workspace-pkg", "workspace:*"],
+  ["file-pkg", "file:../local"],
+  ["link-pkg", "link:../local"],
+])("skips local-source %s resolved from %s and reports it", async (name, version) => {
   const root = fixture(
     lockText({ [name]: [`${name}@${version}`], "old-pkg": ["old-pkg@2.0.0"] }),
     undefined,
@@ -210,6 +246,10 @@ test.each([
   expect(result.checked).toBe(1);
   expect(result.ok).toBe(true);
   expect(calls).toEqual(["https://registry.npmjs.org/old-pkg"]);
+  const cli = runCli(root);
+  expect(cli.status).toBe(0);
+  expect(cli.stdout).toContain("Skipped local-source lock entries (1)");
+  expect(cli.stdout).toContain(`${name}@${version}`);
 });
 
 function cliScript(root) {
@@ -268,6 +308,50 @@ test.each([
   const cli = runCli(root);
   expect(cli.status).toBe(2);
   expect(cli.stderr).toContain(`bunfig.toml ${problem}`);
+});
+
+test.each([0, 604799, 604801, 1209600])("refuses an unpinned minimumReleaseAge of %s", (value) => {
+  const root = fixture(lockText({ "fresh-pkg": ["fresh-pkg@1.2.3"] }), undefined);
+  writeFileSync(join(root, "bunfig.toml"), `[install]\nminimumReleaseAge = ${value}\n`);
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("UnpinnedReleaseAge");
+  expect(cli.stderr).toContain(`must be 604800, found ${value}`);
+});
+
+test("accepts the pinned minimumReleaseAge of 604800", async () => {
+  const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+  const result = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({ "old-pkg": { "2.0.0": new Date(NOW - 30 * 86_400_000).toISOString() } }),
+    now: NOW,
+  });
+  expect(result.bakeSeconds).toBe(604800);
+  const cli = runCli(root);
+  expect(cli.status).toBe(0);
+  expect(cli.stdout).toContain(`(${604800}s)`);
+});
+
+test("an unreadable repo .npmrc refuses by name, with code and remedy", async () => {
+  const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+  mkdirSync(join(root, ".npmrc"));
+  const npmrc = join(root, ".npmrc");
+  const error = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({}),
+    now: NOW,
+  }).catch((thrown) => thrown);
+  expect(error.name).toBe("UnreadableConfiguration");
+  expect(error.message).toContain(npmrc);
+  expect(error.message).toContain("EISDIR");
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("UnreadableConfiguration");
+  expect(cli.stderr).toContain(npmrc);
+  expect(cli.stderr).toContain("EISDIR");
+  expect(cli.stderr).toContain(
+    "make it readable, or remove it if it holds no settings for this install",
+  );
 });
 
 test.each(['"604800"', "true", "-1", "1.5", "nan", "inf", "[]", "{}"])(

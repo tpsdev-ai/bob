@@ -610,3 +610,133 @@ test("checker exits 2 on a Bun-written lock whose recorded resolution is a non-d
     rmSync(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+async function expectNonRegistryRefusal(project: string, key: string, version: string) {
+  writeFileSync(join(project, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
+  const lookup = await startRecordingServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ time: {} }));
+    return true;
+  });
+  try {
+    const cli = await runBun(
+      ["--no-install", copyChecker(project), "--registry", lookup.url, "--timeout-ms", "1000"],
+      project,
+      { ...isolatedEnv(project), BOB_RELEASE_AGE_TEST_REGISTRY: "1" },
+    );
+    expect(cli.code).toBe(2);
+    expect(cli.stderr).toContain("NonRegistryDependency");
+    expect(cli.stderr).toContain(`bun.lock packages[${JSON.stringify(key)}]`);
+    expect(cli.stderr).toContain(version);
+    expect(lookup.requests).toEqual([]);
+  } finally {
+    await lookup.close();
+  }
+}
+
+test("checker exits 2 on a Bun-written tarball lock entry before any lookup", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bob-tarball-lock-"));
+  let registry: RecordingServer | undefined;
+  try {
+    const packageRoot = join(root, "tarball", "package");
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "tiny-pkg", version: "1.0.0", main: "index.js" }),
+    );
+    writeFileSync(join(packageRoot, "index.js"), "module.exports = 1;\n");
+    const tarball = join(root, "tiny-pkg-1.0.0.tgz");
+    const tar = spawnSync("tar", ["czf", tarball, "-C", join(root, "tarball"), "package"], {
+      encoding: "utf8",
+    });
+    expect(tar.status).toBe(0);
+    const bytes = readFileSync(tarball);
+
+    registry = await startRecordingServer((request, response) => {
+      if (request.url !== "/tiny-pkg/-/tiny-pkg-1.0.0.tgz") return false;
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.end(bytes);
+      return true;
+    });
+
+    const project = join(root, "project");
+    mkdirSync(project);
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", private: true }),
+    );
+    const url = `${registry.url}/tiny-pkg/-/tiny-pkg-1.0.0.tgz`;
+    const add = await runBun(
+      ["add", "--ignore-scripts", "--no-cache", "--cache-dir", join(root, "cache"), url],
+      project,
+      isolatedEnv(root),
+    );
+    expect(add.code).toBe(0);
+
+    const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+    expect(lock.packages["tiny-pkg"][0]).toBe(`tiny-pkg@${url}`);
+
+    await expectNonRegistryRefusal(project, "tiny-pkg", url);
+  } finally {
+    await registry?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("checker exits 2 on a Bun-written git lock entry before any lookup", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bob-git-lock-"));
+  try {
+    const source = join(root, "source");
+    mkdirSync(source);
+    writeFileSync(
+      join(source, "package.json"),
+      JSON.stringify({ name: "git-pkg", version: "1.0.0" }),
+    );
+    const git = (...args: string[]) =>
+      spawnSync("git", args, {
+        cwd: source,
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      });
+    expect(git("init", "-q").status).toBe(0);
+    expect(git("add", "-A").status).toBe(0);
+    expect(
+      git(
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-qm",
+        "fixture",
+      ).status,
+    ).toBe(0);
+    const bare = join(root, "repo.git");
+    expect(
+      spawnSync("git", ["clone", "-q", "--bare", source, bare], { encoding: "utf8" }).status,
+    ).toBe(0);
+
+    const project = join(root, "project");
+    mkdirSync(project);
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", private: true }),
+    );
+    const url = `git+file://${bare}`;
+    const add = await runBun(
+      ["add", "--ignore-scripts", "--no-cache", "--cache-dir", join(root, "cache"), url],
+      project,
+      isolatedEnv(root),
+    );
+    expect(add.code).toBe(0);
+
+    const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+    const resolution = lock.packages["git-pkg"][0];
+    expect(resolution.startsWith(`git-pkg@${url}#`)).toBe(true);
+
+    const version = resolution.slice(resolution.indexOf("@", 1) + 1);
+    await expectNonRegistryRefusal(project, "git-pkg", version);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);

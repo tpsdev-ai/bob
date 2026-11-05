@@ -7,10 +7,14 @@
  * Every entry in bun.lock's `packages` map is read. The lock's resolution
  * string is parsed as package@version.
  *
- * Non-registry entries are skipped by one explicit rule: the version part of
- * the resolution starts with `workspace:`, `file:`, `link:`, `git:`, `git+`,
- * `github:`, `http:` or `https:`. Every other entry must parse as package@version;
- * each unique pair not listed in `minimumReleaseAgeExcludes` is looked up.
+ * An entry is checked only when its version is an exact semver version.
+ * Entries whose version starts with `workspace:`, `file:` or `link:` are
+ * skipped: those name local source in the reviewed tree. Any other version
+ * form — `git:`, `git+…`, `github:`, `http:`, `https:` or an unrecognised
+ * value — is refused before any lookup, naming the lock key and version.
+ * Each unique checked pair not listed in `minimumReleaseAgeExcludes` is
+ * looked up. The bake is pinned: the checker refuses any
+ * `minimumReleaseAge` other than 604800.
  *
  * Exit codes:
  *   0 — every checked version is at least the bake length old
@@ -47,12 +51,19 @@ function requireNpmRegistry(value, source, tarball = false) {
   }
 }
 
+/**
+ * Read a configuration file, or undefined when it does not exist.
+ * Bun skips an unreadable .npmrc; the checker refuses rather than guess.
+ */
 function optionalText(path) {
   try {
     return readFileSync(path, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") return undefined;
-    throw error;
+    throw namedError(
+      "UnreadableConfiguration",
+      `${path}: ${error.code ?? error.message}; make it readable, or remove it if it holds no settings for this install`,
+    );
   }
 }
 
@@ -164,16 +175,12 @@ function requireTestRegistry(registry, env) {
   }
 }
 
-const NON_REGISTRY_PREFIXES = [
-  "workspace:",
-  "file:",
-  "link:",
-  "git:",
-  "git+",
-  "github:",
-  "http:",
-  "https:",
-];
+const LOCAL_SOURCE_PREFIXES = ["workspace:", "file:", "link:"];
+const EXACT_VERSION =
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/** The release-age policy the checker enforces, in seconds. */
+const PINNED_RELEASE_AGE_SECONDS = 7 * 24 * 60 * 60;
 
 /** Encode a package name for a registry URL: `@scope/name` → `@scope%2fname`. */
 export function encodePackageName(name) {
@@ -296,6 +303,12 @@ export function readBunfigPolicy(text) {
       "bunfig.toml install.minimumReleaseAge must be a non-negative integer number of seconds",
     );
   }
+  if (bakeSeconds !== PINNED_RELEASE_AGE_SECONDS) {
+    throw namedError(
+      "UnpinnedReleaseAge",
+      `bunfig.toml install.minimumReleaseAge must be ${PINNED_RELEASE_AGE_SECONDS}, found ${bakeSeconds}`,
+    );
+  }
   const excludes =
     install.minimumReleaseAgeExcludes === undefined ? [] : install.minimumReleaseAgeExcludes;
   if (
@@ -319,6 +332,8 @@ function isPlainObject(value) {
  * A missing/non-object or empty map, non-array entry, or missing/empty/non-string
  * resolution throws, as does a resolution without a name or version.
  * A one-element entry containing a name@version string is accepted.
+ * Local-source versions (`workspace:`, `file:`, `link:`) are skipped; any
+ * other non-semver version is refused by name.
  */
 export function collectLockEntries(lock) {
   const packages = lock?.packages;
@@ -348,9 +363,15 @@ export function collectLockEntries(lock) {
     }
     const name = resolution.slice(0, at);
     const version = resolution.slice(at + 1);
-    if (NON_REGISTRY_PREFIXES.some((prefix) => version.startsWith(prefix))) {
+    if (LOCAL_SOURCE_PREFIXES.some((prefix) => version.startsWith(prefix))) {
       skipped.push({ key, name, version });
       continue;
+    }
+    if (!EXACT_VERSION.test(version)) {
+      throw namedError(
+        "NonRegistryDependency",
+        `bun.lock packages[${JSON.stringify(key)}] resolves to version ${JSON.stringify(version)}; only exact semver versions are checked and only workspace:, file: and link: sources are skipped`,
+      );
     }
     if (entry[1] !== undefined && entry[1] !== "") {
       requireNpmRegistry(entry[1], `bun.lock packages[${JSON.stringify(key)}] resolution`, true);
@@ -544,7 +565,9 @@ async function main() {
     );
   }
   if (result.skipped.length > 0) {
-    console.log(`Skipped non-registry lock entries (${result.skipped.length}).`);
+    console.log(
+      `Skipped local-source lock entries (${result.skipped.length}): ${result.skipped.map((e) => `${e.name}@${e.version}`).join(", ")}`,
+    );
   }
 
   if (result.tooYoung.length > 0) {
