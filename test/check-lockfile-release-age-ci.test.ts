@@ -1,4 +1,4 @@
-// The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The action allow-set check does not inspect input values or action contents.
+// The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a `uses:` step may not set `env`, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The action allow-set check does not inspect input values or action contents.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -55,7 +55,8 @@ const JOB_KEYS = [
   "environment",
   "if",
 ];
-const STEP_KEYS = ["uses", "with", "name", "run", "env", "id", "if"];
+const USES_STEP_KEYS = ["uses", "with", "name", "id", "if"];
+const RUN_STEP_KEYS = ["run", "name", "env", "id", "if"];
 const ANCESTRY_JOB = "verify-ancestry";
 const CHECKER_STEP_KEYS = ["name", "run"];
 const ANCESTRY_JOB_KEYS = ["name", "runs-on", "permissions", "steps"];
@@ -183,7 +184,13 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
     problems.push(...conditionProblems(definition.if, where));
     for (const [index, step] of steps.entries()) {
       const stepWhere = `${where} step ${index + 1}`;
-      problems.push(...keyProblems(step, STEP_KEYS, stepWhere));
+      const hasUses = Object.hasOwn(step, "uses");
+      const hasRun = Object.hasOwn(step, "run");
+      if (hasUses === hasRun) {
+        problems.push(`${stepWhere}: expected exactly one of uses or run`);
+        continue;
+      }
+      problems.push(...keyProblems(step, hasUses ? USES_STEP_KEYS : RUN_STEP_KEYS, stepWhere));
       problems.push(...conditionProblems(step.if, stepWhere));
       if (step.uses !== undefined) {
         problems.push(...actionProblems(step, stepWhere, ACTIONS, ""));
@@ -305,6 +312,39 @@ test.each([
     }
   },
 );
+
+test.each([
+  ["ci.yml", "build", "oven-sh/setup-bun"],
+  ["codeql.yml", "analyze", "github/codeql-action/analyze"],
+  ["release-publish.yml", "verify-ancestry", "actions/checkout"],
+])("%s job %s uses %s with env is red", (source, job, action) => {
+  const workflow = loadWorkflow(source);
+  const steps = workflow.jobs?.[job].steps ?? [];
+  const index = steps.findIndex((step) => actionOf(step) === action);
+  expect(index).toBeGreaterThanOrEqual(0);
+  steps[index].env = { CI: "" };
+  const expected = [
+    `.github/workflows/${source}: job "${job}" step ${index + 1}: key "env" is not allowed`,
+  ];
+  if (job === ANCESTRY_JOB) {
+    expected.push(
+      `.github/workflows/${source}: job "${job}" step ${index + 1}: actions/checkout field "env" is not allowed`,
+    );
+  }
+  expect(orderingProblems(workflow, `.github/workflows/${source}`)).toEqual(expected);
+});
+
+test.each(["both", "neither"])("a step with %s uses and run after the checker is red", (kind) => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const steps = workflow.jobs?.["stage-publish"].steps ?? [];
+  const index = steps.findIndex((step) => actionOf(step) === "actions/cache");
+  expect(index).toBeGreaterThan(firstRunIndex(steps));
+  if (kind === "both") steps[index].run = "echo test";
+  else delete steps[index].uses;
+  expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
+    `.github/workflows/release-publish.yml: job "stage-publish" step ${index + 1}: expected exactly one of uses or run`,
+  ]);
+});
 
 test.each(["success()", "$" + "{{ failure() }}", "always()", "cancelled()", "ALWAYS ()"])(
   "job and step if %s is red",
@@ -492,6 +532,7 @@ test("a step with neither uses nor run before the first run step is red", () => 
   const workflow = loadWorkflow("ci.yml");
   workflow.jobs?.build.steps?.splice(0, 0, { name: "empty" });
   expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    '.github/workflows/ci.yml: job "build" step 1: expected exactly one of uses or run',
     '.github/workflows/ci.yml: job "build" step 1: action "<missing uses>" is not allowed before the first run step',
   ]);
 });
