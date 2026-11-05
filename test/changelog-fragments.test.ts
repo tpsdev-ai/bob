@@ -3,7 +3,7 @@
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` carries the migrated list
 // entries reordered by category and filename, and apart from that order they
-// differ only by the twenty-three repairs the migration tests name and the whitespace
+// differ only by the repairs the migration tests name and the whitespace
 // trimmed at the end of each fragment (the block body's two HTML comment
 // markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
 // and do not render); `promote`
@@ -1553,13 +1553,7 @@ describe("changelog fragments — the migration (bob#236)", () => {
   const before = ENTRIES(readFileSync(join(FIXTURES, "unreleased-main-fff78d6a.md"), "utf8"));
   const migrated = cf.readFragments(join(FIXTURES, "migrated-bob-236"));
 
-  // The twenty-four entries the migrated set changes from main's text, each as EXACT edits
-  // (applied in order, each `from` found exactly once) plus every word that
-  // disappears from the entry (`dropped`). Five were changed to pass `check`
-  // (fixed-17, fixed-19, added-09, fixed-bob225, fixed-bob228; fixed-19 was also corrected), and nineteen more were
-  // corrected because they no longer matched bob's code or the rendered order,
-  // most of them because code merged after they were written changed what they
-  // describe.
+  // Each changed entry lists exact edits and dropped words.
   // Every other entry is main's text unchanged (whitespace at its end aside). A
   // new difference, or a word that vanishes without being listed, fails. That
   // detects unlisted vanished words; it does not prove every fact is preserved (a
@@ -1572,6 +1566,30 @@ describe("changelog fragments — the migration (bob#236)", () => {
     dropped: string[];
   };
   const REPAIRED: Repair[] = [
+    {
+      fragment: "changed-02-dependency-updates-are-configured-through-renovate.md",
+      was: "- **Dependency updates are configured through Renovate",
+      why: "Frozen installs do not apply minimumReleaseAge; the checker gates the lockfile.",
+      edits: [
+        ["bob keeps its stricter install gate: advisory fixes", "Advisory fixes"],
+        [
+          "(bunfig refuses versions younger than 7 days, except @types/node and typescript)",
+          "(bunfig filters during resolution, except @types/node and typescript; frozen installs do not filter, and scripts/check-lockfile-release-age.mjs gates the committed lockfile)",
+        ],
+      ],
+      dropped: [
+        "bob",
+        "gate",
+        "install",
+        "its",
+        "keeps",
+        "refuses",
+        "stricter",
+        "than",
+        "versions",
+        "younger",
+      ],
+    },
     {
       fragment: "fixed-17-bob-loads-the-raw-32-byte.md",
       was: "- **bob loads the raw 32-byte seed key",

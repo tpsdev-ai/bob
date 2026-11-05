@@ -1,6 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -224,14 +233,15 @@ test.each([
 });
 
 test.each([
-  ["workspace-pkg", "workspace:*"],
-  ["file-pkg", "file:../local"],
-  ["link-pkg", "link:../local"],
+  ["workspace-pkg", "workspace:vendor/x"],
+  ["file-pkg", "file:./vendor/x"],
+  ["link-pkg", "link:./vendor/x"],
 ])("skips local-source %s resolved from %s and reports it", async (name, version) => {
   const root = fixture(
     lockText({ [name]: [`${name}@${version}`], "old-pkg": ["old-pkg@2.0.0"] }),
     undefined,
   );
+  mkdirSync(join(root, "vendor/x"), { recursive: true });
   const calls = [];
   const result = await checkLockfileReleaseAge({
     root,
@@ -252,6 +262,151 @@ test.each([
   expect(cli.stdout).toContain(`${name}@${version}`);
 });
 
+test.each(["file:", "link:", "workspace:"])(
+  "%s target outside the checkout exits 2 before lookup",
+  async (prefix) => {
+    const container = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+    const root = join(container, "project");
+    const outside = join(container, "outside");
+    mkdirSync(root);
+    mkdirSync(outside);
+    writeFileSync(join(root, "bunfig.toml"), bunfigText(undefined));
+    writeFileSync(
+      join(root, "bun.lock"),
+      lockText({ local: [`local@${prefix}../outside`], "old-pkg": ["old-pkg@2.0.0"] }),
+    );
+    const calls = [];
+    const error = await checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}, calls) }).catch(
+      (thrown) => thrown,
+    );
+    expect(error.name).toBe("LocalSourceOutsideCheckout");
+    expect(error.message).toContain('packages["local"]');
+    expect(error.message).toContain(realpathSync(outside));
+    expect(calls).toEqual([]);
+    const cli = runCli(root);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("LocalSourceOutsideCheckout");
+    expect(cli.stderr).toContain(realpathSync(outside));
+  },
+);
+
+test.each(["file:", "link:", "workspace:"])(
+  "%s symlink target outside the checkout exits 2 before lookup",
+  async (prefix) => {
+    const container = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+    const root = join(container, "project");
+    const outside = join(container, "project-sibling");
+    mkdirSync(root);
+    mkdirSync(outside);
+    symlinkSync(outside, join(root, "vendor"));
+    writeFileSync(join(root, "bunfig.toml"), bunfigText(undefined));
+    writeFileSync(
+      join(root, "bun.lock"),
+      lockText({ local: [`local@${prefix}./vendor`], "old-pkg": ["old-pkg@2.0.0"] }),
+    );
+    const calls = [];
+    const error = await checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}, calls) }).catch(
+      (thrown) => thrown,
+    );
+    expect(error.name).toBe("LocalSourceOutsideCheckout");
+    expect(error.message).toContain('packages["local"]');
+    expect(error.message).toContain(realpathSync(outside));
+    expect(calls).toEqual([]);
+    const cli = runCli(root);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("LocalSourceOutsideCheckout");
+    expect(cli.stderr).toContain(realpathSync(outside));
+  },
+);
+
+test.each(["file:", "link:", "workspace:"])(
+  "%s unresolved target exits 2 before lookup",
+  async (prefix) => {
+    const root = fixture(
+      lockText({ local: [`local@${prefix}missing`], "old-pkg": ["old-pkg@2.0.0"] }),
+      undefined,
+    );
+    const calls = [];
+    const error = await checkLockfileReleaseAge({ root, fetchImpl: stubFetch({}, calls) }).catch(
+      (thrown) => thrown,
+    );
+    expect(error.name).toBe("LocalSourceOutsideCheckout");
+    expect(error.message).toContain('packages["local"]');
+    expect(error.message).toContain(join(root, "missing"));
+    expect(error.message).toContain("ENOENT");
+    expect(calls).toEqual([]);
+    const cli = runCli(root);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("LocalSourceOutsideCheckout");
+  },
+);
+
+test.each([
+  ["inside", true],
+  ["outside", false],
+])("Bun-written file entry %s the checkout", async (_location, inside) => {
+  const container = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+  const root = join(container, "project");
+  mkdirSync(root);
+  expect(spawnSync("git", ["init", "-q", root], { encoding: "utf8" }).status).toBe(0);
+  const source = inside ? join(root, "vendor/x") : join(container, "outside");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(
+    join(source, "package.json"),
+    JSON.stringify({ name: "local-pkg", version: "1.0.0" }),
+  );
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "fixture", private: true }));
+  const add = spawnSync(
+    process.execPath,
+    [
+      "add",
+      "--ignore-scripts",
+      "--no-cache",
+      "--cache-dir",
+      join(container, "cache"),
+      inside ? "file:./vendor/x" : "file:../outside",
+    ],
+    { cwd: root, env: fixtureEnv(container), encoding: "utf8", timeout: 10_000 },
+  );
+  expect(add.error).toBeUndefined();
+  expect(add.status).toBe(0);
+  const lock = parseBunLock(readFileSync(join(root, "bun.lock"), "utf8"));
+  const version = inside ? "file:vendor/x" : "file:../outside";
+  expect(lock.packages["local-pkg"][0]).toBe(`local-pkg@${version}`);
+  lock.packages["old-pkg"] = ["old-pkg@2.0.0"];
+  writeFileSync(join(root, "bun.lock"), JSON.stringify(lock));
+  writeFileSync(join(root, "bunfig.toml"), bunfigText(undefined));
+  const calls = [];
+  const result = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch(
+      { "old-pkg": { "2.0.0": new Date(NOW - 30 * 86_400_000).toISOString() } },
+      calls,
+    ),
+    now: NOW,
+  }).catch((error) => error);
+  const fetchLog = join(root, "fetch.log");
+  const cli = runCli(root, undefined, { BOB_TEST_FETCH_LOG: fetchLog });
+  if (inside) {
+    expect(result.ok).toBe(true);
+    expect(result.skipped).toEqual([{ key: "local-pkg", name: "local-pkg", version }]);
+    expect(calls).toEqual(["https://registry.npmjs.org/old-pkg"]);
+    expect(cli.status).toBe(0);
+    expect(cli.stdout).toContain("Skipped local-source lock entries (1)");
+    expect(cli.stdout).toContain(`local-pkg@${version}`);
+    expect(readFileSync(fetchLog, "utf8")).toBe("lookup\n");
+  } else {
+    expect(result.name).toBe("LocalSourceOutsideCheckout");
+    expect(result.message).toContain('packages["local-pkg"]');
+    expect(result.message).toContain(realpathSync(source));
+    expect(calls).toEqual([]);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("LocalSourceOutsideCheckout");
+    expect(cli.stderr).toContain(realpathSync(source));
+    expect(() => readFileSync(fetchLog)).toThrow("ENOENT");
+  }
+});
+
 function cliScript(root) {
   mkdirSync(join(root, "scripts"), { recursive: true });
   const script = join(root, "scripts", "check-lockfile-release-age.mjs");
@@ -268,7 +423,7 @@ function runCli(
   const preload = join(root, "fetch.mjs");
   writeFileSync(
     preload,
-    'globalThis.fetch = async () => ({ok: true, status: 200, json: async () => ({time: {"1.2.3": process.env.BOB_TEST_PUBLISHED, "2.0.0": process.env.BOB_TEST_PUBLISHED}})});',
+    'import { appendFileSync } from "node:fs"; globalThis.fetch = async () => { if (process.env.BOB_TEST_FETCH_LOG) appendFileSync(process.env.BOB_TEST_FETCH_LOG, "lookup\\n"); return {ok: true, status: 200, json: async () => ({time: {"1.2.3": process.env.BOB_TEST_PUBLISHED, "2.0.0": process.env.BOB_TEST_PUBLISHED}})}; };',
   );
   const cli = spawnSync(
     process.execPath,
@@ -352,6 +507,20 @@ test("an unreadable repo .npmrc refuses by name, with code and remedy", async ()
   expect(cli.stderr).toContain(
     "make it readable, or remove it if it holds no settings for this install",
   );
+});
+
+test.each(["directory", "missing"])("unreadable required bunfig (%s) exits 2 by name", (kind) => {
+  const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0"] }), undefined);
+  const path = join(root, "bunfig.toml");
+  rmSync(path);
+  if (kind === "directory") mkdirSync(path);
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("UnreadableConfiguration");
+  expect(cli.stderr).toContain(path);
+  expect(cli.stderr).toContain(kind === "directory" ? "EISDIR" : "ENOENT");
+  expect(cli.stderr).toContain("make it readable");
+  expect(cli.stderr).not.toContain("remove it");
 });
 
 test.each(['"604800"', "true", "-1", "1.5", "nan", "inf", "[]", "{}"])(
@@ -487,10 +656,11 @@ test.each(["\n", "\r", "\r\n"])(
 
 test.each([
   [{ "fresh-pkg": ["fresh-pkg@1.2.3"] }, ["fresh-pkg"]],
-  [{ local: ["local@file:../local"] }, []],
-  [{ "fresh-pkg": ["fresh-pkg@1.2.3"], local: ["local@workspace:*"] }, ["fresh-pkg"]],
+  [{ local: ["local@file:./local"] }, []],
+  [{ "fresh-pkg": ["fresh-pkg@1.2.3"], local: ["local@workspace:./local"] }, ["fresh-pkg"]],
 ])("an empty checked set exits 2: %j", async (packages, excludes) => {
   const root = fixture(lockText(packages), excludes);
+  mkdirSync(join(root, "local"));
   const cli = runCli(root);
   expect(cli.status).toBe(2);
   expect(cli.stderr).toContain("EmptyCheckedSet");

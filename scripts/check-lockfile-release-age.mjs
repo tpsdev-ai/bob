@@ -8,8 +8,8 @@
  * string is parsed as package@version.
  *
  * An entry is checked only when its version is an exact semver version.
- * Entries whose version starts with `workspace:`, `file:` or `link:` are
- * skipped: those name local source in the reviewed tree. Any other version
+ * `workspace:`, `file:` and `link:` targets are skipped only when realpath
+ * resolves them inside the checkout. Any other version
  * form — `git:`, `git+…`, `github:`, `http:`, `https:` or an unrecognised
  * value — is refused before any lookup, naming the lock key and version.
  * Each unique checked pair not listed in `minimumReleaseAgeExcludes` is
@@ -22,9 +22,9 @@
  *   2 — policy/lockfile error, or lookup failure with no too-young version
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs, parseEnv } from "node:util";
@@ -52,19 +52,23 @@ function requireNpmRegistry(value, source, tarball = false) {
 }
 
 /**
- * Read a configuration file, or undefined when it does not exist.
+ * Read a configuration file; an absent optional file returns undefined.
  * Bun skips an unreadable .npmrc; the checker refuses rather than guess.
  */
-function optionalText(path) {
+function configurationText(path, optional = false) {
   try {
     return readFileSync(path, "utf8");
   } catch (error) {
-    if (error.code === "ENOENT") return undefined;
+    if (optional && error.code === "ENOENT") return undefined;
     throw namedError(
       "UnreadableConfiguration",
-      `${path}: ${error.code ?? error.message}; make it readable, or remove it if it holds no settings for this install`,
+      `${path}: ${error.code ?? error.message}; make it readable${optional ? ", or remove it if it holds no settings for this install" : ""}`,
     );
   }
+}
+
+function optionalText(path) {
+  return configurationText(path, true);
 }
 
 function expandRegistry(value, env) {
@@ -332,10 +336,10 @@ function isPlainObject(value) {
  * A missing/non-object or empty map, non-array entry, or missing/empty/non-string
  * resolution throws, as does a resolution without a name or version.
  * A one-element entry containing a name@version string is accepted.
- * Local-source versions (`workspace:`, `file:`, `link:`) are skipped; any
- * other non-semver version is refused by name.
+ * Local-source targets are skipped only when realpath resolves inside root;
+ * other non-semver versions are refused by name.
  */
-export function collectLockEntries(lock) {
+export function collectLockEntries(lock, root) {
   const packages = lock?.packages;
   if (!isPlainObject(packages)) {
     throw new Error('bun.lock has no "packages" object');
@@ -363,14 +367,37 @@ export function collectLockEntries(lock) {
     }
     const name = resolution.slice(0, at);
     const version = resolution.slice(at + 1);
-    if (LOCAL_SOURCE_PREFIXES.some((prefix) => version.startsWith(prefix))) {
+    const localPrefix = LOCAL_SOURCE_PREFIXES.find((prefix) => version.startsWith(prefix));
+    if (localPrefix) {
+      let target = resolve(root, version.slice(localPrefix.length));
+      let checkout;
+      try {
+        checkout = realpathSync(root);
+        target = realpathSync(target);
+      } catch (error) {
+        throw namedError(
+          "LocalSourceOutsideCheckout",
+          `bun.lock packages[${JSON.stringify(key)}] local target ${JSON.stringify(target)} cannot be resolved: ${error.code ?? error.message}; use an existing source inside the checkout`,
+        );
+      }
+      const fromCheckout = relative(checkout, target);
+      if (
+        fromCheckout === ".." ||
+        fromCheckout.startsWith(`..${sep}`) ||
+        isAbsolute(fromCheckout)
+      ) {
+        throw namedError(
+          "LocalSourceOutsideCheckout",
+          `bun.lock packages[${JSON.stringify(key)}] local target ${JSON.stringify(target)} is outside the checkout; use a source inside the checkout`,
+        );
+      }
       skipped.push({ key, name, version });
       continue;
     }
     if (!EXACT_VERSION.test(version)) {
       throw namedError(
         "NonRegistryDependency",
-        `bun.lock packages[${JSON.stringify(key)}] resolves to version ${JSON.stringify(version)}; only exact semver versions are checked and only workspace:, file: and link: sources are skipped`,
+        `bun.lock packages[${JSON.stringify(key)}] resolves to version ${JSON.stringify(version)}; only exact semver versions are checked and only in-checkout workspace:, file: and link: sources are skipped`,
       );
     }
     if (entry[1] !== undefined && entry[1] !== "") {
@@ -474,13 +501,13 @@ export async function checkLockfileReleaseAge(options = {}) {
     throw new Error(`timeoutMs must be a positive integer: ${timeoutMs}`);
   }
 
-  const bunfigText = readFileSync(join(root, "bunfig.toml"), "utf8");
+  const bunfigText = configurationText(join(root, "bunfig.toml"));
   const policy = readBunfigPolicy(bunfigText);
   checkRegistryConfiguration(root, bunfigText, env);
   if (registry !== undefined) requireTestRegistry(registry, env);
   const lockText = readFileSync(join(root, "bun.lock"), "utf8");
   const lock = parseBunLock(lockText);
-  const { entries, skipped } = collectLockEntries(lock);
+  const { entries, skipped } = collectLockEntries(lock, root);
 
   const excludedSet = new Set(policy.excludes);
   const toCheck = [];
