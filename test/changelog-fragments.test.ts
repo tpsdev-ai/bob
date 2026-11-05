@@ -3,7 +3,7 @@
 // cleanly in either order; `check` fails on anything but the managed note under
 // [Unreleased] and on a malformed fragment; `render` carries the migrated list
 // entries reordered by category and filename, and apart from that order they
-// differ only by the twenty-three repairs the migration tests name and the whitespace
+// differ only by the repairs the migration tests name and the whitespace
 // trimmed at the end of each fragment (the block body's two HTML comment
 // markers, `<!-- START #221 -->` and `<!-- END #221 -->`, are not list entries
 // and do not render); `promote`
@@ -1804,8 +1804,13 @@ describe("changelog fragments — the migration (bob#236)", () => {
           "so pi's own compaction runs mid-run and the run continues.",
           "so pi's own compaction runs mid-run and the run continues (once per threshold until the check re-arms: bob#225, under Fixed).",
         ],
+        ["per-request usage (#214)", "usage logging (#214)"],
+        [
+          "Every run log carries a `requestUsage` record per request (",
+          "The run log carries a `requestUsage` record per ended assistant message (",
+        ],
       ],
-      dropped: [],
+      dropped: ["per-request"],
     },
     {
       fragment: "added-04-positions-packaged-role-compatible-agent-presets.md",

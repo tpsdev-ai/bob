@@ -16,10 +16,7 @@
 //     reasoning-only, or (when the run declares final markers) with narration
 //     that is not a final report, is re-prompted, bounded, and fails the run
 //     as `reasoning_only` / `narration_only` past the bound (bob#256, bob#365);
-//   * an attempt to send a BEST-EFFORT "what remains" note after non-aborted compactions, except
-//     after `agent_end` with stopReason "stop", no tool calls, willRetry false,
-//     and final text satisfying the completion contract: the text survives
-//     and no note is attempted (bob#179).
+//   * a BEST-EFFORT "what remains" note.
 //
 //     There is no direct success gate on note delivery.
 //
@@ -27,6 +24,10 @@
 // session wiring lives in run.ts / persistent.ts and passes the event stream in.
 
 import { spawnSync } from "node:child_process";
+import {
+  type EmptyResponseExhaustion,
+  emptyResponseExhaustionOf,
+} from "./empty-response-marker.js";
 import { gitEnvironment } from "./git-environment.js";
 
 /** The explicit continue turn sent as the single retry. */
@@ -88,7 +89,12 @@ export type SilenceReason =
   // call, and text that does not begin with a marker, or with final text read
   // from session state with no observed assistant ending, re-prompted up to the
   // bound and still so — "ended without a final report" (bob#365).
-  | "narration_only";
+  | "narration_only"
+  // The provider answered a request with no content blocks and zero output
+  // tokens, and the same request was re-issued up to the bound and still came
+  // back empty (bob#381). It is a failed run naming the provider and the model,
+  // never a completion.
+  | "empty_response";
 
 /** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
  *  less yields "" — never the untruncated text. */
@@ -178,7 +184,12 @@ export interface SessionEventLike {
   willRetry?: boolean;
   result?: unknown;
   reason?: string;
-  message?: { role?: string; content?: unknown; stopReason?: string } | null;
+  message?: {
+    role?: string;
+    content?: unknown;
+    stopReason?: string;
+    errorMessage?: unknown;
+  } | null;
   assistantMessageEvent?: { type?: string; delta?: string } | null;
   toolName?: string;
   args?: unknown;
@@ -361,20 +372,21 @@ export interface CompactionObserver {
   /** The classification of the LAST assistant message that ended since the
    *  boundary (bob#256), or undefined when none has or the last one failed. */
   lastEnding(): AssistantEnding | undefined;
+  /** True when this run or admitted turn has seen the typed exhaustion
+   *  provenance from empty-response-marker.ts (bob#381), set locally by the
+   *  empty-response wrapper. The latch is set once and survives compaction and
+   *  every later message event; it is cleared only by `beginOperation` at the
+   *  start of a new enclosing operation. It is never inferred from an error's
+   *  text, which a provider also controls. */
+  emptyResponseExhausted(): boolean;
+  emptyResponseExhaustion(): EmptyResponseExhaustion | undefined;
+  /** Start a NEW enclosing operation (a fresh admitted turn): clear the capture
+   *  and the exhaustion latch. Never call this at a turn boundary inside the
+   *  operation the latch belongs to — that would let a later message replace an
+   *  exhausted request's failure. */
+  beginOperation(): void;
 }
 
-/**
- * Observe the session event stream: track the compaction count and the final
- * message boundary, capture "what remains" as it goes (the agent's last stated
- * plan and the last few tool calls), and — when an `inject` seam is given —
- * attempt to send a best-effort note on non-aborted compaction, except after `agent_end`
- * with stopReason "stop", no tool calls, willRetry false, and final text satisfying
- * the completion contract.
- *
- * A failed note is LOGGED and nothing else happens. There is no verdict, no
- * refusal and no exit code attached to it: the contract it accompanies is in
- * the system prompt, so a lost note loses the plan's *reminder*, not the task.
- */
 export function createCompactionObserver(opts: CompactionObserverOptions = {}): CompactionObserver {
   const log = opts.log ?? (() => {});
   const recentToolCalls = opts.recentToolCalls ?? DEFAULT_RECENT_TOOL_CALLS;
@@ -389,6 +401,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
   let sawAssistantEnd = false;
   let lastEndFailed = false;
   let lastEnding: AssistantEnding | undefined;
+  let emptyResponseExhaustion: EmptyResponseExhaustion | undefined;
   let lastStopReason: string | undefined;
   let agentEnded = false;
 
@@ -419,6 +432,12 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
     assistantEnded: () => sawAssistantEnd,
     lastEndFailed: () => lastEndFailed,
     lastEnding: () => lastEnding,
+    emptyResponseExhausted: () => emptyResponseExhaustion !== undefined,
+    emptyResponseExhaustion: () => emptyResponseExhaustion,
+    beginOperation: () => {
+      clearCapture();
+      emptyResponseExhaustion = undefined;
+    },
     observe(event: unknown): void {
       const e = (event ?? {}) as SessionEventLike;
       switch (e.type) {
@@ -444,8 +463,15 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             return;
           }
           // The boundary: everything streamed BEFORE this compaction is not the
-          // run's final message.
+          // run's final message. The exhaustion latch is deliberately NOT part
+          // of the capture: a compaction cannot undo a failed request.
           clearCapture();
+          if (opts.inject !== undefined && emptyResponseExhaustion !== undefined) {
+            log(
+              'bob: the turn exhausted the empty-response bound before this compaction — not sending the "what remains" note',
+            );
+            return;
+          }
           if (opts.inject === undefined) return;
           const note = noteFor();
           log(`bob: sending the best-effort "what remains" note (${note.length} chars)`);
@@ -497,6 +523,7 @@ export function createCompactionObserver(opts: CompactionObserverOptions = {}): 
             lastEndFailed = failed;
             lastStopReason = e.message.stopReason;
             lastEnding = failed ? undefined : classifyAssistantEnding(e.message.content);
+            emptyResponseExhaustion ??= emptyResponseExhaustionOf(e.message);
           }
           deltaBuffer = "";
           return;

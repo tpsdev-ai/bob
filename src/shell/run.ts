@@ -90,6 +90,7 @@ import {
   isVerifiedEdit,
   type RepositoryState,
 } from "./edit-evidence.js";
+import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES } from "./empty-response.js";
 import {
   EXPLORATION_INSTRUCTION,
   ExplorationBudgetDetector,
@@ -819,10 +820,6 @@ export interface RunResult {
   // or `reasoning_only` / `narration_only` past a re-prompt bound — bob#256,
   // bob#365). Undefined on exit 0.
   reason?: SilenceReason;
-  // True when the run FAILED rather than settled: the prompt threw, or the last
-  // assistant message ended on an error/abort. Undefined otherwise — a run with
-  // no final message that did NOT fail simply had nothing to say. (A mail turn
-  // retries a failure and sends no reply for silence.)
   failed?: true;
   // bob#143 item 3: set when the loop breaker ended the run — the same tool call
   // repeated `toolLoopLimit` times in a row. The exit code is non-zero.
@@ -1459,10 +1456,9 @@ async function runBoundedSession(
     }
   });
 
-  // bob#214: one flat usage record per model request (prompt, cached-prompt,
-  // completion and thinking tokens, time to first token, model), written when
-  // the request's assistant message ends. A NON-delta record: the delta cap
-  // never drops it.
+  // bob#214: one flat usage record per ended assistant message (prompt, cached-prompt,
+  // completion and thinking tokens, time to first token, model). A NON-delta
+  // record: the delta cap never drops it.
   // bob#185 item 2: when the selected row declares a budget, a request whose
   // stopReason is "length" carries the output cap in the record. bob#306: that
   // is the session model's maxTokens, read once here when the run starts.
@@ -1482,9 +1478,6 @@ async function runBoundedSession(
   let failed = false;
   let aborted: TerminationReason | undefined;
 
-  // #145: Non-aborted compactions attempt a note unless a response after
-  // `agent_end` has stopReason "stop", no tool calls, compaction willRetry false,
-  // and final text satisfying the completion contract.
   // The observer also owns the final-message boundary the judge reads.
   const observer = createCompactionObserver({
     isComplete: (text) => judge(text).ok,
@@ -1511,6 +1504,17 @@ async function runBoundedSession(
     return lastAssistantText(session) ?? "";
   };
 
+  const emptyResponseFailure = (): { provider: string; model: string; retries: number } => {
+    const exhaustion = observer.emptyResponseExhaustion();
+    if (exhaustion !== undefined) return exhaustion;
+    const m = (session as { model?: { provider?: unknown; id?: unknown } }).model;
+    return {
+      provider: typeof m?.provider === "string" ? m.provider : provider,
+      model: typeof m?.id === "string" ? m.id : model,
+      retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
+    };
+  };
+
   // ONE judge: the first evaluation and the one after the continue turn are the
   // same call, so the run cannot be judged by two different rules.
   const judge = (capturedText = finalTextNow()): { ok: boolean; reason?: SilenceReason } =>
@@ -1527,7 +1531,7 @@ async function runBoundedSession(
     let reasoningReprompts = 0;
     const budgetLeft = (): number => DEFAULT_MAX_REASONING_REPROMPTS - reasoningReprompts;
     const drainReasoningOnly = async (): Promise<void> => {
-      if (budgetLeft() <= 0) return;
+      if (observer.emptyResponseExhausted() || budgetLeft() <= 0) return;
       const spent = await repromptWhileReasoningOnly({
         session,
         // Every re-prompt goes through the SAME bounded sender as the first
@@ -1535,6 +1539,7 @@ async function runBoundedSession(
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         readEnding: () => observer.lastEnding(),
         beginTurn: () => observer.startTurn(),
+        shouldStop: () => observer.emptyResponseExhausted(),
         maxReprompts: budgetLeft(),
         onReprompt: (n) =>
           process.stderr.write(
@@ -1573,6 +1578,7 @@ async function runBoundedSession(
     // Bounded by the two constants together. With no declared markers this is
     // drainReasoningOnly.
     const drainNonFinal = async (): Promise<void> => {
+      if (observer.emptyResponseExhausted()) return;
       await drainReasoningOnly();
       if (finalMarkers === undefined || narrationBudgetLeft() <= 0) return;
       const spent = await repromptWhileNarrating({
@@ -1581,6 +1587,7 @@ async function runBoundedSession(
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         narrating,
         beginTurn: () => observer.startTurn(),
+        shouldStop: () => observer.emptyResponseExhausted(),
         afterTurn: drainReasoningOnly,
         maxReprompts: narrationBudgetLeft(),
         onReprompt: (n) =>
@@ -1603,7 +1610,15 @@ async function runBoundedSession(
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
     let outcome = judge();
-    if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
+    if (observer.emptyResponseExhausted()) {
+      // bob#381: the provider answered with no content and zero output tokens,
+      // and re-issuing the SAME request up to the bound did not change that. The
+      // latch outlives any later compaction and message event, so a text answer
+      // after the failed request cannot turn the run green. It is decided BEFORE
+      // the compaction continue turn, which is a NEW user message and not a
+      // re-issued request.
+      outcome = { ok: false, reason: "empty_response" };
+    } else if (budgetLeft() <= 0 && observer.lastEnding()?.reasoningOnly === true) {
       // Budget exhausted on a reasoning-only ending: report the honest failure
       // BEFORE the compaction retry. The retry recovers a SILENT settlement after
       // compaction; it is not a fourth reasoning turn, and a
@@ -1648,12 +1663,21 @@ async function runBoundedSession(
       }
       // bob#365: still narrating after the retry is likewise a failure.
       if (narrating()) outcome = { ok: false, reason: "narration_only" };
+      // bob#381: the continue turn's own request may be the one whose empty
+      // responses outlasted the bound.
+      if (observer.emptyResponseExhausted()) {
+        outcome = { ok: false, reason: "empty_response" };
+      }
     }
-    // A run with no final message whose last message ended on an error or an
-    // abort FAILED; one that ended cleanly with nothing to say did not.
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
-    if (outcome.reason === "reasoning_only" || outcome.reason === "narration_only") failed = true;
+    if (
+      outcome.reason === "reasoning_only" ||
+      outcome.reason === "narration_only" ||
+      outcome.reason === "empty_response"
+    )
+      failed = true;
     if (!outcome.ok) {
+      const emptyFailure = emptyResponseFailure();
       // NEVER exit 0 for silence. Name the reason and print what we can (the
       // dirty paths, if the agent's cwd is a git worktree).
       exitCode = 1;
@@ -1679,6 +1703,17 @@ async function runBoundedSession(
           },
           false,
         );
+      } else if (reason === "empty_response") {
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: {
+              reason: "empty_response",
+              ...emptyFailure,
+            },
+          },
+          false,
+        );
       }
       process.stderr.write(
         `bob run ${opts.name}: REFUSING to report success — ${reason}` +
@@ -1690,7 +1725,9 @@ async function runBoundedSession(
                 ? ` (the session ended without a final report — its last turn carried reasoning only, no text beyond whitespace and no tool call, after ${reasoningReprompts} re-prompt(s))`
                 : reason === "narration_only"
                   ? ` (the session ended without a final report — its last turn carried ${narrationShape()}, after ${narrationReprompts} re-prompt(s))`
-                  : " (the session settled without a final message)") +
+                  : reason === "empty_response"
+                    ? ` (the provider ${emptyFailure.provider} returned an empty response for model ${emptyFailure.model} — no content blocks and zero output tokens — after ${emptyFailure.retries} re-issued request(s))`
+                    : " (the session settled without a final message)") +
           "\n",
       );
       reportWorktreeStatus(opts.name, config.cwd, true);
@@ -1795,6 +1832,7 @@ async function runBoundedSession(
       {
         done: true,
         exitCode,
+        ...(reason !== undefined ? { reason } : {}),
         ...(repositoryAtLaunch.kind === "git" && repositoryAtLaunch.historyCheckSkipped
           ? { repositoryHistoryCheckSkipped: repositoryAtLaunch.historyCheckSkipped }
           : {}),

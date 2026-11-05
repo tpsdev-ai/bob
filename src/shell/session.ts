@@ -69,6 +69,7 @@ import {
   WEB_SESSION_CWD,
   WEB_SESSION_SYSTEM_PROMPT,
 } from "./data-class.js";
+import { withEmptyResponseRetry } from "./empty-response.js";
 import { ADMIN_PASS_ENV } from "./flair-pair.js";
 import {
   applyModelLimits,
@@ -967,11 +968,8 @@ export function sessionModelLimits(
 
 /**
  * bob#214: install the model budget on a session pi just built — the
- * output-cap backstop on its stream function and the compaction check between
- * model calls.
- * Both hook pi's PUBLIC agent surfaces (`agent.streamFunction`,
- * `agent.shouldStopAfterTurn`); a session without them cannot carry the budget
- * and is refused rather than run unbudgeted.
+ * output-cap backstop on its stream function, bob#381's bounded re-issue of an
+ * empty response, and the compaction check between model calls.
  */
 export function installSessionBudget(
   session: unknown,
@@ -990,7 +988,10 @@ export function installSessionBudget(
       "bob: refusing a session that does not expose pi's agent stream function, compaction settings, steer() and subscribe() — bob installs the output-cap backstop and the between-calls compaction check on those (bob#214)",
     );
   }
-  s.agent.streamFunction = capOutputStream(s.agent.streamFunction, deps);
+  s.agent.streamFunction = withEmptyResponseRetry(
+    capOutputStream(s.agent.streamFunction, deps),
+    deps,
+  );
   installMidRunCompaction(s as MidRunCompactionSession, deps);
 }
 

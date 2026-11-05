@@ -365,9 +365,15 @@ change one, the named test is what tells you.
   still without a final message the run exits non-zero naming the reason
   (`settled_after_compaction` / `no_final_message` /
   `final_shape_mismatch` / `reasoning_only` / `narration_only`).
+  An attempt that starts no content block, ends with no content blocks and
+  zero output tokens, and did not end in an error or abort is re-issued as
+  the SAME request up to three times; a still-empty answer ends
+  the request with an error naming the provider and the model, and a one-shot
+  run fails as `empty_response`.
   *(`test/shell/compaction-contract.test.ts`, `run.test.ts`,
   `reasoning-only-turn.test.ts`, `narration-turn.test.ts`,
-  `narration-turn-live.test.ts` — a real pi session on a scripted provider)*
+  `narration-turn-live.test.ts` — a real pi session on a scripted provider,
+  `empty-response-381.test.ts` — the same, plus a real mid-run compaction)*
 
 - **builder-local checks edit evidence or a BLOCKED report.** `bob run` and prompted
   `bob launch` apply the edit-or-BLOCKED gate after the completion judge accepts.
@@ -1225,7 +1231,7 @@ session:                      # optional; each key overrides the role's default
 - **The output cap is sent, with a backstop.** `max_output_tokens` is the token count pi sends (`max_completion_tokens` or `max_tokens` on the OpenAI-compatible path); a server that honours it stops there. For a server that ignores it, bob has a backstop that counts streamed pieces (text, thinking and tool-call deltas), not tokens: it ends the stream after more pieces than the token cap, aborting the request and ending the message as a `length` stop. A server sends a piece only after generating at least one token, so the backstop is never early (bob does not tokenize: a server or proxy that split one token across pieces would break that premise); it can be late, because a piece that carries several tokens counts once (a stream of a few large pieces may not be ended at all). The ended message holds only the pieces bob accepted, never output that arrived after the cut. Its usage is assigned, not measured: the server's final count never arrives, so `usage.output` is the cap (a lower bound) and the prompt counts are 0.
 - **Role defaults.** `roles/<role>/role.json` may carry `"session": {"compaction_threshold": …, "thinking": …}`; `builder-local` ships `0.5` and `low`. A role without one uses pi's defaults.
 
-Every `bob run` log also carries one `requestUsage` record per model request: `promptTokens`, `cachedPromptTokens`, `completionTokens`, `thinkingTokens` (the provider's count when it reports one, otherwise the number of streamed thinking pieces, a count of pieces rather than tokens, labelled by `thinkingTokensSource`), `ttftMs` (request start to the first streamed piece), `durationMs`, `stopReason`, `provider` and `model`, plus `outputCapped` when bob's backstop ended the stream (then the token counts are the assigned ones above, not the provider's). The record carries counts and timings only, no prompt or response text; the run log as a whole is the session transcript and does carry both.
+`bob run` logs a `requestUsage` record when an assistant message ends: `promptTokens`, `cachedPromptTokens`, `completionTokens`, `thinkingTokens` (the provider's count when it reports one, otherwise the number of streamed thinking pieces, a count of pieces rather than tokens, labelled by `thinkingTokensSource`), `ttftMs` (request start to the first streamed piece), `durationMs`, `stopReason`, `provider` and `model`, plus `outputCapped` when bob's backstop ended the stream (then the token counts are the assigned ones above, not the provider's). Up to three empty attempts per request are discarded before re-issue and have no usage record. The record carries counts and timings only, no prompt or response text; the run log as a whole is the session transcript and does carry both.
 
 ## Status
 
