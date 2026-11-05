@@ -137,6 +137,9 @@ jobs:
           restore-keys: |
             bun-cache-${{ runner.os }}-
 
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
+
       - name: Install
         run: sfw bun install --frozen-lockfile
 
