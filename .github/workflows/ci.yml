@@ -34,8 +34,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.4"
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - name: Check action pin versions
-        run: bun scripts/check-action-pins.mjs
+        run: bun --no-install scripts/check-action-pins.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -53,6 +55,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       # bob#355: the lockfile is written with the bun version package.json's
       # packageManager declares; every workflow step that uses setup-bun must
       # install that same version, or this fails. It runs before the frozen
@@ -84,6 +88,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # The changelog fragment gate (bob#236): refuses a malformed fragment, and
@@ -116,6 +122,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # Provision the unprivileged user the jarvis key-read proof runs as (the
@@ -149,6 +157,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # npm, not bun: npm is what a user runs, what the release pipeline
@@ -169,11 +179,11 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
-      - run: sfw bun install --frozen-lockfile
       # Frozen installs resolve nothing, so bunfig.toml's minimumReleaseAge is
       # not applied to the committed lockfile. This compares each checked registry
-      # version with its npm publish time.
+      # version with its npm publish time. It is this job's first `run:` step.
       - name: Lockfile release-age bake
         run: bun --no-install scripts/check-lockfile-release-age.mjs
+      - run: sfw bun install --frozen-lockfile
       - name: Check for known vulnerabilities
         run: bun audit

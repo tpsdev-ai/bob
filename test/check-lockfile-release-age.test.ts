@@ -29,7 +29,13 @@ function fixtureEnv(root) {
     XDG_CONFIG_HOME: root,
     NPM_CONFIG_USERCONFIG: join(root, "absent.npmrc"),
   };
-  for (const key of ["BUN_CONFIG_REGISTRY", "NPM_CONFIG_REGISTRY", "npm_config_registry"])
+  for (const key of [
+    "BUN_CONFIG_REGISTRY",
+    "NPM_CONFIG_REGISTRY",
+    "npm_config_registry",
+    "CI",
+    "GITHUB_ACTIONS",
+  ])
     delete env[key];
   return env;
 }
@@ -912,6 +918,19 @@ test.each([
   expect(cli.status).toBe(2);
   expect(cli.stderr).toContain("TestRegistryOverrideRefused");
 });
+
+test.each(["CI", "GITHUB_ACTIONS"])(
+  "--registry is refused when %s is set even with the test variable",
+  (key) => {
+    const root = oldFixture();
+    const cli = runCli(root, undefined, { BOB_RELEASE_AGE_TEST_REGISTRY: "1", [key]: "true" }, [
+      "--registry",
+      "http://127.0.0.1:4873",
+    ]);
+    expect(cli.status).toBe(2);
+    expect(cli.stderr).toContain("TestRegistryOverrideRefusedInCi");
+  },
+);
 
 test.each(["http://127.0.0.1:4873", "http://[::1]:4873"])(
   "enabled loopback test registry proceeds: %s",
