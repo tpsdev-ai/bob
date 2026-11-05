@@ -1,4 +1,4 @@
-// the test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. It does not inspect the contents of the actions those steps use.
+// the test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set with fixed inputs, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. It does not inspect the contents of the actions those steps use.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -14,6 +14,13 @@ const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
   ["oven-sh/setup-bun", ["bun-version"]],
   ["actions/setup-node", ["node-version"]],
   ["socketdev/action", ["mode"]],
+]);
+const ACTIONS = new Map<string, readonly string[]>([
+  ...PRE_RUN_ACTIONS,
+  ["github/codeql-action/init", ["languages", "queries"]],
+  ["github/codeql-action/autobuild", []],
+  ["github/codeql-action/analyze", ["category"]],
+  ["actions/cache", ["key", "path", "restore-keys"]],
 ]);
 
 type Step = {
@@ -68,6 +75,8 @@ function keyProblems(value: object, allowed: readonly string[], where: string): 
     .map((key) => `${where}: key "${key}" is not allowed`);
 }
 
+// An if without a status-check function runs as success() && <expr>;
+// contains(needs.X.result, 'failure') cannot start a job after a failed guard.
 function conditionProblems(condition: unknown, where: string): string[] {
   return /\b(success|failure|always|cancelled)\s*\(/i.test(String(condition ?? ""))
     ? [`${where}: if contains a status-check function`]
@@ -96,13 +105,16 @@ function actionOf(step: Step): string | undefined {
   return parts.length === 2 && parts[1] !== "" ? parts[0] : undefined;
 }
 
-function actionProblems(step: Step, where: string): string[] {
+function actionProblems(
+  step: Step,
+  where: string,
+  allowed = PRE_RUN_ACTIONS,
+  scope = " before the first run step",
+): string[] {
   const action = actionOf(step);
-  const inputs = action === undefined ? undefined : PRE_RUN_ACTIONS.get(action);
+  const inputs = action === undefined ? undefined : allowed.get(action);
   if (inputs === undefined) {
-    return [
-      `${where}: action "${step.uses ?? "<missing uses>"}" is not allowed before the first run step`,
-    ];
+    return [`${where}: action "${step.uses ?? "<missing uses>"}" is not allowed${scope}`];
   }
   if (step.with === undefined) return [];
   if (step.with === null || typeof step.with !== "object" || Array.isArray(step.with)) {
@@ -110,10 +122,7 @@ function actionProblems(step: Step, where: string): string[] {
   }
   return Object.keys(step.with)
     .filter((input) => !inputs.includes(input))
-    .map(
-      (input) =>
-        `${where}: action "${step.uses}" input "${input}" is not allowed before the first run step`,
-    );
+    .map((input) => `${where}: action "${step.uses}" input "${input}" is not allowed${scope}`);
 }
 
 function ancestryProblems(steps: Step[], where: string): string[] {
@@ -165,12 +174,16 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
     const steps = definition.steps ?? [];
     const where = `${source}: job "${job}"`;
+    const firstRun = firstRunIndex(steps);
     problems.push(...keyProblems(definition, JOB_KEYS, where));
     problems.push(...conditionProblems(definition.if, where));
     for (const [index, step] of steps.entries()) {
       const stepWhere = `${where} step ${index + 1}`;
       problems.push(...keyProblems(step, STEP_KEYS, stepWhere));
       problems.push(...conditionProblems(step.if, stepWhere));
+      if (step.uses !== undefined) {
+        problems.push(...actionProblems(step, stepWhere, ACTIONS, ""));
+      }
     }
     const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
     if (isAncestry) {
@@ -180,8 +193,25 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
     if (dependsOn(workflow.jobs ?? {}, job, ANCESTRY_JOB)) {
       problems.push(...keyProblems(definition, DEPENDENT_JOB_KEYS, where));
     }
-    const firstRun = firstRunIndex(steps);
-    if (firstRun === -1) continue;
+    if (firstRun === -1) {
+      const jobs = workflow.jobs ?? {};
+      const hasCheckerDependency = Object.entries(jobs).some(([name, candidate]) => {
+        const candidateSteps = candidate.steps ?? [];
+        const index = firstRunIndex(candidateSteps);
+        return (
+          name !== job &&
+          index !== -1 &&
+          candidateSteps[index].run?.trim() === CHECKER &&
+          dependsOn(jobs, job, name)
+        );
+      });
+      if (!hasCheckerDependency) {
+        problems.push(
+          `${where}: a job with no run step must need a job whose first run step is the checker`,
+        );
+      }
+      continue;
+    }
     if (!isAncestry) {
       problems.push(
         ...keyProblems(steps[firstRun], CHECKER_STEP_KEYS, `${where} step ${firstRun + 1}`),
@@ -193,7 +223,12 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
       }
     }
     for (let index = 0; index < firstRun; index += 1) {
-      problems.push(...actionProblems(steps[index], `${where} step ${index + 1}`));
+      if (
+        steps[index].uses === undefined ||
+        actionProblems(steps[index], "", ACTIONS, "").length === 0
+      ) {
+        problems.push(...actionProblems(steps[index], `${where} step ${index + 1}`));
+      }
     }
   }
   return [...new Set(problems)];
@@ -413,7 +448,7 @@ test.each([
   expect(steps).toBeDefined();
   steps?.splice(0, 0, { uses });
   expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
-    `.github/workflows/ci.yml: job "build" step 1: action "${uses}" is not allowed before the first run step`,
+    `.github/workflows/ci.yml: job "build" step 1: action "${uses}" is not allowed${uses.startsWith("actions/cache@") ? " before the first run step" : ""}`,
   ]);
 });
 
@@ -427,7 +462,7 @@ test.each([...PRE_RUN_ACTIONS.keys()])(
     if (step === undefined) throw new Error(`Missing ${action}`);
     step.with = { ...step.with, cache: "bun" };
     expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
-      `.github/workflows/ci.yml: job "build" step ${steps.indexOf(step) + 1}: action "${step.uses}" input "cache" is not allowed before the first run step`,
+      `.github/workflows/ci.yml: job "build" step ${steps.indexOf(step) + 1}: action "${step.uses}" input "cache" is not allowed`,
     ]);
   },
 );
@@ -505,19 +540,51 @@ test.each([
   ).toBeGreaterThan(0);
 });
 
-test("a job with no run step is exempt from the ordering rule", () => {
-  const workflow = parseYaml(
-    [
-      "jobs:",
-      "  uses-only:",
-      "    steps:",
-      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-      "      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
-      "        with:",
-      '          bun-version: "1.4.4"',
-    ].join("\n"),
-  ) as Workflow;
-  expect(orderingProblems(workflow, "fixture.yml")).toEqual([]);
+test.each([
+  ["bahmutov/npm-install@v1", false],
+  ["./.github/actions/install-deps", false],
+  ["actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9", false],
+  ["bahmutov/npm-install@v1", true],
+] as const)("run-less action %s with contents write %s is red", (uses, write) => {
+  const workflow = loadWorkflow("socket.yml");
+  const jobs = workflow.jobs ?? {};
+  jobs["uses-only"] = {
+    needs: "socket-note",
+    permissions: { contents: write ? "write" : "read" },
+    steps: [{ uses }],
+  };
+  expect(orderingProblems(workflow, ".github/workflows/socket.yml")).toEqual([
+    `.github/workflows/socket.yml: job "uses-only" step 1: action "${uses}" is not allowed`,
+  ]);
+});
+
+test("an unlisted action input after the checker is red", () => {
+  const workflow = loadWorkflow("socket.yml");
+  workflow.jobs?.["socket-note"].steps?.push({
+    uses: "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+    with: { cache: "npm" },
+  });
+  expect(orderingProblems(workflow, ".github/workflows/socket.yml")).toEqual([
+    '.github/workflows/socket.yml: job "socket-note" step 5: action "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1" input "cache" is not allowed',
+  ]);
+});
+
+test("codeql analyze without needs is red", () => {
+  const workflow = loadWorkflow("codeql.yml");
+  const analyze = workflow.jobs?.analyze;
+  if (analyze === undefined) throw new Error("Missing analyze");
+  delete analyze.needs;
+  expect(orderingProblems(workflow, ".github/workflows/codeql.yml")).toEqual([
+    '.github/workflows/codeql.yml: job "analyze": a job with no run step must need a job whose first run step is the checker',
+  ]);
+});
+
+test("a run-less job can need the checker through another run-less job", () => {
+  const workflow = loadWorkflow("codeql.yml");
+  const jobs = workflow.jobs ?? {};
+  jobs.bridge = { needs: "release-age", steps: [{ uses: "actions/checkout@main" }] };
+  jobs.analyze.needs = "bridge";
+  expect(orderingProblems(workflow, ".github/workflows/codeql.yml")).toEqual([]);
 });
 
 function dependsOn(jobs: Record<string, Job>, from: string, target: string): boolean {
