@@ -1481,8 +1481,6 @@ async function runBoundedSession(
       : {}),
   });
   let terminalAssistant: unknown;
-  // bob#396: an attempt the empty-response wrapper drops never reaches the
-  // session's event stream, so feed its terminal message to the usage tracker.
   const recordRequestUsage = (message: unknown): void => {
     const record = usageTracker.observe({ type: "message_end", message });
     if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);

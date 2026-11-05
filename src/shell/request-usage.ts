@@ -1,9 +1,5 @@
 // bob#214 — one usage record per agent provider attempt when run logging succeeds.
 //
-// An attempt the empty-response wrapper drops (bob#396) never reaches pi, so
-// its terminal message is fed to `observe` directly from the wrapper's report;
-// an ended assistant message reaches it through the session event stream.
-//
 // The run log already carries every event, but reading token counts and timing
 // out of it meant reverse engineering: prompt tokens split across `input` and
 // `cacheRead`, time to first token only from the gap between the message's
@@ -80,8 +76,8 @@ function count(value: unknown): number {
 }
 
 export interface RequestUsageTracker {
-  /** Feed a session event, or a dropped attempt's terminal message. Returns the
-   *  record when an assistant message ends. */
+  /** Feed session events, including dropped attempts wrapped as `{ type: "message_end", message }`.
+   *  Returns a record for an assistant `message_end`. */
   observe(event: unknown): RequestUsageRecord | undefined;
 }
 
