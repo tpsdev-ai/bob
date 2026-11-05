@@ -15,7 +15,7 @@
  * form — `git:`, `git+…`, `github:`, `http:`, `https:` or an unrecognised
  * value — is refused before any lookup, naming the lock key and version.
  * Each unique checked pair not listed in `minimumReleaseAgeExcludes` is
- * looked up. The exclude list is honoured as written. The bake is pinned: the checker refuses any
+ * looked up. The bake is pinned: the checker refuses any
  * `minimumReleaseAge` other than 604800.
  *
  * Exit codes:
