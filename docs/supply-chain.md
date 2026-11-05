@@ -23,7 +23,7 @@ by commit SHA in the last section. The 7-day release-age bake is
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | `test/release-publish-npm-pin.test.ts` checks that the named upgrade step runs an exact `x.y.z` pin before the first direct `npm stage` / `npm publish` line, and that each such line has an immediately preceding version assertion for the same pin in its run script. |
+| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | `test/release-publish-npm-pin.test.ts` checks that the named upgrade step runs an exact `x.y.z` pin before the first direct `npm stage` / `npm publish` line, and that each such line has an immediately preceding version assertion for the same pin in its run script. CI does not check a future pin's publish age; that remains a follow-up. |
 | `npm stage publish` | `release-publish.yml` `stage-publish` | The immediately preceding runtime assertion requires `npm --version` to succeed and report the upgrade pin before staging. |
 
 ## Actions
