@@ -1,22 +1,103 @@
-#!/usr/bin/env node
-// Check that each pinned action SHA is the commit behind its full release tag.
-//
-// Scope: remote action references (owner/repo[/path]@ref). A referenced ref must
-// be a full 40-character commit SHA. Local actions (./path) and Docker
-// references (docker://image) are out of scope and skipped explicitly.
+#!/usr/bin/env bun
+// Parse YAML with Bun.YAML: inventory jobs.<id>.steps[*].uses, jobs.<id>.uses,
+// and action metadata runs.steps[*].uses; refuse parse errors and unwalkable shapes.
+// Locate each reference at its step/job key on a canonical `- uses: <value>` or
+// `uses: <value>` line (unquoted or simply quoted value); otherwise refuse it and
+// request `- uses: owner/repo@<40-hex> # vX.Y.Z`. Ignore uses text in run blocks.
+// Remote refs require a full 40-hex SHA and a full release-tag comment resolving
+// to that SHA. Follow ./ local actions through action.yml/action.yaml, cycle-safe
+// and bounded; missing metadata is an error. Docker refs require @sha256:<64-hex>.
+// The CLI requires GITHUB_TOKEN for tag lookups and refuses without it before scanning.
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
 const FULL_TAG = /^v\d+\.\d+\.\d+$/;
-const USES_LINE = /^\s*(?:-\s*)?uses:\s*(.*)$/;
+const USES_LINE = /^(\s*(?:-\s+)?uses:\s*)(.*)$/;
 const REMOTE_ACTION = /^([\w.-]+)\/([\w.-]+)((?:\/[^\s@#"'/]+)*)@(.*)$/;
 const FULL_SHA = /^[a-f\d]{40}$/i;
 const MAX_ENTRIES = 10_000;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_TAG_PAGES = 100;
+const DOCKER_DIGEST = /^docker:\/\/[^\s@]+@sha256:[a-f\d]{64}$/i;
+
+function isMapping(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function inventory(doc, metadata) {
+  const refs = [];
+  const mapping = (value, path) => {
+    if (!isMapping(value)) throw new Error(`${path} must be a mapping`);
+  };
+  const reference = (value, path) => {
+    if (typeof value !== "string" || !value.trim())
+      throw new Error(`${path.join(".")} must be a non-empty string`);
+    refs.push({ value, path: JSON.stringify(path) });
+  };
+  const steps = (value, path) => {
+    if (!Array.isArray(value)) throw new Error(`${path.join(".")} must be an array`);
+    for (const [index, step] of value.entries()) {
+      mapping(step, `${path.join(".")}.${index}`);
+      if (Object.hasOwn(step, "uses")) reference(step.uses, [...path, index, "uses"]);
+    }
+  };
+  mapping(doc, "document");
+  if (metadata) {
+    mapping(doc.runs, "runs");
+    if (Object.hasOwn(doc.runs, "steps")) steps(doc.runs.steps, ["runs", "steps"]);
+    else if (doc.runs.using === "composite") throw new Error("runs.steps must be an array");
+  } else {
+    mapping(doc.jobs, "jobs");
+    for (const [id, job] of Object.entries(doc.jobs)) {
+      mapping(job, `jobs.${id}`);
+      if (Object.hasOwn(job, "uses")) reference(job.uses, ["jobs", id, "uses"]);
+      if (Object.hasOwn(job, "steps")) steps(job.steps, ["jobs", id, "steps"]);
+      else if (!Object.hasOwn(job, "uses")) throw new Error(`jobs.${id} must have steps or uses`);
+    }
+  }
+  return refs;
+}
+
+function locateReferences(text, metadata) {
+  const candidates = new Map();
+  const marked = text.split("\n").map((line, index) => {
+    const match = line.match(USES_LINE);
+    if (!match) return line;
+    const parsed = parseUses(match[2]);
+    if (!parsed || !/^\s*(?:#.*)?$/.test(parsed.suffix)) return line;
+    const marker = `__action_pin_line_${index}__`;
+    candidates.set(marker, { ...parsed, line: index + 1 });
+    return `${match[1]}"${marker}"${parsed.suffix}`;
+  });
+  try {
+    return new Map(
+      inventory(Bun.YAML.parse(marked.join("\n")), metadata)
+        .filter((ref) => candidates.has(ref.value))
+        .map((ref) => [ref.path, candidates.get(ref.value)]),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function localMetadata(root, value) {
+  const directory = resolve(root, value);
+  const rel = relative(root, realpathSync(directory));
+  if (rel === ".." || rel.startsWith("../"))
+    throw new Error("local action is outside the repository");
+  for (const name of ["action.yml", "action.yaml"]) {
+    const file = join(directory, name);
+    try {
+      if (statSync(file).isFile()) return file;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error("missing local action.yml/action.yaml");
+}
 
 function parseUses(raw) {
   const trimmed = raw.trim();
@@ -72,24 +153,67 @@ function actionFiles(root) {
 export async function checkActionPins({ root = ROOT, resolver }) {
   const errors = [];
   let checked = 0;
-  for (const file of actionFiles(root)) {
-    const source = readFileSync(file);
-    if (source.length > MAX_FILE_BYTES) throw new Error(`${file}: action file exceeds scan limit`);
-    const lines = source.toString("utf8").split("\n");
-    for (const [index, line] of lines.entries()) {
-      const usesLine = line.match(USES_LINE);
-      if (!usesLine) continue;
-      const parsed = parseUses(usesLine[1]);
-      if (!parsed) {
-        errors.push(`${relative(root, file)}:${index + 1}: malformed uses value: ${line.trim()}`);
+  let references = 0;
+  if (typeof globalThis.Bun?.YAML?.parse !== "function") {
+    return { checked, errors: ["Bun.YAML is required; run bun scripts/check-action-pins.mjs"] };
+  }
+  root = realpathSync(root);
+  const queue = actionFiles(root);
+  const visited = new Set();
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const file = queue[cursor];
+    const rel = relative(root, file);
+    let refs;
+    let locations;
+    try {
+      const canonical = realpathSync(file);
+      const canonicalRel = relative(root, canonical);
+      if (canonicalRel === ".." || canonicalRel.startsWith("../"))
+        throw new Error("action metadata is outside the repository");
+      if (visited.has(canonical)) continue;
+      visited.add(canonical);
+      if (visited.size > MAX_ENTRIES) throw new Error("Too many action files to check");
+      if (statSync(file).size > MAX_FILE_BYTES) throw new Error("action file exceeds scan limit");
+      const text = readFileSync(file, "utf8");
+      const metadata = dirname(file) !== join(root, ".github/workflows");
+      refs = inventory(Bun.YAML.parse(text), metadata);
+      locations = locateReferences(text, metadata);
+    } catch (error) {
+      errors.push(`${rel}: ${error.message}`);
+      continue;
+    }
+    references += refs.length;
+    for (const reference of refs) {
+      const { value } = reference;
+      const located = locations.get(reference.path);
+      if (!located || located.value !== value) {
+        errors.push(
+          `${rel}: ${value} is written in a form the pin check cannot locate; write it as ` +
+            "`- uses: owner/repo@<40-hex> # vX.Y.Z`",
+        );
         continue;
       }
-      const { value, suffix } = parsed;
-      if (value.startsWith("./") || value.startsWith("docker://")) continue;
+      const { line, suffix } = located;
+      if (value.startsWith("./")) {
+        try {
+          const metadata = localMetadata(root, value);
+          if (queue.length >= MAX_ENTRIES)
+            throw new Error("Too many local action references to check");
+          queue.push(metadata);
+        } catch (error) {
+          errors.push(`${rel}:${line}: ${value}: ${error.message}`);
+        }
+        continue;
+      }
+      if (value.startsWith("docker://")) {
+        if (!DOCKER_DIGEST.test(value))
+          errors.push(`${rel}:${line}: ${value}: Docker reference requires @sha256:<64-hex>`);
+        continue;
+      }
       const match = value.match(REMOTE_ACTION);
       if (!match) {
         errors.push(
-          `${relative(root, file)}:${index + 1}: ${value}: not a remote action reference (owner/repo[/path]@ref)`,
+          `${rel}:${line}: ${value}: not a remote action reference (owner/repo[/path]@ref)`,
         );
         continue;
       }
@@ -98,13 +222,11 @@ export async function checkActionPins({ root = ROOT, resolver }) {
       checked++;
       if (!FULL_SHA.test(ref)) {
         const target = ref === "" ? `${action} (empty ref)` : `${action}@${ref}`;
-        errors.push(
-          `${relative(root, file)}:${index + 1}: ${target}: not pinned to a full 40-character commit SHA`,
-        );
+        errors.push(`${rel}:${line}: ${target}: not pinned to a full 40-character commit SHA`);
         continue;
       }
       const sha = ref;
-      const location = `${relative(root, file)}:${index + 1}: ${action}@${sha}`;
+      const location = `${rel}:${line}: ${action}@${sha}`;
       const comment = suffix.match(/^\s+#\s*(\S+)\s*$/)?.[1];
       try {
         if (!comment || !FULL_TAG.test(comment)) {
@@ -124,7 +246,8 @@ export async function checkActionPins({ root = ROOT, resolver }) {
       }
     }
   }
-  if (checked === 0) errors.push("No SHA-pinned actions found in workflows or composite actions");
+  if (references === 0 && errors.length === 0)
+    errors.push("No action references found in workflows or action metadata");
   return { checked, errors };
 }
 
@@ -195,7 +318,7 @@ export function createGithubResolver(token, fetchImpl = fetch) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.length !== 2) {
-    console.error("Usage: node scripts/check-action-pins.mjs");
+    console.error("Usage: bun scripts/check-action-pins.mjs");
     process.exitCode = 2;
   } else if (!process.env.GITHUB_TOKEN) {
     console.error("GITHUB_TOKEN is required for the action pin check");
