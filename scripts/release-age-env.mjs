@@ -54,14 +54,7 @@ function namedError(name, message) {
   return Object.assign(new Error(message), { name });
 }
 
-/**
- * Build the environment for an npm install that resolves from the registry:
- * `base` without any npm config, plus the release-age cutoff in npm's `before`
- * config. Inherited npm config is dropped so the environment cannot carry an
- * exclusion into npm; settings that could relax the cutoff are refused by name
- * rather than dropped silently. `overrides` is for the caller's own controlled
- * settings (cache, empty userconfig/globalconfig paths).
- */
+/** Replace inherited npm_config_* variables with controlled settings and the cutoff. */
 export function releaseAgeInstallEnv(base, now = Date.now(), overrides = {}) {
   const inherited = inheritedNpmSettings(base);
   if (inherited.length > 0) {
@@ -85,11 +78,7 @@ export function releaseAgeInstallEnv(base, now = Date.now(), overrides = {}) {
   return env;
 }
 
-/**
- * Whether npm failed while resolving a dependency range (ETARGET/notarget or
- * ENOVERSIONS). The caller adds the cutoff and the remedy; the range may be
- * unsatisfiable because every version it allows was published after the cutoff.
- */
+/** Classify ETARGET, ENOVERSIONS and "No matching version found" output. */
 export function isResolutionFailure(output) {
   return (
     /\bETARGET\b/i.test(output) ||

@@ -4,9 +4,9 @@
 // time. `installVerifiedTarball` therefore verifies every resolved registry
 // version in the lock against its publish time before it runs `npm ci`, and
 // refuses inherited npm config that could relax the cutoff. A refused version
-// is named in that error. A version npm rejects during resolution, before a
-// lock exists, gets the cutoff guidance instead, and a registry metadata lookup
-// failure is reported as its own error.
+// is named in that error. ETARGET, ENOVERSIONS and "No matching version" errors
+// get resolution-failed-under-cutoff guidance; registry metadata lookup failures
+// are reported separately.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -214,7 +214,7 @@ test("the cutoff is exactly 7 days before the supplied NOW", () => {
   expect(releaseAgeCutoff(NOW)).toBe(CUTOFF);
 });
 
-test("the install environment sets npm_config_before and keeps only controlled npm config", () => {
+test("the install environment sets the cutoff and controlled npm_config_* settings", () => {
   const base = { HOME: "/tmp/host-a-home", npm_config_cache: "/tmp/inherited-cache" };
   const env = releaseAgeInstallEnv(base, NOW, { npm_config_cache: "/tmp/scratch-cache" });
   expect(env.npm_config_before).toBe(CUTOFF);
@@ -252,7 +252,7 @@ test.each([
   ["npm error code ENOVERSIONS No versions available for host-a-lib", true],
   ["npm error code E404", false],
   ["", false],
-])("only a resolution failure is classified as one: %s", (output, expected) => {
+])("classifies npm output: %s", (output, expected) => {
   expect(isResolutionFailure(output)).toBe(expected);
 });
 
@@ -411,7 +411,7 @@ test("an install refusal removes scratch without --keep", () => {
     });
     expect(result.status).toBe(1);
     expect(result.stdout + result.stderr).toContain(
-      "No version the tarball's dependency ranges allow was published before the release-age cutoff",
+      "npm dependency resolution failed under the release-age cutoff",
     );
     expect(readdirSync(root).filter((name) => name.startsWith("bob-verify-pack-"))).toEqual([]);
   } finally {

@@ -304,8 +304,8 @@ export async function installVerifiedTarball({
     const error = namedError(
       "ResolveFailed",
       resolved.timedOut
-        ? `npm could not resolve the tarball's dependencies before the release-age cutoff ${cutoff}: timed out`
-        : `npm could not resolve the tarball's dependencies before the release-age cutoff ${cutoff}`,
+        ? `npm dependency resolution failed under the release-age cutoff ${cutoff}: timed out`
+        : `npm dependency resolution failed under the release-age cutoff ${cutoff}`,
     );
     error.output = output;
     throw error;

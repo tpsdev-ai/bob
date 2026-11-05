@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
           echo "::group::npm stage publish — $name"
-          test "$(npm --version)" = "11.21.1" || { echo "npm is $(npm --version), expected the pinned 11.21.1" >&2; exit 1; }
+          v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "11.21.1" || { echo "npm is $v, expected the pinned 11.21.1" >&2; exit 1; }
           npm stage publish
           echo "::endgroup::"
 

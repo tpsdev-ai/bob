@@ -5,8 +5,8 @@
   seven days before `NOW` captured before `npm pack`, then refuses any resolved
   registry version whose
   publish time is missing or after that cutoff, naming each version it refuses,
-  before `npm ci` runs an install script. A version npm rejects during
-  resolution, before a lock exists, gets the cutoff guidance instead, and a
+  before `npm ci` runs an install script. ETARGET, ENOVERSIONS and "No matching
+  version" errors get guidance that resolution failed under the cutoff; a
   registry metadata lookup failure is reported as its own error. Inherited npm
   config that could relax the cutoff is refused by name. The release pipeline's
   npm self-update pins the exact

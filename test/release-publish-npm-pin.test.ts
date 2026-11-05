@@ -20,7 +20,7 @@ function loadSteps(): Step[] {
 }
 
 function assertion(version: string): string {
-  return `test "$(npm --version)" = "${version}" || { echo "npm is $(npm --version), expected the pinned ${version}" >&2; exit 1; }`;
+  return `v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "${version}" || { echo "npm is $v, expected the pinned ${version}" >&2; exit 1; }`;
 }
 
 function pinProblems(steps: Step[]): string[] {
@@ -58,7 +58,7 @@ function pinProblems(steps: Step[]): string[] {
   return problems;
 }
 
-test("the named npm upgrade pins an exact version before stage/publish, with matching assertions", () => {
+test("the named npm upgrade pins an exact version before direct npm stage/publish lines, with matching assertions", () => {
   expect(pinProblems(loadSteps())).toEqual([]);
 });
 
@@ -87,7 +87,7 @@ test.each([
       if (step?.run)
         step.run = step.run
           .split("\n")
-          .filter((line) => !line.trim().startsWith("test "))
+          .filter((line) => !line.trim().startsWith("v=$(npm --version)"))
           .join("\n");
     },
     "Stage-publish: stage/publish must immediately follow the npm 11.21.1 assertion",
@@ -125,9 +125,13 @@ test.each([
   },
 );
 
-test.each([true, false])(
-  "the workflow shell reaches staging only with the pinned npm: %s",
-  (matches) => {
+test.each([
+  ["pinned version", true, 0],
+  ["different version", false, 0],
+  ["failed probe printing the pin", true, 1],
+] as const)(
+  "the workflow shell checks the npm probe status and version before its direct npm stage command: %s",
+  (_name, matches, probeStatus) => {
     const steps = loadSteps();
     const version = SELF_UPDATE.exec(
       steps.find((step) => step.name === UPGRADE)?.run?.trim() ?? "",
@@ -142,7 +146,7 @@ test.each([true, false])(
         join(root, "npm"),
         [
           "#!/bin/sh",
-          'if [ "$1" = "--version" ]; then echo "$BOB_TEST_NPM_VERSION"; exit 0; fi',
+          'if [ "$1" = "--version" ]; then echo "$BOB_TEST_NPM_VERSION"; exit "$BOB_TEST_NPM_PROBE_STATUS"; fi',
           'if [ "$1" = "stage" ] && [ "$2" = "publish" ]; then touch "$BOB_TEST_PUBLISH_MARKER"; exit 0; fi',
           "exit 2",
           "",
@@ -155,12 +159,15 @@ test.each([true, false])(
           ...process.env,
           PATH: `${root}:${process.env.PATH ?? ""}`,
           BOB_TEST_NPM_VERSION: matches ? version : "0.0.0",
+          BOB_TEST_NPM_PROBE_STATUS: String(probeStatus),
           BOB_TEST_PUBLISH_MARKER: marker,
         },
         encoding: "utf8",
       });
-      expect(result.status, result.stderr).toBe(matches ? 0 : 1);
-      expect(existsSync(marker)).toBe(matches);
+      const allowed = matches && probeStatus === 0;
+      expect(result.status, result.stderr).toBe(allowed ? 0 : 1);
+      expect(existsSync(marker)).toBe(allowed);
+      if (probeStatus !== 0) expect(result.stderr).toContain("npm --version failed");
       if (!matches) expect(result.stderr).toContain(`expected the pinned ${version}`);
     } finally {
       rmSync(root, { recursive: true, force: true });

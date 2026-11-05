@@ -99,8 +99,8 @@ for (const d of [home, cache, config, install, tmp, compileCache, agents])
 // npm reads the project .npmrc (the scratch install dir), the user .npmrc
 // (HOME), and the global one (prefix/etc). Point user and global config at
 // empty files in the scratch tree, and the module refuses a .npmrc in either
-// scratch directory. Only the controlled config (cache, user/global config
-// paths, audit/fund/update-notifier) plus npm_config_before reaches npm.
+// scratch directory. The controlled npm_config_* settings are cache, user/global
+// config paths, audit/fund/update-notifier and before; other environment variables remain.
 const userConfig = join(config, "user.npmrc");
 const globalConfig = join(config, "global.npmrc");
 writeFileSync(userConfig, "");
@@ -205,10 +205,8 @@ try {
     if (err.output) console.error(err.output);
     console.error(`\n${err.name}: ${err.message}`);
     if (err.name === "ResolveFailed" && isResolutionFailure(err.output ?? "")) {
-      console.error(
-        `\nNo version the tarball's dependency ranges allow was published before the release-age cutoff ${CUTOFF}.`,
-      );
-      console.error("Wait for the 7-day bake to pass, or pin the dependency to an older version.");
+      console.error(`\nnpm dependency resolution failed under the release-age cutoff ${CUTOFF}.`);
+      console.error("Options: wait for the 7-day bake, or pin the dependency to an older version.");
     }
     failures++;
     throw REFUSAL;
