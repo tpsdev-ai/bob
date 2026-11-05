@@ -22,6 +22,15 @@ function fixture(line: string, composite = false): string {
   return root;
 }
 
+function fixtureLines(lines: string[]): string {
+  const root = mkdtempSync(join(tmpdir(), "bob-action-pins-"));
+  roots.push(root);
+  const dir = join(root, ".github/workflows");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "ci.yml"), `${lines.join("\n")}\n`);
+  return root;
+}
+
 function resolver(commit = RIGHT, tag = "v2.2.0") {
   return {
     resolveTag: async () => commit,
@@ -107,6 +116,52 @@ test("a missing release tag fails with the action and HTTP status", async () => 
   const root = fixture(`- uses: oven-sh/setup-bun@${RIGHT} # v9.9.9`);
   const result = await checkActionPins({ root, resolver: createGithubResolver("fake", fakeFetch) });
   expect(result.errors.join("\n")).toMatch(/oven-sh\/setup-bun@.*HTTP 404/);
+});
+
+test("a floating branch ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@main");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:1: actions/checkout@main: not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("a floating major-version ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@v4");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:1: actions/checkout@v4: not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("a short SHA is reported with file and line", async () => {
+  const short = RIGHT.slice(0, 7);
+  const root = fixture(`- uses: actions/checkout@${short}`);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    `.github/workflows/ci.yml:1: actions/checkout@${short}: not pinned to a full 40-character commit SHA`,
+  );
+});
+
+test("an empty ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:1: actions/checkout (empty ref): not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("local and docker references are skipped", async () => {
+  const root = fixtureLines([
+    "- uses: ./local",
+    "- uses: docker://alpine:3.20",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
 });
 
 test("a major-only comment names the full-tag remedy", async () => {

@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 // Check that each pinned action SHA is the commit behind its full release tag.
+//
+// Scope: remote action references (owner/repo[/path]@ref). A referenced ref must
+// be a full 40-character commit SHA. Local actions (./path) and Docker
+// references (docker://image) are out of scope and skipped explicitly.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -7,11 +11,30 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(import.meta.url), "../..");
 const FULL_TAG = /^v\d+\.\d+\.\d+$/;
-const USES =
-  /^\s*(?:-\s*)?uses:\s*(["']?)([\w.-]+)\/([\w.-]+)((?:\/[^\s@#"'/]+)*)@([a-f\d]{40})\1(?=\s|#|$)(.*)$/i;
+const USES_LINE = /^\s*(?:-\s*)?uses:\s*(.*)$/;
+const REMOTE_ACTION = /^([\w.-]+)\/([\w.-]+)((?:\/[^\s@#"'/]+)*)@(.*)$/;
+const FULL_SHA = /^[a-f\d]{40}$/i;
 const MAX_ENTRIES = 10_000;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_TAG_PAGES = 100;
+
+function parseUses(raw) {
+  const trimmed = raw.trim();
+  let value;
+  let suffix;
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const quote = trimmed[0];
+    const end = trimmed.indexOf(quote, 1);
+    if (end === -1) return null;
+    value = trimmed.slice(1, end);
+    suffix = trimmed.slice(end + 1);
+  } else {
+    const commentAt = trimmed.search(/\s#/);
+    value = commentAt === -1 ? trimmed : trimmed.slice(0, commentAt);
+    suffix = commentAt === -1 ? "" : trimmed.slice(commentAt);
+  }
+  return { value: value.trim(), suffix };
+}
 
 function actionFiles(root) {
   const files = [];
@@ -54,11 +77,33 @@ export async function checkActionPins({ root = ROOT, resolver }) {
     if (source.length > MAX_FILE_BYTES) throw new Error(`${file}: action file exceeds scan limit`);
     const lines = source.toString("utf8").split("\n");
     for (const [index, line] of lines.entries()) {
-      const match = line.match(USES);
-      if (!match) continue;
-      checked++;
-      const [, , owner, repo, subpath, sha, suffix] = match;
+      const usesLine = line.match(USES_LINE);
+      if (!usesLine) continue;
+      const parsed = parseUses(usesLine[1]);
+      if (!parsed) {
+        errors.push(`${relative(root, file)}:${index + 1}: malformed uses value: ${line.trim()}`);
+        continue;
+      }
+      const { value, suffix } = parsed;
+      if (value.startsWith("./") || value.startsWith("docker://")) continue;
+      const match = value.match(REMOTE_ACTION);
+      if (!match) {
+        errors.push(
+          `${relative(root, file)}:${index + 1}: ${value}: not a remote action reference (owner/repo[/path]@ref)`,
+        );
+        continue;
+      }
+      const [, owner, repo, subpath, ref] = match;
       const action = `${owner}/${repo}${subpath}`;
+      checked++;
+      if (!FULL_SHA.test(ref)) {
+        const target = ref === "" ? `${action} (empty ref)` : `${action}@${ref}`;
+        errors.push(
+          `${relative(root, file)}:${index + 1}: ${target}: not pinned to a full 40-character commit SHA`,
+        );
+        continue;
+      }
+      const sha = ref;
       const location = `${relative(root, file)}:${index + 1}: ${action}@${sha}`;
       const comment = suffix.match(/^\s+#\s*(\S+)\s*$/)?.[1];
       try {
