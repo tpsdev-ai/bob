@@ -44,7 +44,11 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { wireDiscordCapability } from "../../src/capabilities/discord/capability.js";
-import { CONTINUE_TURN, REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
+import {
+  CONTINUE_TURN,
+  DEFAULT_MAX_REASONING_REPROMPTS,
+  REASONING_CONTINUE_TURN,
+} from "../../src/shell/compaction-contract.js";
 import { startCronScheduler, type TimerHandle } from "../../src/shell/cron.js";
 import type { DiscordMessage } from "../../src/shell/discord-types.js";
 import {
@@ -68,6 +72,12 @@ const OVER_THRESHOLD = 60_001;
 
 type Reply = { inputTokens: number } & (
   | { kind: "empty" }
+  | {
+      kind: "terminal";
+      content?: AssistantMessage["content"] | null;
+      stopReason: "stop" | "length";
+      outputTokens: number;
+    }
   | {
       kind: "length";
       outputTokens?: number;
@@ -146,7 +156,8 @@ function scriptedProvider(
         const input = step.inputTokens;
         const content: AssistantMessage["content"] = [];
         let stopReason: AssistantMessage["stopReason"] = "stop";
-        if (step.kind === "length") stopReason = "length";
+        if (step.kind === "length" || step.kind === "terminal")
+          stopReason = step.kind === "terminal" ? step.stopReason : "length";
         if (step.kind === "providerError") {
           const failed: AssistantMessage = {
             role: "assistant",
@@ -182,11 +193,19 @@ function scriptedProvider(
           model: model.id,
           usage: usage(
             input,
-            step.kind === "length" ? (step.outputTokens ?? 0) : step.kind === "empty" ? 0 : 10,
+            step.kind === "length" || step.kind === "terminal"
+              ? (step.outputTokens ?? 0)
+              : step.kind === "empty"
+                ? 0
+                : 10,
           ),
           stopReason,
           timestamp: Date.now(),
         };
+        if (step.kind === "terminal") {
+          if (step.content === undefined) delete (message as Partial<AssistantMessage>).content;
+          else (message as { content: unknown }).content = step.content;
+        }
         if (step.kind === "length" && step.omitField) {
           delete (message as Partial<AssistantMessage>)[step.omitField];
         }
@@ -685,9 +704,8 @@ describe("an exhausted turn stays failed through automatic compaction (#381)", (
       if (request.lastUserText === latePrompt) {
         return { kind: "text", text: narration, inputTokens: 1_000 };
       }
-      return request.lastUserText === CONTINUE_TURN
-        ? { kind: "empty", inputTokens: 1_000 }
-        : { kind: "text", text: "", inputTokens: 1_000 };
+      expect(request.lastUserText).toBe(CONTINUE_TURN);
+      return { kind: "empty", inputTokens: 1_000 };
     }, seen);
     const res = await runAgent({
       name: "testbot",
@@ -700,7 +718,10 @@ describe("an exhausted turn stays failed through automatic compaction (#381)", (
         const prompt = session.prompt.bind(session);
         session.prompt = async (text, options) => {
           await prompt(text, options);
-          if (text === CONTINUE_TURN) await prompt(latePrompt, options);
+          if (text === PROMPT) {
+            await prompt(CONTINUE_TURN, options);
+            await prompt(latePrompt, options);
+          }
         };
         return session;
       },
@@ -930,8 +951,7 @@ describe("classified length stops and turn settlement (#395)", () => {
         expect(
           logs.some(
             (m) =>
-              m.includes("inbound turn/reply failed") &&
-              m.includes("unrecovered empty length response"),
+              m.includes("inbound turn/reply failed") && m.includes("unrecovered empty response"),
           ),
         ).toBe(true);
         expect(replies).toEqual([]);
@@ -990,5 +1010,124 @@ describe("classified length stops and turn settlement (#395)", () => {
       expect(res.reason).toBeUndefined();
       expect(res.stdout).toBe("DONE: recovered from the length stop.");
     }, 20_000);
+  }
+});
+
+const invisibleContents: Array<{
+  label: string;
+  content?: AssistantMessage["content"] | null;
+}> = [
+  { label: "no blocks", content: [] },
+  { label: "content absent" },
+  { label: "non-array content", content: null },
+  { label: "empty text", content: [{ type: "text", text: "" }] },
+  { label: "whitespace text", content: [{ type: "text", text: " \n\t" }] },
+  { label: "empty thinking", content: [{ type: "thinking", thinking: "" }] },
+  { label: "whitespace thinking", content: [{ type: "thinking", thinking: " \n\t" }] },
+  {
+    label: "empty text and thinking",
+    content: [
+      { type: "text", text: "" },
+      { type: "thinking", thinking: "" },
+    ],
+  },
+];
+
+describe("terminal settlement matrix (#395)", () => {
+  for (const shape of [
+    ...invisibleContents,
+    {
+      label: "reasoning exhaustion",
+      content: [{ type: "thinking" as const, thinking: "working" }],
+    },
+  ]) {
+    for (const stopReason of ["stop", "length"] as const) {
+      for (const outputTokens of [0, 5]) {
+        const reasoning = shape.label === "reasoning exhaustion";
+        const exhaustion =
+          !reasoning &&
+          stopReason === "stop" &&
+          outputTokens === 0 &&
+          (!Array.isArray(shape.content) || shape.content.length === 0);
+        const reason = reasoning
+          ? "reasoning_only"
+          : exhaustion
+            ? "empty_response"
+            : "unrecovered_empty_response";
+        const calls = reasoning
+          ? DEFAULT_MAX_REASONING_REPROMPTS + 1
+          : exhaustion
+            ? DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1
+            : 1;
+        for (const entry of ["run", "admission"] as const) {
+          it(`${entry}: ${shape.label}, ${stopReason}, output=${outputTokens} -> ${reason}`, async () => {
+            const seen: SeenRequest[] = [];
+            const live = await liveFactory(
+              () => ({ kind: "terminal", inputTokens: 1_000, ...shape, stopReason, outputTokens }),
+              seen,
+            );
+            if (entry === "run") {
+              const result = await runAgent({
+                name: "testbot",
+                agentsRoot: root,
+                prompt: "hi",
+                sessionFactory: live.factory,
+              });
+              expect(result).toMatchObject({ exitCode: 1, failed: true, reason });
+              const identity = { provider: STUB_PROVIDER, model: STUB_MODEL };
+              expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual(
+                reasoning
+                  ? { reason, reprompts: DEFAULT_MAX_REASONING_REPROMPTS }
+                  : exhaustion
+                    ? { reason, ...identity, retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES }
+                    : { reason, ...identity },
+              );
+            } else {
+              const handle = await startPersistent({
+                name: "testbot",
+                agentsRoot: root,
+                log: () => {},
+                sessionFactory: live.factory,
+              });
+              try {
+                await expect(
+                  handle.admitTurn({ kind: "cron", job: "matrix" }, "hi"),
+                ).rejects.toMatchObject(
+                  reasoning
+                    ? {
+                        name: "ReasoningOnlyExhaustedError",
+                        reprompts: DEFAULT_MAX_REASONING_REPROMPTS,
+                      }
+                    : exhaustion
+                      ? {
+                          name: "EmptyResponseExhaustedError",
+                          exhaustion: {
+                            provider: STUB_PROVIDER,
+                            model: STUB_MODEL,
+                            retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
+                          },
+                        }
+                      : {
+                          name: "UnrecoveredEmptyResponseError",
+                          reason,
+                          provider: STUB_PROVIDER,
+                          model: STUB_MODEL,
+                        },
+                );
+              } finally {
+                await handle.shutdown();
+              }
+            }
+            const requests = seen.filter((r) => !r.summarization);
+            expect(requests).toHaveLength(calls);
+            expect(requests.map((r) => r.lastUserText)).toEqual([
+              "hi",
+              ...Array(calls - 1).fill(reasoning ? REASONING_CONTINUE_TURN : "hi"),
+            ]);
+            expect(live.compactionStarts).toEqual([]);
+          }, 20_000);
+        }
+      }
+    }
   }
 });

@@ -243,7 +243,7 @@ describe("reasoning-only turn (#256)", () => {
       sessionFactory: factoryReturning(stub.session),
     });
     expect(stub.promptCalls).toHaveLength(1);
-    expect(res.reason).toBe("no_final_message");
+    expect(res.reason).toBe("unrecovered_empty_response");
   }, 10_000);
 
   it("a WHITESPACE-only message is not reasoning-only", async () => {
@@ -255,7 +255,7 @@ describe("reasoning-only turn (#256)", () => {
       sessionFactory: factoryReturning(stub.session),
     });
     expect(stub.promptCalls).toHaveLength(1);
-    expect(res.reason).toBe("no_final_message");
+    expect(res.reason).toBe("unrecovered_empty_response");
   }, 10_000);
 
   it("a TOOL-CALL message is not reasoning-only", async () => {

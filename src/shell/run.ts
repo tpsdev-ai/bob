@@ -1617,7 +1617,6 @@ async function runBoundedSession(
     // whenever the prompt promise resolved — including after a compaction that
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
-    if (!observer.emptyResponseExhausted()) rejectUnrecoveredEmptyResponse(terminalAssistant);
     let outcome = judge();
     if (observer.emptyResponseExhausted()) {
       // bob#381: the provider answered with no content and zero output tokens,
@@ -1664,7 +1663,6 @@ async function runBoundedSession(
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
-      if (!observer.emptyResponseExhausted()) rejectUnrecoveredEmptyResponse(terminalAssistant);
       outcome = judge();
       // Still reasoning-only after the retry is a failure, never a normal
       // completion.
@@ -1678,6 +1676,9 @@ async function runBoundedSession(
       if (observer.emptyResponseExhausted()) {
         outcome = { ok: false, reason: "empty_response" };
       }
+    }
+    if (outcome.ok || outcome.reason === "no_final_message") {
+      rejectUnrecoveredEmptyResponse(terminalAssistant);
     }
     if (!outcome.ok && observer.lastEndFailed()) failed = true;
     if (
