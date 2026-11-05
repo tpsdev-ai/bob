@@ -9,7 +9,7 @@
 // before `npm ci` can run an install script.
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { RELEASE_AGE_MS, releaseAgeCutoff } from "./release-age-env.mjs";
 
@@ -263,7 +263,19 @@ export async function installVerifiedTarball({
     throw namedError("UnisolatedHome", "the install environment has no scratch HOME");
   }
   assertControlledNpmEnv(env);
-  const installEnv = { ...env, npm_config_before: cutoff };
+  // Node 22's npm writes its module compile cache under TMPDIR, and npm can
+  // leave other temporary files there. Both directories live inside the
+  // scratch install tree, so removing the tree removes them too.
+  const tmpDir = join(installDir, ".tmp");
+  const compileCache = join(installDir, ".node-compile-cache");
+  mkdirSync(tmpDir, { recursive: true });
+  mkdirSync(compileCache, { recursive: true });
+  const installEnv = {
+    ...env,
+    npm_config_before: cutoff,
+    TMPDIR: tmpDir,
+    NODE_COMPILE_CACHE: compileCache,
+  };
   for (const path of [join(installDir, ".npmrc"), join(home, ".npmrc")]) {
     if (existsSync(path)) {
       throw namedError(

@@ -90,8 +90,11 @@ const home = join(scratch, "home");
 const cache = join(scratch, "npm-cache");
 const config = join(scratch, "npm-config");
 const install = join(scratch, "install");
+const tmp = join(scratch, "tmp");
+const compileCache = join(scratch, "node-compile-cache");
 const agents = join(home, "agents");
-for (const d of [home, cache, config, install, agents]) mkdirSync(d, { recursive: true });
+for (const d of [home, cache, config, install, tmp, compileCache, agents])
+  mkdirSync(d, { recursive: true });
 // npm reads the project .npmrc (the scratch install dir), the user .npmrc
 // (HOME), and the global one (prefix/etc). Point user and global config at
 // empty files in the scratch tree, and the module refuses a .npmrc in either
@@ -115,6 +118,8 @@ try {
     npm_config_cache: cache,
     npm_config_userconfig: userConfig,
     npm_config_globalconfig: globalConfig,
+    TMPDIR: tmp,
+    NODE_COMPILE_CACHE: compileCache,
   });
 } catch (err) {
   rmSync(scratch, { recursive: true, force: true });
