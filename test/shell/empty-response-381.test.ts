@@ -16,7 +16,8 @@
 // (e) classified zero-output length stops pass through (#395).
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
-// over the same factory; the last block unit-tests the retry bound.
+// over the same factory; unrecovered empty length stops fail runs and admissions.
+// The bound tests unit-test the retry ceiling.
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   existsSync,
@@ -68,7 +69,7 @@ const OVER_THRESHOLD = 60_001;
 
 type Reply = { inputTokens: number } & (
   | { kind: "empty" }
-  | { kind: "length" }
+  | { kind: "length"; outputTokens?: number }
   | { kind: "text"; text: string }
   | { kind: "thinking"; thinking: string }
   | { kind: "toolRead"; path: string }
@@ -175,9 +176,10 @@ function scriptedProvider(
           api: model.api,
           provider: model.provider,
           model: model.id,
-          // The empty and length replies are the issue's shape: no content, zero
-          // output tokens.
-          usage: usage(input, step.kind === "empty" || step.kind === "length" ? 0 : 10),
+          usage: usage(
+            input,
+            step.kind === "length" ? (step.outputTokens ?? 0) : step.kind === "empty" ? 0 : 10,
+          ),
           stopReason,
           timestamp: Date.now(),
         };
@@ -818,101 +820,109 @@ describe("classified length stops and turn settlement (#395)", () => {
     expect(res.reason).toBe("empty_response");
   }, 20_000);
 
-  it("fails a first short run with unrecovered_empty_response when pi cannot compact", async () => {
-    const seen: SeenRequest[] = [];
-    const live = await liveFactory(() => ({ kind: "length", inputTokens: 1_000 }), seen);
-    const res = await runAgent({
-      name: "testbot",
-      agentsRoot: root,
-      prompt: "hi",
-      captureStdout: true,
-      sessionFactory: live.factory,
-    });
-    expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
-    expect(live.compactionStarts).toEqual([]);
-    expect(live.compactions).toEqual([]);
-    expect(live.ended).toEqual([{ content: [], stopReason: "length" }]);
-    expect(res.exitCode).toBe(1);
-    expect(res.failed).toBe(true);
-    expect(res.reason).toBe("unrecovered_empty_response");
-    expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
-      reason: "unrecovered_empty_response",
-      provider: STUB_PROVIDER,
-      model: STUB_MODEL,
-    });
-    expect(runLogRecords().at(-1)).toEqual({
-      done: true,
-      exitCode: 1,
-      reason: "unrecovered_empty_response",
-    });
-  }, 20_000);
-
-  it("rejects a first short Discord admission and reaches the handler's failure path", async () => {
-    const seen: SeenRequest[] = [];
-    const live = await liveFactory(() => ({ kind: "length", inputTokens: 1_000 }), seen);
-    const handle = await startPersistent({
-      name: "testbot",
-      agentsRoot: root,
-      log: () => {},
-      sessionFactory: live.factory,
-    });
-    let inbound: ((msg: DiscordMessage) => void) | undefined;
-    let admissionResult: Promise<unknown[]> | undefined;
-    const logs: string[] = [];
-    const replies: string[] = [];
-    const wired = wireDiscordCapability({
-      pi: { registerTool: () => {}, on: () => {} },
-      admitTurn: (origin, text) => {
-        admissionResult = handle.admitTurn(origin, text);
-        return admissionResult;
-      },
-      client: {
-        on: (_event, handler) => {
-          inbound = handler;
-        },
-        reply: async (_channel, text) => {
-          replies.push(text);
-        },
-        react: async () => {},
-        fetchRecent: async () => [],
-        fetchMessage: async () => null,
-        sendTyping: async () => {},
-        connect: async () => {},
-        disconnect: async () => {},
-      },
-      config: { tokenFile: "unused", channelIds: ["123456789"], dispatchAll: true },
-      log: (m) => logs.push(m),
-    });
-    try {
-      inbound?.({
-        id: "message-A",
-        channelId: "123456789",
-        authorId: "user-A",
-        authorName: "user",
-        content: "hi",
-        mentionsBot: true,
+  for (const outputTokens of [0, 5]) {
+    it(`fails a first short run with unrecovered_empty_response (output=${outputTokens})`, async () => {
+      const seen: SeenRequest[] = [];
+      const live = await liveFactory(
+        () => ({ kind: "length", inputTokens: 1_000, outputTokens }),
+        seen,
+      );
+      const res = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "hi",
+        captureStdout: true,
+        sessionFactory: live.factory,
       });
-      expect(admissionResult).toBeDefined();
-      await expect(admissionResult).rejects.toMatchObject({
-        name: "UnrecoveredEmptyResponseError",
-        reason: "unrecovered_empty_response",
-      });
-      expect(
-        logs.some(
-          (m) =>
-            m.includes("inbound turn/reply failed") &&
-            m.includes("unrecovered empty length response"),
-        ),
-      ).toBe(true);
-      expect(replies).toEqual([]);
       expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
       expect(live.compactionStarts).toEqual([]);
       expect(live.compactions).toEqual([]);
-    } finally {
-      await wired.stop();
-      await handle.shutdown();
-    }
-  }, 20_000);
+      expect(live.ended).toEqual([{ content: [], stopReason: "length" }]);
+      expect(res.exitCode).toBe(1);
+      expect(res.reason).toBe("unrecovered_empty_response");
+      expect(res.failed).toBe(true);
+      expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
+        reason: "unrecovered_empty_response",
+        provider: STUB_PROVIDER,
+        model: STUB_MODEL,
+      });
+      expect(runLogRecords().at(-1)).toEqual({
+        done: true,
+        exitCode: 1,
+        reason: "unrecovered_empty_response",
+      });
+    }, 20_000);
+
+    it(`rejects a first short Discord admission and logs failure (output=${outputTokens})`, async () => {
+      const seen: SeenRequest[] = [];
+      const live = await liveFactory(
+        () => ({ kind: "length", inputTokens: 1_000, outputTokens }),
+        seen,
+      );
+      const handle = await startPersistent({
+        name: "testbot",
+        agentsRoot: root,
+        log: () => {},
+        sessionFactory: live.factory,
+      });
+      let inbound: ((msg: DiscordMessage) => void) | undefined;
+      let admissionResult: Promise<unknown[]> | undefined;
+      const logs: string[] = [];
+      const replies: string[] = [];
+      const wired = wireDiscordCapability({
+        pi: { registerTool: () => {}, on: () => {} },
+        admitTurn: (origin, text) => {
+          admissionResult = handle.admitTurn(origin, text);
+          return admissionResult;
+        },
+        client: {
+          on: (_event, handler) => {
+            inbound = handler;
+          },
+          reply: async (_channel, text) => {
+            replies.push(text);
+          },
+          react: async () => {},
+          fetchRecent: async () => [],
+          fetchMessage: async () => null,
+          sendTyping: async () => {},
+          connect: async () => {},
+          disconnect: async () => {},
+        },
+        config: { tokenFile: "unused", channelIds: ["123456789"], dispatchAll: true },
+        log: (m) => logs.push(m),
+      });
+      try {
+        inbound?.({
+          id: "message-A",
+          channelId: "123456789",
+          authorId: "user-A",
+          authorName: "user",
+          content: "hi",
+          mentionsBot: true,
+        });
+        expect(admissionResult).toBeDefined();
+        await expect(admissionResult).rejects.toMatchObject({
+          name: "UnrecoveredEmptyResponseError",
+          reason: "unrecovered_empty_response",
+        });
+        expect(
+          logs.some(
+            (m) =>
+              m.includes("inbound turn/reply failed") &&
+              m.includes("unrecovered empty length response"),
+          ),
+        ).toBe(true);
+        expect(replies).toEqual([]);
+        expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+        expect(live.compactionStarts).toEqual([]);
+        expect(live.compactions).toEqual([]);
+      } finally {
+        await wired.stop();
+        await handle.shutdown();
+      }
+    }, 20_000);
+  }
 
   for (const variant of [
     { label: "input filling the window", inputTokens: 99_500 },

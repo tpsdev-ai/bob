@@ -8,7 +8,7 @@
 // function: an inner wrapper may add its own per-call inputs (when the
 // output-cap wrapper applies a cap, model-budget.ts, it replaces the caller's
 // abort signal with its own), so the provider sees the same model and context,
-// not a promise of identical options objects. Before the bound, an empty attempt
+// not a promise of identical options objects. Before the bound, an empty zero-output attempt
 // that starts no block and ends without an error or abort is dropped before
 // pi sees it, unless it is a length stop pi's own classifiers accept (bob#395).
 // The retry is BOUNDED by a constant, and past the bound the request ends with a
@@ -61,16 +61,13 @@ export function resolveMaxEmptyResponseRetries(value?: number): number {
   return Math.min(raw, DEFAULT_MAX_EMPTY_RESPONSE_RETRIES);
 }
 
-/**
- * True when `message` is an empty response (bob#381): no content blocks at all
- * and zero output tokens, ending in neither an error nor an abort.
- */
-export function isEmptyResponse(message: AssistantMessage): boolean {
-  if (message.stopReason === "error" || message.stopReason === "aborted") return false;
-  const blocks = Array.isArray(message.content) ? message.content.length : 0;
-  if (blocks !== 0) return false;
-  const output = message.usage?.output;
-  return typeof output === "number" && output === 0;
+export function hasNoContentBlocks(message: Partial<AssistantMessage>): boolean {
+  return (
+    message.stopReason !== "error" &&
+    message.stopReason !== "aborted" &&
+    Array.isArray(message.content) &&
+    message.content.length === 0
+  );
 }
 
 /** Length stops pi classifies pass through for its recovery attempt (bob#395). */
@@ -180,7 +177,12 @@ export function withEmptyResponseRetry(
           out.end(message);
           return;
         }
-        if (!forwarded && isEmptyResponse(terminal) && !isPiRecoveryCandidate(terminal, model)) {
+        if (
+          !forwarded &&
+          hasNoContentBlocks(terminal) &&
+          terminal.usage?.output === 0 &&
+          !isPiRecoveryCandidate(terminal, model)
+        ) {
           if (retries >= maxRetries) {
             const message: AssistantMessage & {
               [EMPTY_RESPONSE_EXHAUSTED]: EmptyResponseExhaustion;

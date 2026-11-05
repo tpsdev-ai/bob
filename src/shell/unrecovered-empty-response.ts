@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { hasNoContentBlocks } from "./empty-response.js";
 
 export class UnrecoveredEmptyResponseError extends Error {
   readonly reason = "unrecovered_empty_response";
@@ -20,9 +21,7 @@ export function rejectUnrecoveredEmptyResponse(message: unknown): void {
   if (
     terminal.role === "assistant" &&
     terminal.stopReason === "length" &&
-    Array.isArray(terminal.content) &&
-    terminal.content.length === 0 &&
-    terminal.usage?.output === 0 &&
+    hasNoContentBlocks(terminal) &&
     typeof terminal.provider === "string" &&
     typeof terminal.model === "string"
   ) {
