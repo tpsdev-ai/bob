@@ -1,10 +1,11 @@
-- **npm installs that resolve from the registry are held to the 7-day bake.**
+- **The packaged artifact's npm install is held to the 7-day bake.**
   `scripts/verify-pack.mjs` installs the packed tarball's dependencies with
-  npm, which reads neither `bun.lock` nor `bunfig.toml`. Its install
-  environment now sets npm's `before` config to seven days before the run, so
-  npm resolves only versions published before that cutoff; the script prints
-  the cutoff and, on an ETARGET resolution failure, names it with the remedy
-  (wait for the bake or pin). The release pipeline's npm self-update installs
-  the exact version 11.21.1 (published 2026-10-15) instead of resolving a
-  range at run time. `docs/supply-chain.md` lists every install path in CI and
-  release and the control that bakes it.
+  npm, which reads neither `bun.lock` nor `bunfig.toml`. It now resolves the
+  tarball's dependency tree into a lockfile with npm's `before` config set to
+  seven days before the run, then refuses any resolved registry version whose
+  publish time is missing or after that cutoff, naming each, before `npm ci`
+  runs an install script. Inherited npm config that could relax the cutoff is
+  refused by name. The release pipeline's npm self-update pins the exact
+  version 11.21.1 instead of resolving a range at run time.
+  `docs/supply-chain.md` lists Bob's dependency-install commands and the
+  control for each.

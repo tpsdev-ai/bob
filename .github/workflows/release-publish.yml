@@ -141,9 +141,9 @@ jobs:
         # OIDC trusted publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
         # Node 22 ships npm 10.x, so upgrade explicitly. The version is exact,
         # not a range: a range resolves at run time with no release-age bake.
-        # 11.21.1 was published 2026-10-15, more than 7 days before this pin.
-        # Future bumps land as reviewed PRs; Renovate's minimumReleaseAge holds
-        # the dependency updates it proposes for 7 days.
+        # The current pin is 11.21.1, published 2026-10-15.
+        # test/release-publish-npm-pin.test.ts requires exactly one self-update
+        # command naming one exact version; a bump is a reviewed change.
         run: |
           npm install -g npm@11.21.1
           echo "npm $(npm --version)"

@@ -1,27 +1,33 @@
 # Supply-chain controls for installs
 
-Bob resolves packages in three places: the checkout's lockfile, a packed
-tarball's dependencies, and the npm CLI used to stage a release. The 7-day
-release-age bake is `bunfig.toml`'s `install.minimumReleaseAge = 604800`. Every
-install path in CI and in the release pipeline, and the control that bakes it:
+Bob's dependency-install commands in CI and the release pipeline, and the
+control that bakes each. Action-managed runtime downloads (`oven-sh/setup-bun`,
+`actions/setup-node`) are outside this table; the Actions themselves are pinned
+by commit SHA in the last section. The 7-day release-age bake is
+`bunfig.toml`'s `install.minimumReleaseAge = 604800`.
 
 ## Checkouts
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `bun install` (resolving) | local development | `bunfig.toml` `install.minimumReleaseAge` makes bun skip versions published in the last 7 days. |
-| `sfw bun install --frozen-lockfile` | `ci.yml` `build`, `test`, `leak-check`, `pack`, `audit`; `release-publish.yml` `stage-publish` | A frozen install resolves nothing, so bun applies no `minimumReleaseAge`. `bun --no-install scripts/check-lockfile-release-age.mjs` is the first `run:` step of every job and refuses any registry version in `bun.lock` younger than 7 days, or a registry lookup it cannot complete. `sfw` (Socket Firewall) additionally blocks known-malicious packages. |
+| `bun install` (resolving) | local development | `bunfig.toml` `install.minimumReleaseAge` makes bun skip versions published in the last 7 days, except the names in `minimumReleaseAgeExcludes`. |
+| `sfw bun install --frozen-lockfile` | `ci.yml` `build`, `test`, `leak-check`, `pack`, `audit`; `release-publish.yml` `stage-publish` | A frozen install resolves nothing, so bun applies no `minimumReleaseAge`. `bun --no-install scripts/check-lockfile-release-age.mjs` refuses each registry version in `bun.lock` that is younger than 7 days or whose registry lookup fails; it applies `bunfig.toml`'s `minimumReleaseAgeExcludes` (currently `@types/node` and `typescript`) before the lookup. It is the first `run:` step of those jobs and of `ci.yml` `action-pins`, `release-publish.yml` `github-release`, and `codeql.yml` `release-age`. `release-publish.yml` `verify-ancestry` instead starts with its ancestry guard, and `codeql.yml` `analyze` has no `run:` step and runs after the `release-age` job. `sfw` (Socket Firewall) additionally blocks known-malicious packages. |
 
 ## The packed artifact
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install --no-save <tarball>` into a scratch directory | `ci.yml` `pack`; the release Preflight | npm resolves the tarball's dependency ranges from the registry, not from `bun.lock`, and does not read `bunfig.toml`. `scripts/verify-pack.mjs` sets `npm_config_before` to `now - 7 days` (ISO) in the install environment, so npm resolves only versions published before that cutoff. The script prints the cutoff and, on an ETARGET resolution failure, fails with a message naming it and the remedy (wait for the bake or pin the dependency). |
+| `npm install --package-lock-only <tarball>` then `npm ci` into a scratch directory | `ci.yml` `pack`; the release Preflight | npm resolves the tarball's dependency ranges from the registry, not from `bun.lock`, and does not read `bunfig.toml`. `scripts/verify-pack-install.mjs` resolves with npm's `before` set to `now - 7 days`, then checks every resolved registry `name@version` against the registry's publish time. A missing publish time or a time after the cutoff refuses the install before `npm ci` runs an install script, and the message names each. The helper refuses inherited `before`, `min-release-age`, `min-release-age-exclude`, `registry`, `replace-registry-host`, `userconfig`, `globalconfig`, `prefix` and any `@scope:registry` setting; it drops all other inherited `npm_config_*` keys. User and global config point at empty files in the scratch tree, and a `.npmrc` in the scratch install directory or HOME is refused. |
 
 ## Release pipeline
 
 | Install path | Where it runs | Control |
 | --- | --- | --- |
-| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | Exact version, not a range: a range resolves at run time with no bake. 11.21.1 was published 2026-10-15, more than 7 days before this pin. Future bumps are reviewed changes; Renovate's `minimumReleaseAge` holds the dependency updates it proposes for 7 days. |
-| `npm stage publish` | `release-publish.yml` `stage-publish` | Publishes the tarball built from the verified checkout; it resolves no dependency for installation. |
+| `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | The current pin is the exact version 11.21.1, published 2026-10-15. `test/release-publish-npm-pin.test.ts` requires this step to contain exactly one npm self-update command naming one exact version at least 11.15.0. A bump is a reviewed change; CI does not check the pin's age. |
+| `npm stage publish` | `release-publish.yml` `stage-publish` | Publishes the tarball built from the verified checkout; it installs no dependency. |
+
+## Actions
+
+| Install path | Where it runs | Control |
+| --- | --- | --- |
 | GitHub Actions `uses:` | every workflow | A full commit SHA, never a tag or branch; Renovate's `helpers:pinGitHubActionDigests`. |

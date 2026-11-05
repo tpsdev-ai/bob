@@ -39,6 +39,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isResolutionFailure, releaseAgeCutoff, releaseAgeInstallEnv } from "./release-age-env.mjs";
+import { installVerifiedTarball } from "./verify-pack-install.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const KEEP = process.argv.includes("--keep");
@@ -87,27 +88,39 @@ function run(cmd, args, opts = {}) {
 const scratch = mkdtempSync(join(tmpdir(), "bob-verify-pack-"));
 const home = join(scratch, "home");
 const cache = join(scratch, "npm-cache");
+const config = join(scratch, "npm-config");
 const install = join(scratch, "install");
 const agents = join(home, "agents");
-for (const d of [home, cache, install, agents]) mkdirSync(d, { recursive: true });
+for (const d of [home, cache, config, install, agents]) mkdirSync(d, { recursive: true });
+// npm reads the project .npmrc (the scratch install dir), the user .npmrc
+// (HOME), and the global one (prefix/etc). Point user and global config at
+// empty files in the scratch tree, and the module refuses a .npmrc in either
+// scratch directory. Only the controlled config (cache, user/global config
+// paths, audit/fund/update-notifier) plus npm_config_before reaches npm.
+const userConfig = join(config, "user.npmrc");
+const globalConfig = join(config, "global.npmrc");
+writeFileSync(userConfig, "");
+writeFileSync(globalConfig, "");
 
 // npm resolves the tarball's dependency ranges from the registry, not from
-// bun.lock, and npm does not read bunfig.toml. Hold it to the same 7-day bake
-// with npm's `before` config: only versions published before the cutoff are
-// eligible.
+// bun.lock, and npm does not read bunfig.toml. `npm_config_before` filters
+// resolution, but npm accepts a version with no publish time; the install
+// helper verifies every resolved version against the registry's publish times
+// before it runs `npm ci`.
 const NOW = Date.now();
 const CUTOFF = releaseAgeCutoff(NOW);
-const ENV = releaseAgeInstallEnv(
-  {
-    ...process.env,
-    HOME: home,
+let ENV;
+try {
+  ENV = releaseAgeInstallEnv({ ...process.env, HOME: home }, NOW, {
     npm_config_cache: cache,
-    npm_config_audit: "false",
-    npm_config_fund: "false",
-    npm_config_update_notifier: "false",
-  },
-  NOW,
-);
+    npm_config_userconfig: userConfig,
+    npm_config_globalconfig: globalConfig,
+  });
+} catch (err) {
+  rmSync(scratch, { recursive: true, force: true });
+  console.error(`verify-pack: ${err.name}: ${err.message}`);
+  process.exit(1);
+}
 // This sandbox has no Flair instance, so it must carry no Flair credential
 // either. Otherwise the "refuses to half-provision" check below would pass or
 // fail on the RUNNER's ambient environment rather than on bob's behaviour —
@@ -178,11 +191,13 @@ try {
     join(install, "package.json"),
     `${JSON.stringify({ name: "bob-pack-probe", version: "0.0.0", private: true, type: "module" }, null, 2)}\n`,
   );
-  const installed = run("npm", ["install", "--no-save", tarball], { cwd: install, env: ENV });
-  if (installed.status !== 0) {
-    const output = installed.stderr || installed.stdout;
-    console.error(output);
-    if (isResolutionFailure(output)) {
+  let verified;
+  try {
+    verified = await installVerifiedTarball({ tarball, installDir: install, env: ENV, now: NOW });
+  } catch (err) {
+    if (err.output) console.error(err.output);
+    console.error(`\n${err.name}: ${err.message}`);
+    if (err.name === "ResolveFailed" && isResolutionFailure(err.output ?? "")) {
       console.error(
         `\nNo version the tarball's dependency ranges allow was published before the release-age cutoff ${CUTOFF}.`,
       );
@@ -191,7 +206,9 @@ try {
     process.exit(1);
   }
   const bob = join(install, "node_modules", ".bin", "bob");
-  console.log(`  ok    npm install <tarball> — exit 0`);
+  console.log(
+    `  ok    npm install <tarball> — exit 0 (${verified.checked} registry version(s) verified)`,
+  );
 
   check("the `bob` bin shim is on PATH and executable", () => {
     if (!existsSync(bob)) throw new Error(`no ${bob}`);
