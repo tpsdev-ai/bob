@@ -1,4 +1,4 @@
-// the test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set with fixed inputs, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. It does not inspect the contents of the actions those steps use.
+// The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The action allow-set check does not inspect input values or action contents.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -102,7 +102,7 @@ function writePermissions(job: Job, workflow: Workflow): string[] {
 function actionOf(step: Step): string | undefined {
   if (typeof step.uses !== "string") return undefined;
   const parts = step.uses.split("@");
-  return parts.length === 2 && parts[1] !== "" ? parts[0] : undefined;
+  return parts.length === 2 && /^[0-9a-f]{40}$/i.test(parts[1]) ? parts[0] : undefined;
 }
 
 function actionProblems(
@@ -114,7 +114,11 @@ function actionProblems(
   const action = actionOf(step);
   const inputs = action === undefined ? undefined : allowed.get(action);
   if (inputs === undefined) {
-    return [`${where}: action "${step.uses ?? "<missing uses>"}" is not allowed${scope}`];
+    const refProblem =
+      action === undefined && typeof step.uses === "string" ? "; ref is not a full commit SHA" : "";
+    return [
+      `${where}: action "${step.uses ?? "<missing uses>"}" is not allowed${scope}${refProblem}`,
+    ];
   }
   if (step.with === undefined) return [];
   if (step.with === null || typeof step.with !== "object" || Array.isArray(step.with)) {
@@ -448,8 +452,25 @@ test.each([
   expect(steps).toBeDefined();
   steps?.splice(0, 0, { uses });
   expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
-    `.github/workflows/ci.yml: job "build" step 1: action "${uses}" is not allowed${uses.startsWith("actions/cache@") ? " before the first run step" : ""}`,
+    `.github/workflows/ci.yml: job "build" step 1: action "${uses}" is not allowed${uses.startsWith("actions/cache@") ? " before the first run step" : ""}${uses === "unknown/action@main" ? "; ref is not a full commit SHA" : ""}`,
   ]);
+});
+
+test.each([
+  ["ci.yml", "build", "actions/checkout@main", 0],
+  ["release-publish.yml", "verify-ancestry", "actions/checkout@main", 0],
+  ["codeql.yml", "release-age", "oven-sh/setup-bun@main", 1],
+  ["ci.yml", "build", "actions/checkout@3d3c42e", 0],
+  ["ci.yml", "build", "actions/checkout@v4", 0],
+  ["ci.yml", "build", "actions/checkout@", 0],
+] as const)("%s job %s uses %s is red", (source, job, uses, index) => {
+  const workflow = loadWorkflow(source);
+  const step = workflow.jobs?.[job].steps?.[index];
+  if (step === undefined) throw new Error(`Missing ${source} ${job} step ${index + 1}`);
+  step.uses = uses;
+  expect(orderingProblems(workflow, `.github/workflows/${source}`)).toContain(
+    `.github/workflows/${source}: job "${job}" step ${index + 1}: action "${uses}" is not allowed; ref is not a full commit SHA`,
+  );
 });
 
 test.each([...PRE_RUN_ACTIONS.keys()])(
@@ -554,7 +575,7 @@ test.each([
     steps: [{ uses }],
   };
   expect(orderingProblems(workflow, ".github/workflows/socket.yml")).toEqual([
-    `.github/workflows/socket.yml: job "uses-only" step 1: action "${uses}" is not allowed`,
+    `.github/workflows/socket.yml: job "uses-only" step 1: action "${uses}" is not allowed${actionOf({ uses }) === undefined ? "; ref is not a full commit SHA" : ""}`,
   ]);
 });
 
@@ -582,7 +603,7 @@ test("codeql analyze without needs is red", () => {
 test("a run-less job can need the checker through another run-less job", () => {
   const workflow = loadWorkflow("codeql.yml");
   const jobs = workflow.jobs ?? {};
-  jobs.bridge = { needs: "release-age", steps: [{ uses: "actions/checkout@main" }] };
+  jobs.bridge = { needs: "release-age", steps: [{ ...jobs["release-age"].steps?.[0] }] };
   jobs.analyze.needs = "bridge";
   expect(orderingProblems(workflow, ".github/workflows/codeql.yml")).toEqual([]);
 });
@@ -619,9 +640,7 @@ test("the release guard has no effective write permission or id-token and checko
   expect(guard).toBeDefined();
   expect(writePermissions(guard, workflow)).toEqual([]);
   expect(guard.permissions).not.toHaveProperty("id-token");
-  const checkout = (guard.steps ?? []).find(
-    (step) => typeof step.uses === "string" && /^actions\/checkout@/.test(step.uses),
-  );
+  const checkout = (guard.steps ?? []).find((step) => actionOf(step) === "actions/checkout");
   expect(checkout?.with?.["persist-credentials"]).toBe(false);
 });
 
