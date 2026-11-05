@@ -14,8 +14,8 @@ jobs:
   release-age:
     name: Lockfile release age
     runs-on: ubuntu-latest
-    # Read-only, no repository script runs in a job that holds a write
-    # permission: analyze depends on this job instead of running the checker.
+    # Analyze holds security-events: write, so the checker runs here in a
+    # read-only job and analyze depends on this job instead of running it.
     permissions:
       contents: read
     steps:

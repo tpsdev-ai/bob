@@ -26,7 +26,7 @@ type Workflow = { jobs?: Record<string, Job> };
 
 const ANCESTRY_CHECK = "git merge-base --is-ancestor";
 
-// The ancestry guard job runs git commands only, so it cannot also run the
+// The ancestry guard job runs no repository script, so it cannot also run the
 // checker. It is the one job the ordering rule skips.
 function isAncestryGuard(job: Job): boolean {
   return (job.steps ?? []).some(
@@ -102,7 +102,7 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
   return problems;
 }
 
-test("the checker is the first run step of every workflow job that runs commands", () => {
+test("the checker is the first run step of every workflow job that runs commands, except the ancestry guard", () => {
   const sources = readdirSync(WORKFLOWS)
     .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
     .sort();
@@ -249,7 +249,7 @@ test("the release workflow's ancestry guard is read-only and checks out without 
   expect(checkout?.with?.["persist-credentials"]).toBe(false);
 });
 
-test("every job with id-token or a write permission needs the ancestry guard", () => {
+test("every privileged job in the release workflow needs the ancestry guard", () => {
   const workflow = loadWorkflow("release-publish.yml");
   const jobs = workflow.jobs ?? {};
   const guard = Object.keys(jobs).find((name) => isAncestryGuard(jobs[name]));
