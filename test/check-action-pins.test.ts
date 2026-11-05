@@ -1,7 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { checkActionPins, createGithubResolver } from "../scripts/check-action-pins.mjs";
 
 const WRONG = "de0fac2e4500dabe0009e67214ff5f5447ce83dd";
@@ -12,14 +21,64 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(line: string, composite = false): string {
+function workflow(lines: string[]): string {
+  return [
+    "name: Fixture",
+    "on: push",
+    "jobs:",
+    "  check:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    ...lines.map((line) => `      ${line}`),
+    "",
+  ].join("\n");
+}
+
+function composite(lines: string[]): string {
+  return [
+    "name: Fixture",
+    "description: Fixture action",
+    "runs:",
+    "  using: composite",
+    "  steps:",
+    ...lines.map((line) => `    ${line}`),
+    "",
+  ].join("\n");
+}
+
+function fixture(line: string, action = false): string {
+  const root = fixtureLines(action ? ["- run: echo fixture", "  shell: bash"] : [line]);
+  if (action) writeAction(root, ".github/actions/local", [line]);
+  return root;
+}
+
+function fixtureLines(lines: string[]): string {
   const root = mkdtempSync(join(tmpdir(), "bob-action-pins-"));
   roots.push(root);
-  const dir = join(root, composite ? ".github/actions/local" : ".github/workflows");
+  const dir = join(root, ".github/workflows");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, composite ? "action.yml" : "ci.yml"), `${line}\n`);
-  if (composite) mkdirSync(join(root, ".github/workflows"), { recursive: true });
+  writeFileSync(join(dir, "ci.yml"), workflow(lines));
   return root;
+}
+
+function writeAction(root: string, path: string, lines: string[]) {
+  const dir = join(root, path);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "action.yml"), composite(lines));
+}
+
+function runChecker(root: string, token: string | undefined = "fixture-token") {
+  const scripts = join(root, "scripts");
+  mkdirSync(scripts, { recursive: true });
+  const checker = join(scripts, "check-action-pins.mjs");
+  copyFileSync(
+    fileURLToPath(new URL("../scripts/check-action-pins.mjs", import.meta.url)),
+    checker,
+  );
+  const env = { ...process.env };
+  if (token) env.GITHUB_TOKEN = token;
+  else delete env.GITHUB_TOKEN;
+  return Bun.spawnSync([process.execPath, checker], { env });
 }
 
 function resolver(commit = RIGHT, tag = "v2.2.0") {
@@ -109,6 +168,55 @@ test("a missing release tag fails with the action and HTTP status", async () => 
   expect(result.errors.join("\n")).toMatch(/oven-sh\/setup-bun@.*HTTP 404/);
 });
 
+test("a floating branch ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@main");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:7: actions/checkout@main: not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("a floating major-version ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@v4");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:7: actions/checkout@v4: not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("a short SHA is reported with file and line", async () => {
+  const short = RIGHT.slice(0, 7);
+  const root = fixture(`- uses: actions/checkout@${short}`);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    `.github/workflows/ci.yml:7: actions/checkout@${short}: not pinned to a full 40-character commit SHA`,
+  );
+});
+
+test("an empty ref is reported with file and line", async () => {
+  const root = fixture("- uses: actions/checkout@");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:7: actions/checkout (empty ref): not pinned to a full 40-character commit SHA",
+  );
+});
+
+test("a missing local action and a Docker tag are reported", async () => {
+  const root = fixtureLines([
+    "- uses: ./local",
+    "- uses: docker://alpine:3.20",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain("./local:");
+  expect(result.errors.join("\n")).toContain("docker://alpine:3.20: Docker reference requires");
+});
+
 test("a major-only comment names the full-tag remedy", async () => {
   const root = fixture(`- uses: oven-sh/setup-bun@${RIGHT} # v2`);
   expect((await checkActionPins({ root, resolver: resolver() })).errors.join("\n")).toContain(
@@ -147,3 +255,340 @@ test("an API error never passes", async () => {
   const result = await checkActionPins({ root, resolver: createGithubResolver("fake", fakeFetch) });
   expect(result.errors.join("\n")).toMatch(/oven-sh\/setup-bun@.*HTTP 503/);
 });
+
+for (const [form, line] of [
+  ["flow-mapping step", "- { uses: oven-sh/setup-bun@v2 }"],
+  ["quoted uses key", '- "uses": oven-sh/setup-bun@v2'],
+]) {
+  test(`${form} is refused with the canonical-line remedy`, async () => {
+    const root = fixtureLines([line, `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(
+      ".github/workflows/ci.yml: oven-sh/setup-bun@v2 is written in a form the pin check cannot locate; " +
+        "write it as `- uses: owner/repo[/path]@<40-hex> # vX.Y.Z`",
+    );
+  });
+}
+
+for (const [form, source, alias] of [
+  [
+    "an aliased workflow step",
+    workflow(["- &action", `  uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`, "- *action"]),
+    "*action",
+  ],
+  [
+    "an aliased uses value",
+    workflow([`- uses: &action oven-sh/setup-bun@${RIGHT} # v2.2.0`, "- uses: *action"]),
+    "*action",
+  ],
+  [
+    "an aliased workflow job",
+    `jobs:\n  check: &job\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\n  copy: *job\n`,
+    "*job",
+  ],
+  [
+    "a merge-key job inheriting uses",
+    `jobs:\n  check: &job\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\n  copy:\n    <<: *job\n`,
+    "*job",
+  ],
+  [
+    "a flow merge-key step inheriting uses",
+    workflow([`- &action { uses: oven-sh/setup-bun@${RIGHT} }`, "- { <<: *action }"]),
+    "*action",
+  ],
+  [
+    "an alias of the jobs mapping",
+    `definitions: &jobs\n  check:\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\njobs: *jobs\n`,
+    "*jobs",
+  ],
+]) {
+  test(`${form} is refused with the file, alias and full-step remedy`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), source);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(
+      ".github/workflows/ci.yml: YAML aliases are refused",
+    );
+    expect(result.errors.join("\n")).toContain(alias);
+    expect(result.errors.join("\n")).toContain("write the step out in full");
+  });
+}
+
+test("an aliased composite-action step is refused", async () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  writeAction(root, "tools/local", [
+    "- &action",
+    `  uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    "- *action",
+  ]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain("tools/local/action.yml: YAML aliases are refused");
+  expect(result.errors.join("\n")).toContain("*action");
+  expect(result.errors.join("\n")).toContain("write the step out in full");
+});
+
+test("alias-like text in run blocks, quotes and comments is ignored", async () => {
+  const root = fixtureLines([
+    "- run: |",
+    "    echo *action &action",
+    '- run: "echo *action"',
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    "# *action &action",
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+for (const [form, line, remedy] of [
+  [
+    "a job-level flow mapping",
+    "jobs: { check: { uses: owner/repo/.github/workflows/build.yml@main } }\n",
+    "`uses: owner/repo/.github/workflows/<file>.yml@<40-hex> # vX.Y.Z` at the job key",
+  ],
+  [
+    "a job-level local flow mapping",
+    "jobs: { check: { uses: ./.github/workflows/build.yml } }\n",
+    "`uses: ./.github/workflows/<file>.yml` at the job key",
+  ],
+  [
+    "a quoted local uses key",
+    workflow(['- "uses": "./tools/local"']),
+    "`- uses: ./path` (local actions are followed, not pinned)",
+  ],
+  [
+    "a quoted Docker uses key",
+    workflow(['- "uses": "docker://alpine:3.20"']),
+    "`- uses: docker://image@sha256:<64-hex>`",
+  ],
+]) {
+  test(`${form} is refused with its reference-kind remedy`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), line);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(".github/workflows/ci.yml:");
+    expect(result.errors.join("\n")).toContain(`write it as ${remedy}`);
+  });
+}
+
+test("a reusable-workflow job reference is checked", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    "name: Fixture\non: push\njobs:\n  check:\n    uses: owner/repo/.github/workflows/build.yml@main\n",
+  );
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.checked).toBe(1);
+  expect(result.errors.join("\n")).toContain(
+    ".github/workflows/ci.yml:5: owner/repo/.github/workflows/build.yml@main: not pinned",
+  );
+});
+
+for (const extension of ["yml", "yaml"]) {
+  test(`an existing local reusable .${extension} workflow is scanned as a workflow`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      `jobs:\n  check:\n    uses: ./.github/workflows/build.${extension}\n`,
+    );
+    writeFileSync(
+      join(root, `.github/workflows/build.${extension}`),
+      workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]),
+    );
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 1,
+      errors: [],
+    });
+    writeFileSync(
+      join(root, `.github/workflows/build.${extension}`),
+      workflow(["- uses: evil/repo@main"]),
+    );
+    expect((await checkActionPins({ root, resolver: resolver() })).errors.join("\n")).toContain(
+      `.github/workflows/build.${extension}:7: evil/repo@main: not pinned`,
+    );
+  });
+}
+
+for (const [form, value] of [
+  ["missing file", "./.github/workflows/missing.yml"],
+  ["outside workflows", "./tools/build.yml"],
+  ["parent traversal", "./.github/workflows/../build.yml"],
+  ["wrong extension", "./.github/workflows/build.txt"],
+  ["directory", "./.github/workflows/directory.yml"],
+  ["symlink outside workflows", "./.github/workflows/link.yml"],
+]) {
+  test(`a job-level local reusable workflow reports its ${form}`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), `jobs:\n  check:\n    uses: ${value}\n`);
+    mkdirSync(join(root, ".github/workflows/directory.yml"));
+    mkdirSync(join(root, "tools"));
+    writeFileSync(join(root, "tools/build.yml"), workflow(["- run: echo fixture"]));
+    symlinkSync(join(root, "tools/build.yml"), join(root, ".github/workflows/link.yml"));
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain(`.github/workflows/ci.yml:3: ${value}:`);
+    expect(result.errors[0]).not.toContain(root);
+  });
+}
+
+for (const pinnedFirst of [false, true]) {
+  for (const kind of ["step", "job", "composite", "flow step", "quoted step", "escaped step"]) {
+    test(`duplicate uses keys are refused in a ${kind} with the pin ${pinnedFirst ? "first" : "last"}`, async () => {
+      const values = [`oven-sh/setup-bun@${RIGHT} # v2.2.0`, "evil/repo@main"];
+      if (!pinnedFirst) values.reverse();
+      const root = fixtureLines([]);
+      let source: string;
+      if (kind === "job")
+        source = `jobs:\n  check:\n    uses: ${values[0]}\n    uses: ${values[1]}\n`;
+      else if (kind === "flow step")
+        source = workflow([
+          `- { uses: ${values[0].split(" #")[0]}, uses: ${values[1].split(" #")[0]} }`,
+        ]);
+      else {
+        const key =
+          kind === "quoted step" ? '"uses"' : kind === "escaped step" ? '"\\u0075ses"' : "uses";
+        const lines = [`- ${key}: ${values[0]}`, `  uses: ${values[1]}`];
+        source = kind === "composite" ? composite(lines) : workflow(lines);
+      }
+      const file =
+        kind === "composite" ? ".github/actions/local/action.yml" : ".github/workflows/ci.yml";
+      mkdirSync(join(root, ".github/actions/local"), { recursive: true });
+      writeFileSync(join(root, file), source);
+      const result = await checkActionPins({ root, resolver: resolver() });
+      expect(result.errors.join("\n")).toContain(`${file}: duplicate uses keys are refused`);
+      expect(result.errors.join("\n")).toContain("one `uses` per step");
+    });
+  }
+}
+
+test("repeated uses text in run strings and comments is ignored", async () => {
+  const root = fixtureLines([
+    "- run: |",
+    "    uses: evil/repo@main",
+    "    uses: other/repo@main",
+    '- run: "uses: uses: literal"',
+    "# uses: uses:",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("multiple YAML documents report the unsupported-document error", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), "jobs: {}\n---\njobs: {}\n");
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: multiple YAML documents are not supported",
+  ]);
+});
+
+test("uses text in a run block is ignored", async () => {
+  const root = fixtureLines([
+    "- run: |",
+    "    uses: actions/checkout@main",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("run text cannot locate a noncanonical reference with the same value", async () => {
+  const root = fixtureLines([
+    `- { uses: oven-sh/setup-bun@${RIGHT} }`,
+    "- run: |",
+    `    uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain("is written in a form the pin check cannot locate");
+});
+
+test("a followed local action reports its floating reference", async () => {
+  const root = fixtureLines([
+    "- uses: ./tools/local",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  writeAction(root, "tools/local", ["- uses: actions/checkout@main"]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain(
+    "tools/local/action.yml:6: actions/checkout@main: not pinned",
+  );
+});
+
+test("missing local action metadata is reported", async () => {
+  const root = fixtureLines([
+    "- uses: ./tools/local",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  mkdirSync(join(root, "tools/local"), { recursive: true });
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain("./tools/local: missing local action.yml/action.yaml");
+});
+
+test("an oversized workflow file is reported", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), " ".repeat(1_048_577));
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors).toEqual([".github/workflows/ci.yml: action file exceeds scan limit"]);
+});
+
+test("a directory named action.yml is reported", async () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  mkdirSync(join(root, "tools/local/action.yml"), { recursive: true });
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors).toEqual(["tools/local/action.yml: action file is not a regular file"]);
+});
+
+test("local action.yaml references and cycles are followed once", async () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  writeAction(root, "tools/local", [
+    "- uses: ./tools/local",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  renameSync(join(root, "tools/local/action.yml"), join(root, "tools/local/action.yaml"));
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("a tag-only Docker reference is reported", async () => {
+  const root = fixtureLines([
+    "- uses: docker://alpine:3.20",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain("Docker reference requires @sha256:<64-hex>");
+});
+
+test("a Docker reference with a full digest is accepted", async () => {
+  const root = fixtureLines([`- uses: docker://alpine@sha256:${"a".repeat(64)}`]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 0, errors: [] });
+});
+
+test("unparseable YAML reports the file and exits non-zero", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), "jobs: [\n");
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain(".github/workflows/ci.yml:");
+  const cli = runChecker(root);
+  expect(cli.exitCode).toBe(1);
+  expect(cli.stderr.toString()).toContain(".github/workflows/ci.yml:");
+});
+
+test("the CLI refuses a missing token before scanning YAML", () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), "jobs: [\n");
+  const cli = runChecker(root, "");
+  expect(cli.exitCode).toBe(1);
+  expect(cli.stderr.toString()).toContain("GITHUB_TOKEN is required");
+  expect(cli.stderr.toString()).not.toContain(".github/workflows/ci.yml:");
+});
+
+for (const source of [
+  "jobs: []\n",
+  "jobs: { check: null }\n",
+  "jobs: { check: { steps: {} } }\n",
+  "jobs: { check: { steps: [null] } }\n",
+  "jobs: { check: { steps: [{ uses: 42 }] } }\n",
+]) {
+  test(`an unwalkable workflow is reported: ${source.trim()}`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), source);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(".github/workflows/ci.yml:");
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+}

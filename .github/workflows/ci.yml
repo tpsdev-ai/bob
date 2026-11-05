@@ -37,7 +37,7 @@ jobs:
       - name: Lockfile release-age bake
         run: bun --no-install scripts/check-lockfile-release-age.mjs
       - name: Check action pin versions
-        run: node scripts/check-action-pins.mjs
+        run: bun --no-install scripts/check-action-pins.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
