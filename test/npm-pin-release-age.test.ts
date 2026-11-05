@@ -3,7 +3,7 @@
 // it from release-publish.yml and looks its publish time up in the registry.
 // The lookup is exercised offline against a loopback HTTP registry, including
 // the CLI's exit codes and its refusal to accept a test registry under CI.
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -18,6 +18,14 @@ const NOW = Date.parse("2026-11-05T16:23:34.927Z");
 const OLD = "2020-01-01T00:00:00.000Z";
 const YOUNG = new Date(NOW - 60 * 60 * 1000).toISOString();
 const CUTOFF = new Date(NOW - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+function cliTimes() {
+  const now = Date.now();
+  return {
+    old: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString(),
+    young: new Date(now - 60 * 60 * 1000).toISOString(),
+  };
+}
 
 type Registry = { url: string; requests: string[]; close: () => Promise<void> };
 
@@ -98,6 +106,37 @@ test("a pin with no publish time is refused", async () => {
   expect(result.reason).toContain("no publish time");
 }, 15_000);
 
+test.each([
+  "2020",
+  "2020-13-01T00:00:00Z",
+  "2026-02-30T00:00:00.000Z",
+  "",
+  2020,
+  "2020-01-01T00:00:00+00:00",
+  "2020-01-01T01:00:00+01:00",
+  "2020-01-01T24:00:00.000Z",
+])("invalid publish timestamp %j is refused by version and value", async (published) => {
+  const result = await checkNpmPinReleaseAge({
+    now: NOW,
+    fetchImpl: async () => Response.json({ time: { "11.21.1": published } }),
+  });
+  expect(result.ok).toBe(false);
+  expect(result.reason).toContain("npm@11.21.1");
+  expect(result.reason).toContain(JSON.stringify(published));
+});
+
+test.each(["2020-02-29T12:34:56.789Z", "2020-02-29T12:34:56Z"])(
+  "valid UTC publish timestamp %s passes the bake",
+  async (published) => {
+    const result = await checkNpmPinReleaseAge({
+      now: NOW,
+      fetchImpl: async () => Response.json({ time: { "11.21.1": published } }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.publishedAt).toBe(published);
+  },
+);
+
 test("the pin is read from the workflow file, not hardcoded", async () => {
   const root = mkdtempSync(join(tmpdir(), "bob-npm-pin-workflow-"));
   try {
@@ -129,14 +168,18 @@ test("a non-exact pin is refused", () => {
   ).toThrow(/must run exactly npm install -g npm@<x\.y\.z>/);
 });
 
-function runCli(args: string[], env: Record<string, string>) {
+function runCli(args: string[], env: Record<string, string>, preload?: string) {
   return new Promise<{ status: number | null; stdout: string; stderr: string }>(
     (resolve, reject) => {
-      const child = spawn("bun", ["--no-install", CLI, ...args], {
-        cwd: REPO,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child = spawn(
+        "bun",
+        ["--no-install", ...(preload ? ["--preload", preload] : []), CLI, ...args],
+        {
+          cwd: REPO,
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
       let stdout = "";
       let stderr = "";
       const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
@@ -159,7 +202,8 @@ function runCli(args: string[], env: Record<string, string>) {
 }
 
 test("the CLI passes an old pin and fails a young one", async () => {
-  const oldRegistry = await startRegistry({ "11.21.1": OLD });
+  const times = cliTimes();
+  const oldRegistry = await startRegistry({ "11.21.1": times.old });
   try {
     const accepted = await runCli(["--registry", oldRegistry.url], fixtureEnv());
     expect(accepted.status, accepted.stderr).toBe(0);
@@ -167,7 +211,7 @@ test("the CLI passes an old pin and fails a young one", async () => {
   } finally {
     await oldRegistry.close();
   }
-  const youngRegistry = await startRegistry({ "11.21.1": YOUNG });
+  const youngRegistry = await startRegistry({ "11.21.1": times.young });
   try {
     const refused = await runCli(["--registry", youngRegistry.url], fixtureEnv());
     expect(refused.status, refused.stderr).toBe(1);
@@ -177,8 +221,44 @@ test("the CLI passes an old pin and fails a young one", async () => {
   }
 }, 30_000);
 
+test("the CLI refuses an invalid publish timestamp by version and value", async () => {
+  const registry = await startRegistry({ "11.21.1": "2020" });
+  try {
+    const result = await runCli(["--registry", registry.url], fixtureEnv());
+    expect(result.status, result.stdout).toBe(1);
+    expect(result.stderr).toContain("npm@11.21.1");
+    expect(result.stderr).toContain('"2020"');
+  } finally {
+    await registry.close();
+  }
+}, 15_000);
+
+test("real-clock CLI fixtures retain their verdicts after the former fixture expires", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bob-npm-pin-clock-"));
+  try {
+    setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const times = cliTimes();
+    for (const [published, status] of [
+      [times.old, 0],
+      [times.young, 1],
+    ] as const) {
+      const preload = join(root, "clock-and-registry.mjs");
+      writeFileSync(
+        preload,
+        `Date.now = () => ${Date.now()};\nglobalThis.fetch = async () => Response.json(${JSON.stringify({ time: { "11.21.1": published } })});\n`,
+      );
+      const result = await runCli([], fixtureEnv(), preload);
+      expect(result.status, result.stderr || result.stdout).toBe(status);
+      expect(result.stdout || result.stderr).toContain("npm@11.21.1");
+    }
+  } finally {
+    setSystemTime();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("the CLI refuses --registry under CI", async () => {
-  const registry = await startRegistry({ "11.21.1": OLD });
+  const registry = await startRegistry({ "11.21.1": cliTimes().old });
   try {
     const result = await runCli(["--registry", registry.url], {
       ...fixtureEnv(),

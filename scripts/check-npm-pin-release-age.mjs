@@ -6,12 +6,12 @@
  * release-publish.yml installs an exact npm version before it stages a
  * release. That pin is a registry install like any other, but it happens in a
  * workflow that no lockfile covers. This checker reads the pin from
- * release-publish.yml and refuses it when the registry has no publish time for
+ * release-publish.yml and refuses it when the registry has no valid UTC publish time for
  * `npm@<pin>` or published it less than seven days ago.
  *
  * Exit codes:
  *   0 — the pinned npm version is at least the bake length old
- *   1 — the pin is younger than the bake, or its publish time is missing
+ *   1 — the pin is younger than the bake, or its publish time is missing or invalid
  *   2 — policy/workflow error, or the registry lookup failed
  */
 
@@ -25,6 +25,8 @@ const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const WORKFLOW_REL = join(".github", "workflows", "release-publish.yml");
 const UPGRADE_STEP = "Upgrade npm to a staging-capable version";
 const EXACT_PIN = /^npm install -g npm@(\d+\.\d+\.\d+)$/;
+
+const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
 function namedError(name, message) {
   return Object.assign(new Error(message), { name });
@@ -144,15 +146,21 @@ export async function checkNpmPinReleaseAge(options = {}) {
   }
 
   const published = metadata?.time?.[pin];
-  const publishedMs = typeof published === "string" ? Date.parse(published) : Number.NaN;
-  if (!Number.isFinite(publishedMs)) {
+  const publishedMs =
+    typeof published === "string" && UTC_TIMESTAMP.test(published)
+      ? Date.parse(published)
+      : Number.NaN;
+  if (
+    !Number.isFinite(publishedMs) ||
+    new Date(publishedMs).toISOString() !== published.replace(/(:\d{2})Z$/, "$1.000Z")
+  ) {
     return {
       ok: false,
       pin,
       publishedAt: null,
       ageMs: null,
       bakeMs: RELEASE_AGE_MS,
-      reason: `npm@${pin} — no publish time in the registry metadata`,
+      reason: `npm@${pin} — no publish time or invalid UTC timestamp in the registry metadata: ${JSON.stringify(published)}`,
     };
   }
   const ageMs = now - publishedMs;
