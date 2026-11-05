@@ -14,10 +14,18 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { releaseAgeInstallEnv } from "../scripts/release-age-env.mjs";
 import { installVerifiedTarball } from "../scripts/verify-pack-install.mjs";
 
@@ -190,7 +198,7 @@ async function runLock(
   rootDependencies: Record<string, string>,
   makePackages: (registryUrl: string) => Record<string, unknown>,
 ) {
-  const root = mkdtempSync(join(tmpdir(), "bob-pack-lock-source-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-pack-lock-source-")));
   const registry = await startRegistry(times);
   const tarball = makeTarball(root);
   const npm = fakeNpm(root);
@@ -235,7 +243,7 @@ async function runRealNpmLock(
   prepare: (root: string) => Prepared | Promise<Prepared>,
   times: Record<string, Record<string, string>> = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), "bob-pack-lock-source-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-pack-lock-source-")));
   const realNpm = realNpmPath();
   const registry = await startRegistry(times);
   const tarball = makeTarball(root);
@@ -283,12 +291,17 @@ async function runRealNpmLock(
     const lock = existsSync(lockPath)
       ? (JSON.parse(readFileSync(lockPath, "utf8")) as Lock)
       : undefined;
-    return { result, error, log, lock, requests: registry.requests };
+    return { result, error, log, lock, requests: registry.requests, root, installDir };
   } finally {
     await prepared?.close?.();
     await registry.close();
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+/** The `file:` path npm writes for `target` when installing in `fromDir`. */
+function fileSourceFrom(fromDir: string, target: string) {
+  return `file:${relative(fromDir, target).split(sep).join("/")}`;
 }
 
 function expectRefusedBeforeCi(outcome: { error?: Error; log: string }, problem: string) {
@@ -372,11 +385,14 @@ test("a link entry npm writes is refused before ci", async () => {
 
 test("another local file: tarball npm writes is refused before ci", async () => {
   const outcome = await runRealNpmLock(fileTarballDependency);
-  expect(outcome.lock?.packages?.["node_modules/app-fixture"]?.resolved).toBe("file:../app.tgz");
-  expect(outcome.lock?.packages?.["node_modules/host-d-file"]?.resolved).toBe(
-    "file:../host-d-file-1.0.0.tgz",
+  const appSource = fileSourceFrom(outcome.installDir, join(outcome.root, "app.tgz"));
+  const hostDSource = fileSourceFrom(
+    outcome.installDir,
+    join(outcome.root, "host-d-file-1.0.0.tgz"),
   );
-  expectRealRefusal(outcome, "host-d-file@1.0.0: local source file:../host-d-file-1.0.0.tgz");
+  expect(outcome.lock?.packages?.["node_modules/app-fixture"]?.resolved).toBe(appSource);
+  expect(outcome.lock?.packages?.["node_modules/host-d-file"]?.resolved).toBe(hostDSource);
+  expectRealRefusal(outcome, `host-d-file@1.0.0: local source ${hostDSource}`);
 }, 60_000);
 
 test("a tarball npm writes from a foreign origin is refused before ci", async () => {
