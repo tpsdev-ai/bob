@@ -2,8 +2,7 @@
 //
 // The empty-response wrapper (empty-response.ts) sets this marker on the error
 // message of a request whose own empty answers outlasted its bound. The runner
-// and the turn admission classify on this typed marker, never on error text: a
-// provider can put any phrase in an error message of its own.
+// and admission classify exhaustion on this marker, never on error text.
 //
 // It lives in its own module because empty-response.ts also needs a constant
 // from compaction-contract.ts; importing the marker there would make the two

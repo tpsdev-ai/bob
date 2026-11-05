@@ -94,7 +94,8 @@ export type SilenceReason =
   // tokens, and the same request was re-issued up to the bound and still came
   // back empty (bob#381). It is a failed run naming the provider and the model,
   // never a completion.
-  | "empty_response";
+  | "empty_response"
+  | "unrecovered_empty_response";
 
 /** Truncate `text` to at most `cap` characters, marking the cut. A cap of 0 or
  *  less yields "" — never the untruncated text. */

@@ -156,6 +156,10 @@ import {
 } from "./tool-loop.js";
 import type { TurnAdmission } from "./turn-admission.js";
 import { originValidationError, type TurnOrigin } from "./turn-origin.js";
+import {
+  rejectUnrecoveredEmptyResponse,
+  UnrecoveredEmptyResponseError,
+} from "./unrecovered-empty-response.js";
 
 // Same regex as init.ts AGENT_NAME — names are filesystem paths, keep them
 // strict-safe (no `..`, no `/`, no newlines).
@@ -1468,7 +1472,11 @@ async function runBoundedSession(
       ? { outputCap: sessionOutputCap }
       : {}),
   });
+  let terminalAssistant: unknown;
   const unsubscribeUsage = session.subscribe((event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      terminalAssistant = event.message;
+    }
     const record = usageTracker.observe(event);
     if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);
   });
@@ -1609,6 +1617,7 @@ async function runBoundedSession(
     // whenever the prompt promise resolved — including after a compaction that
     // erased the plan. Now it settles 0 ONLY with a final message (matching an
     // expected shape when one is declared).
+    if (!observer.emptyResponseExhausted()) rejectUnrecoveredEmptyResponse(terminalAssistant);
     let outcome = judge();
     if (observer.emptyResponseExhausted()) {
       // bob#381: the provider answered with no content and zero output tokens,
@@ -1655,6 +1664,7 @@ async function runBoundedSession(
         const m = err instanceof Error ? err.message : String(err);
         process.stderr.write(`bob run ${opts.name}: the continue turn failed — ${m}\n`);
       }
+      if (!observer.emptyResponseExhausted()) rejectUnrecoveredEmptyResponse(terminalAssistant);
       outcome = judge();
       // Still reasoning-only after the retry is a failure, never a normal
       // completion.
@@ -1754,7 +1764,14 @@ async function runBoundedSession(
   } catch (err) {
     exitCode = 1;
     failed = true;
-    if (err instanceof ToolLoopError) {
+    if (err instanceof UnrecoveredEmptyResponseError) {
+      reason = err.reason;
+      writeRunLog(
+        { t: now().toISOString(), outcome: { reason, provider: err.provider, model: err.model } },
+        false,
+      );
+      process.stderr.write(`bob run ${opts.name}: ${reason} — ${err.message}\n`);
+    } else if (err instanceof ToolLoopError) {
       // The event subscriber has already logged the break and named the call.
       // Use the same bounded abort as every other one-shot termination.
       await stopTurn("repeated");

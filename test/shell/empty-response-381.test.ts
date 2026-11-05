@@ -12,8 +12,8 @@
 // (c) bob#256's reasoning-only case, unchanged: a thinking-only turn is still
 //     re-prompted with a new continuation turn.
 // (d) a provider error whose text contains the empty-response phrase is not
-//     recorded as `empty_response` (classification reads only the typed marker).
-// (e) a zero-output `length` stop is passed through to pi (bob#395).
+//     recorded as `empty_response`.
+// (e) classified zero-output length stops pass through; unrecovered turns fail (#395).
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
 // over the same factory; the last block unit-tests the retry bound.
@@ -43,8 +43,10 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { wireDiscordCapability } from "../../src/capabilities/discord/capability.js";
 import { CONTINUE_TURN, REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
 import { startCronScheduler, type TimerHandle } from "../../src/shell/cron.js";
+import type { DiscordMessage } from "../../src/shell/discord-types.js";
 import {
   DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
   EMPTY_RESPONSE_MARK,
@@ -796,7 +798,122 @@ describe("the empty-response bound (#381)", () => {
   }, 10_000);
 });
 
-describe("a zero-output length stop is pi's to recover (#395)", () => {
+describe("classified length stops and turn settlement (#395)", () => {
+  it("re-issues an empty normal stop over the window up to the bound", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(
+      () => ({ kind: "empty", inputTokens: CONTEXT_WINDOW + 1 }),
+      seen,
+    );
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: "do the thing",
+      sessionFactory: live.factory,
+    });
+    const requests = seen.filter((r) => !r.summarization);
+    expect(requests).toHaveLength(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1);
+    expect(new Set(requests.map((r) => r.messagesJson)).size).toBe(1);
+    expect(res.exitCode).toBe(1);
+    expect(res.reason).toBe("empty_response");
+  }, 20_000);
+
+  it("fails a first short run with unrecovered_empty_response when pi cannot compact", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(() => ({ kind: "length", inputTokens: 1_000 }), seen);
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: "hi",
+      captureStdout: true,
+      sessionFactory: live.factory,
+    });
+    expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+    expect(live.compactionStarts).toEqual([]);
+    expect(live.compactions).toEqual([]);
+    expect(live.ended).toEqual([{ content: [], stopReason: "length" }]);
+    expect(res.exitCode).toBe(1);
+    expect(res.failed).toBe(true);
+    expect(res.reason).toBe("unrecovered_empty_response");
+    expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
+      reason: "unrecovered_empty_response",
+      provider: STUB_PROVIDER,
+      model: STUB_MODEL,
+    });
+    expect(runLogRecords().at(-1)).toEqual({
+      done: true,
+      exitCode: 1,
+      reason: "unrecovered_empty_response",
+    });
+  }, 20_000);
+
+  it("rejects a first short Discord admission and reaches the handler's failure path", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(() => ({ kind: "length", inputTokens: 1_000 }), seen);
+    const handle = await startPersistent({
+      name: "testbot",
+      agentsRoot: root,
+      log: () => {},
+      sessionFactory: live.factory,
+    });
+    let inbound: ((msg: DiscordMessage) => void) | undefined;
+    let admissionResult: Promise<unknown[]> | undefined;
+    const logs: string[] = [];
+    const replies: string[] = [];
+    const wired = wireDiscordCapability({
+      pi: { registerTool: () => {}, on: () => {} },
+      admitTurn: (origin, text) => {
+        admissionResult = handle.admitTurn(origin, text);
+        return admissionResult;
+      },
+      client: {
+        on: (_event, handler) => {
+          inbound = handler;
+        },
+        reply: async (_channel, text) => {
+          replies.push(text);
+        },
+        react: async () => {},
+        fetchRecent: async () => [],
+        fetchMessage: async () => null,
+        sendTyping: async () => {},
+        connect: async () => {},
+        disconnect: async () => {},
+      },
+      config: { tokenFile: "unused", channelIds: ["123456789"], dispatchAll: true },
+      log: (m) => logs.push(m),
+    });
+    try {
+      inbound?.({
+        id: "message-A",
+        channelId: "123456789",
+        authorId: "user-A",
+        authorName: "user",
+        content: "hi",
+        mentionsBot: true,
+      });
+      expect(admissionResult).toBeDefined();
+      await expect(admissionResult).rejects.toMatchObject({
+        name: "UnrecoveredEmptyResponseError",
+        reason: "unrecovered_empty_response",
+      });
+      expect(
+        logs.some(
+          (m) =>
+            m.includes("inbound turn/reply failed") &&
+            m.includes("unrecovered empty length response"),
+        ),
+      ).toBe(true);
+      expect(replies).toEqual([]);
+      expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+      expect(live.compactionStarts).toEqual([]);
+      expect(live.compactions).toEqual([]);
+    } finally {
+      await wired.stop();
+      await handle.shutdown();
+    }
+  }, 20_000);
+
   for (const variant of [
     { label: "input filling the window", inputTokens: 99_500 },
     { label: "input well under the window", inputTokens: 1_000 },

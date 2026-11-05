@@ -10,8 +10,7 @@
 // abort signal with its own), so the provider sees the same model and context,
 // not a promise of identical options objects. Before the bound, an empty attempt
 // that starts no block and ends without an error or abort is dropped before
-// pi sees it, unless pi's own overflow or recoverable-length checks classify it
-// (bob#395) — then it is passed through unchanged.
+// pi sees it, unless it is a length stop pi's own classifiers accept (bob#395).
 // The retry is BOUNDED by a constant, and past the bound the request ends with a
 // named error that names the provider, the model and the empty response.
 //
@@ -74,15 +73,15 @@ export function isEmptyResponse(message: AssistantMessage): boolean {
   return typeof output === "number" && output === 0;
 }
 
-/**
- * True when pi's own compaction checks classify this response (bob#395): a
- * context overflow, or a length stop that ended below the model's output limit.
- * Matching responses pass through unchanged; pi decides whether to compact and
- * retry, subject to its session state, compaction preparation and recovery bound.
- */
-function piRecovers(message: AssistantMessage, model: Parameters<StreamFunction>[0]): boolean {
+/** Length stops pi classifies pass through for its recovery attempt (bob#395). */
+function isPiRecoveryCandidate(
+  message: AssistantMessage,
+  model: Parameters<StreamFunction>[0],
+): boolean {
   return (
-    isContextOverflow(message, model.contextWindow) || isRecoverableLength(message, model.maxTokens)
+    message.stopReason === "length" &&
+    (isContextOverflow(message, model.contextWindow) ||
+      isRecoverableLength(message, model.maxTokens))
   );
 }
 
@@ -123,9 +122,8 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
 /**
  * Re-issue a request only when its stream starts no content block and ends with
  * no content blocks, zero output tokens, and neither an error nor an abort,
- * while retries remain and neither pi classifier matches (bob#395).
- * Matching responses pass through unchanged; pi decides whether to compact and
- * retry, subject to its session state, compaction preparation and recovery bound.
+ * while retries remain, except length stops pi classifies for recovery (bob#395).
+ * An unrecovered empty length stop fails as `unrecovered_empty_response` at settlement.
  * Past the bound, pi receives an error naming the provider, model and empty
  * response (`emptyResponseErrorText`).
  *
@@ -181,7 +179,7 @@ export function withEmptyResponseRetry(
           out.end(message);
           return;
         }
-        if (!forwarded && isEmptyResponse(terminal) && !piRecovers(terminal, model)) {
+        if (!forwarded && isEmptyResponse(terminal) && !isPiRecoveryCandidate(terminal, model)) {
           if (retries >= maxRetries) {
             const message: AssistantMessage & {
               [EMPTY_RESPONSE_EXHAUSTED]: EmptyResponseExhaustion;
