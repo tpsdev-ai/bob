@@ -1,10 +1,5 @@
-// bob#390: in every job that installs project dependencies or restores a
-// recognised package cache, a dedicated step whose trimmed `run` is exactly
-// `bun --no-install scripts/check-lockfile-release-age.mjs` must precede any
-// project dependency install and any package-cache restore. A global tool
-// install before it is allowed only where it is not a project install; none
-// remains. The test reads the directory instead of a list of files or jobs, so
-// an installing workflow or job added later without that step fails here.
+// bob#390: a dedicated checker step must precede every npm or bun install
+// command (global or not) and every recognised package-cache restore.
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,20 +8,16 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
-// These commands can fetch or change project dependencies before the bake check.
+// npm and Bun install commands, global or not.
 // `bun --no-install` and `bun run build` do not match.
 const PROJECT_INSTALL = /^(?:npm\s+ci\b|npm\s+(?:install|i)\b|bun\s+(?:install|add)\b)/;
-const GLOBAL_TOOL = /^(?:npm\s+(?:install|i)|bun\s+add)\b/;
-const GLOBAL_FLAG = /(?:^|\s)(?:-g|--global)(?:\s|$)/;
 // A package cache under the user's Bun or npm cache directory.
 const PACKAGE_CACHE_PATH = /(?:^|[/\\])(?:\.bun|\.npm)(?:[/\\]|$)/;
 
 type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
 type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
 
-// A `run` can hold several shell commands. Each is classified on its own, so a
-// global tool install in the same step as a project install does not exempt the
-// project install.
+// Classify each command in a `run` separately.
 function splitCommands(run: string): string[] {
   return run
     .split(/\r?\n|&&|\|\||;|\|/)
@@ -36,7 +27,6 @@ function splitCommands(run: string): string[] {
 
 function isProjectDependencyInstall(command: string): boolean {
   const trimmed = command.replace(/^sfw\s+/, "");
-  if (GLOBAL_TOOL.test(trimmed) && GLOBAL_FLAG.test(trimmed)) return false;
   return PROJECT_INSTALL.test(trimmed);
 }
 
@@ -142,10 +132,11 @@ test("an install without an earlier check is reported in each install form", () 
     'fixture.yml: job "bun-install" step 1 (sfw bun install --frozen-lockfile) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
     'fixture.yml: job "npm-ci" step 1 (npm ci) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
     'fixture.yml: job "npm-install" step 1 (npm install) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
+    'fixture.yml: job "npm-global" step 1 (npm install -g npm@^11.15.0) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
   ]);
 });
 
-test("a global upgrade in the same run does not exempt a project install", () => {
+test("global installs before the checker are reported alone and in a mixed run", () => {
   const workflow = parseYaml(
     [
       "jobs:",
@@ -161,6 +152,7 @@ test("a global upgrade in the same run does not exempt a project install", () =>
   ) as Workflow;
   expect(installsWithoutEarlierCheck(workflow, "fixture.yml")).toEqual([
     'fixture.yml: job "mixed" step 1 (npm install -g npm@^11.15.0 && sfw bun install --frozen-lockfile) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
+    'fixture.yml: job "global-only" step 1 (npm install -g npm@^11.15.0) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
   ]);
 });
 
