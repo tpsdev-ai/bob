@@ -486,6 +486,32 @@ describe("empty response after a compaction checkpoint (#381)", () => {
     expect(ending).toContain(STUB_MODEL);
     expect(ending).toContain(EMPTY_RESPONSE_MARK);
     const records = runLogRecords();
+    // bob#396: every request the wrapper made gets its own usage record (the
+    // empty attempts pi never saw included), and the exhausted one carries the
+    // provider's usage for the FINAL attempt rather than zero.
+    const usageRecords = records
+      .filter((r) => "requestUsage" in r)
+      .map(
+        (r) =>
+          r.requestUsage as {
+            provider: string;
+            model: string;
+            promptTokens: number;
+            completionTokens: number;
+            stopReason: string;
+          },
+      );
+    expect(usageRecords).toHaveLength(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1);
+    expect(usageRecords.map((r) => r.promptTokens)).toEqual(
+      Array<number>(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1).fill(1_000),
+    );
+    expect(usageRecords.at(-1)).toMatchObject({
+      provider: STUB_PROVIDER,
+      model: STUB_MODEL,
+      promptTokens: 1_000,
+      completionTokens: 0,
+      stopReason: "error",
+    });
     expect(records.find((r) => "outcome" in r)?.outcome).toEqual({
       reason: "empty_response",
       provider: STUB_PROVIDER,
