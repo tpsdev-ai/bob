@@ -11,7 +11,7 @@
 // not a promise of identical options objects. Before the bound, an empty attempt
 // that starts no block and ends without an error or abort is dropped before
 // pi sees it, unless pi's own overflow or recoverable-length checks classify it
-// (bob#395) — then it is handed to pi for its own recovery.
+// (bob#395) — then it is passed through unchanged.
 // The retry is BOUNDED by a constant, and past the bound the request ends with a
 // named error that names the provider, the model and the empty response.
 //
@@ -77,9 +77,8 @@ export function isEmptyResponse(message: AssistantMessage): boolean {
 /**
  * True when pi's own compaction checks classify this response (bob#395): a
  * context overflow, or a length stop that ended below the model's output limit.
- * pi applies its own overflow or recoverable-length recovery to such a message,
- * so the wrapper hands it over unchanged instead of re-issuing it as an empty
- * response.
+ * Matching responses pass through unchanged; pi decides whether to compact and
+ * retry, subject to its session state, compaction preparation and recovery bound.
  */
 function piRecovers(message: AssistantMessage, model: Parameters<StreamFunction>[0]): boolean {
   return (
@@ -124,10 +123,11 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
 /**
  * Re-issue a request only when its stream starts no content block and ends with
  * no content blocks, zero output tokens, and neither an error nor an abort,
- * while retries remain. A response pi's own overflow or recoverable-length
- * checks classify (bob#395) is passed through instead, so pi applies its own
- * recovery as it does without bob. Past the bound, pi receives an error
- * naming the provider, model and empty response (`emptyResponseErrorText`).
+ * while retries remain and neither pi classifier matches (bob#395).
+ * Matching responses pass through unchanged; pi decides whether to compact and
+ * retry, subject to its session state, compaction preparation and recovery bound.
+ * Past the bound, pi receives an error naming the provider, model and empty
+ * response (`emptyResponseErrorText`).
  *
  * On a block-start event, held events are flushed and forwarding begins.
  * Content present only in the terminal message is forwarded at the end.

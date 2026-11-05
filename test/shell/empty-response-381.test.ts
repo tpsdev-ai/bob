@@ -13,8 +13,7 @@
 //     re-prompted with a new continuation turn.
 // (d) a provider error whose text contains the empty-response phrase is not
 //     recorded as `empty_response` (classification reads only the typed marker).
-// (e) a zero-output `length` stop is left to pi's own overflow recovery, which
-//     compacts and retries the request (bob#395).
+// (e) a zero-output `length` stop is passed through to pi (bob#395).
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
 // over the same factory; the last block unit-tests the retry bound.
