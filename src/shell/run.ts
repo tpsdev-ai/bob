@@ -696,7 +696,7 @@ export interface RunSessionConfig {
   thinking?: ThinkingSetting;
   // bob#396: the run log's usage observer, when the session's caller keeps
   // one. When set, the empty-response wrapper reports each attempt it drops
-  // here, so an attempt pi never sees still gets its request-usage record.
+  // here for usage tracking.
   onDroppedAttempt?: (message: unknown) => void;
   // bob#275 (S2a): the launcher-supplied task binding the work capability reads
   // (via the task-binding environment hand-off). It carries the task and
@@ -1482,8 +1482,7 @@ async function runBoundedSession(
   });
   let terminalAssistant: unknown;
   // bob#396: an attempt the empty-response wrapper drops never reaches the
-  // session's event stream, so the wrapper reports it here and it gets the same
-  // request-usage record an ended message does.
+  // session's event stream, so feed its terminal message to the usage tracker.
   const recordRequestUsage = (message: unknown): void => {
     const record = usageTracker.observe({ type: "message_end", message });
     if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);

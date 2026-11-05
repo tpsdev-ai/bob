@@ -125,9 +125,9 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
  * On a block-start event, held events are flushed and forwarding begins.
  * Content present only in the terminal message is forwarded at the end.
  *
- * Each attempt the wrapper drops is reported to `onDroppedAttempt` with its
- * terminal message, so the caller can record that attempt's usage. The error
- * an exhausted request ends with keeps the final attempt's provider usage.
+ * When `onDroppedAttempt` is supplied, the wrapper reports each dropped attempt's
+ * terminal message to it. An exhausted request's error keeps the final attempt's
+ * provider usage.
  */
 export function withEmptyResponseRetry(
   inner: StreamFunction,
@@ -209,7 +209,13 @@ export function withEmptyResponseRetry(
             out.end(message);
             return;
           }
-          deps.onDroppedAttempt?.(terminal);
+          try {
+            deps.onDroppedAttempt?.(terminal);
+          } catch (err) {
+            log(
+              `bob: onDroppedAttempt failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
           retries += 1;
           log(
             `bob: the provider ${model.provider} returned an empty response for ${model.id} (no content blocks, zero output tokens) — re-issuing the same request (${retries}/${maxRetries})`,

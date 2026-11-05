@@ -1,4 +1,4 @@
-// bob#214 — one usage record per agent provider attempt, for the run log.
+// bob#214 — one usage record per agent provider attempt when run logging succeeds.
 //
 // An attempt the empty-response wrapper drops (bob#396) never reaches pi, so
 // its terminal message is fed to `observe` directly from the wrapper's report;
