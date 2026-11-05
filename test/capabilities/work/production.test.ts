@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,7 +20,7 @@ let scratch: string;
 let savedTmpdir: string | undefined;
 let savedState: string | undefined;
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), "bob-work-prod-"));
+  scratch = realpathSync(mkdtempSync(join(tmpdir(), "bob-work-prod-")));
   savedTmpdir = process.env.TMPDIR;
   savedState = process.env.BOB_STATE_DIR;
   process.env.BOB_STATE_DIR = join(scratch, "state");
