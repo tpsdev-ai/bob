@@ -123,7 +123,8 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
  * Re-issue a request only when its stream starts no content block and ends with
  * no content blocks, zero output tokens, and neither an error nor an abort,
  * while retries remain, except length stops pi classifies for recovery (bob#395).
- * An unrecovered empty length stop fails as `unrecovered_empty_response` at settlement.
+ * For one-shot runs and admitted turns, an unrecovered empty length stop fails as
+ * `unrecovered_empty_response`; `bob run` exits non-zero.
  * Past the bound, pi receives an error naming the provider, model and empty
  * response (`emptyResponseErrorText`).
  *

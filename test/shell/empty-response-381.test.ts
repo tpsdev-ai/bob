@@ -13,7 +13,7 @@
 //     re-prompted with a new continuation turn.
 // (d) a provider error whose text contains the empty-response phrase is not
 //     recorded as `empty_response`.
-// (e) classified zero-output length stops pass through; unrecovered turns fail (#395).
+// (e) classified zero-output length stops pass through (#395).
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
 // over the same factory; the last block unit-tests the retry bound.
