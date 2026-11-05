@@ -1,6 +1,8 @@
 // bob#390: the lockfile release-age checker is the first run step of every
-// workflow job that runs commands. No package-cache restore and no `uses:`
-// step whose inputs install dependencies may precede it.
+// workflow job that runs commands, except the release workflow's ancestry
+// guard job, which runs no repository script. An actions/cache step whose path
+// contains .bun or .npm, and a uses step with an input named cache or install,
+// may not precede the checker.
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +17,36 @@ const PACKAGE_CACHE_PATH = /(?:^|[/\\])(?:\.bun|\.npm)(?:[/\\]|$)/;
 const INSTALL_INPUT = /^(?:cache|install)$/;
 
 type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
-type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
+type Job = {
+  needs?: string | string[];
+  permissions?: Record<string, string> | string;
+  steps?: Step[];
+};
+type Workflow = { jobs?: Record<string, Job> };
+
+const ANCESTRY_CHECK = "git merge-base --is-ancestor";
+
+// The ancestry guard job runs git commands only, so it cannot also run the
+// checker. It is the one job the ordering rule skips.
+function isAncestryGuard(job: Job): boolean {
+  return (job.steps ?? []).some(
+    (step) => typeof step.run === "string" && step.run.includes(ANCESTRY_CHECK),
+  );
+}
+
+function needsOf(job: Job): string[] {
+  if (job.needs === undefined) return [];
+  return Array.isArray(job.needs) ? job.needs : [job.needs];
+}
+
+// Permissions that grant a write scope, including `id-token: write`.
+function writePermissions(job: Job): string[] {
+  const permissions = job.permissions;
+  if (permissions === null || typeof permissions !== "object") return [];
+  return Object.entries(permissions)
+    .filter(([, value]) => value === "write")
+    .map(([name]) => name);
+}
 
 function restoresPackageCache(step: Step): boolean {
   if (typeof step.uses !== "string" || !/^actions\/cache@/.test(step.uses)) return false;
@@ -43,6 +74,7 @@ function firstRunIndex(steps: Step[]): number {
 function orderingProblems(workflow: Workflow, source: string): string[] {
   const problems: string[] = [];
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
+    if (isAncestryGuard(definition)) continue;
     const steps = definition.steps ?? [];
     const firstRun = firstRunIndex(steps);
     if (firstRun === -1) continue;
@@ -176,4 +208,78 @@ test("a job with only uses steps is exempt", () => {
     ].join("\n"),
   ) as Workflow;
   expect(orderingProblems(workflow, "fixture.yml")).toEqual([]);
+});
+
+function dependsOn(jobs: Record<string, Job>, from: string, target: string): boolean {
+  const stack = [...needsOf(jobs[from])];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const name = stack.pop();
+    if (name === undefined) continue;
+    if (name === target) return true;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const job = jobs[name];
+    if (job !== undefined) stack.push(...needsOf(job));
+  }
+  return false;
+}
+
+function workflowSources(): string[] {
+  return readdirSync(WORKFLOWS)
+    .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
+    .sort();
+}
+
+function loadWorkflow(name: string): Workflow {
+  return parseYaml(readFileSync(join(WORKFLOWS, name), "utf8")) as Workflow;
+}
+
+test("the release workflow's ancestry guard is read-only and checks out without credentials", () => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const jobs = workflow.jobs ?? {};
+  const guards = Object.keys(jobs).filter((name) => isAncestryGuard(jobs[name]));
+  expect(guards).toHaveLength(1);
+  const guard = jobs[guards[0]];
+  expect(writePermissions(guard)).toEqual([]);
+  expect(guard.permissions).not.toHaveProperty("id-token");
+  const checkout = (guard.steps ?? []).find(
+    (step) => typeof step.uses === "string" && /^actions\/checkout@/.test(step.uses),
+  );
+  expect(checkout?.with?.["persist-credentials"]).toBe(false);
+});
+
+test("every job with id-token or a write permission needs the ancestry guard", () => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const jobs = workflow.jobs ?? {};
+  const guard = Object.keys(jobs).find((name) => isAncestryGuard(jobs[name]));
+  expect(guard).toBeDefined();
+  const privileged = Object.entries(jobs).filter(([, job]) => {
+    const permissions = job.permissions;
+    if (permissions === null || typeof permissions !== "object") return false;
+    return permissions["id-token"] === "write" || writePermissions(job).length > 0;
+  });
+  expect(privileged.length).toBeGreaterThan(0);
+  for (const [name] of privileged) {
+    expect(dependsOn(jobs, name, guard as string)).toBe(true);
+  }
+});
+
+test("a job that holds a write permission needs a prerequisite before a repository script", () => {
+  const problems: string[] = [];
+  for (const source of workflowSources()) {
+    const workflow = loadWorkflow(source);
+    for (const [name, job] of Object.entries(workflow.jobs ?? {})) {
+      if (writePermissions(job).length === 0) continue;
+      const runsRepositoryScript = (job.steps ?? []).some(
+        (step) => typeof step.run === "string" && /\bscripts\//.test(step.run),
+      );
+      if (runsRepositoryScript && needsOf(job).length === 0) {
+        problems.push(
+          `.github/workflows/${source}: job "${name}" holds a write permission and runs a repository script with no needs:`,
+        );
+      }
+    }
+  }
+  expect(problems).toEqual([]);
 });

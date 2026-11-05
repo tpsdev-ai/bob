@@ -57,8 +57,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-ancestry:
+    name: Verify tagged commit is on main
+    runs-on: ubuntu-latest
+    # This job holds no write permission and runs no repository script: it only
+    # fetches main and checks that the tagged commit is an ancestor. Every job
+    # that holds a write permission or id-token depends on it, so none of them
+    # starts unless the tag points at merged code.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tagged commit is on main
+        # A tag can point at any commit; require it to be merged to main so a tag
+        # can never ship un-reviewed code past the npm staging gate.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Commit ${GITHUB_SHA} is not an ancestor of origin/main. Tag a merged release commit."
+            exit 1
+          fi
+          echo "  ok ${GITHUB_SHA} is on main"
+
   stage-publish:
     name: Stage-publish @tpsdev-ai/bob
+    needs: verify-ancestry
     runs-on: ubuntu-latest
     # `release` is an OIDC-scoping environment, NOT an approval gate: it pins the
     # trusted-publisher trust to this environment. The human gate is the npm
@@ -66,7 +94,7 @@ jobs:
     environment: release
     permissions:
       id-token: write   # mint the short-lived OIDC token for npm trusted publishing
-      contents: read    # checkout + fetch main for the ancestry guard
+      contents: read    # checkout
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,18 +129,6 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VERSION"
-
-      - name: Verify tagged commit is on main
-        # A tag can point at any commit; require it to be merged to main so a tag
-        # can never ship un-reviewed code past the npm staging gate.
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Commit ${GITHUB_SHA} is not an ancestor of origin/main. Tag a merged release commit."
-            exit 1
-          fi
-          echo "  ok ${GITHUB_SHA} is on main"
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -203,6 +219,7 @@ jobs:
 
   github-release:
     name: Cut GitHub release from CHANGELOG
+    needs: verify-ancestry
     runs-on: ubuntu-latest
     # Independent of stage-publish on purpose: the GitHub release documents the
     # tagged commit and can be cut immediately on tag push. It does NOT wait on
