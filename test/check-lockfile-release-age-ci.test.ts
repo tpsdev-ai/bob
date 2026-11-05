@@ -2,7 +2,8 @@
 // step whose trimmed `run` is exactly
 // `bun --no-install scripts/check-lockfile-release-age.mjs` must precede the
 // first dependency install. The test reads the directory instead of a list of
-// files or jobs, so a workflow or job added later without that step fails here.
+// files or jobs, so an installing workflow or job added later without that step
+// fails here.
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -46,7 +47,7 @@ function installsWithoutEarlierCheck(workflow: Workflow, source: string): string
   return problems;
 }
 
-test("every workflow job checks the lockfile release age before it installs", () => {
+test("every installing workflow job checks the lockfile release age before it installs", () => {
   const sources = readdirSync(WORKFLOWS)
     .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
     .sort();
