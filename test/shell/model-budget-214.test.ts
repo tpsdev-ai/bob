@@ -829,6 +829,9 @@ describe("bob#214 — the OpenAI-compatible path: max_tokens is sent, a piece-co
       // The first request carried no content and zero output tokens; the same
       // request (a second one) recovered, and pi saw only the recovered message.
       expect(server.requests()).toBe(2);
+      // bob#396: compare the parsed request bodies.
+      expect(server.bodies).toHaveLength(2);
+      expect(server.bodies[1]).toEqual(server.bodies[0]);
       const message = lastAssistant(session);
       expect(message?.stopReason).toBe("stop");
       expect(textOf(message)).toBe("DONE: recovered");

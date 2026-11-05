@@ -973,7 +973,11 @@ export function sessionModelLimits(
  */
 export function installSessionBudget(
   session: unknown,
-  deps?: { log?: (message: string) => void; outputBudget?: number },
+  deps?: {
+    log?: (message: string) => void;
+    outputBudget?: number;
+    onDroppedAttempt?: (message: unknown) => void;
+  },
 ): void {
   const s = session as Partial<MidRunCompactionSession> & {
     agent?: { streamFunction?: StreamFunction };
@@ -1835,6 +1839,9 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
         log: deps?.log ?? ((m: string) => console.error(m)),
         ...(row?.auth.kind === "none" && row.budget !== undefined
           ? { outputBudget: row.budget.maxOutputTokens }
+          : {}),
+        ...(config.onDroppedAttempt !== undefined
+          ? { onDroppedAttempt: config.onDroppedAttempt }
           : {}),
       });
     } catch (err) {

@@ -694,6 +694,10 @@ export interface RunSessionConfig {
   // bob#214: the thinking level handed to pi (bob.yaml `session:` over
   // role.json `session`). Absent: pi's default.
   thinking?: ThinkingSetting;
+  // bob#396: the run log's usage observer, when the session's caller keeps
+  // one. When set, the empty-response wrapper reports each attempt it drops
+  // here for usage tracking.
+  onDroppedAttempt?: (message: unknown) => void;
   // bob#275 (S2a): the launcher-supplied task binding the work capability reads
   // (via the task-binding environment hand-off). It carries the task and
   // publication identities, repository/workspace, pinned base, mode, artifact
@@ -1090,12 +1094,16 @@ async function runBoundedSession(
   // finishes standing up (pi's resource/extension load), the run returns
   // without waiting for it. The guard does not cancel the factory.
   let session: RunSession;
+  // bob#396: filled in once the run log exists; attempts dropped before that
+  // (there are none: no request runs before the session is prompted) are lost.
+  let reportDroppedAttempt: ((message: unknown) => void) | undefined;
   try {
     session = await bounds.guard(
       factory({
         ...config,
         taskContract,
         ...(opts.contractCapChars !== undefined ? { contractCapChars: opts.contractCapChars } : {}),
+        onDroppedAttempt: (message) => reportDroppedAttempt?.(message),
       }),
     );
   } catch (err) {
@@ -1473,6 +1481,11 @@ async function runBoundedSession(
       : {}),
   });
   let terminalAssistant: unknown;
+  const recordRequestUsage = (message: unknown): void => {
+    const record = usageTracker.observe({ type: "message_end", message });
+    if (record !== undefined) writeRunLog({ t: now().toISOString(), requestUsage: record }, false);
+  };
+  reportDroppedAttempt = recordRequestUsage;
   const unsubscribeUsage = session.subscribe((event) => {
     if (event.type === "message_end" && event.message.role === "assistant") {
       terminalAssistant = event.message;

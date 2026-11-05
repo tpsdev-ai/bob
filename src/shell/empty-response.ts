@@ -124,12 +124,24 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
  *
  * On a block-start event, held events are flushed and forwarding begins.
  * Content present only in the terminal message is forwarded at the end.
+ *
+ * When `onDroppedAttempt` is supplied, the wrapper reports each dropped attempt's
+ * terminal message to it. An exhausted request's error keeps the final attempt's
+ * provider usage.
  */
 export function withEmptyResponseRetry(
   inner: StreamFunction,
-  deps: { log?: (message: string) => void; maxRetries?: number } = {},
+  deps: {
+    log?: (message: string) => void;
+    maxRetries?: number;
+    onDroppedAttempt?: (message: AssistantMessage) => void;
+  } = {},
 ): StreamFunction {
-  const log = deps.log ?? (() => {});
+  const log = (message: () => string): void => {
+    try {
+      deps.log?.(message());
+    } catch {}
+  };
   const maxRetries = resolveMaxEmptyResponseRetries(deps.maxRetries);
   const wrapped = async (
     model: Parameters<StreamFunction>[0],
@@ -189,7 +201,6 @@ export function withEmptyResponseRetry(
             } = {
               ...terminal,
               content: [],
-              usage: zeroUsage(),
               stopReason: "error",
               errorMessage: emptyResponseErrorText(model.provider, model.id, retries),
               [EMPTY_RESPONSE_EXHAUSTED]: {
@@ -202,9 +213,18 @@ export function withEmptyResponseRetry(
             out.end(message);
             return;
           }
+          try {
+            deps.onDroppedAttempt?.(terminal);
+          } catch (err) {
+            log(
+              () =>
+                `bob: onDroppedAttempt failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
           retries += 1;
           log(
-            `bob: the provider ${model.provider} returned an empty response for ${model.id} (no content blocks, zero output tokens) — re-issuing the same request (${retries}/${maxRetries})`,
+            () =>
+              `bob: the provider ${model.provider} returned an empty response for ${model.id} (no content blocks, zero output tokens) — re-issuing the same request (${retries}/${maxRetries})`,
           );
           continue;
         }

@@ -1,4 +1,4 @@
-// bob#214 — one usage record per ended assistant message, for the run log.
+// bob#214 — one usage record per agent provider attempt when run logging succeeds.
 //
 // The run log already carries every event, but reading token counts and timing
 // out of it meant reverse engineering: prompt tokens split across `input` and
@@ -76,7 +76,8 @@ function count(value: unknown): number {
 }
 
 export interface RequestUsageTracker {
-  /** Feed every session event. Returns the record when an assistant message ends. */
+  /** Feed session events, including dropped attempts wrapped as `{ type: "message_end", message }`.
+   *  Returns a record for an assistant `message_end`. */
   observe(event: unknown): RequestUsageRecord | undefined;
 }
 
