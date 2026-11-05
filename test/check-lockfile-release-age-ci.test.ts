@@ -1,10 +1,4 @@
-// bob#390: the checker is the first `run:` step in each job with a `run:` step,
-// except release-publish.yml's verify-ancestry job. Before the first run, allow only
-// actions/checkout {fetch-depth, persist-credentials}, oven-sh/setup-bun {bun-version},
-// actions/setup-node {node-version}, socketdev/action {mode}.
-// Checker step keys: name, run. verify-ancestry job keys: name, runs-on, permissions, steps.
-// Jobs needing verify-ancestry directly or transitively allow only name, needs, runs-on,
-// environment, if, permissions, steps; their if contains no success(, failure(, always(, cancelled(.
+// the test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. It does not inspect the contents of the actions those steps use.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -37,8 +31,24 @@ type Job = {
   permissions?: Permissions;
   steps?: Step[];
 };
-type Workflow = { permissions?: Permissions; jobs?: Record<string, Job> };
+type Workflow = {
+  [key: string]: unknown;
+  permissions?: Permissions;
+  jobs?: Record<string, Job>;
+};
 
+const WORKFLOW_KEYS = ["name", "on", "permissions", "concurrency", "jobs"];
+const JOB_KEYS = [
+  "name",
+  "runs-on",
+  "permissions",
+  "steps",
+  "needs",
+  "strategy",
+  "environment",
+  "if",
+];
+const STEP_KEYS = ["uses", "with", "name", "run", "env", "id", "if"];
 const ANCESTRY_JOB = "verify-ancestry";
 const CHECKER_STEP_KEYS = ["name", "run"];
 const ANCESTRY_JOB_KEYS = ["name", "runs-on", "permissions", "steps"];
@@ -56,6 +66,12 @@ function keyProblems(value: object, allowed: readonly string[], where: string): 
   return Object.keys(value)
     .filter((key) => !allowed.includes(key))
     .map((key) => `${where}: key "${key}" is not allowed`);
+}
+
+function conditionProblems(condition: unknown, where: string): string[] {
+  return /\b(success|failure|always|cancelled)\s*\(/i.test(String(condition ?? ""))
+    ? [`${where}: if contains a status-check function`]
+    : [];
 }
 
 function needsOf(job: Job): string[] {
@@ -145,10 +161,17 @@ function firstRunIndex(steps: Step[]): number {
 }
 
 function orderingProblems(workflow: Workflow, source: string): string[] {
-  const problems: string[] = [];
+  const problems = keyProblems(workflow, WORKFLOW_KEYS, source);
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
     const steps = definition.steps ?? [];
     const where = `${source}: job "${job}"`;
+    problems.push(...keyProblems(definition, JOB_KEYS, where));
+    problems.push(...conditionProblems(definition.if, where));
+    for (const [index, step] of steps.entries()) {
+      const stepWhere = `${where} step ${index + 1}`;
+      problems.push(...keyProblems(step, STEP_KEYS, stepWhere));
+      problems.push(...conditionProblems(step.if, stepWhere));
+    }
     const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
     if (isAncestry) {
       problems.push(...keyProblems(definition, ANCESTRY_JOB_KEYS, where));
@@ -156,9 +179,6 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
     }
     if (dependsOn(workflow.jobs ?? {}, job, ANCESTRY_JOB)) {
       problems.push(...keyProblems(definition, DEPENDENT_JOB_KEYS, where));
-      if (/\b(success|failure|always|cancelled)\s*\(/i.test(String(definition.if ?? ""))) {
-        problems.push(`${where}: if contains a status-check function`);
-      }
     }
     const firstRun = firstRunIndex(steps);
     if (firstRun === -1) continue;
@@ -179,17 +199,102 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
   return [...new Set(problems)];
 }
 
-test("the checker is the first run step of each job with a run step, except release-publish.yml verify-ancestry", () => {
+test("workflow keys, conditions, shapes and checker ordering", () => {
   const sources = readdirSync(WORKFLOWS)
     .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
     .sort();
-  expect(sources.length).toBeGreaterThan(0);
+  expect(sources).toEqual(["ci.yml", "codeql.yml", "release-publish.yml", "socket.yml"]);
   const problems = sources.flatMap((name) => {
     const workflow = parseYaml(readFileSync(join(WORKFLOWS, name), "utf8")) as Workflow;
     return orderingProblems(workflow, `.github/workflows/${name}`);
   });
   expect(problems).toEqual([]);
 });
+
+test.each([
+  ["defaults", { run: { shell: "bash -c true {0}" } }],
+  ["env", { CI: "" }],
+  ["unlisted-key", false],
+] satisfies [string, unknown][])("workflow key %s is red", (key, value) => {
+  const workflow = loadWorkflow("ci.yml");
+  workflow[key] = value;
+  expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    `.github/workflows/ci.yml: key "${key}" is not allowed`,
+  ]);
+});
+
+test.each([
+  ["defaults", { run: { shell: "bash -c true {0}" } }],
+  ["continue-on-error", true],
+  ["env", { CI: "" }],
+  ["container", "node"],
+  ["services", {}],
+  ["timeout-minutes", 1],
+  ["outputs", {}],
+  ["unlisted-key", false],
+] satisfies [string, unknown][])("build job key %s is red", (key, value) => {
+  const workflow = loadWorkflow("ci.yml");
+  const job = workflow.jobs?.build;
+  if (job === undefined) throw new Error("Missing build");
+  job[key] = value;
+  expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    `.github/workflows/ci.yml: job "build": key "${key}" is not allowed`,
+  ]);
+});
+
+test.each([
+  ["continue-on-error", true],
+  ["shell", "bash"],
+  ["working-directory", "."],
+  ["timeout-minutes", 1],
+  ["unlisted-key", false],
+] satisfies [string, unknown][])(
+  "step key %s is red before and after the checker and without run steps",
+  (key, value) => {
+    for (const [source, name, index] of [
+      ["ci.yml", "build", 0],
+      ["socket.yml", "socket-note", 3],
+      ["codeql.yml", "analyze", 2],
+    ] as const) {
+      const workflow = loadWorkflow(source);
+      const step = workflow.jobs?.[name].steps?.[index];
+      if (step === undefined) throw new Error(`Missing ${source} ${name} step ${index + 1}`);
+      step[key] = value;
+      expect(orderingProblems(workflow, `.github/workflows/${source}`)).toEqual([
+        `.github/workflows/${source}: job "${name}" step ${index + 1}: key "${key}" is not allowed`,
+      ]);
+    }
+  },
+);
+
+test.each(["success()", "$" + "{{ failure() }}", "always()", "cancelled()", "ALWAYS ()"])(
+  "job and step if %s is red",
+  (condition) => {
+    for (const [source, name] of [
+      ["ci.yml", "build"],
+      ["socket.yml", "socket-note"],
+      ["codeql.yml", "analyze"],
+    ]) {
+      const workflow = loadWorkflow(source);
+      const job = workflow.jobs?.[name];
+      if (job === undefined) throw new Error(`Missing ${source} ${name}`);
+      job.if = condition;
+      expect(orderingProblems(workflow, `.github/workflows/${source}`)).toEqual([
+        `.github/workflows/${source}: job "${name}": if contains a status-check function`,
+      ]);
+      delete job.if;
+      const steps = job.steps ?? [];
+      for (const [index, step] of steps.entries()) {
+        if (step.run === CHECKER) continue;
+        step.if = condition;
+        expect(orderingProblems(workflow, `.github/workflows/${source}`)).toEqual([
+          `.github/workflows/${source}: job "${name}" step ${index + 1}: if contains a status-check function`,
+        ]);
+        delete step.if;
+      }
+    }
+  },
+);
 
 test.each([
   ["continue-on-error", true],
