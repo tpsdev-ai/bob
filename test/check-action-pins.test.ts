@@ -1,5 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -337,6 +345,11 @@ for (const [form, line, remedy] of [
     "`uses: owner/repo/.github/workflows/<file>.yml@<40-hex> # vX.Y.Z` at the job key",
   ],
   [
+    "a job-level local flow mapping",
+    "jobs: { check: { uses: ./.github/workflows/build.yml } }\n",
+    "`uses: ./.github/workflows/<file>.yml` at the job key",
+  ],
+  [
     "a quoted local uses key",
     workflow(['- "uses": "./tools/local"']),
     "`- uses: ./path` (local actions are followed, not pinned)",
@@ -367,6 +380,103 @@ test("a reusable-workflow job reference is checked", async () => {
   expect(result.errors.join("\n")).toContain(
     ".github/workflows/ci.yml:5: owner/repo/.github/workflows/build.yml@main: not pinned",
   );
+});
+
+for (const extension of ["yml", "yaml"]) {
+  test(`an existing local reusable .${extension} workflow is scanned as a workflow`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      `jobs:\n  check:\n    uses: ./.github/workflows/build.${extension}\n`,
+    );
+    writeFileSync(
+      join(root, `.github/workflows/build.${extension}`),
+      workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]),
+    );
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 1,
+      errors: [],
+    });
+    writeFileSync(
+      join(root, `.github/workflows/build.${extension}`),
+      workflow(["- uses: evil/repo@main"]),
+    );
+    expect((await checkActionPins({ root, resolver: resolver() })).errors.join("\n")).toContain(
+      `.github/workflows/build.${extension}:7: evil/repo@main: not pinned`,
+    );
+  });
+}
+
+for (const [form, value] of [
+  ["missing file", "./.github/workflows/missing.yml"],
+  ["outside workflows", "./tools/build.yml"],
+  ["parent traversal", "./.github/workflows/../build.yml"],
+  ["wrong extension", "./.github/workflows/build.txt"],
+  ["directory", "./.github/workflows/directory.yml"],
+  ["symlink outside workflows", "./.github/workflows/link.yml"],
+]) {
+  test(`a job-level local reusable workflow reports its ${form}`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), `jobs:\n  check:\n    uses: ${value}\n`);
+    mkdirSync(join(root, ".github/workflows/directory.yml"));
+    mkdirSync(join(root, "tools"));
+    writeFileSync(join(root, "tools/build.yml"), workflow(["- run: echo fixture"]));
+    symlinkSync(join(root, "tools/build.yml"), join(root, ".github/workflows/link.yml"));
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain(`.github/workflows/ci.yml:3: ${value}:`);
+    expect(result.errors[0]).not.toContain(root);
+  });
+}
+
+for (const pinnedFirst of [false, true]) {
+  for (const kind of ["step", "job", "composite", "flow step", "quoted step", "escaped step"]) {
+    test(`duplicate uses keys are refused in a ${kind} with the pin ${pinnedFirst ? "first" : "last"}`, async () => {
+      const values = [`oven-sh/setup-bun@${RIGHT} # v2.2.0`, "evil/repo@main"];
+      if (!pinnedFirst) values.reverse();
+      const root = fixtureLines([]);
+      let source: string;
+      if (kind === "job")
+        source = `jobs:\n  check:\n    uses: ${values[0]}\n    uses: ${values[1]}\n`;
+      else if (kind === "flow step")
+        source = workflow([
+          `- { uses: ${values[0].split(" #")[0]}, uses: ${values[1].split(" #")[0]} }`,
+        ]);
+      else {
+        const key =
+          kind === "quoted step" ? '"uses"' : kind === "escaped step" ? '"\\u0075ses"' : "uses";
+        const lines = [`- ${key}: ${values[0]}`, `  uses: ${values[1]}`];
+        source = kind === "composite" ? composite(lines) : workflow(lines);
+      }
+      const file =
+        kind === "composite" ? ".github/actions/local/action.yml" : ".github/workflows/ci.yml";
+      mkdirSync(join(root, ".github/actions/local"), { recursive: true });
+      writeFileSync(join(root, file), source);
+      const result = await checkActionPins({ root, resolver: resolver() });
+      expect(result.errors.join("\n")).toContain(`${file}: duplicate uses keys are refused`);
+      expect(result.errors.join("\n")).toContain("one `uses` per step");
+    });
+  }
+}
+
+test("repeated uses text in run strings and comments is ignored", async () => {
+  const root = fixtureLines([
+    "- run: |",
+    "    uses: evil/repo@main",
+    "    uses: other/repo@main",
+    '- run: "uses: uses: literal"',
+    "# uses: uses:",
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("multiple YAML documents report the unsupported-document error", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(join(root, ".github/workflows/ci.yml"), "jobs: {}\n---\njobs: {}\n");
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: multiple YAML documents are not supported",
+  ]);
 });
 
 test("uses text in a run block is ignored", async () => {

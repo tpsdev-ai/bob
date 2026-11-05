@@ -4,15 +4,24 @@
 // Locate each reference at its step/job key on a canonical `- uses: <value>` or
 // `uses: <value>` source line (unquoted or simply quoted value); otherwise refuse
 // it with a remedy for its reference kind. Refuse YAML aliases; request the step
-// written out in full. Ignore uses text in run blocks.
+// written out in full. Refuse duplicate step/job uses keys. Ignore uses text in run blocks.
 // Remote refs require a full 40-hex SHA and a full release-tag comment resolving
 // to that SHA. Follow ./ local actions through action.yml/action.yaml, cycle-safe
-// and bounded; missing metadata is an error. Docker refs require @sha256:<64-hex>.
+// and bounded; missing metadata is an error. Check job-level local reusable
+// workflows as workflow files. Docker refs require @sha256:<64-hex>.
 // The CLI requires GITHUB_TOKEN for tag lookups and refuses without it before scanning.
 // Read a stable checkout that no other process is rewriting; check path containment
 // before opening files.
 
-import { closeSync, fstatSync, openSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -78,7 +87,28 @@ function refuseAliases(text) {
   }
 }
 
+function refuseDuplicateUses(text, metadata) {
+  let marker = "__action_pin_uses_key__";
+  while (text.includes(marker)) marker += "_";
+  const keys = new Set(["uses"]);
+  const marked = text.replaceAll("uses", () => {
+    const key = `${marker}${keys.size}`;
+    keys.add(key);
+    return key;
+  });
+  const doc = Bun.YAML.parse(marked);
+  const mappings = metadata
+    ? (doc.runs.steps ?? [])
+    : Object.values(doc.jobs).flatMap((job) => [job, ...(job.steps ?? [])]);
+  for (const mapping of mappings) {
+    if (Object.keys(mapping).filter((key) => keys.has(key)).length > 1)
+      throw new Error("duplicate uses keys are refused; write one `uses` per step (or job)");
+  }
+}
+
 function referenceRemedy({ value, kind }) {
+  if (kind === "job" && value.startsWith("./"))
+    return "`uses: ./.github/workflows/<file>.yml` at the job key";
   if (value.startsWith("./")) return "`- uses: ./path` (local actions are followed, not pinned)";
   if (value.startsWith("docker://")) return "`- uses: docker://image@sha256:<64-hex>`";
   if (kind === "job")
@@ -123,6 +153,24 @@ function localMetadata(root, value) {
     }
   }
   throw new Error("missing local action.yml/action.yaml");
+}
+
+function localWorkflow(root, value) {
+  const invalid = () =>
+    new Error("local reusable workflow must be a regular .yml/.yaml file under .github/workflows/");
+  if (!/^\.\/\.github\/workflows\/[^/]+\.ya?ml$/.test(value)) throw invalid();
+  try {
+    const file = realpathSync(resolve(root, value));
+    const rel = relative(root, file);
+    if (
+      !/^\.github\/workflows\/[^/]+\.ya?ml$/.test(rel) ||
+      !lstatSync(resolve(root, value)).isFile()
+    )
+      throw invalid();
+  } catch (error) {
+    if (error.code) throw new Error(`cannot read local reusable workflow (${error.code})`);
+    throw error;
+  }
 }
 
 function parseUses(raw) {
@@ -208,7 +256,9 @@ export async function checkActionPins({ root = ROOT, resolver }) {
         const metadata = dirname(file) !== join(root, ".github/workflows");
         const doc = Bun.YAML.parse(text);
         refuseAliases(text);
+        if (Array.isArray(doc)) throw new Error("multiple YAML documents are not supported");
         refs = inventory(doc, metadata);
+        refuseDuplicateUses(text, metadata);
         locations = locateReferences(text, metadata);
       } finally {
         closeSync(fd);
@@ -231,6 +281,10 @@ export async function checkActionPins({ root = ROOT, resolver }) {
       const { line, suffix } = located;
       if (value.startsWith("./")) {
         try {
+          if (reference.kind === "job") {
+            localWorkflow(root, value);
+            continue;
+          }
           const metadata = localMetadata(root, value);
           if (queue.length >= MAX_ENTRIES)
             throw new Error("Too many local action references to check");
