@@ -12,10 +12,11 @@
 // (c) bob#256's reasoning-only case, unchanged: a thinking-only turn is still
 //     re-prompted with a new continuation turn.
 // (d) a provider error whose text contains the empty-response phrase is not
-//     recorded as `empty_response` (classification reads only the typed marker).
+//     recorded as `empty_response`.
+// (e) classified zero-output length stops pass through (#395).
 //
-// The admission tests drive `startPersistent` (and the real cron scheduler)
-// over the same factory; the last block unit-tests the retry bound.
+// The admission tests drive `startPersistent` (and the real cron scheduler).
+// The bound tests unit-test the retry ceiling.
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   existsSync,
@@ -42,8 +43,14 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { CONTINUE_TURN, REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
+import { wireDiscordCapability } from "../../src/capabilities/discord/capability.js";
+import {
+  CONTINUE_TURN,
+  DEFAULT_MAX_REASONING_REPROMPTS,
+  REASONING_CONTINUE_TURN,
+} from "../../src/shell/compaction-contract.js";
 import { startCronScheduler, type TimerHandle } from "../../src/shell/cron.js";
+import type { DiscordMessage } from "../../src/shell/discord-types.js";
 import {
   DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
   EMPTY_RESPONSE_MARK,
@@ -65,6 +72,18 @@ const OVER_THRESHOLD = 60_001;
 
 type Reply = { inputTokens: number } & (
   | { kind: "empty" }
+  | {
+      kind: "terminal";
+      content?: AssistantMessage["content"] | null;
+      stopReason: "stop" | "length";
+      outputTokens: number;
+    }
+  | {
+      kind: "length";
+      outputTokens?: number;
+      omitField?: "provider" | "model" | "content";
+      nonArrayContent?: boolean;
+    }
   | { kind: "text"; text: string }
   | { kind: "thinking"; thinking: string }
   | { kind: "toolRead"; path: string }
@@ -137,6 +156,8 @@ function scriptedProvider(
         const input = step.inputTokens;
         const content: AssistantMessage["content"] = [];
         let stopReason: AssistantMessage["stopReason"] = "stop";
+        if (step.kind === "length" || step.kind === "terminal")
+          stopReason = step.kind === "terminal" ? step.stopReason : "length";
         if (step.kind === "providerError") {
           const failed: AssistantMessage = {
             role: "assistant",
@@ -170,11 +191,27 @@ function scriptedProvider(
           api: model.api,
           provider: model.provider,
           model: model.id,
-          // The empty reply is the issue's shape: no content, zero output tokens.
-          usage: usage(input, step.kind === "empty" ? 0 : 10),
+          usage: usage(
+            input,
+            step.kind === "length" || step.kind === "terminal"
+              ? (step.outputTokens ?? 0)
+              : step.kind === "empty"
+                ? 0
+                : 10,
+          ),
           stopReason,
           timestamp: Date.now(),
         };
+        if (step.kind === "terminal") {
+          if (step.content === undefined) delete (message as Partial<AssistantMessage>).content;
+          else (message as { content: unknown }).content = step.content;
+        }
+        if (step.kind === "length" && step.omitField) {
+          delete (message as Partial<AssistantMessage>)[step.omitField];
+        }
+        if (step.kind === "length" && step.nonArrayContent) {
+          (message as { content: unknown }).content = "invalid";
+        }
         await options?.onPayload?.(
           {
             model: model.id,
@@ -202,7 +239,7 @@ function scriptedProvider(
         }
         stream.push({
           type: "done",
-          reason: stopReason === "toolUse" ? "toolUse" : "stop",
+          reason: stopReason === "toolUse" || stopReason === "length" ? stopReason : "stop",
           message,
         });
         stream.end(message);
@@ -258,11 +295,13 @@ async function liveFactory(
   logs: string[];
   ended: Array<{ content: unknown; stopReason?: string }>;
   compactions: Array<{ result?: unknown; aborted?: boolean }>;
+  compactionStarts: string[];
 }> {
   const logs: string[] = [];
   const sessions: RunSession[] = [];
   const ended: Array<{ content: unknown; stopReason?: string }> = [];
   const compactions: Array<{ result?: unknown; aborted?: boolean }> = [];
+  const compactionStarts: string[] = [];
   const modelRuntime = await ModelRuntime.create({
     authPath: join(root, "testbot", ".pi-agent", "auth.json"),
     modelsPath: null,
@@ -327,6 +366,10 @@ async function liveFactory(
         aborted?: boolean;
         message?: { role?: string; content?: unknown; stopReason?: string };
       };
+      if (e.type === "compaction_start") {
+        compactionStarts.push(String((e as { reason?: unknown }).reason));
+        return;
+      }
       if (e.type === "compaction_end") {
         compactions.push({ result: e.result, aborted: e.aborted });
         return;
@@ -336,7 +379,7 @@ async function liveFactory(
     });
     return session;
   };
-  return { factory, sessions, logs, ended, compactions };
+  return { factory, sessions, logs, ended, compactions, compactionStarts };
 }
 
 /** Every record of the run log this run wrote. */
@@ -661,9 +704,8 @@ describe("an exhausted turn stays failed through automatic compaction (#381)", (
       if (request.lastUserText === latePrompt) {
         return { kind: "text", text: narration, inputTokens: 1_000 };
       }
-      return request.lastUserText === CONTINUE_TURN
-        ? { kind: "empty", inputTokens: 1_000 }
-        : { kind: "text", text: "", inputTokens: 1_000 };
+      expect(request.lastUserText).toBe(CONTINUE_TURN);
+      return { kind: "empty", inputTokens: 1_000 };
     }, seen);
     const res = await runAgent({
       name: "testbot",
@@ -676,7 +718,10 @@ describe("an exhausted turn stays failed through automatic compaction (#381)", (
         const prompt = session.prompt.bind(session);
         session.prompt = async (text, options) => {
           await prompt(text, options);
-          if (text === CONTINUE_TURN) await prompt(latePrompt, options);
+          if (text === PROMPT) {
+            await prompt(CONTINUE_TURN, options);
+            await prompt(latePrompt, options);
+          }
         };
         return session;
       },
@@ -784,4 +829,305 @@ describe("the empty-response bound (#381)", () => {
       expect(() => resolveMaxEmptyResponseRetries(bad)).toThrow(/invalid maxEmptyResponseRetries/);
     }
   }, 10_000);
+});
+
+describe("classified length stops and turn settlement (#395)", () => {
+  it("re-issues an empty normal stop over the window up to the bound", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(
+      () => ({ kind: "empty", inputTokens: CONTEXT_WINDOW + 1 }),
+      seen,
+    );
+    const res = await runAgent({
+      name: "testbot",
+      agentsRoot: root,
+      prompt: "do the thing",
+      sessionFactory: live.factory,
+    });
+    const requests = seen.filter((r) => !r.summarization);
+    expect(requests).toHaveLength(DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1);
+    expect(new Set(requests.map((r) => r.messagesJson)).size).toBe(1);
+    expect(res.exitCode).toBe(1);
+    expect(res.reason).toBe("empty_response");
+  }, 20_000);
+
+  for (const variant of [
+    { label: "output=0", outputTokens: 0 },
+    { label: "output=5", outputTokens: 5 },
+    { label: "provider deleted", outputTokens: 0, omitField: "provider" as const },
+    { label: "model deleted", outputTokens: 0, omitField: "model" as const },
+    { label: "content absent", outputTokens: 0, omitField: "content" as const },
+    { label: "non-array content", outputTokens: 0, nonArrayContent: true },
+  ]) {
+    const provider = variant.omitField === "provider" ? "unknown" : STUB_PROVIDER;
+    const model = variant.omitField === "model" ? "unknown" : STUB_MODEL;
+    it(`fails a first short run with unrecovered_empty_response (${variant.label})`, async () => {
+      const seen: SeenRequest[] = [];
+      const live = await liveFactory(
+        () => ({ kind: "length", inputTokens: 1_000, ...variant }),
+        seen,
+      );
+      const res = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "hi",
+        captureStdout: true,
+        sessionFactory: live.factory,
+      });
+      expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+      expect(live.compactionStarts).toEqual([]);
+      expect(live.compactions).toEqual([]);
+      expect(live.ended).toEqual([{ content: [], stopReason: "length" }]);
+      expect(res.exitCode).toBe(1);
+      expect(res.reason).toBe("unrecovered_empty_response");
+      expect(res.failed).toBe(true);
+      expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
+        reason: "unrecovered_empty_response",
+        provider,
+        model,
+      });
+      expect(runLogRecords().at(-1)).toEqual({
+        done: true,
+        exitCode: 1,
+        reason: "unrecovered_empty_response",
+      });
+    }, 20_000);
+
+    it(`rejects a first short Discord admission and logs failure (${variant.label})`, async () => {
+      const seen: SeenRequest[] = [];
+      const live = await liveFactory(
+        () => ({ kind: "length", inputTokens: 1_000, ...variant }),
+        seen,
+      );
+      const handle = await startPersistent({
+        name: "testbot",
+        agentsRoot: root,
+        log: () => {},
+        sessionFactory: live.factory,
+      });
+      let inbound: ((msg: DiscordMessage) => void) | undefined;
+      let admissionResult: Promise<unknown[]> | undefined;
+      const logs: string[] = [];
+      const replies: string[] = [];
+      const wired = wireDiscordCapability({
+        pi: { registerTool: () => {}, on: () => {} },
+        admitTurn: (origin, text) => {
+          admissionResult = handle.admitTurn(origin, text);
+          return admissionResult;
+        },
+        client: {
+          on: (_event, handler) => {
+            inbound = handler;
+          },
+          reply: async (_channel, text) => {
+            replies.push(text);
+          },
+          react: async () => {},
+          fetchRecent: async () => [],
+          fetchMessage: async () => null,
+          sendTyping: async () => {},
+          connect: async () => {},
+          disconnect: async () => {},
+        },
+        config: { tokenFile: "unused", channelIds: ["123456789"], dispatchAll: true },
+        log: (m) => logs.push(m),
+      });
+      try {
+        inbound?.({
+          id: "message-A",
+          channelId: "123456789",
+          authorId: "user-A",
+          authorName: "user",
+          content: "hi",
+          mentionsBot: true,
+        });
+        expect(admissionResult).toBeDefined();
+        await expect(admissionResult).rejects.toMatchObject({
+          name: "UnrecoveredEmptyResponseError",
+          reason: "unrecovered_empty_response",
+          provider,
+          model,
+        });
+        expect(
+          logs.some(
+            (m) =>
+              m.includes("inbound turn/reply failed") && m.includes("unrecovered empty response"),
+          ),
+        ).toBe(true);
+        expect(replies).toEqual([]);
+        expect(seen.filter((r) => !r.summarization)).toHaveLength(1);
+        expect(live.compactionStarts).toEqual([]);
+        expect(live.compactions).toEqual([]);
+      } finally {
+        await wired.stop();
+        await handle.shutdown();
+      }
+    }, 20_000);
+  }
+
+  for (const variant of [
+    { label: "input filling the window", inputTokens: 99_500 },
+    { label: "input well under the window", inputTokens: 1_000 },
+  ]) {
+    it(`${variant.label}: compacts with reason overflow, retries and completes`, async () => {
+      const seen: SeenRequest[] = [];
+      const work = join(root, "testbot", "work");
+      for (const n of [1, 2, 3]) {
+        writeFileSync(join(work, `file${n}.txt`), `FILE${n}-MARKER ${"x".repeat(40_000)}`);
+      }
+      let lengthReplies = 0;
+      const live = await liveFactory((agentCall) => {
+        if (agentCall <= 3) {
+          return {
+            kind: "toolRead",
+            path: `file${agentCall}.txt`,
+            inputTokens: agentCall * 10_000,
+          };
+        }
+        // Until pi compacts, a request that follows the tool turns gets the same
+        // zero-output length stop: the request bob used to re-issue.
+        if (!seen.some((r) => r.summarization)) {
+          lengthReplies += 1;
+          return { kind: "length", inputTokens: variant.inputTokens };
+        }
+        return { kind: "text", text: "DONE: recovered from the length stop.", inputTokens: 1_000 };
+      }, seen);
+      const res = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "do the thing",
+        captureStdout: true,
+        sessionFactory: live.factory,
+      });
+      const agentRequests = seen.filter((r) => !r.summarization);
+      // pi dropped the length stop, compacted once and retried: the request was
+      // not re-issued four times by the empty-response bound.
+      expect(lengthReplies).toBe(1);
+      expect(agentRequests).toHaveLength(5);
+      expect(live.compactionStarts).toEqual(["overflow"]);
+      expect(seen.filter((r) => r.summarization)).toHaveLength(1);
+      expect(res.exitCode).toBe(0);
+      expect(res.reason).toBeUndefined();
+      expect(res.stdout).toBe("DONE: recovered from the length stop.");
+    }, 20_000);
+  }
+});
+
+const invisibleContents: Array<{
+  label: string;
+  content?: AssistantMessage["content"] | null;
+}> = [
+  { label: "no blocks", content: [] },
+  { label: "content absent" },
+  { label: "non-array content", content: null },
+  { label: "empty text", content: [{ type: "text", text: "" }] },
+  { label: "whitespace text", content: [{ type: "text", text: " \n\t" }] },
+  { label: "empty thinking", content: [{ type: "thinking", thinking: "" }] },
+  { label: "whitespace thinking", content: [{ type: "thinking", thinking: " \n\t" }] },
+  {
+    label: "empty text and thinking",
+    content: [
+      { type: "text", text: "" },
+      { type: "thinking", thinking: "" },
+    ],
+  },
+];
+
+describe("terminal settlement matrix (#395)", () => {
+  for (const shape of [
+    ...invisibleContents,
+    {
+      label: "reasoning exhaustion",
+      content: [{ type: "thinking" as const, thinking: "working" }],
+    },
+  ]) {
+    for (const stopReason of ["stop", "length"] as const) {
+      for (const outputTokens of [0, 5]) {
+        const reasoning = shape.label === "reasoning exhaustion";
+        const exhaustion =
+          !reasoning &&
+          stopReason === "stop" &&
+          outputTokens === 0 &&
+          (!Array.isArray(shape.content) || shape.content.length === 0);
+        const reason = reasoning
+          ? "reasoning_only"
+          : exhaustion
+            ? "empty_response"
+            : "unrecovered_empty_response";
+        const calls = reasoning
+          ? DEFAULT_MAX_REASONING_REPROMPTS + 1
+          : exhaustion
+            ? DEFAULT_MAX_EMPTY_RESPONSE_RETRIES + 1
+            : 1;
+        for (const entry of ["run", "admission"] as const) {
+          it(`${entry}: ${shape.label}, ${stopReason}, output=${outputTokens} -> ${reason}`, async () => {
+            const seen: SeenRequest[] = [];
+            const live = await liveFactory(
+              () => ({ kind: "terminal", inputTokens: 1_000, ...shape, stopReason, outputTokens }),
+              seen,
+            );
+            if (entry === "run") {
+              const result = await runAgent({
+                name: "testbot",
+                agentsRoot: root,
+                prompt: "hi",
+                sessionFactory: live.factory,
+              });
+              expect(result).toMatchObject({ exitCode: 1, failed: true, reason });
+              const identity = { provider: STUB_PROVIDER, model: STUB_MODEL };
+              expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual(
+                reasoning
+                  ? { reason, reprompts: DEFAULT_MAX_REASONING_REPROMPTS }
+                  : exhaustion
+                    ? { reason, ...identity, retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES }
+                    : { reason, ...identity },
+              );
+            } else {
+              const handle = await startPersistent({
+                name: "testbot",
+                agentsRoot: root,
+                log: () => {},
+                sessionFactory: live.factory,
+              });
+              try {
+                await expect(
+                  handle.admitTurn({ kind: "cron", job: "matrix" }, "hi"),
+                ).rejects.toMatchObject(
+                  reasoning
+                    ? {
+                        name: "ReasoningOnlyExhaustedError",
+                        reprompts: DEFAULT_MAX_REASONING_REPROMPTS,
+                      }
+                    : exhaustion
+                      ? {
+                          name: "EmptyResponseExhaustedError",
+                          exhaustion: {
+                            provider: STUB_PROVIDER,
+                            model: STUB_MODEL,
+                            retries: DEFAULT_MAX_EMPTY_RESPONSE_RETRIES,
+                          },
+                        }
+                      : {
+                          name: "UnrecoveredEmptyResponseError",
+                          reason,
+                          provider: STUB_PROVIDER,
+                          model: STUB_MODEL,
+                        },
+                );
+              } finally {
+                await handle.shutdown();
+              }
+            }
+            const requests = seen.filter((r) => !r.summarization);
+            expect(requests).toHaveLength(calls);
+            expect(requests.map((r) => r.lastUserText)).toEqual([
+              "hi",
+              ...Array(calls - 1).fill(reasoning ? REASONING_CONTINUE_TURN : "hi"),
+            ]);
+            expect(live.compactionStarts).toEqual([]);
+          }, 20_000);
+        }
+      }
+    }
+  }
 });

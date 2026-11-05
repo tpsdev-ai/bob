@@ -17,6 +17,7 @@ import {
   ToolLoopError,
 } from "./tool-loop.js";
 import { approvedOrigin, type TurnOrigin } from "./turn-origin.js";
+import { rejectUnrecoveredEmptyResponse } from "./unrecovered-empty-response.js";
 
 // Identifies one admitted operation: one `admitTurn` call. Opaque, compared by
 // identity. The same token is returned for the whole operation, including every
@@ -245,6 +246,7 @@ export function createTurnAdmission(
             .find((message) => (message as { role?: unknown }).role === "assistant");
           const exhaustion = turn.exhaustion ?? emptyResponseExhaustionOf(lastAssistant);
           if (exhaustion !== undefined) throw new EmptyResponseExhaustedError(exhaustion);
+          rejectUnrecoveredEmptyResponse(lastAssistant);
           return turn.messages;
         } finally {
           // bob#143: the origin binding is released only when the PROMPT

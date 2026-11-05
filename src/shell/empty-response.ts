@@ -8,9 +8,9 @@
 // function: an inner wrapper may add its own per-call inputs (when the
 // output-cap wrapper applies a cap, model-budget.ts, it replaces the caller's
 // abort signal with its own), so the provider sees the same model and context,
-// not a promise of identical options objects. Before the bound, an empty attempt
+// not a promise of identical options objects. Before the bound, an empty zero-output attempt
 // that starts no block and ends without an error or abort is dropped before
-// pi sees it.
+// pi sees it, unless it is a length stop pi's own classifiers accept (bob#395).
 // The retry is BOUNDED by a constant, and past the bound the request ends with a
 // named error that names the provider, the model and the empty response.
 //
@@ -25,6 +25,8 @@ import {
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
   createAssistantMessageEventStream,
+  isContextOverflow,
+  isRecoverableLength,
 } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_REASONING_REPROMPTS } from "./compaction-contract.js";
 import {
@@ -59,16 +61,24 @@ export function resolveMaxEmptyResponseRetries(value?: number): number {
   return Math.min(raw, DEFAULT_MAX_EMPTY_RESPONSE_RETRIES);
 }
 
-/**
- * True when `message` is an empty response (bob#381): no content blocks at all
- * and zero output tokens, ending in neither an error nor an abort.
- */
-export function isEmptyResponse(message: AssistantMessage): boolean {
-  if (message.stopReason === "error" || message.stopReason === "aborted") return false;
-  const blocks = Array.isArray(message.content) ? message.content.length : 0;
-  if (blocks !== 0) return false;
-  const output = message.usage?.output;
-  return typeof output === "number" && output === 0;
+export function hasNoContentBlocks(message: Partial<AssistantMessage>): boolean {
+  return (
+    message.stopReason !== "error" &&
+    message.stopReason !== "aborted" &&
+    (!Array.isArray(message.content) || message.content.length === 0)
+  );
+}
+
+/** Length stops pi classifies pass through for its recovery attempt (bob#395). */
+function isPiRecoveryCandidate(
+  message: AssistantMessage,
+  model: Parameters<StreamFunction>[0],
+): boolean {
+  return (
+    message.stopReason === "length" &&
+    (isContextOverflow(message, model.contextWindow) ||
+      isRecoverableLength(message, model.maxTokens))
+  );
 }
 
 /** True for a block-start event, which flushes held events and begins forwarding. */
@@ -108,8 +118,9 @@ function failureMessage(model: Parameters<StreamFunction>[0], err: unknown): Ass
 /**
  * Re-issue a request only when its stream starts no content block and ends with
  * no content blocks, zero output tokens, and neither an error nor an abort,
- * while retries remain. Past the bound, pi receives an error naming the
- * provider, model and empty response (`emptyResponseErrorText`).
+ * while retries remain, except length stops pi classifies for recovery (bob#395).
+ * Past the bound, pi receives an error naming the provider, model and empty
+ * response (`emptyResponseErrorText`).
  *
  * On a block-start event, held events are flushed and forwarding begins.
  * Content present only in the terminal message is forwarded at the end.
@@ -163,7 +174,15 @@ export function withEmptyResponseRetry(
           out.end(message);
           return;
         }
-        if (!forwarded && isEmptyResponse(terminal)) {
+        if (!Array.isArray(terminal.content) && hasNoContentBlocks(terminal)) {
+          terminal.content = [];
+        }
+        if (
+          !forwarded &&
+          hasNoContentBlocks(terminal) &&
+          terminal.usage?.output === 0 &&
+          !isPiRecoveryCandidate(terminal, model)
+        ) {
           if (retries >= maxRetries) {
             const message: AssistantMessage & {
               [EMPTY_RESPONSE_EXHAUSTED]: EmptyResponseExhaustion;
