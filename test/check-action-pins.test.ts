@@ -257,8 +257,102 @@ for (const [form, line] of [
     const result = await checkActionPins({ root, resolver: resolver() });
     expect(result.errors.join("\n")).toContain(
       ".github/workflows/ci.yml: oven-sh/setup-bun@v2 is written in a form the pin check cannot locate; " +
-        "write it as `- uses: owner/repo@<40-hex> # vX.Y.Z`",
+        "write it as `- uses: owner/repo[/path]@<40-hex> # vX.Y.Z`",
     );
+  });
+}
+
+for (const [form, source, alias] of [
+  [
+    "an aliased workflow step",
+    workflow(["- &action", `  uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`, "- *action"]),
+    "*action",
+  ],
+  [
+    "an aliased uses value",
+    workflow([`- uses: &action oven-sh/setup-bun@${RIGHT} # v2.2.0`, "- uses: *action"]),
+    "*action",
+  ],
+  [
+    "an aliased workflow job",
+    `jobs:\n  check: &job\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\n  copy: *job\n`,
+    "*job",
+  ],
+  [
+    "a merge-key job inheriting uses",
+    `jobs:\n  check: &job\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\n  copy:\n    <<: *job\n`,
+    "*job",
+  ],
+  [
+    "a flow merge-key step inheriting uses",
+    workflow([`- &action { uses: oven-sh/setup-bun@${RIGHT} }`, "- { <<: *action }"]),
+    "*action",
+  ],
+  [
+    "an alias of the jobs mapping",
+    `definitions: &jobs\n  check:\n    uses: owner/repo/.github/workflows/build.yml@${RIGHT} # v2.2.0\njobs: *jobs\n`,
+    "*jobs",
+  ],
+]) {
+  test(`${form} is refused with the file, alias and full-step remedy`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), source);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(
+      ".github/workflows/ci.yml: YAML aliases are refused",
+    );
+    expect(result.errors.join("\n")).toContain(alias);
+    expect(result.errors.join("\n")).toContain("write the step out in full");
+  });
+}
+
+test("an aliased composite-action step is refused", async () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  writeAction(root, "tools/local", [
+    "- &action",
+    `  uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    "- *action",
+  ]);
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain("tools/local/action.yml: YAML aliases are refused");
+  expect(result.errors.join("\n")).toContain("*action");
+  expect(result.errors.join("\n")).toContain("write the step out in full");
+});
+
+test("alias-like text in run blocks, quotes and comments is ignored", async () => {
+  const root = fixtureLines([
+    "- run: |",
+    "    echo *action &action",
+    '- run: "echo *action"',
+    `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    "# *action &action",
+  ]);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+for (const [form, line, remedy] of [
+  [
+    "a job-level flow mapping",
+    "jobs: { check: { uses: owner/repo/.github/workflows/build.yml@main } }\n",
+    "`uses: owner/repo/.github/workflows/<file>.yml@<40-hex> # vX.Y.Z` at the job key",
+  ],
+  [
+    "a quoted local uses key",
+    workflow(['- "uses": "./tools/local"']),
+    "`- uses: ./path` (local actions are followed, not pinned)",
+  ],
+  [
+    "a quoted Docker uses key",
+    workflow(['- "uses": "docker://alpine:3.20"']),
+    "`- uses: docker://image@sha256:<64-hex>`",
+  ],
+]) {
+  test(`${form} is refused with its reference-kind remedy`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), line);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(".github/workflows/ci.yml:");
+    expect(result.errors.join("\n")).toContain(`write it as ${remedy}`);
   });
 }
 
