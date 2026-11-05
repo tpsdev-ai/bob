@@ -137,7 +137,11 @@ export function withEmptyResponseRetry(
     onDroppedAttempt?: (message: AssistantMessage) => void;
   } = {},
 ): StreamFunction {
-  const log = deps.log ?? (() => {});
+  const log = (message: () => string): void => {
+    try {
+      deps.log?.(message());
+    } catch {}
+  };
   const maxRetries = resolveMaxEmptyResponseRetries(deps.maxRetries);
   const wrapped = async (
     model: Parameters<StreamFunction>[0],
@@ -213,12 +217,14 @@ export function withEmptyResponseRetry(
             deps.onDroppedAttempt?.(terminal);
           } catch (err) {
             log(
-              `bob: onDroppedAttempt failed: ${err instanceof Error ? err.message : String(err)}`,
+              () =>
+                `bob: onDroppedAttempt failed: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
           retries += 1;
           log(
-            `bob: the provider ${model.provider} returned an empty response for ${model.id} (no content blocks, zero output tokens) — re-issuing the same request (${retries}/${maxRetries})`,
+            () =>
+              `bob: the provider ${model.provider} returned an empty response for ${model.id} (no content blocks, zero output tokens) — re-issuing the same request (${retries}/${maxRetries})`,
           );
           continue;
         }

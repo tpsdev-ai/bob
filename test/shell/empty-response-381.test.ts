@@ -289,6 +289,7 @@ async function liveFactory(
   reply: (agentCall: number, request: SeenRequest) => Reply,
   seen: SeenRequest[],
   maxRetries?: number,
+  log?: (message: string) => void,
 ): Promise<{
   factory: RunSessionFactory;
   sessions: RunSession[];
@@ -347,7 +348,13 @@ async function liveFactory(
         resident: false,
         allowResidentShell: false,
       },
-      deps: { log: (m) => logs.push(m), exit: () => {} },
+      deps: {
+        log: (m) => {
+          logs.push(m);
+          log?.(m);
+        },
+        exit: () => {},
+      },
       modelRuntime,
     });
     const runtime = await createAgentSessionRuntime(bobFactory, {
@@ -844,45 +851,59 @@ describe("an exhausted turn stays failed through automatic compaction (#381)", (
 });
 
 describe("a throwing dropped-attempt observer (#396)", () => {
-  for (const outcome of ["success", "provider error", "exhaustion"] as const) {
-    it(`re-issues and ends the run with ${outcome}`, async () => {
-      const seen: SeenRequest[] = [];
-      const live = await liveFactory((call) => {
-        if (call === 1 || outcome === "exhaustion") {
-          return { kind: "empty", inputTokens: 1_000 };
-        }
-        return outcome === "success"
-          ? { kind: "text", text: "DONE: recovered", inputTokens: 1_000 }
-          : { kind: "providerError", message: "provider failed", inputTokens: 1_000 };
-      }, seen);
-      let reports = 0;
-      const result = await runAgent({
-        name: "testbot",
-        agentsRoot: root,
-        prompt: "do the thing",
-        captureStdout: true,
-        sessionFactory: (config) =>
-          live.factory({
-            ...config,
-            onDroppedAttempt: () => {
-              reports += 1;
-              throw new Error("usage observer failed");
-            },
-          }),
-      });
-      const retries = outcome === "exhaustion" ? DEFAULT_MAX_EMPTY_RESPONSE_RETRIES : 1;
-      expect(reports).toBe(retries);
-      expect(seen.filter((r) => !r.summarization)).toHaveLength(retries + 1);
-      expect(live.logs.filter((line) => line.includes("onDroppedAttempt failed"))).toEqual(
-        Array<string>(retries).fill("bob: onDroppedAttempt failed: usage observer failed"),
-      );
-      expect(live.ended).toHaveLength(1);
-      expect(live.ended[0]?.stopReason).toBe(outcome === "success" ? "stop" : "error");
-      expect(result.exitCode).toBe(outcome === "success" ? 0 : 1);
-      if (outcome === "success") expect(result.stdout).toContain("DONE: recovered");
-      if (outcome === "provider error") expect(result.reason).toBe("no_final_message");
-      if (outcome === "exhaustion") expect(result.reason).toBe("empty_response");
-    }, 10_000);
+  for (const throwingLog of [false, true]) {
+    for (const outcome of ["success", "provider error", "exhaustion"] as const) {
+      it(`re-issues and ends the run with ${outcome}${throwingLog ? " and a throwing logger" : ""}`, async () => {
+        const seen: SeenRequest[] = [];
+        const live = await liveFactory(
+          (call) => {
+            if (call === 1 || outcome === "exhaustion") {
+              return { kind: "empty", inputTokens: 1_000 };
+            }
+            return outcome === "success"
+              ? { kind: "text", text: "DONE: recovered", inputTokens: 1_000 }
+              : { kind: "providerError", message: "provider failed", inputTokens: 1_000 };
+          },
+          seen,
+          undefined,
+          throwingLog
+            ? () => {
+                throw new Error("diagnostic logger failed");
+              }
+            : undefined,
+        );
+        let reports = 0;
+        const result = await runAgent({
+          name: "testbot",
+          agentsRoot: root,
+          prompt: "do the thing",
+          captureStdout: true,
+          sessionFactory: (config) =>
+            live.factory({
+              ...config,
+              onDroppedAttempt: () => {
+                reports += 1;
+                throw new Error("usage observer failed");
+              },
+            }),
+        });
+        const retries = outcome === "exhaustion" ? DEFAULT_MAX_EMPTY_RESPONSE_RETRIES : 1;
+        expect(reports).toBe(retries);
+        expect(seen.filter((r) => !r.summarization)).toHaveLength(retries + 1);
+        expect(live.logs.filter((line) => line.includes("onDroppedAttempt failed"))).toEqual(
+          Array<string>(retries).fill("bob: onDroppedAttempt failed: usage observer failed"),
+        );
+        expect(
+          live.logs.filter((line) => line.includes("re-issuing the same request")),
+        ).toHaveLength(retries);
+        expect(live.ended).toHaveLength(1);
+        expect(live.ended[0]?.stopReason).toBe(outcome === "success" ? "stop" : "error");
+        expect(result.exitCode).toBe(outcome === "success" ? 0 : 1);
+        if (outcome === "success") expect(result.stdout).toContain("DONE: recovered");
+        if (outcome === "provider error") expect(result.reason).toBe("no_final_message");
+        if (outcome === "exhaustion") expect(result.reason).toBe("empty_response");
+      }, 10_000);
+    }
   }
 });
 
