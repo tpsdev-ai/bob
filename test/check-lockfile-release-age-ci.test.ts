@@ -2,6 +2,9 @@
 // except release-publish.yml's verify-ancestry job. Before the first run, allow only
 // actions/checkout {fetch-depth, persist-credentials}, oven-sh/setup-bun {bun-version},
 // actions/setup-node {node-version}, socketdev/action {mode}.
+// Checker step keys: name, run. verify-ancestry job keys: name, runs-on, permissions, steps.
+// Jobs needing verify-ancestry directly or transitively allow only name, needs, runs-on,
+// environment, if, permissions, steps; their if contains no success(, failure(, always(, cancelled(.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -19,9 +22,17 @@ const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
   ["socketdev/action", ["mode"]],
 ]);
 
-type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
+type Step = {
+  [key: string]: unknown;
+  name?: string;
+  run?: string;
+  uses?: string;
+  with?: Record<string, unknown>;
+};
 type Permissions = Record<string, string> | string;
 type Job = {
+  [key: string]: unknown;
+  if?: unknown;
   needs?: string | string[];
   permissions?: Permissions;
   steps?: Step[];
@@ -29,6 +40,23 @@ type Job = {
 type Workflow = { permissions?: Permissions; jobs?: Record<string, Job> };
 
 const ANCESTRY_JOB = "verify-ancestry";
+const CHECKER_STEP_KEYS = ["name", "run"];
+const ANCESTRY_JOB_KEYS = ["name", "runs-on", "permissions", "steps"];
+const DEPENDENT_JOB_KEYS = [
+  "name",
+  "needs",
+  "runs-on",
+  "environment",
+  "if",
+  "permissions",
+  "steps",
+];
+
+function keyProblems(value: object, allowed: readonly string[], where: string): string[] {
+  return Object.keys(value)
+    .filter((key) => !allowed.includes(key))
+    .map((key) => `${where}: key "${key}" is not allowed`);
+}
 
 function needsOf(job: Job): string[] {
   if (job.needs === undefined) return [];
@@ -122,13 +150,27 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
     const steps = definition.steps ?? [];
     const where = `${source}: job "${job}"`;
     const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
-    if (isAncestry) problems.push(...ancestryProblems(steps, where));
+    if (isAncestry) {
+      problems.push(...keyProblems(definition, ANCESTRY_JOB_KEYS, where));
+      problems.push(...ancestryProblems(steps, where));
+    }
+    if (dependsOn(workflow.jobs ?? {}, job, ANCESTRY_JOB)) {
+      problems.push(...keyProblems(definition, DEPENDENT_JOB_KEYS, where));
+      if (/\b(success|failure|always|cancelled)\s*\(/i.test(String(definition.if ?? ""))) {
+        problems.push(`${where}: if contains a status-check function`);
+      }
+    }
     const firstRun = firstRunIndex(steps);
     if (firstRun === -1) continue;
-    if (!isAncestry && (steps[firstRun].run ?? "").trim() !== CHECKER) {
+    if (!isAncestry) {
       problems.push(
-        `${where} step ${firstRun + 1}: the first run step is not the ${CHECKER} checker`,
+        ...keyProblems(steps[firstRun], CHECKER_STEP_KEYS, `${where} step ${firstRun + 1}`),
       );
+      if ((steps[firstRun].run ?? "").trim() !== CHECKER) {
+        problems.push(
+          `${where} step ${firstRun + 1}: the first run step is not the ${CHECKER} checker`,
+        );
+      }
     }
     for (let index = 0; index < firstRun; index += 1) {
       problems.push(...actionProblems(steps[index], `${where} step ${index + 1}`));
@@ -148,6 +190,81 @@ test("the checker is the first run step of each job with a run step, except rele
   });
   expect(problems).toEqual([]);
 });
+
+test.each([
+  ["continue-on-error", true],
+  ["if", "$" + "{{ false }}"],
+  ["env", { CI: "" }],
+  ["shell", "bash"],
+  ["working-directory", "."],
+  ["timeout-minutes", 1],
+  ["id", "checker"],
+  ["unlisted-key", false],
+] satisfies [string, unknown][])("checker step key %s is red", (key, value) => {
+  const workflow = loadWorkflow("ci.yml");
+  const steps = workflow.jobs?.build.steps ?? [];
+  const index = firstRunIndex(steps);
+  expect(index).toBeGreaterThanOrEqual(0);
+  steps[index][key] = value;
+  expect(orderingProblems(workflow, ".github/workflows/ci.yml")).toEqual([
+    `.github/workflows/ci.yml: job "build" step ${index + 1}: key "${key}" is not allowed`,
+  ]);
+});
+
+test.each([
+  ["continue-on-error", true],
+  ["if", "$" + "{{ false }}"],
+  ["strategy", { matrix: { attempt: [1] } }],
+  ["needs", "other"],
+  ["environment", "release"],
+  ["unlisted-key", false],
+] satisfies [string, unknown][])("verify-ancestry job key %s is red", (key, value) => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const guard = workflow.jobs?.[ANCESTRY_JOB];
+  if (guard === undefined) throw new Error("Missing verify-ancestry");
+  guard[key] = value;
+  expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
+    `.github/workflows/release-publish.yml: job "verify-ancestry": key "${key}" is not allowed`,
+  ]);
+});
+
+test.each([
+  ["stage-publish", "always()"],
+  ["github-release", "$" + "{{ !cancelled() }}"],
+  ["stage-publish", "success()"],
+  ["stage-publish", "failure()"],
+  ["stage-publish", "$" + "{{ ALWAYS () }}"],
+])("%s if %s is red", (name, condition) => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const job = workflow.jobs?.[name];
+  if (job === undefined) throw new Error(`Missing ${name}`);
+  job.if = condition;
+  expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
+    `.github/workflows/release-publish.yml: job "${name}": if contains a status-check function`,
+  ]);
+});
+
+test.each(["stage-publish", "github-release"])(
+  "%s job keys and status-check functions are checked through transitive needs",
+  (name) => {
+    for (const transitive of [false, true]) {
+      for (const key of ["continue-on-error", "strategy", "unlisted-key", "if"]) {
+        const workflow = loadWorkflow("release-publish.yml");
+        const jobs = workflow.jobs ?? {};
+        if (transitive) {
+          jobs.bridge = { ...jobs[name], needs: ANCESTRY_JOB };
+          jobs[name].needs = "bridge";
+        }
+        jobs[name][key] = key === "if" ? "always()" : true;
+        expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
+          key === "if"
+            ? `.github/workflows/release-publish.yml: job "${name}": if contains a status-check function`
+            : `.github/workflows/release-publish.yml: job "${name}": key "${key}" is not allowed`,
+        ]);
+      }
+    }
+  },
+);
 
 test("a first run step different from the checker is red", () => {
   const workflow = parseYaml(
