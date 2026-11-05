@@ -24,7 +24,7 @@ by commit SHA in the last section. The 7-day release-age bake is
 | Install path | Where it runs | Control |
 | --- | --- | --- |
 | `npm install -g npm@11.21.1` | `release-publish.yml` `stage-publish` | The current pin is the exact version 11.21.1, published 2026-10-15. `test/release-publish-npm-pin.test.ts` requires this step to contain exactly one npm self-update command naming one exact version at least 11.15.0. A bump is a reviewed change; CI does not check the pin's age. |
-| `npm stage publish` | `release-publish.yml` `stage-publish` | Publishes the tarball built from the verified checkout; it installs no dependency. |
+| `npm stage publish` | `release-publish.yml` `stage-publish` | Publishes the tarball built from the verified checkout. |
 
 ## Actions
 

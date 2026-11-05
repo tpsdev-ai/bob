@@ -245,7 +245,7 @@ test.each([
   expect(isResolutionFailure(output)).toBe(expected);
 });
 
-test("an old version installs, and its install script runs after the check", async () => {
+test("an old version installs, and its install script runs", async () => {
   const root = mkdtempSync(join(tmpdir(), "bob-pack-age-old-"));
   try {
     const { result, installDir, marker, error } = await runInstall(root, {
