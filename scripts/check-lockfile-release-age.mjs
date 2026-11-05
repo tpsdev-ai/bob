@@ -180,8 +180,13 @@ function requireTestRegistry(registry, env) {
 }
 
 const LOCAL_SOURCE_PREFIXES = ["workspace:", "file:", "link:"];
-const EXACT_VERSION =
-  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+// The SemVer 2.0.0 grammar: a numeric pre-release identifier has no leading zero.
+const PRERELEASE_IDENTIFIER = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
+const EXACT_VERSION = new RegExp(
+  "^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)" +
+    `(?:-${PRERELEASE_IDENTIFIER}(?:\\.${PRERELEASE_IDENTIFIER})*)?` +
+    "(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+);
 
 /** The release-age policy the checker enforces, in seconds. */
 const PINNED_RELEASE_AGE_SECONDS = 7 * 24 * 60 * 60;

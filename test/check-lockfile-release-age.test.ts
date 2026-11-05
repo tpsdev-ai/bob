@@ -205,6 +205,8 @@ test.each([
   ["tarball-pkg", "http://host/tarball-pkg-1.2.3.tgz"],
   ["odd-pkg", "1.2"],
   ["odd-pkg", "^1.2.3"],
+  ["odd-pkg", "1.0.0-01"],
+  ["odd-pkg", "1.0.0-alpha.01"],
 ])("refuses %s resolved from %s before any lookup", async (name, version) => {
   const root = fixture(
     lockText({
@@ -231,6 +233,27 @@ test.each([
   expect(cli.stderr).toContain(`bun.lock packages[${JSON.stringify(name)}]`);
   expect(cli.stderr).toContain(version);
 });
+
+test.each(["1.0.0-0", "1.0.0-0a", "1.0.0-alpha.1", "1.0.0-x-y.10+build.05"])(
+  "checks the exact SemVer version %s against the registry",
+  async (version) => {
+    const root = fixture(
+      lockText({ "pre-pkg": [`pre-pkg@${version}`, "", {}, "sha512-pre"] }),
+      undefined,
+    );
+    const calls = [];
+    const result = await checkLockfileReleaseAge({
+      root,
+      fetchImpl: stubFetch(
+        { "pre-pkg": { [version]: new Date(NOW - 30 * 86_400_000).toISOString() } },
+        calls,
+      ),
+      now: NOW,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual(["https://registry.npmjs.org/pre-pkg"]);
+  },
+);
 
 test.each([
   ["workspace-pkg", "workspace:vendor/x"],
