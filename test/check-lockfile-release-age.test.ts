@@ -44,7 +44,10 @@ afterEach(() => {
 
 function lockText(packages) {
   const body = Object.entries(packages)
-    .map(([key, value]) => `    ${JSON.stringify(key)}: ${JSON.stringify(value)},`)
+    .map(([key, value]) => {
+      const entry = Array.isArray(value) && value.length === 1 ? [...value, ""] : value;
+      return `    ${JSON.stringify(key)}: ${JSON.stringify(entry)},`;
+    })
     .join("\n");
   return `{\n  "lockfileVersion": 1,\n  "packages": {\n${body}\n  },\n}\n`;
 }
@@ -396,7 +399,7 @@ test.each([
   const lock = parseBunLock(readFileSync(join(root, "bun.lock"), "utf8"));
   const version = inside ? "file:vendor/x" : "file:../outside";
   expect(lock.packages["local-pkg"][0]).toBe(`local-pkg@${version}`);
-  lock.packages["old-pkg"] = ["old-pkg@2.0.0"];
+  lock.packages["old-pkg"] = ["old-pkg@2.0.0", ""];
   writeFileSync(join(root, "bun.lock"), JSON.stringify(lock));
   writeFileSync(join(root, "bunfig.toml"), bunfigText(undefined));
   const calls = [];
@@ -796,23 +799,105 @@ test("default registries in config files and environment proceed", () => {
   expect(cli.stdout).toContain("All 1 checked");
 });
 
-test.each([OTHER_REGISTRY, `${OTHER_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz`])(
-  "lock registry resolution exits 2: %s",
-  async (resolution) => {
-    const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0", resolution] }), ["old-pkg"]);
-    const cli = runCli(root);
-    expect(cli.status).toBe(2);
-    expect(cli.stderr).toContain('UnsupportedRegistry: bun.lock packages["old-pkg"] resolution');
-  },
-);
+test.each([
+  ["old-pkg", ""],
+  ["old-pkg", `${NPM_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz`],
+  ["@scope/old-pkg", ""],
+  ["@scope/old-pkg", `${NPM_REGISTRY}@scope/old-pkg/-/old-pkg-2.0.0.tgz`],
+])("recorded resolution accepted for %s: %s", async (name, resolution) => {
+  const root = fixture(lockText({ alias: [`${name}@2.0.0`, resolution] }), undefined);
+  const calls = [];
+  const result = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({ [name]: { "2.0.0": "2000-01-01T00:00:00.000Z" } }, calls),
+    now: NOW,
+  });
+  expect(result.ok).toBe(true);
+  expect(calls).toHaveLength(1);
+  expect(runCli(root).status).toBe(0);
+});
 
-test.each(["", NPM_REGISTRY, `${NPM_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz`])(
-  "default lock registry resolution proceeds: %s",
-  (resolution) => {
-    const root = fixture(lockText({ "old-pkg": ["old-pkg@2.0.0", resolution] }), undefined);
-    expect(runCli(root).status).toBe(0);
-  },
-);
+test.each([
+  ["old-pkg", `${NPM_REGISTRY}other-pkg/-/other-pkg-2.0.0.tgz`],
+  ["old-pkg", `${NPM_REGISTRY}old-pkg/-/old-pkg-3.0.0.tgz`],
+  ["@scope/old-pkg", `${NPM_REGISTRY}@other/old-pkg/-/old-pkg-2.0.0.tgz`],
+  ["old-pkg", `${NPM_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz?download=1`],
+  ["old-pkg", `${NPM_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz#fragment`],
+  ["old-pkg", `${NPM_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz/`],
+  ["old-pkg", "https://REGISTRY.NPMJS.ORG/old-pkg/-/old-pkg-2.0.0.tgz"],
+  ["old-pkg", "http://registry.npmjs.org/old-pkg/-/old-pkg-2.0.0.tgz"],
+  ["old-pkg", NPM_REGISTRY],
+  ["old-pkg", OTHER_REGISTRY],
+  ["old-pkg", `${OTHER_REGISTRY}old-pkg/-/old-pkg-2.0.0.tgz`],
+  ["old-pkg", null],
+  ["old-pkg", 42],
+  ["old-pkg", undefined],
+])("recorded resolution for %s exits 2 before lookup: %s", async (name, resolution) => {
+  const canonical = `${NPM_REGISTRY}${name}/-/old-pkg-2.0.0.tgz`;
+  const root = fixture(
+    JSON.stringify({
+      packages: {
+        first: ["first@2.0.0", ""],
+        alias: [`${name}@2.0.0`, resolution],
+      },
+    }),
+    undefined,
+  );
+  const calls = [];
+  const error = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({}, calls),
+    now: NOW,
+  }).catch((thrown) => thrown);
+  expect(error.name).toBe("RecordedResolutionMismatch");
+  expect(error.message).toContain('bun.lock packages["alias"]');
+  expect(error.message).toContain(JSON.stringify(resolution ?? null));
+  expect(error.message).toContain(canonical);
+  expect(calls).toEqual([]);
+  const fetchLog = join(root, "fetch.log");
+  writeFileSync(fetchLog, "");
+  const cli = runCli(root, undefined, { BOB_TEST_FETCH_LOG: fetchLog });
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("RecordedResolutionMismatch");
+  expect(cli.stderr).toContain('bun.lock packages["alias"]');
+  expect(cli.stderr).toContain(JSON.stringify(resolution ?? null));
+  expect(cli.stderr).toContain(canonical);
+  expect(readFileSync(fetchLog, "utf8")).toBe("");
+});
+
+test("a missing recorded resolution exits 2 before lookup", async () => {
+  const root = fixture('{"packages":{"alias":["old-pkg@2.0.0"]}}', undefined);
+  const calls = [];
+  const error = await checkLockfileReleaseAge({
+    root,
+    fetchImpl: stubFetch({}, calls),
+    now: NOW,
+  }).catch((thrown) => thrown);
+  expect(error.name).toBe("RecordedResolutionMismatch");
+  expect(error.message).toContain('bun.lock packages["alias"]');
+  expect(error.message).toContain("undefined");
+  expect(error.message).toContain("https://registry.npmjs.org/old-pkg/-/old-pkg-2.0.0.tgz");
+  expect(calls).toEqual([]);
+  const cli = runCli(root);
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain("RecordedResolutionMismatch");
+});
+
+test("an excluded duplicate with a mismatched recorded resolution exits 2 before lookup", () => {
+  const root = fixture(
+    lockText({
+      first: ["old-pkg@2.0.0", ""],
+      duplicate: ["old-pkg@2.0.0", `${NPM_REGISTRY}other-pkg/-/other-pkg-2.0.0.tgz`],
+    }),
+    ["old-pkg"],
+  );
+  const fetchLog = join(root, "fetch.log");
+  writeFileSync(fetchLog, "");
+  const cli = runCli(root, undefined, { BOB_TEST_FETCH_LOG: fetchLog });
+  expect(cli.status).toBe(2);
+  expect(cli.stderr).toContain('RecordedResolutionMismatch: bun.lock packages["duplicate"]');
+  expect(readFileSync(fetchLog, "utf8")).toBe("");
+});
 
 test.each([
   ["http://127.0.0.1:4873", ""],

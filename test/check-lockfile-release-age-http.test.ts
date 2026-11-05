@@ -74,7 +74,7 @@ async function checkCli(
     timers.add(timer);
   });
   try {
-    writeFileSync(join(root, "bun.lock"), '{"packages":{"old-pkg":["old-pkg@1.0.0"]}}');
+    writeFileSync(join(root, "bun.lock"), '{"packages":{"old-pkg":["old-pkg@1.0.0",""]}}');
     writeFileSync(join(root, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
     mkdirSync(join(root, "scripts"));
     const script = join(root, "scripts", "check-lockfile-release-age.mjs");
@@ -498,118 +498,131 @@ test("Bun ignores ~/.bunfig.toml when XDG_CONFIG_HOME is set", async () => {
   }
 }, 20_000);
 
-test("checker exits 2 on a Bun-written lock whose recorded resolution is a non-default registry", async () => {
-  const root = mkdtempSync(join(tmpdir(), "bob-bun-lock-"));
-  let registry: RecordingServer | undefined;
-  let lookup: RecordingServer | undefined;
-  try {
-    const packageRoot = join(root, "tarball", "package");
-    mkdirSync(packageRoot, { recursive: true });
-    writeFileSync(
-      join(packageRoot, "package.json"),
-      JSON.stringify({ name: "tiny-pkg", version: "1.0.0", main: "index.js" }),
-    );
-    writeFileSync(join(packageRoot, "index.js"), "module.exports = 1;\n");
-    const tarball = join(root, "tiny-pkg-1.0.0.tgz");
-    const tar = spawnSync("tar", ["czf", tarball, "-C", join(root, "tarball"), "package"], {
-      encoding: "utf8",
-    });
-    expect(tar.status).toBe(0);
-    const bytes = readFileSync(tarball);
-    const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
-    const shasum = createHash("sha1").update(bytes).digest("hex");
+test.each([
+  ["non-default registry", undefined],
+  ["another package", "https://registry.npmjs.org/other-pkg/-/other-pkg-1.0.0.tgz"],
+])(
+  "checker exits 2 before lookup on a Bun-written lock with %s recorded resolution",
+  async (_label, rewritten) => {
+    const root = mkdtempSync(join(tmpdir(), "bob-bun-lock-"));
+    let registry: RecordingServer | undefined;
+    let lookup: RecordingServer | undefined;
+    try {
+      const packageRoot = join(root, "tarball", "package");
+      mkdirSync(packageRoot, { recursive: true });
+      writeFileSync(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ name: "tiny-pkg", version: "1.0.0", main: "index.js" }),
+      );
+      writeFileSync(join(packageRoot, "index.js"), "module.exports = 1;\n");
+      const tarball = join(root, "tiny-pkg-1.0.0.tgz");
+      const tar = spawnSync("tar", ["czf", tarball, "-C", join(root, "tarball"), "package"], {
+        encoding: "utf8",
+      });
+      expect(tar.status).toBe(0);
+      const bytes = readFileSync(tarball);
+      const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+      const shasum = createHash("sha1").update(bytes).digest("hex");
 
-    let registryUrl = "";
-    registry = await startRecordingServer((request, response) => {
-      if (request.url === "/tiny-pkg") {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(
-          JSON.stringify({
-            name: "tiny-pkg",
-            "dist-tags": { latest: "1.0.0" },
-            versions: {
-              "1.0.0": {
-                name: "tiny-pkg",
-                version: "1.0.0",
-                dist: {
-                  tarball: `${registryUrl}/tiny-pkg/-/tiny-pkg-1.0.0.tgz`,
-                  integrity,
-                  shasum,
+      let registryUrl = "";
+      registry = await startRecordingServer((request, response) => {
+        if (request.url === "/tiny-pkg") {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify({
+              name: "tiny-pkg",
+              "dist-tags": { latest: "1.0.0" },
+              versions: {
+                "1.0.0": {
+                  name: "tiny-pkg",
+                  version: "1.0.0",
+                  dist: {
+                    tarball: `${registryUrl}/tiny-pkg/-/tiny-pkg-1.0.0.tgz`,
+                    integrity,
+                    shasum,
+                  },
                 },
               },
-            },
-          }),
-        );
-        return true;
+            }),
+          );
+          return true;
+        }
+        if (request.url === "/tiny-pkg/-/tiny-pkg-1.0.0.tgz") {
+          response.writeHead(200, { "content-type": "application/octet-stream" });
+          response.end(bytes);
+          return true;
+        }
+        return false;
+      });
+      registryUrl = registry.url;
+
+      const project = join(root, "project");
+      mkdirSync(project);
+      writeFileSync(
+        join(project, "package.json"),
+        JSON.stringify({ name: "fixture", dependencies: { "tiny-pkg": "1.0.0" } }),
+      );
+      writeFileSync(join(project, ".npmrc"), `registry=${registryUrl}\n`);
+      const env = isolatedEnv(root);
+      const install = await runBun(
+        ["install", "--ignore-scripts", "--no-cache", "--cache-dir", join(root, "cache")],
+        project,
+        env,
+      );
+      expect(install.code).toBe(0);
+
+      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      expect(lock.packages["tiny-pkg"][0]).toBe("tiny-pkg@1.0.0");
+      const resolution = lock.packages["tiny-pkg"][1];
+      expect(resolution).toBe(`${registryUrl}/tiny-pkg/-/tiny-pkg-1.0.0.tgz`);
+
+      rmSync(join(project, ".npmrc"));
+      rmSync(join(project, "node_modules"), { recursive: true, force: true });
+      registry.requests.length = 0;
+      const frozen = await runBun(
+        [
+          "install",
+          "--frozen-lockfile",
+          "--ignore-scripts",
+          "--no-cache",
+          "--cache-dir",
+          join(root, "cache2"),
+        ],
+        project,
+        env,
+      );
+      expect(frozen.code).toBe(0);
+      expect(registry.requests).toEqual(["/tiny-pkg/-/tiny-pkg-1.0.0.tgz"]);
+
+      if (rewritten !== undefined) {
+        lock.packages["tiny-pkg"][1] = rewritten;
+        writeFileSync(join(project, "bun.lock"), JSON.stringify(lock));
       }
-      if (request.url === "/tiny-pkg/-/tiny-pkg-1.0.0.tgz") {
-        response.writeHead(200, { "content-type": "application/octet-stream" });
-        response.end(bytes);
+      writeFileSync(join(project, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
+      lookup = await startRecordingServer((request, response) => {
+        if (request.url !== "/tiny-pkg") return false;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ time: { "1.0.0": "2000-01-01T00:00:00.000Z" } }));
         return true;
-      }
-      return false;
-    });
-    registryUrl = registry.url;
-
-    const project = join(root, "project");
-    mkdirSync(project);
-    writeFileSync(
-      join(project, "package.json"),
-      JSON.stringify({ name: "fixture", dependencies: { "tiny-pkg": "1.0.0" } }),
-    );
-    writeFileSync(join(project, ".npmrc"), `registry=${registryUrl}\n`);
-    const env = isolatedEnv(root);
-    const install = await runBun(
-      ["install", "--ignore-scripts", "--no-cache", "--cache-dir", join(root, "cache")],
-      project,
-      env,
-    );
-    expect(install.code).toBe(0);
-
-    const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
-    const resolution = lock.packages["tiny-pkg"][1];
-    expect(resolution).toBe(`${registryUrl}/tiny-pkg/-/tiny-pkg-1.0.0.tgz`);
-
-    rmSync(join(project, ".npmrc"));
-    rmSync(join(project, "node_modules"), { recursive: true, force: true });
-    registry.requests.length = 0;
-    const frozen = await runBun(
-      [
-        "install",
-        "--frozen-lockfile",
-        "--ignore-scripts",
-        "--no-cache",
-        "--cache-dir",
-        join(root, "cache2"),
-      ],
-      project,
-      env,
-    );
-    expect(frozen.code).toBe(0);
-    expect(registry.requests).toEqual(["/tiny-pkg/-/tiny-pkg-1.0.0.tgz"]);
-
-    writeFileSync(join(project, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
-    lookup = await startRecordingServer((request, response) => {
-      if (request.url !== "/tiny-pkg") return false;
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ time: { "1.0.0": "2000-01-01T00:00:00.000Z" } }));
-      return true;
-    });
-    const cli = await runBun(
-      ["--no-install", copyChecker(project), "--registry", lookup.url, "--timeout-ms", "1000"],
-      project,
-      { ...env, BOB_RELEASE_AGE_TEST_REGISTRY: "1" },
-    );
-    expect(cli.code).toBe(2);
-    expect(cli.stderr).toContain("UnsupportedRegistry");
-    expect(cli.stderr).toContain('bun.lock packages["tiny-pkg"] resolution');
-    expect(lookup.requests).toEqual([]);
-  } finally {
-    await registry?.close();
-    await lookup?.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-}, 30_000);
+      });
+      const cli = await runBun(
+        ["--no-install", copyChecker(project), "--registry", lookup.url, "--timeout-ms", "1000"],
+        project,
+        { ...env, BOB_RELEASE_AGE_TEST_REGISTRY: "1" },
+      );
+      expect(cli.code).toBe(2);
+      expect(cli.stderr).toContain('RecordedResolutionMismatch: bun.lock packages["tiny-pkg"]');
+      expect(cli.stderr).toContain(rewritten ?? resolution);
+      expect(cli.stderr).toContain("https://registry.npmjs.org/tiny-pkg/-/tiny-pkg-1.0.0.tgz");
+      expect(lookup.requests).toEqual([]);
+    } finally {
+      await registry?.close();
+      await lookup?.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
 
 async function expectNonRegistryRefusal(project: string, key: string, version: string) {
   writeFileSync(join(project, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");

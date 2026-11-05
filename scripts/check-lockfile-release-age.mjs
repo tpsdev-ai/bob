@@ -8,6 +8,8 @@
  * string is parsed as package@version.
  *
  * An entry is checked only when its version is an exact semver version.
+ * Its recorded resolution must be empty or exactly the canonical npm tarball
+ * URL for that checked name and version.
  * `workspace:`, `file:` and `link:` targets are skipped only when realpath
  * resolves them inside the checkout. Any other version
  * form — `git:`, `git+…`, `github:`, `http:`, `https:` or an unrecognised
@@ -36,7 +38,7 @@ function namedError(name, message) {
   return Object.assign(new Error(message), { name });
 }
 
-function requireNpmRegistry(value, source, tarball = false) {
+function requireNpmRegistry(value, source) {
   let url;
   try {
     url = new URL(value);
@@ -45,7 +47,9 @@ function requireNpmRegistry(value, source, tarball = false) {
     url?.protocol !== "https:" ||
     url.hostname !== "registry.npmjs.org" ||
     url.port ||
-    (!tarball && (url.pathname !== "/" || url.search || url.hash))
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
   ) {
     throw namedError("UnsupportedRegistry", `${source} must use the default npm registry`);
   }
@@ -340,7 +344,6 @@ function isPlainObject(value) {
  * Returns { entries, skipped }: unique registry pairs and non-registry entries.
  * A missing/non-object or empty map, non-array entry, or missing/empty/non-string
  * resolution throws, as does a resolution without a name or version.
- * A one-element entry containing a name@version string is accepted.
  * Local-source targets are skipped only when realpath resolves inside root;
  * other non-semver versions are refused by name.
  */
@@ -405,8 +408,13 @@ export function collectLockEntries(lock, root) {
         `bun.lock packages[${JSON.stringify(key)}] resolves to version ${JSON.stringify(version)}; only exact semver versions are checked and only in-checkout workspace:, file: and link: sources are skipped`,
       );
     }
-    if (entry[1] !== undefined && entry[1] !== "") {
-      requireNpmRegistry(entry[1], `bun.lock packages[${JSON.stringify(key)}] resolution`, true);
+    const basename = name.slice(name.lastIndexOf("/") + 1);
+    const canonical = `${DEFAULT_REGISTRY}/${name}/-/${basename}-${version}.tgz`;
+    if (entry[1] !== "" && entry[1] !== canonical) {
+      throw namedError(
+        "RecordedResolutionMismatch",
+        `bun.lock packages[${JSON.stringify(key)}] recorded resolution ${JSON.stringify(entry[1])}; expected empty or ${JSON.stringify(canonical)}`,
+      );
     }
     const id = `${name}\u0000${version}`;
     if (seen.has(id)) continue;
