@@ -21,10 +21,11 @@ export function rejectUnrecoveredEmptyResponse(message: unknown): void {
   if (
     terminal.role === "assistant" &&
     terminal.stopReason === "length" &&
-    hasNoContentBlocks(terminal) &&
-    typeof terminal.provider === "string" &&
-    typeof terminal.model === "string"
+    hasNoContentBlocks(terminal)
   ) {
-    throw new UnrecoveredEmptyResponseError(terminal.provider, terminal.model);
+    throw new UnrecoveredEmptyResponseError(
+      typeof terminal.provider === "string" ? terminal.provider : "unknown",
+      typeof terminal.model === "string" ? terminal.model : "unknown",
+    );
   }
 }

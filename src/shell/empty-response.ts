@@ -65,8 +65,7 @@ export function hasNoContentBlocks(message: Partial<AssistantMessage>): boolean 
   return (
     message.stopReason !== "error" &&
     message.stopReason !== "aborted" &&
-    Array.isArray(message.content) &&
-    message.content.length === 0
+    (!Array.isArray(message.content) || message.content.length === 0)
   );
 }
 
@@ -176,6 +175,9 @@ export function withEmptyResponseRetry(
           out.push({ type: "error", reason: "error", error: message });
           out.end(message);
           return;
+        }
+        if (!Array.isArray(terminal.content) && hasNoContentBlocks(terminal)) {
+          terminal.content = [];
         }
         if (
           !forwarded &&

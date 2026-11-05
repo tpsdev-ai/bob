@@ -1,1 +1,1 @@
-- **Preserve pi recovery for classified empty length stops (#395).** For one-shot runs and admitted turns, an unrecovered empty length stop fails as `unrecovered_empty_response`; `bob run` exits non-zero. (`test/shell/empty-response-381.test.ts`)
+- **Preserve pi recovery for classified empty length stops (#395).** For one-shot runs and admitted turns, an unrecovered empty length stop fails as `unrecovered_empty_response`; `bob run` exits non-zero. A terminal missing provider/model/content is rejected the same way. (`test/shell/empty-response-381.test.ts`)

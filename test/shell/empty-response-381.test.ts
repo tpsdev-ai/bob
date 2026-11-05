@@ -15,8 +15,7 @@
 //     recorded as `empty_response`.
 // (e) classified zero-output length stops pass through (#395).
 //
-// The admission tests drive `startPersistent` (and the real cron scheduler)
-// over the same factory; unrecovered empty length stops fail runs and admissions.
+// The admission tests drive `startPersistent` (and the real cron scheduler).
 // The bound tests unit-test the retry ceiling.
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
@@ -69,7 +68,12 @@ const OVER_THRESHOLD = 60_001;
 
 type Reply = { inputTokens: number } & (
   | { kind: "empty" }
-  | { kind: "length"; outputTokens?: number }
+  | {
+      kind: "length";
+      outputTokens?: number;
+      omitField?: "provider" | "model" | "content";
+      nonArrayContent?: boolean;
+    }
   | { kind: "text"; text: string }
   | { kind: "thinking"; thinking: string }
   | { kind: "toolRead"; path: string }
@@ -183,6 +187,12 @@ function scriptedProvider(
           stopReason,
           timestamp: Date.now(),
         };
+        if (step.kind === "length" && step.omitField) {
+          delete (message as Partial<AssistantMessage>)[step.omitField];
+        }
+        if (step.kind === "length" && step.nonArrayContent) {
+          (message as { content: unknown }).content = "invalid";
+        }
         await options?.onPayload?.(
           {
             model: model.id,
@@ -820,11 +830,20 @@ describe("classified length stops and turn settlement (#395)", () => {
     expect(res.reason).toBe("empty_response");
   }, 20_000);
 
-  for (const outputTokens of [0, 5]) {
-    it(`fails a first short run with unrecovered_empty_response (output=${outputTokens})`, async () => {
+  for (const variant of [
+    { label: "output=0", outputTokens: 0 },
+    { label: "output=5", outputTokens: 5 },
+    { label: "provider deleted", outputTokens: 0, omitField: "provider" as const },
+    { label: "model deleted", outputTokens: 0, omitField: "model" as const },
+    { label: "content absent", outputTokens: 0, omitField: "content" as const },
+    { label: "non-array content", outputTokens: 0, nonArrayContent: true },
+  ]) {
+    const provider = variant.omitField === "provider" ? "unknown" : STUB_PROVIDER;
+    const model = variant.omitField === "model" ? "unknown" : STUB_MODEL;
+    it(`fails a first short run with unrecovered_empty_response (${variant.label})`, async () => {
       const seen: SeenRequest[] = [];
       const live = await liveFactory(
-        () => ({ kind: "length", inputTokens: 1_000, outputTokens }),
+        () => ({ kind: "length", inputTokens: 1_000, ...variant }),
         seen,
       );
       const res = await runAgent({
@@ -843,8 +862,8 @@ describe("classified length stops and turn settlement (#395)", () => {
       expect(res.failed).toBe(true);
       expect(runLogRecords().find((r) => "outcome" in r)?.outcome).toEqual({
         reason: "unrecovered_empty_response",
-        provider: STUB_PROVIDER,
-        model: STUB_MODEL,
+        provider,
+        model,
       });
       expect(runLogRecords().at(-1)).toEqual({
         done: true,
@@ -853,10 +872,10 @@ describe("classified length stops and turn settlement (#395)", () => {
       });
     }, 20_000);
 
-    it(`rejects a first short Discord admission and logs failure (output=${outputTokens})`, async () => {
+    it(`rejects a first short Discord admission and logs failure (${variant.label})`, async () => {
       const seen: SeenRequest[] = [];
       const live = await liveFactory(
-        () => ({ kind: "length", inputTokens: 1_000, outputTokens }),
+        () => ({ kind: "length", inputTokens: 1_000, ...variant }),
         seen,
       );
       const handle = await startPersistent({
@@ -905,6 +924,8 @@ describe("classified length stops and turn settlement (#395)", () => {
         await expect(admissionResult).rejects.toMatchObject({
           name: "UnrecoveredEmptyResponseError",
           reason: "unrecovered_empty_response",
+          provider,
+          model,
         });
         expect(
           logs.some(
