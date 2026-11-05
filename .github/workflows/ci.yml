@@ -61,6 +61,8 @@ jobs:
       # setup step stops the job before it runs.
       - name: bun version pin matches package.json
         run: bun --no-install scripts/check-bun-version.mjs
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck
@@ -81,6 +83,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # The changelog fragment gate (bob#236): refuses a malformed fragment, and
@@ -113,6 +117,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # Provision the unprivileged user the jarvis key-read proof runs as (the
@@ -146,6 +152,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       # npm, not bun: npm is what a user runs, what the release pipeline
