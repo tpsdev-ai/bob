@@ -13,6 +13,8 @@
 //     re-prompted with a new continuation turn.
 // (d) a provider error whose text contains the empty-response phrase is not
 //     recorded as `empty_response` (classification reads only the typed marker).
+// (e) a zero-output `length` stop is left to pi's own overflow recovery, which
+//     compacts and retries the request (bob#395).
 //
 // The admission tests drive `startPersistent` (and the real cron scheduler)
 // over the same factory; the last block unit-tests the retry bound.
@@ -65,6 +67,7 @@ const OVER_THRESHOLD = 60_001;
 
 type Reply = { inputTokens: number } & (
   | { kind: "empty" }
+  | { kind: "length" }
   | { kind: "text"; text: string }
   | { kind: "thinking"; thinking: string }
   | { kind: "toolRead"; path: string }
@@ -137,6 +140,7 @@ function scriptedProvider(
         const input = step.inputTokens;
         const content: AssistantMessage["content"] = [];
         let stopReason: AssistantMessage["stopReason"] = "stop";
+        if (step.kind === "length") stopReason = "length";
         if (step.kind === "providerError") {
           const failed: AssistantMessage = {
             role: "assistant",
@@ -170,8 +174,9 @@ function scriptedProvider(
           api: model.api,
           provider: model.provider,
           model: model.id,
-          // The empty reply is the issue's shape: no content, zero output tokens.
-          usage: usage(input, step.kind === "empty" ? 0 : 10),
+          // The empty and length replies are the issue's shape: no content, zero
+          // output tokens.
+          usage: usage(input, step.kind === "empty" || step.kind === "length" ? 0 : 10),
           stopReason,
           timestamp: Date.now(),
         };
@@ -202,7 +207,7 @@ function scriptedProvider(
         }
         stream.push({
           type: "done",
-          reason: stopReason === "toolUse" ? "toolUse" : "stop",
+          reason: stopReason === "toolUse" || stopReason === "length" ? stopReason : "stop",
           message,
         });
         stream.end(message);
@@ -258,11 +263,13 @@ async function liveFactory(
   logs: string[];
   ended: Array<{ content: unknown; stopReason?: string }>;
   compactions: Array<{ result?: unknown; aborted?: boolean }>;
+  compactionStarts: string[];
 }> {
   const logs: string[] = [];
   const sessions: RunSession[] = [];
   const ended: Array<{ content: unknown; stopReason?: string }> = [];
   const compactions: Array<{ result?: unknown; aborted?: boolean }> = [];
+  const compactionStarts: string[] = [];
   const modelRuntime = await ModelRuntime.create({
     authPath: join(root, "testbot", ".pi-agent", "auth.json"),
     modelsPath: null,
@@ -327,6 +334,10 @@ async function liveFactory(
         aborted?: boolean;
         message?: { role?: string; content?: unknown; stopReason?: string };
       };
+      if (e.type === "compaction_start") {
+        compactionStarts.push(String((e as { reason?: unknown }).reason));
+        return;
+      }
       if (e.type === "compaction_end") {
         compactions.push({ result: e.result, aborted: e.aborted });
         return;
@@ -336,7 +347,7 @@ async function liveFactory(
     });
     return session;
   };
-  return { factory, sessions, logs, ended, compactions };
+  return { factory, sessions, logs, ended, compactions, compactionStarts };
 }
 
 /** Every record of the run log this run wrote. */
@@ -784,4 +795,53 @@ describe("the empty-response bound (#381)", () => {
       expect(() => resolveMaxEmptyResponseRetries(bad)).toThrow(/invalid maxEmptyResponseRetries/);
     }
   }, 10_000);
+});
+
+describe("a zero-output length stop is pi's to recover (#395)", () => {
+  for (const variant of [
+    { label: "input filling the window", inputTokens: 99_500 },
+    { label: "input well under the window", inputTokens: 1_000 },
+  ]) {
+    it(`${variant.label}: compacts with reason overflow, retries and completes`, async () => {
+      const seen: SeenRequest[] = [];
+      const work = join(root, "testbot", "work");
+      for (const n of [1, 2, 3]) {
+        writeFileSync(join(work, `file${n}.txt`), `FILE${n}-MARKER ${"x".repeat(40_000)}`);
+      }
+      let lengthReplies = 0;
+      const live = await liveFactory((agentCall) => {
+        if (agentCall <= 3) {
+          return {
+            kind: "toolRead",
+            path: `file${agentCall}.txt`,
+            inputTokens: agentCall * 10_000,
+          };
+        }
+        // Until pi compacts, a request that follows the tool turns gets the same
+        // zero-output length stop: the request bob used to re-issue.
+        if (!seen.some((r) => r.summarization)) {
+          lengthReplies += 1;
+          return { kind: "length", inputTokens: variant.inputTokens };
+        }
+        return { kind: "text", text: "DONE: recovered from the length stop.", inputTokens: 1_000 };
+      }, seen);
+      const res = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "do the thing",
+        captureStdout: true,
+        sessionFactory: live.factory,
+      });
+      const agentRequests = seen.filter((r) => !r.summarization);
+      // pi dropped the length stop, compacted once and retried: the request was
+      // not re-issued four times by the empty-response bound.
+      expect(lengthReplies).toBe(1);
+      expect(agentRequests).toHaveLength(5);
+      expect(live.compactionStarts).toEqual(["overflow"]);
+      expect(seen.filter((r) => r.summarization)).toHaveLength(1);
+      expect(res.exitCode).toBe(0);
+      expect(res.reason).toBeUndefined();
+      expect(res.stdout).toBe("DONE: recovered from the length stop.");
+    }, 20_000);
+  }
 });
