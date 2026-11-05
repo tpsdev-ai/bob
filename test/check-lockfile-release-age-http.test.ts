@@ -21,7 +21,13 @@ function fixtureEnv(root: string) {
     XDG_CONFIG_HOME: root,
     NPM_CONFIG_USERCONFIG: join(root, "absent.npmrc"),
   };
-  for (const key of ["BUN_CONFIG_REGISTRY", "NPM_CONFIG_REGISTRY", "npm_config_registry"])
+  for (const key of [
+    "BUN_CONFIG_REGISTRY",
+    "NPM_CONFIG_REGISTRY",
+    "npm_config_registry",
+    "CI",
+    "GITHUB_ACTIONS",
+  ])
     delete env[key];
   return env;
 }
@@ -138,6 +144,23 @@ test.each([429, 503])("Bun fetch: HTTP %s twice fails naming the status", (statu
   checkCli(0, 5000, 2, [status, status]),
 );
 
+test("CI refuses --registry even with the loopback test variable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bob-lockfile-age-ci-"));
+  try {
+    writeFileSync(join(root, "bun.lock"), '{"packages":{"old-pkg":["old-pkg@1.0.0",""]}}');
+    writeFileSync(join(root, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
+    const cli = await runBun(
+      ["--no-install", copyChecker(root), "--registry", "http://127.0.0.1:1"],
+      root,
+      { ...fixtureEnv(root), BOB_RELEASE_AGE_TEST_REGISTRY: "1", CI: "true" },
+    );
+    expect(cli.code).toBe(2);
+    expect(cli.stderr).toContain("TestRegistryOverrideRefusedInCi");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bun frozen install reads the repo npmrc registry", async () => {
   const root = mkdtempSync(join(tmpdir(), "bob-registry-install-"));
   const requests: string[] = [];
@@ -240,6 +263,8 @@ function isolatedEnv(root: string, extra: Record<string, string> = {}) {
     "npm_config_userconfig",
     "BUN_ENV",
     "NODE_ENV",
+    "CI",
+    "GITHUB_ACTIONS",
   ]) {
     delete env[key];
   }

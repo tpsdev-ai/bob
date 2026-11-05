@@ -15,7 +15,9 @@
  * form — `git:`, `git+…`, `github:`, `http:`, `https:` or an unrecognised
  * value — is refused before any lookup, naming the lock key and version.
  * Each unique checked pair not listed in `minimumReleaseAgeExcludes` is
- * looked up. The bake is pinned: the checker refuses any
+ * looked up. The exclude list is honoured as written; widening it is
+ * protected by review (the main ruleset requires two approvals), not by
+ * this checker. The bake is pinned: the checker refuses any
  * `minimumReleaseAge` other than 604800.
  *
  * Exit codes:
@@ -162,6 +164,12 @@ function checkRegistryConfiguration(root, bunfigText, env) {
 }
 
 function requireTestRegistry(registry, env) {
+  if (env.CI !== undefined || env.GITHUB_ACTIONS !== undefined) {
+    throw namedError(
+      "TestRegistryOverrideRefusedInCi",
+      "--registry is refused when CI or GITHUB_ACTIONS is set",
+    );
+  }
   let url;
   try {
     url = new URL(registry);
