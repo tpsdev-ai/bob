@@ -695,8 +695,8 @@ export interface RunSessionConfig {
   // role.json `session`). Absent: pi's default.
   thinking?: ThinkingSetting;
   // bob#396: the run log's usage observer, when the session's caller keeps
-  // one. The empty-response wrapper reports each attempt it drops here, so an
-  // attempt pi never sees still gets its request-usage record.
+  // one. When set, the empty-response wrapper reports each attempt it drops
+  // here, so an attempt pi never sees still gets its request-usage record.
   onDroppedAttempt?: (message: unknown) => void;
   // bob#275 (S2a): the launcher-supplied task binding the work capability reads
   // (via the task-binding environment hand-off). It carries the task and
