@@ -139,10 +139,8 @@ jobs:
 
       - name: Upgrade npm to a staging-capable version
         # OIDC trusted publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
-        # Node 22 ships npm 10.x, so upgrade explicitly.
         run: |
-          npm install -g npm@^11.15.0
-          echo "npm $(npm --version)"
+          npm install -g npm@11.21.1
 
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
@@ -197,6 +195,7 @@ jobs:
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
           echo "::group::npm stage publish — $name"
+          v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "11.21.1" || { echo "npm is $v, expected the pinned 11.21.1" >&2; exit 1; }
           npm stage publish
           echo "::endgroup::"
 
