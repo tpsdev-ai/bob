@@ -162,6 +162,12 @@ function checkRegistryConfiguration(root, bunfigText, env) {
 }
 
 function requireTestRegistry(registry, env) {
+  if (env.CI !== undefined || env.GITHUB_ACTIONS !== undefined) {
+    throw namedError(
+      "TestRegistryOverrideRefusedInCi",
+      "--registry is refused when CI or GITHUB_ACTIONS is set",
+    );
+  }
   let url;
   try {
     url = new URL(registry);

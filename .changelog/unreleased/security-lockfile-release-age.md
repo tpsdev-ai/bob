@@ -1,6 +1,10 @@
-- **Lockfile release-age enforcement in the Dependency Audit job.** A frozen
+- **Lockfile release-age enforcement in CI.** A frozen
   install resolves nothing, so `bunfig.toml`'s `minimumReleaseAge` did not
   apply to the committed pins. A Bun script now reads the package versions in
   `bun.lock`, reads the bake and `minimumReleaseAgeExcludes` from `bunfig.toml`,
   and fails on each checked registry version younger than the bake or a registry
-  lookup it cannot complete. It runs as a step in the existing Dependency Audit job.
+  lookup it cannot complete. The checker is the first `run:` step of each
+  workflow job with a `run:` step, except release-publish.yml's verify-ancestry
+  job. Before the first `run:` step, only `actions/checkout` (`fetch-depth`, `persist-credentials`), `oven-sh/setup-bun` (`bun-version`), `actions/setup-node` (`node-version`), and `socketdev/action` (`mode`) are allowed, with only those inputs.
+  `minimumReleaseAgeExcludes` filters entries by exact package name before registry lookup.
+  The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a `uses:` step may not set `env`, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The action allow-set check does not inspect input values or action contents.
