@@ -31,6 +31,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - name: Check action pin versions
         run: node scripts/check-action-pins.mjs
         env:
@@ -50,6 +55,8 @@ jobs:
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+      - name: Lockfile release-age bake
+        run: bun --no-install scripts/check-lockfile-release-age.mjs
       # bob#355: the lockfile is written with the bun version package.json's
       # packageManager declares; every workflow step that uses setup-bun must
       # install that same version, or this fails. It runs before the frozen
@@ -61,8 +68,6 @@ jobs:
       # setup step stops the job before it runs.
       - name: bun version pin matches package.json
         run: bun --no-install scripts/check-bun-version.mjs
-      - name: Lockfile release-age bake
-        run: bun --no-install scripts/check-lockfile-release-age.mjs
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint
       - run: bun run typecheck

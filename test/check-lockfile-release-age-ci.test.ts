@@ -1,5 +1,6 @@
-// bob#390: a dedicated checker step must precede every npm or bun install
-// command (global or not) and every recognised package-cache restore.
+// bob#390: the lockfile release-age checker is the first run step of every
+// workflow job that runs commands. No package-cache restore and no `uses:`
+// step whose inputs install dependencies may precede it.
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,31 +9,13 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
-// npm and Bun install commands, global or not.
-// `bun --no-install` and `bun run build` do not match.
-const PROJECT_INSTALL = /^(?:npm\s+ci\b|npm\s+(?:install|i)\b|bun\s+(?:install|add)\b)/;
 // A package cache under the user's Bun or npm cache directory.
 const PACKAGE_CACHE_PATH = /(?:^|[/\\])(?:\.bun|\.npm)(?:[/\\]|$)/;
+// A `uses:` input that installs or restores dependencies.
+const INSTALL_INPUT = /^(?:cache|install)$/;
 
 type Step = { name?: string; run?: string; uses?: string; with?: Record<string, unknown> };
 type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
-
-// Classify each command in a `run` separately.
-function splitCommands(run: string): string[] {
-  return run
-    .split(/\r?\n|&&|\|\||;|\|/)
-    .map((command) => command.trim())
-    .filter((command) => command.length > 0);
-}
-
-function isProjectDependencyInstall(command: string): boolean {
-  const trimmed = command.replace(/^sfw\s+/, "");
-  return PROJECT_INSTALL.test(trimmed);
-}
-
-function isDependencyInstall(run: string): boolean {
-  return splitCommands(run).some(isProjectDependencyInstall);
-}
 
 function restoresPackageCache(step: Step): boolean {
   if (typeof step.uses !== "string" || !/^actions\/cache@/.test(step.uses)) return false;
@@ -41,122 +24,97 @@ function restoresPackageCache(step: Step): boolean {
   return paths.some((path) => typeof path === "string" && PACKAGE_CACHE_PATH.test(path.trim()));
 }
 
-type Gate = { index: number; kind: "install" | "cache" };
-
-function firstGate(steps: Step[]): Gate | null {
-  for (let index = 0; index < steps.length; index += 1) {
-    const step = steps[index];
-    if (typeof step.run === "string" && isDependencyInstall(step.run)) {
-      return { index, kind: "install" };
-    }
-    if (restoresPackageCache(step)) return { index, kind: "cache" };
+function installInput(step: Step): string | null {
+  if (typeof step.uses !== "string" || step.with === null || typeof step.with !== "object") {
+    return null;
+  }
+  for (const key of Object.keys(step.with)) {
+    if (INSTALL_INPUT.test(key)) return key;
   }
   return null;
 }
 
-// Every job that installs a dependency or restores a package cache must run the
-// checker in an earlier step, as the step's whole command.
-function installsWithoutEarlierCheck(workflow: Workflow, source: string): string[] {
+function firstRunIndex(steps: Step[]): number {
+  return steps.findIndex((step) => typeof step.run === "string");
+}
+
+// Jobs with no run step are exempt. Everywhere else the first run step must be
+// the checker, and nothing before it may fetch packages.
+function orderingProblems(workflow: Workflow, source: string): string[] {
   const problems: string[] = [];
   for (const [job, definition] of Object.entries(workflow.jobs ?? {})) {
     const steps = definition.steps ?? [];
-    const gate = firstGate(steps);
-    if (gate === null) continue;
-    const check = steps.findIndex((step) => step.run?.trim() === CHECKER);
-    if (check >= 0 && check < gate.index) continue;
-    const step = steps[gate.index];
-    const detail =
-      gate.kind === "install"
-        ? `${step.run}) installs dependencies`
-        : `${step.name ?? step.uses}) restores a package cache`;
-    const where = `${source}: job "${job}" step ${gate.index + 1} (${detail}`;
-    problems.push(
-      check === -1
-        ? `${where} with no dedicated ${CHECKER} step`
-        : `${where} before the ${CHECKER} step (step ${check + 1})`,
-    );
+    const firstRun = firstRunIndex(steps);
+    if (firstRun === -1) continue;
+    const where = `${source}: job "${job}"`;
+    if ((steps[firstRun].run ?? "").trim() !== CHECKER) {
+      problems.push(
+        `${where} step ${firstRun + 1}: the first run step is not the ${CHECKER} checker`,
+      );
+    }
+    for (let index = 0; index < firstRun; index += 1) {
+      const step = steps[index];
+      if (restoresPackageCache(step)) {
+        problems.push(
+          `${where} step ${index + 1} (${step.name ?? step.uses}) restores a package cache before the first run step`,
+        );
+      }
+      const input = installInput(step);
+      if (input !== null) {
+        problems.push(
+          `${where} step ${index + 1} (${step.uses}) sets install input "${input}" before the first run step`,
+        );
+      }
+    }
   }
   return problems;
 }
 
-test("every installing workflow job checks the lockfile release age before it installs", () => {
+test("the checker is the first run step of every workflow job that runs commands", () => {
   const sources = readdirSync(WORKFLOWS)
     .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
     .sort();
   expect(sources.length).toBeGreaterThan(0);
   const problems = sources.flatMap((name) => {
     const workflow = parseYaml(readFileSync(join(WORKFLOWS, name), "utf8")) as Workflow;
-    return installsWithoutEarlierCheck(workflow, `.github/workflows/${name}`);
+    return orderingProblems(workflow, `.github/workflows/${name}`);
   });
   expect(problems).toEqual([]);
 });
 
-test("a checker step must be its own exact command, not a mention", () => {
+test("a run step before the checker is red whatever its text", () => {
   const workflow = parseYaml(
     [
       "jobs:",
-      "  echoed-check:",
+      "  bun-i:",
       "    steps:",
-      "      - run: echo scripts/check-lockfile-release-age.mjs",
-      "      - run: bun install --frozen-lockfile",
+      "      - run: bun i",
+      `      - run: ${CHECKER}`,
+      "  bun-a:",
+      "    steps:",
+      "      - run: bun a",
+      `      - run: ${CHECKER}`,
+      "  npm-prefix:",
+      "    steps:",
+      "      - run: npm --prefix . install",
+      `      - run: ${CHECKER}`,
+      "  continued:",
+      "    steps:",
+      "      - run: |",
+      "          bun \\",
+      "            install --frozen-lockfile",
+      `      - run: ${CHECKER}`,
     ].join("\n"),
   ) as Workflow;
-  expect(installsWithoutEarlierCheck(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "echoed-check" step 2 (bun install --frozen-lockfile) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
+  expect(orderingProblems(workflow, "fixture.yml")).toEqual([
+    `fixture.yml: job "bun-i" step 1: the first run step is not the ${CHECKER} checker`,
+    `fixture.yml: job "bun-a" step 1: the first run step is not the ${CHECKER} checker`,
+    `fixture.yml: job "npm-prefix" step 1: the first run step is not the ${CHECKER} checker`,
+    `fixture.yml: job "continued" step 1: the first run step is not the ${CHECKER} checker`,
   ]);
 });
 
-test("an install without an earlier check is reported in each install form", () => {
-  const workflow = parseYaml(
-    [
-      "jobs:",
-      "  bun-install:",
-      "    steps:",
-      "      - run: sfw bun install --frozen-lockfile",
-      "      - run: bun --no-install scripts/check-lockfile-release-age.mjs",
-      "  npm-ci:",
-      "    steps:",
-      "      - run: npm ci",
-      "  npm-install:",
-      "    steps:",
-      "      - run: npm install",
-      "  npm-global:",
-      "    steps:",
-      "      - run: npm install -g npm@^11.15.0",
-      "  no-install:",
-      "    steps:",
-      "      - run: bun run build",
-    ].join("\n"),
-  ) as Workflow;
-  expect(installsWithoutEarlierCheck(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "bun-install" step 1 (sfw bun install --frozen-lockfile) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
-    'fixture.yml: job "npm-ci" step 1 (npm ci) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
-    'fixture.yml: job "npm-install" step 1 (npm install) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
-    'fixture.yml: job "npm-global" step 1 (npm install -g npm@^11.15.0) installs dependencies with no dedicated bun --no-install scripts/check-lockfile-release-age.mjs step',
-  ]);
-});
-
-test("global installs before the checker are reported alone and in a mixed run", () => {
-  const workflow = parseYaml(
-    [
-      "jobs:",
-      "  mixed:",
-      "    steps:",
-      "      - run: npm install -g npm@^11.15.0 && sfw bun install --frozen-lockfile",
-      "      - run: bun --no-install scripts/check-lockfile-release-age.mjs",
-      "  global-only:",
-      "    steps:",
-      "      - run: npm install -g npm@^11.15.0",
-      "      - run: bun --no-install scripts/check-lockfile-release-age.mjs",
-    ].join("\n"),
-  ) as Workflow;
-  expect(installsWithoutEarlierCheck(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "mixed" step 1 (npm install -g npm@^11.15.0 && sfw bun install --frozen-lockfile) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
-    'fixture.yml: job "global-only" step 1 (npm install -g npm@^11.15.0) installs dependencies before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
-  ]);
-});
-
-test("a package-cache restore after the checker passes and one before it fails", () => {
+test("a package-cache restore before the checker is red", () => {
   const workflow = parseYaml(
     [
       "jobs:",
@@ -166,18 +124,56 @@ test("a package-cache restore after the checker passes and one before it fails",
       "        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
       "        with:",
       "          path: ~/.bun/install/cache",
-      "      - run: bun --no-install scripts/check-lockfile-release-age.mjs",
+      `      - run: ${CHECKER}`,
       "  cache-after:",
       "    steps:",
-      "      - run: bun --no-install scripts/check-lockfile-release-age.mjs",
+      `      - run: ${CHECKER}`,
       "      - name: Cache npm",
       "        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
       "        with:",
       "          path: ~/.npm",
-      "      - run: sfw bun install --frozen-lockfile",
     ].join("\n"),
   ) as Workflow;
-  expect(installsWithoutEarlierCheck(workflow, "fixture.yml")).toEqual([
-    'fixture.yml: job "cache-before" step 1 (Cache bun install) restores a package cache before the bun --no-install scripts/check-lockfile-release-age.mjs step (step 2)',
+  expect(orderingProblems(workflow, "fixture.yml")).toEqual([
+    'fixture.yml: job "cache-before" step 1 (Cache bun install) restores a package cache before the first run step',
   ]);
+});
+
+test("a uses step whose inputs install dependencies before the checker is red", () => {
+  const workflow = parseYaml(
+    [
+      "jobs:",
+      "  cache-input:",
+      "    steps:",
+      "      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+      "        with:",
+      '          node-version: "22"',
+      "          cache: npm",
+      `      - run: ${CHECKER}`,
+      "  version-only:",
+      "    steps:",
+      "      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+      "        with:",
+      '          node-version: "22"',
+      `      - run: ${CHECKER}`,
+    ].join("\n"),
+  ) as Workflow;
+  expect(orderingProblems(workflow, "fixture.yml")).toEqual([
+    'fixture.yml: job "cache-input" step 1 (actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1) sets install input "cache" before the first run step',
+  ]);
+});
+
+test("a job with only uses steps is exempt", () => {
+  const workflow = parseYaml(
+    [
+      "jobs:",
+      "  uses-only:",
+      "    steps:",
+      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+      "        with:",
+      '          bun-version: "1.4.4"',
+    ].join("\n"),
+  ) as Workflow;
+  expect(orderingProblems(workflow, "fixture.yml")).toEqual([]);
 });
