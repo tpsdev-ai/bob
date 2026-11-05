@@ -262,6 +262,8 @@ test("ci.yml action-pins runs the npm pin release-age checker with no condition"
   const workflow = loadWorkflow("ci.yml");
   const job = workflow.jobs?.["action-pins"];
   if (job === undefined) throw new Error("Missing action-pins");
+  expect(job).not.toHaveProperty("if");
+  expect(job).not.toHaveProperty("continue-on-error");
   const matches = (job.steps ?? []).filter(
     (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
   );
