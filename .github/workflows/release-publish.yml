@@ -143,7 +143,8 @@ jobs:
         # not a range: a range resolves at run time with no release-age bake.
         # The current pin is 11.21.1, published 2026-10-15.
         # test/release-publish-npm-pin.test.ts requires exactly one self-update
-        # command naming one exact version; a bump is a reviewed change.
+        # command naming one exact version, and refuses every other global npm
+        # mutation in this job. CI does not check a future pin's publish age (follow-up).
         run: |
           npm install -g npm@11.21.1
           echo "npm $(npm --version)"

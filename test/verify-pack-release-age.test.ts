@@ -3,11 +3,22 @@
 // `before` config is not fail-closed: it accepts a version with no publish
 // time. `installVerifiedTarball` therefore verifies every resolved registry
 // version in the lock against its publish time before it runs `npm ci`, and
-// refuses inherited npm config that could relax the cutoff.
+// refuses inherited npm config that could relax the cutoff. A refused version
+// is named in that error. A version npm rejects during resolution, before a
+// lock exists, gets the cutoff guidance instead, and a registry metadata lookup
+// failure is reported as its own error.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -336,3 +347,74 @@ test("an inherited exclusion is refused before resolving against the registry", 
     rmSync(root, { recursive: true, force: true });
   }
 }, 120_000);
+
+async function npmrcRefusal(where: "install" | "home") {
+  const root = mkdtempSync(join(tmpdir(), `bob-pack-npmrc-${where}-`));
+  const tarball = appFixture(root, "fixture-npmrc-lib");
+  const installDir = newInstallDir(root);
+  const env = installEnv(root);
+  const npmrc = where === "install" ? join(installDir, ".npmrc") : join(env.HOME, ".npmrc");
+  writeFileSync(npmrc, "before=2030-01-01T00:00:00.000Z\n");
+  let error: Error | undefined;
+  try {
+    await installVerifiedTarball({ tarball: tarball.tarball, installDir, env, now: NOW });
+  } catch (caught) {
+    error = caught as Error;
+  }
+  return { root, error, npmrc, installDir };
+}
+
+test.each(["install", "home"] as const)(
+  "a .npmrc in the %s scratch directory is refused",
+  async (where) => {
+    const { root, error, npmrc, installDir } = await npmrcRefusal(where);
+    try {
+      expect(error?.name).toBe("InheritedNpmConfigRefused");
+      expect(error?.message).toContain(npmrc);
+      expect(existsSync(join(installDir, "package-lock.json"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  120_000,
+);
+
+test("an install refusal leaves no verify-pack scratch directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "bob-pack-refusal-"));
+  try {
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const realNpm = spawnSync("which", ["npm"], { encoding: "utf8" }).stdout.trim();
+    expect(realNpm).toMatch(/npm$/);
+    writeFileSync(
+      join(bin, "npm"),
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "pack" ]; then',
+        `  exec ${JSON.stringify(realNpm)} "$@"`,
+        "fi",
+        'echo "npm error code ETARGET" >&2',
+        'echo "npm error notarget No matching version found for fixture-lib@^1.0.0." >&2',
+        "exit 1",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const env = baseEnv(root);
+    env.TMPDIR = root;
+    env.PATH = `${bin}:${process.env.PATH ?? ""}`;
+    const result = spawnSync("node", [VERIFY_PACK], {
+      cwd: join(import.meta.dir, ".."),
+      env,
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout + result.stderr).toContain(
+      "No version the tarball's dependency ranges allow was published before the release-age cutoff",
+    );
+    expect(readdirSync(root).filter((name) => name.startsWith("bob-verify-pack-"))).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 180_000);

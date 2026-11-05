@@ -54,6 +54,9 @@ const CAPABILITY_TOOLS = {
 };
 
 let failures = 0;
+// Unwinds through the scratch cleanup in `finally` instead of calling
+// process.exit, which would leave the scratch tree behind.
+const REFUSAL = Symbol("refusal");
 function check(name, fn) {
   try {
     const detail = fn();
@@ -208,7 +211,8 @@ try {
       );
       console.error("Wait for the 7-day bake to pass, or pin the dependency to an older version.");
     }
-    process.exit(1);
+    failures++;
+    throw REFUSAL;
   }
   const bob = join(install, "node_modules", ".bin", "bob");
   console.log(
@@ -465,6 +469,8 @@ console.log("__PROBE__" + JSON.stringify(out));
   });
 
   console.log(`\n${failures === 0 ? "PASS" : `FAIL — ${failures} check(s)`}`);
+} catch (err) {
+  if (err !== REFUSAL) throw err;
 } finally {
   if (KEEP) console.log(`\nkept: ${scratch}`);
   else rmSync(scratch, { recursive: true, force: true });
