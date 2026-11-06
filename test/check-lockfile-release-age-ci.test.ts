@@ -10,7 +10,6 @@ const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
 const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs";
-const NPM_PIN_STEP = "npm pin release-age bake";
 const SELF_UPDATE = /^npm install -g npm@\d+\.\d+\.\d+$/;
 const PUBLISH_LINE = /^npm\s+(?:stage|publish)\b/;
 const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
@@ -282,14 +281,11 @@ function npmPinStepProblems(steps: Step[]): string[] {
     (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
   );
   if (matches.length !== 1) {
-    return [`expected exactly one ${NPM_PIN_STEP} step, found ${matches.length}`];
+    return [`expected exactly one ${NPM_PIN_CHECKER} step, found ${matches.length}`];
   }
   const step = matches[0];
   const index = steps.indexOf(step);
   const problems: string[] = [];
-  if (step.name !== NPM_PIN_STEP) {
-    problems.push(`the npm pin release-age step must be named "${NPM_PIN_STEP}"`);
-  }
   if (step.if !== undefined) problems.push("the npm pin release-age step must not have an if");
   if (step["continue-on-error"] !== undefined) {
     problems.push("the npm pin release-age step must not have continue-on-error");
@@ -332,13 +328,19 @@ function npmPinStep(steps: Step[]): Step {
   return step;
 }
 
+test("renaming the npm pin release-age step preserves its checks", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  npmPinStep(steps).name = "Check npm publish age";
+  expect(npmPinStepProblems(steps)).toEqual([]);
+});
+
 test.each([
   [
     "removed",
     (steps: Step[]) => {
       steps.splice(steps.indexOf(npmPinStep(steps)), 1);
     },
-    `expected exactly one ${NPM_PIN_STEP} step, found 0`,
+    `expected exactly one ${NPM_PIN_CHECKER} step, found 0`,
   ],
   [
     "moved after the npm self-update",
