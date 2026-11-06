@@ -340,6 +340,39 @@ describe("completion gate under a declared work root", () => {
     expect(result.noEditNoBlocked).toBe(true);
   }, 20_000);
 
+  it("does not credit a no-op amend after its predecessor reflog entry is pruned", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    let replaced = "";
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          writeFileSync(join(repo, "tracked"), "replacement content\n");
+          replaced = seedSuccessor(repo);
+          git(repo, "commit", "--amend", "--quiet", "-m", "no-op amendment");
+          const branch = git(repo, "symbolic-ref", "HEAD");
+          git(repo, "reflog", "delete", `${branch}@{1}`);
+          git(repo, "reflog", "delete", "HEAD@{1}");
+        },
+      },
+    ]);
+    expect(git(repo, "reflog", "show", "--format=%gs")).toContain(
+      "commit (amend): no-op amendment",
+    );
+    expect(git(repo, "rev-parse", "HEAD^{tree}")).toBe(
+      git(repo, "rev-parse", `${replaced}^{tree}`),
+    );
+    expect(git(repo, "rev-parse", "HEAD@{1}^{tree}")).not.toBe(
+      git(repo, "rev-parse", "HEAD^{tree}"),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  }, 20_000);
+
   it("credits a changed-tree amend in a fresh clone into an initially empty child", async () => {
     const source = join(agentsRoot, "source");
     init(source);

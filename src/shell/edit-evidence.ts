@@ -704,17 +704,43 @@ function amendChangedContent(
 ): boolean {
   const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
   if (!selected) return false;
-  const entries = readGit(
-    cwd,
-    ["reflog", "show", "--date=raw", "--format=%H%x00%gD%x00%gs", selected[1]],
-    undefined,
-    timeoutMs,
-  )
-    .toString()
-    .trimEnd()
-    .split("\n");
-  const index = entries.indexOf(`${commit}\0${selector}\0${action}`);
-  const replacedCommit = index < 0 ? undefined : entries[index + 1]?.split("\0")[0];
+  const ref = selected[1];
+  const sharedHead = ref === "main-worktree/HEAD" || /^worktrees\/[^/]+\/HEAD$/.test(ref);
+  const logPath = sharedHead
+    ? join(
+        gitLine(
+          cwd,
+          ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+          undefined,
+          timeoutMs,
+        ),
+        ...(ref === "main-worktree/HEAD"
+          ? ["logs", "HEAD"]
+          : ["worktrees", ref.split("/")[1], "logs", "HEAD"]),
+      )
+    : gitLine(
+        cwd,
+        ["rev-parse", "--path-format=absolute", "--git-path", `logs/${ref}`],
+        undefined,
+        timeoutMs,
+      );
+  // Use the old id in the amend's own record; deny credit if it cannot be read.
+  const records = readFileSync(logPath, "utf8")
+    .split("\n")
+    .map((line) =>
+      line.match(
+        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/,
+      ),
+    )
+    .filter(
+      (record) =>
+        record !== null &&
+        record[2] === commit &&
+        record[3] === selected[2] &&
+        record[4] === selected[3] &&
+        record[5] === action,
+    );
+  const replacedCommit = records.length === 1 ? records[0]?.[1] : undefined;
   return (
     replacedCommit !== undefined && commitChangedContent(cwd, commit, timeoutMs, replacedCommit)
   );
