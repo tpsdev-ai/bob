@@ -776,6 +776,7 @@ export function isWorkRootEditVerified(
   return false;
 }
 
+// Doctor's unknown count covers discovery failures and children beyond the bound.
 export function countWorkRootTrees(
   root: string,
   options: WorkRootCaptureOptions = {},

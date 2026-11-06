@@ -594,7 +594,7 @@ describe("completion gate under a declared work root", () => {
     expect(check?.status).toBe("ok");
     expect(check?.detail).toContain(workRoot);
     expect(check?.detail).toContain(
-      "would scan 4 child directory(s); 3 are work trees now; 0 unknown",
+      "would scan 4 child directory(s); 3 are work trees now; 0 discovery unknown; evidence is captured at launch",
     );
   });
 });
