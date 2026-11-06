@@ -120,7 +120,7 @@ function session(calls: Call[]): RunSession {
   };
 }
 
-describe("edit evidence under a declared work root", () => {
+describe("completion gate under a declared work root", () => {
   let agentsRoot: string;
   let cwd: string;
   let workRoot: string;
@@ -169,7 +169,7 @@ describe("edit evidence under a declared work root", () => {
       sessionFactory: async () => session(calls),
     });
 
-  it("credits a commit in an existing work tree under the root", async () => {
+  it("credits new tracked content committed in an existing work tree", async () => {
     const repo = join(workRoot, "alpha");
     init(repo);
     const result = await run([
@@ -183,6 +183,85 @@ describe("edit evidence under a declared work root", () => {
     ]);
     expect(result.exitCode).toBe(0);
     expect(result.noEditNoBlocked).toBeUndefined();
+  });
+
+  it.each(["reset", "checkout"])(
+    "does not credit %s to a descendant commit already in launch history",
+    async (operation) => {
+      const repo = join(workRoot, "alpha");
+      const launchHead = init(repo);
+      writeFileSync(join(repo, "tracked"), "pre-existing descendant\n");
+      const descendant = seedSuccessor(repo);
+      git(repo, "branch", "future", descendant);
+      git(repo, "reset", "--hard", launchHead);
+      const result = await run([
+        {
+          toolName: "run",
+          action: () => {
+            if (operation === "reset") git(repo, "reset", "--hard", descendant);
+            else git(repo, "checkout", "--detach", descendant);
+          },
+        },
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.noEditNoBlocked).toBe(true);
+    },
+  );
+
+  it("does not credit checkout of a non-descendant commit already in launch history", async () => {
+    const repo = join(workRoot, "alpha");
+    const parent = init(repo);
+    writeFileSync(join(repo, "tracked"), "side branch\n");
+    const side = seedSuccessor(repo);
+    git(repo, "branch", "side", side);
+    git(repo, "reset", "--hard", parent);
+    writeFileSync(join(repo, "tracked"), "launch branch\n");
+    seedSuccessor(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(repo, "checkout", "--detach", side);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it("does not credit uncommitted tracked content already in launch history", async () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    writeFileSync(join(repo, "tracked"), "launch content\n");
+    seedSuccessor(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          writeFileSync(join(repo, "tracked"), "original\n");
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it("does not credit tracked content when the launch history check was skipped", async () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    const brokenRef = join(repo, ".git", "refs", "heads", "broken");
+    writeFileSync(brokenRef, `${"0".repeat(40)}\n`);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          rmSync(brokenRef);
+          writeFileSync(join(repo, "tracked"), "new content\n");
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
   });
 
   it("credits a content commit in a new work tree", async () => {

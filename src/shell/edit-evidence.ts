@@ -618,8 +618,8 @@ export type WorkTreeLaunchState =
   | {
       kind: "known";
       head: string;
-      headTree: string;
       tree: string;
+      launchTrees: Set<string>;
       gitDir: string;
       gitDirId: string;
     }
@@ -657,8 +657,8 @@ function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
       gitDir: state.gitDir,
       gitDirId: `${stat.dev}:${stat.ino}`,
       head: gitLine(path, ["rev-parse", "--verify", "HEAD^{commit}"], state, timeoutMs),
-      headTree: gitLine(path, ["rev-parse", "--verify", "HEAD^{tree}"], state, timeoutMs),
       tree: state.tree,
+      launchTrees: state.launchTrees,
     };
   } catch {
     return { kind: "unknown" };
@@ -680,7 +680,12 @@ function commitChangedContent(cwd: string, commit: string, timeoutMs: number): b
   );
 }
 
-function hasCommitOperation(cwd: string, timeoutMs: number, launchedAtSeconds: number): boolean {
+// Heuristic: %gs is a reflog subject label; update-ref -m or a crafted log can set it.
+function hasCommitLabelWithContentChange(
+  cwd: string,
+  timeoutMs: number,
+  launchedAtSeconds: number,
+): boolean {
   try {
     const reflog = readGit(
       cwd,
@@ -730,7 +735,8 @@ export function captureWorkRootSnapshot(
 }
 
 /**
- * Evidence of a content-changing commit or tracked change observed by bob.
+ * Existing trees need changed tracked content absent from launch history.
+ * New trees use a content-change and reflog-label heuristic.
  * Reflog and committer times use the local clock / GIT_COMMITTER_DATE;
  * this is not proof against a deliberately forged clock.
  */
@@ -762,11 +768,10 @@ export function isWorkRootEditVerified(
         timeoutMs,
       );
       if (ancestor.error || ancestor.status !== 0) continue;
-      if (end.headTree !== launch.headTree) return true;
-      if (end.tree !== launch.tree && end.tree !== end.headTree) return true;
+      if (end.tree !== launch.tree && !launch.launchTrees.has(end.tree)) return true;
       continue;
     }
-    if (hasCommitOperation(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
+    if (hasCommitLabelWithContentChange(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
   }
   return false;
 }
