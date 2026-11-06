@@ -108,7 +108,9 @@ jobs:
         run: bun --no-install scripts/check-lockfile-release-age.mjs
 
       # This workflow revision checks the npm pin before the npm self-update,
-      # dependency-install run steps and staging, with no `if:` on the check.
+      # before a run step that installs dependencies (npm ci, npm install,
+      # bun install, pnpm install, yarn install) and before staging, with no
+      # `if:` on the check.
       - name: npm pin release-age bake
         run: bun --no-install scripts/check-npm-pin-release-age.mjs
 

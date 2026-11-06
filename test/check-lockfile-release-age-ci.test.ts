@@ -276,6 +276,52 @@ test("ci.yml action-pins runs the npm pin release-age checker with no condition"
   expect(step["continue-on-error"]).toBeUndefined();
 });
 
+// Run steps that install dependencies from the workspace's manifest and lock:
+// npm's `ci` (package-lock.json) and `install` (package.json entry points),
+// bun's `install` (bun.lock), pnpm's `install` (pnpm-lock.yaml) and yarn's
+// `install` (yarn.lock). Each one fetches packages from a registry and unpacks
+// them into the workspace, so a pin-age check that ran after it would guard an
+// install that had already happened. The exact `npm install -g npm@<pin>`
+// self-update is excluded: it IS the pin under test, and a separate rule
+// orders it after the check.
+const INSTALL_MANAGERS = ["npm", "bun", "pnpm", "yarn"];
+
+// Join backslash-continued lines so `bun \` + `install` reads as one command.
+function logicalLines(run: string): string[] {
+  const lines: string[] = [];
+  let pending = "";
+  for (const line of run.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.endsWith("\\")) {
+      pending += `${trimmed.slice(0, -1)} `;
+      continue;
+    }
+    lines.push(`${pending}${trimmed}`);
+    pending = "";
+  }
+  if (pending !== "") lines.push(pending);
+  return lines;
+}
+
+// The install command a run step executes, if any, labelled `<manager> <sub>`.
+function installCommand(run: string): string | undefined {
+  for (const line of logicalLines(run)) {
+    for (const segment of line.split(/&&|\|\||[;|]/)) {
+      const command = segment.trim();
+      if (SELF_UPDATE.test(command)) continue;
+      const words = command.split(/\s+/).filter(Boolean);
+      if (words[0] === "sfw") words.shift();
+      const manager = words[0];
+      if (manager === undefined || !INSTALL_MANAGERS.includes(manager)) continue;
+      const sub = words
+        .slice(1)
+        .find((word) => word === "install" || (manager === "npm" && word === "ci"));
+      if (sub !== undefined) return `${manager} ${sub}`;
+    }
+  }
+  return undefined;
+}
+
 function npmPinStepProblems(steps: Step[]): string[] {
   const matches = steps.filter(
     (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
@@ -286,9 +332,10 @@ function npmPinStepProblems(steps: Step[]): string[] {
   const step = matches[0];
   const index = steps.indexOf(step);
   const problems: string[] = [];
-  if (step.if !== undefined) problems.push("the npm pin release-age step must not have an if");
-  if (step["continue-on-error"] !== undefined) {
-    problems.push("the npm pin release-age step must not have continue-on-error");
+  for (const key of Object.keys(step)) {
+    if (key !== "name" && key !== "run") {
+      problems.push(`the npm pin release-age step must not set "${key}"`);
+    }
   }
   const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
   if (upgrade === -1) {
@@ -305,6 +352,13 @@ function npmPinStepProblems(steps: Step[]): string[] {
     if (publishes) {
       problems.push(
         `the npm pin release-age step must run before ${candidate.name} stages or publishes`,
+      );
+    }
+    const install = installCommand(candidate.run ?? "");
+    if (install !== undefined) {
+      const name = candidate.name ?? `step ${candidateIndex + 1}`;
+      problems.push(
+        `the npm pin release-age step must run before the install in "${name}" (${install})`,
       );
     }
   }
@@ -332,6 +386,21 @@ test("renaming the npm pin release-age step preserves its checks", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
   npmPinStep(steps).name = "Check npm publish age";
   expect(npmPinStepProblems(steps)).toEqual([]);
+});
+
+test.each([
+  ["npm ci", "npm ci"],
+  ["npm install --ignore-scripts", "npm install"],
+  ["npm --prefix . install", "npm install"],
+  ["sfw bun install --frozen-lockfile", "bun install"],
+  ["bun \\\n  install --frozen-lockfile", "bun install"],
+  ["pnpm install --frozen-lockfile", "pnpm install"],
+  ["yarn install --immutable", "yarn install"],
+  ["bun --no-install scripts/check-lockfile-release-age.mjs", undefined],
+  ["npm install -g npm@11.21.1", undefined],
+  ["bun run build", undefined],
+] satisfies [string, string | undefined][])("run step %j reads as install %j", (run, expected) => {
+  expect(installCommand(run)).toBe(expected);
 });
 
 test.each([
@@ -368,7 +437,45 @@ test.each([
     (steps: Step[]) => {
       npmPinStep(steps).if = `$` + `{{ false }}`;
     },
-    "the npm pin release-age step must not have an if",
+    'the npm pin release-age step must not set "if"',
+  ],
+  [
+    "given an env",
+    (steps: Step[]) => {
+      npmPinStep(steps).env = { CI: "" };
+    },
+    'the npm pin release-age step must not set "env"',
+  ],
+  [
+    "given an id",
+    (steps: Step[]) => {
+      npmPinStep(steps).id = "npm-pin";
+    },
+    'the npm pin release-age step must not set "id"',
+  ],
+  [
+    "given a continue-on-error",
+    (steps: Step[]) => {
+      npmPinStep(steps)["continue-on-error"] = true;
+    },
+    'the npm pin release-age step must not set "continue-on-error"',
+  ],
+  [
+    "preceded by a bun install step",
+    (steps: Step[]) => {
+      steps.splice(steps.indexOf(npmPinStep(steps)), 0, {
+        name: "Install deps",
+        run: "sfw bun install --frozen-lockfile",
+      });
+    },
+    'the npm pin release-age step must run before the install in "Install deps" (bun install)',
+  ],
+  [
+    "preceded by an npm ci step",
+    (steps: Step[]) => {
+      steps.splice(steps.indexOf(npmPinStep(steps)), 0, { name: "Install", run: "npm ci" });
+    },
+    'the npm pin release-age step must run before the install in "Install" (npm ci)',
   ],
 ] satisfies [string, (steps: Step[]) => void, string][])(
   "npm pin release-age step %s is red",
