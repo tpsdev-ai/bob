@@ -1,3 +1,6 @@
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
 import { isAlias, isMap, isSeq, type Node, parseDocument } from "yaml";
 import { DEFAULT_PROVIDER_REGISTRY, type ProviderRegistry } from "./provider-registry.js";
 import { MAX_TIMER_MS, type RunLimitsBlock } from "./run-bounds.js";
@@ -640,6 +643,56 @@ export function readResident(yamlText: string): boolean {
     lineOf(yamlText, /^resident[ \t]*:/m),
     "`resident` must be true or false.",
   );
+}
+
+export function readWorkRoot(yamlText: string, home: string = homedir()): string | undefined {
+  const raw = parseBobYamlBlock(yamlText, "work_root");
+  if (raw === undefined) return undefined;
+  const line = lineOf(yamlText, /^[ \t]*(?:work_root|"work_root"|'work_root')[ \t]*:/m);
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new BobYamlError(
+      "work_root",
+      line,
+      `"work_root" must be one absolute path to an existing directory — write it as "work_root: <path>".`,
+    );
+  }
+  const value = raw.trim();
+  const expanded =
+    value === "~" ? home : value.startsWith("~/") ? `${home}/${value.slice(2)}` : value;
+  if (!isAbsolute(expanded)) {
+    throw new BobYamlError(
+      "work_root",
+      line,
+      `"work_root" must be an absolute path — write the full path or start it with "~/".`,
+    );
+  }
+  const root = resolve(expanded);
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(root);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "";
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new BobYamlError(
+        "work_root",
+        line,
+        `"work_root" points at ${root}, which does not exist — create that directory or set "work_root" to an existing one.`,
+      );
+    }
+    throw new BobYamlError(
+      "work_root",
+      line,
+      `"work_root" could not be read at ${root} (${code === "" ? "unknown error" : code}) — check the path and its permissions.`,
+    );
+  }
+  if (!stat.isDirectory()) {
+    throw new BobYamlError(
+      "work_root",
+      line,
+      `"work_root" points at ${root}, which is not a directory — set it to the directory that holds the task work trees.`,
+    );
+  }
+  return root;
 }
 
 // 1-based line of the first match of `pattern`, or 1. Used to point a config

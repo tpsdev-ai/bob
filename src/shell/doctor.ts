@@ -76,6 +76,7 @@ import {
   readProviderLimits,
   readResident,
   readTools,
+  readWorkRoot,
   type ToolsBlock,
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
@@ -478,6 +479,27 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   } catch (err) {
     bobYamlReadError =
       (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
+  }
+
+  if (yamlText !== undefined) {
+    let workRoot: string | undefined;
+    try {
+      workRoot = readWorkRoot(yamlText, home);
+    } catch (err) {
+      checks.push({
+        name: "work root",
+        status: "fail",
+        detail: err instanceof Error ? err.message : String(err),
+        fix: `set "work_root" in ${bobYamlPath} to an absolute path to an existing directory, then re-run 'bob doctor ${opts.name}'`,
+      });
+    }
+    if (workRoot !== undefined) {
+      checks.push({
+        name: "work root",
+        status: "ok",
+        detail: `work_root ${workRoot}`,
+      });
+    }
   }
 
   if (bobYamlReadError !== undefined) {

@@ -63,6 +63,7 @@ import {
   readSessionBudget,
   readToolLoopLimit,
   readTools,
+  readWorkRoot,
 } from "./bob-yaml.js";
 import {
   assertConditionalTools,
@@ -86,9 +87,12 @@ import { collectCredentialPaths } from "./confined-read.js";
 import { configHoldsWeb, gatedNoteInjection } from "./data-class.js";
 import {
   captureRepositoryState,
+  captureWorkRootSnapshot,
   isCommandRunnerTool,
   isVerifiedEdit,
+  isWorkRootEditVerified,
   type RepositoryState,
+  type WorkRootLaunchSnapshot,
 } from "./edit-evidence.js";
 import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES } from "./empty-response.js";
 import {
@@ -1022,6 +1026,10 @@ async function runBoundedSession(
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
       : { kind: "unavailable" };
+  const workRootAtLaunch: WorkRootLaunchSnapshot | undefined =
+    requireEditOrBlocked && resolved.workRoot !== undefined
+      ? captureWorkRootSnapshot(resolved.workRoot)
+      : undefined;
   const commandStarts = new Map<string, { toolName: string; before: RepositoryState }>();
   const seenCommandIds = new Set<string>();
   const finalizeAbort = async (reason: TerminationReason): Promise<RunResult> => {
@@ -1765,7 +1773,8 @@ async function runBoundedSession(
         cwd: config.cwd,
         before: repositoryAtLaunch,
         after: captureRepositoryState(config.cwd, repositoryAtLaunch),
-      })
+      }) &&
+      !(workRootAtLaunch !== undefined && isWorkRootEditVerified(workRootAtLaunch))
     ) {
       if (!/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {
         exitCode = 1;
@@ -2100,6 +2109,10 @@ export interface ResolvedRunConfig {
   // over the role's role.json `exploration_budget`. Absent when neither sets one,
   // which leaves the budget off.
   explorationBudget?: number;
+  // bob#425 — bob.yaml `work_root`: checks immediate child directories (excluding
+  // symlinks), not a repository at `work_root` itself, so point `work_root` at
+  // the directory that holds the task repositories.
+  workRoot?: string;
   // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
   // when the role does not; used by bob run and launch with a prompt.
   requireEditOrBlocked?: true;
@@ -2727,6 +2740,8 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // bob#279: the exploration budget (bob.yaml `run.exploration_budget` over
   // role.json `exploration_budget`), or undefined when neither sets one.
   const explorationBudget = resolveExplorationBudget(yamlText);
+  // bob#425: the declared work root, validated at load.
+  const workRoot = readWorkRoot(yamlText, homedir());
   // bob#283: the role's edit-or-blocked opt-in.
   const requireEditOrBlocked = resolveRequireEditOrBlocked(yamlText);
   // bob#365: the role's final-report markers, if it declares any.
@@ -2810,6 +2825,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilities,
     toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     runLimits: readRunLimits(yamlText),
+    ...(workRoot !== undefined ? { workRoot } : {}),
     ...(explorationBudget !== undefined ? { explorationBudget } : {}),
     ...(requireEditOrBlocked ? { requireEditOrBlocked: true as const } : {}),
     ...(finalMarkers !== undefined ? { finalMarkers } : {}),
@@ -2919,10 +2935,6 @@ function assistantContentToText(content: unknown): string {
   return "";
 }
 
-// Read ~/agents/<name>/bob.yaml, erroring with an onboard hint when absent.
-// Returned text is parsed by the targeted readers below + the capability
-// loader — hand-rolled, except the provider block, which is parsed by the YAML
-// library (parseBobYamlBlock in bob-yaml.ts).
 function readBobYaml(agentDir: string, name: string): string {
   const yamlPath = join(agentDir, "bob.yaml");
   if (!existsSync(yamlPath)) {
@@ -2930,7 +2942,17 @@ function readBobYaml(agentDir: string, name: string): string {
       `bob run ${name}: config not found at ${yamlPath} (run 'bob onboard ${name}' first)`,
     );
   }
-  return readFileSync(yamlPath, "utf8");
+  const text = readFileSync(yamlPath, "utf8");
+  const lines = text.split(/\r?\n/);
+  const content = lines.filter((line) => line.trim() !== "" && !line.trimStart().startsWith("#"));
+  const indent = content.reduce(
+    (min, line) => Math.min(min, line.length - line.trimStart().length),
+    Infinity,
+  );
+  if (!Number.isFinite(indent) || indent === 0) return text;
+  return lines
+    .map((line) => (line.startsWith(" ".repeat(indent)) ? line.slice(indent) : line))
+    .join("\n");
 }
 
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
