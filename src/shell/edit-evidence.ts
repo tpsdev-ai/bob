@@ -675,18 +675,74 @@ function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
   }
 }
 
-function commitChangedContent(cwd: string, commit: string, timeoutMs: number): boolean {
-  const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, timeoutMs)
+function commitChangedContent(
+  cwd: string,
+  commit: string,
+  remainingMs: () => number,
+  replacedCommit?: string,
+): boolean {
+  const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, remainingMs())
     .toString()
     .split("\n\n", 1)[0]
     .split("\n");
-  const parent = headers.find((line) => line.startsWith("parent "))?.slice(7);
+  const parent = replacedCommit ?? headers.find((line) => line.startsWith("parent "))?.slice(7);
   if (parent === undefined) {
-    return readGit(cwd, ["ls-tree", commit], undefined, timeoutMs).length > 0;
+    return readGit(cwd, ["ls-tree", commit], undefined, remainingMs()).length > 0;
   }
   return (
-    gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, timeoutMs) !==
-    gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, timeoutMs)
+    gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, remainingMs()) !==
+    gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, remainingMs())
+  );
+}
+
+function amendChangedContent(
+  cwd: string,
+  commit: string,
+  selector: string,
+  action: string,
+  remainingMs: () => number,
+): boolean {
+  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  if (!selected) return false;
+  const ref = selected[1];
+  const sharedHead = ref === "main-worktree/HEAD" || /^worktrees\/[^/]+\/HEAD$/.test(ref);
+  const logPath = sharedHead
+    ? join(
+        gitLine(
+          cwd,
+          ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+          undefined,
+          remainingMs(),
+        ),
+        ...(ref === "main-worktree/HEAD"
+          ? ["logs", "HEAD"]
+          : ["worktrees", ref.split("/")[1], "logs", "HEAD"]),
+      )
+    : gitLine(
+        cwd,
+        ["rev-parse", "--path-format=absolute", "--git-path", `logs/${ref}`],
+        undefined,
+        remainingMs(),
+      );
+  // Use the old id in the amend's own record; deny credit if it cannot be read.
+  const records = readFileSync(logPath, "utf8")
+    .split("\n")
+    .map((line) =>
+      line.match(
+        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/,
+      ),
+    )
+    .filter(
+      (record) =>
+        record !== null &&
+        record[2] === commit &&
+        record[3] === selected[2] &&
+        record[4] === selected[3] &&
+        record[5] === action,
+    );
+  const replacedCommit = records.length === 1 ? records[0]?.[1] : undefined;
+  return (
+    replacedCommit !== undefined && commitChangedContent(cwd, commit, remainingMs, replacedCommit)
   );
 }
 
@@ -696,23 +752,34 @@ function hasCommitLabelWithContentChange(
   timeoutMs: number,
   launchedAtSeconds: number,
 ): boolean {
+  const deadline = performance.now() + timeoutMs;
+  const remainingMs = () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("reflog scan deadline exceeded");
+    return Math.ceil(remaining);
+  };
   try {
     const reflog = readGit(
       cwd,
       ["reflog", "show", "--all", "--date=raw", "--format=%H%x00%gD%x00%gs"],
       undefined,
-      timeoutMs,
+      remainingMs(),
     ).toString();
     for (const entry of reflog.split("\n")) {
-      const [commit, selector, action] = entry.split("\0");
-      const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
-      if (
-        timestamp !== undefined &&
-        Number(timestamp) >= launchedAtSeconds &&
-        /^commit(?: \(initial\))?:/.test(action ?? "") &&
-        commitChangedContent(cwd, commit, timeoutMs)
-      )
-        return true;
+      if (performance.now() >= deadline) return false;
+      try {
+        const [commit, selector, action] = entry.split("\0");
+        const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
+        if (
+          timestamp !== undefined &&
+          Number(timestamp) >= launchedAtSeconds &&
+          ((/^commit(?: \(initial\))?:/.test(action ?? "") &&
+            commitChangedContent(cwd, commit, remainingMs)) ||
+            (action?.startsWith("commit (amend):") &&
+              amendChangedContent(cwd, commit, selector, action, remainingMs)))
+        )
+          return performance.now() < deadline;
+      } catch {}
     }
   } catch {
     return false;

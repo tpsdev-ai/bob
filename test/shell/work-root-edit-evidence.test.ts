@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -335,6 +336,207 @@ describe("completion gate under a declared work root", () => {
     expect(git(repo, "reflog", "show", "--format=%gs")).toContain(
       "commit (amend): amended fixture",
     );
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  }, 20_000);
+
+  it("does not credit a no-op amend after its predecessor reflog entry is pruned", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    let replaced = "";
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          writeFileSync(join(repo, "tracked"), "replacement content\n");
+          replaced = seedSuccessor(repo);
+          git(repo, "commit", "--amend", "--quiet", "-m", "no-op amendment");
+          const branch = git(repo, "symbolic-ref", "HEAD");
+          git(repo, "reflog", "delete", `${branch}@{1}`);
+          git(repo, "reflog", "delete", "HEAD@{1}");
+        },
+      },
+    ]);
+    expect(git(repo, "reflog", "show", "--format=%gs")).toContain(
+      "commit (amend): no-op amendment",
+    );
+    expect(git(repo, "rev-parse", "HEAD^{tree}")).toBe(
+      git(repo, "rev-parse", `${replaced}^{tree}`),
+    );
+    expect(git(repo, "rev-parse", "HEAD@{1}^{tree}")).not.toBe(
+      git(repo, "rev-parse", "HEAD^{tree}"),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  }, 20_000);
+
+  it("credits a changed-tree amend in a fresh clone into an initially empty child", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    writeFileSync(join(source, "tracked"), "source content\n");
+    seedSuccessor(source);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          writeFileSync(join(repo, "tracked"), "original\n");
+          git(repo, "add", ".");
+          git(repo, "commit", "--amend", "--allow-empty", "--quiet", "-m", "amended fixture");
+        },
+      },
+    ]);
+    expect(git(repo, "rev-parse", "HEAD^{tree}")).toBe(git(repo, "rev-parse", "HEAD~1^{tree}"));
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  }, 20_000);
+
+  it("credits a changed-tree amend in a detached linked worktree of a new child clone", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const repo = join(workRoot, "alpha");
+    const linked = join(repo, "linked");
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          git(repo, "worktree", "add", "--quiet", "--detach", linked);
+          writeFileSync(join(linked, "tracked"), "linked edit\n");
+          git(linked, "add", ".");
+          git(linked, "commit", "--amend", "--quiet", "-m", "linked amendment");
+        },
+      },
+    ]);
+    expect(git(repo, "reflog", "show", "--all", "--format=%gD")).toContain(
+      "worktrees/linked/HEAD@{",
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  }, 20_000);
+
+  it("credits a detached main-worktree amend from a new linked child", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const repo = join(agentsRoot, "clone");
+    const linked = join(workRoot, "linked");
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          git(repo, "checkout", "--detach", "--quiet");
+          git(repo, "worktree", "add", "--quiet", "--detach", linked);
+          writeFileSync(join(repo, "tracked"), "main edit\n");
+          git(repo, "add", ".");
+          git(repo, "commit", "--amend", "--quiet", "-m", "main amendment");
+        },
+      },
+    ]);
+    expect(git(linked, "reflog", "show", "--all", "--format=%gD")).toContain(
+      "main-worktree/HEAD@{",
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  }, 20_000);
+
+  it("bounds slow eligible reflog entries by the child's scan budget without credit", () => {
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    const head = init(repo);
+    const spawn = childProcess.spawnSync;
+    const timeouts: number[] = [];
+    let elapsed = 0;
+    let eligibleEntries = 0;
+    const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      const result = spawn(...args);
+      const command = args[1] as string[];
+      if (args[0] === "git" && command.includes("reflog")) {
+        const entries = Array.from(
+          { length: 3 },
+          (_, index) =>
+            `${head}\0HEAD@{${snapshot.launchedAtSeconds + index} +0000}\0commit: fixture`,
+        );
+        eligibleEntries = entries.length;
+        elapsed += 25;
+        return { ...result, stdout: Buffer.from(`${entries.join("\n")}\n`) };
+      }
+      if (args[0] === "git" && command.includes("cat-file")) {
+        const timeout = (args[2] as { timeout: number }).timeout;
+        timeouts.push(timeout);
+        elapsed += timeout + 1;
+        return {
+          ...result,
+          status: null,
+          error: Object.assign(new Error("git timed out"), { code: "ETIMEDOUT" }),
+        };
+      }
+      return result;
+    });
+    try {
+      expect(isWorkRootEditVerified(snapshot, { gitTimeoutMs: 100 })).toBe(false);
+      expect(eligibleEntries).toBeGreaterThan(1);
+      expect(elapsed).toBeLessThanOrEqual(101);
+      expect(timeouts).toEqual([75]);
+    } finally {
+      probe.mockRestore();
+      clock.mockRestore();
+    }
+  }, 20_000);
+
+  it("credits a content commit after an unreadable amend entry", () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    git(agentsRoot, "clone", "--quiet", source, repo);
+    writeFileSync(join(repo, "tracked"), "committed edit\n");
+    const valid = commit(repo);
+    git(repo, "commit", "--amend", "--quiet", "-m", "unreadable amendment");
+    const amended = git(repo, "rev-parse", "HEAD");
+    const spawn = childProcess.spawnSync;
+    let failedEntryReads = 0;
+    let validEntryReads = 0;
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      const result = spawn(...args);
+      const command = args[1] as string[];
+      if (args[0] === "git" && command.includes("cat-file")) {
+        if (command.includes(amended)) {
+          failedEntryReads++;
+          return { ...result, status: 1 };
+        }
+        if (command.includes(valid)) validEntryReads++;
+      }
+      return result;
+    });
+    try {
+      expect(isWorkRootEditVerified(snapshot)).toBe(true);
+      expect(failedEntryReads).toBeGreaterThan(0);
+      expect(validEntryReads).toBeGreaterThan(0);
+    } finally {
+      probe.mockRestore();
+    }
+  }, 20_000);
+
+  it("does not credit a content commit through a child symlink created after launch", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          symlinkSync(source, join(workRoot, "linked"), "dir");
+          writeFileSync(join(source, "tracked"), "outside edit\n");
+          commit(source);
+        },
+      },
+    ]);
     expect(result.exitCode).toBe(1);
     expect(result.noEditNoBlocked).toBe(true);
   }, 20_000);
