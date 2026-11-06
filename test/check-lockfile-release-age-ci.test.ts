@@ -13,27 +13,36 @@ const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs"
 const NPM_SELF_UPDATE = "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org";
 const NPM_UPGRADE_STEP = "Upgrade npm to a staging-capable version";
 const SELF_UPDATE = /^npm install -g npm@11\.21\.1 --registry=https:\/\/registry\.npmjs\.org$/;
-const NPM_LINES = new Map<string, { step: string; count: number }>([
-  [NPM_PIN_CHECKER, { step: "npm pin release-age bake", count: 1 }],
-  [NPM_SELF_UPDATE, { step: "Upgrade npm to a staging-capable version", count: 1 }],
+function npmLineKey(step: string, line: string): string {
+  return JSON.stringify([step, line]);
+}
+const NPM_LINES = new Map<string, number>([
+  [npmLineKey("npm pin release-age bake", NPM_PIN_CHECKER), 1],
+  [npmLineKey(NPM_UPGRADE_STEP, NPM_SELF_UPDATE), 1],
   [
-    'v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "11.21.1" || { echo "npm is $v, expected the pinned 11.21.1" >&2; exit 1; }',
-    { step: "Stage-publish", count: 1 },
+    npmLineKey(
+      "Stage-publish",
+      'v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "11.21.1" || { echo "npm is $v, expected the pinned 11.21.1" >&2; exit 1; }',
+    ),
+    1,
   ],
-  ["npm stage publish", { step: "Stage-publish", count: 1 }],
-  ['echo "::group::npm stage publish — $name"', { step: "Stage-publish", count: 1 }],
+  [npmLineKey("Stage-publish", "npm stage publish"), 1],
+  [npmLineKey("Stage-publish", 'echo "::group::npm stage publish — $name"'), 1],
   [
-    'echo "\\`@tpsdev-ai/bob\\` submitted to npm **staging** with provenance."',
-    { step: "Summary", count: 1 },
+    npmLineKey(
+      "Summary",
+      'echo "\\`@tpsdev-ai/bob\\` submitted to npm **staging** with provenance."',
+    ),
+    1,
   ],
   [
-    'echo "**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),"',
-    { step: "Summary", count: 1 },
+    npmLineKey(
+      "Summary",
+      'echo "**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),"',
+    ),
+    1,
   ],
-  [
-    'echo "Or: \\`npm stage list\\` then \\`npm stage approve <id>\\`."',
-    { step: "Summary", count: 1 },
-  ],
+  [npmLineKey("Summary", 'echo "Or: \\`npm stage list\\` then \\`npm stage approve <id>\\`."'), 1],
 ]);
 const PINNED_BUN = JSON.parse(
   readFileSync(join(REPO, "package.json"), "utf8"),
@@ -317,21 +326,26 @@ const NPM_PIN_PREFIX = [
   { run: CHECKER, keys: ["name", "run"] },
 ];
 
-// Join backslash continuations; each trimmed line containing literal npm/npx
-// (case-insensitive substrings) must match the allowlist with exact counts.
-// Changed, added or duplicated npm lines need an allowlist edit.
+// Join backslash continuations; pin each stage-publish step's trimmed npm/npx-containing
+// lines (case-insensitive substrings) to the allowlist with exact counts per step.
 // Deliberate shell obfuscation without literal npm/npx (e.g. n"p"m) is out of scope.
 function npmLineProblems(steps: Step[]): string[] {
   const problems: string[] = [];
-  const occurrences = new Map<string, string[]>();
+  const occurrences = new Map<string, number>();
+  const names = new Set<string>();
   for (const step of steps) {
+    if (step.name !== undefined) {
+      if (names.has(step.name)) {
+        problems.push(`${step.name}: duplicate step name prevents per-step npm/npx counts`);
+      }
+      names.add(step.name);
+    }
     const lines = (step.run ?? "").replace(/\\\r?\n/g, "").split("\n");
     for (const raw of lines) {
       const line = raw.trim();
       if (!/npm|npx/i.test(line)) continue;
-      const names = occurrences.get(line) ?? [];
-      names.push(step.name ?? "<unnamed>");
-      occurrences.set(line, names);
+      const key = npmLineKey(step.name ?? "<unnamed>", line);
+      occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
       if (line === NPM_SELF_UPDATE) {
         if (step.name !== NPM_UPGRADE_STEP || step.run?.trim() !== NPM_SELF_UPDATE) {
           problems.push("npm self-update must be the exact named step");
@@ -339,19 +353,20 @@ function npmLineProblems(steps: Step[]): string[] {
       }
     }
   }
-  for (const [line, names] of occurrences) {
-    if (!NPM_LINES.has(line)) {
+  for (const [key, count] of occurrences) {
+    if (!NPM_LINES.has(key)) {
+      const [name, line] = JSON.parse(key) as [string, string];
       problems.push(
-        `${[...new Set(names)].join(", ")}: npm/npx line is not allowlisted: ${line} (expected 0, found ${names.length})`,
+        `${name}: npm/npx line is not allowlisted: ${line} (expected 0, found ${count})`,
       );
     }
   }
-  for (const [line, expected] of NPM_LINES) {
-    const names = occurrences.get(line) ?? [];
-    if (names.length !== expected.count) {
-      const where = [...new Set([expected.step, ...names])].join(", ");
+  for (const [key, count] of NPM_LINES) {
+    const found = occurrences.get(key) ?? 0;
+    if (found !== count) {
+      const [name, line] = JSON.parse(key) as [string, string];
       problems.push(
-        `${where}: npm/npx line ${JSON.stringify(line)}: expected ${expected.count}, found ${names.length}`,
+        `${name}: npm/npx line ${JSON.stringify(line)}: expected ${count}, found ${found}`,
       );
     }
   }
@@ -459,10 +474,15 @@ function npmPinStep(steps: Step[]): Step {
   return step;
 }
 
-test("renaming the npm pin release-age step preserves its checks", () => {
+test("renaming the npm pin release-age step needs an allowlist edit", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
   npmPinStep(steps).name = "Check npm publish age";
-  expect(npmPinStepProblems(steps)).toEqual([]);
+  expect(npmPinStepProblems(steps)).toContain(
+    `Check npm publish age: npm/npx line is not allowlisted: ${NPM_PIN_CHECKER} (expected 0, found 1)`,
+  );
+  expect(npmPinStepProblems(steps)).toContain(
+    `npm pin release-age bake: npm/npx line ${JSON.stringify(NPM_PIN_CHECKER)}: expected 1, found 0`,
+  );
 });
 
 test.each([
@@ -778,6 +798,45 @@ test.each([
   },
   5_000,
 );
+
+test("npm line counts refuse a Summary echo moved to Stage-publish", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  const summary = steps.find((step) => step.name === "Summary");
+  const publish = steps.find((step) => step.name === "Stage-publish");
+  if (summary?.run === undefined || publish?.run === undefined) {
+    throw new Error("Missing Summary or Stage-publish");
+  }
+  const line = summary.run
+    .split("\n")
+    .find((raw) => /npm|npx/i.test(raw))
+    ?.trim();
+  if (line === undefined) throw new Error("Missing Summary npm/npx line");
+  summary.run = summary.run
+    .split("\n")
+    .filter((raw) => raw.trim() !== line)
+    .join("\n");
+  publish.run += `\n${line}`;
+  const problems = npmLineProblems(steps);
+  expect(problems).toContain(`Summary: npm/npx line ${JSON.stringify(line)}: expected 1, found 0`);
+  expect(problems).toContain(
+    `Stage-publish: npm/npx line is not allowlisted: ${line} (expected 0, found 1)`,
+  );
+}, 5_000);
+
+test("npm line counts refuse a Summary echo moved to another Summary step", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  const summary = steps.find((step) => step.name === "Summary");
+  if (summary?.run === undefined) throw new Error("Missing Summary");
+  const lines = summary.run.split("\n");
+  const index = lines.findIndex((line) => /npm|npx/i.test(line));
+  if (index === -1) throw new Error("Missing Summary npm/npx line");
+  const [line] = lines.splice(index, 1);
+  summary.run = lines.join("\n");
+  steps.push({ name: "Summary", run: line });
+  expect(npmLineProblems(steps)).toContain(
+    "Summary: duplicate step name prevents per-step npm/npx counts",
+  );
+}, 5_000);
 
 test("npm allowlist requires the self-update step name", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
