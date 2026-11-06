@@ -9,6 +9,7 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
+const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs";
 const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
   ["actions/checkout", ["fetch-depth", "persist-credentials"]],
   ["oven-sh/setup-bun", ["bun-version"]],
@@ -255,6 +256,22 @@ test("workflow keys, conditions, shapes and checker ordering", () => {
     return orderingProblems(workflow, `.github/workflows/${name}`);
   });
   expect(problems).toEqual([]);
+});
+
+test("ci.yml action-pins runs the npm pin release-age checker with no condition", () => {
+  const workflow = loadWorkflow("ci.yml");
+  const job = workflow.jobs?.["action-pins"];
+  if (job === undefined) throw new Error("Missing action-pins");
+  expect(job).not.toHaveProperty("if");
+  expect(job).not.toHaveProperty("continue-on-error");
+  const matches = (job.steps ?? []).filter(
+    (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
+  );
+  expect(matches).toHaveLength(1);
+  const step = matches[0];
+  if (step === undefined) throw new Error("Missing npm pin release-age checker step");
+  expect(step.if).toBeUndefined();
+  expect(step["continue-on-error"]).toBeUndefined();
 });
 
 test.each([

@@ -40,6 +40,8 @@ jobs:
         run: bun --no-install scripts/check-action-pins.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      - name: npm pin release-age bake
+        run: bun --no-install scripts/check-npm-pin-release-age.mjs
 
   build:
     name: Build (TypeScript strict)
