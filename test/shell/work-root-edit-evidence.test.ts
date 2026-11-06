@@ -444,7 +444,10 @@ describe("completion gate under a declared work root", () => {
   it("credits init and a content commit in an initially empty child directory", async () => {
     const repo = join(workRoot, "alpha");
     mkdirSync(repo);
-    expect(captureWorkRootSnapshot(workRoot)?.trees.get("alpha")?.kind).toBe("not a repo");
+    expect(captureWorkRootSnapshot(workRoot)?.trees.get("alpha")).toEqual({
+      kind: "not a repo",
+      emptyAtLaunch: true,
+    });
     const result = await run([
       {
         toolName: "run",
@@ -457,6 +460,71 @@ describe("completion gate under a declared work root", () => {
     ]);
     expect(result.exitCode).toBe(0);
     expect(result.noEditNoBlocked).toBeUndefined();
+  });
+
+  it("does not credit init and a commit of pre-existing files in a non-repository child", async () => {
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    writeFileSync(join(repo, "tracked"), "pre-existing\n");
+    const snapshot = snapshotRoot(workRoot);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(repo, "init", "--quiet");
+          commit(repo);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(snapshot.trees.get("alpha")).toEqual({
+      kind: "not a repo",
+      emptyAtLaunch: false,
+    });
+  });
+
+  it("credits a content commit in an unborn repository empty at launch except for .git", async () => {
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    const snapshot = snapshotRoot(workRoot);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          writeFileSync(join(repo, "tracked"), "initial content\n");
+          commit(repo);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+    expect(snapshot.trees.get("alpha")).toEqual({
+      kind: "unborn",
+      emptyAtLaunch: true,
+    });
+  });
+
+  it("does not credit a commit of pre-existing files in an unborn repository", async () => {
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    writeFileSync(join(repo, "tracked"), "pre-existing\n");
+    git(repo, "add", ".");
+    const snapshot = snapshotRoot(workRoot);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => commit(repo),
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(snapshot.trees.get("alpha")).toEqual({
+      kind: "unborn",
+      emptyAtLaunch: false,
+    });
   });
 
   it("credits a content commit with a reflog time in the launch second", () => {

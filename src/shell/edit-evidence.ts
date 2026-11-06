@@ -621,7 +621,7 @@ export type WorkTreeLaunchState =
       gitDir: string;
       gitDirId: string;
     }
-  | { kind: "not a repo" }
+  | { kind: "not a repo" | "unborn"; emptyAtLaunch: boolean }
   | { kind: "unknown" };
 
 export interface WorkRootLaunchSnapshot {
@@ -646,9 +646,12 @@ function workTreeCandidates(root: string): string[] {
 function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
   try {
     const state = captureRepositoryState(path, undefined, { gitTimeoutMs: timeoutMs });
-    if (state.kind === "not a git work tree") return { kind: "not a repo" };
+    if (state.kind === "not a git work tree")
+      return { kind: "not a repo", emptyAtLaunch: readdirSync(path).length === 0 };
     if (state.kind !== "git" || state.historyCheckSkipped || state.workTree !== realpathSync(path))
       return { kind: "unknown" };
+    if (unbornHead(state, timeoutMs))
+      return { kind: "unborn", emptyAtLaunch: readdirSync(path).every((name) => name === ".git") };
     const stat = lstatSync(state.gitDir, { bigint: true });
     return {
       kind: "known",
@@ -737,7 +740,10 @@ export function captureWorkRootSnapshot(
 
 /**
  * Existing trees need changed tracked content absent from launch history.
- * New trees use a content-change and reflog-label heuristic.
+ * New children use a content-change and reflog-label heuristic; children confirmed
+ * not a repo or unborn at launch must have been empty (excluding .git for unborn).
+ * Any content change in a qualifying tree counts, including one unrelated to the
+ * task; the operator chooses the root. The gate refuses a claim with no change at all.
  * Reflog and committer times use the local clock / GIT_COMMITTER_DATE;
  * this is not proof against a deliberately forged clock.
  */
@@ -772,6 +778,7 @@ export function isWorkRootEditVerified(
       if (end.tree !== launch.tree && !launch.launchTrees.has(end.tree)) return true;
       continue;
     }
+    if (launch && !launch.emptyAtLaunch) continue;
     if (hasCommitLabelWithContentChange(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
   }
   return false;
