@@ -6,7 +6,7 @@
 import { expect, setSystemTime, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkNpmPinReleaseAge, readNpmPin } from "../scripts/check-npm-pin-release-age.mjs";
@@ -29,17 +29,13 @@ function cliTimes() {
 
 type Registry = { url: string; requests: string[]; close: () => Promise<void> };
 
-async function startRegistry(times: Record<string, string>): Promise<Registry> {
+async function serve(
+  respond: (request: IncomingMessage, response: ServerResponse) => void,
+): Promise<Registry> {
   const requests: string[] = [];
   const server = createServer((request, response) => {
     requests.push(request.url ?? "");
-    if (request.url === "/npm") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ name: "npm", time: times }));
-      return;
-    }
-    response.writeHead(404);
-    response.end();
+    respond(request, response);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -55,6 +51,18 @@ async function startRegistry(times: Record<string, string>): Promise<Registry> {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+async function startRegistry(times: Record<string, string>): Promise<Registry> {
+  return serve((request, response) => {
+    if (request.url === "/npm") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ name: "npm", time: times }));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
 }
 
 function fixtureEnv() {
@@ -278,3 +286,60 @@ test("the CLI refuses --registry under CI", async () => {
     await registry.close();
   }
 }, 15_000);
+
+const PASS_LINE = "at least 7 days old";
+
+// A loopback URL with nothing listening on it: the port is bound and freed.
+async function closedLoopbackUrl(): Promise<string> {
+  const registry = await serve((_request, response) => {
+    response.writeHead(204);
+    response.end();
+  });
+  const url = registry.url;
+  await registry.close();
+  return url;
+}
+
+// A failed lookup is a lookup error (exit 2), not a verdict on the pin, so the
+// CLI must exit non-zero and never print the pass line.
+async function expectLookupFailure(url: string, stderrNeedle?: string): Promise<void> {
+  const result = await runCli(["--registry", url], fixtureEnv());
+  expect(result.status, result.stderr).toBe(2);
+  expect(result.stderr).toContain("PublishTimeLookupFailed");
+  expect(result.stderr).toContain("registry lookup failed for npm");
+  if (stderrNeedle !== undefined) expect(result.stderr).toContain(stderrNeedle);
+  expect(result.stdout).not.toContain(PASS_LINE);
+  expect(result.stderr).not.toContain(PASS_LINE);
+}
+
+test("the CLI exits non-zero when the registry refuses the connection", async () => {
+  await expectLookupFailure(await closedLoopbackUrl());
+}, 30_000);
+
+test.each([500, 503])(
+  "the CLI exits non-zero when the registry answers HTTP %s",
+  async (status) => {
+    const registry = await serve((_request, response) => {
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unavailable" }));
+    });
+    try {
+      await expectLookupFailure(registry.url, `HTTP ${status}`);
+    } finally {
+      await registry.close();
+    }
+  },
+  30_000,
+);
+
+test("the CLI exits non-zero when the registry answers a non-JSON body", async () => {
+  const registry = await serve((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end("<html>not the registry</html>");
+  });
+  try {
+    await expectLookupFailure(registry.url);
+  } finally {
+    await registry.close();
+  }
+}, 30_000);

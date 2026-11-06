@@ -276,6 +276,12 @@ test("ci.yml action-pins runs the npm pin release-age checker with no condition"
   expect(step["continue-on-error"]).toBeUndefined();
 });
 
+const NPM_PIN_PREFIX = [
+  { action: "actions/checkout", keys: ["name", "uses", "with"] },
+  { action: "oven-sh/setup-bun", keys: ["name", "uses", "with"] },
+  { run: CHECKER, keys: ["name", "run"] },
+];
+
 function npmPinStepProblems(steps: Step[]): string[] {
   const matches = steps.filter(
     (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
@@ -286,9 +292,34 @@ function npmPinStepProblems(steps: Step[]): string[] {
   const step = matches[0];
   const index = steps.indexOf(step);
   const problems: string[] = [];
-  if (step.if !== undefined) problems.push("the npm pin release-age step must not have an if");
-  if (step["continue-on-error"] !== undefined) {
-    problems.push("the npm pin release-age step must not have continue-on-error");
+  for (const key of Object.keys(step)) {
+    if (key !== "name" && key !== "run") {
+      problems.push(`the npm pin release-age step must not set "${key}"`);
+    }
+  }
+  for (const [position, candidate] of steps.slice(0, index).entries()) {
+    const expected = NPM_PIN_PREFIX[position];
+    const label = candidate.name ?? candidate.uses ?? candidate.run ?? "<unnamed>";
+    const where = `before the npm pin release-age step, step ${position + 1} ("${label}")`;
+    if (expected === undefined) {
+      problems.push(`${where}: no additional step is allowed`);
+      continue;
+    }
+    problems.push(...keyProblems(candidate, expected.keys, where));
+    if (expected.action !== undefined) {
+      if (actionOf(candidate) !== expected.action) {
+        problems.push(`${where}: expected ${expected.action}`);
+      } else {
+        problems.push(...actionProblems(candidate, where));
+      }
+    } else if (candidate.run?.trim() !== expected.run) {
+      problems.push(`${where}: expected ${expected.run}`);
+    }
+  }
+  if (index !== NPM_PIN_PREFIX.length) {
+    problems.push(
+      "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
+    );
   }
   const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
   if (upgrade === -1) {
@@ -368,7 +399,28 @@ test.each([
     (steps: Step[]) => {
       npmPinStep(steps).if = `$` + `{{ false }}`;
     },
-    "the npm pin release-age step must not have an if",
+    'the npm pin release-age step must not set "if"',
+  ],
+  [
+    "given an env",
+    (steps: Step[]) => {
+      npmPinStep(steps).env = { CI: "" };
+    },
+    'the npm pin release-age step must not set "env"',
+  ],
+  [
+    "given an id",
+    (steps: Step[]) => {
+      npmPinStep(steps).id = "npm-pin";
+    },
+    'the npm pin release-age step must not set "id"',
+  ],
+  [
+    "given a continue-on-error",
+    (steps: Step[]) => {
+      npmPinStep(steps)["continue-on-error"] = true;
+    },
+    'the npm pin release-age step must not set "continue-on-error"',
   ],
 ] satisfies [string, (steps: Step[]) => void, string][])(
   "npm pin release-age step %s is red",
@@ -378,6 +430,44 @@ test.each([
     expect(npmPinStepProblems(steps)).toContain(problem);
   },
 );
+
+test.each([
+  { name: "Conditional install", run: "if true; then npm ci; fi" },
+  { name: "Env install", run: "env npm ci" },
+  { name: "Other action", uses: `some/action@${"a".repeat(40)}` },
+  { name: "Echo", run: "echo hi" },
+] satisfies Step[])("extra prefix step $name is refused", (extra) => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps.splice(steps.indexOf(npmPinStep(steps)), 0, extra);
+  expect(npmPinStepProblems(steps)).toContain(
+    `before the npm pin release-age step, step 4 ("${extra.name}"): no additional step is allowed`,
+  );
+});
+
+test("the lockfile checker cannot move after the npm pin step", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  const checker = steps.splice(2, 1)[0];
+  steps.splice(steps.indexOf(npmPinStep(steps)) + 1, 0, checker);
+  expect(npmPinStepProblems(steps)).toContain(
+    "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
+  );
+});
+
+test.each([0, 1, 2])("prefix step %s can be renamed", (position) => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps[position].name = "Harmless rename";
+  expect(npmPinStepProblems(steps)).toEqual([]);
+});
+
+test.each([0, 1, 2])("prefix step %s refuses keys outside its allowlist", (position) => {
+  for (const key of ["if", "continue-on-error", "env", "id", "shell", "working-directory"]) {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    steps[position][key] = true;
+    expect(
+      npmPinStepProblems(steps).some((problem) => problem.includes(`key "${key}" is not allowed`)),
+    ).toBe(true);
+  }
+});
 
 test.each([
   ["defaults", { run: { shell: "bash -c true {0}" } }],
