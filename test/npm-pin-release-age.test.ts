@@ -248,9 +248,14 @@ test("real-clock CLI fixtures retain their verdicts after the former fixture exp
       const preload = join(root, "clock-and-registry.mjs");
       writeFileSync(
         preload,
-        `Date.now = () => ${Date.now()};\nglobalThis.fetch = async () => Response.json(${JSON.stringify({ time: { "11.21.1": published } })});\n`,
+        'import { readFileSync } from "node:fs";\nconst data = JSON.parse(readFileSync(process.env.BOB_TEST_CLOCK_FILE, "utf8"));\nDate.now = () => data.now;\nglobalThis.fetch = async () => Response.json(data.metadata);\n',
       );
-      const result = await runCli([], fixtureEnv(), preload);
+      const clockFile = join(root, "clock.json");
+      writeFileSync(
+        clockFile,
+        JSON.stringify({ now: Date.now(), metadata: { time: { "11.21.1": published } } }),
+      );
+      const result = await runCli([], { ...fixtureEnv(), BOB_TEST_CLOCK_FILE: clockFile }, preload);
       expect(result.status, result.stderr || result.stdout).toBe(status);
       expect(result.stdout || result.stderr).toContain("npm@11.21.1");
     }

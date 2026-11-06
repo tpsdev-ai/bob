@@ -156,13 +156,15 @@ function realNpmPath(): string {
 }
 
 /** Log every npm invocation, then run the real npm with the same arguments. */
-function recordingShim(root: string, realNpm: string) {
+function recordingShim(root: string) {
   const bin = join(root, "bin");
   mkdirSync(bin);
   const log = join(root, "npm.log");
   writeFileSync(
     join(bin, "npm"),
-    ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$BOB_NPM_LOG"', `exec "${realNpm}" "$@"`, ""].join("\n"),
+    ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$BOB_NPM_LOG"', 'exec "$BOB_REAL_NPM" "$@"', ""].join(
+      "\n",
+    ),
     { mode: 0o755 },
   );
   return { bin, log };
@@ -250,7 +252,7 @@ async function runRealNpmLock(
   let prepared: Prepared | undefined;
   try {
     prepared = await prepare(root);
-    const shim = recordingShim(root, realNpm);
+    const shim = recordingShim(root);
     const installDir = join(root, "install");
     mkdirSync(installDir);
     writeFileSync(
@@ -271,6 +273,7 @@ async function runRealNpmLock(
     });
     env.PATH = `${shim.bin}:${env.PATH ?? ""}`;
     env.BOB_NPM_LOG = shim.log;
+    env.BOB_REAL_NPM = realNpm;
     let result: Awaited<ReturnType<typeof installVerifiedTarball>> | undefined;
     let error: Error | undefined;
     try {
