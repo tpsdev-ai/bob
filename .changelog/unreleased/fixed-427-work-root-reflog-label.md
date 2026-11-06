@@ -1,0 +1,1 @@
+- **Work-root edit evidence excludes amend reflog labels.** Regression tests cover an amended fresh clone and a child symlink to an external repository.

@@ -709,7 +709,7 @@ function hasCommitLabelWithContentChange(
       if (
         timestamp !== undefined &&
         Number(timestamp) >= launchedAtSeconds &&
-        /^commit(?: \(initial\)| \(amend\))?:/.test(action ?? "") &&
+        /^commit(?: \(initial\))?:/.test(action ?? "") &&
         commitChangedContent(cwd, commit, timeoutMs)
       )
         return true;
