@@ -8,4 +8,4 @@
   subject label. Reflog and committer times use the local clock /
   `GIT_COMMITTER_DATE`; this is not proof against a deliberately forged clock.
   `bob doctor` reports the child directories it would scan, current work trees
-  and discovery unknowns; evidence is captured at launch.
+  and discovery unknowns.
