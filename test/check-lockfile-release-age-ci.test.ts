@@ -10,6 +10,9 @@ const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
 const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs";
+const NPM_PIN_STEP = "npm pin release-age bake";
+const SELF_UPDATE = /^npm install -g npm@\d+\.\d+\.\d+$/;
+const PUBLISH_LINE = /^npm\s+(?:stage|publish)\b/;
 const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
   ["actions/checkout", ["fetch-depth", "persist-credentials"]],
   ["oven-sh/setup-bun", ["bun-version"]],
@@ -273,6 +276,106 @@ test("ci.yml action-pins runs the npm pin release-age checker with no condition"
   expect(step.if).toBeUndefined();
   expect(step["continue-on-error"]).toBeUndefined();
 });
+
+function npmPinStepProblems(steps: Step[]): string[] {
+  const matches = steps.filter(
+    (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
+  );
+  if (matches.length !== 1) {
+    return [`expected exactly one ${NPM_PIN_STEP} step, found ${matches.length}`];
+  }
+  const step = matches[0];
+  const index = steps.indexOf(step);
+  const problems: string[] = [];
+  if (step.name !== NPM_PIN_STEP) {
+    problems.push(`the npm pin release-age step must be named "${NPM_PIN_STEP}"`);
+  }
+  if (step.if !== undefined) problems.push("the npm pin release-age step must not have an if");
+  if (step["continue-on-error"] !== undefined) {
+    problems.push("the npm pin release-age step must not have continue-on-error");
+  }
+  const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
+  if (upgrade === -1) {
+    problems.push("expected the exact npm self-update step");
+  } else if (index > upgrade) {
+    problems.push("the npm pin release-age step must run before the npm self-update");
+  }
+  for (const [candidateIndex, candidate] of steps.entries()) {
+    if (candidateIndex >= index) continue;
+    const publishes = (candidate.run ?? "")
+      .split("\n")
+      .map((line) => line.trim())
+      .some((line) => PUBLISH_LINE.test(line));
+    if (publishes) {
+      problems.push(
+        `the npm pin release-age step must run before ${candidate.name} stages or publishes`,
+      );
+    }
+  }
+  return problems;
+}
+
+test("release-publish stage-publish runs the npm pin release-age checker before the npm self-update with no condition", () => {
+  const workflow = loadWorkflow("release-publish.yml");
+  const job = workflow.jobs?.["stage-publish"];
+  if (job === undefined) throw new Error("Missing stage-publish");
+  expect(job).not.toHaveProperty("if");
+  expect(job).not.toHaveProperty("continue-on-error");
+  expect(npmPinStepProblems(job.steps ?? [])).toEqual([]);
+});
+
+function npmPinStep(steps: Step[]): Step {
+  const step = steps.find(
+    (candidate) => typeof candidate.run === "string" && candidate.run.trim() === NPM_PIN_CHECKER,
+  );
+  if (step === undefined) throw new Error("Missing npm pin release-age step");
+  return step;
+}
+
+test.each([
+  [
+    "removed",
+    (steps: Step[]) => {
+      steps.splice(steps.indexOf(npmPinStep(steps)), 1);
+    },
+    `expected exactly one ${NPM_PIN_STEP} step, found 0`,
+  ],
+  [
+    "moved after the npm self-update",
+    (steps: Step[]) => {
+      const step = npmPinStep(steps);
+      steps.splice(steps.indexOf(step), 1);
+      const upgrade = steps.findIndex((candidate) =>
+        SELF_UPDATE.test((candidate.run ?? "").trim()),
+      );
+      steps.splice(upgrade + 1, 0, step);
+    },
+    "the npm pin release-age step must run before the npm self-update",
+  ],
+  [
+    "moved after the stage/publish step",
+    (steps: Step[]) => {
+      const step = npmPinStep(steps);
+      steps.splice(steps.indexOf(step), 1);
+      steps.push(step);
+    },
+    "the npm pin release-age step must run before Stage-publish stages or publishes",
+  ],
+  [
+    "given an if",
+    (steps: Step[]) => {
+      npmPinStep(steps).if = `$` + `{{ false }}`;
+    },
+    "the npm pin release-age step must not have an if",
+  ],
+] satisfies [string, (steps: Step[]) => void, string][])(
+  "npm pin release-age step %s is red",
+  (_name, mutate, problem) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    mutate(steps);
+    expect(npmPinStepProblems(steps)).toContain(problem);
+  },
+);
 
 test.each([
   ["defaults", { run: { shell: "bash -c true {0}" } }],

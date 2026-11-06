@@ -107,6 +107,12 @@ jobs:
       - name: Lockfile release-age bake
         run: bun --no-install scripts/check-lockfile-release-age.mjs
 
+      # The same checker CI runs, against the commit being released. It must run
+      # before the npm self-update and before any install or stage/publish step,
+      # and it carries no `if:` so a release cannot skip it.
+      - name: npm pin release-age bake
+        run: bun --no-install scripts/check-npm-pin-release-age.mjs
+
       - name: Resolve version
         id: ver
         env:
