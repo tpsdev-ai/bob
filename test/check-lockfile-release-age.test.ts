@@ -67,7 +67,7 @@ function bunfigText(excludes) {
 }
 
 function fixture(lock, excludes) {
-  const root = mkdtempSync(join(tmpdir(), "bob-lockfile-age-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-lockfile-age-")));
   roots.push(root);
   writeFileSync(join(root, "bunfig.toml"), bunfigText(excludes));
   writeFileSync(join(root, "bun.lock"), lock);

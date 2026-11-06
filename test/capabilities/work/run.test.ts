@@ -372,7 +372,7 @@ describe("run — output", () => {
     live = await workSession({ script: program(call("run", { command: "echo x" })) });
     await live.prompt();
     const ref = String(lastOf(live.results, "run").details.output_ref);
-    expect(ref.startsWith(join(tmpdir(), "bob-run-"))).toBe(true);
+    expect(ref.startsWith(join(realpathSync(tmpdir()), "bob-run-"))).toBe(true);
     expect(ref.startsWith(live.stateRoot)).toBe(false);
     expect(ref.startsWith(live.cwd)).toBe(false);
     expect(statSync(ref).mode & 0o777).toBe(0o600);

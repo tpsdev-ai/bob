@@ -11,7 +11,7 @@
 // Every job a test starts is a job the TOOL started, in its own process group;
 // cleanup kills only those groups (by the pgid the tool recorded), never by name.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -147,7 +147,7 @@ export interface WorkSessionOptions {
 }
 
 export async function workSession(opts: WorkSessionOptions): Promise<LiveWork> {
-  const scratch = mkdtempSync(join(tmpdir(), "bob-work-test-"));
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), "bob-work-test-")));
   // Remove this directory if the setup below throws (catch and remove). Removal
   // used to exist only on the returned handle's cleanup(), which a caller never
   // receives when this function throws — so a failed session load (a load error,
