@@ -341,9 +341,19 @@ function npmPinStepProblems(steps: Step[]): string[] {
       "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
     );
   }
-  const updates = steps.flatMap((candidate) => [
-    ...(candidate.run ?? "").matchAll(/\bnpm\s+install\s+-g\s+npm@/g),
-  ]);
+  const updates = steps
+    .flatMap((candidate) => [
+      ...(candidate.run ?? "").matchAll(
+        /\bnpm[ \t]+(?:-[^\s;&|]+[ \t]+)*(?:install|i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add)(?=[ \t])[^;\r\n&|]*/g,
+      ),
+    ])
+    .filter(([command]) => {
+      const args = command.trim().split(/\s+/).slice(1);
+      return (
+        args.some((arg) => arg === "-g" || arg === "--global") &&
+        args.some((arg) => /^npm(?:@\S+)?$/.test(arg))
+      );
+    });
   if (updates.length !== 1) {
     problems.push(`expected exactly one npm self-update command, found ${updates.length}`);
   }
@@ -550,6 +560,41 @@ test.each(["before the checker", "after publishing", "inside a run block"])(
     if (position === "before the checker") steps.splice(0, 0, { name: "Another update", run });
     else if (position === "after publishing") steps.push({ name: "Another update", run });
     else steps[steps.length - 1].run = `${steps[steps.length - 1].run ?? ""}\n${run}`;
+    expect(npmPinStepProblems(steps)).toContain(
+      "expected exactly one npm self-update command, found 2",
+    );
+  },
+  5_000,
+);
+
+test.each(
+  [
+    "install",
+    "i",
+    "in",
+    "ins",
+    "inst",
+    "insta",
+    "instal",
+    "isnt",
+    "isnta",
+    "isntal",
+    "isntall",
+    "add",
+  ].flatMap((alias) =>
+    ["npm@11.21.1", "npm"].flatMap((spec) =>
+      ["-g", "--global"].flatMap((flag) => [
+        `npm ${flag} ${alias} ${spec} --registry=https://registry.example`,
+        `npm ${alias} ${flag} ${spec} --registry=https://registry.example`,
+        `npm ${alias} ${spec} --registry=https://registry.example ${flag}`,
+      ]),
+    ),
+  ),
+)(
+  "a second npm self-update using %s is refused",
+  (run) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    steps.push({ name: "Another update", run });
     expect(npmPinStepProblems(steps)).toContain(
       "expected exactly one npm self-update command, found 2",
     );
