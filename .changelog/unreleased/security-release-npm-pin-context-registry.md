@@ -1,1 +1,1 @@
-- **Release npm pins use the checked registry** — the self-update names registry.npmjs.org, and structure checks validate prefix inputs, the release job set, and self-update command counts.
+- **Release npm pins use the checked registry** — structure checks validate prefix inputs and the release job set; allowlist npm install -g npm@11.21.1 --registry=https://registry.npmjs.org once in the named upgrade step, and npm --version and npm stage publish in Stage-publish. Unclassified npm/npx commands are refused.

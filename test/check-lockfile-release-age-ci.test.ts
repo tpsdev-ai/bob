@@ -10,7 +10,10 @@ const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
 const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs";
-const SELF_UPDATE = /^npm install -g npm@\d+\.\d+\.\d+ --registry=https:\/\/registry\.npmjs\.org$/;
+const NPM_SELF_UPDATE = "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org";
+const NPM_UPGRADE_STEP = "Upgrade npm to a staging-capable version";
+const SELF_UPDATE = /^npm install -g npm@11\.21\.1 --registry=https:\/\/registry\.npmjs\.org$/;
+const NPM_COMMANDS = new Set([NPM_SELF_UPDATE, "npm --version", "npm stage publish"]);
 const PINNED_BUN = JSON.parse(
   readFileSync(join(REPO, "package.json"), "utf8"),
 ).packageManager.replace(/^bun@/, "");
@@ -293,6 +296,106 @@ const NPM_PIN_PREFIX = [
   { run: CHECKER, keys: ["name", "run"] },
 ];
 
+function shellCommands(run: string): { commands: string[][]; malformed: boolean } {
+  const source = run.replace(/\\\r?\n/g, "");
+  type Frame = { end: string; quote: string; words: string[]; word: string };
+  const frames: Frame[] = [{ end: "", quote: "", words: [], word: "" }];
+  const commands: string[][] = [];
+  const flushWord = (frame: Frame) => {
+    if (frame.word) frame.words.push(frame.word);
+    frame.word = "";
+  };
+  const flushCommand = (frame: Frame) => {
+    flushWord(frame);
+    if (frame.words.length) commands.push(frame.words);
+    frame.words = [];
+  };
+  // Each iteration consumes a source character; substitutions use the same scan.
+  for (let index = 0; index < source.length; index += 1) {
+    const frame = frames[frames.length - 1];
+    const char = source[index];
+    if (char === "\\" && frame.quote !== "'") {
+      frame.word += char + (source[index + 1] ?? "");
+      index += 1;
+    } else if (frame.quote === "'") {
+      frame.word += char;
+      if (char === "'") frame.quote = "";
+    } else if (char === "'" && !frame.quote) {
+      frame.quote = char;
+      frame.word += char;
+    } else if (char === '"') {
+      frame.quote = frame.quote ? "" : char;
+      frame.word += char;
+    } else if (!frame.quote && frame.end && char === frame.end) {
+      flushCommand(frame);
+      frames.pop();
+    } else if (char === "`" || (char === "$" && source[index + 1] === "(")) {
+      frame.word += "$()";
+      frames.push({ end: char === "`" ? "`" : ")", quote: "", words: [], word: "" });
+      if (char === "$") index += 1;
+    } else if (frame.quote) {
+      frame.word += char;
+    } else if (char === "#" && !frame.word) {
+      const end = source.indexOf("\n", index);
+      index = end === -1 ? source.length : end - 1;
+    } else if (/^[\n;|&{}]$/.test(char)) {
+      flushCommand(frame);
+    } else if (/\s/.test(char)) {
+      flushWord(frame);
+    } else {
+      frame.word += char;
+    }
+  }
+  for (const frame of frames) flushCommand(frame);
+  return { commands, malformed: frames.length !== 1 || frames[0].quote !== "" };
+}
+
+function npmCommandProblems(steps: Step[]): string[] {
+  const problems: string[] = [];
+  let updates = 0;
+  for (const step of steps) {
+    const { commands, malformed } = shellCommands(step.run ?? "");
+    if (malformed) problems.push("unclassified shell syntax in release run");
+    for (const words of commands) {
+      let first = 0;
+      // This bound is the number of words in the simple command.
+      for (; first < words.length; first += 1) {
+        if (
+          !/^[A-Za-z_][A-Za-z_0-9]*=/.test(words[first]) &&
+          !["env", "command", "exec", "builtin"].includes(words[first])
+        )
+          break;
+      }
+      const commandWords = words.slice(first);
+      const command = commandWords.join(" ");
+      const unquote = (text: string) => text.replace(/["']/g, "").replace(/\\(.)/g, "$1");
+      const executable = unquote(commandWords[0] ?? "");
+      if (/^(?:.*\/)?(?:npm|npx)$/.test(executable)) {
+        if (!NPM_COMMANDS.has(command)) {
+          problems.push(`npm command is not allowlisted: ${command}`);
+        } else if (command === NPM_SELF_UPDATE) {
+          updates += 1;
+          if (step.name !== NPM_UPGRADE_STEP || step.run?.trim() !== NPM_SELF_UPDATE) {
+            problems.push("npm self-update must be the exact named step");
+          }
+        } else if (step.name !== "Stage-publish") {
+          problems.push(`npm command outside the version probe/staging step: ${command}`);
+        }
+      } else if (
+        /\$/.test(executable) ||
+        (!["echo", "printf"].includes(executable) &&
+          /(?<![\w.-])(?:npm|npx)(?![\w.-])/.test(unquote(command)))
+      ) {
+        problems.push(`unclassified npm command: ${command}`);
+      }
+    }
+  }
+  if (updates !== 1) {
+    problems.push(`expected exactly one allowlisted npm self-update command, found ${updates}`);
+  }
+  return problems;
+}
+
 function npmPinStepProblems(steps: Step[]): string[] {
   const matches = steps.filter(
     (step) => typeof step.run === "string" && step.run.trim() === NPM_PIN_CHECKER,
@@ -341,22 +444,7 @@ function npmPinStepProblems(steps: Step[]): string[] {
       "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
     );
   }
-  const updates = steps
-    .flatMap((candidate) => [
-      ...(candidate.run ?? "").matchAll(
-        /\bnpm[ \t]+(?:-[^\s;&|]+[ \t]+)*(?:install|i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add)(?=[ \t])[^;\r\n&|]*/g,
-      ),
-    ])
-    .filter(([command]) => {
-      const args = command.trim().split(/\s+/).slice(1);
-      return (
-        args.some((arg) => arg === "-g" || arg === "--global") &&
-        args.some((arg) => /^npm(?:@\S+)?$/.test(arg))
-      );
-    });
-  if (updates.length !== 1) {
-    problems.push(`expected exactly one npm self-update command, found ${updates.length}`);
-  }
+  problems.push(...npmCommandProblems(steps));
   const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
   if (upgrade !== -1 && Object.hasOwn(steps[upgrade], "env")) {
     problems.push('the npm self-update step must not set "env"');
@@ -560,9 +648,7 @@ test.each(["before the checker", "after publishing", "inside a run block"])(
     if (position === "before the checker") steps.splice(0, 0, { name: "Another update", run });
     else if (position === "after publishing") steps.push({ name: "Another update", run });
     else steps[steps.length - 1].run = `${steps[steps.length - 1].run ?? ""}\n${run}`;
-    expect(npmPinStepProblems(steps)).toContain(
-      "expected exactly one npm self-update command, found 2",
-    );
+    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${run}`);
   },
   5_000,
 );
@@ -595,12 +681,111 @@ test.each(
   (run) => {
     const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
     steps.push({ name: "Another update", run });
-    expect(npmPinStepProblems(steps)).toContain(
-      "expected exactly one npm self-update command, found 2",
-    );
+    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${run}`);
   },
   5_000,
 );
+
+test.each([
+  [
+    "separate option value",
+    "npm --registry https://different.example.invalid i -g npm@11.21.1",
+    "npm --registry https://different.example.invalid i -g npm@11.21.1",
+  ],
+  ["env wrapper", "env npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
+  ["command wrapper", "command npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
+  ["exec wrapper", "exec npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
+  ["builtin wrapper", "builtin npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
+  [
+    "assignments and wrappers",
+    "A=one env B=two command exec builtin npm i -g npm@11.21.1",
+    "npm i -g npm@11.21.1",
+  ],
+  ["continued command", 'PKG=npm@11.21.1; n\\\npm i -g "$PKG"', 'npm i -g "$PKG"'],
+  ["continued arguments", "npm \\\n i -g npm@11.21.1", "npm i -g npm@11.21.1"],
+  ["substitution", "echo $(npm i -g npm@11.21.1)", "npm i -g npm@11.21.1"],
+  ["quoted substitution", 'echo "$(npm i -g npm@11.21.1)"', "npm i -g npm@11.21.1"],
+  ["backticks", "echo `npm i -g npm@11.21.1`", "npm i -g npm@11.21.1"],
+  ["npx", "npx npm@11.21.1 i -g npm@11.21.1", "npx npm@11.21.1 i -g npm@11.21.1"],
+  ["path", "/usr/bin/npm i -g npm@11.21.1", "/usr/bin/npm i -g npm@11.21.1"],
+] as const)(
+  "npm allowlist refuses %s",
+  (_name, run, command) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    steps.push({ name: "Another update", run });
+    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${command}`);
+  },
+  5_000,
+);
+
+test.each([
+  "NPM=npm; $NPM i -g npm@11.21.1",
+  "NPM=npm; $" + "{NPM} i -g npm@11.21.1",
+  "eval 'npm i -g npm@11.21.1'",
+  "eval 'npm; exit'",
+  "sh -c 'npx|cat'",
+  "eval 'n\"\"pm --version'",
+  "sh -c 'n\"\"px --version'",
+  "sh -c 'npm i -g npm@11.21.1'",
+  "xargs npm i -g npm@11.21.1",
+])(
+  "npm allowlist refuses unclassified %s",
+  (run) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    steps.push({ name: "Another update", run });
+    expect(
+      npmPinStepProblems(steps).some((problem) => problem.startsWith("unclassified npm command:")),
+    ).toBe(true);
+  },
+  5_000,
+);
+
+test.each(["\n", ";", "&&", "||", "|"])(
+  "npm allowlist checks commands separated by %j",
+  (separator) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    steps.push({ run: `echo npm is text ${separator} npm ci` });
+    expect(npmPinStepProblems(steps)).toContain("npm command is not allowlisted: npm ci");
+  },
+  5_000,
+);
+
+test("npm allowlist keeps literal echo and printf arguments", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps.push({
+    run: "echo \"npm i -g npm@11.21.1; npx bad | npm ci\"\nprintf '%s\\n' 'npm i -g npm@11.21.1 $(npm ci) `npm ci`'",
+  });
+  expect(npmPinStepProblems(steps)).toEqual([]);
+}, 5_000);
+
+test.each(["env", "command", "exec", "builtin", "A=one env B=two command"])(
+  "npm allowlist classifies %s before the version probe",
+  (wrapper) => {
+    expect(
+      npmCommandProblems([
+        { name: NPM_UPGRADE_STEP, run: NPM_SELF_UPDATE },
+        { name: "Stage-publish", run: `${wrapper} npm   --version` },
+      ]),
+    ).toEqual([]);
+  },
+  5_000,
+);
+
+test("npm allowlist counts a duplicate canonical self-update", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps.push({ name: NPM_UPGRADE_STEP, run: NPM_SELF_UPDATE });
+  expect(npmPinStepProblems(steps)).toContain(
+    "expected exactly one allowlisted npm self-update command, found 2",
+  );
+}, 5_000);
+
+test("npm allowlist requires the self-update step name", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  const upgrade = steps.find((step) => step.name === NPM_UPGRADE_STEP);
+  if (upgrade === undefined) throw new Error("Missing npm self-update");
+  upgrade.name = "Renamed update";
+  expect(npmPinStepProblems(steps)).toContain("npm self-update must be the exact named step");
+}, 5_000);
 
 test("the npm self-update step refuses env", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
