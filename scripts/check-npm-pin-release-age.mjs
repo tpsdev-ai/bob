@@ -24,9 +24,7 @@ import { RELEASE_AGE_MS } from "./release-age-env.mjs";
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const WORKFLOW_REL = join(".github", "workflows", "release-publish.yml");
 const UPGRADE_STEP = "Upgrade npm to a staging-capable version";
-const EXACT_PIN = new RegExp(
-  `^npm install -g npm@(\\d+\\.\\d+\\.\\d+) --registry=${DEFAULT_REGISTRY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-);
+const EXACT_PIN = /^npm install -g npm@(\d+\.\d+\.\d+) --registry=(\S+)$/;
 
 const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
@@ -72,10 +70,10 @@ export function readNpmPin(workflowText) {
   }
   const run = typeof upgrades[0].run === "string" ? upgrades[0].run.trim() : "";
   const match = EXACT_PIN.exec(run);
-  if (!match) {
+  if (!match || match[2] !== DEFAULT_REGISTRY) {
     throw namedError(
       "UnpinnedNpmVersion",
-      `"${UPGRADE_STEP}" must run exactly npm install -g npm@<x.y.z> --registry=${DEFAULT_REGISTRY}`,
+      `"${UPGRADE_STEP}" must run exactly npm install -g npm@<x.y.z> --registry=${DEFAULT_REGISTRY}; found ${run}`,
     );
   }
   return match[1];
