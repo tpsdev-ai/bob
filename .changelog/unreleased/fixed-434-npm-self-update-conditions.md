@@ -1,0 +1,1 @@
+- **Release npm self-update refuses conditional execution** — the npm pin reader and workflow structure check reject `if` and `continue-on-error` keys on the named npm self-update step.

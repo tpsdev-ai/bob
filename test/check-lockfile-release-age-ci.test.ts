@@ -1,4 +1,4 @@
-// The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a `uses:` step may not set `env`, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The action allow-set check does not inspect input values or action contents.
+// The test pins the structure of ci.yml, codeql.yml, socket.yml and release-publish.yml: every workflow, job and step key is from a fixed allow set, every action any step uses is from a fixed allow set, pinned to a full commit SHA, with fixed input names, a `uses:` step may not set `env`, a job with no run step must depend on a job that runs the checker first, no job or step condition uses a status-check function, and the checker and the ancestry guard have fixed shapes; an edit outside these sets fails the test until the sets are deliberately changed in review. Whether the SHA is the right release commit is checked by scripts/check-action-pins.mjs and review, not here. The npm pin prefix checks two input values: the pinned Bun version and `persist-credentials: false`. The action allow-set check does not inspect other input values or action contents.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -429,6 +429,13 @@ function npmPinStepProblems(steps: Step[]): string[] {
   if (upgrade !== -1 && Object.hasOwn(steps[upgrade], "env")) {
     problems.push('the npm self-update step must not set "env"');
   }
+  if (upgrade !== -1) {
+    for (const key of ["if", "continue-on-error"]) {
+      if (Object.hasOwn(steps[upgrade], key)) {
+        problems.push(`"${NPM_UPGRADE_STEP}" must not set "${key}"`);
+      }
+    }
+  }
   if (upgrade === -1) {
     problems.push("expected the exact npm self-update step");
   } else if (index > upgrade) {
@@ -473,6 +480,23 @@ function npmPinStep(steps: Step[]): Step {
   if (step === undefined) throw new Error("Missing npm pin release-age step");
   return step;
 }
+
+test.each([
+  ["if", false],
+  ["if", `$` + `{{ github.event_name == 'push' }}`],
+  ["if", true],
+  ["continue-on-error", true],
+] as const)(
+  "npm self-update refuses %s: %j",
+  (key, value) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    const upgrade = steps.find((step) => step.name === NPM_UPGRADE_STEP);
+    if (upgrade === undefined) throw new Error("Missing npm self-update");
+    upgrade[key] = value;
+    expect(npmPinStepProblems(steps)).toContain(`"${NPM_UPGRADE_STEP}" must not set "${key}"`);
+  },
+  5_000,
+);
 
 test("renaming the npm pin release-age step needs an allowlist edit", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];

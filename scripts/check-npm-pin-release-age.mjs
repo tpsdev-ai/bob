@@ -68,7 +68,13 @@ export function readNpmPin(workflowText) {
       `expected exactly one "${UPGRADE_STEP}" step, found ${upgrades.length}`,
     );
   }
-  const run = typeof upgrades[0].run === "string" ? upgrades[0].run.trim() : "";
+  const upgrade = upgrades[0];
+  for (const key of ["if", "continue-on-error"]) {
+    if (Object.hasOwn(upgrade, key)) {
+      throw namedError("UnpinnedNpmVersion", `"${UPGRADE_STEP}" must not set "${key}"`);
+    }
+  }
+  const run = typeof upgrade.run === "string" ? upgrade.run.trim() : "";
   const match = EXACT_PIN.exec(run);
   if (!match || match[2] !== DEFAULT_REGISTRY) {
     throw namedError(
