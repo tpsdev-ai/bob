@@ -7,5 +7,4 @@
   at or after the launch second: `git update-ref -m` or a crafted log can set the
   subject label. Reflog and committer times use the local clock /
   `GIT_COMMITTER_DATE`; this is not proof against a deliberately forged clock.
-  `bob doctor` reports the root, its child directories, how many are work trees
-  now, and discovery unknowns.
+  `bob doctor` shows the configured work root.

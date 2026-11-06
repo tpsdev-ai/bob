@@ -81,7 +81,6 @@ import {
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { conditionalToolRefusals } from "./capability-loader.js";
-import { countWorkRootTrees } from "./edit-evidence.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
@@ -495,21 +494,11 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       });
     }
     if (workRoot !== undefined) {
-      const trees = countWorkRootTrees(workRoot);
-      checks.push(
-        trees === undefined
-          ? {
-              name: "work root",
-              status: "warn",
-              detail: `${workRoot} — could not list its child directories`,
-              fix: `check that ${workRoot} is readable, then re-run 'bob doctor ${opts.name}'`,
-            }
-          : {
-              name: "work root",
-              status: trees.unknown > 0 ? "warn" : "ok",
-              detail: `work_root ${workRoot}: ${trees.childDirectories} child directory(s), ${trees.workTrees} work tree(s) now, ${trees.unknown} discovery unknown`,
-            },
-      );
+      checks.push({
+        name: "work root",
+        status: "ok",
+        detail: `work_root ${workRoot}`,
+      });
     }
   }
 

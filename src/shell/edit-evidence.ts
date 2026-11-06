@@ -775,39 +775,3 @@ export function isWorkRootEditVerified(
   }
   return false;
 }
-
-// Doctor's unknown count covers discovery failures and children beyond the bound.
-export function countWorkRootTrees(
-  root: string,
-  options: WorkRootCaptureOptions = {},
-): { childDirectories: number; workTrees: number; unknown: number } | undefined {
-  const maxChildren = options.maxChildDirectories ?? WORK_ROOT_MAX_CHILD_DIRECTORIES;
-  const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
-  let names: string[];
-  try {
-    names = workTreeCandidates(root);
-  } catch {
-    return undefined;
-  }
-  const scanned = names.slice(0, maxChildren);
-  let workTrees = 0;
-  let unknown = names.length - scanned.length;
-  for (const name of scanned) {
-    const path = join(root, name);
-    const inside = git(path, ["rev-parse", "--is-inside-work-tree"], undefined, timeoutMs);
-    if (
-      !inside.error &&
-      ((inside.status === 0 && inside.stdout.toString().trim() === "false") ||
-        (inside.status === 128 && inside.stderr.toString().includes("not a git repository")))
-    )
-      continue;
-    try {
-      if (inside.error || inside.status !== 0 || inside.stdout.toString().trim() !== "true")
-        throw new Error("git discovery unavailable");
-      if (resolveRepository(path, timeoutMs).workTree === realpathSync(path)) workTrees += 1;
-    } catch {
-      unknown += 1;
-    }
-  }
-  return { childDirectories: scanned.length, workTrees, unknown };
-}

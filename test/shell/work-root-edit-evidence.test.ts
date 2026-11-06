@@ -7,7 +7,6 @@ import { readWorkRoot } from "../../src/shell/bob-yaml.js";
 import { runDoctor } from "../../src/shell/doctor.js";
 import {
   captureWorkRootSnapshot,
-  countWorkRootTrees,
   isWorkRootEditVerified,
   type WorkRootCaptureOptions,
   type WorkRootLaunchSnapshot,
@@ -522,11 +521,6 @@ describe("completion gate under a declared work root", () => {
     writeFileSync(join(workRoot, "z-repo", "tracked"), "edited\n");
     rmSync(join(workRoot, "a-empty"), { recursive: true });
     expect(isWorkRootEditVerified(snapshot, options)).toBe(false);
-    expect(countWorkRootTrees(workRoot, options)).toEqual({
-      childDirectories: 1,
-      workTrees: 1,
-      unknown: 0,
-    });
   });
 
   it.each([
@@ -577,13 +571,7 @@ describe("completion gate under a declared work root", () => {
     expect(resolveRunConfig({ name: "builder", agentsRoot }).workRoot).toBeUndefined();
   });
 
-  it("reports the work root, child directories, current work trees and discovery unknowns", () => {
-    init(join(workRoot, "alpha"));
-    init(join(workRoot, "beta"));
-    mkdirSync(join(workRoot, "empty"));
-    const unborn = join(workRoot, "unborn");
-    mkdirSync(unborn);
-    git(unborn, "init", "--quiet");
+  it("shows the configured work root", () => {
     const report = runDoctor({
       name: "builder",
       agentsRoot,
@@ -592,9 +580,7 @@ describe("completion gate under a declared work root", () => {
     });
     const check = report.checks.find((entry) => entry.name === "work root");
     expect(check?.status).toBe("ok");
-    expect(check?.detail).toBe(
-      `work_root ${workRoot}: 4 child directory(s), 3 work tree(s) now, 0 discovery unknown`,
-    );
+    expect(check?.detail).toBe(`work_root ${workRoot}`);
   });
 });
 
