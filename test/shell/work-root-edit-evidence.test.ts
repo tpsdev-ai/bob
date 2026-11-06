@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readWorkRoot } from "../../src/shell/bob-yaml.js";
@@ -313,6 +313,50 @@ describe("completion gate under a declared work root", () => {
     expect(result.exitCode).toBe(1);
     expect(result.noEditNoBlocked).toBe(true);
   });
+
+  it("does not credit an amend in a fresh clone into an initially empty child", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    expect(captureWorkRootSnapshot(workRoot)?.trees.get("alpha")).toEqual({
+      kind: "not a repo",
+      emptyAtLaunch: true,
+    });
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          git(repo, "commit", "--amend", "--quiet", "-m", "amended fixture");
+        },
+      },
+    ]);
+    expect(git(repo, "reflog", "show", "--format=%gs")).toContain(
+      "commit (amend): amended fixture",
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  }, 20_000);
+
+  it("excludes a child symlink from capture and gives no credit for its target's content commit", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    symlinkSync(source, join(workRoot, "linked"), "dir");
+    const snapshot = captureWorkRootSnapshot(workRoot);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          writeFileSync(join(source, "tracked"), "outside edit\n");
+          seedSuccessor(source);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(snapshot?.trees.size).toBe(0);
+  }, 20_000);
 
   it("does not credit a diff that existed before launch and did not change", async () => {
     const repo = join(workRoot, "alpha");
