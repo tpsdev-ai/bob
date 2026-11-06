@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-// Parse YAML with Bun.YAML: inventory jobs.<id>.steps[*].uses, jobs.<id>.uses,
-// and action metadata runs.steps[*].uses; refuse parse errors and unwalkable shapes.
+// Admit the subset defined at refuseDuplicateKeys before parsing with Bun.YAML.
+// Inventory jobs.<id>.steps[*].uses, jobs.<id>.uses and action metadata
+// runs.steps[*].uses; refuse parse errors and unwalkable shapes.
 // Locate each reference at its step/job key on a canonical `- uses: <value>` or
 // `uses: <value>` source line (unquoted or simply quoted value); otherwise refuse
-// it with a remedy for its reference kind. Refuse YAML aliases; request the step
-// written out in full. Refuse duplicate step/job uses keys. Ignore uses text in run blocks.
+// it with a remedy for its reference kind.
 // Remote refs require a full 40-hex SHA and a full release-tag comment resolving
 // to that SHA. Follow ./ local actions through action.yml/action.yaml, cycle-safe
 // and bounded; missing metadata is an error. Check job-level local reusable
@@ -73,37 +73,193 @@ function inventory(doc, metadata) {
   return refs;
 }
 
-function refuseAliases(text) {
-  if (!text.includes("*")) return;
-  let marker = "__action_pin_unbound_alias__";
-  while (text.includes(marker)) marker += "_";
-  try {
-    Bun.YAML.parse(text.replaceAll("*", `*${marker}`));
-  } catch {
-    const tokens = [...new Set(text.match(/\*[^\s[\]{},]*/g))].join(", ");
-    throw new Error(
-      `YAML aliases are refused (source tokens: ${tokens}); write the step out in full`,
-    );
+// Subset: block mappings/sequences (including indentless mapping-value sequences),
+// unquoted string keys, one-line plain/quoted scalars, block scalars and flat
+// one-line scalar flow sequences. Bun.YAML validates syntax after this gate.
+export function refuseDuplicateKeys(text) {
+  const fail = (line, construct, remedy) => {
+    throw new Error(`line ${line}: ${construct} is outside the YAML subset; ${remedy}`);
+  };
+  const scalarRemedy = "write a one-line scalar or use a | or > block scalar";
+  const keyRemedy = "write an unquoted key using letters, digits, _, -, . or /";
+  const rows = [];
+  let scalarIndent = null;
+  let started = false;
+  let ended = false;
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    const line = index + 1;
+    // Pinned Bun line-break coverage: "scanner break refusal matches Bun.YAML" test.
+    if (/\r(?!\n)/.test(raw)) fail(line, "bare CR", "convert to LF");
+    const indent = raw.match(/^ */)[0].length;
+    const content = raw.slice(indent);
+    if (scalarIndent !== null) {
+      if (!content || indent > scalarIndent) continue;
+      scalarIndent = null;
+    }
+    if (/^[ \t]*\t/.test(raw)) fail(line, "tab indentation", "indent with spaces");
+    if (!content || content.startsWith("#")) continue;
+    if (/^(?:---|\.\.\.)(?:\s|$)/.test(content)) {
+      if (indent === 0 && /^---(?:\s+#.*)?\s*$/.test(content) && !started && !ended) {
+        started = true;
+        continue;
+      }
+      if (indent === 0 && /^\.\.\.(?:\s+#.*)?\s*$/.test(content) && started && !ended) {
+        ended = true;
+        continue;
+      }
+      fail(line, "document marker", "write a single YAML document");
+    }
+    if (ended) fail(line, "content after document end", "write a single YAML document");
+    started = true;
+    let column = indent;
+    let rest = content;
+    while (/^-(?: +|$)/.test(rest)) {
+      const width = rest.match(/^-(?: +|$)/)[0].length;
+      rows.push({ indent: column, content: "-", line });
+      column += width;
+      rest = rest.slice(width);
+    }
+    if (!rest || rest.startsWith("#")) continue;
+    rows.push({ indent: column, content: rest, line });
+    const value = rest.replace(/^[A-Za-z0-9_./-]+:[ \t]*/, "");
+    if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(value)) {
+      scalarIndent = value === rest && column > indent ? rows.at(-2).indent : column;
+    }
   }
-}
 
-function refuseDuplicateUses(text, metadata) {
-  let marker = "__action_pin_uses_key__";
-  while (text.includes(marker)) marker += "_";
-  const keys = new Set(["uses"]);
-  const marked = text.replaceAll("uses", () => {
-    const key = `${marker}${keys.size}`;
-    keys.add(key);
-    return key;
-  });
-  const doc = Bun.YAML.parse(marked);
-  const mappings = metadata
-    ? (doc.runs.steps ?? [])
-    : Object.values(doc.jobs).flatMap((job) => [job, ...(job.steps ?? [])]);
-  for (const mapping of mappings) {
-    if (Object.keys(mapping).filter((key) => keys.has(key)).length > 1)
-      throw new Error("duplicate uses keys are refused; write one `uses` per step (or job)");
-  }
+  const quotedEnd = (value, line) => {
+    const quote = value[0];
+    for (let i = 1; i < value.length; i++) {
+      if (quote === '"' && value[i] === "\\") {
+        i++;
+      } else if (value[i] === quote) {
+        if (quote === "'" && value[i + 1] === "'") i++;
+        else return i + 1;
+      }
+    }
+    fail(line, "multiline quoted scalar", scalarRemedy);
+  };
+  const plain = (value, line, flow = false) => {
+    if (/^[&*]/.test(value))
+      fail(line, "anchor or alias", "write the step out in full without anchors or aliases");
+    if (value.startsWith("!")) fail(line, "tag", "remove the tag and write a scalar");
+    if (value.startsWith("{")) fail(line, "flow mapping", "write a block mapping");
+    if (/^\?(?:\s|$)/.test(value)) fail(line, "explicit ? key", keyRemedy);
+    if (/^[[\]}>|%@`]/.test(value) || /^-(?:\s|$)/.test(value))
+      fail(line, "scalar indicator", scalarRemedy);
+    if (/:(?:\s|$)/.test(value) || (flow && /[[\]{},]|:$/.test(value)))
+      fail(
+        line,
+        "mapping or nested collection in scalar",
+        "quote the scalar or write a block mapping",
+      );
+  };
+  const scanFlow = (value, line) => {
+    let index = 1;
+    while (index < value.length) {
+      while (/[ \t]/.test(value[index] ?? "")) index++;
+      if (value[index] === "]") return index + 1;
+      if (value[index] === "[")
+        fail(line, "nested flow collection", "write nested collections in block style");
+      if (value[index] === '"' || value[index] === "'") {
+        index += quotedEnd(value.slice(index), line);
+      } else {
+        const start = index;
+        while (index < value.length && !/[,\]]/.test(value[index])) index++;
+        const item = value.slice(start, index).trim();
+        if (!item || /(?:^|\s)#/.test(item))
+          fail(line, "flow sequence item", "write plain or quoted scalars on one line");
+        plain(item, line, true);
+      }
+      while (/[ \t]/.test(value[index] ?? "")) index++;
+      if (value[index] === "]") return index + 1;
+      if (value[index] !== ",")
+        fail(line, "flow sequence syntax", "write a flat flow sequence on one line");
+      index++;
+    }
+    fail(line, "multiline flow sequence", "write the sequence on one line or in block style");
+  };
+  const scalar = (value, line) => {
+    if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(value)) return;
+    let end;
+    if (value.startsWith("[")) end = scanFlow(value, line);
+    else if (/^["']/.test(value)) end = quotedEnd(value, line);
+    else {
+      plain(value.replace(/[ \t]+#.*$/, ""), line);
+      return;
+    }
+    if (!/^(?:[ \t]+#.*)?[ \t]*$/.test(value.slice(end)))
+      fail(line, "content after scalar", scalarRemedy);
+  };
+  const member = (row) => {
+    if (/^["']/.test(row.content)) {
+      const end = quotedEnd(row.content, row.line);
+      if (/^[ \t]*:/.test(row.content.slice(end))) fail(row.line, "quoted key", keyRemedy);
+    }
+    if (/^\?(?:\s|$)/.test(row.content)) fail(row.line, "explicit ? key", keyRemedy);
+    if (/^<<\s*:/.test(row.content)) fail(row.line, "merge key", "write the mapping out in full");
+    const match = row.content.match(/^([A-Za-z0-9_./-]+):(?:[ \t]+|$)(.*)$/);
+    if (!match) return null;
+    const key = match[1];
+    if (Object.keys(Bun.YAML.parse(`${key}: null`))[0] !== key)
+      fail(
+        row.line,
+        "key whose spelling Bun.YAML changes",
+        "rename the key to a plain string identifier",
+      );
+    return { key, value: match[2] };
+  };
+  let cursor = 0;
+  const block = (indentless = false) => {
+    const first = rows[cursor];
+    const indent = first.indent;
+    const kind = first.content === "-" ? "sequence" : member(first) ? "mapping" : "scalar";
+    const keys = new Map();
+    do {
+      const row = rows[cursor++];
+      let value;
+      if (kind === "sequence") {
+        if (row.content !== "-")
+          fail(row.line, "mixed block mapping and sequence", "use separate indented blocks");
+        value = "";
+      } else if (kind === "mapping") {
+        const entry = member(row);
+        if (!entry) fail(row.line, "unsupported mapping key", keyRemedy);
+        if (keys.has(entry.key)) {
+          const lines = `${keys.get(entry.key)} and ${row.line}`;
+          throw new Error(
+            entry.key === "uses"
+              ? `duplicate uses keys are refused at lines ${lines}; write one \`uses\` per step (or job)`
+              : `duplicate mapping key ${JSON.stringify(entry.key)} is refused at lines ${lines}; write one ${JSON.stringify(entry.key)} per mapping`,
+          );
+        }
+        keys.set(entry.key, row.line);
+        value = entry.value;
+      } else value = row.content;
+      const empty = !value || value.startsWith("#");
+      if (!empty) scalar(value, row.line);
+      if (rows[cursor]?.indent > indent) {
+        if (!empty)
+          fail(rows[cursor].line, "multiline scalar or unexpected indentation", scalarRemedy);
+        block();
+      } else if (
+        kind === "mapping" &&
+        empty &&
+        rows[cursor]?.indent === indent &&
+        rows[cursor].content === "-"
+      ) {
+        block(true);
+      }
+      if (kind === "scalar") break;
+    } while (rows[cursor]?.indent === indent && (!indentless || rows[cursor].content === "-"));
+  };
+  if (rows.length) block();
+  if (cursor < rows.length)
+    fail(
+      rows[cursor].line,
+      "block indentation",
+      "indent child collections beneath their parent key",
+    );
 }
 
 function referenceRemedy({ value, kind }) {
@@ -254,11 +410,10 @@ export async function checkActionPins({ root = ROOT, resolver }) {
         if (stats.size > MAX_FILE_BYTES) throw new Error("action file exceeds scan limit");
         const text = readFileSync(fd, "utf8");
         const metadata = dirname(file) !== join(root, ".github/workflows");
+        refuseDuplicateKeys(text);
         const doc = Bun.YAML.parse(text);
-        refuseAliases(text);
         if (Array.isArray(doc)) throw new Error("multiple YAML documents are not supported");
         refs = inventory(doc, metadata);
-        refuseDuplicateUses(text, metadata);
         locations = locateReferences(text, metadata);
       } finally {
         closeSync(fd);
