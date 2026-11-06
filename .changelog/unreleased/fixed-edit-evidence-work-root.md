@@ -1,7 +1,6 @@
 - **Declared work root for the completion gate (#425).** `bob.yaml` takes an
   optional top-level `work_root`, one absolute existing directory (`~/` is
-  expanded); other values are refused at load. When the edit gate is enabled,
-  bob scans at most 200 child directories in name order. Existing trees need
+  expanded); other values are refused at load. Existing trees need
   changed tracked content absent from launch history. Unknown launch captures
   cannot count. New repositories use a content-change and reflog-label heuristic
   at or after the launch second: `git update-ref -m` or a crafted log can set the

@@ -510,7 +510,7 @@ describe("completion gate under a declared work root", () => {
     expect(isWorkRootEditVerified(snapshot)).toBe(false);
   });
 
-  it("records children beyond the directory bound as unknown in name order", () => {
+  it("marks the over-bound directory unknown", () => {
     init(join(workRoot, "z-repo"));
     mkdirSync(join(workRoot, "a-empty"));
     const options = { maxChildDirectories: 1 };

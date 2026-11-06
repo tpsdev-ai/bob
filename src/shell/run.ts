@@ -1026,8 +1026,6 @@ async function runBoundedSession(
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
       : { kind: "unavailable" };
-  // bob#425: the work-root snapshot is only taken for the edit gate, and only
-  // when the agent declared a root. An unset root adds no work-root scans.
   const workRootAtLaunch: WorkRootLaunchSnapshot | undefined =
     requireEditOrBlocked && resolved.workRoot !== undefined
       ? captureWorkRootSnapshot(resolved.workRoot)
@@ -2111,8 +2109,8 @@ export interface ResolvedRunConfig {
   // over the role's role.json `exploration_budget`. Absent when neither sets one,
   // which leaves the budget off.
   explorationBudget?: number;
-  // bob#425 — bob.yaml `work_root`: the directory whose git work trees the
-  // completion gate also observes. Absent: repository snapshots cover only cwd.
+  // bob#425 — bob.yaml `work_root`: observes work trees in immediate child
+  // directories, excluding symlinks.
   workRoot?: string;
   // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
   // when the role does not; used by bob run and launch with a prompt.

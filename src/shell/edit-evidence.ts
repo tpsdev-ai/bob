@@ -378,8 +378,6 @@ const LAUNCH_OBJECT_LIMIT = 10_000;
 export interface RepositoryCaptureOptions {
   launchCommitLimit?: number;
   historyTimeoutMs?: number;
-  // Bound on each git invocation in the capture. The default matches the
-  // helper's own 5 s bound.
   gitTimeoutMs?: number;
 }
 
@@ -710,7 +708,10 @@ function hasCommitLabelWithContentChange(
   return false;
 }
 
-/** Capture at most maxChildDirectories children in name order; the rest are unknown. */
+/**
+ * Capture immediate child directories, excluding symlinks, in name order up to
+ * maxChildDirectories; directories beyond the capture bound are marked unknown.
+ */
 export function captureWorkRootSnapshot(
   root: string,
   options: WorkRootCaptureOptions = {},
