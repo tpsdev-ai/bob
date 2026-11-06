@@ -695,6 +695,33 @@ function commitChangedContent(
   );
 }
 
+export function replacedCommitFromReflog(
+  raw: string,
+  selector: string,
+  commit: string,
+  action: string,
+): string | undefined {
+  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  if (!selected) return undefined;
+  const records = raw
+    .split("\n")
+    .map((line) =>
+      line.match(
+        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/,
+      ),
+    )
+    .filter(
+      (record) =>
+        record !== null &&
+        record[2] === commit &&
+        record[3] === selected[2] &&
+        record[4] === selected[3] &&
+        record[5] === action,
+    );
+  // Two matching same-second amends, second a no-op of the first, deny the first amend's credit (fail-closed by design).
+  return records.length === 1 ? records[0]?.[1] : undefined;
+}
+
 function amendChangedContent(
   cwd: string,
   commit: string,
@@ -725,22 +752,12 @@ function amendChangedContent(
         remainingMs(),
       );
   // Use the old id in the amend's own record; deny credit if it cannot be read.
-  const records = readFileSync(logPath, "utf8")
-    .split("\n")
-    .map((line) =>
-      line.match(
-        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/,
-      ),
-    )
-    .filter(
-      (record) =>
-        record !== null &&
-        record[2] === commit &&
-        record[3] === selected[2] &&
-        record[4] === selected[3] &&
-        record[5] === action,
-    );
-  const replacedCommit = records.length === 1 ? records[0]?.[1] : undefined;
+  const replacedCommit = replacedCommitFromReflog(
+    readFileSync(logPath, "utf8"),
+    selector,
+    commit,
+    action,
+  );
   return (
     replacedCommit !== undefined && commitChangedContent(cwd, commit, remainingMs, replacedCommit)
   );

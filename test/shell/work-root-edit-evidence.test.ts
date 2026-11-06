@@ -9,6 +9,7 @@ import { runDoctor } from "../../src/shell/doctor.js";
 import {
   captureWorkRootSnapshot,
   isWorkRootEditVerified,
+  replacedCommitFromReflog,
   type WorkRootCaptureOptions,
   type WorkRootLaunchSnapshot,
 } from "../../src/shell/edit-evidence.js";
@@ -484,6 +485,53 @@ describe("completion gate under a declared work root", () => {
       expect(eligibleEntries).toBeGreaterThan(1);
       expect(elapsed).toBeLessThanOrEqual(101);
       expect(timeouts).toEqual([75]);
+    } finally {
+      probe.mockRestore();
+      clock.mockRestore();
+    }
+  }, 20_000);
+
+  it("denies a qualifying evaluation that succeeds after the scan deadline", () => {
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    const parent = init(repo);
+    writeFileSync(join(repo, "tracked"), "committed edit\n");
+    const head = seedSuccessor(repo);
+    const spawn = childProcess.spawnSync;
+    let elapsed = 0;
+    let overrun = false;
+    let successfulFinalReads = 0;
+    const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      const result = spawn(...args);
+      const command = args[1] as string[];
+      if (args[0] === "git" && command.includes("reflog")) {
+        return {
+          ...result,
+          stdout: Buffer.from(
+            `${head}\0HEAD@{${snapshot.launchedAtSeconds} +0000}\0commit: fixture\n`,
+          ),
+        };
+      }
+      if (
+        args[0] === "git" &&
+        command.includes("rev-parse") &&
+        command.includes(`${parent}^{tree}`) &&
+        result.status === 0 &&
+        !result.error
+      ) {
+        successfulFinalReads++;
+        if (overrun) elapsed = 101;
+      }
+      return result;
+    });
+    try {
+      expect(isWorkRootEditVerified(snapshot, { gitTimeoutMs: 100 })).toBe(true);
+      expect(successfulFinalReads).toBe(1);
+      overrun = true;
+      expect(isWorkRootEditVerified(snapshot, { gitTimeoutMs: 100 })).toBe(false);
+      expect(successfulFinalReads).toBe(2);
+      expect(elapsed).toBe(101);
     } finally {
       probe.mockRestore();
       clock.mockRestore();
@@ -1010,6 +1058,28 @@ describe("completion gate under a declared work root", () => {
     const check = report.checks.find((entry) => entry.name === "work root");
     expect(check?.status).toBe("ok");
     expect(check?.detail).toBe(`work_root ${workRoot}`);
+  });
+});
+
+describe("raw amend reflog record matching", () => {
+  const old = "1".repeat(40);
+  const commit = "2".repeat(40);
+  const selector = "HEAD@{1700000000 +0000}";
+  const action = "commit (amend): fixture";
+  const record = (before: string, after: string) =>
+    `${before} ${after} Test <test@example.invalid> 1700000000 +0000\t${action}\n`;
+
+  it("denies credit with no matching raw record", () => {
+    expect(replacedCommitFromReflog(record(old, old), selector, commit, action)).toBeUndefined();
+  });
+
+  it("denies credit for duplicate same-second amend records", () => {
+    const raw = record(old, commit) + record(commit, commit);
+    expect(replacedCommitFromReflog(raw, selector, commit, action)).toBeUndefined();
+  });
+
+  it("returns the replaced commit from one matching raw record", () => {
+    expect(replacedCommitFromReflog(record(old, commit), selector, commit, action)).toBe(old);
   });
 });
 
