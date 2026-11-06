@@ -704,25 +704,20 @@ function amendChangedContent(
 ): boolean {
   const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
   if (!selected) return false;
-  const logPath = gitLine(
+  const entries = readGit(
     cwd,
-    ["rev-parse", "--path-format=absolute", "--git-path", `logs/${selected[1]}`],
+    ["reflog", "show", "--date=raw", "--format=%H%x00%gD%x00%gs", selected[1]],
     undefined,
     timeoutMs,
+  )
+    .toString()
+    .trimEnd()
+    .split("\n");
+  const index = entries.indexOf(`${commit}\0${selector}\0${action}`);
+  const replacedCommit = index < 0 ? undefined : entries[index + 1]?.split("\0")[0];
+  return (
+    replacedCommit !== undefined && commitChangedContent(cwd, commit, timeoutMs, replacedCommit)
   );
-  return readFileSync(logPath, "utf8")
-    .split("\n")
-    .some((line) => {
-      const entry = line.match(/^([0-9a-f]+) ([0-9a-f]+) .+ (-?\d+) ([+-]\d{4})\t(.*)$/);
-      return (
-        entry !== null &&
-        entry[2] === commit &&
-        entry[3] === selected[2] &&
-        entry[4] === selected[3] &&
-        entry[5] === action &&
-        commitChangedContent(cwd, commit, timeoutMs, entry[1])
-      );
-    });
 }
 
 // Heuristic: %gs is a reflog subject label; update-ref -m or a crafted log can set it.
@@ -739,17 +734,19 @@ function hasCommitLabelWithContentChange(
       timeoutMs,
     ).toString();
     for (const entry of reflog.split("\n")) {
-      const [commit, selector, action] = entry.split("\0");
-      const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
-      if (
-        timestamp !== undefined &&
-        Number(timestamp) >= launchedAtSeconds &&
-        ((/^commit(?: \(initial\))?:/.test(action ?? "") &&
-          commitChangedContent(cwd, commit, timeoutMs)) ||
-          (action?.startsWith("commit (amend):") &&
-            amendChangedContent(cwd, commit, selector, action, timeoutMs)))
-      )
-        return true;
+      try {
+        const [commit, selector, action] = entry.split("\0");
+        const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
+        if (
+          timestamp !== undefined &&
+          Number(timestamp) >= launchedAtSeconds &&
+          ((/^commit(?: \(initial\))?:/.test(action ?? "") &&
+            commitChangedContent(cwd, commit, timeoutMs)) ||
+            (action?.startsWith("commit (amend):") &&
+              amendChangedContent(cwd, commit, selector, action, timeoutMs)))
+        )
+          return true;
+      } catch {}
     }
   } catch {
     return false;
