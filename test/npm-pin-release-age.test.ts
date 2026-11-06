@@ -300,7 +300,7 @@ async function closedLoopbackUrl(): Promise<string> {
   return url;
 }
 
-// A failed lookup is a policy error (exit 2), not a verdict on the pin, so the
+// A failed lookup is a lookup error (exit 2), not a verdict on the pin, so the
 // CLI must exit non-zero and never print the pass line.
 async function expectLookupFailure(url: string, stderrNeedle?: string): Promise<void> {
   const result = await runCli(["--registry", url], fixtureEnv());
