@@ -852,6 +852,93 @@ test("a duplicate key after a comment or blank line following indentless steps k
   }
 });
 
+for (const [label, separator] of [
+  ["comment", "# before the document start marker"],
+  ["blank", ""],
+] as const) {
+  test(`a ${label} line before a document start marker is admitted`, async () => {
+    const root = fixtureLines([]);
+    const file = join(root, ".github/workflows/ci.yml");
+    writeFileSync(
+      file,
+      `${separator}\n---\n${workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])}`,
+    );
+    const text = readFileSync(file, "utf8");
+    const parsed = Bun.YAML.parse(text) as { jobs: { check: { steps: unknown } } };
+    expect(Array.isArray(parsed.jobs.check.steps)).toBe(true);
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 1,
+      errors: [],
+    });
+  });
+}
+
+for (const [label, separator] of [
+  ["comment", "# after the document end marker"],
+  ["blank", ""],
+] as const) {
+  test(`a ${label} line after a document end marker is admitted`, async () => {
+    const root = fixtureLines([]);
+    const file = join(root, ".github/workflows/ci.yml");
+    writeFileSync(
+      file,
+      `${workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])}...\n${separator}\n`,
+    );
+    const text = readFileSync(file, "utf8");
+    const parsed = Bun.YAML.parse(text) as { jobs: { check: { steps: unknown } } };
+    expect(Array.isArray(parsed.jobs.check.steps)).toBe(true);
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 1,
+      errors: [],
+    });
+  });
+}
+
+// Bun.YAML parses a dash followed by a comment, with no indented content, as a
+// null sequence item, so the scanner refuses that null at the shape check.
+test("a dash followed by a comment between indentless steps is a null step", async () => {
+  const root = fixtureLines([]);
+  const file = join(root, ".github/workflows/ci.yml");
+  writeFileSync(
+    file,
+    workflow([
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "- # placeholder",
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    ]).replace(/^      /gm, "    "),
+  );
+  const text = readFileSync(file, "utf8");
+  const parsed = Bun.YAML.parse(text) as { jobs: { check: { steps: unknown[] } } };
+  expect(parsed.jobs.check.steps).toHaveLength(3);
+  expect(parsed.jobs.check.steps[1]).toBeNull();
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+    checked: 0,
+    errors: [".github/workflows/ci.yml: jobs.check.steps.1 must be a mapping"],
+  });
+});
+
+test("a dash followed by a comment above an indented step mapping is admitted", async () => {
+  const root = fixtureLines([]);
+  const file = join(root, ".github/workflows/ci.yml");
+  const step = `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`;
+  writeFileSync(
+    file,
+    workflow([
+      step,
+      "- # placeholder",
+      `  uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      step,
+    ]).replace(/^      /gm, "    "),
+  );
+  const text = readFileSync(file, "utf8");
+  const parsed = Bun.YAML.parse(text) as { jobs: { check: { steps: unknown[] } } };
+  expect(parsed.jobs.check.steps).toHaveLength(3);
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+    checked: 3,
+    errors: [],
+  });
+});
+
 test("indentless steps scan nested mappings and block scalars before sibling keys", async () => {
   const root = fixtureLines([]);
   writeFileSync(
