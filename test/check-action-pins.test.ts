@@ -894,6 +894,28 @@ for (const [label, separator] of [
   });
 }
 
+test("content after a document end marker is refused at its line", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    `${workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])}...\nname: Other\n`,
+  );
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: line 9: content after document end is outside the YAML subset; write a single YAML document",
+  ]);
+});
+
+test("a comment after a document end marker does not hide the following content", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    `${workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])}...\n# between documents\nname: Other\n`,
+  );
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: line 10: content after document end is outside the YAML subset; write a single YAML document",
+  ]);
+});
+
 // Bun.YAML parses a dash followed by a comment, with no indented content, as a
 // null sequence item, so the scanner refuses that null at the shape check.
 test("a dash followed by a comment between indentless steps is a null step", async () => {
