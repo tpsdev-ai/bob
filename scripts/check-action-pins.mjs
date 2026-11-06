@@ -3,9 +3,8 @@
 // and action metadata runs.steps[*].uses; refuse parse errors and unwalkable shapes.
 // Locate each reference at its step/job key on a canonical `- uses: <value>` or
 // `uses: <value>` source line (unquoted or simply quoted value); otherwise refuse
-// it with a remedy for its reference kind. Refuse YAML aliases; request the step
-// written out in full. Refuse any duplicate mapping key in the source, naming the
-// file, key and line numbers. Ignore keys in run blocks.
+// it with a remedy for its reference kind. Check the YAML subset below before
+// parsing; refuse duplicate block keys with the file, key and both lines.
 // Remote refs require a full 40-hex SHA and a full release-tag comment resolving
 // to that SHA. Follow ./ local actions through action.yml/action.yaml, cycle-safe
 // and bounded; missing metadata is an error. Check job-level local reusable
@@ -74,313 +73,188 @@ function inventory(doc, metadata) {
   return refs;
 }
 
-function refuseAliases(text) {
-  if (!text.includes("*")) return;
-  let marker = "__action_pin_unbound_alias__";
-  while (text.includes(marker)) marker += "_";
-  try {
-    Bun.YAML.parse(text.replaceAll("*", `*${marker}`));
-  } catch {
-    const tokens = [...new Set(text.match(/\*[^\s[\]{},]*/g))].join(", ");
-    throw new Error(
-      `YAML aliases are refused (source tokens: ${tokens}); write the step out in full`,
-    );
-  }
-}
-
-function skipQuoted(text, start) {
-  const quote = text[start];
-  let index = start + 1;
-  while (index < text.length) {
-    if (quote === '"' && text[index] === "\\") {
-      index += 2;
-      continue;
-    }
-    if (text[index] === quote) {
-      if (quote === "'" && text[index + 1] === "'") {
-        index += 2;
-        continue;
-      }
-      return index + 1;
-    }
-    index++;
-  }
-  return index;
-}
-
-function decodeKey(raw) {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('"')) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed.slice(1, -1);
-    }
-  }
-  if (trimmed.startsWith("'")) return trimmed.slice(1, -1).replaceAll("''", "'");
-  return trimmed;
-}
-
-function isBlockScalar(value) {
-  return /^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(value);
-}
-
-// Collect every mapping key in the source with its span, decoded text and line.
-// Block mappings are entered at the line's indentation (after any `- ` indicators);
-// flow mappings are walked inside `{...}` at any depth. Quoted text is skipped,
-// `#` comments and block-scalar bodies are not scanned, and a plain key's colon
-// must be followed by whitespace or end of line.
-function mappingKeys(text) {
-  const keys = [];
-  const newlines = [];
-  for (let index = 0; index < text.length; index++) {
-    if (text[index] === "\n") newlines.push(index);
-  }
-  const lineOf = (position) => {
-    let low = 0;
-    let high = newlines.length;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if (newlines[middle] < position) low = middle + 1;
-      else high = middle;
-    }
-    return low + 1;
+// Accept block mappings/sequences, one-line scalars, block scalars and flat
+// one-line flow sequences. Mapping keys use [A-Za-z0-9_./-]+ and must retain
+// their spelling in Bun.YAML. Compare keys within each indentation scope;
+// sequence items open separate scopes. Refuse quoted/explicit keys, flow maps,
+// multiline plain/quoted scalars, nested/multiline flows, anchors, aliases, merges,
+// tags, directives and indentation tabs. Allow only an opening --- and closing ...;
+// child collections must be indented. Bun.YAML parses the admitted document.
+export function refuseDuplicateKeys(text) {
+  const fail = (line, construct, remedy) => {
+    throw new Error(`line ${line}: ${construct} is outside the YAML subset; ${remedy}`);
   };
+  const scalarRemedy = "write a one-line scalar or use a | or > block scalar";
+  const keyRemedy = "write an unquoted key using letters, digits, _, -, . or /";
+  const rows = [];
+  let scalarIndent = null;
+  let started = false;
+  let ended = false;
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    const line = index + 1;
+    const indent = raw.match(/^ */)[0].length;
+    const content = raw.slice(indent);
+    if (/^[ \t]*\t/.test(raw)) fail(line, "tab indentation", "indent with spaces");
+    if (scalarIndent !== null) {
+      if (!content || indent > scalarIndent) continue;
+      scalarIndent = null;
+    }
+    if (!content || content.startsWith("#")) continue;
+    if (/^(?:---|\.\.\.)(?:\s|$)/.test(content)) {
+      if (indent === 0 && /^---(?:\s+#.*)?\s*$/.test(content) && !started && !ended) {
+        started = true;
+        continue;
+      }
+      if (indent === 0 && /^\.\.\.(?:\s+#.*)?\s*$/.test(content) && started && !ended) {
+        ended = true;
+        continue;
+      }
+      fail(line, "document marker", "write a single YAML document");
+    }
+    if (ended) fail(line, "content after document end", "write a single YAML document");
+    started = true;
+    let column = indent;
+    let rest = content;
+    while (/^-(?: +|$)/.test(rest)) {
+      const width = rest.match(/^-(?: +|$)/)[0].length;
+      rows.push({ indent: column, content: "-", line });
+      column += width;
+      rest = rest.slice(width);
+    }
+    if (!rest || rest.startsWith("#")) continue;
+    rows.push({ indent: column, content: rest, line });
+    const value = rest.replace(/^[A-Za-z0-9_./-]+:[ \t]*/, "");
+    if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(value)) {
+      scalarIndent = value === rest && column > indent ? rows.at(-2).indent : column;
+    }
+  }
 
-  const scanFlow = (start) => {
-    const stack = [];
-    let index = start;
-    let expectingKey = false;
-    while (index < text.length) {
-      const char = text[index];
-      if (char === '"' || char === "'") {
-        index = skipQuoted(text, index);
-        continue;
+  const quotedEnd = (value, line) => {
+    const quote = value[0];
+    for (let i = 1; i < value.length; i++) {
+      if (quote === '"' && value[i] === "\\") {
+        i++;
+      } else if (value[i] === quote) {
+        if (quote === "'" && value[i + 1] === "'") i++;
+        else return i + 1;
       }
-      if (char === "#" && (index === start || /[ \t\r\n]/.test(text[index - 1]))) {
-        const newline = text.indexOf("\n", index);
-        index = newline === -1 ? text.length : newline;
-        continue;
+    }
+    fail(line, "multiline quoted scalar", scalarRemedy);
+  };
+  const plain = (value, line, flow = false) => {
+    if (/^[&*]/.test(value))
+      fail(line, "anchor or alias", "write the step out in full without anchors or aliases");
+    if (value.startsWith("!")) fail(line, "tag", "remove the tag and write a scalar");
+    if (value.startsWith("{")) fail(line, "flow mapping", "write a block mapping");
+    if (/^\?(?:\s|$)/.test(value)) fail(line, "explicit ? key", keyRemedy);
+    if (/^[[\]}>|%@`]/.test(value) || /^-(?:\s|$)/.test(value))
+      fail(line, "scalar indicator", scalarRemedy);
+    if (/:(?:\s|$)/.test(value) || (flow && /[[\]{},]|:$/.test(value)))
+      fail(
+        line,
+        "mapping or nested collection in scalar",
+        "quote the scalar or write a block mapping",
+      );
+  };
+  const scanFlow = (value, line) => {
+    let index = 1;
+    while (index < value.length) {
+      while (/[ \t]/.test(value[index] ?? "")) index++;
+      if (value[index] === "]") return index + 1;
+      if (value[index] === "[")
+        fail(line, "nested flow collection", "write nested collections in block style");
+      if (value[index] === '"' || value[index] === "'") {
+        index += quotedEnd(value.slice(index), line);
+      } else {
+        const start = index;
+        while (index < value.length && !/[,\]]/.test(value[index])) index++;
+        const item = value.slice(start, index).trim();
+        if (!item || /(?:^|\s)#/.test(item))
+          fail(line, "flow sequence item", "write plain or quoted scalars on one line");
+        plain(item, line, true);
       }
-      if (char === "{") {
-        stack.push("mapping");
-        expectingKey = true;
-        index++;
-        continue;
-      }
-      if (char === "[") {
-        stack.push("sequence");
-        expectingKey = false;
-        index++;
-        continue;
-      }
-      if (char === "}" || char === "]") {
-        if (stack.length === 0) return index + 1;
-        stack.pop();
-        expectingKey = false;
-        index++;
-        continue;
-      }
-      if (char === "," && stack.at(-1) === "mapping") {
-        expectingKey = true;
-        index++;
-        continue;
-      }
-      if (expectingKey) {
-        const keyStart = index;
-        let keyEnd = -1;
-        let colon = -1;
-        if (char === '"' || char === "'") {
-          keyEnd = skipQuoted(text, index);
-          let next = keyEnd;
-          while (next < text.length && /[ \t\r\n]/.test(text[next])) next++;
-          if (text[next] === ":") colon = next;
-        } else {
-          for (let next = index; next < text.length; next++) {
-            const inner = text[next];
-            if (
-              inner === ":" &&
-              (next + 1 >= text.length || /[ \t\r\n,}\]]/.test(text[next + 1]))
-            ) {
-              colon = next;
-              break;
-            }
-            if (inner === "," || inner === "}" || inner === "]" || inner === "{") break;
-          }
-          if (colon !== -1) {
-            keyEnd = colon;
-            while (keyEnd > keyStart && /[ \t]/.test(text[keyEnd - 1])) keyEnd--;
-          }
-        }
-        if (colon !== -1 && keyEnd > keyStart) {
-          keys.push({
-            start: keyStart,
-            end: keyEnd,
-            key: decodeKey(text.slice(keyStart, keyEnd)),
-            line: lineOf(keyStart),
-          });
-          expectingKey = false;
-          index = colon + 1;
-          continue;
-        }
-        expectingKey = false;
-      }
+      while (/[ \t]/.test(value[index] ?? "")) index++;
+      if (value[index] === "]") return index + 1;
+      if (value[index] !== ",")
+        fail(line, "flow sequence syntax", "write a flat flow sequence on one line");
       index++;
     }
-    return index;
+    fail(line, "multiline flow sequence", "write the sequence on one line or in block style");
   };
-
-  let index = 0;
-  let blockScalarIndent = null;
-  while (index < text.length) {
-    const newline = text.indexOf("\n", index);
-    const lineEnd = newline === -1 ? text.length : newline;
-    const line = text.slice(index, lineEnd);
-    const indent = line.length - line.trimStart().length;
-    const content = line.slice(indent);
-    if (blockScalarIndent !== null) {
-      if (content === "" || indent > blockScalarIndent) {
-        index = lineEnd + 1;
-        continue;
-      }
-      blockScalarIndent = null;
-    }
-    if (content === "" || content.startsWith("#")) {
-      index = lineEnd + 1;
-      continue;
-    }
-    let column = index + indent;
-    while (text[column] === "-") {
-      const next = text[column + 1];
-      if (next !== undefined && !/[ \t\r\n]/.test(next)) break;
-      column++;
-      while (text[column] === " " || text[column] === "\t") column++;
-    }
-    if (column >= lineEnd) {
-      index = lineEnd + 1;
-      continue;
-    }
-    const first = text[column];
-    if (first === "{" || first === "[") {
-      const flowEnd = scanFlow(column);
-      const rest = text.indexOf("\n", flowEnd);
-      index = rest === -1 ? text.length : rest + 1;
-      continue;
-    }
-    if ((first === "|" || first === ">") && isBlockScalar(text.slice(column, lineEnd))) {
-      blockScalarIndent = indent;
-      index = lineEnd + 1;
-      continue;
-    }
-    let keyStart = -1;
-    let keyEnd = -1;
-    let colon = -1;
-    if (first === '"' || first === "'") {
-      const quoteEnd = skipQuoted(text, column);
-      if (quoteEnd <= lineEnd) {
-        let next = quoteEnd;
-        while (next < lineEnd && /[ \t]/.test(text[next])) next++;
-        if (text[next] === ":") {
-          keyStart = column;
-          keyEnd = quoteEnd;
-          colon = next;
-        }
-      }
-    } else {
-      for (let next = column; next < lineEnd; next++) {
-        const char = text[next];
-        if (char === ":" && (next + 1 >= text.length || /[ \t\r\n]/.test(text[next + 1]))) {
-          colon = next;
-          break;
-        }
-        if (char === "#" && /[ \t]/.test(text[next - 1])) break;
-      }
-      if (colon !== -1) {
-        keyStart = column;
-        keyEnd = colon;
-        while (keyEnd > keyStart && /[ \t]/.test(text[keyEnd - 1])) keyEnd--;
-      }
-    }
-    if (colon !== -1 && keyEnd > keyStart) {
-      keys.push({
-        start: keyStart,
-        end: keyEnd,
-        key: decodeKey(text.slice(keyStart, keyEnd)),
-        line: lineOf(keyStart),
-      });
-      let valueStart = colon + 1;
-      while (valueStart < lineEnd && /[ \t]/.test(text[valueStart])) valueStart++;
-      const value = text.slice(valueStart, lineEnd).trim();
-      if (isBlockScalar(value)) {
-        blockScalarIndent = indent;
-      } else if (value.startsWith("{") || value.startsWith("[")) {
-        const flowEnd = scanFlow(valueStart);
-        const rest = text.indexOf("\n", flowEnd);
-        index = rest === -1 ? text.length : rest + 1;
-        continue;
-      }
-    }
-    index = lineEnd + 1;
-  }
-  return keys;
-}
-
-function refuseDuplicateKeys(text) {
-  const keys = mappingKeys(text);
-  if (keys.length === 0) return null;
-  let marker = "__action_pin_mapping_key__";
-  while (text.includes(marker)) marker += "_";
-  const marked = [];
-  let cursor = 0;
-  for (const [position, key] of keys.entries()) {
-    const name = `${marker}${position}`;
-    key.marker = name;
-    marked.push(text.slice(cursor, key.start), name);
-    cursor = key.end;
-  }
-  marked.push(text.slice(cursor));
-  const doc = Bun.YAML.parse(marked.join(""));
-  const paths = new Map();
-  const walk = (value, path) => {
-    if (Array.isArray(value)) {
-      value.forEach((item, itemIndex) => {
-        walk(item, [...path, itemIndex]);
-      });
+  const scalar = (value, line) => {
+    if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?$/.test(value)) return;
+    let end;
+    if (value.startsWith("[")) end = scanFlow(value, line);
+    else if (/^["']/.test(value)) end = quotedEnd(value, line);
+    else {
+      plain(value.replace(/[ \t]+#.*$/, ""), line);
       return;
     }
-    if (value === null || typeof value !== "object") return;
-    for (const [name, child] of Object.entries(value)) {
-      paths.set(name, [...path, name]);
-      walk(child, [...path, name]);
-    }
+    if (!/^(?:[ \t]+#.*)?[ \t]*$/.test(value.slice(end)))
+      fail(line, "content after scalar", scalarRemedy);
   };
-  walk(doc, []);
-  const groups = new Map();
-  for (const key of keys) {
-    const path = paths.get(key.marker);
-    if (!path)
-      throw new Error(
-        `mapping key ${JSON.stringify(key.key)} at line ${key.line} cannot be located after parsing`,
+  const member = (row) => {
+    if (/^["']/.test(row.content)) {
+      const end = quotedEnd(row.content, row.line);
+      if (/^[ \t]*:/.test(row.content.slice(end))) fail(row.line, "quoted key", keyRemedy);
+    }
+    if (/^\?(?:\s|$)/.test(row.content)) fail(row.line, "explicit ? key", keyRemedy);
+    if (/^<<\s*:/.test(row.content)) fail(row.line, "merge key", "write the mapping out in full");
+    const match = row.content.match(/^([A-Za-z0-9_./-]+):(?:[ \t]+|$)(.*)$/);
+    if (!match) return null;
+    const key = match[1];
+    if (Object.keys(Bun.YAML.parse(`${key}: null`))[0] !== key)
+      fail(
+        row.line,
+        "key whose spelling Bun.YAML changes",
+        "rename the key to a plain string identifier",
       );
-    const identity = `${JSON.stringify(path.slice(0, -1))}\u0000${key.key}`;
-    if (!groups.has(identity)) groups.set(identity, []);
-    groups.get(identity).push(key);
-  }
-  for (const group of groups.values()) {
-    if (group.length < 2) continue;
-    const lines = group
-      .map((key) => key.line)
-      .join(", ")
-      .replace(/, ([^,]*)$/, " and $1");
-    const { key } = group[0];
-    if (key === "uses")
-      throw new Error(
-        `duplicate uses keys are refused at lines ${lines}; write one \`uses\` per step (or job)`,
-      );
-    throw new Error(
-      `duplicate mapping key ${JSON.stringify(key)} is refused at lines ${lines}; write one ${JSON.stringify(key)} per mapping`,
+    return { key, value: match[2] };
+  };
+  let cursor = 0;
+  const block = () => {
+    const first = rows[cursor];
+    const indent = first.indent;
+    const kind = first.content === "-" ? "sequence" : member(first) ? "mapping" : "scalar";
+    const keys = new Map();
+    do {
+      const row = rows[cursor++];
+      let value;
+      if (kind === "sequence") {
+        if (row.content !== "-")
+          fail(row.line, "mixed block mapping and sequence", "use separate indented blocks");
+        value = "";
+      } else if (kind === "mapping") {
+        const entry = member(row);
+        if (!entry) fail(row.line, "unsupported mapping key", keyRemedy);
+        if (keys.has(entry.key)) {
+          const lines = `${keys.get(entry.key)} and ${row.line}`;
+          throw new Error(
+            entry.key === "uses"
+              ? `duplicate uses keys are refused at lines ${lines}; write one \`uses\` per step (or job)`
+              : `duplicate mapping key ${JSON.stringify(entry.key)} is refused at lines ${lines}; write one ${JSON.stringify(entry.key)} per mapping`,
+          );
+        }
+        keys.set(entry.key, row.line);
+        value = entry.value;
+      } else value = row.content;
+      const empty = !value || value.startsWith("#");
+      if (!empty) scalar(value, row.line);
+      if (rows[cursor]?.indent > indent) {
+        if (!empty)
+          fail(rows[cursor].line, "multiline scalar or unexpected indentation", scalarRemedy);
+        block();
+      }
+      if (kind === "scalar") break;
+    } while (rows[cursor]?.indent === indent);
+  };
+  if (rows.length) block();
+  if (cursor < rows.length)
+    fail(
+      rows[cursor].line,
+      "block indentation",
+      "indent child collections beneath their parent key",
     );
-  }
 }
 
 function referenceRemedy({ value, kind }) {
@@ -531,10 +405,9 @@ export async function checkActionPins({ root = ROOT, resolver }) {
         if (stats.size > MAX_FILE_BYTES) throw new Error("action file exceeds scan limit");
         const text = readFileSync(fd, "utf8");
         const metadata = dirname(file) !== join(root, ".github/workflows");
-        const doc = Bun.YAML.parse(text);
-        refuseAliases(text);
-        if (Array.isArray(doc)) throw new Error("multiple YAML documents are not supported");
         refuseDuplicateKeys(text);
+        const doc = Bun.YAML.parse(text);
+        if (Array.isArray(doc)) throw new Error("multiple YAML documents are not supported");
         refs = inventory(doc, metadata);
         locations = locateReferences(text, metadata);
       } finally {

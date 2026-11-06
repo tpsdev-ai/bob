@@ -1,6 +1,11 @@
-- **The action pin check refuses duplicate mapping keys in workflow and action
-  files, not only duplicate `uses` keys (bob#402).** A duplicate key in a block
-  or flow mapping is reported with the file, the key and both line numbers;
-  siblings may reuse the same child keys, and block-scalar bodies are not
-  scanned as mappings. The existing `uses` remedy is kept.
+- **The action pin check restricts YAML syntax before checking block mapping
+  keys for duplicates (bob#402).** It accepts block mappings and indented block
+  sequences, plain keys matching `[A-Za-z0-9_./-]+` whose spelling Bun.YAML
+  preserves, one-line plain/quoted scalars, `|`/`>` block scalars with optional
+  chomping/indent indicators, and flat one-line flow sequences of scalars.
+  It refuses quoted/explicit keys, flow mappings, multiline plain/quoted scalars,
+  nested/multiline flow collections, anchors, aliases, merge keys, tags, directives,
+  tab indentation and additional document markers (one opening `---` and closing
+  `...` are allowed). Refusals name the file, line and rewrite; duplicate keys
+  name both lines and are compared byte-for-byte within their block mapping.
   (`scripts/check-action-pins.mjs`, `test/check-action-pins.test.ts`)
