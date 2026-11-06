@@ -7,12 +7,14 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   readSync,
   realpathSync,
   type Stats,
 } from "node:fs";
+import { join } from "node:path";
 import { gitEnvironment } from "./git-environment.js";
 import { TOOL_EFFECTS } from "./tool-allowlist.js";
 
@@ -141,22 +143,32 @@ function git(
   );
 }
 
-function readGit(cwd: string, args: string[], repository?: RepositoryIdentity): Buffer {
-  const result = git(cwd, args, repository);
+function readGit(
+  cwd: string,
+  args: string[],
+  repository?: RepositoryIdentity,
+  timeoutMs?: number,
+): Buffer {
+  const result = git(cwd, args, repository, timeoutMs);
   if (result.error || result.status !== 0) throw new Error("git evidence unavailable");
   return result.stdout;
 }
 
-function gitLine(cwd: string, args: string[], repository?: RepositoryIdentity): string {
-  const output = readGit(cwd, args, repository).toString();
+function gitLine(
+  cwd: string,
+  args: string[],
+  repository?: RepositoryIdentity,
+  timeoutMs?: number,
+): string {
+  const output = readGit(cwd, args, repository, timeoutMs).toString();
   if (!output.endsWith("\n")) throw new Error("incomplete git output");
   return output.slice(0, -1);
 }
 
-function resolveRepository(cwd: string): RepositoryIdentity {
+function resolveRepository(cwd: string, timeoutMs = 5_000): RepositoryIdentity {
   return {
-    workTree: realpathSync(gitLine(cwd, ["rev-parse", "--show-toplevel"])),
-    gitDir: realpathSync(gitLine(cwd, ["rev-parse", "--absolute-git-dir"])),
+    workTree: realpathSync(gitLine(cwd, ["rev-parse", "--show-toplevel"], undefined, timeoutMs)),
+    gitDir: realpathSync(gitLine(cwd, ["rev-parse", "--absolute-git-dir"], undefined, timeoutMs)),
   };
 }
 
@@ -269,11 +281,12 @@ function trackedContent(
   objectFormat: "sha1" | "sha256",
   launch?: Map<string, TrackedEntry>,
   cache: ContentCache = new Map(),
+  timeoutMs?: number,
 ): Map<string, TrackedEntry> {
   const captureStartNs = BigInt(Date.now()) * 1_000_000n;
   const { workTree } = repository;
   const index = trackedEntries(
-    readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository),
+    readGit(workTree, ["ls-files", "--stage", "-z", "--full-name"], repository, timeoutMs),
   );
   const content = new Map<string, TrackedEntry>();
   const observedParents = new Map<string, { path: Buffer; stat: Stats | undefined }>();
@@ -326,10 +339,10 @@ function trackedContent(
         mode = "160000";
         const childPath = absolute.toString();
         if (!Buffer.from(childPath).equals(absolute)) throw new Error("unsupported submodule path");
-        const child = resolveRepository(childPath);
+        const child = resolveRepository(childPath, timeoutMs);
         object =
           child.workTree === realpathSync(childPath)
-            ? gitLine(childPath, ["rev-parse", "--verify", "HEAD^{commit}"], child)
+            ? gitLine(childPath, ["rev-parse", "--verify", "HEAD^{commit}"], child, timeoutMs)
             : ((index.get(path) ?? baseline)?.object ?? "");
         bytes = Buffer.from(object);
       } else if (stat) {
@@ -365,22 +378,26 @@ const LAUNCH_OBJECT_LIMIT = 10_000;
 export interface RepositoryCaptureOptions {
   launchCommitLimit?: number;
   historyTimeoutMs?: number;
+  // Bound on each git invocation in the capture. The default matches the
+  // helper's own 5 s bound.
+  gitTimeoutMs?: number;
 }
 
 /** True for a symbolic HEAD to an absent ref. */
-function unbornHead(repository: RepositoryIdentity): boolean {
+function unbornHead(repository: RepositoryIdentity, timeoutMs?: number): boolean {
   const head = git(
     repository.workTree,
     ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
     repository,
+    timeoutMs,
   );
   if (head.error || head.status !== 0) return false;
   const output = head.stdout.toString();
   if (!/^refs\/[^\r\n]+\n$/.test(output)) return false;
   const target = output.slice(0, -1);
-  const valid = git(repository.workTree, ["check-ref-format", target], repository);
+  const valid = git(repository.workTree, ["check-ref-format", target], repository, timeoutMs);
   if (valid.error || valid.status !== 0) return false;
-  const result = git(repository.workTree, ["show-ref", "--exists", target], repository);
+  const result = git(repository.workTree, ["show-ref", "--exists", target], repository, timeoutMs);
   return !result.error && result.status === 2;
 }
 
@@ -392,11 +409,12 @@ function launchTrees(
   historyCheckSkipped?: "limit" | "timeout" | "unavailable";
 } {
   const limit = options.launchCommitLimit ?? LAUNCH_COMMIT_LIMIT;
+  const timeoutMs = options.historyTimeoutMs ?? options.gitTimeoutMs;
   const result = git(
     repository.workTree,
     ["rev-list", "--all", `--max-count=${limit + 1}`, "--format=%T", "--no-commit-header"],
     repository,
-    options.historyTimeoutMs,
+    timeoutMs,
   );
   if (result.error || result.status !== 0) {
     return {
@@ -410,15 +428,16 @@ function launchTrees(
   const output = result.stdout.toString();
   if (output === "") {
     // Unborn acceptance requires symbolic HEAD to an absent ref and no commit/tag objects.
-    if (!unbornHead(repository)) return { trees: new Set(), historyCheckSkipped: "unavailable" };
-    const refs = git(repository.workTree, ["show-ref"], repository, options.historyTimeoutMs);
+    if (!unbornHead(repository, timeoutMs))
+      return { trees: new Set(), historyCheckSkipped: "unavailable" };
+    const refs = git(repository.workTree, ["show-ref"], repository, timeoutMs);
     if (refs.error || refs.status !== 1 || refs.stdout.length !== 0)
       return { trees: new Set(), historyCheckSkipped: "unavailable" };
     const objects = git(
       repository.workTree,
       ["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"],
       repository,
-      options.historyTimeoutMs,
+      timeoutMs,
       (LAUNCH_OBJECT_LIMIT + 1) * "commit\n".length,
     );
     if (
@@ -517,7 +536,8 @@ export function captureRepositoryState(
     return { kind: "unavailable" };
   if (launch && launch.kind !== "git") return { kind: "unavailable" };
   try {
-    const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
+    const timeoutMs = options.gitTimeoutMs;
+    const inside = git(cwd, ["rev-parse", "--is-inside-work-tree"], undefined, timeoutMs);
     if (
       !inside.error &&
       ((inside.status === 0 && inside.stdout.toString().trim() === "false") ||
@@ -528,13 +548,13 @@ export function captureRepositoryState(
     if (inside.error || inside.status !== 0 || inside.stdout.toString().trim() !== "true") {
       return { kind: "unavailable" };
     }
-    const repository = resolveRepository(cwd);
+    const repository = resolveRepository(cwd, options.gitTimeoutMs);
     if (launch?.kind === "git" && !sameRepository(launch, repository))
       return { kind: "unavailable" };
     const objectFormat =
       launch?.kind === "git"
         ? launch.objectFormat
-        : gitLine(cwd, ["rev-parse", "--show-object-format"], repository);
+        : gitLine(cwd, ["rev-parse", "--show-object-format"], repository, options.gitTimeoutMs);
     if (objectFormat !== "sha1" && objectFormat !== "sha256")
       throw new Error("unsupported object format");
     const history =
@@ -547,9 +567,11 @@ export function captureRepositoryState(
       objectFormat,
       launch?.kind === "git" ? launch.tracked : undefined,
       cache,
+      options.gitTimeoutMs,
     );
     const tree = contentTree(tracked, objectFormat);
-    if (!sameRepository(repository, resolveRepository(cwd))) return { kind: "unavailable" };
+    if (!sameRepository(repository, resolveRepository(cwd, options.gitTimeoutMs)))
+      return { kind: "unavailable" };
     const state: RepositoryState = {
       kind: "git",
       ...repository,
@@ -585,4 +607,168 @@ export function isVerifiedEdit(
   } catch {
     return false;
   }
+}
+
+// --- declared work root (bob#425) ------------------------------------------
+//
+// A builder-local run may reach its task repository with `cd <path> && …`
+// rather than from the run's cwd. The launch snapshot above only sees cwd, so
+// the same capture is taken for every git work tree directly under the
+// agent's declared `work_root`. The end check then compares each tree with its
+// own launch state; a tree that did not exist at launch counts only when it
+// holds a commit made after launch.
+
+export const WORK_ROOT_MAX_TREES = 200;
+export const WORK_ROOT_CAPTURE_TIMEOUT_MS = 5_000;
+
+export type WorkTreeLaunchState =
+  | { kind: "known"; head: string; tree: string }
+  | { kind: "unknown" };
+
+export interface WorkRootLaunchSnapshot {
+  root: string;
+  launchedAtSeconds: number;
+  // Keyed by the directory name directly under `root`.
+  trees: Map<string, WorkTreeLaunchState>;
+}
+
+export interface WorkRootCaptureOptions {
+  gitTimeoutMs?: number;
+  maxTrees?: number;
+}
+
+function workTreeCandidates(root: string): string[] {
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function captureWorkTree(
+  path: string,
+  timeoutMs: number,
+): { head: string; headTree: string; tree: string } | undefined {
+  try {
+    const state = captureRepositoryState(path, undefined, { gitTimeoutMs: timeoutMs });
+    if (state.kind !== "git" || state.workTree !== realpathSync(path)) return undefined;
+    return {
+      head: gitLine(path, ["rev-parse", "--verify", "HEAD^{commit}"], state, timeoutMs),
+      headTree: gitLine(path, ["rev-parse", "--verify", "HEAD^{tree}"], state, timeoutMs),
+      tree: state.tree,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function hasCommitAfter(cwd: string, timeoutMs: number, launchedAtSeconds: number): boolean {
+  const result = git(
+    cwd,
+    ["rev-list", "--all", "--max-count=1", `--since=@${launchedAtSeconds + 1}`],
+    undefined,
+    timeoutMs,
+  );
+  return !result.error && result.status === 0 && result.stdout.toString().trim() !== "";
+}
+
+/**
+ * Snapshot every git work tree directly under `root`, keyed by its directory
+ * name. A directory that is not the top of a work tree is skipped; a capture
+ * that fails, or a tree past `maxTrees`, is recorded as unknown and can never
+ * count as evidence. Returns undefined when the root cannot be listed.
+ */
+export function captureWorkRootSnapshot(
+  root: string,
+  options: WorkRootCaptureOptions = {},
+): WorkRootLaunchSnapshot | undefined {
+  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+  const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
+  const launchedAtSeconds = Math.floor(Date.now() / 1000);
+  let names: string[];
+  try {
+    names = workTreeCandidates(root);
+  } catch {
+    return undefined;
+  }
+  const trees = new Map<string, WorkTreeLaunchState>();
+  for (const [index, name] of names.entries()) {
+    if (index >= maxTrees) {
+      trees.set(name, { kind: "unknown" });
+      continue;
+    }
+    const captured = captureWorkTree(join(root, name), timeoutMs);
+    trees.set(
+      name,
+      captured === undefined
+        ? { kind: "unknown" }
+        : { kind: "known", head: captured.head, tree: captured.tree },
+    );
+  }
+  return { root, launchedAtSeconds, trees };
+}
+
+/**
+ * True when a work tree under the launch snapshot's root shows an edit made
+ * during the run: an existing tree whose HEAD moved or whose non-empty tracked
+ * diff differs, or a tree absent at launch that now holds a commit made after
+ * launch. An unknown launch state never counts.
+ */
+export function isWorkRootEditVerified(
+  snapshot: WorkRootLaunchSnapshot,
+  options: WorkRootCaptureOptions = {},
+): boolean {
+  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+  const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
+  let names: string[];
+  try {
+    names = workTreeCandidates(snapshot.root);
+  } catch {
+    return false;
+  }
+  for (const [index, name] of names.entries()) {
+    if (index >= maxTrees) break;
+    const launch = snapshot.trees.get(name);
+    if (launch?.kind === "unknown") continue;
+    const path = join(snapshot.root, name);
+    const end = captureWorkTree(path, timeoutMs);
+    if (end === undefined) continue;
+    if (launch !== undefined) {
+      if (end.head !== launch.head) return true;
+      if (end.tree !== launch.tree && end.tree !== end.headTree) return true;
+      continue;
+    }
+    if (hasCommitAfter(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
+  }
+  return false;
+}
+
+/**
+ * Number of git work trees directly under `root` that a run would watch, or
+ * undefined when the bound is exceeded or any candidate cannot be read.
+ */
+export function countWorkRootTrees(
+  root: string,
+  options: WorkRootCaptureOptions = {},
+): number | undefined {
+  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+  const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
+  let names: string[];
+  try {
+    names = workTreeCandidates(root);
+  } catch {
+    return undefined;
+  }
+  if (names.length > maxTrees) return undefined;
+  let count = 0;
+  for (const name of names) {
+    const path = join(root, name);
+    try {
+      const state = captureRepositoryState(path, undefined, { gitTimeoutMs: timeoutMs });
+      if (state.kind === "unavailable") return undefined;
+      if (state.kind === "git" && state.workTree === realpathSync(path)) count += 1;
+    } catch {
+      return undefined;
+    }
+  }
+  return count;
 }

@@ -63,6 +63,7 @@ import {
   readSessionBudget,
   readToolLoopLimit,
   readTools,
+  readWorkRoot,
 } from "./bob-yaml.js";
 import {
   assertConditionalTools,
@@ -86,9 +87,12 @@ import { collectCredentialPaths } from "./confined-read.js";
 import { configHoldsWeb, gatedNoteInjection } from "./data-class.js";
 import {
   captureRepositoryState,
+  captureWorkRootSnapshot,
   isCommandRunnerTool,
   isVerifiedEdit,
+  isWorkRootEditVerified,
   type RepositoryState,
+  type WorkRootLaunchSnapshot,
 } from "./edit-evidence.js";
 import { DEFAULT_MAX_EMPTY_RESPONSE_RETRIES } from "./empty-response.js";
 import {
@@ -1022,6 +1026,12 @@ async function runBoundedSession(
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
       : { kind: "unavailable" };
+  // bob#425: the work-root snapshot is only taken for the edit gate, and only
+  // when the agent declared a root. An unset root makes no calls at all.
+  const workRootAtLaunch: WorkRootLaunchSnapshot | undefined =
+    requireEditOrBlocked && resolved.workRoot !== undefined
+      ? captureWorkRootSnapshot(resolved.workRoot)
+      : undefined;
   const commandStarts = new Map<string, { toolName: string; before: RepositoryState }>();
   const seenCommandIds = new Set<string>();
   const finalizeAbort = async (reason: TerminationReason): Promise<RunResult> => {
@@ -1765,7 +1775,8 @@ async function runBoundedSession(
         cwd: config.cwd,
         before: repositoryAtLaunch,
         after: captureRepositoryState(config.cwd, repositoryAtLaunch),
-      })
+      }) &&
+      !(workRootAtLaunch !== undefined && isWorkRootEditVerified(workRootAtLaunch))
     ) {
       if (!/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {
         exitCode = 1;
@@ -2100,6 +2111,10 @@ export interface ResolvedRunConfig {
   // over the role's role.json `exploration_budget`. Absent when neither sets one,
   // which leaves the budget off.
   explorationBudget?: number;
+  // bob#425 — bob.yaml `work_root`: the directory whose git work trees the
+  // completion gate also observes for edit evidence. Absent: only cwd is
+  // observed, exactly as before.
+  workRoot?: string;
   // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
   // when the role does not; used by bob run and launch with a prompt.
   requireEditOrBlocked?: true;
@@ -2727,6 +2742,8 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
   // bob#279: the exploration budget (bob.yaml `run.exploration_budget` over
   // role.json `exploration_budget`), or undefined when neither sets one.
   const explorationBudget = resolveExplorationBudget(yamlText);
+  // bob#425: the declared work root, validated at load.
+  const workRoot = readWorkRoot(yamlText, homedir());
   // bob#283: the role's edit-or-blocked opt-in.
   const requireEditOrBlocked = resolveRequireEditOrBlocked(yamlText);
   // bob#365: the role's final-report markers, if it declares any.
@@ -2810,6 +2827,7 @@ export function resolveRunConfig(opts: ResolveRunConfigOptions): ResolvedRunConf
     capabilities,
     toolLoopLimit: readToolLoopLimit(yamlText) ?? DEFAULT_TOOL_LOOP_LIMIT,
     runLimits: readRunLimits(yamlText),
+    ...(workRoot !== undefined ? { workRoot } : {}),
     ...(explorationBudget !== undefined ? { explorationBudget } : {}),
     ...(requireEditOrBlocked ? { requireEditOrBlocked: true as const } : {}),
     ...(finalMarkers !== undefined ? { finalMarkers } : {}),

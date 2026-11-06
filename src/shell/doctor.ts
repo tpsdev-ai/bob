@@ -76,10 +76,12 @@ import {
   readProviderLimits,
   readResident,
   readTools,
+  readWorkRoot,
   type ToolsBlock,
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { conditionalToolRefusals } from "./capability-loader.js";
+import { countWorkRootTrees, WORK_ROOT_MAX_TREES } from "./edit-evidence.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
@@ -478,6 +480,39 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
   } catch (err) {
     bobYamlReadError =
       (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
+  }
+
+  // bob#425: the declared work root and how many work trees it would watch.
+  // Absent: no check at all, exactly as before.
+  if (yamlText !== undefined) {
+    let workRoot: string | undefined;
+    try {
+      workRoot = readWorkRoot(yamlText, home);
+    } catch (err) {
+      checks.push({
+        name: "work root",
+        status: "fail",
+        detail: err instanceof Error ? err.message : String(err),
+        fix: `set "work_root" in ${bobYamlPath} to an absolute path to an existing directory, then re-run 'bob doctor ${opts.name}'`,
+      });
+    }
+    if (workRoot !== undefined) {
+      const trees = countWorkRootTrees(workRoot);
+      checks.push(
+        trees === undefined
+          ? {
+              name: "work root",
+              status: "warn",
+              detail: `${workRoot} — could not count its work trees`,
+              fix: `check that ${workRoot} is readable and holds at most ${WORK_ROOT_MAX_TREES} directories, then re-run 'bob doctor ${opts.name}'`,
+            }
+          : {
+              name: "work root",
+              status: "ok",
+              detail: `${workRoot} — ${trees} work tree(s) under it`,
+            },
+      );
+    }
   }
 
   if (bobYamlReadError !== undefined) {
