@@ -13,7 +13,16 @@ const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs"
 const NPM_SELF_UPDATE = "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org";
 const NPM_UPGRADE_STEP = "Upgrade npm to a staging-capable version";
 const SELF_UPDATE = /^npm install -g npm@11\.21\.1 --registry=https:\/\/registry\.npmjs\.org$/;
-const NPM_COMMANDS = new Set([NPM_SELF_UPDATE, "npm --version", "npm stage publish"]);
+const NPM_LINES = new Set([
+  NPM_PIN_CHECKER,
+  NPM_SELF_UPDATE,
+  'v=$(npm --version) || { echo "npm --version failed" >&2; exit 1; }; test "$v" = "11.21.1" || { echo "npm is $v, expected the pinned 11.21.1" >&2; exit 1; }',
+  "npm stage publish",
+  'echo "::group::npm stage publish — $name"',
+  'echo "\\`@tpsdev-ai/bob\\` submitted to npm **staging** with provenance."',
+  'echo "**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),"',
+  'echo "Or: \\`npm stage list\\` then \\`npm stage approve <id>\\`."',
+]);
 const PINNED_BUN = JSON.parse(
   readFileSync(join(REPO, "package.json"), "utf8"),
 ).packageManager.replace(/^bun@/, "");
@@ -296,102 +305,32 @@ const NPM_PIN_PREFIX = [
   { run: CHECKER, keys: ["name", "run"] },
 ];
 
-function shellCommands(run: string): { commands: string[][]; malformed: boolean } {
-  const source = run.replace(/\\\r?\n/g, "");
-  type Frame = { end: string; quote: string; words: string[]; word: string };
-  const frames: Frame[] = [{ end: "", quote: "", words: [], word: "" }];
-  const commands: string[][] = [];
-  const flushWord = (frame: Frame) => {
-    if (frame.word) frame.words.push(frame.word);
-    frame.word = "";
-  };
-  const flushCommand = (frame: Frame) => {
-    flushWord(frame);
-    if (frame.words.length) commands.push(frame.words);
-    frame.words = [];
-  };
-  // Each iteration consumes a source character; substitutions use the same scan.
-  for (let index = 0; index < source.length; index += 1) {
-    const frame = frames[frames.length - 1];
-    const char = source[index];
-    if (char === "\\" && frame.quote !== "'") {
-      frame.word += char + (source[index + 1] ?? "");
-      index += 1;
-    } else if (frame.quote === "'") {
-      frame.word += char;
-      if (char === "'") frame.quote = "";
-    } else if (char === "'" && !frame.quote) {
-      frame.quote = char;
-      frame.word += char;
-    } else if (char === '"') {
-      frame.quote = frame.quote ? "" : char;
-      frame.word += char;
-    } else if (!frame.quote && frame.end && char === frame.end) {
-      flushCommand(frame);
-      frames.pop();
-    } else if (char === "`" || (char === "$" && source[index + 1] === "(")) {
-      frame.word += "$()";
-      frames.push({ end: char === "`" ? "`" : ")", quote: "", words: [], word: "" });
-      if (char === "$") index += 1;
-    } else if (frame.quote) {
-      frame.word += char;
-    } else if (char === "#" && !frame.word) {
-      const end = source.indexOf("\n", index);
-      index = end === -1 ? source.length : end - 1;
-    } else if (/^[\n;|&{}]$/.test(char)) {
-      flushCommand(frame);
-    } else if (/\s/.test(char)) {
-      flushWord(frame);
-    } else {
-      frame.word += char;
-    }
-  }
-  for (const frame of frames) flushCommand(frame);
-  return { commands, malformed: frames.length !== 1 || frames[0].quote !== "" };
-}
-
-function npmCommandProblems(steps: Step[]): string[] {
+// Catch accidental or careless edits to release-job npm usage with exact lines.
+// Join backslash continuations, then require each trimmed line containing npm/npx
+// (case-insensitive substrings) to match this workflow's allowlist byte for byte.
+// Changed or added npm lines need a deliberate allowlist edit in the same PR.
+// Deliberate shell obfuscation without literal npm (e.g. n"p"m) is out of scope:
+// changes to the release workflow are themselves reviewed.
+function npmLineProblems(steps: Step[]): string[] {
   const problems: string[] = [];
   let updates = 0;
   for (const step of steps) {
-    const { commands, malformed } = shellCommands(step.run ?? "");
-    if (malformed) problems.push("unclassified shell syntax in release run");
-    for (const words of commands) {
-      let first = 0;
-      // This bound is the number of words in the simple command.
-      for (; first < words.length; first += 1) {
-        if (
-          !/^[A-Za-z_][A-Za-z_0-9]*=/.test(words[first]) &&
-          !["env", "command", "exec", "builtin"].includes(words[first])
-        )
-          break;
-      }
-      const commandWords = words.slice(first);
-      const command = commandWords.join(" ");
-      const unquote = (text: string) => text.replace(/["']/g, "").replace(/\\(.)/g, "$1");
-      const executable = unquote(commandWords[0] ?? "");
-      if (/^(?:.*\/)?(?:npm|npx)$/.test(executable)) {
-        if (!NPM_COMMANDS.has(command)) {
-          problems.push(`npm command is not allowlisted: ${command}`);
-        } else if (command === NPM_SELF_UPDATE) {
-          updates += 1;
-          if (step.name !== NPM_UPGRADE_STEP || step.run?.trim() !== NPM_SELF_UPDATE) {
-            problems.push("npm self-update must be the exact named step");
-          }
-        } else if (step.name !== "Stage-publish") {
-          problems.push(`npm command outside the version probe/staging step: ${command}`);
+    const lines = (step.run ?? "").replace(/\\\r?\n/g, "").split("\n");
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!/npm|npx/i.test(line)) continue;
+      if (!NPM_LINES.has(line)) {
+        problems.push(`${step.name ?? "<unnamed>"}: npm/npx line is not allowlisted: ${line}`);
+      } else if (line === NPM_SELF_UPDATE) {
+        updates += 1;
+        if (step.name !== NPM_UPGRADE_STEP || step.run?.trim() !== NPM_SELF_UPDATE) {
+          problems.push("npm self-update must be the exact named step");
         }
-      } else if (
-        /\$/.test(executable) ||
-        (!["echo", "printf"].includes(executable) &&
-          /(?<![\w.-])(?:npm|npx)(?![\w.-])/.test(unquote(command)))
-      ) {
-        problems.push(`unclassified npm command: ${command}`);
       }
     }
   }
   if (updates !== 1) {
-    problems.push(`expected exactly one allowlisted npm self-update command, found ${updates}`);
+    problems.push(`expected exactly one allowlisted npm self-update line, found ${updates}`);
   }
   return problems;
 }
@@ -444,7 +383,7 @@ function npmPinStepProblems(steps: Step[]): string[] {
       "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
     );
   }
-  problems.push(...npmCommandProblems(steps));
+  problems.push(...npmLineProblems(steps));
   const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
   if (upgrade !== -1 && Object.hasOwn(steps[upgrade], "env")) {
     problems.push('the npm self-update step must not set "env"');
@@ -648,7 +587,9 @@ test.each(["before the checker", "after publishing", "inside a run block"])(
     if (position === "before the checker") steps.splice(0, 0, { name: "Another update", run });
     else if (position === "after publishing") steps.push({ name: "Another update", run });
     else steps[steps.length - 1].run = `${steps[steps.length - 1].run ?? ""}\n${run}`;
-    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${run}`);
+    expect(npmPinStepProblems(steps)).toContain(
+      `${position === "inside a run block" ? steps[steps.length - 1].name : "Another update"}: npm/npx line is not allowlisted: ${run}`,
+    );
   },
   5_000,
 );
@@ -681,39 +622,53 @@ test.each(
   (run) => {
     const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
     steps.push({ name: "Another update", run });
-    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${run}`);
+    expect(npmPinStepProblems(steps)).toContain(
+      `Another update: npm/npx line is not allowlisted: ${run}`,
+    );
   },
   5_000,
 );
 
 test.each([
+  ["separate option value", "npm --registry https://different.example.invalid i -g npm@11.21.1"],
+  ["env wrapper", "env npm i -g npm@11.21.1"],
+  ["command wrapper", "command npm i -g npm@11.21.1"],
+  ["exec wrapper", "exec npm i -g npm@11.21.1"],
+  ["builtin wrapper", "builtin npm i -g npm@11.21.1"],
+  ["assignments and wrappers", "A=one env B=two command exec builtin npm i -g npm@11.21.1"],
+  ["continued command", 'PKG=npm@11.21.1; n\\\npm i -g "$PKG"'],
+  ["continued arguments", "npm \\\n i -g npm@11.21.1"],
+  ["continuation-split executable", "n\\\npm ci"],
+  ["substitution", "echo $(npm i -g npm@11.21.1)"],
+  ["quoted substitution", 'echo "$(npm i -g npm@11.21.1)"'],
+  ["backticks", "echo `npm i -g npm@11.21.1`"],
+  ["npx", "npx npm@11.21.1 i -g npm@11.21.1"],
+  ["path", "/usr/bin/npm i -g npm@11.21.1"],
   [
-    "separate option value",
-    "npm --registry https://different.example.invalid i -g npm@11.21.1",
-    "npm --registry https://different.example.invalid i -g npm@11.21.1",
+    "process substitution",
+    "echo <(npm install -g npm@11.21.1 --registry=https://different.example.invalid)",
   ],
-  ["env wrapper", "env npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
-  ["command wrapper", "command npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
-  ["exec wrapper", "exec npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
-  ["builtin wrapper", "builtin npm i -g npm@11.21.1", "npm i -g npm@11.21.1"],
   [
-    "assignments and wrappers",
-    "A=one env B=two command exec builtin npm i -g npm@11.21.1",
-    "npm i -g npm@11.21.1",
+    "command substitution",
+    "echo $(npm install -g npm@11.21.1 --registry=https://different.example.invalid)",
   ],
-  ["continued command", 'PKG=npm@11.21.1; n\\\npm i -g "$PKG"', 'npm i -g "$PKG"'],
-  ["continued arguments", "npm \\\n i -g npm@11.21.1", "npm i -g npm@11.21.1"],
-  ["substitution", "echo $(npm i -g npm@11.21.1)", "npm i -g npm@11.21.1"],
-  ["quoted substitution", 'echo "$(npm i -g npm@11.21.1)"', "npm i -g npm@11.21.1"],
-  ["backticks", "echo `npm i -g npm@11.21.1`", "npm i -g npm@11.21.1"],
-  ["npx", "npx npm@11.21.1 i -g npm@11.21.1", "npx npm@11.21.1 i -g npm@11.21.1"],
-  ["path", "/usr/bin/npm i -g npm@11.21.1", "/usr/bin/npm i -g npm@11.21.1"],
+  ["heredoc body", "cat <<'EOF'\nnpm i -g npm@11.21.1\nEOF"],
+  ["assignment", "NPM=npm"],
+  ["case-insensitive substring", "echo prefixNPMsuffix"],
+  ["npx substring", "echo prefixnpxsuffix"],
+  ["extra whitespace", "npm  stage publish"],
 ] as const)(
-  "npm allowlist refuses %s",
-  (_name, run, command) => {
+  "npm line allowlist refuses %s",
+  (_name, run) => {
     const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
     steps.push({ name: "Another update", run });
-    expect(npmPinStepProblems(steps)).toContain(`npm command is not allowlisted: ${command}`);
+    const refused = run
+      .replace(/\\\r?\n/g, "")
+      .split("\n")
+      .find((line) => /npm|npx/i.test(line));
+    expect(npmPinStepProblems(steps)).toContain(
+      `Another update: npm/npx line is not allowlisted: ${refused?.trim()}`,
+    );
   },
   5_000,
 );
@@ -724,58 +679,51 @@ test.each([
   "eval 'npm i -g npm@11.21.1'",
   "eval 'npm; exit'",
   "sh -c 'npx|cat'",
-  "eval 'n\"\"pm --version'",
-  "sh -c 'n\"\"px --version'",
   "sh -c 'npm i -g npm@11.21.1'",
   "xargs npm i -g npm@11.21.1",
+  'echo "npm i -g npm@11.21.1; npx bad | npm ci"',
+  "printf '%s\\n' 'npm i -g npm@11.21.1 $(npm ci) `npm ci`'",
+  ...["env", "command", "exec", "builtin", "A=one env B=two command"].map(
+    (wrapper) => `${wrapper} npm   --version`,
+  ),
 ])(
-  "npm allowlist refuses unclassified %s",
+  "npm line allowlist refuses %s",
   (run) => {
     const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
     steps.push({ name: "Another update", run });
-    expect(
-      npmPinStepProblems(steps).some((problem) => problem.startsWith("unclassified npm command:")),
-    ).toBe(true);
+    expect(npmPinStepProblems(steps)).toContain(
+      `Another update: npm/npx line is not allowlisted: ${run}`,
+    );
   },
   5_000,
 );
 
 test.each(["\n", ";", "&&", "||", "|"])(
-  "npm allowlist checks commands separated by %j",
+  "npm line allowlist refuses unlisted lines with separator %j",
   (separator) => {
     const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
-    steps.push({ run: `echo npm is text ${separator} npm ci` });
-    expect(npmPinStepProblems(steps)).toContain("npm command is not allowlisted: npm ci");
+    steps.push({ name: "Another update", run: `echo npm is text ${separator} npm ci` });
+    expect(npmPinStepProblems(steps)).toContain(
+      `Another update: npm/npx line is not allowlisted: ${separator === "\n" ? "echo npm is text" : `echo npm is text ${separator} npm ci`}`,
+    );
   },
   5_000,
 );
 
-test("npm allowlist keeps literal echo and printf arguments", () => {
+test("literal-free shell obfuscation is outside the npm line rule's scope", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
   steps.push({
-    run: "echo \"npm i -g npm@11.21.1; npx bad | npm ci\"\nprintf '%s\\n' 'npm i -g npm@11.21.1 $(npm ci) `npm ci`'",
+    name: "Outside scope",
+    run: ['n"p"m --version', "eval 'n\"\"pm --version'", "sh -c 'n\"\"px --version'"].join("\n"),
   });
-  expect(npmPinStepProblems(steps)).toEqual([]);
+  expect(npmLineProblems(steps)).toEqual([]);
 }, 5_000);
-
-test.each(["env", "command", "exec", "builtin", "A=one env B=two command"])(
-  "npm allowlist classifies %s before the version probe",
-  (wrapper) => {
-    expect(
-      npmCommandProblems([
-        { name: NPM_UPGRADE_STEP, run: NPM_SELF_UPDATE },
-        { name: "Stage-publish", run: `${wrapper} npm   --version` },
-      ]),
-    ).toEqual([]);
-  },
-  5_000,
-);
 
 test("npm allowlist counts a duplicate canonical self-update", () => {
   const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
   steps.push({ name: NPM_UPGRADE_STEP, run: NPM_SELF_UPDATE });
   expect(npmPinStepProblems(steps)).toContain(
-    "expected exactly one allowlisted npm self-update command, found 2",
+    "expected exactly one allowlisted npm self-update line, found 2",
   );
 }, 5_000);
 
