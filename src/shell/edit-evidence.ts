@@ -678,20 +678,20 @@ function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
 function commitChangedContent(
   cwd: string,
   commit: string,
-  timeoutMs: number,
+  remainingMs: () => number,
   replacedCommit?: string,
 ): boolean {
-  const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, timeoutMs)
+  const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, remainingMs())
     .toString()
     .split("\n\n", 1)[0]
     .split("\n");
   const parent = replacedCommit ?? headers.find((line) => line.startsWith("parent "))?.slice(7);
   if (parent === undefined) {
-    return readGit(cwd, ["ls-tree", commit], undefined, timeoutMs).length > 0;
+    return readGit(cwd, ["ls-tree", commit], undefined, remainingMs()).length > 0;
   }
   return (
-    gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, timeoutMs) !==
-    gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, timeoutMs)
+    gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, remainingMs()) !==
+    gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, remainingMs())
   );
 }
 
@@ -700,7 +700,7 @@ function amendChangedContent(
   commit: string,
   selector: string,
   action: string,
-  timeoutMs: number,
+  remainingMs: () => number,
 ): boolean {
   const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
   if (!selected) return false;
@@ -712,7 +712,7 @@ function amendChangedContent(
           cwd,
           ["rev-parse", "--path-format=absolute", "--git-common-dir"],
           undefined,
-          timeoutMs,
+          remainingMs(),
         ),
         ...(ref === "main-worktree/HEAD"
           ? ["logs", "HEAD"]
@@ -722,7 +722,7 @@ function amendChangedContent(
         cwd,
         ["rev-parse", "--path-format=absolute", "--git-path", `logs/${ref}`],
         undefined,
-        timeoutMs,
+        remainingMs(),
       );
   // Use the old id in the amend's own record; deny credit if it cannot be read.
   const records = readFileSync(logPath, "utf8")
@@ -742,7 +742,7 @@ function amendChangedContent(
     );
   const replacedCommit = records.length === 1 ? records[0]?.[1] : undefined;
   return (
-    replacedCommit !== undefined && commitChangedContent(cwd, commit, timeoutMs, replacedCommit)
+    replacedCommit !== undefined && commitChangedContent(cwd, commit, remainingMs, replacedCommit)
   );
 }
 
@@ -752,14 +752,21 @@ function hasCommitLabelWithContentChange(
   timeoutMs: number,
   launchedAtSeconds: number,
 ): boolean {
+  const deadline = performance.now() + timeoutMs;
+  const remainingMs = () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("reflog scan deadline exceeded");
+    return Math.ceil(remaining);
+  };
   try {
     const reflog = readGit(
       cwd,
       ["reflog", "show", "--all", "--date=raw", "--format=%H%x00%gD%x00%gs"],
       undefined,
-      timeoutMs,
+      remainingMs(),
     ).toString();
     for (const entry of reflog.split("\n")) {
+      if (performance.now() >= deadline) return false;
       try {
         const [commit, selector, action] = entry.split("\0");
         const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
@@ -767,11 +774,11 @@ function hasCommitLabelWithContentChange(
           timestamp !== undefined &&
           Number(timestamp) >= launchedAtSeconds &&
           ((/^commit(?: \(initial\))?:/.test(action ?? "") &&
-            commitChangedContent(cwd, commit, timeoutMs)) ||
+            commitChangedContent(cwd, commit, remainingMs)) ||
             (action?.startsWith("commit (amend):") &&
-              amendChangedContent(cwd, commit, selector, action, timeoutMs)))
+              amendChangedContent(cwd, commit, selector, action, remainingMs)))
         )
-          return true;
+          return performance.now() < deadline;
       } catch {}
     }
   } catch {

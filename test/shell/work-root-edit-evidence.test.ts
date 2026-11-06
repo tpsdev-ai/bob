@@ -445,6 +445,51 @@ describe("completion gate under a declared work root", () => {
     expect(result.noEditNoBlocked).toBeUndefined();
   }, 20_000);
 
+  it("bounds slow eligible reflog entries by the child's scan budget without credit", () => {
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    const head = init(repo);
+    const spawn = childProcess.spawnSync;
+    const timeouts: number[] = [];
+    let elapsed = 0;
+    let eligibleEntries = 0;
+    const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((...args) => {
+      const result = spawn(...args);
+      const command = args[1] as string[];
+      if (args[0] === "git" && command.includes("reflog")) {
+        const entries = Array.from(
+          { length: 3 },
+          (_, index) =>
+            `${head}\0HEAD@{${snapshot.launchedAtSeconds + index} +0000}\0commit: fixture`,
+        );
+        eligibleEntries = entries.length;
+        elapsed += 25;
+        return { ...result, stdout: Buffer.from(`${entries.join("\n")}\n`) };
+      }
+      if (args[0] === "git" && command.includes("cat-file")) {
+        const timeout = (args[2] as { timeout: number }).timeout;
+        timeouts.push(timeout);
+        elapsed += timeout + 1;
+        return {
+          ...result,
+          status: null,
+          error: Object.assign(new Error("git timed out"), { code: "ETIMEDOUT" }),
+        };
+      }
+      return result;
+    });
+    try {
+      expect(isWorkRootEditVerified(snapshot, { gitTimeoutMs: 100 })).toBe(false);
+      expect(eligibleEntries).toBeGreaterThan(1);
+      expect(elapsed).toBeLessThanOrEqual(101);
+      expect(timeouts).toEqual([75]);
+    } finally {
+      probe.mockRestore();
+      clock.mockRestore();
+    }
+  }, 20_000);
+
   it("credits a content commit after an unreadable amend entry", () => {
     const source = join(agentsRoot, "source");
     init(source);
