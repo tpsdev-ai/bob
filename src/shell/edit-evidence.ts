@@ -675,12 +675,17 @@ function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
   }
 }
 
-function commitChangedContent(cwd: string, commit: string, timeoutMs: number): boolean {
+function commitChangedContent(
+  cwd: string,
+  commit: string,
+  timeoutMs: number,
+  replacedCommit?: string,
+): boolean {
   const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, timeoutMs)
     .toString()
     .split("\n\n", 1)[0]
     .split("\n");
-  const parent = headers.find((line) => line.startsWith("parent "))?.slice(7);
+  const parent = replacedCommit ?? headers.find((line) => line.startsWith("parent "))?.slice(7);
   if (parent === undefined) {
     return readGit(cwd, ["ls-tree", commit], undefined, timeoutMs).length > 0;
   }
@@ -688,6 +693,36 @@ function commitChangedContent(cwd: string, commit: string, timeoutMs: number): b
     gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, timeoutMs) !==
     gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, timeoutMs)
   );
+}
+
+function amendChangedContent(
+  cwd: string,
+  commit: string,
+  selector: string,
+  action: string,
+  timeoutMs: number,
+): boolean {
+  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  if (!selected) return false;
+  const logPath = gitLine(
+    cwd,
+    ["rev-parse", "--path-format=absolute", "--git-path", `logs/${selected[1]}`],
+    undefined,
+    timeoutMs,
+  );
+  return readFileSync(logPath, "utf8")
+    .split("\n")
+    .some((line) => {
+      const entry = line.match(/^([0-9a-f]+) ([0-9a-f]+) .+ (-?\d+) ([+-]\d{4})\t(.*)$/);
+      return (
+        entry !== null &&
+        entry[2] === commit &&
+        entry[3] === selected[2] &&
+        entry[4] === selected[3] &&
+        entry[5] === action &&
+        commitChangedContent(cwd, commit, timeoutMs, entry[1])
+      );
+    });
 }
 
 // Heuristic: %gs is a reflog subject label; update-ref -m or a crafted log can set it.
@@ -709,8 +744,10 @@ function hasCommitLabelWithContentChange(
       if (
         timestamp !== undefined &&
         Number(timestamp) >= launchedAtSeconds &&
-        /^commit(?: \(initial\))?:/.test(action ?? "") &&
-        commitChangedContent(cwd, commit, timeoutMs)
+        ((/^commit(?: \(initial\))?:/.test(action ?? "") &&
+          commitChangedContent(cwd, commit, timeoutMs)) ||
+          (action?.startsWith("commit (amend):") &&
+            amendChangedContent(cwd, commit, selector, action, timeoutMs)))
       )
         return true;
     }

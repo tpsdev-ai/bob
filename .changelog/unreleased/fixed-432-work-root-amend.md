@@ -1,0 +1,1 @@
+- **Work-root edit evidence credits content-changing amends** in new or initially empty child repositories by comparing the amended tree with the replaced commit recorded in the reflog. No-op amends earn no credit.

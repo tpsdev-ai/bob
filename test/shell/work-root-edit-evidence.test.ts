@@ -339,6 +339,46 @@ describe("completion gate under a declared work root", () => {
     expect(result.noEditNoBlocked).toBe(true);
   }, 20_000);
 
+  it("credits a changed-tree amend in a fresh clone into an initially empty child", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    writeFileSync(join(source, "tracked"), "source content\n");
+    seedSuccessor(source);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(agentsRoot, "clone", "--quiet", source, repo);
+          writeFileSync(join(repo, "tracked"), "original\n");
+          git(repo, "add", ".");
+          git(repo, "commit", "--amend", "--allow-empty", "--quiet", "-m", "amended fixture");
+        },
+      },
+    ]);
+    expect(git(repo, "rev-parse", "HEAD^{tree}")).toBe(git(repo, "rev-parse", "HEAD~1^{tree}"));
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  }, 20_000);
+
+  it("does not credit a content commit through a child symlink created after launch", async () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          symlinkSync(source, join(workRoot, "linked"), "dir");
+          writeFileSync(join(source, "tracked"), "outside edit\n");
+          commit(source);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  }, 20_000);
+
   it("excludes a child symlink from capture and gives no credit for its target's content commit", async () => {
     const source = join(agentsRoot, "source");
     init(source);
