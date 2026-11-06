@@ -791,6 +791,67 @@ test("duplicate uses inside indentless steps are refused across child blocks", a
   ]);
 });
 
+test("a comment line between indentless steps does not end the sequence", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    workflow([
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "# between steps",
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    ]).replace(/^      /gm, "    "),
+  );
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 2, errors: [] });
+});
+
+test("a blank line between indentless steps does not end the sequence", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    workflow([
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "",
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    ]).replace(/^      /gm, "    "),
+  );
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 2, errors: [] });
+});
+
+test("an unpinned uses after a comment or blank line between indentless steps is still refused", async () => {
+  for (const separator of ["# between steps", ""]) {
+    const root = fixtureLines([]);
+    writeFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      workflow([
+        `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+        separator,
+        "- uses: oven-sh/setup-bun@main",
+      ]).replace(/^      /gm, "    "),
+    );
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 2,
+      errors: [
+        ".github/workflows/ci.yml:9: oven-sh/setup-bun@main: not pinned to a full 40-character commit SHA",
+      ],
+    });
+  }
+});
+
+test("a duplicate key after a comment or blank line following indentless steps keeps both lines", async () => {
+  for (const separator of ["# between the sequence and the key", ""]) {
+    const root = fixtureLines([]);
+    writeFileSync(
+      join(root, ".github/workflows/ci.yml"),
+      workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])
+        .replace("      - uses:", "    - uses:")
+        .concat(`    ${separator}\n`, "    runs-on: windows-latest\n"),
+    );
+    expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+      '.github/workflows/ci.yml: duplicate mapping key "runs-on" is refused at lines 5 and 9; write one "runs-on" per mapping',
+    ]);
+  }
+});
+
 test("indentless steps scan nested mappings and block scalars before sibling keys", async () => {
   const root = fixtureLines([]);
   writeFileSync(
