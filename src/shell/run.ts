@@ -2109,8 +2109,9 @@ export interface ResolvedRunConfig {
   // over the role's role.json `exploration_budget`. Absent when neither sets one,
   // which leaves the budget off.
   explorationBudget?: number;
-  // bob#425 — bob.yaml `work_root`: observes work trees in immediate child
-  // directories, excluding symlinks.
+  // bob#425 — bob.yaml `work_root`: checks immediate child directories (excluding
+  // symlinks), not a repository at `work_root` itself, so point `work_root` at
+  // the directory that holds the task repositories.
   workRoot?: string;
   // bob#283 — the role opted in to the edit-or-blocked completion rule. Absent
   // when the role does not; used by bob run and launch with a prompt.
