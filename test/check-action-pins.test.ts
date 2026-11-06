@@ -14,7 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkActionPins, createGithubResolver } from "../scripts/check-action-pins.mjs";
+import {
+  checkActionPins,
+  createGithubResolver,
+  refuseDuplicateKeys,
+} from "../scripts/check-action-pins.mjs";
 
 const WRONG = "de0fac2e4500dabe0009e67214ff5f5447ce83dd";
 const RIGHT = "0c5077e51419868618aeaa5fe8019c62421857d6";
@@ -922,3 +926,80 @@ test("a block scalar sequence item ends before the next item", async () => {
   );
   expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
 });
+
+for (const metadata of [false, true]) {
+  test(`bare CR hiding a mapping in ${metadata ? "followed action metadata" : "a workflow"} is refused`, async () => {
+    const root = fixtureLines([
+      metadata ? "- uses: ./tools/local" : `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+    ]);
+    if (metadata) {
+      writeAction(root, "tools/local", [`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+    }
+    const path = metadata ? "tools/local/action.yml" : ".github/workflows/ci.yml";
+    const file = join(root, path);
+    const prefix = metadata
+      ? "# comment\rruns:\r  using: composite\r  steps:\r    - uses: evil/repo@main\r\n"
+      : "# comment\rjobs:\r  hidden:\r    steps:\r      - uses: evil/repo@main\r\n";
+    const text = prefix + readFileSync(file, "utf8");
+    writeFileSync(file, text);
+    const parsed = Bun.YAML.parse(text) as { jobs?: unknown; runs?: unknown };
+    expect(metadata ? parsed.runs : parsed.jobs).toBeDefined();
+    expect(JSON.stringify(parsed)).not.toContain("evil/repo@main");
+    expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+      `${path}: line 1: bare CR is outside the YAML subset; convert to LF`,
+    ]);
+  });
+}
+
+for (const prefix of ["# comment\r\n# second\rhidden", "name: |2\n  text\rhidden"]) {
+  test(`bare CR on a skipped line ${JSON.stringify(prefix)} is refused`, async () => {
+    const root = fixtureLines([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+    const file = join(root, ".github/workflows/ci.yml");
+    writeFileSync(file, `${prefix}\n${readFileSync(file, "utf8")}`);
+    expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+      ".github/workflows/ci.yml: line 2: bare CR is outside the YAML subset; convert to LF",
+    ]);
+  });
+}
+
+test("CRLF workflow and action metadata pass subset admission", () => {
+  const root = fixtureLines(["- uses: ./tools/local"]);
+  writeAction(root, "tools/local", [`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+  for (const path of [".github/workflows/ci.yml", "tools/local/action.yml"]) {
+    const file = join(root, path);
+    const text = readFileSync(file, "utf8").replaceAll("\n", "\r\n");
+    writeFileSync(file, text);
+    expect(() => refuseDuplicateKeys(readFileSync(file, "utf8"))).not.toThrow();
+  }
+});
+
+for (const indicator of ["|", "|2", ">", ">2"]) {
+  test(`a content tab after ${indicator} block indentation passes`, async () => {
+    const root = fixtureLines([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+    const file = join(root, ".github/workflows/ci.yml");
+    const text = readFileSync(file, "utf8").replace(
+      "name: Fixture\n",
+      `name: ${indicator}\n  \techo hello\n`,
+    );
+    writeFileSync(file, text);
+    expect((Bun.YAML.parse(text) as { name: string }).name).toBe("\techo hello\n");
+    expect(await checkActionPins({ root, resolver: resolver() })).toEqual({
+      checked: 1,
+      errors: [],
+    });
+  });
+}
+
+for (const source of ["name: |2\n\techo hello", "name: |2\n \techo hello"]) {
+  test(`a tab inside required block indentation ${JSON.stringify(source)} is refused`, async () => {
+    const root = fixtureLines([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`]);
+    const file = join(root, ".github/workflows/ci.yml");
+    const text = readFileSync(file, "utf8").replace("name: Fixture", source);
+    writeFileSync(file, text);
+    expect(() => Bun.YAML.parse(text)).toThrow();
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.checked).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain(".github/workflows/ci.yml:");
+  });
+}

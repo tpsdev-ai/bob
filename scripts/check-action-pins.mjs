@@ -3,8 +3,7 @@
 // and action metadata runs.steps[*].uses; refuse parse errors and unwalkable shapes.
 // Locate each reference at its step/job key on a canonical `- uses: <value>` or
 // `uses: <value>` source line (unquoted or simply quoted value); otherwise refuse
-// it with a remedy for its reference kind. Check the YAML subset below before
-// parsing; refuse duplicate block keys with the file, key and both lines.
+// it with a remedy for its reference kind.
 // Remote refs require a full 40-hex SHA and a full release-tag comment resolving
 // to that SHA. Follow ./ local actions through action.yml/action.yaml, cycle-safe
 // and bounded; missing metadata is an error. Check job-level local reusable
@@ -73,13 +72,6 @@ function inventory(doc, metadata) {
   return refs;
 }
 
-// Accept block mappings/sequences, one-line scalars, block scalars and flat
-// one-line flow sequences. Mapping keys use [A-Za-z0-9_./-]+ and must retain
-// their spelling in Bun.YAML. Compare keys within each indentation scope;
-// sequence items open separate scopes. Refuse quoted/explicit keys, flow maps,
-// multiline plain/quoted scalars, nested/multiline flows, anchors, aliases, merges,
-// tags, directives and indentation tabs. Allow only an opening --- and closing ...;
-// child collections must be indented. Bun.YAML parses the admitted document.
 export function refuseDuplicateKeys(text) {
   const fail = (line, construct, remedy) => {
     throw new Error(`line ${line}: ${construct} is outside the YAML subset; ${remedy}`);
@@ -92,13 +84,14 @@ export function refuseDuplicateKeys(text) {
   let ended = false;
   for (const [index, raw] of text.split(/\r?\n/).entries()) {
     const line = index + 1;
+    if (/\r(?!\n)/.test(raw)) fail(line, "bare CR", "convert to LF");
     const indent = raw.match(/^ */)[0].length;
     const content = raw.slice(indent);
-    if (/^[ \t]*\t/.test(raw)) fail(line, "tab indentation", "indent with spaces");
     if (scalarIndent !== null) {
       if (!content || indent > scalarIndent) continue;
       scalarIndent = null;
     }
+    if (/^[ \t]*\t/.test(raw)) fail(line, "tab indentation", "indent with spaces");
     if (!content || content.startsWith("#")) continue;
     if (/^(?:---|\.\.\.)(?:\s|$)/.test(content)) {
       if (indent === 0 && /^---(?:\s+#.*)?\s*$/.test(content) && !started && !ended) {
