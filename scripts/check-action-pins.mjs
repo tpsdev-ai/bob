@@ -412,7 +412,6 @@ export async function checkActionPins({ root = ROOT, resolver }) {
         const metadata = dirname(file) !== join(root, ".github/workflows");
         refuseDuplicateKeys(text);
         const doc = Bun.YAML.parse(text);
-        if (Array.isArray(doc)) throw new Error("multiple YAML documents are not supported");
         refs = inventory(doc, metadata);
         locations = locateReferences(text, metadata);
       } finally {

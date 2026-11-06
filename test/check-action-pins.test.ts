@@ -484,7 +484,7 @@ test("repeated uses text in run strings and comments is ignored", async () => {
   expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
 });
 
-test("multiple YAML documents report the unsupported-document error", async () => {
+test("a second document after a document marker is refused at the marker", async () => {
   const root = fixtureLines([]);
   writeFileSync(join(root, ".github/workflows/ci.yml"), "name: Fixture\n---\nname: Other\n");
   expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
@@ -927,11 +927,11 @@ test("content after a document end marker that the first document lacks is refus
   ]);
 });
 
-test("a root sequence is refused by the parsed-document check", async () => {
+test("a root sequence is refused as a non-mapping document", async () => {
   const root = fixtureLines([]);
   writeFileSync(join(root, ".github/workflows/ci.yml"), "- a\n- b\n");
   expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
-    ".github/workflows/ci.yml: multiple YAML documents are not supported",
+    ".github/workflows/ci.yml: document must be a mapping",
   ]);
 });
 
