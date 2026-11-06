@@ -610,19 +610,20 @@ export function isVerifiedEdit(
 }
 
 // --- declared work root (bob#425) ------------------------------------------
-//
-// A builder-local run may reach its task repository with `cd <path> && …`
-// rather than from the run's cwd. The launch snapshot above only sees cwd, so
-// the same capture is taken for every git work tree directly under the
-// agent's declared `work_root`. The end check then compares each tree with its
-// own launch state; a tree that did not exist at launch counts only when it
-// holds a commit made after launch.
 
-export const WORK_ROOT_MAX_TREES = 200;
+export const WORK_ROOT_MAX_CHILD_DIRECTORIES = 200;
 export const WORK_ROOT_CAPTURE_TIMEOUT_MS = 5_000;
 
 export type WorkTreeLaunchState =
-  | { kind: "known"; head: string; tree: string }
+  | {
+      kind: "known";
+      head: string;
+      headTree: string;
+      tree: string;
+      gitDir: string;
+      gitDirId: string;
+    }
+  | { kind: "not a repo" }
   | { kind: "unknown" };
 
 export interface WorkRootLaunchSnapshot {
@@ -634,7 +635,7 @@ export interface WorkRootLaunchSnapshot {
 
 export interface WorkRootCaptureOptions {
   gitTimeoutMs?: number;
-  maxTrees?: number;
+  maxChildDirectories?: number;
 }
 
 function workTreeCandidates(root: string): string[] {
@@ -644,44 +645,72 @@ function workTreeCandidates(root: string): string[] {
     .sort();
 }
 
-function captureWorkTree(
-  path: string,
-  timeoutMs: number,
-): { head: string; headTree: string; tree: string } | undefined {
+function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
   try {
     const state = captureRepositoryState(path, undefined, { gitTimeoutMs: timeoutMs });
-    if (state.kind !== "git" || state.workTree !== realpathSync(path)) return undefined;
+    if (state.kind === "not a git work tree") return { kind: "not a repo" };
+    if (state.kind !== "git" || state.historyCheckSkipped || state.workTree !== realpathSync(path))
+      return { kind: "unknown" };
+    const stat = lstatSync(state.gitDir, { bigint: true });
     return {
+      kind: "known",
+      gitDir: state.gitDir,
+      gitDirId: `${stat.dev}:${stat.ino}`,
       head: gitLine(path, ["rev-parse", "--verify", "HEAD^{commit}"], state, timeoutMs),
       headTree: gitLine(path, ["rev-parse", "--verify", "HEAD^{tree}"], state, timeoutMs),
       tree: state.tree,
     };
   } catch {
-    return undefined;
+    return { kind: "unknown" };
   }
 }
 
-function hasCommitAfter(cwd: string, timeoutMs: number, launchedAtSeconds: number): boolean {
-  const result = git(
-    cwd,
-    ["rev-list", "--all", "--max-count=1", `--since=@${launchedAtSeconds + 1}`],
-    undefined,
-    timeoutMs,
+function commitChangedContent(cwd: string, commit: string, timeoutMs: number): boolean {
+  const headers = readGit(cwd, ["cat-file", "commit", commit], undefined, timeoutMs)
+    .toString()
+    .split("\n\n", 1)[0]
+    .split("\n");
+  const parent = headers.find((line) => line.startsWith("parent "))?.slice(7);
+  if (parent === undefined) {
+    return readGit(cwd, ["ls-tree", commit], undefined, timeoutMs).length > 0;
+  }
+  return (
+    gitLine(cwd, ["rev-parse", `${commit}^{tree}`], undefined, timeoutMs) !==
+    gitLine(cwd, ["rev-parse", `${parent}^{tree}`], undefined, timeoutMs)
   );
-  return !result.error && result.status === 0 && result.stdout.toString().trim() !== "";
 }
 
-/**
- * Snapshot every git work tree directly under `root`, keyed by its directory
- * name. A directory that is not the top of a work tree is skipped; a capture
- * that fails, or a tree past `maxTrees`, is recorded as unknown and can never
- * count as evidence. Returns undefined when the root cannot be listed.
- */
+function hasCommitOperation(cwd: string, timeoutMs: number, launchedAtSeconds: number): boolean {
+  try {
+    const reflog = readGit(
+      cwd,
+      ["reflog", "show", "--all", "--date=raw", "--format=%H%x00%gD%x00%gs"],
+      undefined,
+      timeoutMs,
+    ).toString();
+    for (const entry of reflog.split("\n")) {
+      const [commit, selector, action] = entry.split("\0");
+      const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
+      if (
+        timestamp !== undefined &&
+        Number(timestamp) >= launchedAtSeconds &&
+        /^commit(?: \(initial\)| \(amend\))?:/.test(action ?? "") &&
+        commitChangedContent(cwd, commit, timeoutMs)
+      )
+        return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/** Capture at most maxChildDirectories children in name order; the rest are unknown. */
 export function captureWorkRootSnapshot(
   root: string,
   options: WorkRootCaptureOptions = {},
 ): WorkRootLaunchSnapshot | undefined {
-  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+  const maxChildren = options.maxChildDirectories ?? WORK_ROOT_MAX_CHILD_DIRECTORIES;
   const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
   const launchedAtSeconds = Math.floor(Date.now() / 1000);
   let names: string[];
@@ -692,32 +721,24 @@ export function captureWorkRootSnapshot(
   }
   const trees = new Map<string, WorkTreeLaunchState>();
   for (const [index, name] of names.entries()) {
-    if (index >= maxTrees) {
-      trees.set(name, { kind: "unknown" });
-      continue;
-    }
-    const captured = captureWorkTree(join(root, name), timeoutMs);
     trees.set(
       name,
-      captured === undefined
-        ? { kind: "unknown" }
-        : { kind: "known", head: captured.head, tree: captured.tree },
+      index >= maxChildren ? { kind: "unknown" } : captureWorkTree(join(root, name), timeoutMs),
     );
   }
   return { root, launchedAtSeconds, trees };
 }
 
 /**
- * True when a work tree under the launch snapshot's root shows an edit made
- * during the run: an existing tree whose HEAD moved or whose non-empty tracked
- * diff differs, or a tree absent at launch that now holds a commit made after
- * launch. An unknown launch state never counts.
+ * Evidence of a content-changing commit or tracked change observed by bob.
+ * Reflog and committer times use the local clock / GIT_COMMITTER_DATE;
+ * this is not proof against a deliberately forged clock.
  */
 export function isWorkRootEditVerified(
   snapshot: WorkRootLaunchSnapshot,
   options: WorkRootCaptureOptions = {},
 ): boolean {
-  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+  const maxChildren = options.maxChildDirectories ?? WORK_ROOT_MAX_CHILD_DIRECTORIES;
   const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
   let names: string[];
   try {
@@ -726,31 +747,35 @@ export function isWorkRootEditVerified(
     return false;
   }
   for (const [index, name] of names.entries()) {
-    if (index >= maxTrees) break;
+    if (index >= maxChildren) break;
     const launch = snapshot.trees.get(name);
     if (launch?.kind === "unknown") continue;
     const path = join(snapshot.root, name);
     const end = captureWorkTree(path, timeoutMs);
-    if (end === undefined) continue;
-    if (launch !== undefined) {
-      if (end.head !== launch.head) return true;
+    if (end.kind !== "known") continue;
+    if (launch?.kind === "known") {
+      if (end.gitDir !== launch.gitDir || end.gitDirId !== launch.gitDirId) continue;
+      const ancestor = git(
+        path,
+        ["merge-base", "--is-ancestor", launch.head, end.head],
+        undefined,
+        timeoutMs,
+      );
+      if (ancestor.error || ancestor.status !== 0) continue;
+      if (end.headTree !== launch.headTree) return true;
       if (end.tree !== launch.tree && end.tree !== end.headTree) return true;
       continue;
     }
-    if (hasCommitAfter(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
+    if (hasCommitOperation(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
   }
   return false;
 }
 
-/**
- * Number of git work trees directly under `root` that a run would watch, or
- * undefined when the bound is exceeded or any candidate cannot be read.
- */
 export function countWorkRootTrees(
   root: string,
   options: WorkRootCaptureOptions = {},
-): number | undefined {
-  const maxTrees = options.maxTrees ?? WORK_ROOT_MAX_TREES;
+): { childDirectories: number; workTrees: number; unknown: number } | undefined {
+  const maxChildren = options.maxChildDirectories ?? WORK_ROOT_MAX_CHILD_DIRECTORIES;
   const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
   let names: string[];
   try {
@@ -758,17 +783,25 @@ export function countWorkRootTrees(
   } catch {
     return undefined;
   }
-  if (names.length > maxTrees) return undefined;
-  let count = 0;
-  for (const name of names) {
+  const scanned = names.slice(0, maxChildren);
+  let workTrees = 0;
+  let unknown = names.length - scanned.length;
+  for (const name of scanned) {
     const path = join(root, name);
+    const inside = git(path, ["rev-parse", "--is-inside-work-tree"], undefined, timeoutMs);
+    if (
+      !inside.error &&
+      ((inside.status === 0 && inside.stdout.toString().trim() === "false") ||
+        (inside.status === 128 && inside.stderr.toString().includes("not a git repository")))
+    )
+      continue;
     try {
-      const state = captureRepositoryState(path, undefined, { gitTimeoutMs: timeoutMs });
-      if (state.kind === "unavailable") return undefined;
-      if (state.kind === "git" && state.workTree === realpathSync(path)) count += 1;
+      if (inside.error || inside.status !== 0 || inside.stdout.toString().trim() !== "true")
+        throw new Error("git discovery unavailable");
+      if (resolveRepository(path, timeoutMs).workTree === realpathSync(path)) workTrees += 1;
     } catch {
-      return undefined;
+      unknown += 1;
     }
   }
-  return count;
+  return { childDirectories: scanned.length, workTrees, unknown };
 }

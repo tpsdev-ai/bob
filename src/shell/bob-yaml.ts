@@ -645,18 +645,10 @@ export function readResident(yamlText: string): boolean {
   );
 }
 
-// The directory that holds the agent's task work trees (bob#425):
-//
-//   work_root: ~/work
-//
-// One absolute path. `~` / `~/` is expanded the way the capabilities expand
-// their path fields. A relative path, a missing directory and a non-directory
-// are refused at load, each with the remedy, because the run's edit evidence
-// would otherwise silently watch nothing.
 export function readWorkRoot(yamlText: string, home: string = homedir()): string | undefined {
-  if (!/^work_root[ \t]*:/m.test(yamlText)) return undefined;
-  const line = lineOf(yamlText, /^work_root[ \t]*:/m);
   const raw = parseBobYamlBlock(yamlText, "work_root");
+  if (raw === undefined) return undefined;
+  const line = lineOf(yamlText, /^[ \t]*(?:work_root|"work_root"|'work_root')[ \t]*:/m);
   if (typeof raw !== "string" || raw.trim() === "") {
     throw new BobYamlError(
       "work_root",

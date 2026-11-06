@@ -81,7 +81,7 @@ import {
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { conditionalToolRefusals } from "./capability-loader.js";
-import { countWorkRootTrees, WORK_ROOT_MAX_TREES } from "./edit-evidence.js";
+import { countWorkRootTrees } from "./edit-evidence.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
@@ -482,8 +482,6 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   }
 
-  // bob#425: the declared work root and how many work trees it would watch.
-  // Absent: no check at all, exactly as before.
   if (yamlText !== undefined) {
     let workRoot: string | undefined;
     try {
@@ -503,13 +501,13 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
           ? {
               name: "work root",
               status: "warn",
-              detail: `${workRoot} — could not count its work trees`,
-              fix: `check that ${workRoot} is readable and holds at most ${WORK_ROOT_MAX_TREES} directories, then re-run 'bob doctor ${opts.name}'`,
+              detail: `${workRoot} — could not list its child directories`,
+              fix: `check that ${workRoot} is readable, then re-run 'bob doctor ${opts.name}'`,
             }
           : {
               name: "work root",
-              status: "ok",
-              detail: `${workRoot} — ${trees} work tree(s) under it`,
+              status: trees.unknown > 0 ? "warn" : "ok",
+              detail: `${workRoot} — would scan ${trees.childDirectories} child directory(s); ${trees.workTrees} are work trees now; ${trees.unknown} unknown`,
             },
       );
     }

@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readWorkRoot } from "../../src/shell/bob-yaml.js";
 import { runDoctor } from "../../src/shell/doctor.js";
 import {
+  captureWorkRootSnapshot,
+  countWorkRootTrees,
   isWorkRootEditVerified,
+  type WorkRootCaptureOptions,
   type WorkRootLaunchSnapshot,
 } from "../../src/shell/edit-evidence.js";
-import { type RunSession, runAgent } from "../../src/shell/run.js";
+import { type RunSession, resolveRunConfig, runAgent } from "../../src/shell/run.js";
 
 const gitEnv = {
   ...process.env,
@@ -31,19 +34,42 @@ function git(cwd: string, ...args: string[]): string {
   }).trim();
 }
 
-function commit(cwd: string, parent?: string): string {
+function commit(cwd: string): string {
   git(cwd, "add", ".");
-  const tree = git(cwd, "write-tree");
-  const head = git(cwd, "commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", "fixture");
-  git(cwd, "reset", "--hard", head);
-  return head;
+  git(cwd, "commit", "--quiet", "-m", "fixture");
+  return git(cwd, "rev-parse", "HEAD");
 }
 
 function init(cwd: string): string {
   mkdirSync(cwd, { recursive: true });
   git(cwd, "init", "--quiet");
   writeFileSync(join(cwd, "tracked"), "original\n");
-  return commit(cwd);
+  git(cwd, "add", ".");
+  const tree = git(cwd, "write-tree");
+  const head = git(cwd, "commit-tree", tree, "-m", "seed");
+  git(cwd, "reset", "--hard", head);
+  return head;
+}
+
+function seedSuccessor(cwd: string): string {
+  git(cwd, "add", ".");
+  const head = git(
+    cwd,
+    "commit-tree",
+    git(cwd, "write-tree"),
+    "-p",
+    git(cwd, "rev-parse", "HEAD"),
+    "-m",
+    "seed",
+  );
+  git(cwd, "reset", "--hard", head);
+  return head;
+}
+
+function snapshotRoot(root: string, options?: WorkRootCaptureOptions): WorkRootLaunchSnapshot {
+  const snapshot = captureWorkRootSnapshot(root, options);
+  if (!snapshot) throw new Error("fixture root could not be captured");
+  return snapshot;
 }
 
 type Call = {
@@ -151,7 +177,7 @@ describe("edit evidence under a declared work root", () => {
         toolName: "run",
         action: () => {
           writeFileSync(join(repo, "tracked"), "edited\n");
-          commit(repo);
+          seedSuccessor(repo);
         },
       },
     ]);
@@ -159,7 +185,7 @@ describe("edit evidence under a declared work root", () => {
     expect(result.noEditNoBlocked).toBeUndefined();
   });
 
-  it("credits a new work tree that holds a commit made after launch", async () => {
+  it("credits a content commit in a new work tree", async () => {
     const source = join(agentsRoot, "source");
     init(source);
     const result = await run([
@@ -171,7 +197,6 @@ describe("edit evidence under a declared work root", () => {
             stdio: "pipe",
             timeout: 5_000,
           });
-          execFileSync("sleep", ["1.1"]);
           writeFileSync(join(workRoot, "fresh", "tracked"), "fresh edit\n");
           commit(join(workRoot, "fresh"));
         },
@@ -181,9 +206,20 @@ describe("edit evidence under a declared work root", () => {
     expect(result.noEditNoBlocked).toBeUndefined();
   }, 20_000);
 
-  it("does not credit a new work tree whose only commit predates launch", async () => {
+  it("does not credit a fresh clone of a future-dated commit", async () => {
     const source = join(agentsRoot, "source");
     init(source);
+    const future = execFileSync(
+      "git",
+      ["commit-tree", git(source, "write-tree"), "-m", "future seed"],
+      {
+        cwd: source,
+        env: { ...gitEnv, GIT_COMMITTER_DATE: `@${Math.floor(Date.now() / 1000) + 3600} +0000` },
+        encoding: "utf8",
+        stdio: "pipe",
+      },
+    ).trim();
+    git(source, "reset", "--hard", future);
     const result = await run([
       {
         toolName: "run",
@@ -217,7 +253,7 @@ describe("edit evidence under a declared work root", () => {
         toolName: "run",
         action: () => {
           writeFileSync(join(cwd, "tracked"), "cwd edit\n");
-          commit(cwd);
+          seedSuccessor(cwd);
         },
       },
     ]);
@@ -230,7 +266,7 @@ describe("edit evidence under a declared work root", () => {
         toolName: "run",
         action: () => {
           writeFileSync(join(repo, "tracked"), "elsewhere\n");
-          commit(repo);
+          seedSuccessor(repo);
         },
       },
     ]);
@@ -238,22 +274,237 @@ describe("edit evidence under a declared work root", () => {
     expect(ignored.noEditNoBlocked).toBe(true);
   });
 
-  it("does not credit a work tree whose launch capture is unknown", () => {
+  it("does not credit a work tree whose launch capture fails", () => {
     const repo = join(workRoot, "alpha");
     init(repo);
-    const snapshot: WorkRootLaunchSnapshot = {
-      root: workRoot,
-      launchedAtSeconds: Math.floor(Date.now() / 1000),
-      trees: new Map([["alpha", { kind: "unknown" }]]),
-    };
+    const index = join(repo, ".git", "index");
+    renameSync(index, `${index}.saved`);
+    mkdirSync(index);
+    const snapshot = captureWorkRootSnapshot(workRoot);
+    expect(snapshot?.trees.get("alpha")?.kind).toBe("unknown");
+    rmSync(index, { recursive: true });
+    renameSync(`${index}.saved`, index);
     writeFileSync(join(repo, "tracked"), "edited\n");
-    commit(repo);
+    if (!snapshot) throw new Error("fixture root could not be captured");
     expect(isWorkRootEditVerified(snapshot)).toBe(false);
   });
 
-  it("reports the work root and the number of work trees it watches", () => {
+  it("does not credit an empty commit in an existing work tree", async () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          seedSuccessor(repo);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it("does not credit an older clone swapped in under the same name", async () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    const older = join(agentsRoot, "older");
+    git(agentsRoot, "clone", "--quiet", repo, older);
+    writeFileSync(join(repo, "tracked"), "newer\n");
+    seedSuccessor(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          renameSync(repo, join(agentsRoot, "original"));
+          renameSync(older, repo);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+  });
+
+  it("does not credit a different git directory with a descendant HEAD", () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    const snapshot = snapshotRoot(workRoot);
+    const replacement = join(agentsRoot, "replacement");
+    git(agentsRoot, "clone", "--quiet", repo, replacement);
+    writeFileSync(join(replacement, "tracked"), "descendant\n");
+    seedSuccessor(replacement);
+    renameSync(repo, join(agentsRoot, "original"));
+    renameSync(replacement, repo);
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit a non-ancestor HEAD in the same repository", () => {
+    const repo = join(workRoot, "alpha");
+    const older = init(repo);
+    writeFileSync(join(repo, "tracked"), "newer\n");
+    seedSuccessor(repo);
+    const snapshot = snapshotRoot(workRoot);
+    git(repo, "reset", "--hard", older);
+    writeFileSync(join(repo, "tracked"), "uncommitted\n");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("credits a tracked uncommitted change", async () => {
+    const repo = join(workRoot, "alpha");
+    init(repo);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          writeFileSync(join(repo, "tracked"), "edited\n");
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  });
+
+  it("credits init and a content commit in an initially empty child directory", async () => {
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    expect(captureWorkRootSnapshot(workRoot)?.trees.get("alpha")?.kind).toBe("not a repo");
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => {
+          git(repo, "init", "--quiet");
+          writeFileSync(join(repo, "tracked"), "initial content\n");
+          commit(repo);
+        },
+      },
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.noEditNoBlocked).toBeUndefined();
+  });
+
+  it("credits a content commit with a reflog time in the launch second", () => {
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    writeFileSync(join(repo, "tracked"), "content\n");
+    git(repo, "add", ".");
+    execFileSync("git", ["commit", "--quiet", "-m", "fixture"], {
+      cwd: repo,
+      env: { ...gitEnv, GIT_COMMITTER_DATE: `@${snapshot.launchedAtSeconds} +0000` },
+      stdio: "pipe",
+    });
+    expect(git(repo, "reflog", "show", "--date=raw", "--format=%gD")).toContain(
+      `@{${snapshot.launchedAtSeconds} +0000}`,
+    );
+    expect(isWorkRootEditVerified(snapshot)).toBe(true);
+  });
+
+  it("does not credit an empty root commit in a new repository", () => {
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    git(repo, "commit", "--quiet", "--allow-empty", "-m", "empty");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit an empty commit in a new clone", () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    git(agentsRoot, "clone", "--quiet", source, repo);
+    git(repo, "commit", "--quiet", "--allow-empty", "-m", "empty");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not treat a shallow empty commit as a content-changing root", () => {
+    const source = join(agentsRoot, "source");
+    init(source);
+    const snapshot = snapshotRoot(workRoot);
+    const repo = join(workRoot, "alpha");
+    git(agentsRoot, "clone", "--quiet", source, repo);
+    const parent = git(repo, "rev-parse", "HEAD");
+    const empty = git(repo, "commit-tree", git(repo, "write-tree"), "-p", parent, "-m", "empty");
+    git(repo, "update-ref", "-m", "commit: empty fixture", "HEAD", empty, parent);
+    writeFileSync(join(repo, ".git", "shallow"), `${empty}\n`);
+    expect(git(repo, "rev-list", "--parents", "-n", "1", "HEAD")).toBe(empty);
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("records children beyond the directory bound as unknown in name order", () => {
+    init(join(workRoot, "z-repo"));
+    mkdirSync(join(workRoot, "a-empty"));
+    const options = { maxChildDirectories: 1 };
+    const snapshot = snapshotRoot(workRoot, options);
+    expect([...snapshot.trees.keys()]).toEqual(["a-empty", "z-repo"]);
+    expect(snapshot.trees.get("a-empty")?.kind).toBe("not a repo");
+    expect(snapshot.trees.get("z-repo")?.kind).toBe("unknown");
+    writeFileSync(join(workRoot, "z-repo", "tracked"), "edited\n");
+    rmSync(join(workRoot, "a-empty"), { recursive: true });
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(false);
+    expect(countWorkRootTrees(workRoot, options)).toEqual({
+      childDirectories: 1,
+      workTrees: 1,
+      unknown: 0,
+    });
+  });
+
+  it.each([
+    ["plain", "work_root"],
+    ["double-quoted", '"work_root"'],
+    ["single-quoted", "'work_root'"],
+    ["indented", "  work_root"],
+  ])("resolves the %s YAML key from bob.yaml", (_label, key) => {
+    writeConfig(`${key}: ${workRoot}`);
+    if (key.startsWith("  ")) {
+      const path = join(agentsRoot, "builder", "bob.yaml");
+      // Indent the entire mapping to keep the key at the top level.
+      const config = [
+        "  agent:",
+        "    id: builder",
+        "    name: builder",
+        "    role: builder-local",
+        "  provider:",
+        "    name: anthropic",
+        "    model: claude-sonnet-4-6",
+        `${key}: ${workRoot}`,
+        "  tools:",
+        "    allow: [run]",
+      ].join("\n");
+      writeFileSync(path, config);
+    }
+    expect(resolveRunConfig({ name: "builder", agentsRoot }).workRoot).toBe(workRoot);
+  });
+
+  it.each(["work_root", '"work_root"'])(
+    "refuses a relative value for %s through resolveRunConfig",
+    (key) => {
+      writeConfig(`${key}: relative/tasks`);
+      expect(() => resolveRunConfig({ name: "builder", agentsRoot })).toThrow(/absolute path/);
+    },
+  );
+
+  it.each(["123", "false", "null", "[a]", "{path: a}"])(
+    "refuses non-string work_root %s through resolveRunConfig",
+    (value) => {
+      writeConfig(`work_root: ${value}`);
+      expect(() => resolveRunConfig({ name: "builder", agentsRoot })).toThrow(/one absolute path/);
+    },
+  );
+
+  it("leaves workRoot absent when the YAML key is absent", () => {
+    writeConfig("");
+    expect(resolveRunConfig({ name: "builder", agentsRoot }).workRoot).toBeUndefined();
+  });
+
+  it("reports the child directories it would scan and current work trees", () => {
     init(join(workRoot, "alpha"));
     init(join(workRoot, "beta"));
+    mkdirSync(join(workRoot, "empty"));
+    const unborn = join(workRoot, "unborn");
+    mkdirSync(unborn);
+    git(unborn, "init", "--quiet");
     const report = runDoctor({
       name: "builder",
       agentsRoot,
@@ -263,7 +514,9 @@ describe("edit evidence under a declared work root", () => {
     const check = report.checks.find((entry) => entry.name === "work root");
     expect(check?.status).toBe("ok");
     expect(check?.detail).toContain(workRoot);
-    expect(check?.detail).toContain("2 work tree");
+    expect(check?.detail).toContain(
+      "would scan 4 child directory(s); 3 are work trees now; 0 unknown",
+    );
   });
 });
 

@@ -2937,10 +2937,6 @@ function assistantContentToText(content: unknown): string {
   return "";
 }
 
-// Read ~/agents/<name>/bob.yaml, erroring with an onboard hint when absent.
-// Returned text is parsed by the targeted readers below + the capability
-// loader — hand-rolled, except the provider block, which is parsed by the YAML
-// library (parseBobYamlBlock in bob-yaml.ts).
 function readBobYaml(agentDir: string, name: string): string {
   const yamlPath = join(agentDir, "bob.yaml");
   if (!existsSync(yamlPath)) {
@@ -2948,7 +2944,17 @@ function readBobYaml(agentDir: string, name: string): string {
       `bob run ${name}: config not found at ${yamlPath} (run 'bob onboard ${name}' first)`,
     );
   }
-  return readFileSync(yamlPath, "utf8");
+  const text = readFileSync(yamlPath, "utf8");
+  const lines = text.split(/\r?\n/);
+  const content = lines.filter((line) => line.trim() !== "" && !line.trimStart().startsWith("#"));
+  const indent = content.reduce(
+    (min, line) => Math.min(min, line.length - line.trimStart().length),
+    Infinity,
+  );
+  if (!Number.isFinite(indent) || indent === 0) return text;
+  return lines
+    .map((line) => (line.startsWith(" ".repeat(indent)) ? line.slice(indent) : line))
+    .join("\n");
 }
 
 // Resolve provider + model from bob.yaml text. We parse only the `provider:`
