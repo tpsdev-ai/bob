@@ -577,7 +577,7 @@ describe("completion gate under a declared work root", () => {
     expect(resolveRunConfig({ name: "builder", agentsRoot }).workRoot).toBeUndefined();
   });
 
-  it("reports the child directories it would scan and current work trees", () => {
+  it("reports the work root, child directories, current work trees and discovery unknowns", () => {
     init(join(workRoot, "alpha"));
     init(join(workRoot, "beta"));
     mkdirSync(join(workRoot, "empty"));
@@ -592,9 +592,8 @@ describe("completion gate under a declared work root", () => {
     });
     const check = report.checks.find((entry) => entry.name === "work root");
     expect(check?.status).toBe("ok");
-    expect(check?.detail).toContain(workRoot);
-    expect(check?.detail).toContain(
-      "would scan 4 child directory(s); 3 are work trees now; 0 discovery unknown",
+    expect(check?.detail).toBe(
+      `work_root ${workRoot}: 4 child directory(s), 3 work tree(s) now, 0 discovery unknown`,
     );
   });
 });

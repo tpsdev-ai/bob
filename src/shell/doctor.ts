@@ -507,7 +507,7 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
           : {
               name: "work root",
               status: trees.unknown > 0 ? "warn" : "ok",
-              detail: `${workRoot} — would scan ${trees.childDirectories} child directory(s); ${trees.workTrees} are work trees now; ${trees.unknown} discovery unknown`,
+              detail: `work_root ${workRoot}: ${trees.childDirectories} child directory(s), ${trees.workTrees} work tree(s) now, ${trees.unknown} discovery unknown`,
             },
       );
     }
