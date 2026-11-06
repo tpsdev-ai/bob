@@ -1,8 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
+import type { Dirent } from "node:fs";
 import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -592,3 +595,145 @@ for (const source of [
     expect(result.errors.length).toBeGreaterThan(0);
   });
 }
+
+for (const [name, source, key, lines] of [
+  [
+    "a duplicated top-level jobs key",
+    "name: Fixture\non: push\njobs:\n  one:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\njobs:\n  two:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo two\n",
+    "jobs",
+    "3 and 8",
+  ],
+  [
+    "a duplicated steps key in one job",
+    "name: Fixture\non: push\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n    steps:\n      - run: echo two\n",
+    "steps",
+    "6 and 8",
+  ],
+  [
+    "a duplicated arbitrary key",
+    "name: Fixture\nname: Fixture again\non: push\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n",
+    "name",
+    "1 and 2",
+  ],
+  [
+    "a quoted and unquoted duplicate",
+    'name: Fixture\non: push\n"jobs":\n  one:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\njobs:\n  two:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo two\n',
+    "jobs",
+    "3 and 8",
+  ],
+] as const) {
+  test(`${name} is refused with its key and both lines`, async () => {
+    const root = fixtureLines([]);
+    writeFileSync(join(root, ".github/workflows/ci.yml"), source);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    expect(result.errors.join("\n")).toContain(
+      `.github/workflows/ci.yml: duplicate mapping key "${key}" is refused at lines ${lines}`,
+    );
+  });
+}
+
+test("a duplicate key in a flow mapping is refused", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    "jobs: { check: { runs-on: ubuntu-latest, runs-on: ubuntu-latest, steps: [{ run: echo }] } }\n",
+  );
+  const result = await checkActionPins({ root, resolver: resolver() });
+  expect(result.errors.join("\n")).toContain(
+    '.github/workflows/ci.yml: duplicate mapping key "runs-on" is refused at lines 1 and 1',
+  );
+});
+
+test("sibling mappings may share the same child keys", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    [
+      "name: Fixture",
+      "on: push",
+      "jobs:",
+      "  one:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      `      - uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "  two:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: echo two",
+      "",
+    ].join("\n"),
+  );
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("keys in a run block scalar are not mapping keys", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    [
+      "name: Fixture",
+      "on: push",
+      "jobs:",
+      "  check:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: |",
+      "          jobs:",
+      "            steps:",
+      "          uses: evil/repo@main",
+      `      - uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "",
+    ].join("\n"),
+  );
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+function repositoryResolver(root: string) {
+  const pins = new Map<string, string>();
+  const stack = [join(root, ".github/workflows"), join(root, ".github/actions")];
+  while (stack.length > 0) {
+    const directory = stack.pop() as string;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(path);
+        continue;
+      }
+      if (!/\.ya?ml$/.test(entry.name)) continue;
+      for (const line of readFileSync(path, "utf8").split("\n")) {
+        const match = line.match(
+          /^\s*(?:-\s+)?uses:\s*["']?([\w.-]+\/[\w.-]+)(?:\/[^\s@#"']+)?@([a-f\d]{40})["']?\s+#\s*(\S+)\s*$/i,
+        );
+        if (match) pins.set(`${match[1]}\u0000${match[3]}`, match[2]);
+      }
+    }
+  }
+  return {
+    resolveTag: async (owner: string, repo: string, tag: string) => {
+      const sha = pins.get(`${owner}/${repo}\u0000${tag}`);
+      if (!sha) throw new Error(`no fixture pin for ${owner}/${repo}@${tag}`);
+      return sha;
+    },
+    findTagForSha: async (owner: string, repo: string, sha: string) => {
+      for (const [key, value] of pins) {
+        if (key.startsWith(`${owner}/${repo}\u0000`) && value.toLowerCase() === sha.toLowerCase())
+          return key.split("\u0000")[1];
+      }
+      return null;
+    },
+  };
+}
+
+test("every real workflow and action in the repository passes", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const result = await checkActionPins({ root, resolver: repositoryResolver(root) });
+  expect(result.errors).toEqual([]);
+  expect(result.checked).toBeGreaterThan(0);
+});
