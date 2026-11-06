@@ -484,7 +484,7 @@ describe("completion gate under a declared work root", () => {
     });
   });
 
-  it("credits a content commit in an unborn repository empty at launch except for .git", async () => {
+  it("does not credit a later commit in a repository unborn and empty at launch", async () => {
     const repo = join(workRoot, "alpha");
     mkdirSync(repo);
     git(repo, "init", "--quiet");
@@ -498,12 +498,31 @@ describe("completion gate under a declared work root", () => {
         },
       },
     ]);
-    expect(result.exitCode).toBe(0);
-    expect(result.noEditNoBlocked).toBeUndefined();
-    expect(snapshot.trees.get("alpha")).toEqual({
-      kind: "unborn",
-      emptyAtLaunch: true,
-    });
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(snapshot.trees.get("alpha")?.kind).toBe("unborn");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit a later commit of a file staged then deleted before launch in an unborn repository", async () => {
+    const repo = join(workRoot, "alpha");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    writeFileSync(join(repo, "tracked"), "pre-staged\n");
+    git(repo, "add", ".");
+    rmSync(join(repo, "tracked"));
+    const snapshot = snapshotRoot(workRoot);
+    const result = await run([
+      {
+        toolName: "run",
+        action: () => git(repo, "commit", "--quiet", "-m", "pre-staged content"),
+      },
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.noEditNoBlocked).toBe(true);
+    expect(snapshot.trees.get("alpha")?.kind).toBe("unborn");
+    expect(git(repo, "show", "HEAD:tracked")).toBe("pre-staged");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
   });
 
   it("does not credit a commit of pre-existing files in an unborn repository", async () => {
@@ -521,10 +540,7 @@ describe("completion gate under a declared work root", () => {
     ]);
     expect(result.exitCode).toBe(1);
     expect(result.noEditNoBlocked).toBe(true);
-    expect(snapshot.trees.get("alpha")).toEqual({
-      kind: "unborn",
-      emptyAtLaunch: false,
-    });
+    expect(snapshot.trees.get("alpha")?.kind).toBe("unborn");
   });
 
   it("credits a content commit with a reflog time in the launch second", () => {

@@ -621,7 +621,8 @@ export type WorkTreeLaunchState =
       gitDir: string;
       gitDirId: string;
     }
-  | { kind: "not a repo" | "unborn"; emptyAtLaunch: boolean }
+  | { kind: "not a repo"; emptyAtLaunch: boolean }
+  | { kind: "unborn" }
   | { kind: "unknown" };
 
 export interface WorkRootLaunchSnapshot {
@@ -650,8 +651,7 @@ function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
       return { kind: "not a repo", emptyAtLaunch: readdirSync(path).length === 0 };
     if (state.kind !== "git" || state.historyCheckSkipped || state.workTree !== realpathSync(path))
       return { kind: "unknown" };
-    if (unbornHead(state, timeoutMs))
-      return { kind: "unborn", emptyAtLaunch: readdirSync(path).every((name) => name === ".git") };
+    if (unbornHead(state, timeoutMs)) return { kind: "unborn" };
     const stat = lstatSync(state.gitDir, { bigint: true });
     return {
       kind: "known",
@@ -739,13 +739,12 @@ export function captureWorkRootSnapshot(
 }
 
 /**
- * Existing trees need changed tracked content absent from launch history.
- * New children use a content-change and reflog-label heuristic; children confirmed
- * not a repo or unborn at launch must have been empty (excluding .git for unborn).
- * Any content change in a qualifying tree counts, including one unrelated to the
- * task; the operator chooses the root. The gate refuses a claim with no change at all.
- * Reflog and committer times use the local clock / GIT_COMMITTER_DATE;
- * this is not proof against a deliberately forged clock.
+ * Existing trees need changed tracked content absent from launch history, the same
+ * repository and a launch HEAD ancestor. New or initially empty non-repository
+ * children need a reflog commit entry at or after the launch second with changed
+ * commit content (a heuristic). Unborn, non-empty non-repository and unknown launch
+ * captures never count. Any qualifying tree under the root counts, including one
+ * unrelated to the task. Reflog labels and local times can be forged.
  */
 export function isWorkRootEditVerified(
   snapshot: WorkRootLaunchSnapshot,
@@ -762,7 +761,7 @@ export function isWorkRootEditVerified(
   for (const [index, name] of names.entries()) {
     if (index >= maxChildren) break;
     const launch = snapshot.trees.get(name);
-    if (launch?.kind === "unknown") continue;
+    if (launch?.kind === "unknown" || launch?.kind === "unborn") continue;
     const path = join(snapshot.root, name);
     const end = captureWorkTree(path, timeoutMs);
     if (end.kind !== "known") continue;
