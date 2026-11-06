@@ -8,7 +8,8 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOW = join(REPO, ".github", "workflows", "release-publish.yml");
 const UPGRADE = "Upgrade npm to a staging-capable version";
-const SELF_UPDATE = /^npm install -g npm@(\d+\.\d+\.\d+)$/;
+const SELF_UPDATE =
+  /^npm install -g npm@(\d+\.\d+\.\d+) --registry=https:\/\/registry\.npmjs\.org$/;
 const PUBLISH = /^npm\s+(?:stage|publish)\b/;
 
 type Step = { name?: string; run?: string };
@@ -28,7 +29,10 @@ function pinProblems(steps: Step[]): string[] {
   if (upgrades.length !== 1) return ["expected one named npm upgrade step"];
   const upgrade = upgrades[0];
   const match = SELF_UPDATE.exec(upgrade.run?.trim() ?? "");
-  if (!match) return ["npm upgrade must be exactly npm install -g npm@<x.y.z>"];
+  if (!match)
+    return [
+      "npm upgrade must be exactly npm install -g npm@<x.y.z> --registry=https://registry.npmjs.org",
+    ];
   const version = match[1];
   const [major, minor] = version.split(".").map(Number);
   const problems: string[] = [];
@@ -114,7 +118,7 @@ test.each([
       const step = steps.find((step) => step.name === UPGRADE);
       if (step) step.run = "npm install -g npm@^11.21.1";
     },
-    "npm upgrade must be exactly npm install -g npm@<x.y.z>",
+    "npm upgrade must be exactly npm install -g npm@<x.y.z> --registry=https://registry.npmjs.org",
   ],
 ] satisfies [string, (steps: Step[]) => void, string][])(
   "%s is refused",

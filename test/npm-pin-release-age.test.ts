@@ -168,15 +168,26 @@ test("the pin is read from the workflow file, not hardcoded", async () => {
   }
 }, 15_000);
 
-test("a non-exact pin is refused", () => {
-  expect(() =>
-    readNpmPin(
-      readFileSync(WORKFLOW, "utf8").replace(
-        "npm install -g npm@11.21.1",
-        "npm install -g npm@^11.21.1",
-      ),
-    ),
-  ).toThrow(/must run exactly npm install -g npm@<x\.y\.z>/);
+const INSTALL = "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org";
+
+test("the parser reads the exact command with the checked registry", () => {
+  const workflow = readFileSync(WORKFLOW, "utf8");
+  expect(readNpmPin(workflow)).toBe("11.21.1");
+  expect(readNpmPin(workflow.replace(INSTALL, INSTALL.replace("11.21.1", "11.99.0")))).toBe(
+    "11.99.0",
+  );
+});
+
+test.each([
+  "npm install -g npm@^11.21.1 --registry=https://registry.npmjs.org",
+  "npm install -g npm@11.21.1",
+  "npm install -g npm@11.21.1 --registry=https://registry.example",
+  "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org --ignore-scripts",
+  "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org --registry=https://registry.example",
+])("the parser refuses %s", (command) => {
+  expect(() => readNpmPin(readFileSync(WORKFLOW, "utf8").replace(INSTALL, command))).toThrow(
+    "must run exactly npm install -g npm@<x.y.z> --registry=https://registry.npmjs.org",
+  );
 });
 
 function runCli(args: string[], env: Record<string, string>, preload?: string) {

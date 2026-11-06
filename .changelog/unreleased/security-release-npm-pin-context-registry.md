@@ -1,0 +1,1 @@
+- **Release npm pins use the checked registry** — the self-update names registry.npmjs.org, and structure checks validate prefix inputs, the release job set, and self-update command counts.

@@ -10,7 +10,10 @@ const REPO = join(import.meta.dir, "..");
 const WORKFLOWS = join(REPO, ".github/workflows");
 const CHECKER = "bun --no-install scripts/check-lockfile-release-age.mjs";
 const NPM_PIN_CHECKER = "bun --no-install scripts/check-npm-pin-release-age.mjs";
-const SELF_UPDATE = /^npm install -g npm@\d+\.\d+\.\d+$/;
+const SELF_UPDATE = /^npm install -g npm@\d+\.\d+\.\d+ --registry=https:\/\/registry\.npmjs\.org$/;
+const PINNED_BUN = JSON.parse(
+  readFileSync(join(REPO, "package.json"), "utf8"),
+).packageManager.replace(/^bun@/, "");
 const PUBLISH_LINE = /^npm\s+(?:stage|publish)\b/;
 const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
   ["actions/checkout", ["fetch-depth", "persist-credentials"]],
@@ -277,8 +280,16 @@ test("ci.yml action-pins runs the npm pin release-age checker with no condition"
 });
 
 const NPM_PIN_PREFIX = [
-  { action: "actions/checkout", keys: ["name", "uses", "with"] },
-  { action: "oven-sh/setup-bun", keys: ["name", "uses", "with"] },
+  {
+    action: "actions/checkout",
+    keys: ["name", "uses", "with"],
+    inputs: { "persist-credentials": false },
+  },
+  {
+    action: "oven-sh/setup-bun",
+    keys: ["name", "uses", "with"],
+    inputs: { "bun-version": PINNED_BUN },
+  },
   { run: CHECKER, keys: ["name", "run"] },
 ];
 
@@ -310,7 +321,16 @@ function npmPinStepProblems(steps: Step[]): string[] {
       if (actionOf(candidate) !== expected.action) {
         problems.push(`${where}: expected ${expected.action}`);
       } else {
-        problems.push(...actionProblems(candidate, where));
+        problems.push(
+          ...actionProblems(candidate, where, PRE_RUN_ACTIONS, " in the npm pin prefix"),
+        );
+        for (const [input, value] of Object.entries(expected.inputs ?? {})) {
+          if (candidate.with?.[input] !== value) {
+            problems.push(
+              `${where}: ${expected.action} input "${input}" must be ${JSON.stringify(value)}`,
+            );
+          }
+        }
       }
     } else if (candidate.run?.trim() !== expected.run) {
       problems.push(`${where}: expected ${expected.run}`);
@@ -321,7 +341,16 @@ function npmPinStepProblems(steps: Step[]): string[] {
       "the npm pin release-age step must immediately follow the checkout, setup-bun, lockfile checker prefix",
     );
   }
+  const updates = steps.flatMap((candidate) => [
+    ...(candidate.run ?? "").matchAll(/\bnpm\s+install\s+-g\s+npm@/g),
+  ]);
+  if (updates.length !== 1) {
+    problems.push(`expected exactly one npm self-update command, found ${updates.length}`);
+  }
   const upgrade = steps.findIndex((candidate) => SELF_UPDATE.test((candidate.run ?? "").trim()));
+  if (upgrade !== -1 && Object.hasOwn(steps[upgrade], "env")) {
+    problems.push('the npm self-update step must not set "env"');
+  }
   if (upgrade === -1) {
     problems.push("expected the exact npm self-update step");
   } else if (index > upgrade) {
@@ -341,6 +370,14 @@ function npmPinStepProblems(steps: Step[]): string[] {
   }
   return problems;
 }
+
+test("release-publish has the reviewed job set", () => {
+  expect(Object.keys(loadWorkflow("release-publish.yml").jobs ?? {}).sort()).toEqual([
+    "github-release",
+    "stage-publish",
+    "verify-ancestry",
+  ]);
+});
 
 test("release-publish stage-publish runs the npm pin release-age checker before the npm self-update with no condition", () => {
   const workflow = loadWorkflow("release-publish.yml");
@@ -467,6 +504,65 @@ test.each([0, 1, 2])("prefix step %s refuses keys outside its allowlist", (posit
       npmPinStepProblems(steps).some((problem) => problem.includes(`key "${key}" is not allowed`)),
     ).toBe(true);
   }
+});
+
+test.each([
+  [0, "persist-credentials", true, false],
+  [0, "persist-credentials", "false", false],
+  [0, "persist-credentials", undefined, false],
+  [1, "bun-version", "0.0.0", PINNED_BUN],
+  [1, "bun-version", undefined, PINNED_BUN],
+] as const)("prefix step %s input %s value %j is refused", (position, input, value, expected) => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps[position].with = { ...steps[position].with, [input]: value };
+  expect(
+    npmPinStepProblems(steps).some((problem) =>
+      problem.endsWith(`input "${input}" must be ${JSON.stringify(expected)}`),
+    ),
+  ).toBe(true);
+});
+
+test("swapped checkout and Bun setup prefix is refused", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  [steps[0], steps[1]] = [steps[1], steps[0]];
+  expect(npmPinStepProblems(steps)).toContain(
+    `before the npm pin release-age step, step 1 ("${steps[0].uses}"): expected actions/checkout`,
+  );
+  expect(npmPinStepProblems(steps)).toContain(
+    `before the npm pin release-age step, step 2 ("${steps[1].uses}"): expected oven-sh/setup-bun`,
+  );
+});
+
+test.each([0, 1])("prefix step %s input error names the prefix context", (position) => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  steps[position].with = { ...steps[position].with, unlisted: true };
+  expect(npmPinStepProblems(steps)).toContain(
+    `before the npm pin release-age step, step ${position + 1} ("${steps[position].uses}"): action "${steps[position].uses}" input "unlisted" is not allowed in the npm pin prefix`,
+  );
+  expect(npmPinStepProblems(steps).join("\n")).not.toContain("before the first run step");
+});
+
+test.each(["before the checker", "after publishing", "inside a run block"])(
+  "a second npm self-update %s is refused",
+  (position) => {
+    const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+    const run = "npm install -g npm@11.99.0";
+    if (position === "before the checker") steps.splice(0, 0, { name: "Another update", run });
+    else if (position === "after publishing") steps.push({ name: "Another update", run });
+    else steps[steps.length - 1].run = `${steps[steps.length - 1].run ?? ""}\n${run}`;
+    expect(npmPinStepProblems(steps)).toContain(
+      "expected exactly one npm self-update command, found 2",
+    );
+  },
+  5_000,
+);
+
+test("the npm self-update step refuses env", () => {
+  const steps = loadWorkflow("release-publish.yml").jobs?.["stage-publish"]?.steps ?? [];
+  const upgrade = steps.find((step) => SELF_UPDATE.test((step.run ?? "").trim()));
+  if (upgrade === undefined) throw new Error("Missing npm self-update");
+  upgrade.env = { npm_config_registry: "https://registry.example" };
+  expect(npmPinStepProblems(steps)).toContain('the npm self-update step must not set "env"');
 });
 
 test.each([
