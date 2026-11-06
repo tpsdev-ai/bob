@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
-// Parse YAML with Bun.YAML: inventory jobs.<id>.steps[*].uses, jobs.<id>.uses,
-// and action metadata runs.steps[*].uses; refuse parse errors and unwalkable shapes.
+// Admit the subset defined at refuseDuplicateKeys before parsing with Bun.YAML.
+// Inventory jobs.<id>.steps[*].uses, jobs.<id>.uses and action metadata
+// runs.steps[*].uses; refuse parse errors and unwalkable shapes.
 // Locate each reference at its step/job key on a canonical `- uses: <value>` or
 // `uses: <value>` source line (unquoted or simply quoted value); otherwise refuse
 // it with a remedy for its reference kind.
@@ -72,6 +73,9 @@ function inventory(doc, metadata) {
   return refs;
 }
 
+// Subset: block mappings/sequences (including indentless mapping-value sequences),
+// unquoted string keys, one-line plain/quoted scalars, block scalars and flat
+// one-line scalar flow sequences. Bun.YAML validates syntax after this gate.
 export function refuseDuplicateKeys(text) {
   const fail = (line, construct, remedy) => {
     throw new Error(`line ${line}: ${construct} is outside the YAML subset; ${remedy}`);
@@ -84,6 +88,7 @@ export function refuseDuplicateKeys(text) {
   let ended = false;
   for (const [index, raw] of text.split(/\r?\n/).entries()) {
     const line = index + 1;
+    // Pinned Bun line-break coverage: "scanner break refusal matches Bun.YAML" test.
     if (/\r(?!\n)/.test(raw)) fail(line, "bare CR", "convert to LF");
     const indent = raw.match(/^ */)[0].length;
     const content = raw.slice(indent);
@@ -205,7 +210,7 @@ export function refuseDuplicateKeys(text) {
     return { key, value: match[2] };
   };
   let cursor = 0;
-  const block = () => {
+  const block = (indentless = false) => {
     const first = rows[cursor];
     const indent = first.indent;
     const kind = first.content === "-" ? "sequence" : member(first) ? "mapping" : "scalar";
@@ -237,9 +242,16 @@ export function refuseDuplicateKeys(text) {
         if (!empty)
           fail(rows[cursor].line, "multiline scalar or unexpected indentation", scalarRemedy);
         block();
+      } else if (
+        kind === "mapping" &&
+        empty &&
+        rows[cursor]?.indent === indent &&
+        rows[cursor].content === "-"
+      ) {
+        block(true);
       }
       if (kind === "scalar") break;
-    } while (rows[cursor]?.indent === indent);
+    } while (rows[cursor]?.indent === indent && (!indentless || rows[cursor].content === "-"));
   };
   if (rows.length) block();
   if (cursor < rows.length)

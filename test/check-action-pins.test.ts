@@ -742,6 +742,149 @@ test("the real workflow and action tree passes with a source-derived tag resolve
   expect(result.checked).toBeGreaterThan(0);
 });
 
+test("indentless workflow steps retain pin checking", async () => {
+  const root = fixtureLines([]);
+  const file = join(root, ".github/workflows/ci.yml");
+  for (const ref of [`oven-sh/setup-bun@${RIGHT} # v2.2.0`, "oven-sh/setup-bun@main"]) {
+    const text = workflow([`- uses: ${ref}`])
+      .replace("  check:", "  build:")
+      .replace("      - uses:", "    - uses:");
+    writeFileSync(file, text);
+    const parsed = Bun.YAML.parse(text) as { jobs: { build: { steps: unknown } } };
+    expect(Array.isArray(parsed.jobs.build.steps)).toBe(true);
+    const result = await checkActionPins({ root, resolver: resolver() });
+    if (ref.endsWith("@main")) {
+      expect(result.checked).toBe(1);
+      expect(result.errors).toEqual([
+        ".github/workflows/ci.yml:7: oven-sh/setup-bun@main: not pinned to a full 40-character commit SHA",
+      ]);
+    } else expect(result).toEqual({ checked: 1, errors: [] });
+  }
+});
+
+test("a duplicate sibling after indentless steps retains both key lines", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    workflow([`- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`])
+      .replace("      - uses:", "    - uses:")
+      .concat("    runs-on: windows-latest\n"),
+  );
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    '.github/workflows/ci.yml: duplicate mapping key "runs-on" is refused at lines 5 and 8; write one "runs-on" per mapping',
+  ]);
+});
+
+test("duplicate uses inside indentless steps are refused across child blocks", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    workflow([
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "  with:",
+      "    child: value",
+      "  uses: evil/repo@main",
+    ]).replace(/^      /gm, "    "),
+  );
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: duplicate uses keys are refused at lines 7 and 10; write one `uses` per step (or job)",
+  ]);
+});
+
+test("indentless steps scan nested mappings and block scalars before sibling keys", async () => {
+  const root = fixtureLines([]);
+  writeFileSync(
+    join(root, ".github/workflows/ci.yml"),
+    workflow([
+      "- run: |",
+      "    uses: literal",
+      "    uses: literal",
+      `- uses: oven-sh/setup-bun@${RIGHT} # v2.2.0`,
+      "  with:",
+      "    child:",
+      "    - one",
+      "    - two",
+      "    sibling: value",
+      "- run: echo done",
+    ])
+      .replace(/^      /gm, "    ")
+      .concat("    timeout-minutes: 10\n"),
+  );
+  expect(await checkActionPins({ root, resolver: resolver() })).toEqual({ checked: 1, errors: [] });
+});
+
+test("a document sequence after a scalar is refused", async () => {
+  const root = fixtureLines([]);
+  const text = "scalar\n- item\n";
+  writeFileSync(join(root, ".github/workflows/ci.yml"), text);
+  expect(() => refuseDuplicateKeys(text)).toThrow("line 2: block indentation");
+  expect((await checkActionPins({ root, resolver: resolver() })).errors).toEqual([
+    ".github/workflows/ci.yml: line 2: block indentation is outside the YAML subset; indent child collections beneath their parent key",
+  ]);
+});
+
+test("the real workflow and action tree passes with indentless mapping-value sequences", async () => {
+  const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
+  const root = fixtureLines([]);
+  const stack = [".github/workflows", ".github/actions"];
+  while (stack.length) {
+    const directory = stack.pop() as string;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(join(sourceRoot, directory), { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    mkdirSync(join(root, directory), { recursive: true });
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) stack.push(path);
+      else {
+        const text = readFileSync(join(sourceRoot, path), "utf8");
+        let stepsIndent: number | undefined;
+        const indentless = text.split("\n").map((line) => {
+          const indent = line.match(/^ */)?.[0].length ?? 0;
+          if (line.trim() && stepsIndent !== undefined && indent <= stepsIndent)
+            stepsIndent = undefined;
+          if (/^ +steps:\s*$/.test(line)) stepsIndent = indent;
+          else if (stepsIndent !== undefined && indent > stepsIndent) return line.slice(2);
+          return line;
+        });
+        writeFileSync(join(root, path), indentless.join("\n"));
+      }
+    }
+  }
+  const original = await checkActionPins({
+    root: sourceRoot,
+    resolver: repositoryResolver(sourceRoot),
+  });
+  expect(original.errors).toEqual([]);
+  expect(original.checked).toBeGreaterThan(0);
+  expect(await checkActionPins({ root, resolver: repositoryResolver(root) })).toEqual(original);
+});
+
+for (const [name, character] of [
+  ["CR", "\r"],
+  ["LS", "\u2028"],
+  ["PS", "\u2029"],
+  ["NEL", "\u0085"],
+  ["VT", "\u000b"],
+  ["FF", "\u000c"],
+]) {
+  test(`scanner break refusal matches Bun.YAML for ${name}`, () => {
+    const text = `# c${character}hidden:${character}  x: 1\nvisible: 2\n`;
+    const parsed = Bun.YAML.parse(text) as Record<string, unknown>;
+    let refused = false;
+    try {
+      refuseDuplicateKeys(text);
+    } catch {
+      refused = true;
+    }
+    expect(refused).toBe(Object.hasOwn(parsed, "hidden"));
+  });
+}
+
 for (const [name, source, line, construct, remedy] of [
   ["quoted flow key", 'env: {"A": one, A: two}', 1, "flow mapping", "write a block mapping"],
   ["empty flow mapping", "env: {}", 1, "flow mapping", "write a block mapping"],
