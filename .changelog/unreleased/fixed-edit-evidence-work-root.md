@@ -4,7 +4,9 @@
   tracked content whose tree is absent from launch history, the same repository
   and a launch HEAD ancestor. New or initially empty non-repository children need
   a reflog commit entry at or after the launch second with changed commit content
-  (a heuristic). Unborn repositories, non-empty non-repository children and unknown
-  launch captures never count. Any qualifying tree under the root counts, including
-  one unrelated to the task. Reflog labels and local times can be forged.
+  (a heuristic). A child that existed at launch, under any later name, retains its
+  launch state: unborn repositories, non-empty non-repository children and unknown
+  captures never count. All surviving launch children are checked first; new
+  children fill remaining slots in the 200-child bound in name order. Qualifying
+  trees may be unrelated to the task. Reflog labels and local times can be forged.
   `bob doctor` shows the configured work root.

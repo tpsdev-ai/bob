@@ -594,6 +594,105 @@ describe("completion gate under a declared work root", () => {
     expect(isWorkRootEditVerified(snapshot)).toBe(false);
   });
 
+  it("does not credit staged then deleted content in an unborn child renamed after launch", () => {
+    const repo = join(workRoot, "alpha");
+    const renamed = join(workRoot, "renamed");
+    mkdirSync(repo);
+    git(repo, "init", "--quiet");
+    writeFileSync(join(repo, "tracked"), "pre-staged\n");
+    git(repo, "add", ".");
+    rmSync(join(repo, "tracked"));
+    const snapshot = snapshotRoot(workRoot);
+    expect(snapshot.trees.get("alpha")?.kind).toBe("unborn");
+    renameSync(repo, renamed);
+    git(renamed, "commit", "--quiet", "-m", "pre-staged content");
+    expect(git(renamed, "show", "HEAD:tracked")).toBe("pre-staged");
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit pre-existing files in a non-repository child renamed after launch", () => {
+    const repo = join(workRoot, "alpha");
+    const renamed = join(workRoot, "renamed");
+    mkdirSync(repo);
+    writeFileSync(join(repo, "tracked"), "pre-existing\n");
+    const snapshot = snapshotRoot(workRoot);
+    expect(snapshot.trees.get("alpha")).toEqual({ kind: "not a repo", emptyAtLaunch: false });
+    renameSync(repo, renamed);
+    git(renamed, "init", "--quiet");
+    commit(renamed);
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit an unknown capture renamed after launch", () => {
+    const repo = join(workRoot, "alpha");
+    const renamed = join(workRoot, "renamed");
+    init(repo);
+    const index = join(repo, ".git", "index");
+    renameSync(index, `${index}.saved`);
+    mkdirSync(index);
+    const snapshot = snapshotRoot(workRoot);
+    expect(snapshot.trees.get("alpha")?.kind).toBe("unknown");
+    rmSync(index, { recursive: true });
+    renameSync(`${index}.saved`, index);
+    renameSync(repo, renamed);
+    writeFileSync(join(renamed, "tracked"), "edited\n");
+    commit(renamed);
+    expect(isWorkRootEditVerified(snapshot)).toBe(false);
+  });
+
+  it("does not credit an over-bound unknown child renamed after launch", () => {
+    mkdirSync(join(workRoot, "a-empty"));
+    const repo = join(workRoot, "z-repo");
+    const renamed = join(workRoot, "0-renamed");
+    init(repo);
+    const options = { maxChildDirectories: 1 };
+    const snapshot = snapshotRoot(workRoot, options);
+    expect(snapshot.trees.get("z-repo")?.kind).toBe("unknown");
+    renameSync(repo, renamed);
+    writeFileSync(join(renamed, "tracked"), "edited\n");
+    commit(renamed);
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(false);
+  });
+
+  it("credits a content commit in a known work tree renamed after launch", () => {
+    const repo = join(workRoot, "alpha");
+    const renamed = join(workRoot, "renamed");
+    init(repo);
+    const snapshot = snapshotRoot(workRoot);
+    expect(snapshot.trees.get("alpha")?.kind).toBe("known");
+    renameSync(repo, renamed);
+    writeFileSync(join(renamed, "tracked"), "edited\n");
+    seedSuccessor(renamed);
+    expect(isWorkRootEditVerified(snapshot)).toBe(true);
+  });
+
+  it("credits a launch-known edit despite a new earlier-sorting child at the scan bound", () => {
+    const repo = join(workRoot, "z-repo");
+    init(repo);
+    const options = { maxChildDirectories: 1 };
+    const snapshot = snapshotRoot(workRoot, options);
+    expect(snapshot.trees.get("z-repo")?.kind).toBe("known");
+    mkdirSync(join(workRoot, "a-new"));
+    writeFileSync(join(repo, "tracked"), "edited\n");
+    seedSuccessor(repo);
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
+  });
+
+  it("limits new children to remaining slots after surviving launch children", () => {
+    const existing = join(workRoot, "z-existing");
+    init(existing);
+    const options = { maxChildDirectories: 2 };
+    const snapshot = snapshotRoot(workRoot, options);
+    mkdirSync(join(workRoot, "a-empty"));
+    const repo = join(workRoot, "b-new");
+    init(repo);
+    writeFileSync(join(repo, "tracked"), "edited\n");
+    commit(repo);
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(false);
+    rmSync(join(workRoot, "a-empty"), { recursive: true });
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
+  });
+
   it("marks the over-bound directory unknown", () => {
     init(join(workRoot, "z-repo"));
     mkdirSync(join(workRoot, "a-empty"));

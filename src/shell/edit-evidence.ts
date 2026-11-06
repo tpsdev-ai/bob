@@ -628,8 +628,8 @@ export type WorkTreeLaunchState =
 export interface WorkRootLaunchSnapshot {
   root: string;
   launchedAtSeconds: number;
-  // Keyed by the directory name directly under `root`.
   trees: Map<string, WorkTreeLaunchState>;
+  directoryNames: Map<string, string>;
 }
 
 export interface WorkRootCaptureOptions {
@@ -642,6 +642,15 @@ function workTreeCandidates(root: string): string[] {
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+}
+
+function childDirectoryId(path: string): string | undefined {
+  try {
+    const stat = lstatSync(path, { bigint: true });
+    return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function captureWorkTree(path: string, timeoutMs: number): WorkTreeLaunchState {
@@ -729,22 +738,28 @@ export function captureWorkRootSnapshot(
     return undefined;
   }
   const trees = new Map<string, WorkTreeLaunchState>();
+  const directoryNames = new Map<string, string>();
   for (const [index, name] of names.entries()) {
+    const directoryId = childDirectoryId(join(root, name));
+    if (directoryId === undefined) return undefined;
+    directoryNames.set(directoryId, name);
     trees.set(
       name,
       index >= maxChildren ? { kind: "unknown" } : captureWorkTree(join(root, name), timeoutMs),
     );
   }
-  return { root, launchedAtSeconds, trees };
+  return { root, launchedAtSeconds, trees, directoryNames };
 }
 
 /**
  * Existing trees need changed tracked content absent from launch history, the same
  * repository and a launch HEAD ancestor. New or initially empty non-repository
  * children need a reflog commit entry at or after the launch second with changed
- * commit content (a heuristic). Unborn, non-empty non-repository and unknown launch
- * captures never count. Any qualifying tree under the root counts, including one
- * unrelated to the task. Reflog labels and local times can be forged.
+ * commit content (a heuristic). A child that existed at launch, under any later
+ * name, retains its launch state. Unborn, non-empty non-repository and unknown
+ * states never count. All surviving launch children are checked first; new
+ * children fill remaining maxChildDirectories slots in name order. Qualifying
+ * trees may be unrelated to the task. Reflog labels and local times can be forged.
  */
 export function isWorkRootEditVerified(
   snapshot: WorkRootLaunchSnapshot,
@@ -758,15 +773,27 @@ export function isWorkRootEditVerified(
   } catch {
     return false;
   }
-  for (const [index, name] of names.entries()) {
-    if (index >= maxChildren) break;
-    const launch = snapshot.trees.get(name);
+  const launchChildren: { name: string; launch: WorkTreeLaunchState }[] = [];
+  const newChildren: { name: string; launch?: undefined }[] = [];
+  for (const name of names) {
+    const directoryId = childDirectoryId(join(snapshot.root, name));
+    if (directoryId === undefined) continue;
+    const launchName = snapshot.directoryNames.get(directoryId);
+    const launch = launchName === undefined ? undefined : snapshot.trees.get(launchName);
+    if (launch) launchChildren.push({ name, launch });
+    else newChildren.push({ name });
+  }
+  const candidates = [
+    ...launchChildren,
+    ...newChildren.slice(0, Math.max(0, maxChildren - launchChildren.length)),
+  ];
+  for (const { name, launch } of candidates) {
     if (launch?.kind === "unknown" || launch?.kind === "unborn") continue;
     const path = join(snapshot.root, name);
     const end = captureWorkTree(path, timeoutMs);
     if (end.kind !== "known") continue;
     if (launch?.kind === "known") {
-      if (end.gitDir !== launch.gitDir || end.gitDirId !== launch.gitDirId) continue;
+      if (end.gitDirId !== launch.gitDirId) continue;
       const ancestor = git(
         path,
         ["merge-base", "--is-ancestor", launch.head, end.head],
