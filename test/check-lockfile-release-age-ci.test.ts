@@ -49,7 +49,7 @@ const PINNED_BUN = JSON.parse(
 ).packageManager.replace(/^bun@/, "");
 const PUBLISH_LINE = /^npm\s+(?:stage|publish)\b/;
 const PRE_RUN_ACTIONS = new Map<string, readonly string[]>([
-  ["actions/checkout", ["fetch-depth", "persist-credentials"]],
+  ["actions/checkout", ["fetch-depth", "fetch-tags", "persist-credentials", "ref"]],
   ["oven-sh/setup-bun", ["bun-version"]],
   ["actions/setup-node", ["node-version"]],
   ["socketdev/action", ["mode"]],
@@ -98,7 +98,9 @@ const USES_STEP_KEYS = ["uses", "with", "name", "id", "if"];
 const RUN_STEP_KEYS = ["run", "name", "env", "id", "if"];
 const ANCESTRY_JOB = "verify-ancestry";
 const CHECKER_STEP_KEYS = ["name", "run"];
-const ANCESTRY_JOB_KEYS = ["name", "runs-on", "permissions", "steps"];
+const ANCESTRY_JOB_KEYS = ["name", "runs-on", "permissions", "steps", "outputs"];
+const GUARD_STEP = "Resolve the release commit";
+const GUARD_SCRIPT = "bun --no-install scripts/resolve-release-commit.mjs";
 const DEPENDENT_JOB_KEYS = [
   "name",
   "needs",
@@ -171,9 +173,9 @@ function actionProblems(
 
 function ancestryProblems(steps: Step[], where: string): string[] {
   const problems: string[] = [];
-  if (steps.length !== 2) {
+  if (steps.length !== 3) {
     problems.push(
-      `${where}: expected exactly 2 steps (checkout, ancestry guard), found ${steps.length}`,
+      `${where}: expected exactly 3 steps (checkout, Bun setup, commit guard), found ${steps.length}`,
     );
   }
   const checkout = steps[0];
@@ -184,25 +186,35 @@ function ancestryProblems(steps: Step[], where: string): string[] {
     if (checkout.with?.["persist-credentials"] !== false) {
       problems.push(`${where} step 1: actions/checkout input "persist-credentials" must be false`);
     }
+    if (checkout.with?.["fetch-depth"] !== 0) {
+      problems.push(`${where} step 1: actions/checkout input "fetch-depth" must be 0`);
+    }
     for (const key of Object.keys(checkout)) {
       if (key !== "uses" && key !== "with") {
         problems.push(`${where} step 1: actions/checkout field "${key}" is not allowed`);
       }
     }
   }
-  const guard = steps[1];
+  const bun = steps[1];
+  if (bun === undefined || actionOf(bun) !== "oven-sh/setup-bun") {
+    problems.push(`${where} step 2: expected oven-sh/setup-bun`);
+  }
+  const guard = steps[2];
   if (
     guard === undefined ||
-    guard.name !== "Verify the run's commit is on main" ||
+    guard.name !== GUARD_STEP ||
+    guard.id !== "commit" ||
     typeof guard.run !== "string" ||
-    guard.run.trim() === ""
+    guard.run.trim() !== GUARD_SCRIPT
   ) {
-    problems.push(`${where} step 2: expected run step named "Verify the run's commit is on main"`);
+    problems.push(
+      `${where} step 3: expected run step named "${GUARD_STEP}", id "commit", running ${GUARD_SCRIPT}`,
+    );
   }
   if (guard !== undefined) {
     for (const key of Object.keys(guard)) {
-      if (key !== "name" && key !== "run") {
-        problems.push(`${where} step 2: ancestry guard field "${key}" is not allowed`);
+      if (key !== "name" && key !== "run" && key !== "id" && key !== "env") {
+        problems.push(`${where} step 3: commit guard field "${key}" is not allowed`);
       }
     }
   }
@@ -219,7 +231,11 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
     const steps = definition.steps ?? [];
     const where = `${source}: job "${job}"`;
     const firstRun = firstRunIndex(steps);
-    problems.push(...keyProblems(definition, JOB_KEYS, where));
+    const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
+    // Only the guard job publishes a job output (the verified commit sha).
+    problems.push(
+      ...keyProblems(definition, isAncestry ? [...JOB_KEYS, "outputs"] : JOB_KEYS, where),
+    );
     problems.push(...conditionProblems(definition.if, where));
     for (const [index, step] of steps.entries()) {
       const stepWhere = `${where} step ${index + 1}`;
@@ -235,7 +251,6 @@ function orderingProblems(workflow: Workflow, source: string): string[] {
         problems.push(...actionProblems(step, stepWhere, ACTIONS, ""));
       }
     }
-    const isAncestry = source === ".github/workflows/release-publish.yml" && job === ANCESTRY_JOB;
     if (isAncestry) {
       problems.push(...keyProblems(definition, ANCESTRY_JOB_KEYS, where));
       problems.push(...ancestryProblems(steps, where));
@@ -1162,10 +1177,10 @@ test.each(['git update-ref refs/remotes/origin/main "$GITHUB_SHA"', "bun install
   "%s before the ancestry guard is red",
   (run) => {
     const workflow = loadWorkflow("release-publish.yml");
-    workflow.jobs?.[ANCESTRY_JOB].steps?.splice(1, 0, { run });
+    workflow.jobs?.[ANCESTRY_JOB].steps?.splice(2, 0, { run });
     expect(orderingProblems(workflow, ".github/workflows/release-publish.yml")).toEqual([
-      '.github/workflows/release-publish.yml: job "verify-ancestry": expected exactly 2 steps (checkout, ancestry guard), found 3',
-      '.github/workflows/release-publish.yml: job "verify-ancestry" step 2: expected run step named "Verify the run\'s commit is on main"',
+      '.github/workflows/release-publish.yml: job "verify-ancestry": expected exactly 3 steps (checkout, Bun setup, commit guard), found 4',
+      '.github/workflows/release-publish.yml: job "verify-ancestry" step 3: expected run step named "Resolve the release commit", id "commit", running bun --no-install scripts/resolve-release-commit.mjs',
     ]);
   },
 );
@@ -1176,13 +1191,13 @@ test.each([
   [
     "extra checkout input",
     (steps: Step[]) => {
-      steps[0].with = { ...steps[0].with, ref: "main" };
+      steps[0].with = { ...steps[0].with, token: "x" };
     },
   ],
   [
     "persisted credentials",
     (steps: Step[]) => {
-      steps[0].with = { "persist-credentials": true };
+      steps[0].with = { ...steps[0].with, "persist-credentials": true };
     },
   ],
   [
@@ -1194,19 +1209,19 @@ test.each([
   [
     "extra guard input",
     (steps: Step[]) => {
-      steps[1].with = { cache: "bun" };
+      steps[2].with = { cache: "bun" };
     },
   ],
   [
     "renamed guard",
     (steps: Step[]) => {
-      steps[1].name = "other";
+      steps[2].name = "other";
     },
   ],
   [
     "missing guard run",
     (steps: Step[]) => {
-      delete steps[1].run;
+      delete steps[2].run;
     },
   ],
   [
@@ -1356,8 +1371,9 @@ test("the release guard accepts a merged commit and refuses an unmerged commit",
   expect(
     ancestryProblems(steps, '.github/workflows/release-publish.yml: job "verify-ancestry"'),
   ).toEqual([]);
-  const script = steps[1].run;
-  expect(typeof script).toBe("string");
+  const guard = steps[2];
+  expect(guard?.run).toBe(GUARD_SCRIPT);
+  const scriptPath = join(REPO, "scripts", "resolve-release-commit.mjs");
   const root = mkdtempSync(join(tmpdir(), "bob-release-ancestry-"));
   const checkout = join(root, "checkout");
   const remote = join(root, "origin.git");
@@ -1393,9 +1409,14 @@ test("the release guard accepts a merged commit and refuses an unmerged commit",
       [merged, true],
       [unmerged, false],
     ] as const) {
-      const result = spawnSync("bash", ["-euo", "pipefail", "-c", script as string], {
+      const result = spawnSync(process.execPath, ["--no-install", scriptPath], {
         cwd: checkout,
-        env: { ...env, GITHUB_SHA: sha },
+        env: {
+          ...env,
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/tags/v1.0.0",
+          GITHUB_SHA: sha,
+        },
         encoding: "utf8",
       });
       if (accepted) expect(result.status, result.stderr).toBe(0);
