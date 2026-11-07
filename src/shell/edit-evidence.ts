@@ -695,13 +695,20 @@ function commitChangedContent(
   );
 }
 
+function parseReflogSelector(
+  selector: string,
+): { ref: string; timestamp: string; zone: string } | undefined {
+  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  return selected ? { ref: selected[1], timestamp: selected[2], zone: selected[3] } : undefined;
+}
+
 export function replacedCommitFromReflog(
   raw: string,
   selector: string,
   commit: string,
   action: string,
 ): string | undefined {
-  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  const selected = parseReflogSelector(selector);
   if (!selected) return undefined;
   const records = raw
     .split("\n")
@@ -714,8 +721,8 @@ export function replacedCommitFromReflog(
       (record) =>
         record !== null &&
         record[2] === commit &&
-        record[3] === selected[2] &&
-        record[4] === selected[3] &&
+        record[3] === selected.timestamp &&
+        record[4] === selected.zone &&
         record[5] === action,
     );
   // Two matching same-second amends, second a no-op of the first, deny the first amend's credit (fail-closed by design).
@@ -729,9 +736,9 @@ function amendChangedContent(
   action: string,
   remainingMs: () => number,
 ): boolean {
-  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  const selected = parseReflogSelector(selector);
   if (!selected) return false;
-  const ref = selected[1];
+  const ref = selected.ref;
   const sharedHead = ref === "main-worktree/HEAD" || /^worktrees\/[^/]+\/HEAD$/.test(ref);
   const logPath = sharedHead
     ? join(

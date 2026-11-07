@@ -1,0 +1,1 @@
+- **Pruned-amend test precondition reads the next surviving reflog entry** instead of using Git-version-dependent `HEAD@{1}` resolution (bob#437).
