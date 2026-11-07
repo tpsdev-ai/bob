@@ -712,18 +712,20 @@ export function replacedCommitFromReflog(
   if (!selected) return undefined;
   const records = raw
     .split("\n")
-    .map((line) =>
-      line.match(
-        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/s,
-      ),
-    )
+    .map((line) => {
+      // Git strips < and > from the name and email, so the ident ends at its closing >.
+      const header = line.match(
+        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) ([^<>]*<[^<>]*>) (-?\d+) ([+-]\d{4})\t/,
+      );
+      if (!header || line.slice(header[0].length) !== action) return null;
+      return header;
+    })
     .filter(
       (record) =>
         record !== null &&
         record[2] === commit &&
-        record[3] === selected.timestamp &&
-        record[4] === selected.zone &&
-        record[5] === action,
+        record[4] === selected.timestamp &&
+        record[5] === selected.zone,
     );
   // Two matching same-second amends, second a no-op of the first, deny the first amend's credit (fail-closed by design).
   return records.length === 1 ? records[0]?.[1] : undefined;
