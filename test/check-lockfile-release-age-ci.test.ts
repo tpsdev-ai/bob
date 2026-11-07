@@ -1411,7 +1411,12 @@ test("the release guard accepts a merged commit and refuses an unmerged commit",
     ] as const) {
       const result = spawnSync(process.execPath, ["--no-install", scriptPath], {
         cwd: checkout,
-        env: { ...env, GITHUB_EVENT_NAME: "push", GITHUB_SHA: sha },
+        env: {
+          ...env,
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/tags/v1.0.0",
+          GITHUB_SHA: sha,
+        },
         encoding: "utf8",
       });
       if (accepted) expect(result.status, result.stderr).toBe(0);

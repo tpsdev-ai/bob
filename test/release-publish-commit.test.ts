@@ -14,6 +14,7 @@ const WORKFLOW = join(REPO, ".github", "workflows", "release-publish.yml");
 const SCRIPT = join(REPO, "scripts", "resolve-release-commit.mjs");
 const GUARD_JOB = "verify-ancestry";
 const GUARD_SHA = "$" + "{{ needs.verify-ancestry.outputs.sha }}";
+const INPUT_VERSION = "$" + "{{ inputs.version }}";
 
 // GITHUB_* variables are dropped so the test never writes into a real step's
 // output file when the suite runs inside Actions.
@@ -22,6 +23,7 @@ for (const key of [
   "GITHUB_OUTPUT",
   "GITHUB_EVENT_NAME",
   "GITHUB_SHA",
+  "GITHUB_REF",
   "GITHUB_REF_NAME",
   "VERSION",
 ]) {
@@ -173,16 +175,163 @@ test("the tag-push path accepts the run's commit only when it is on main", () =>
   const repo = makeRepo();
   try {
     const head = git(repo.work, "rev-parse", "HEAD");
-    const accepted = guard(repo, { GITHUB_EVENT_NAME: "push", GITHUB_SHA: head });
+    const accepted = guard(repo, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v8.0.0",
+      GITHUB_SHA: head,
+    });
     expect(accepted.status, accepted.stderr).toBe(0);
     expect(accepted.stdout).toContain(`sha=${head}`);
 
     git(repo.work, "checkout", "-b", "unmerged");
     git(repo.work, "commit", "--allow-empty", "-m", "unmerged change");
     const unmerged = git(repo.work, "rev-parse", "HEAD");
-    const refused = guard(repo, { GITHUB_EVENT_NAME: "push", GITHUB_SHA: unmerged });
+    const refused = guard(repo, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v8.0.0",
+      GITHUB_SHA: unmerged,
+    });
     expect(refused.status).toBe(1);
     expect(refused.stderr).toContain("not an ancestor of origin/main");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a tag push ancestry refusal names the version derived from the ref", () => {
+  const repo = makeRepo();
+  try {
+    const merged = git(repo.work, "rev-parse", "HEAD");
+    const accepted = guard(repo, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v7.0.0",
+      GITHUB_SHA: merged,
+    });
+    expect(accepted.status, accepted.stderr).toBe(0);
+    expect(accepted.stdout).toContain(`sha=${merged}`);
+
+    git(repo.work, "checkout", "-b", "unmerged");
+    git(repo.work, "commit", "--allow-empty", "-m", "unmerged change");
+    const unmerged = git(repo.work, "rev-parse", "HEAD");
+    const refused = guard(repo, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v7.0.0",
+      GITHUB_SHA: unmerged,
+    });
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toContain("v7.0.0");
+    expect(refused.stderr).toContain(unmerged);
+    expect(refused.stderr).toContain("not an ancestor of origin/main");
+    expect(refused.stdout).not.toContain("sha=");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test.each(["refs/heads/main", "refs/tags/release", "refs/tags/v1.2"])(
+  "a tag push whose ref %s is not a v<version> tag is refused by ref",
+  (ref) => {
+    const repo = makeRepo();
+    try {
+      const head = git(repo.work, "rev-parse", "HEAD");
+      const result = guard(repo, {
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_REF: ref,
+        GITHUB_SHA: head,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(ref);
+      expect(result.stderr).toContain("is not a v<version> tag");
+      expect(result.stdout).not.toContain("sha=");
+    } finally {
+      rmSync(repo.root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test("a tag that points at a tree or blob is refused by version", () => {
+  const repo = makeRepo();
+  try {
+    writeFileSync(join(repo.work, "release.txt"), "release\n");
+    git(repo.work, "add", "release.txt");
+    git(repo.work, "commit", "-m", "add release file");
+    const tree = git(repo.work, "rev-parse", "HEAD^{tree}");
+    const blob = git(repo.work, "rev-parse", "HEAD:release.txt");
+    git(repo.work, "tag", "v4.0.0", tree);
+    git(repo.work, "tag", "v4.0.1", blob);
+
+    for (const version of ["4.0.0", "4.0.1"]) {
+      const result = guard(repo, dispatch(version));
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain(`v${version}`);
+      expect(result.stderr).toContain("does not point at a commit");
+      expect(result.stdout).not.toContain("sha=");
+    }
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a git error while peeling is a failure, not a refusal", () => {
+  const repo = makeRepo();
+  try {
+    const bin = join(repo.root, "fake-bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "git"),
+      '#!/bin/sh\ncase "$*" in\n  *"^{commit}"*) echo "fatal: simulated git failure" >&2; exit 128 ;;\nesac\necho 1111111111111111111111111111111111111111\n',
+      { mode: 0o755 },
+    );
+    const result = spawnSync(process.execPath, ["--no-install", SCRIPT], {
+      cwd: repo.work,
+      env: { ...BASE_ENV, ...dispatch("5.0.0"), PATH: bin },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("git rev-parse");
+    expect(result.stderr).toContain("fatal: simulated git failure");
+    expect(result.stderr).not.toContain("does not point at a commit");
+    expect(result.stdout).not.toContain("sha=");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a missing git is a failure, not a refusal", () => {
+  const repo = makeRepo();
+  try {
+    const bin = join(repo.root, "empty-bin");
+    mkdirSync(bin);
+    const result = spawnSync(process.execPath, ["--no-install", SCRIPT], {
+      cwd: repo.work,
+      env: { ...BASE_ENV, ...dispatch("5.0.1"), PATH: bin },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("git rev-parse --verify --quiet refs/tags/v5.0.1");
+    expect(result.stderr).toContain("failed:");
+    expect(result.stderr).not.toContain("does not point at a commit");
+    expect(result.stdout).not.toContain("sha=");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a failed output write is a guard failure with its own exit code", () => {
+  const repo = makeRepo();
+  try {
+    git(repo.work, "tag", "v1.2.3");
+    const output = join(repo.root, "output-dir");
+    mkdirSync(output);
+    const result = guard(repo, { ...dispatch("1.2.3"), GITHUB_OUTPUT: output });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain("GITHUB_OUTPUT");
+    expect(result.stderr).toContain(output);
+    expect(result.stderr).toContain("EISDIR");
+    expect(result.stdout).not.toContain("sha=");
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }
@@ -193,6 +342,7 @@ type Step = {
   run?: string;
   id?: string;
   name?: string;
+  env?: Record<string, unknown>;
   with?: Record<string, unknown>;
 };
 type Job = { needs?: string | string[]; steps?: Step[]; outputs?: Record<string, unknown> };
@@ -222,6 +372,9 @@ test("every job after the guard checks out the guard's output sha", () => {
   );
   expect(guardStep?.id).toBeDefined();
   expect(guard?.outputs?.sha).toBe(`\${{ steps.${guardStep?.id}.outputs.sha }}`);
+  // The manual path reads the version input; the tag-push path reads the
+  // runner's own GITHUB_REF, so VERSION is the only env the step maps.
+  expect(guardStep?.env?.VERSION).toBe(INPUT_VERSION);
 
   const dependents = Object.keys(jobs).filter(
     (name) => name !== GUARD_JOB && afterGuard(jobs, name),
