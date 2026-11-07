@@ -1,0 +1,1 @@
+- **Amend reflog records split at the first tab** Subjects containing U+2028, timestamps and tabs can match edit evidence.

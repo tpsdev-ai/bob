@@ -1112,56 +1112,71 @@ describe("raw amend reflog record matching", () => {
   it.each([
     ["U+2028", "\u2028"],
     ["U+2029", "\u2029"],
+    ["CR", "\r"],
   ])("returns the replaced commit with %s in the subject", (_name, separator) => {
     const subject = `${action}${separator}continued`;
     const raw = `${old} ${commit} Test <test@example.invalid> 1700000000 +0000\t${subject}\n`;
     expect(replacedCommitFromReflog(raw, selector, commit, subject)).toBe(old);
   });
+
+  it("returns the replaced commit with U+2028, a timestamp and a tab in the subject", () => {
+    const subject = "commit (amend): x\u2028abc 1700000000 +0000\tcommit: y";
+    const raw = `${old} ${commit} Test <test@example.invalid> 1700000000 +0000\t${subject}\n`;
+    expect(replacedCommitFromReflog(raw, selector, commit, subject)).toBe(old);
+  });
+
+  it("denies credit for a raw line without a tab", () => {
+    const raw = `${old} ${commit} Test <test@example.invalid> 1700000000 +0000 ${action}\n`;
+    expect(replacedCommitFromReflog(raw, selector, commit, action)).toBeUndefined();
+  });
 });
 
 describe("reflog scan timestamp validation", () => {
   it("denies credit when the selector has trailing text after its closing brace", () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-reflog-scan-")));
-    const snapshot = snapshotRoot(root);
-    const repo = join(root, "child");
-    mkdirSync(repo);
-    const head = "2".repeat(40);
-    let suffix = "";
-    let scannedEntries = 0;
-    const outputs = new Map([
-      ["--is-inside-work-tree", "true\n"],
-      ["--show-toplevel", `${repo}\n`],
-      ["--absolute-git-dir", `${repo}\n`],
-      ["--show-object-format", "sha1\n"],
-      ["rev-list", `${"3".repeat(40)}\n`],
-      ["ls-files", ""],
-      ["symbolic-ref", "HEAD\n"],
-      ["HEAD^{commit}", `${head}\n`],
-      ["cat-file", `tree ${"3".repeat(40)}\n\nfixture\n`],
-      ["ls-tree", `100644 blob ${"4".repeat(40)}\ttracked\n`],
-    ]);
-    const probe = spyOn(childProcess, "spawnSync").mockImplementation((_file, args) => {
-      const command = args as string[];
-      let output: string | undefined;
-      if (command.includes("reflog")) {
-        scannedEntries++;
-        output = `${head}\0HEAD@{${snapshot.launchedAtSeconds} +0000}${suffix}\0commit: fixture\n`;
-      } else {
-        output = outputs.get(command.find((arg) => outputs.has(arg)) ?? "");
-      }
-      if (output === undefined) throw new Error(`unexpected git command: ${command.join(" ")}`);
-      const stdout = Buffer.from(output);
-      const stderr = Buffer.alloc(0);
-      return { pid: 0, output: [null, stdout, stderr], stdout, stderr, status: 0, signal: null };
-    });
+    let root: string | undefined;
+    let probe: { mockRestore(): void } | undefined;
     try {
+      root = mkdtempSync(join(tmpdir(), "bob-reflog-scan-"));
+      root = realpathSync(root);
+      const snapshot = snapshotRoot(root);
+      const repo = join(root, "child");
+      mkdirSync(repo);
+      const head = "2".repeat(40);
+      let suffix = "";
+      let scannedEntries = 0;
+      const outputs = new Map([
+        ["--is-inside-work-tree", "true\n"],
+        ["--show-toplevel", `${repo}\n`],
+        ["--absolute-git-dir", `${repo}\n`],
+        ["--show-object-format", "sha1\n"],
+        ["rev-list", `${"3".repeat(40)}\n`],
+        ["ls-files", ""],
+        ["symbolic-ref", "HEAD\n"],
+        ["HEAD^{commit}", `${head}\n`],
+        ["cat-file", `tree ${"3".repeat(40)}\n\nfixture\n`],
+        ["ls-tree", `100644 blob ${"4".repeat(40)}\ttracked\n`],
+      ]);
+      probe = spyOn(childProcess, "spawnSync").mockImplementation((_file, args) => {
+        const command = args as string[];
+        let output: string | undefined;
+        if (command.includes("reflog")) {
+          scannedEntries++;
+          output = `${head}\0HEAD@{${snapshot.launchedAtSeconds} +0000}${suffix}\0commit: fixture\n`;
+        } else {
+          output = outputs.get(command.find((arg) => outputs.has(arg)) ?? "");
+        }
+        if (output === undefined) throw new Error(`unexpected git command: ${command.join(" ")}`);
+        const stdout = Buffer.from(output);
+        const stderr = Buffer.alloc(0);
+        return { pid: 0, output: [null, stdout, stderr], stdout, stderr, status: 0, signal: null };
+      });
       expect(isWorkRootEditVerified(snapshot)).toBe(true);
       suffix = "trailing";
       expect(isWorkRootEditVerified(snapshot)).toBe(false);
       expect(scannedEntries).toBe(2);
     } finally {
-      probe.mockRestore();
-      rmSync(root, { recursive: true, force: true });
+      probe?.mockRestore();
+      if (root !== undefined) rmSync(root, { recursive: true, force: true });
     }
   }, 5_000);
 });
