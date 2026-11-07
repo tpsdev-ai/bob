@@ -1,0 +1,1 @@
+- **Reflog selector checks share a parser** with malformed-selector coverage and an explicit pruned-amend fixture precondition (bob#440).
