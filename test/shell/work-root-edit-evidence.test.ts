@@ -1109,6 +1109,25 @@ describe("raw amend reflog record matching", () => {
     expect(replacedCommitFromReflog(record(old, commit), selector, commit, action)).toBe(old);
   });
 
+  it("matches the exact subject among records sharing the header tuple", () => {
+    const other = "3".repeat(40);
+    const raw =
+      `${old} ${commit} Tab\tName <t@e.i> 1700000000 +0000\t${action}\n` +
+      `${other} ${commit} Test <t@e.i> 1700000000 +0000\treset: moving to ${commit}\n`;
+    expect(replacedCommitFromReflog(raw, selector, commit, action)).toBe(old);
+  });
+
+  it("denies credit when the header matches but the subject differs", () => {
+    const other = "3".repeat(40);
+    const raw = `${other} ${commit} Test <t@e.i> 1700000000 +0000\treset: moving to ${commit}\n`;
+    expect(replacedCommitFromReflog(raw, selector, commit, action)).toBeUndefined();
+  });
+
+  it("returns the replaced commit with tabs and a timestamp inside the ident", () => {
+    const raw = `${old} ${commit} Tab\tNam 1700000000 +0000\tq <evil@x.y> 1794026764 -0800\t${action}\n`;
+    expect(replacedCommitFromReflog(raw, "HEAD@{1794026764 -0800}", commit, action)).toBe(old);
+  });
+
   it.each([
     ["U+2028", "\u2028"],
     ["U+2029", "\u2029"],
