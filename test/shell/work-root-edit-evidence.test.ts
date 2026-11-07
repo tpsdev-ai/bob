@@ -1109,6 +1109,20 @@ describe("raw amend reflog record matching", () => {
     expect(replacedCommitFromReflog(record(old, commit), selector, commit, action)).toBe(old);
   });
 
+  it("returns the replaced commit from a matching sha256 raw record", () => {
+    const before = "1".repeat(64);
+    const after = "2".repeat(64);
+    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\t${action}\n`;
+    expect(replacedCommitFromReflog(raw, selector, after, action)).toBe(before);
+  });
+
+  it("denies credit for a sha256 raw record with a different subject", () => {
+    const before = "1".repeat(64);
+    const after = "2".repeat(64);
+    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\treset: moving to ${after}\n`;
+    expect(replacedCommitFromReflog(raw, selector, after, action)).toBeUndefined();
+  });
+
   it("matches the exact subject among records sharing the header tuple", () => {
     const other = "3".repeat(40);
     const raw =
