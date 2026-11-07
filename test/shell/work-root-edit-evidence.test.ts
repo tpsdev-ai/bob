@@ -367,7 +367,9 @@ describe("completion gate under a declared work root", () => {
     expect(git(repo, "rev-parse", "HEAD^{tree}")).toBe(
       git(repo, "rev-parse", `${replaced}^{tree}`),
     );
-    expect(git(repo, "rev-parse", "HEAD@{1}^{tree}")).not.toBe(
+    // HEAD@{1} resolution over a pruned reflog differs across Git versions.
+    const nextSurviving = git(repo, "reflog", "show", "--format=%H", "HEAD").split("\n")[1];
+    expect(git(repo, "rev-parse", `${nextSurviving}^{tree}`)).not.toBe(
       git(repo, "rev-parse", "HEAD^{tree}"),
     );
     expect(result.exitCode).toBe(1);
