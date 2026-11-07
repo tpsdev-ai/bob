@@ -714,7 +714,7 @@ export function replacedCommitFromReflog(
     .split("\n")
     .map((line) =>
       line.match(
-        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/,
+        /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) .+ (-?\d+) ([+-]\d{4})\t(.*)$/s,
       ),
     )
     .filter(
