@@ -30,8 +30,8 @@
  *   1 — refused: an invalid version, a push ref that is not a v<version> tag,
  *       a missing tag, a tag that does not point at a commit, or a commit that
  *       is not on main
- *   2 — the guard could not run: unsupported event, a run sha that is not a
- *       full 40-hex sha, or git could not run or exited with an error
+ *   2 — the guard could not run: unsupported event, a sha that is not a full
+ *       40-hex sha, or git could not run or exited with an error
  *   3 — the resolved sha could not be written to GITHUB_OUTPUT
  */
 
