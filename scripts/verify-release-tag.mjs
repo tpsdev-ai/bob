@@ -2,8 +2,8 @@
 /**
  * verify-release-tag.mjs — before the GitHub release job creates or edits a
  * release, confirm the tag still resolves to the commit the release guard
- * verified, and refuse (naming the tag, the expected sha and the resolved sha)
- * when it does not. An annotated tag is peeled to its commit.
+ * verified, and refuse when it resolves to another commit, naming the tag, the
+ * expected sha and the resolved sha. An annotated tag is peeled to its commit.
  *
  * TAG is the already-validated `v<version>` tag and EXPECTED_SHA the full
  * 40-hex sha from the guard's job output; both arrive through the environment.
