@@ -1,1 +1,1 @@
-- **Amend reflog header parsing** Parse the raw header through the ident's closing `>` and compare the subject exactly, so a tab or timestamp inside the committer ident no longer denies credit.
+- **Amend reflog header parsing** Parse the raw header through the ident's closing `>` and compare the subject exactly.
