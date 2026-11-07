@@ -362,6 +362,19 @@ function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<stri
   return false;
 }
 
+test("every release-publish checkout leaves no credentials in .git/config", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const checkouts = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
+    (spec.steps ?? [])
+      .filter((step) => step.uses?.startsWith("actions/checkout@") === true)
+      .map((step) => ({ job, step })),
+  );
+  expect(checkouts.length).toBeGreaterThan(0);
+  for (const { job, step } of checkouts) {
+    expect(step.with?.["persist-credentials"], `${job} checkout keeps the token`).toBe(false);
+  }
+});
+
 test("every job after the guard checks out the guard's output sha", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
   const jobs = workflow.jobs ?? {};
