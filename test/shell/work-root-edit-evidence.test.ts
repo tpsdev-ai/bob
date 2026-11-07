@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readWorkRoot } from "../../src/shell/bob-yaml.js";
@@ -1100,6 +1108,62 @@ describe("raw amend reflog record matching", () => {
   it("returns the replaced commit from one matching raw record", () => {
     expect(replacedCommitFromReflog(record(old, commit), selector, commit, action)).toBe(old);
   });
+
+  it.each([
+    ["U+2028", "\u2028"],
+    ["U+2029", "\u2029"],
+  ])("returns the replaced commit with %s in the subject", (_name, separator) => {
+    const subject = `${action}${separator}continued`;
+    const raw = `${old} ${commit} Test <test@example.invalid> 1700000000 +0000\t${subject}\n`;
+    expect(replacedCommitFromReflog(raw, selector, commit, subject)).toBe(old);
+  });
+});
+
+describe("reflog scan timestamp validation", () => {
+  it("denies credit when the selector has trailing text after its closing brace", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "bob-reflog-scan-")));
+    const snapshot = snapshotRoot(root);
+    const repo = join(root, "child");
+    mkdirSync(repo);
+    const head = "2".repeat(40);
+    let suffix = "";
+    let scannedEntries = 0;
+    const outputs = new Map([
+      ["--is-inside-work-tree", "true\n"],
+      ["--show-toplevel", `${repo}\n`],
+      ["--absolute-git-dir", `${repo}\n`],
+      ["--show-object-format", "sha1\n"],
+      ["rev-list", `${"3".repeat(40)}\n`],
+      ["ls-files", ""],
+      ["symbolic-ref", "HEAD\n"],
+      ["HEAD^{commit}", `${head}\n`],
+      ["cat-file", `tree ${"3".repeat(40)}\n\nfixture\n`],
+      ["ls-tree", `100644 blob ${"4".repeat(40)}\ttracked\n`],
+    ]);
+    const probe = spyOn(childProcess, "spawnSync").mockImplementation((_file, args) => {
+      const command = args as string[];
+      let output: string | undefined;
+      if (command.includes("reflog")) {
+        scannedEntries++;
+        output = `${head}\0HEAD@{${snapshot.launchedAtSeconds} +0000}${suffix}\0commit: fixture\n`;
+      } else {
+        output = outputs.get(command.find((arg) => outputs.has(arg)) ?? "");
+      }
+      if (output === undefined) throw new Error(`unexpected git command: ${command.join(" ")}`);
+      const stdout = Buffer.from(output);
+      const stderr = Buffer.alloc(0);
+      return { pid: 0, output: [null, stdout, stderr], stdout, stderr, status: 0, signal: null };
+    });
+    try {
+      expect(isWorkRootEditVerified(snapshot)).toBe(true);
+      suffix = "trailing";
+      expect(isWorkRootEditVerified(snapshot)).toBe(false);
+      expect(scannedEntries).toBe(2);
+    } finally {
+      probe.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
 });
 
 describe("work_root config validation", () => {

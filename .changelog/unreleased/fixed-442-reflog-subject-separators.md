@@ -1,0 +1,1 @@
+- **Amend evidence accepts Unicode subject separators** with coverage for malformed selectors in the timestamp scan (bob#442).
