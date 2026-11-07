@@ -44,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Fallback only: version to stage"
+        description: "Fallback only: the v<version> tag to stage; its commit must be on main"
         required: true
         type: string
 
@@ -58,29 +58,33 @@ concurrency:
 
 jobs:
   verify-ancestry:
-    name: Verify the run's commit is on main
+    name: Resolve and verify the release commit
     runs-on: ubuntu-latest
-    # Checks GITHUB_SHA: the tag's commit on tag push, the dispatched ref's
-    # commit on manual dispatch. Dispatch takes its version from the input
-    # without checking a matching tag (#393). A tag's commit supplies this
-    # workflow file; restricting who can create release tags is #392.
+    # Resolves the one commit this release stages and refuses it unless it is on
+    # main: the tag's commit on a tag push, the v<inputs.version> tag's commit on
+    # a manual dispatch (never the dispatched ref's commit). Exposes that exact
+    # sha so every later job checks out the commit that was verified (#393).
+    # Restricting who can create release tags is #392.
     permissions:
       contents: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
-      - name: Verify the run's commit is on main
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Commit ${GITHUB_SHA} is not an ancestor of origin/main. Release a commit that is on main: push the v<version> tag on the merged release commit, or dispatch from main."
-            exit 1
-          fi
-          echo "  ok ${GITHUB_SHA} is on main"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+
+      - name: Resolve the release commit
+        id: commit
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bun --no-install scripts/resolve-release-commit.mjs
 
   stage-publish:
     name: Stage-publish @tpsdev-ai/bob
@@ -96,6 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.verify-ancestry.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -233,6 +238,8 @@ jobs:
       contents: write   # create/edit the GitHub release for the tag
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify-ancestry.outputs.sha }}
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
