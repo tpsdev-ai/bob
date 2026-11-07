@@ -1,0 +1,1 @@
+- **Amend reflog header parsing** Subjects containing U+2028, timestamps and tabs could match edit evidence.
