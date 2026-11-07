@@ -15,15 +15,18 @@
  * On both tag paths a refusal names the version and the reason; a push ref
  * that is not a v<version> tag is refused by ref.
  *
- * Later jobs check out the sha this script prints, so the commit that was
- * verified is the commit that is staged even if the tag moves afterwards.
+ * Later jobs check out the sha this script outputs; the GitHub release also
+ * takes its version and tag from those outputs. Outside Actions the stdout
+ * `sha=<40-hex>` line remains the interface.
  *
  * Environment:
  *   GITHUB_EVENT_NAME  push | workflow_dispatch (set by the runner)
  *   GITHUB_SHA         the run's commit (tag push only)
  *   GITHUB_REF         the pushed ref, refs/tags/v<VERSION> (tag push only)
  *   VERSION            the v<VERSION> tag to stage (workflow_dispatch only)
- *   GITHUB_OUTPUT      when set, receives `sha=<40-hex>` for the job output
+ *   GITHUB_OUTPUT      receives `sha=<40-hex>`, `version=<VERSION>` and
+ *                      `tag=v<VERSION>`; required when GITHUB_ACTIONS is set
+ *   GITHUB_ACTIONS     set on the runner; makes GITHUB_OUTPUT mandatory
  *
  * Exit codes:
  *   0 — the commit was resolved and is on origin/main; prints `sha=<40-hex>`
@@ -31,7 +34,8 @@
  *       a missing tag, a tag that does not point at a commit, or a commit that
  *       is not on main
  *   2 — the guard could not run: unsupported event, a sha that is not a full
- *       40-hex sha, or git could not run or exited with an error
+ *       40-hex sha, GITHUB_OUTPUT unset or empty under Actions, or git could
+ *       not run or exited with an error
  *   3 — the resolved sha could not be written to GITHUB_OUTPUT
  */
 
@@ -126,12 +130,13 @@ function main() {
   const event = process.env.GITHUB_EVENT_NAME;
   let sha;
   let label;
+  let version;
   if (event === "workflow_dispatch") {
-    const version = requireVersion(process.env.VERSION ?? "");
+    version = requireVersion(process.env.VERSION ?? "");
     sha = tagCommit(version);
     label = `tag v${version}`;
   } else if (event === "push") {
-    const version = pushVersion(process.env.GITHUB_REF ?? "");
+    version = pushVersion(process.env.GITHUB_REF ?? "");
     sha = requireSha(process.env.GITHUB_SHA ?? "", "GITHUB_SHA");
     label = `tag v${version}`;
   } else {
@@ -141,9 +146,12 @@ function main() {
   ensureOnMain(sha, label);
 
   const output = process.env.GITHUB_OUTPUT;
+  if (process.env.GITHUB_ACTIONS && !output) {
+    fail("GITHUB_OUTPUT is unset or empty under Actions; the job outputs cannot be written");
+  }
   if (output) {
     try {
-      appendFileSync(output, `sha=${sha}\n`);
+      appendFileSync(output, `sha=${sha}\nversion=${version}\ntag=v${version}\n`);
     } catch (error) {
       console.error(
         `release commit guard could not write the job output to GITHUB_OUTPUT ${output}: ${error?.message ?? error}`,

@@ -69,6 +69,8 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.commit.outputs.version }}
+      tag: ${{ steps.commit.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -230,16 +232,17 @@ jobs:
     needs: verify-ancestry
     runs-on: ubuntu-latest
     # Independent of stage-publish on purpose: the GitHub release documents the
-    # tagged commit and can be cut immediately on tag push. It does NOT wait on
-    # the npm staging 2FA approval (a manual external gate) — that gate governs
-    # what goes LIVE on npm, not whether the tag is recorded on GitHub.
-    if: github.event_name == 'push'
+    # tagged commit and can be cut immediately on tag push or a manual dispatch.
+    # It does NOT wait on the npm staging 2FA approval (a manual external gate) —
+    # that gate governs what goes LIVE on npm, not whether the tag is recorded on
+    # GitHub.
     permissions:
       contents: write   # create/edit the GitHub release for the tag
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-ancestry.outputs.sha }}
+          fetch-tags: true
           persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -249,21 +252,6 @@ jobs:
       - name: Lockfile release-age bake
         run: bun --no-install scripts/check-lockfile-release-age.mjs
 
-      - name: Resolve version
-        id: ver
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # tag push: github.ref_name is the tag (vX.Y.Z)
-          VERSION="${REF_NAME#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
-            echo "::error::Invalid version '$VERSION'. Expected semver (e.g. 0.3.0 or 1.0.0-rc.1)."
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: $VERSION"
-
       - name: Extract CHANGELOG section
         # The node script reads CHANGELOG.md and writes the matching section body
         # to a file. Version flows through env, never ${{ }} interpolation in the
@@ -271,11 +259,20 @@ jobs:
         # shell string) so neither the tag nor the CHANGELOG text can be parsed as
         # shell. Fails loudly (non-zero) if the section is missing or empty.
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.verify-ancestry.outputs.version }}
         run: |
           set -euo pipefail
           node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > release-notes.md
           echo "Extracted $(wc -l < release-notes.md) lines for v$VERSION"
+
+      - name: Verify the tag still resolves to the verified commit
+        # A tag can move after the guard resolved it. Refuse before touching the
+        # release when it no longer points at the verified commit; the tag and
+        # both shas flow through env, never into the command text.
+        env:
+          TAG: ${{ needs.verify-ancestry.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.verify-ancestry.outputs.sha }}
+        run: bun --no-install scripts/verify-release-tag.mjs
 
       - name: Create or update GitHub release
         # Idempotent: if a release for the tag already exists (re-run), update it
@@ -284,8 +281,8 @@ jobs:
         # never interpolated into the command text.
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ needs.verify-ancestry.outputs.tag }}
+          VERSION: ${{ needs.verify-ancestry.outputs.version }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then

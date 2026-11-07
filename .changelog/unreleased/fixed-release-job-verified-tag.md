@@ -1,0 +1,1 @@
+- **The GitHub release is filed against the verified tag commit.** A manual dispatch now files its release too, and the tag is re-checked before the release is created or edited.
