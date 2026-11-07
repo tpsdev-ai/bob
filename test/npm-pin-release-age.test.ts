@@ -169,6 +169,24 @@ test("the pin is read from the workflow file, not hardcoded", async () => {
 }, 15_000);
 
 const INSTALL = "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org";
+const UPGRADE_STEP = "Upgrade npm to a staging-capable version";
+
+test.each([
+  ["if", "false"],
+  ["if", `$` + `{{ github.event_name == 'push' }}`],
+  ["if", "true"],
+  ["continue-on-error", "true"],
+] as const)(
+  "the parser refuses npm self-update %s: %s",
+  (key, value) => {
+    const workflow = readFileSync(WORKFLOW, "utf8").replace(
+      `- name: ${UPGRADE_STEP}`,
+      `- name: ${UPGRADE_STEP}\n        ${key}: ${value}`,
+    );
+    expect(() => readNpmPin(workflow)).toThrow(`"${UPGRADE_STEP}" must not set "${key}"`);
+  },
+  5_000,
+);
 
 test("the parser reads the exact command with the checked registry", () => {
   const workflow = readFileSync(WORKFLOW, "utf8");
