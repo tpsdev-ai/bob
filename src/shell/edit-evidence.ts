@@ -793,7 +793,7 @@ function hasCommitLabelWithContentChange(
       if (performance.now() >= deadline) return false;
       try {
         const [commit, selector, action] = entry.split("\0");
-        const timestamp = selector?.match(/@\{(-?\d+) [+-]\d{4}\}$/)?.[1];
+        const timestamp = parseReflogSelector(selector ?? "")?.timestamp;
         if (
           timestamp !== undefined &&
           Number(timestamp) >= launchedAtSeconds &&

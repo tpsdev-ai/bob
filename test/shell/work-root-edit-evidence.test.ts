@@ -368,7 +368,11 @@ describe("completion gate under a declared work root", () => {
       git(repo, "rev-parse", `${replaced}^{tree}`),
     );
     // HEAD@{1} resolution over a pruned reflog differs across Git versions.
-    const nextSurviving = git(repo, "reflog", "show", "--format=%H", "HEAD").split("\n")[1];
+    const surviving = git(repo, "reflog", "show", "--format=%H", "HEAD")
+      .split("\n")
+      .filter((entry) => entry.length > 0);
+    expect(surviving.length).toBeGreaterThanOrEqual(2);
+    const nextSurviving = surviving[1];
     expect(git(repo, "rev-parse", `${nextSurviving}^{tree}`)).not.toBe(
       git(repo, "rev-parse", "HEAD^{tree}"),
     );
@@ -1073,6 +1077,11 @@ describe("raw amend reflog record matching", () => {
 
   it("denies credit with no matching raw record", () => {
     expect(replacedCommitFromReflog(record(old, old), selector, commit, action)).toBeUndefined();
+  });
+
+  it("denies credit for a malformed selector", () => {
+    const raw = record(old, commit);
+    expect(replacedCommitFromReflog(raw, "HEAD", commit, action)).toBeUndefined();
   });
 
   it("denies credit for duplicate same-second amend records", () => {
