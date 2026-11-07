@@ -698,7 +698,7 @@ function commitChangedContent(
 function parseReflogSelector(
   selector: string,
 ): { ref: string; timestamp: string; zone: string } | undefined {
-  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/);
+  const selected = selector.match(/^(.*)@\{(-?\d+) ([+-]\d{4})\}$/s);
   return selected ? { ref: selected[1], timestamp: selected[2], zone: selected[3] } : undefined;
 }
 

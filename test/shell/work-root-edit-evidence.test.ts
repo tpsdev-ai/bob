@@ -1084,6 +1084,14 @@ describe("raw amend reflog record matching", () => {
     expect(replacedCommitFromReflog(raw, "HEAD", commit, action)).toBeUndefined();
   });
 
+  it.each([
+    ["U+2028", "\u2028"],
+    ["U+2029", "\u2029"],
+  ])("returns the replaced commit with %s in the ref", (_name, separator) => {
+    const selected = `refs/heads/topic${separator}name@{1700000000 +0000}`;
+    expect(replacedCommitFromReflog(record(old, commit), selected, commit, action)).toBe(old);
+  });
+
   it("denies credit for duplicate same-second amend records", () => {
     const raw = record(old, commit) + record(commit, commit);
     expect(replacedCommitFromReflog(raw, selector, commit, action)).toBeUndefined();
