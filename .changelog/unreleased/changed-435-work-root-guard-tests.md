@@ -1,0 +1,1 @@
+- **Work-root evidence guard coverage** adds regression tests for late successful evaluations and missing or ambiguous amend records.
