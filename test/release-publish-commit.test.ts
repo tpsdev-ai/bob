@@ -4,7 +4,15 @@
 // every job after the guard checks out the guard's output sha.
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -499,6 +507,8 @@ test("an unreadable origin is refused as unreadable at the pre-release check, ne
 }, 30_000);
 
 type Step = {
+  if?: unknown;
+  "continue-on-error"?: unknown;
   uses?: string;
   run?: string;
   id?: string;
@@ -509,10 +519,118 @@ type Step = {
 type Job = {
   needs?: string | string[];
   if?: string;
+  "continue-on-error"?: unknown;
   steps?: Step[];
   outputs?: Record<string, unknown>;
 };
 type Workflow = { jobs?: Record<string, Job> };
+
+const VERSION_CHECK = "Verify the package version matches the resolved version";
+const TAG_CHECK = "Compare the remote tag with the verified commit just before the release";
+const EXTRACT_STEP = "Extract CHANGELOG section";
+const CREATE_RELEASE = "Create or update GitHub release";
+
+function assertRequiredStep(
+  workflow: Workflow,
+  jobName: string,
+  stepName: string,
+  beforeName: string,
+): Step {
+  const job = workflow.jobs?.[jobName];
+  expect(job, `${jobName} is missing`).toBeDefined();
+  expect(job, jobName).not.toHaveProperty("continue-on-error");
+  const steps = job?.steps ?? [];
+  const at = steps.findIndex((step) => step.name === stepName);
+  const before = steps.findIndex((step) => step.name === beforeName);
+  expect(at, `${stepName} is missing`).toBeGreaterThanOrEqual(0);
+  expect(before, `${beforeName} is missing`).toBeGreaterThanOrEqual(0);
+  expect(at, `${stepName} must precede ${beforeName}`).toBeLessThan(before);
+  const step = steps[at];
+  expect(step, stepName).not.toHaveProperty("if");
+  expect(step, stepName).not.toHaveProperty("continue-on-error");
+  return step;
+}
+
+function assertChangelogExtraction(workflow: Workflow): string {
+  const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
+  expect(extract.env?.VERSION).toBe(GUARD_VERSION);
+  const command =
+    /^\s*node scripts\/changelog-extract\.mjs "\$VERSION" CHANGELOG\.md > ([A-Za-z0-9._/-]+)\s*$/m.exec(
+      extract.run ?? "",
+    );
+  expect(
+    command,
+    "extraction must invoke changelog-extract.mjs with VERSION and redirect notes",
+  ).not.toBeNull();
+  const notesFile = command?.[1] ?? "";
+  const create = workflow.jobs?.["github-release"]?.steps?.find(
+    (step) => step.name === CREATE_RELEASE,
+  );
+  const notesArguments = [...(create?.run ?? "").matchAll(/--notes-file\s+([^\s\\]+)/g)];
+  expect(notesArguments.length, "release must read a notes file").toBeGreaterThan(0);
+  for (const argument of notesArguments) expect(argument[1]).toBe(notesFile);
+  return notesFile;
+}
+
+const REQUIRED_STEPS = [
+  ["stage-publish", VERSION_CHECK, "Stage-publish"],
+  ["github-release", TAG_CHECK, CREATE_RELEASE],
+  ["github-release", EXTRACT_STEP, CREATE_RELEASE],
+] as const;
+
+test.each(REQUIRED_STEPS)("%s requires %s before %s", (job, step, before) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertRequiredStep(workflow, job, step, before);
+});
+
+for (const [job, step, before] of REQUIRED_STEPS) {
+  test.each([
+    ["if", false],
+    ["if", "github.event_name == 'push'"],
+    ["continue-on-error", true],
+    ["continue-on-error", false],
+  ] as const)(`${step} refuses %s: %j`, (key, value) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const required = assertRequiredStep(workflow, job, step, before);
+    required[key] = value;
+    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+  });
+
+  test(`${job} refuses continue-on-error for ${step}`, () => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const spec = workflow.jobs?.[job];
+    if (spec === undefined) throw new Error(`Missing ${job}`);
+    spec["continue-on-error"] = true;
+    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+  });
+
+  test(`${step} refuses placement after ${before}`, () => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const required = assertRequiredStep(workflow, job, step, before);
+    const steps = workflow.jobs?.[job]?.steps ?? [];
+    steps.splice(steps.indexOf(required), 1);
+    steps.splice(steps.findIndex((candidate) => candidate.name === before) + 1, 0, required);
+    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+  });
+}
+
+test("changelog extraction writes the release notes file", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertChangelogExtraction(workflow);
+});
+
+test.each([
+  ["run", 'echo "Release v$VERSION" > release-notes.md'],
+  ["run", 'node scripts/changelog-extract.mjs "1.2.3" CHANGELOG.md > release-notes.md'],
+  ["run", 'node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > different-notes.md'],
+  ["env", { VERSION: INPUT_VERSION }],
+] as const)("changelog extraction refuses mismatched %s: %j", (key, value) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertChangelogExtraction(workflow);
+  const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
+  Object.assign(extract, { [key]: value });
+  expect(() => assertChangelogExtraction(workflow)).toThrow();
+});
 
 // A checkout step is identified by the action it runs, not by the pin after the
 // `@`: GitHub resolves the owner and repository case-insensitively, so
@@ -753,19 +871,26 @@ test("the guard's written version feeds the real changelog extractor", () => {
       changelog,
       "## [1.2.3] - 2026-01-01\n\n### Fixed\n\n- Something.\n\n## [1.2.2] - 2025-12-01\n\n- Older.\n",
     );
-    const matched = spawnSync(process.execPath, ["--no-install", EXTRACT, version, changelog], {
-      env: BASE_ENV,
+    const notesFile = assertChangelogExtraction(workflow);
+    const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
+    mkdirSync(join(repo.root, "scripts"));
+    copyFileSync(EXTRACT, join(repo.root, "scripts", "changelog-extract.mjs"));
+    const matched = spawnSync("bash", ["-c", extract.run ?? ""], {
+      cwd: repo.root,
+      env: { ...BASE_ENV, VERSION: version },
       encoding: "utf8",
       timeout: 30_000,
     });
     expect(matched.status, matched.stderr).toBe(0);
-    expect(matched.stdout).toContain("### Fixed");
-    expect(matched.stdout).toContain("- Something.");
-    expect(matched.stdout).not.toContain("- Older.");
+    const notes = readFileSync(join(repo.root, notesFile), "utf8");
+    expect(notes).toContain("### Fixed");
+    expect(notes).toContain("- Something.");
+    expect(notes).not.toContain("- Older.");
 
     writeFileSync(changelog, "## [1.2.2] - 2025-12-01\n\n- Older.\n");
-    const missing = spawnSync(process.execPath, ["--no-install", EXTRACT, version, changelog], {
-      env: BASE_ENV,
+    const missing = spawnSync("bash", ["-c", extract.run ?? ""], {
+      cwd: repo.root,
+      env: { ...BASE_ENV, VERSION: version },
       encoding: "utf8",
       timeout: 30_000,
     });
