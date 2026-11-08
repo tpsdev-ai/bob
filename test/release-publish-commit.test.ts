@@ -517,13 +517,17 @@ type Step = {
   with?: Record<string, unknown>;
 };
 type Job = {
+  permissions?: Record<string, string> | string;
   needs?: string | string[];
   if?: string;
   "continue-on-error"?: unknown;
   steps?: Step[];
   outputs?: Record<string, unknown>;
 };
-type Workflow = { jobs?: Record<string, Job> };
+type Workflow = {
+  permissions?: Record<string, string> | string;
+  jobs?: Record<string, Job>;
+};
 
 const VERSION_CHECK = "Verify the package version matches the resolved version";
 const TAG_CHECK = "Compare the remote tag with the verified commit just before the release";
@@ -831,6 +835,106 @@ function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<stri
   }
   return false;
 }
+
+function assertReleaseStructure(workflow: Workflow): void {
+  expect(workflow.permissions).toEqual({ contents: "read" });
+  const jobs = workflow.jobs ?? {};
+  expect(Object.keys(jobs).sort()).toEqual(["github-release", "stage-publish", GUARD_JOB]);
+  expect(jobs[GUARD_JOB].permissions).toEqual({ contents: "read" });
+  expect(jobs["stage-publish"].permissions).toEqual({ "id-token": "write", contents: "read" });
+  expect(jobs["github-release"].permissions).toEqual({ contents: "write" });
+  for (const name of Object.keys(jobs)) {
+    if (name !== GUARD_JOB)
+      expect(afterGuard(jobs, name), `${name} must need the guard`).toBe(true);
+  }
+  expect((jobs["github-release"].steps ?? []).map(({ name, uses }) => ({ name, uses }))).toEqual([
+    { uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" },
+    { uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6" },
+    { name: "Lockfile release-age bake" },
+    { name: EXTRACT_STEP },
+    { name: TAG_CHECK },
+    { name: CREATE_RELEASE },
+  ]);
+}
+
+test("release workflow pins permissions, guarded job graph and GitHub release steps", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertReleaseStructure(workflow);
+});
+
+test.each([
+  {
+    name: "Early API release",
+    run: 'gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"',
+  },
+  { name: "Early action release", uses: "softprops/action-gh-release@v2" },
+])("release structure refuses an added $name step", (step) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertReleaseStructure(workflow);
+  workflow.jobs?.["github-release"]?.steps?.splice(3, 0, step);
+  expect(() => assertReleaseStructure(workflow)).toThrow();
+});
+
+test("release structure refuses a new contents-write job without the guard", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertReleaseStructure(workflow);
+  Object.assign(workflow.jobs ?? {}, {
+    "early-release": {
+      permissions: { contents: "write" },
+      steps: [{ run: 'gh release create "$TAG"' }],
+    },
+  });
+  expect(() => assertReleaseStructure(workflow)).toThrow();
+});
+
+test.each(["workflow", GUARD_JOB, "stage-publish", "github-release"])(
+  "release structure refuses changed %s permissions",
+  (scope) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    assertReleaseStructure(workflow);
+    const target = scope === "workflow" ? workflow : workflow.jobs?.[scope];
+    Object.assign(target ?? {}, {
+      permissions:
+        scope === "github-release"
+          ? { contents: "write", actions: "write" }
+          : { contents: "write" },
+    });
+    expect(() => assertReleaseStructure(workflow)).toThrow();
+  },
+);
+
+test("release structure refuses missing workflow permissions", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertReleaseStructure(workflow);
+  delete workflow.permissions;
+  expect(() => assertReleaseStructure(workflow)).toThrow();
+});
+
+test.each(["stage-publish", "github-release"])(
+  "release structure refuses %s without a guard dependency",
+  (name) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    assertReleaseStructure(workflow);
+    const job = workflow.jobs?.[name];
+    if (job === undefined) throw new Error(`Missing ${name}`);
+    delete job.needs;
+    expect(() => assertReleaseStructure(workflow)).toThrow();
+  },
+);
+
+test.each(["removed", "reordered", "renamed", "re-pointed"])(
+  "release structure refuses a %s GitHub release step",
+  (mutation) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    assertReleaseStructure(workflow);
+    const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+    if (mutation === "removed") steps.splice(2, 1);
+    else if (mutation === "reordered") [steps[2], steps[3]] = [steps[3], steps[2]];
+    else if (mutation === "renamed") steps[2].name = "Renamed bake";
+    else steps[0].uses = "actions/checkout@main";
+    expect(() => assertReleaseStructure(workflow)).toThrow();
+  },
+);
 
 function assertGuardJobConditions(workflow: Workflow): void {
   const jobs = workflow.jobs ?? {};
