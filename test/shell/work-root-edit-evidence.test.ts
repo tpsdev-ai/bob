@@ -1112,6 +1112,22 @@ describe("completion gate under a declared work root", () => {
     });
   });
 
+  it("passes unused new-child slots to launch children", () => {
+    const options = { maxChildDirectories: 4 };
+    for (const name of ["a-launch", "b-launch", "c-launch", "d-launch"]) {
+      init(join(workRoot, name));
+    }
+    const snapshot = snapshotRoot(workRoot, options);
+    mkdirSync(join(workRoot, "n-empty"));
+    const repo = join(workRoot, "c-launch");
+    writeFileSync(join(repo, "tracked"), "edited\n");
+    seedSuccessor(repo);
+    expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
+      verified: true,
+      notExamined: 1,
+    });
+  });
+
   it.each([0, 1, 2])(
     "records launch-cap exclusions after removing %i earlier children",
     async (removed) => {
