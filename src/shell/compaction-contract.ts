@@ -271,8 +271,7 @@ const FINAL_MARKER_LINE_BREAK = /[\n\v\f\r\u0085\u2028\u2029]/u;
 /**
  * Validate a declared list of final-report markers (bob#365): a non-empty list
  * of non-empty strings, each without leading or trailing whitespace, commas
- * or line breaks (a comma or line break would make the re-prompt's marker list
- * ambiguous, bob#464). "Line break" is every Unicode line terminator: LF, VT,
+ * or line breaks (bob#464). "Line break" is every Unicode line terminator: LF, VT,
  * FF, CR, NEL (U+0085), LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR
  * (U+2029). Returns a copy, or undefined when the value is not such a list —
  * the caller names where it came from in its own error.
