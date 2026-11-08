@@ -44,6 +44,7 @@ import {
   writeRecord,
 } from "../capabilities/tps-mail/helpers.js";
 import { CLI_SPAWN_TIMEOUT_MS } from "../cli-spawn.js";
+import { trackedTempRoots } from "../tracked-temp-roots.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const AGENT = "testbot";
@@ -527,14 +528,14 @@ describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
       body: "x".repeat(bodyBytes),
       tools: ["bash"],
     });
+  const createRoot = trackedTempRoots();
   let home: string;
+  let scratch: string;
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "bob-mailturn-cli-"));
+    home = createRoot("bob-mailturn-cli-");
+    scratch = createRoot("bob-mail-scratch-");
   });
-  afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
-  });
-  const mailEnv = () => ({ ...process.env, HOME: home, BOB_MAIL_TURN: "1" });
+  const mailEnv = () => ({ ...process.env, HOME: home, TMPDIR: scratch, BOB_MAIL_TURN: "1" });
 
   // bob#203: bun's spawnSync hands a child its `input` as a memfd on Linux — a
   // REGULAR FILE, not a pipe. Under bun, reading a regular-file stdin through
@@ -648,7 +649,7 @@ describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
 
   it("refuses a prompt argument: a mail turn takes its input on stdin only", () => {
     const run = spawnSync(process.execPath, [cli, "launch", AGENT, "--", "hello"], {
-      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      env: mailEnv(),
       input: "",
       encoding: "utf8",
       timeout: CLI_SPAWN_TIMEOUT_MS,
@@ -660,7 +661,7 @@ describe("`bob launch` in mail-turn mode, through the REAL CLI", () => {
 
   it("refuses stdin that is not a v1 mail-turn input, before any session", () => {
     const run = spawnSync(process.execPath, [cli, "launch", AGENT], {
-      env: { ...process.env, BOB_MAIL_TURN: "1" },
+      env: mailEnv(),
       input: JSON.stringify({ v: 1, sender: "flint", messageId: "m1", body: "x", tools: ["bash"] }),
       encoding: "utf8",
       timeout: CLI_SPAWN_TIMEOUT_MS,
