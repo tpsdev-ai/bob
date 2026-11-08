@@ -81,6 +81,7 @@ import {
 } from "./bob-yaml.js";
 import { lookupCapability } from "./capability-catalog.js";
 import { conditionalToolRefusals } from "./capability-loader.js";
+import { WORK_ROOT_MAX_CHILD_DIRECTORIES, workTreeCandidates } from "./edit-evidence.js";
 import { SUBSCRIPTION_PROVIDERS, subscriptionCredentialCheck } from "./login.js";
 import { readTpsMailIdentity, type TpsMailIdentity, tpsMailStatsPath } from "./mail-consumer.js";
 import { type ProviderRegistry, providerRecord } from "./provider-registry.js";
@@ -494,11 +495,24 @@ export function runDoctor(opts: DoctorOptions): DoctorReport {
       });
     }
     if (workRoot !== undefined) {
-      checks.push({
-        name: "work root",
-        status: "ok",
-        detail: `work_root ${workRoot}`,
-      });
+      try {
+        const count = workTreeCandidates(workRoot).length;
+        const nearCap = count >= WORK_ROOT_MAX_CHILD_DIRECTORIES - 20;
+        checks.push({
+          name: "work root",
+          status: nearCap ? "warn" : "ok",
+          detail: nearCap
+            ? `work_root ${workRoot}: ${count} child directories; edit-evidence cap ${WORK_ROOT_MAX_CHILD_DIRECTORIES}`
+            : `work_root ${workRoot}`,
+          ...(nearCap ? { fix: "remove finished task trees from work_root" } : {}),
+        });
+      } catch (err) {
+        checks.push({
+          name: "work root",
+          status: "warn",
+          detail: `cannot list work_root ${workRoot}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
     }
   }
 

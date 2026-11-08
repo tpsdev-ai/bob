@@ -89,9 +89,9 @@ import { configHoldsWeb, gatedNoteInjection } from "./data-class.js";
 import {
   captureRepositoryState,
   captureWorkRootSnapshot,
+  checkWorkRootEditEvidence,
   isCommandRunnerTool,
   isVerifiedEdit,
-  isWorkRootEditVerified,
   type RepositoryState,
   type WorkRootLaunchSnapshot,
 } from "./edit-evidence.js";
@@ -1793,13 +1793,25 @@ async function runBoundedSession(
         cwd: config.cwd,
         before: repositoryAtLaunch,
         after: captureRepositoryState(config.cwd, repositoryAtLaunch),
-      }) &&
-      !(workRootAtLaunch !== undefined && isWorkRootEditVerified(workRootAtLaunch))
+      })
     ) {
-      if (!/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {
+      const workRootEvidence =
+        workRootAtLaunch === undefined ? undefined : checkWorkRootEditEvidence(workRootAtLaunch);
+      if (!workRootEvidence?.verified && !/^BLOCKED(?=$|\s|:)/.test(finalTextNow())) {
         exitCode = 1;
         noEditNoBlocked = true;
-        writeRunLog({ t: now().toISOString(), outcome: { reason: "no_edit_no_blocked" } }, false);
+        writeRunLog(
+          {
+            t: now().toISOString(),
+            outcome: {
+              reason: "no_edit_no_blocked",
+              ...(workRootEvidence && workRootEvidence.notExamined > 0
+                ? { workRootDirectoriesNotExamined: workRootEvidence.notExamined }
+                : {}),
+            },
+          },
+          false,
+        );
         process.stderr.write(noEditNoBlockedMessage(opts.name));
         reportWorktreeStatus(opts.name, config.cwd, true);
       }

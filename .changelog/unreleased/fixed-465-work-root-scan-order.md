@@ -1,0 +1,1 @@
+- **Work-root edit evidence checks new children first within the scan cap.** Failed edit gates record the number of directories excluded by the cap; `bob doctor` warns near the cap and recommends removing finished task trees.
