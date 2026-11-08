@@ -78,6 +78,7 @@ import {
   DEFAULT_MAX_NARRATION_REPROMPTS,
   DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
+  invalidFinalMarkerNote,
   isNarrationEnding,
   parseFinalMarkers,
   readWorktreeStatus,
@@ -948,7 +949,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // starts, rather than silently disabling (or narrowing) the narration check.
   if (opts.finalMarkers !== undefined && parseFinalMarkers(opts.finalMarkers) === undefined) {
     throw new Error(
-      "runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace",
+      `runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.${invalidFinalMarkerNote(opts.finalMarkers)}`,
     );
   }
 
@@ -972,7 +973,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     parseFinalMarkers(resolved.finalMarkers) === undefined
   ) {
     throw new Error(
-      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace`,
+      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.${invalidFinalMarkerNote(resolved.finalMarkers)}`,
     );
   }
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the
