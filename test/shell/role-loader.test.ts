@@ -5,6 +5,14 @@ import { join } from "node:path";
 import { loadRole, loadRoleFrom } from "../../src/shell/role-loader.js";
 import { resolveToolNames } from "../../src/shell/tool-allowlist.js";
 
+// The marker as the refusal shows it: JSON-quoted, with the line terminators
+// JSON.stringify leaves raw (NEL, U+2028, U+2029) escaped (bob#464).
+const shownMarker = (m: string) =>
+  JSON.stringify(m).replace(
+    /[\u0085\u2028\u2029]/gu,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+
 describe("role-loader", () => {
   it("loads the ea role template", () => {
     const t = loadRole("ea");
@@ -138,6 +146,9 @@ describe("role.json final_markers validation (#365)", () => {
     ["a carriage return", ["DONE\rX"]],
     ["a Unicode line separator", ["A\u2028B"]],
     ["a Unicode paragraph separator", ["A\u2029B"]],
+    ["a vertical tab", ["DONE\vX"]],
+    ["a form feed", ["DONE\fX"]],
+    ["a NEXT LINE (U+0085)", ["A\u0085B"]],
     ["an empty marker after a valid one", ["DONE", ""]],
     ["a string instead of a list", "DONE"],
     ["a number element", [1]],
@@ -155,7 +166,7 @@ describe("role.json final_markers validation (#365)", () => {
       const invalidMarker = value.find((marker) => typeof marker === "string" && marker !== "DONE");
       if (invalidMarker !== undefined) {
         expect(() => loadRoleFrom([rolesRoot], "custom")).toThrow(
-          `Invalid marker: ${JSON.stringify(invalidMarker)}.`,
+          `Invalid marker: ${shownMarker(invalidMarker)}.`,
         );
       }
     }

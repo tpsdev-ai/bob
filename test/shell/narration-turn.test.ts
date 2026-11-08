@@ -33,6 +33,7 @@ import {
   classifyAssistantEnding,
   DEFAULT_MAX_NARRATION_REPROMPTS,
   DEFAULT_MAX_REASONING_REPROMPTS,
+  invalidFinalMarkerNote,
   isNarrationEnding,
   parseFinalMarkers,
   REASONING_CONTINUE_TURN,
@@ -50,6 +51,14 @@ import {
   resolveFinalMarkers,
   runAgent,
 } from "../../src/shell/run.js";
+
+// The marker as a refusal shows it: JSON-quoted, with the line terminators
+// JSON.stringify leaves raw (NEL, U+2028, U+2029) escaped (bob#464).
+const shownMarker = (m: string) =>
+  JSON.stringify(m).replace(
+    /[\u0085\u2028\u2029]/gu,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 
 /** A scripted emission: an assistant message, or a raw session event. */
 type Emission = { message: { content: unknown; stopReason?: string } } | { event: unknown };
@@ -419,6 +428,9 @@ describe("narration turn (#365)", () => {
     ["a carriage return", ["DONE\rX"]],
     ["a Unicode line separator", ["A\u2028B"]],
     ["a Unicode paragraph separator", ["A\u2029B"]],
+    ["a vertical tab", ["DONE\vX"]],
+    ["a form feed", ["DONE\fX"]],
+    ["a NEXT LINE (U+0085)", ["A\u0085B"]],
   ] as const)(
     "a malformed finalMarkers option is refused before the session starts: %s",
     async (_label, markers) => {
@@ -440,7 +452,7 @@ describe("narration turn (#365)", () => {
       if (markers.length > 0) {
         await expect(
           runAgent({ name: "testbot", prompt: "do the thing", finalMarkers: markers, agentsRoot }),
-        ).rejects.toThrow(`Invalid marker: ${JSON.stringify(markers[0])}.`);
+        ).rejects.toThrow(`Invalid marker: ${shownMarker(markers[0])}.`);
       }
       expect(factoryCalls).toBe(0);
     },
@@ -459,6 +471,9 @@ describe("narration turn (#365)", () => {
     ["a carriage return", ["DONE\rX"], {}],
     ["a Unicode line separator", ["A\u2028B"], {}],
     ["a Unicode paragraph separator", ["A\u2029B"], {}],
+    ["a vertical tab", ["DONE\vX"], {}],
+    ["a form feed", ["DONE\fX"], {}],
+    ["a NEXT LINE (U+0085)", ["A\u0085B"], {}],
     ["an empty marker under a valid finalMarkers option", [""], { finalMarkers: MARKERS }],
     ["an empty marker on a mail turn", [""], { mailTurn: true }],
   ] as const)(
@@ -487,7 +502,7 @@ describe("narration turn (#365)", () => {
         if (Array.isArray(markers)) {
           await expect(
             runAgent({ name: "testbot", prompt: "do the thing", agentsRoot, ...extra }),
-          ).rejects.toThrow(`Invalid marker: ${JSON.stringify(markers[0])}.`);
+          ).rejects.toThrow(`Invalid marker: ${shownMarker(markers[0])}.`);
         }
         // The replacement was what the run resolved (so the refusal is runAgent's).
         expect(spy).toHaveBeenCalled();
@@ -720,8 +735,25 @@ describe("the final-report decision is structural (#365)", () => {
     ["a carriage return", "DONE\rX"],
     ["a Unicode line separator", "A\u2028B"],
     ["a Unicode paragraph separator", "A\u2029B"],
+    ["a vertical tab", "DONE\vX"],
+    ["a form feed", "DONE\fX"],
+    ["a NEXT LINE (U+0085)", "A\u0085B"],
   ])("parseFinalMarkers refuses %s", (_label, marker) => {
     expect(parseFinalMarkers([marker])).toBeUndefined();
+  });
+
+  it("the refusal note escapes line terminators so the error stays on one line", () => {
+    expect(invalidFinalMarkerNote(["A\u2028B"])).toBe(' Invalid marker: "A\\u2028B".');
+    expect(invalidFinalMarkerNote(["A\u2029B"])).toBe(' Invalid marker: "A\\u2029B".');
+    expect(invalidFinalMarkerNote(["A\u0085B"])).toBe(' Invalid marker: "A\\u0085B".');
+    expect(invalidFinalMarkerNote(["DONE\nX"])).toBe(' Invalid marker: "DONE\\nX".');
+    for (const m of ["A\u0085B", "A\u2028B", "A\u2029B", "DONE\vX", "DONE\fX", "DONE\rX"]) {
+      expect(invalidFinalMarkerNote(["DONE", m])).not.toMatch(/[\n\v\f\r\u0085\u2028\u2029]/u);
+    }
+    // No string entry is invalid on its own: the generic error, no note.
+    expect(invalidFinalMarkerNote(["DONE", 1])).toBe("");
+    expect(invalidFinalMarkerNote("DONE")).toBe("");
+    expect(invalidFinalMarkerNote(["DONE", "BLOCKED"])).toBe("");
   });
 
   it("parseFinalMarkers validates list shape and edge whitespace", () => {

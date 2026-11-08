@@ -265,12 +265,17 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
   };
 }
 
+/** Every Unicode line terminator (bob#464). */
+const FINAL_MARKER_LINE_BREAK = /[\n\v\f\r\u0085\u2028\u2029]/u;
+
 /**
  * Validate a declared list of final-report markers (bob#365): a non-empty list
  * of non-empty strings, each without leading or trailing whitespace, commas
  * or line breaks (a comma or line break would make the re-prompt's marker list
- * ambiguous, bob#464). Returns a copy, or undefined when the value is not such
- * a list — the caller names where it came from in its own error.
+ * ambiguous, bob#464). "Line break" is every Unicode line terminator: LF, VT,
+ * FF, CR, NEL (U+0085), LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR
+ * (U+2029). Returns a copy, or undefined when the value is not such a list —
+ * the caller names where it came from in its own error.
  */
 export function parseFinalMarkers(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
@@ -278,21 +283,29 @@ export function parseFinalMarkers(value: unknown): string[] | undefined {
   for (const m of value) {
     if (typeof m !== "string" || m.length === 0 || m.trim() !== m) return undefined;
     if (m.includes(",")) return undefined;
-    if (/[\n\r\u2028\u2029]/u.test(m)) return undefined;
+    if (FINAL_MARKER_LINE_BREAK.test(m)) return undefined;
     markers.push(m);
   }
   return markers;
 }
 
-/** The first string entry of `value` that `parseFinalMarkers` would refuse on
- *  its own, for a caller's error text; undefined when `value` is not an array
- *  or no single string entry is invalid (bob#464). */
-export function firstInvalidFinalMarker(value: unknown): string | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.find(
-    (marker): marker is string =>
-      typeof marker === "string" && parseFinalMarkers([marker]) === undefined,
+/** The note a caller appends to its malformed-list error: the first STRING
+ *  entry of `value` that `parseFinalMarkers` would refuse on its own, as
+ *  ` Invalid marker: "<marker>".` with every line terminator escaped so the
+ *  error stays on one line; "" when `value` is not an array or no single string
+ *  entry is invalid (a non-string entry gets the generic error) (bob#464). */
+export function invalidFinalMarkerNote(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  const marker = value.find(
+    (entry): entry is string =>
+      typeof entry === "string" && parseFinalMarkers([entry]) === undefined,
   );
+  if (marker === undefined) return "";
+  const shown = JSON.stringify(marker).replace(
+    /[\u0085\u2028\u2029]/gu,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return ` Invalid marker: ${shown}.`;
 }
 
 /** True when `text`, trimmed, STARTS WITH one of `markers` (case-sensitive,

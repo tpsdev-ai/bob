@@ -1,1 +1,1 @@
-- **Final markers refuse commas and line breaks** in role.json and run options, naming the invalid marker in the error (bob#464). Previously accepted role.json markers containing these separators now fail to load.
+- **Final markers refuse commas and line breaks** (any Unicode line terminator: LF, VT, FF, CR, NEL, U+2028, U+2029) in role.json and run options; the refusal names the first invalid string marker, with line terminators escaped so the error stays on one line (bob#464). Previously accepted role.json markers containing these separators now fail to load.
