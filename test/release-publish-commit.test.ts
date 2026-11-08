@@ -514,6 +514,42 @@ type Job = {
 };
 type Workflow = { jobs?: Record<string, Job> };
 
+// A checkout step is identified by the action it runs, not by the ref pin: the
+// workflow may write any full commit sha or version after the `@`.
+function isCheckout(step: Step): boolean {
+  const uses = step.uses ?? "";
+  const at = uses.indexOf("@");
+  return at > 0 && uses.slice(0, at).toLowerCase() === "actions/checkout";
+}
+
+const FORBIDDEN_INTERPOLATIONS: ReadonlyArray<{ expression: string; pattern: RegExp }> = [
+  { expression: "$" + "{{ github.ref_name }}", pattern: /\$\{\{\s*github\.ref_name\s*\}\}/ },
+  { expression: "$" + "{{ github.ref }}", pattern: /\$\{\{\s*github\.ref\s*\}\}/ },
+  { expression: "$" + "{{ inputs.* }}", pattern: /\$\{\{\s*inputs\.[^}]*\}\}/ },
+];
+
+function stepLabel(step: Step, index: number): string {
+  return step.name ?? step.uses ?? `step ${index + 1}`;
+}
+
+// A `run:` body is command text and a `with:` value is passed to an action;
+// neither is a place to interpolate a ref or input. `env:` is the safe form.
+function interpolationProblems(job: string, step: Step, index: number): string[] {
+  const values: Array<{ key: string; value: unknown }> = [];
+  if (step.run !== undefined) values.push({ key: "run", value: step.run });
+  for (const [key, value] of Object.entries(step.with ?? {})) values.push({ key, value });
+  const problems: string[] = [];
+  for (const { key, value } of values) {
+    if (typeof value !== "string") continue;
+    for (const { expression, pattern } of FORBIDDEN_INTERPOLATIONS) {
+      if (pattern.test(value)) {
+        problems.push(`${job} / ${stepLabel(step, index)} / ${key}: ${expression}`);
+      }
+    }
+  }
+  return problems;
+}
+
 function needsOf(job: Job | undefined): string[] {
   if (job?.needs === undefined) return [];
   return Array.isArray(job.needs) ? job.needs : [job.needs];
@@ -531,9 +567,7 @@ function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<stri
 test("every release-publish checkout leaves no credentials in .git/config", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
   const checkouts = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
-    (spec.steps ?? [])
-      .filter((step) => step.uses?.startsWith("actions/checkout@") === true)
-      .map((step) => ({ job, step })),
+    (spec.steps ?? []).filter((step) => isCheckout(step)).map((step) => ({ job, step })),
   );
   expect(checkouts.length).toBeGreaterThan(0);
   for (const { job, step } of checkouts) {
@@ -558,9 +592,7 @@ test("every job after the guard checks out the guard's output sha", () => {
   expect(guardStep?.env?.VERSION).toBe(INPUT_VERSION);
   // A manual dispatch resolves from the v<version> tag, not from the run's ref;
   // the guard is not itself pinned to a ref that came from a job output.
-  const guardCheckouts = (guard?.steps ?? []).filter(
-    (step) => step.uses?.startsWith("actions/checkout@") === true,
-  );
+  const guardCheckouts = (guard?.steps ?? []).filter((step) => isCheckout(step));
   expect(guardCheckouts.length).toBe(1);
   expect("ref" in (guardCheckouts[0].with ?? {})).toBe(false);
 
@@ -569,9 +601,7 @@ test("every job after the guard checks out the guard's output sha", () => {
   );
   expect(dependents.sort()).toEqual(["github-release", "stage-publish"]);
   for (const name of dependents) {
-    const checkouts = (jobs[name].steps ?? []).filter(
-      (step) => step.uses?.startsWith("actions/checkout@") === true,
-    );
+    const checkouts = (jobs[name].steps ?? []).filter((step) => isCheckout(step));
     expect(checkouts.length, `${name} has no checkout`).toBeGreaterThan(0);
     for (const step of checkouts) {
       expect(step.with?.ref, `${name} must check out the guard's sha`).toBe(GUARD_SHA);
@@ -579,6 +609,38 @@ test("every job after the guard checks out the guard's output sha", () => {
       expect(ref).not.toContain("github.sha");
       expect(ref).not.toContain("github.ref_name");
     }
+  }
+});
+
+test("no step interpolates a ref or input into a run body or with value", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const problems = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
+    (spec.steps ?? []).flatMap((step, index) => interpolationProblems(job, step, index)),
+  );
+  expect(problems, `interpolated expressions:\n${problems.join("\n")}`).toEqual([]);
+});
+
+test("stage-publish takes its version from the guard outputs, never from the ref", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const stage = workflow.jobs?.["stage-publish"];
+  expect(stage).toBeDefined();
+  const steps = stage?.steps ?? [];
+
+  for (const [index, step] of steps.entries()) {
+    for (const [key, value] of Object.entries(step.env ?? {})) {
+      for (const { expression, pattern } of FORBIDDEN_INTERPOLATIONS) {
+        expect(
+          pattern.test(String(value)),
+          `stage-publish ${stepLabel(step, index)} ${key} must not interpolate ${expression}`,
+        ).toBe(false);
+      }
+    }
+  }
+
+  for (const name of ["Verify the package version matches the resolved version", "Summary"]) {
+    const step = steps.find((candidate) => candidate.name === name);
+    expect(step, `${name} is missing`).toBeDefined();
+    expect(step?.env?.VERSION, `${name} must take the guard's version`).toBe(GUARD_VERSION);
   }
 });
 
