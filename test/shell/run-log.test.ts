@@ -25,7 +25,7 @@
 // is a silent run by design, and a test that wants a successful run says so the
 // way a real provider does.
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { spawn } from "node:child_process";
 import {
   existsSync,
@@ -190,6 +190,73 @@ describe("run-log sizing + retention (issue #146)", () => {
       .map((l) => JSON.parse(l));
     return { path, raw, lines };
   }
+
+  it("drops records after done and warns once per run with the dropped kind (#457)", async () => {
+    const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      for (let run = 0; run < 2; run++) {
+        const session = fakeSession([
+          {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+          },
+        ]);
+        const subscribe = session.subscribe.bind(session);
+        const retained: Parameters<RunSession["subscribe"]>[0][] = [];
+        session.subscribe = (listener) => {
+          retained.push(listener);
+          return subscribe(listener);
+        };
+        await runAgent({
+          name: "testbot",
+          prompt: "go",
+          agentsRoot,
+          sessionFactory: factoryReturning(session),
+        });
+        const runsDir = join(agentsRoot, "testbot", "runs");
+        const files = readdirSync(runsDir).filter((file) => file.endsWith(".jsonl"));
+        expect(files).toHaveLength(run + 1);
+        const paths = files.map((file) => join(runsDir, file));
+        const before = paths.map((path) => readFileSync(path, "utf8"));
+        for (const raw of before)
+          expect(JSON.parse(raw.trim().split("\n").at(-1) ?? "")).toEqual({
+            done: true,
+            exitCode: 0,
+          });
+        stderr.mockClear();
+        expect(() =>
+          retained[0]({
+            type: "tool_execution_end",
+            toolName: "read",
+            toolCallId: "late",
+            result: {},
+            isError: false,
+          }),
+        ).not.toThrow();
+        expect(() =>
+          retained[0](messageUpdate("late", "late") as Parameters<(typeof retained)[0]>[0]),
+        ).not.toThrow();
+        expect(paths.map((path) => readFileSync(path, "utf8"))).toEqual(before);
+        expect(stderr).toHaveBeenCalledTimes(1);
+        expect(String(stderr.mock.calls[0][0])).toContain("tool_execution_end");
+      }
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("keeps done last when it reaches the delta cap (#457)", async () => {
+    await runAgent({
+      name: "testbot",
+      prompt: "go",
+      agentsRoot,
+      sessionFactory: factoryReturning(fakeSession([])),
+      runLogCapBytes: 1,
+    });
+    expect(readRunLog("testbot").lines).toEqual([
+      { done: true, exitCode: 1, reason: "no_final_message" },
+    ]);
+  });
 
   it("keeps a 5,000-token streamed message's log linear, not quadratic", async () => {
     const tokens = 5000;
