@@ -852,9 +852,11 @@ export function captureWorkRootSnapshot(
  * children need a reflog commit entry at or after the launch second with changed
  * commit content (a heuristic). A child that existed at launch, under any later
  * name, retains its launch state. Unborn, non-empty non-repository and unknown
- * states never count. New children are checked first in name order; launch
- * children fill remaining maxChildDirectories slots in name order. Qualifying
- * trees may be unrelated to the task. Reflog labels and local times can be forged.
+ * states never count. New and launch children are checked in name order within
+ * their own class, new children first. New children get a share of
+ * maxChildDirectories (half, rounded up) and launch children get the other half;
+ * slots a class does not need are passed to the other class. Qualifying trees may
+ * be unrelated to the task. Reflog labels and local times can be forged.
  * Failed edit gates report cap exclusions in a best-effort outcome record when
  * the run log is available.
  */
@@ -868,6 +870,19 @@ export function isWorkRootEditVerified(
 export interface WorkRootEditEvidence {
   verified: boolean;
   notExamined: number;
+}
+
+function workRootExaminedPerClass(
+  newChildren: number,
+  launchChildren: number,
+  maxChildren: number,
+): { newChildren: number; launchChildren: number } {
+  const newShare = Math.ceil(maxChildren / 2);
+  const launchShare = maxChildren - newShare;
+  return {
+    newChildren: Math.min(newChildren, newShare + Math.max(0, launchShare - launchChildren)),
+    launchChildren: Math.min(launchChildren, launchShare + Math.max(0, newShare - newChildren)),
+  };
 }
 
 export function checkWorkRootEditEvidence(
@@ -893,9 +908,10 @@ export function checkWorkRootEditEvidence(
     if (launch) launchChildren.push({ name, launch });
     else newChildren.push({ name });
   }
+  const examined = workRootExaminedPerClass(newChildren.length, launchChildren.length, maxChildren);
   const candidates = [
-    ...newChildren.slice(0, maxChildren),
-    ...launchChildren.slice(0, Math.max(0, maxChildren - newChildren.length)),
+    ...newChildren.slice(0, examined.newChildren),
+    ...launchChildren.slice(0, examined.launchChildren),
   ];
   result.notExamined =
     launchChildren.length +

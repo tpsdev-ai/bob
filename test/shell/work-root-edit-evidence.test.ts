@@ -1047,7 +1047,7 @@ describe("completion gate under a declared work root", () => {
     expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
   });
 
-  it("bounds new children in name order before launch children", () => {
+  it("examines new children in name order up to the new-child share", () => {
     const repo = join(workRoot, "a-launch");
     init(repo);
     const options = { maxChildDirectories: 3 };
@@ -1057,13 +1057,55 @@ describe("completion gate under a declared work root", () => {
     init(fresh);
     writeFileSync(join(fresh, "tracked"), "edited\n");
     commit(fresh);
-    writeFileSync(join(repo, "tracked"), "edited\n");
-    seedSuccessor(repo);
     expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
       verified: false,
       notExamined: 2,
     });
     rmSync(join(workRoot, "b-empty"), { recursive: true });
+    rmSync(join(workRoot, "c-empty"), { recursive: true });
+    expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
+      verified: true,
+      notExamined: 0,
+    });
+  });
+
+  it("credits a launch-child edit when nonqualifying new children exceed the cap", () => {
+    const repo = join(workRoot, "a-launch");
+    init(repo);
+    const options = { maxChildDirectories: 4 };
+    const snapshot = snapshotRoot(workRoot, options);
+    for (let i = 0; i < 5; i++) mkdirSync(join(workRoot, `new-${i}`));
+    writeFileSync(join(repo, "tracked"), "edited\n");
+    seedSuccessor(repo);
+    expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
+      verified: true,
+      notExamined: 2,
+    });
+  });
+
+  it("credits a new-child edit when nonqualifying launch children exceed the cap", () => {
+    const options = { maxChildDirectories: 4 };
+    for (let i = 0; i < 5; i++) init(join(workRoot, `launch-${i}`));
+    const snapshot = snapshotRoot(workRoot, options);
+    const fresh = join(workRoot, "z-new");
+    init(fresh);
+    writeFileSync(join(fresh, "tracked"), "edited\n");
+    commit(fresh);
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
+  });
+
+  it("passes unused launch-child slots to new children", () => {
+    const repo = join(workRoot, "a-launch");
+    init(repo);
+    const options = { maxChildDirectories: 4 };
+    const snapshot = snapshotRoot(workRoot, options);
+    mkdirSync(join(workRoot, "n1-empty"));
+    mkdirSync(join(workRoot, "n2-empty"));
+    const fresh = join(workRoot, "n3-new");
+    init(fresh);
+    writeFileSync(join(fresh, "tracked"), "edited\n");
+    commit(fresh);
+    mkdirSync(join(workRoot, "n4-empty"));
     expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
       verified: true,
       notExamined: 1,
