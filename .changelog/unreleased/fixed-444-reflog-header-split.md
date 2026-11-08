@@ -1,1 +1,1 @@
-- **Amend reflog header parsing** Subjects containing U+2028, timestamps and tabs could match edit evidence.
+- **Amend reflog header parsing** Parse the raw header through the ident's closing `>` and compare the subject exactly.

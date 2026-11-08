@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -73,6 +74,43 @@ function seedSuccessor(cwd: string): string {
   );
   git(cwd, "reset", "--hard", head);
   return head;
+}
+
+type Sha256InitProbe = { supported: true } | { supported: false; reason: string };
+
+let sha256InitProbe: Sha256InitProbe | undefined;
+
+function probeSha256Init(): Sha256InitProbe {
+  if (sha256InitProbe !== undefined) return sha256InitProbe;
+  const home = mkdtempSync(join(tmpdir(), "bob-sha256-probe-"));
+  try {
+    const result = childProcess.spawnSync(
+      "git",
+      ["init", "--quiet", "--object-format=sha256", join(home, "repo")],
+      { env: { ...gitEnv, HOME: home }, encoding: "utf8", stdio: "pipe", timeout: 5_000 },
+    );
+    const detail = result.error?.message ?? result.stderr.trim() ?? "";
+    sha256InitProbe =
+      result.status === 0 && result.error === undefined
+        ? { supported: true }
+        : {
+            supported: false,
+            reason: detail.length > 0 ? detail : `git exited ${String(result.status)}`,
+          };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+  return sha256InitProbe;
+}
+
+function gitInHome(home: string, cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    env: { ...gitEnv, HOME: home },
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 5_000,
+  }).trim();
 }
 
 function snapshotRoot(root: string, options?: WorkRootCaptureOptions): WorkRootLaunchSnapshot {
@@ -1108,6 +1146,73 @@ describe("raw amend reflog record matching", () => {
   it("returns the replaced commit from one matching raw record", () => {
     expect(replacedCommitFromReflog(record(old, commit), selector, commit, action)).toBe(old);
   });
+
+  it("returns the replaced commit from a matching sha256 raw record", () => {
+    const before = "1".repeat(64);
+    const after = "2".repeat(64);
+    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\t${action}\n`;
+    expect(replacedCommitFromReflog(raw, selector, after, action)).toBe(before);
+  });
+
+  it("denies credit for a sha256 raw record with a different subject", () => {
+    const before = "1".repeat(64);
+    const after = "2".repeat(64);
+    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\treset: moving to ${after}\n`;
+    expect(replacedCommitFromReflog(raw, selector, after, action)).toBeUndefined();
+  });
+
+  it("credits a git-generated sha256 amend record from a real repository", () => {
+    const probe = probeSha256Init();
+    if (!probe.supported) {
+      // The probe cannot run here, so assert the hand-built sha256 fallback the
+      // matcher relies on and say so: this case must not render as a silent pass.
+      const before = "1".repeat(64);
+      const after = "2".repeat(64);
+      const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\t${action}\n`;
+      expect(replacedCommitFromReflog(raw, selector, after, action)).toBe(before);
+      expect(
+        replacedCommitFromReflog(
+          `${before} ${after} Test <test@example.invalid> 1700000000 +0000\treset: moving to ${after}\n`,
+          selector,
+          after,
+          action,
+        ),
+      ).toBeUndefined();
+      console.warn(
+        `git-generated sha256 amend case not run: git init --object-format=sha256 failed (${probe.reason}); the raw-line fallback assertions ran instead.`,
+      );
+      return;
+    }
+    const home = mkdtempSync(join(tmpdir(), "bob-sha256-home-"));
+    try {
+      const repo = join(home, "repo");
+      gitInHome(home, home, "init", "--quiet", "--object-format=sha256", repo);
+      writeFileSync(join(repo, "tracked"), "first\n");
+      gitInHome(home, repo, "add", ".");
+      gitInHome(home, repo, "commit", "--quiet", "-m", "fixture");
+      writeFileSync(join(repo, "tracked"), "amended\n");
+      gitInHome(home, repo, "add", ".");
+      gitInHome(home, repo, "commit", "--amend", "--quiet", "-m", "amended fixture");
+      const raw = readFileSync(join(repo, ".git", "logs", "HEAD"), "utf8");
+      const amendAction = "commit (amend): amended fixture";
+      const lines = raw.split("\n").filter((line) => line.endsWith(`\t${amendAction}`));
+      expect(lines).toHaveLength(1);
+      const line = lines[0] ?? "";
+      const header = line.match(/^([0-9a-f]+) ([0-9a-f]+) [^<>]*<[^<>]*> (-?\d+) ([+-]\d{4})\t/);
+      expect(header).not.toBeNull();
+      const before = header?.[1] ?? "";
+      const after = header?.[2] ?? "";
+      const timestamp = header?.[3] ?? "";
+      const zone = header?.[4] ?? "";
+      expect(before).toMatch(/^[0-9a-f]{64}$/);
+      expect(after).toMatch(/^[0-9a-f]{64}$/);
+      expect(replacedCommitFromReflog(raw, `HEAD@{${timestamp} ${zone}}`, after, amendAction)).toBe(
+        before,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("matches the exact subject among records sharing the header tuple", () => {
     const other = "3".repeat(40);
