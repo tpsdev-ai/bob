@@ -103,6 +103,8 @@ jobs:
       - name: provision jarvis-sidecar (reachy key-read proof)
         run: sudo useradd -r -M -s /usr/sbin/nologin jarvis-sidecar
       - run: bun run test
+        env:
+          BOB_REQUIRE_RUNBOOK_PIP: "1"
 
   # The whole-suite leak check (#221) runs in ITS OWN job: it spawns a second,
   # complete suite with a fresh TMPDIR, which would slow the unit job down. The
