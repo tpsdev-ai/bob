@@ -351,9 +351,11 @@ change one, the named test is what tells you.
   that ends with text and no tool call when that text, trimmed, does not start
   with a marker (the narration check is a case-sensitive prefix test and reads
   nothing past the marker; a separately declared final shape, `runAgent`'s
-  `expectedFinal`, may still inspect the rest of the text): the fixed
-  continuation is "You announced a step but made no tool call. Continue
-  the task; end only with your final message.", up to three re-prompts — its own
+  `expectedFinal`, may still inspect the rest of the text): the continuation,
+  built once per run from the declared markers and never from the model's own
+  text, says to make the next tool call if the task is not finished, or to send
+  the final message beginning with one of the markers (listed as declared) if
+  it is; up to three re-prompts — its own
   budget, one for the whole run — and a turn still narrating after them fails
   the run as `narration_only`, with no further turn. With markers declared,
   final text read from session state with no observed assistant ending is never

@@ -6,8 +6,9 @@
 // 282-284:") instead of reporting. When the run DECLARES final-report markers
 // (role.json `final_markers`, or the run's `finalMarkers` option), such a turn
 // is decided structurally: its trimmed text does not start with a marker, so it
-// is not a final report, and bob re-prompts the SAME session with a fixed
-// continuation instead of letting it end the run. The caller owns that
+// is not a final report, and bob re-prompts the SAME session with a
+// continuation the caller builds once per run from the declared markers (never
+// from model output) instead of letting it end the run. The caller owns that
 // classification (`narrating`), so the loop and the run's outcome use ONE rule.
 // A run that declares no markers is unchanged.
 //

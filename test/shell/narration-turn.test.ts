@@ -6,8 +6,8 @@
 // with the work unfinished. When the run declares final-report markers (the
 // role's role.json `final_markers`, or the run's `finalMarkers` option), a
 // last turn with text and no tool call whose trimmed text does not START with a
-// marker is not a final report: bob re-prompts the SAME session with a fixed
-// continuation, BOUNDED by its own constant, and past the bound fails the run as
+// marker is not a final report: bob re-prompts the SAME session with a
+// continuation built from the declared markers, BOUNDED by its own constant, and past the bound fails the run as
 // `narration_only`. A run that declares no markers is unchanged.
 //
 // The stub model runtime never touches the network: `prompt()` emits a scripted
