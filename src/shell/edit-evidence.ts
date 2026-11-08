@@ -623,7 +623,7 @@ export type WorkTreeLaunchState =
     }
   | { kind: "not a repo"; emptyAtLaunch: boolean }
   | { kind: "unborn" }
-  | { kind: "unknown" };
+  | { kind: "unknown"; excludedByCap?: true };
 
 export interface WorkRootLaunchSnapshot {
   root: string;
@@ -637,7 +637,7 @@ export interface WorkRootCaptureOptions {
   maxChildDirectories?: number;
 }
 
-function workTreeCandidates(root: string): string[] {
+export function workTreeCandidates(root: string): string[] {
   return readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
@@ -838,7 +838,9 @@ export function captureWorkRootSnapshot(
     directoryNames.set(directoryId, name);
     trees.set(
       name,
-      index >= maxChildren ? { kind: "unknown" } : captureWorkTree(join(root, name), timeoutMs),
+      index >= maxChildren
+        ? { kind: "unknown", excludedByCap: true }
+        : captureWorkTree(join(root, name), timeoutMs),
     );
   }
   return { root, launchedAtSeconds, trees, directoryNames };
@@ -850,21 +852,36 @@ export function captureWorkRootSnapshot(
  * children need a reflog commit entry at or after the launch second with changed
  * commit content (a heuristic). A child that existed at launch, under any later
  * name, retains its launch state. Unborn, non-empty non-repository and unknown
- * states never count. All surviving launch children are checked first; new
+ * states never count. New children are checked first in name order; launch
  * children fill remaining maxChildDirectories slots in name order. Qualifying
  * trees may be unrelated to the task. Reflog labels and local times can be forged.
+ * Failed edit gates report cap exclusions in a best-effort outcome record when
+ * the run log is available.
  */
 export function isWorkRootEditVerified(
   snapshot: WorkRootLaunchSnapshot,
   options: WorkRootCaptureOptions = {},
 ): boolean {
+  return checkWorkRootEditEvidence(snapshot, options).verified;
+}
+
+export interface WorkRootEditEvidence {
+  verified: boolean;
+  notExamined: number;
+}
+
+export function checkWorkRootEditEvidence(
+  snapshot: WorkRootLaunchSnapshot,
+  options: WorkRootCaptureOptions = {},
+): WorkRootEditEvidence {
   const maxChildren = options.maxChildDirectories ?? WORK_ROOT_MAX_CHILD_DIRECTORIES;
   const timeoutMs = options.gitTimeoutMs ?? WORK_ROOT_CAPTURE_TIMEOUT_MS;
+  const result: WorkRootEditEvidence = { verified: false, notExamined: 0 };
   let names: string[];
   try {
     names = workTreeCandidates(snapshot.root);
   } catch {
-    return false;
+    return result;
   }
   const launchChildren: { name: string; launch: WorkTreeLaunchState }[] = [];
   const newChildren: { name: string; launch?: undefined }[] = [];
@@ -877,9 +894,14 @@ export function isWorkRootEditVerified(
     else newChildren.push({ name });
   }
   const candidates = [
-    ...launchChildren,
-    ...newChildren.slice(0, Math.max(0, maxChildren - launchChildren.length)),
+    ...newChildren.slice(0, maxChildren),
+    ...launchChildren.slice(0, Math.max(0, maxChildren - newChildren.length)),
   ];
+  result.notExamined =
+    launchChildren.length +
+    newChildren.length -
+    candidates.length +
+    candidates.filter(({ launch }) => launch?.kind === "unknown" && launch.excludedByCap).length;
   for (const { name, launch } of candidates) {
     if (launch?.kind === "unknown" || launch?.kind === "unborn") continue;
     const path = join(snapshot.root, name);
@@ -894,11 +916,13 @@ export function isWorkRootEditVerified(
         timeoutMs,
       );
       if (ancestor.error || ancestor.status !== 0) continue;
-      if (end.tree !== launch.tree && !launch.launchTrees.has(end.tree)) return true;
+      if (end.tree !== launch.tree && !launch.launchTrees.has(end.tree))
+        return { ...result, verified: true };
       continue;
     }
     if (launch && !launch.emptyAtLaunch) continue;
-    if (hasCommitLabelWithContentChange(path, timeoutMs, snapshot.launchedAtSeconds)) return true;
+    if (hasCommitLabelWithContentChange(path, timeoutMs, snapshot.launchedAtSeconds))
+      return { ...result, verified: true };
   }
-  return false;
+  return result;
 }

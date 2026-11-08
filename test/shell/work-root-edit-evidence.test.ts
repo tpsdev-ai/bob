@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -17,8 +18,10 @@ import { readWorkRoot } from "../../src/shell/bob-yaml.js";
 import { runDoctor } from "../../src/shell/doctor.js";
 import {
   captureWorkRootSnapshot,
+  checkWorkRootEditEvidence,
   isWorkRootEditVerified,
   replacedCommitFromReflog,
+  WORK_ROOT_MAX_CHILD_DIRECTORIES,
   type WorkRootCaptureOptions,
   type WorkRootLaunchSnapshot,
 } from "../../src/shell/edit-evidence.js";
@@ -1020,32 +1023,90 @@ describe("completion gate under a declared work root", () => {
     expect(isWorkRootEditVerified(snapshot)).toBe(true);
   });
 
-  it("credits a launch-known edit despite a new earlier-sorting child at the scan bound", () => {
-    const repo = join(workRoot, "z-repo");
-    init(repo);
-    const options = { maxChildDirectories: 1 };
+  it("credits a new child commit when launch children fill the cap", () => {
+    const options = { maxChildDirectories: 3 };
+    for (const name of ["a-launch", "b-launch", "c-launch"]) init(join(workRoot, name));
     const snapshot = snapshotRoot(workRoot, options);
-    expect(snapshot.trees.get("z-repo")?.kind).toBe("known");
-    mkdirSync(join(workRoot, "a-new"));
+    const repo = join(workRoot, "z-new");
+    init(repo);
+    writeFileSync(join(repo, "tracked"), "edited\n");
+    commit(repo);
+    expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
+    expect(checkWorkRootEditEvidence(snapshot, options).notExamined).toBe(1);
+  });
+
+  it("credits a launch-child change after nonqualifying new children", () => {
+    const repo = join(workRoot, "a-launch");
+    init(repo);
+    const options = { maxChildDirectories: 3 };
+    const snapshot = snapshotRoot(workRoot, options);
+    mkdirSync(join(workRoot, "y-new"));
+    init(join(workRoot, "z-new"));
     writeFileSync(join(repo, "tracked"), "edited\n");
     seedSuccessor(repo);
     expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
   });
 
-  it("limits new children to remaining slots after surviving launch children", () => {
-    const existing = join(workRoot, "z-existing");
-    init(existing);
-    const options = { maxChildDirectories: 2 };
-    const snapshot = snapshotRoot(workRoot, options);
-    mkdirSync(join(workRoot, "a-empty"));
-    const repo = join(workRoot, "b-new");
+  it("bounds new children in name order before launch children", () => {
+    const repo = join(workRoot, "a-launch");
     init(repo);
+    const options = { maxChildDirectories: 3 };
+    const snapshot = snapshotRoot(workRoot, options);
+    for (const name of ["b-empty", "c-empty", "d-empty"]) mkdirSync(join(workRoot, name));
+    const fresh = join(workRoot, "z-new");
+    init(fresh);
+    writeFileSync(join(fresh, "tracked"), "edited\n");
+    commit(fresh);
     writeFileSync(join(repo, "tracked"), "edited\n");
-    commit(repo);
-    expect(isWorkRootEditVerified(snapshot, options)).toBe(false);
-    rmSync(join(workRoot, "a-empty"), { recursive: true });
-    expect(isWorkRootEditVerified(snapshot, options)).toBe(true);
+    seedSuccessor(repo);
+    expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
+      verified: false,
+      notExamined: 2,
+    });
+    rmSync(join(workRoot, "b-empty"), { recursive: true });
+    expect(checkWorkRootEditEvidence(snapshot, options)).toEqual({
+      verified: true,
+      notExamined: 1,
+    });
   });
+
+  it.each([0, 1, 2])(
+    "records launch-cap exclusions after removing %i earlier children",
+    async (removed) => {
+      for (let i = 0; i < WORK_ROOT_MAX_CHILD_DIRECTORIES; i++) {
+        mkdirSync(join(workRoot, `child-${i}`));
+      }
+      const repo = join(workRoot, "z-repo");
+      init(repo);
+      init(join(workRoot, "z-second"));
+      const result = await run([
+        {
+          toolName: "run",
+          action: () => {
+            for (let i = 0; i < removed; i++) {
+              rmSync(join(workRoot, `child-${i}`), { recursive: true });
+            }
+            writeFileSync(join(repo, "tracked"), "edited\n");
+            seedSuccessor(repo);
+          },
+        },
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.noEditNoBlocked).toBe(true);
+      const runsDir = join(agentsRoot, "builder", "runs");
+      const records = readdirSync(runsDir)
+        .filter((name) => name.endsWith(".jsonl"))
+        .flatMap((name) => readFileSync(join(runsDir, name), "utf8").trim().split("\n"))
+        .map((line) => JSON.parse(line));
+      expect(
+        records.find((record) => record.outcome?.reason === "no_edit_no_blocked")?.outcome,
+      ).toEqual({
+        reason: "no_edit_no_blocked",
+        workRootDirectoriesNotExamined: 2,
+      });
+    },
+    30_000,
+  );
 
   it("marks the over-bound directory unknown", () => {
     init(join(workRoot, "z-repo"));
@@ -1106,6 +1167,27 @@ describe("completion gate under a declared work root", () => {
   it("leaves workRoot absent when the YAML key is absent", () => {
     writeConfig("");
     expect(resolveRunConfig({ name: "builder", agentsRoot }).workRoot).toBeUndefined();
+  });
+
+  it.each([
+    [WORK_ROOT_MAX_CHILD_DIRECTORIES - 21, "ok"],
+    [WORK_ROOT_MAX_CHILD_DIRECTORIES - 20, "warn"],
+    [WORK_ROOT_MAX_CHILD_DIRECTORIES + 1, "warn"],
+  ])("reports work root capacity at %i child directories as %s", (count, status) => {
+    for (let i = 0; i < count; i++) mkdirSync(join(workRoot, `child-${i}`));
+    writeFileSync(join(workRoot, "file"), "not a child directory");
+    symlinkSync(cwd, join(workRoot, "symlink"), "dir");
+    const report = runDoctor({ name: "builder", agentsRoot, homeDir: agentsRoot, pathEnv: "" });
+    const check = report.checks.find((entry) => entry.name === "work root");
+    expect(check?.status).toBe(status);
+    if (status === "warn") {
+      expect(check?.detail).toContain(`${count} child directories`);
+      expect(check?.detail).toContain(`cap ${WORK_ROOT_MAX_CHILD_DIRECTORIES}`);
+      expect(check?.fix).toBe("remove finished task trees from work_root");
+    } else {
+      expect(check?.detail).toBe(`work_root ${workRoot}`);
+      expect(check?.fix).toBeUndefined();
+    }
   });
 
   it("shows the configured work root", () => {
