@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { piperInstallProblems } from "../../../scripts/check-reachy-isolation.mjs";
+import { pipCase, pythonWithPip } from "./runbook-pip-gate.js";
 
 const ROOT = realpathSync(join(import.meta.dirname, "../../.."));
 const RUNBOOK = join(ROOT, "sidecar/reachy-voice/RUNBOOK.md");
@@ -351,29 +352,8 @@ describe("bob#356 — RUNBOOK step 3's failure orders", () => {
 // outside the target (`-I` ignores PYTHON* variables, `-X` still applies).
 // pip reads no index, config file or cache. The block's own renames leave the
 // install in `$PIPER_DIR/lib`, and piperInstallProblems verifies it.
-function pythonWithPip(): string | undefined {
-  const probe = join(tmpdir(), "rv-pip-probe-prefix");
-  for (const py of ["/usr/bin/python3", "python3"]) {
-    const r = spawnSync(
-      py,
-      [
-        "-I",
-        "-B",
-        "-X",
-        `pycache_prefix=${probe}`,
-        "-c",
-        `import sys, pip; assert sys.pycache_prefix == ${JSON.stringify(probe)}`,
-      ],
-      { encoding: "utf8", timeout: 30_000 },
-    );
-    if (r.status === 0) return py;
-  }
-  return undefined;
-}
-
-const PY = pythonWithPip();
-const NO_PY =
-  " (skipped: neither /usr/bin/python3 nor python3 on PATH imports pip and honours -X pycache_prefix)";
+const PROBE = pythonWithPip();
+const PY = PROBE.python;
 const ME = process.getuid?.() ?? -1;
 
 // A wheel holding one module, its METADATA, WHEEL and a hashed RECORD.
@@ -426,8 +406,9 @@ function realPip() {
 }
 
 describe("bob#356 — RUNBOOK step 3 with real pip, verified by piperInstallProblems", () => {
-  it.skipIf(!PY)(
-    `the block's install passes the verifier${PY ? "" : NO_PY}`,
+  pipCase(
+    "the block's install passes the verifier",
+    PROBE,
     () => {
       const { requirements, env } = realPip();
       const r = run({}, {}, { env });
@@ -438,8 +419,9 @@ describe("bob#356 — RUNBOOK step 3 with real pip, verified by piperInstallProb
     120_000,
   );
 
-  it.skipIf(!PY)(
-    `without --no-compile the external bytecode is refused as a hashless RECORD line outside lib${PY ? "" : NO_PY}`,
+  pipCase(
+    "without --no-compile the external bytecode is refused as a hashless RECORD line outside lib",
+    PROBE,
     () => {
       const { requirements, env } = realPip();
       const block = BLOCK.replace(/[ \t]--no-compile\b/g, "");
@@ -458,8 +440,9 @@ describe("bob#356 — RUNBOOK step 3 with real pip, verified by piperInstallProb
     120_000,
   );
 
-  it.skipIf(!PY)(
-    `an installed source file changed after the install is refused by its RECORD hash${PY ? "" : NO_PY}`,
+  pipCase(
+    "an installed source file changed after the install is refused by its RECORD hash",
+    PROBE,
     () => {
       const { requirements, env } = realPip();
       const r = run({}, {}, { env });
