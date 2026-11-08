@@ -514,8 +514,10 @@ type Job = {
 };
 type Workflow = { jobs?: Record<string, Job> };
 
-// A checkout step is identified by the action it runs, not by the ref pin: the
-// workflow may write any full commit sha or version after the `@`.
+// A checkout step is identified by the action it runs, not by the pin after the
+// `@`: GitHub resolves the owner and repository case-insensitively, so
+// `Actions/checkout@<sha>` runs the checkout action. The pin itself must be a
+// full commit sha, which check-action-pins.mjs enforces.
 function isCheckout(step: Step): boolean {
   const uses = step.uses ?? "";
   const at = uses.indexOf("@");
@@ -528,24 +530,55 @@ const FORBIDDEN_INTERPOLATIONS: ReadonlyArray<{ expression: string; pattern: Reg
   { expression: "$" + "{{ inputs.* }}", pattern: /\$\{\{\s*inputs\.[^}]*\}\}/ },
 ];
 
+// Every `${{ }}` expression in a `run:` body or a `with:` value must be listed
+// here, compared on whitespace-normalised text. A run body takes no
+// branch- or input-derived value: those go through `env:`, which puts the value
+// in the environment rather than in the script text, and the command quotes the
+// variable.
+const ALLOWED_IN_RUN: readonly string[] = [];
+
+const ALLOWED_IN_WITH: ReadonlyArray<{ expression: string; keys: readonly string[] }> = [
+  // The guard's verified sha, as a checkout `ref`: the commit a later job
+  // builds and stages is the one the guard checked is on main.
+  { expression: "needs.verify-ancestry.outputs.sha", keys: ["ref"] },
+  // Cache-key material: the runner OS and a lockfile hash, used to name a
+  // cache entry.
+  { expression: "runner.os", keys: ["key", "restore-keys"] },
+  { expression: "hashFiles('bun.lock')", keys: ["key"] },
+];
+
+function allowedWithExpressions(key: string): string[] {
+  return ALLOWED_IN_WITH.filter((entry) => entry.keys.includes(key)).map(
+    (entry) => entry.expression,
+  );
+}
+
+const EXPRESSION = /\$\{\{([\s\S]*?)\}\}/g;
+
+function expressionsIn(text: string): string[] {
+  return [...text.matchAll(EXPRESSION)].map((match) => match[1].replace(/\s+/g, " ").trim());
+}
+
 function stepLabel(step: Step, index: number): string {
   return step.name ?? step.uses ?? `step ${index + 1}`;
 }
 
-// A `run:` body is command text and a `with:` value is passed to an action;
-// neither is a place to interpolate a ref or input. `env:` is the safe form.
+// A `run:` body is command text and a `with:` value is passed to an action.
+// `env:` keeps a value out of the script text, and the command still has to
+// quote the variable.
 function interpolationProblems(job: string, step: Step, index: number): string[] {
-  const values: Array<{ key: string; value: unknown }> = [];
-  if (step.run !== undefined) values.push({ key: "run", value: step.run });
-  for (const [key, value] of Object.entries(step.with ?? {})) values.push({ key, value });
   const problems: string[] = [];
-  for (const { key, value } of values) {
-    if (typeof value !== "string") continue;
-    for (const { expression, pattern } of FORBIDDEN_INTERPOLATIONS) {
-      if (pattern.test(value)) {
+  const check = (key: string, value: unknown, allowed: readonly string[]): void => {
+    if (typeof value !== "string") return;
+    for (const expression of expressionsIn(value)) {
+      if (!allowed.includes(expression)) {
         problems.push(`${job} / ${stepLabel(step, index)} / ${key}: ${expression}`);
       }
     }
+  };
+  if (step.run !== undefined) check("run", step.run, ALLOWED_IN_RUN);
+  for (const [key, value] of Object.entries(step.with ?? {})) {
+    check(key, value, allowedWithExpressions(key));
   }
   return problems;
 }
@@ -612,15 +645,15 @@ test("every job after the guard checks out the guard's output sha", () => {
   }
 });
 
-test("no step interpolates a ref or input into a run body or with value", () => {
+test("run bodies and with values hold no expression outside the allowlist", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
   const problems = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
     (spec.steps ?? []).flatMap((step, index) => interpolationProblems(job, step, index)),
   );
-  expect(problems, `interpolated expressions:\n${problems.join("\n")}`).toEqual([]);
+  expect(problems, `expressions outside the allowlist:\n${problems.join("\n")}`).toEqual([]);
 });
 
-test("stage-publish takes its version from the guard outputs, never from the ref", () => {
+test("stage-publish does not resolve the ref itself; the guard derives the version from GITHUB_REF on a tag push", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
   const stage = workflow.jobs?.["stage-publish"];
   expect(stage).toBeDefined();
