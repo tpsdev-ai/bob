@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { REQUIRE_ENV } from "./runbook-pip-gate.js";
 
-it("CI test steps require real pip", () => {
+it("CI `bun run test` steps set the real-pip require flag", () => {
   const workflow = parseYaml(
     readFileSync(join(import.meta.dirname, "../../../.github/workflows/ci.yml"), "utf8"),
   ) as {

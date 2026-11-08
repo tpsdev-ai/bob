@@ -46,9 +46,6 @@ export function pipCase(
       throw new Error(`real pip required (${REQUIRE_ENV}=1) but the probe failed: ${probe.reason}`);
     });
   } else {
-    it.skip(
-      `${name} (skipped: neither /usr/bin/python3 nor python3 on PATH imports pip and honours -X pycache_prefix)`,
-      fn,
-    );
+    it.skip(`${name} (skipped: Python/pip probe failed)`, fn);
   }
 }
