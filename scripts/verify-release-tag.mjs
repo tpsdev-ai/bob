@@ -8,10 +8,10 @@
  * not this workflow).
  *
  * The lookup is `git ls-remote origin refs/tags/<tag> 'refs/tags/<tag>^{}'`, so
- * a tag moved or deleted on the remote after checkout is refused. The peeled
- * `^{}` line names the commit of an annotated tag; a tag with no peeled line is
- * lightweight, and its plain ref is the commit. An ls-remote failure is a
- * refusal, never a pass.
+ * a missing remote tag or one resolving to a different object at this check
+ * is refused. The peeled `^{}` line names the target object ID of an annotated
+ * tag; without it, the plain ref's object ID is compared. An ls-remote failure
+ * is a refusal, never a pass.
  *
  * TAG is the already-validated `v<version>` tag and EXPECTED_SHA the full
  * 40-hex sha from the guard's job output; both arrive through the environment.
@@ -20,7 +20,7 @@
  * Exit codes:
  *   0 — the remote tag was read and matched EXPECTED_SHA at this check
  *   1 — refused: the remote tag is missing, unreadable, or resolves to another
- *       commit at this check
+ *       object at this check
  *   2 — the check could not run: a missing or malformed env value
  */
 
@@ -88,8 +88,7 @@ function main() {
     refuse(`tag ${tag} is missing from origin; expected ${expected}`);
   }
 
-  // Annotated tags carry a peeled `^{}` ref naming the commit; a lightweight
-  // tag has no peeled line and its plain ref is the commit.
+  // Compare the peeled target object ID, or the plain ref's object ID.
   const resolved = peeled ?? plain;
   if (resolved !== expected) {
     refuse(`tag ${tag} resolves to ${resolved} on origin; expected ${expected}`);

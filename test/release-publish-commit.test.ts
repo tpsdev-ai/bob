@@ -435,7 +435,7 @@ test("an annotated remote tag is compared by the commit its peeled ref names", (
   }
 }, 30_000);
 
-test("a remote tag moved on origin after the guard is refused at the pre-release check naming both shas (a later move is not detected)", () => {
+test("a changed remote tag is refused naming both shas while the worktree's local tag stays unchanged", () => {
   const repo = makeRepo();
   try {
     const expected = git(repo.work, "rev-parse", "HEAD");
@@ -445,7 +445,7 @@ test("a remote tag moved on origin after the guard is refused at the pre-release
     const moved = git(repo.work, "rev-parse", "HEAD");
     git(repo.work, "push", "origin", "main");
 
-    // Move the tag in the bare origin only; the clone's local tag stays put.
+    // Move the tag in the bare origin only; the worktree's local tag stays unchanged.
     git(join(repo.root, "origin.git"), "tag", "-f", "-a", "v1.2.3", "-m", "moved", moved);
     expect(git(repo.work, "rev-parse", "refs/tags/v1.2.3^{commit}")).toBe(expected);
 
@@ -460,14 +460,14 @@ test("a remote tag moved on origin after the guard is refused at the pre-release
   }
 }, 30_000);
 
-test("a remote tag deleted from origin after checkout is refused as missing at the pre-release check (a later delete is not detected)", () => {
+test("a deleted remote tag is refused as missing while the worktree's local tag stays unchanged", () => {
   const repo = makeRepo();
   try {
     const head = git(repo.work, "rev-parse", "HEAD");
     git(repo.work, "tag", "v1.2.3");
     pushTag(repo, "v1.2.3");
     git(join(repo.root, "origin.git"), "tag", "-d", "v1.2.3");
-    // The clone still has the tag it fetched at checkout.
+    // The worktree's local tag stays unchanged after the remote tag is deleted.
     expect(git(repo.work, "rev-parse", "refs/tags/v1.2.3")).toBe(head);
 
     const result = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: head });
