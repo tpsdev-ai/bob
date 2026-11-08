@@ -541,6 +541,8 @@ function assertRequiredStep(
   expect(job, `${jobName} is missing`).toBeDefined();
   expect(job, jobName).not.toHaveProperty("if");
   expect(job, jobName).not.toHaveProperty("continue-on-error");
+  expect(workflow).not.toHaveProperty("defaults.run.shell");
+  expect(job, jobName).not.toHaveProperty("defaults.run.shell");
   const steps = job?.steps ?? [];
   expect(steps.filter((step) => step.name === stepName).length, stepName).toBe(1);
   const at = steps.findIndex((step) => step.name === stepName);
@@ -551,11 +553,17 @@ function assertRequiredStep(
   const step = steps[at];
   expect(step, stepName).not.toHaveProperty("if");
   expect(step, stepName).not.toHaveProperty("continue-on-error");
+  expect(step, stepName).not.toHaveProperty("shell");
   if (stepName === TAG_CHECK) {
     const commands = steps.filter((candidate) => candidate.run === TAG_COMMAND);
     expect(commands.length, TAG_COMMAND).toBe(1);
     expect(step).toBe(commands[0]);
     expect(step.env).toEqual({ TAG: GUARD_TAG, EXPECTED_SHA: GUARD_SHA });
+    const releases = steps.filter((candidate) =>
+      /\bgh\s+release\s+(?:create|edit)\b/.test(candidate.run ?? ""),
+    );
+    expect(releases.length, "gh release create/edit").toBe(1);
+    expect(steps[before]).toBe(releases[0]);
   }
   if (stepName === VERSION_CHECK) expect(step.env).toEqual({ VERSION: GUARD_VERSION });
   return step;
@@ -563,9 +571,6 @@ function assertRequiredStep(
 
 function assertVersionCheck(workflow: Workflow): void {
   const step = assertRequiredStep(workflow, "stage-publish", VERSION_CHECK, "Stage-publish");
-  expect(workflow).not.toHaveProperty("defaults.run.shell");
-  expect(workflow.jobs?.["stage-publish"]).not.toHaveProperty("defaults.run.shell");
-  expect(step).not.toHaveProperty("shell");
   const root = mkdtempSync(join(tmpdir(), "bob-release-version-"));
   try {
     for (const [version, status] of [
@@ -622,6 +627,18 @@ test.each(REQUIRED_STEPS)("%s requires %s before %s", (job, step, before) => {
 });
 
 for (const [job, step, before] of REQUIRED_STEPS) {
+  test.each(["workflow", "job", "step"])(`${step} refuses a %s shell override`, (scope) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const required = assertRequiredStep(workflow, job, step, before);
+    if (scope === "step") Object.assign(required, { shell: "echo {0}" });
+    else {
+      Object.assign(scope === "workflow" ? workflow : workflow.jobs?.[job], {
+        defaults: { run: { shell: "echo {0}" } },
+      });
+    }
+    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+  });
+
   test.each([
     ["if", false],
     ["if", "github.event_name == 'push'"],
@@ -659,6 +676,17 @@ for (const [job, step, before] of REQUIRED_STEPS) {
     expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
   });
 }
+
+test.each(["create", "edit"])("tag comparison refuses an earlier gh release %s step", (command) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+  const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+  steps.splice(steps.indexOf(required), 0, {
+    name: "Early release",
+    run: `gh release ${command} "$TAG"`,
+  });
+  expect(() => assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE)).toThrow();
+});
 
 test.each([
   "renamed conditional verifier",
@@ -803,6 +831,32 @@ function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<stri
   }
   return false;
 }
+
+function assertGuardJobConditions(workflow: Workflow): void {
+  const jobs = workflow.jobs ?? {};
+  for (const [name, job] of Object.entries(jobs)) {
+    if (name === GUARD_JOB || afterGuard(jobs, name)) {
+      expect(job, name).not.toHaveProperty("if");
+    }
+  }
+}
+
+test("the guard and its dependent jobs carry no condition", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertGuardJobConditions(workflow);
+});
+
+test.each([GUARD_JOB, "stage-publish", "github-release", "indirect-release"])(
+  "%s refuses a job condition in the guard graph",
+  (name) => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const jobs = workflow.jobs ?? {};
+    jobs["indirect-release"] = { needs: "github-release" };
+    assertGuardJobConditions(workflow);
+    Object.assign(jobs[name], { if: false });
+    expect(() => assertGuardJobConditions(workflow)).toThrow();
+  },
+);
 
 test("every release-publish checkout leaves no credentials in .git/config", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
