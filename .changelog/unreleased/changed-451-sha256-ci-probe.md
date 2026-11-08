@@ -1,0 +1,1 @@
+- **The real-repository sha256 test fails on unsupported initialization in CI** with the probe reason; the different-subject case checks header matching before denial.
