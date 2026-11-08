@@ -12,8 +12,12 @@ import { parse as parseYaml } from "yaml";
 const REPO = join(import.meta.dir, "..");
 const WORKFLOW = join(REPO, ".github", "workflows", "release-publish.yml");
 const SCRIPT = join(REPO, "scripts", "resolve-release-commit.mjs");
+const VERIFY_TAG = join(REPO, "scripts", "verify-release-tag.mjs");
+const EXTRACT = join(REPO, "scripts", "changelog-extract.mjs");
 const GUARD_JOB = "verify-ancestry";
 const GUARD_SHA = "$" + "{{ needs.verify-ancestry.outputs.sha }}";
+const GUARD_VERSION = "$" + "{{ needs.verify-ancestry.outputs.version }}";
+const GUARD_TAG = "$" + "{{ needs.verify-ancestry.outputs.tag }}";
 const INPUT_VERSION = "$" + "{{ inputs.version }}";
 
 // GITHUB_* variables are dropped so the test never writes into a real step's
@@ -25,6 +29,7 @@ for (const key of [
   "GITHUB_SHA",
   "GITHUB_REF",
   "GITHUB_REF_NAME",
+  "GITHUB_ACTIONS",
   "VERSION",
 ]) {
   delete BASE_ENV[key];
@@ -71,6 +76,22 @@ function guard(
   });
 }
 
+function verifyTag(
+  repo: Repo,
+  env: Record<string, string>,
+): { status: number | null; stdout: string; stderr: string } {
+  return spawnSync(process.execPath, ["--no-install", VERIFY_TAG], {
+    cwd: repo.work,
+    env: { ...BASE_ENV, ...env },
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+}
+
+function pushTag(repo: Repo, tag: string): void {
+  git(repo.work, "push", "origin", `refs/tags/${tag}`);
+}
+
 const dispatch = (version: string) => ({
   GITHUB_EVENT_NAME: "workflow_dispatch",
   VERSION: version,
@@ -86,7 +107,7 @@ test("a tag present on main is accepted and prints its commit", () => {
     const result = guard(repo, { ...dispatch("1.2.3"), GITHUB_OUTPUT: output });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain(`sha=${head}`);
-    expect(readFileSync(output, "utf8")).toBe(`sha=${head}\n`);
+    expect(readFileSync(output, "utf8")).toBe(`sha=${head}\nversion=1.2.3\ntag=v1.2.3\n`);
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }
@@ -337,6 +358,146 @@ test("a failed output write is a guard failure with its own exit code", () => {
   }
 }, 30_000);
 
+test.each([
+  ["unset", undefined],
+  ["empty", ""],
+])(
+  "under Actions an %s GITHUB_OUTPUT is a guard failure naming it",
+  (_name, output) => {
+    const repo = makeRepo();
+    try {
+      git(repo.work, "tag", "v1.2.3");
+      const env: Record<string, string> = {
+        ...(dispatch("1.2.3") as Record<string, string>),
+        GITHUB_ACTIONS: "true",
+      };
+      if (output !== undefined) env.GITHUB_OUTPUT = output;
+      const result = guard(repo, env);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("GITHUB_OUTPUT");
+      expect(result.stdout).not.toContain("sha=");
+    } finally {
+      rmSync(repo.root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test("outside Actions an unset GITHUB_OUTPUT keeps the stdout sha line", () => {
+  const repo = makeRepo();
+  try {
+    const head = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "v1.2.3");
+    const result = guard(repo, dispatch("1.2.3"));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`sha=${head}`);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("the remote tag check accepts a lightweight remote tag at the verified commit", () => {
+  const repo = makeRepo();
+  try {
+    const head = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "v1.2.3");
+    pushTag(repo, "v1.2.3");
+    const result = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: head });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("v1.2.3");
+    expect(result.stdout).toContain(head);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("an annotated remote tag is compared by the commit its peeled ref names", () => {
+  const repo = makeRepo();
+  try {
+    const head = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "-a", "v1.2.3", "-m", "release");
+    const tagObject = git(repo.work, "rev-parse", "refs/tags/v1.2.3");
+    expect(tagObject).not.toBe(head);
+    pushTag(repo, "v1.2.3");
+
+    const accepted = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: head });
+    expect(accepted.status, accepted.stderr).toBe(0);
+    expect(accepted.stdout).toContain(head);
+
+    // The tag object sha is not the compared value; the peeled commit is.
+    const refused = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: tagObject });
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toContain(tagObject);
+    expect(refused.stderr).toContain(head);
+    expect(refused.stdout).not.toContain("ok");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a changed remote tag is refused naming both shas while the worktree's local tag stays unchanged", () => {
+  const repo = makeRepo();
+  try {
+    const expected = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "-a", "v1.2.3", "-m", "release");
+    pushTag(repo, "v1.2.3");
+    git(repo.work, "commit", "--allow-empty", "-m", "moved on");
+    const moved = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "push", "origin", "main");
+
+    // Move the tag in the bare origin only; the worktree's local tag stays unchanged.
+    git(join(repo.root, "origin.git"), "tag", "-f", "-a", "v1.2.3", "-m", "moved", moved);
+    expect(git(repo.work, "rev-parse", "refs/tags/v1.2.3^{commit}")).toBe(expected);
+
+    const result = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: expected });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("v1.2.3");
+    expect(result.stderr).toContain(expected);
+    expect(result.stderr).toContain(moved);
+    expect(result.stdout).not.toContain("ok");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a deleted remote tag is refused as missing while the worktree's local tag stays unchanged", () => {
+  const repo = makeRepo();
+  try {
+    const head = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "v1.2.3");
+    pushTag(repo, "v1.2.3");
+    git(join(repo.root, "origin.git"), "tag", "-d", "v1.2.3");
+    // The worktree's local tag stays unchanged after the remote tag is deleted.
+    expect(git(repo.work, "rev-parse", "refs/tags/v1.2.3")).toBe(head);
+
+    const result = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: head });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("v1.2.3");
+    expect(result.stderr).toContain("missing");
+    expect(result.stdout).not.toContain("ok");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("an unreadable origin is refused as unreadable at the pre-release check, never a pass", () => {
+  const repo = makeRepo();
+  try {
+    const head = git(repo.work, "rev-parse", "HEAD");
+    git(repo.work, "tag", "v1.2.3");
+    pushTag(repo, "v1.2.3");
+    git(repo.work, "remote", "set-url", "origin", join(repo.root, "missing.git"));
+
+    const result = verifyTag(repo, { TAG: "v1.2.3", EXPECTED_SHA: head });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("v1.2.3");
+    expect(result.stderr).toContain("unreadable");
+    expect(result.stdout).not.toContain("ok");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 type Step = {
   uses?: string;
   run?: string;
@@ -345,7 +506,12 @@ type Step = {
   env?: Record<string, unknown>;
   with?: Record<string, unknown>;
 };
-type Job = { needs?: string | string[]; steps?: Step[]; outputs?: Record<string, unknown> };
+type Job = {
+  needs?: string | string[];
+  if?: string;
+  steps?: Step[];
+  outputs?: Record<string, unknown>;
+};
 type Workflow = { jobs?: Record<string, Job> };
 
 function needsOf(job: Job | undefined): string[] {
@@ -385,9 +551,18 @@ test("every job after the guard checks out the guard's output sha", () => {
   );
   expect(guardStep?.id).toBeDefined();
   expect(guard?.outputs?.sha).toBe(`\${{ steps.${guardStep?.id}.outputs.sha }}`);
+  expect(guard?.outputs?.version).toBe(`\${{ steps.${guardStep?.id}.outputs.version }}`);
+  expect(guard?.outputs?.tag).toBe(`\${{ steps.${guardStep?.id}.outputs.tag }}`);
   // The manual path reads the version input; the tag-push path reads the
   // runner's own GITHUB_REF, so VERSION is the only env the step maps.
   expect(guardStep?.env?.VERSION).toBe(INPUT_VERSION);
+  // A manual dispatch resolves from the v<version> tag, not from the run's ref;
+  // the guard is not itself pinned to a ref that came from a job output.
+  const guardCheckouts = (guard?.steps ?? []).filter(
+    (step) => step.uses?.startsWith("actions/checkout@") === true,
+  );
+  expect(guardCheckouts.length).toBe(1);
+  expect("ref" in (guardCheckouts[0].with ?? {})).toBe(false);
 
   const dependents = Object.keys(jobs).filter(
     (name) => name !== GUARD_JOB && afterGuard(jobs, name),
@@ -406,3 +581,102 @@ test("every job after the guard checks out the guard's output sha", () => {
     }
   }
 });
+
+test("the GitHub release job takes its version and tag from the guard outputs", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const jobs = workflow.jobs ?? {};
+  const release = jobs["github-release"];
+  expect(release).toBeDefined();
+  // A tag push must not be the only release path.
+  expect(release?.if).toBeUndefined();
+
+  const steps = release?.steps ?? [];
+  for (const step of steps) {
+    for (const [key, value] of Object.entries(step.env ?? {})) {
+      expect(
+        String(value),
+        `${step.name ?? step.uses} ${key} must not read the dispatched ref`,
+      ).not.toContain("github.ref_name");
+    }
+  }
+
+  const create = steps.find((step) => step.name === "Create or update GitHub release");
+  expect(create).toBeDefined();
+  expect(create?.env?.TAG).toBe(GUARD_TAG);
+  expect(create?.env?.VERSION).toBe(GUARD_VERSION);
+
+  const verify = steps.findIndex(
+    (step) => step.run === "bun --no-install scripts/verify-release-tag.mjs",
+  );
+  const createAt = steps.indexOf(create as Step);
+  expect(verify, "the release job must call the tag check").toBeGreaterThanOrEqual(0);
+  expect(verify, "the tag check must precede the release command").toBeLessThan(createAt);
+  expect(steps[verify].env?.TAG).toBe(GUARD_TAG);
+  expect(steps[verify].env?.EXPECTED_SHA).toBe(GUARD_SHA);
+});
+
+function versionOutputKey(workflow: Workflow, job: string, stepName: string): string {
+  const step = (workflow.jobs?.[job]?.steps ?? []).find((candidate) => candidate.name === stepName);
+  const expression = String(step?.env?.VERSION ?? "");
+  const match = /needs\.verify-ancestry\.outputs\.([A-Za-z0-9_]+)/.exec(expression);
+  expect(match, `${stepName} VERSION is ${JSON.stringify(expression)}`).not.toBeNull();
+  return match?.[1] ?? "";
+}
+
+test("the guard's written version feeds the real changelog extractor", () => {
+  const repo = makeRepo();
+  try {
+    git(repo.work, "tag", "v1.2.3");
+    const output = join(repo.root, "github-output");
+    writeFileSync(output, "");
+    const guarded = guard(repo, {
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      VERSION: "1.2.3",
+      GITHUB_ACTIONS: "true",
+      GITHUB_OUTPUT: output,
+    });
+    expect(guarded.status, guarded.stderr).toBe(0);
+
+    // Read the version the resolver wrote under the key the release job's
+    // extractor step names, so a wrong key in either place fails this test.
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const key = versionOutputKey(workflow, "github-release", "Extract CHANGELOG section");
+    const written = Object.fromEntries(
+      readFileSync(output, "utf8")
+        .split("\n")
+        .filter((line) => line.includes("="))
+        .map((line) => {
+          const at = line.indexOf("=");
+          return [line.slice(0, at), line.slice(at + 1)];
+        }),
+    );
+    const version = written[key] ?? "";
+    expect(version).toBe("1.2.3");
+
+    const changelog = join(repo.root, "CHANGELOG.md");
+    writeFileSync(
+      changelog,
+      "## [1.2.3] - 2026-01-01\n\n### Fixed\n\n- Something.\n\n## [1.2.2] - 2025-12-01\n\n- Older.\n",
+    );
+    const matched = spawnSync(process.execPath, ["--no-install", EXTRACT, version, changelog], {
+      env: BASE_ENV,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    expect(matched.status, matched.stderr).toBe(0);
+    expect(matched.stdout).toContain("### Fixed");
+    expect(matched.stdout).toContain("- Something.");
+    expect(matched.stdout).not.toContain("- Older.");
+
+    writeFileSync(changelog, "## [1.2.2] - 2025-12-01\n\n- Older.\n");
+    const missing = spawnSync(process.execPath, ["--no-install", EXTRACT, version, changelog], {
+      env: BASE_ENV,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain("changelog-extract: no '## [1.2.3]' section found");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+}, 30_000);

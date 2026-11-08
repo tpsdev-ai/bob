@@ -1,0 +1,1 @@
+- **A manual dispatch now files its GitHub release too, and the release job reads the tag from origin.** The tag is compared with the verified commit just before the release is created or edited; a tag moved after that comparison is not detected, and tag immutability is a separate policy.
