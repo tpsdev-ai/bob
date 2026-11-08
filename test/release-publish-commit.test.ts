@@ -527,6 +527,7 @@ type Workflow = { jobs?: Record<string, Job> };
 
 const VERSION_CHECK = "Verify the package version matches the resolved version";
 const TAG_CHECK = "Compare the remote tag with the verified commit just before the release";
+const TAG_COMMAND = "bun --no-install scripts/verify-release-tag.mjs";
 const EXTRACT_STEP = "Extract CHANGELOG section";
 const CREATE_RELEASE = "Create or update GitHub release";
 
@@ -538,8 +539,10 @@ function assertRequiredStep(
 ): Step {
   const job = workflow.jobs?.[jobName];
   expect(job, `${jobName} is missing`).toBeDefined();
+  expect(job, jobName).not.toHaveProperty("if");
   expect(job, jobName).not.toHaveProperty("continue-on-error");
   const steps = job?.steps ?? [];
+  expect(steps.filter((step) => step.name === stepName).length, stepName).toBe(1);
   const at = steps.findIndex((step) => step.name === stepName);
   const before = steps.findIndex((step) => step.name === beforeName);
   expect(at, `${stepName} is missing`).toBeGreaterThanOrEqual(0);
@@ -548,7 +551,42 @@ function assertRequiredStep(
   const step = steps[at];
   expect(step, stepName).not.toHaveProperty("if");
   expect(step, stepName).not.toHaveProperty("continue-on-error");
+  if (stepName === TAG_CHECK) {
+    const commands = steps.filter((candidate) => candidate.run === TAG_COMMAND);
+    expect(commands.length, TAG_COMMAND).toBe(1);
+    expect(step).toBe(commands[0]);
+    expect(step.env).toEqual({ TAG: GUARD_TAG, EXPECTED_SHA: GUARD_SHA });
+  }
+  if (stepName === VERSION_CHECK) expect(step.env).toEqual({ VERSION: GUARD_VERSION });
   return step;
+}
+
+function assertVersionCheck(workflow: Workflow): void {
+  const step = assertRequiredStep(workflow, "stage-publish", VERSION_CHECK, "Stage-publish");
+  expect(workflow).not.toHaveProperty("defaults.run.shell");
+  expect(workflow.jobs?.["stage-publish"]).not.toHaveProperty("defaults.run.shell");
+  expect(step).not.toHaveProperty("shell");
+  const root = mkdtempSync(join(tmpdir(), "bob-release-version-"));
+  try {
+    for (const [version, status] of [
+      ["1.2.3", 0],
+      ["1.2.4", 1],
+    ] as const) {
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({ name: "version-fixture", version }),
+      );
+      const result = spawnSync("bash", ["-e", "-c", step.run ?? ""], {
+        cwd: root,
+        env: { ...BASE_ENV, VERSION: "1.2.3" },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      expect(result.status, `package ${version}: ${result.stdout}${result.stderr}`).toBe(status);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function assertChangelogExtraction(workflow: Workflow): string {
@@ -604,6 +642,14 @@ for (const [job, step, before] of REQUIRED_STEPS) {
     expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
   });
 
+  test(`${job} refuses a job condition for ${step}`, () => {
+    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+    const spec = workflow.jobs?.[job];
+    if (spec === undefined) throw new Error(`Missing ${job}`);
+    Object.assign(spec, { if: false });
+    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+  });
+
   test(`${step} refuses placement after ${before}`, () => {
     const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
     const required = assertRequiredStep(workflow, job, step, before);
@@ -613,6 +659,49 @@ for (const [job, step, before] of REQUIRED_STEPS) {
     expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
   });
 }
+
+test.each([
+  "renamed conditional verifier",
+  "renamed failure-tolerant verifier",
+  "failure-tolerant verifier",
+  "duplicate name",
+  "duplicate command",
+  "wrong env",
+])("tag comparison refuses %s", (mutation) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+  const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+  if (
+    mutation === "renamed conditional verifier" ||
+    mutation === "renamed failure-tolerant verifier"
+  ) {
+    required.name = "Renamed verifier";
+    if (mutation === "renamed conditional verifier") required.if = false;
+    else required["continue-on-error"] = true;
+    steps.splice(steps.indexOf(required), 0, { name: TAG_CHECK, run: "echo verified" });
+  } else if (mutation === "failure-tolerant verifier") {
+    required["continue-on-error"] = true;
+  } else if (mutation === "duplicate name") {
+    steps.push({ name: TAG_CHECK, run: "echo verified" });
+  } else if (mutation === "duplicate command") {
+    steps.push({ name: "Duplicate verifier", run: TAG_COMMAND, env: required.env });
+  } else {
+    required.env = { TAG: GUARD_TAG, EXPECTED_SHA: INPUT_VERSION };
+  }
+  expect(() => assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE)).toThrow();
+});
+
+test("workflow version script accepts a matching package and refuses a mismatch", () => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertVersionCheck(workflow);
+});
+
+test.each(["exit 0", "echo verified"])("version check refuses a script bypass: %s", (mutation) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  const step = assertRequiredStep(workflow, "stage-publish", VERSION_CHECK, "Stage-publish");
+  step.run = mutation === "exit 0" ? `exit 0\n${step.run}` : "echo verified";
+  expect(() => assertVersionCheck(workflow)).toThrow();
+});
 
 test("changelog extraction writes the release notes file", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
@@ -818,9 +907,8 @@ test("the GitHub release job takes its version and tag from the guard outputs", 
   expect(create?.env?.TAG).toBe(GUARD_TAG);
   expect(create?.env?.VERSION).toBe(GUARD_VERSION);
 
-  const verify = steps.findIndex(
-    (step) => step.run === "bun --no-install scripts/verify-release-tag.mjs",
-  );
+  const verifier = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+  const verify = steps.indexOf(verifier);
   const createAt = steps.indexOf(create as Step);
   expect(verify, "the release job must call the tag check").toBeGreaterThanOrEqual(0);
   expect(verify, "the tag check must precede the release command").toBeLessThan(createAt);
