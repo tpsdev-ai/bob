@@ -18,6 +18,7 @@
 // The admission tests drive `startPersistent` (and the real cron scheduler).
 // The bound tests unit-test the retry ceiling.
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -128,7 +129,7 @@ function lastUser(content: Context["messages"]): string {
  * reports zero output tokens — the shape the issue names.
  */
 function scriptedProvider(
-  reply: (agentCall: number, request: SeenRequest) => Reply,
+  reply: (agentCall: number, request: SeenRequest) => Reply | Promise<Reply>,
   seen: SeenRequest[],
 ) {
   let agentCalls = 0;
@@ -152,7 +153,7 @@ function scriptedProvider(
         if (agentCall > MAX_PROVIDER_CALLS) throw new Error("stub: provider call guard exceeded");
         const step: Reply = summarization
           ? { kind: "text", text: "Summary of the earlier work.", inputTokens: 1_000 }
-          : reply(agentCall, request);
+          : await reply(agentCall, request);
         const input = step.inputTokens;
         const content: AssistantMessage["content"] = [];
         let stopReason: AssistantMessage["stopReason"] = "stop";
@@ -286,7 +287,7 @@ afterEach(async () => {
 /** bob's ONE session factory over pi's runtime, with the scripted provider in
  *  place of the agent's own. */
 async function liveFactory(
-  reply: (agentCall: number, request: SeenRequest) => Reply,
+  reply: (agentCall: number, request: SeenRequest) => Reply | Promise<Reply>,
   seen: SeenRequest[],
   maxRetries?: number,
   log?: (message: string) => void,
@@ -905,6 +906,109 @@ describe("a throwing dropped-attempt observer (#396)", () => {
       }, 10_000);
     }
   }
+});
+
+describe("dropped-attempt teardown (#429)", () => {
+  it("detaches the callback before the done append", async () => {
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory(
+      (call) =>
+        call === 1
+          ? { kind: "empty", inputTokens: 1_000 }
+          : { kind: "text", text: "DONE: recovered", inputTokens: 1_000 },
+      seen,
+    );
+    let deliver: (() => void) | undefined;
+    let delivered = false;
+    const append = fs.appendFileSync;
+    const writer = spyOn(fs, "appendFileSync").mockImplementation((...args) => {
+      append(...args);
+      if (String(args[1]).startsWith('{"done":true')) {
+        expect(deliver).toBeDefined();
+        expect(existsSync(`${args[0]}.lock`)).toBe(true);
+        delivered = true;
+        deliver?.();
+      }
+    });
+    try {
+      const result = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "hi",
+        sessionFactory: (config) =>
+          live.factory({
+            ...config,
+            onDroppedAttempt: (message) => {
+              // Hold the real retry notification until the terminal append.
+              deliver = () => config.onDroppedAttempt?.(message);
+            },
+          }),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(delivered).toBe(true);
+      expect(runLogRecords().at(-1)).toEqual({ done: true, exitCode: 0 });
+      expect(runLogRecords().filter((r) => r.requestUsage)).toHaveLength(1);
+    } finally {
+      writer.mockRestore();
+    }
+  }, 10_000);
+
+  it("leaves the log unchanged when a real request ends after lock removal", async () => {
+    const started = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<Reply>();
+    const seen: SeenRequest[] = [];
+    const live = await liveFactory((call) => {
+      if (call === 1) {
+        started.resolve();
+        return reply.promise;
+      }
+      return { kind: "text", text: "DONE: late recovery", inputTokens: 1_000 };
+    }, seen);
+    let pending: Promise<void> | undefined;
+    let reports = 0;
+    try {
+      const result = await runAgent({
+        name: "testbot",
+        agentsRoot: root,
+        prompt: "hi",
+        sessionFactory: async (config) => {
+          const session = await live.factory({
+            ...config,
+            onDroppedAttempt: (message) => {
+              reports += 1;
+              config.onDroppedAttempt?.(message);
+            },
+          });
+          const prompt = session.prompt.bind(session);
+          session.prompt = async (text, options) => {
+            pending = prompt(text, options);
+            await started.promise;
+            throw new Error("end run while the provider is pending");
+          };
+          return session;
+        },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(reports).toBe(0);
+      const runsDir = join(root, "testbot", "runs");
+      const files = readdirSync(runsDir);
+      expect(files.filter((file) => file.endsWith(".lock"))).toEqual([]);
+      const logName = files.find((file) => file.endsWith(".jsonl"));
+      if (logName === undefined) throw new Error("missing run log");
+      const log = join(runsDir, logName);
+      const before = readFileSync(log, "utf8");
+      expect(runLogRecords().at(-1)).toEqual({ done: true, exitCode: 1 });
+      reply.resolve({ kind: "empty", inputTokens: 1_000 });
+      await pending;
+      expect(reports).toBe(1);
+      expect(live.logs.some((line) => line.includes("onDroppedAttempt failed"))).toBe(false);
+      expect(readFileSync(log, "utf8")).toBe(before);
+      expect(runLogRecords().at(-1)).toEqual({ done: true, exitCode: 1 });
+    } finally {
+      reply.resolve({ kind: "text", text: "DONE: cleanup", inputTokens: 1_000 });
+      await pending;
+    }
+  }, 10_000);
 });
 
 describe("the empty-response bound (#381)", () => {

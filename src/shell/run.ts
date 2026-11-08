@@ -1828,6 +1828,7 @@ async function runBoundedSession(
   } finally {
     // Stop recording first: the done line below is this log's last record, and the
     // run is over whatever the turn did.
+    reportDroppedAttempt = undefined;
     unsubscribeRunLog();
     unsubscribeUsage();
     unsubscribeContract();
