@@ -1,24 +1,32 @@
 #!/usr/bin/env bun
 /**
- * verify-release-tag.mjs — before the GitHub release job creates or edits a
- * release, confirm the tag still resolves to the commit the release guard
- * verified, and refuse when it resolves to another commit, naming the tag, the
- * expected sha and the resolved sha. An annotated tag is peeled to its commit.
+ * verify-release-tag.mjs — read the release tag from the REMOTE and compare it
+ * with the commit the release guard resolved, immediately before the GitHub
+ * release job creates or edits the release. The tag is compared with the
+ * verified commit just before the release is created or edited; a tag moved
+ * after that comparison is not detected (tag immutability is a separate policy,
+ * not this workflow).
+ *
+ * The lookup is `git ls-remote origin refs/tags/<tag> 'refs/tags/<tag>^{}'`, so
+ * a tag moved or deleted on the remote after checkout is refused. The peeled
+ * `^{}` line names the commit of an annotated tag; a tag with no peeled line is
+ * lightweight, and its plain ref is the commit. An ls-remote failure is a
+ * refusal, never a pass.
  *
  * TAG is the already-validated `v<version>` tag and EXPECTED_SHA the full
  * 40-hex sha from the guard's job output; both arrive through the environment.
+ * TAG is checked with the workflow's version pattern before any git command.
  *
  * Exit codes:
- *   0 — the tag resolves to EXPECTED_SHA
- *   1 — refused: the tag does not resolve to a commit, or resolves to another
- *       commit
- *   2 — the check could not run: a missing or malformed env value, or git
- *       could not run or exited with an error
+ *   0 — the remote tag was read and matched EXPECTED_SHA at this check
+ *   1 — refused: the remote tag is missing, unreadable, or resolves to another
+ *       commit at this check
+ *   2 — the check could not run: a missing or malformed env value
  */
 
 import { spawnSync } from "node:child_process";
 
-// The guard emits a validated version, so the tag is a v<semver> string.
+// The workflow's version pattern for a v<version> tag.
 const TAG_RE = /^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -42,6 +50,19 @@ function fail(message) {
   process.exit(2);
 }
 
+// Split ls-remote output into the tag's own ref and its peeled `^{}` ref.
+function parseRemote(output, tag) {
+  let plain = null;
+  let peeled = null;
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    const [sha, ref] = line.split(/\s+/);
+    if (ref === `refs/tags/${tag}`) plain = sha;
+    else if (ref === `refs/tags/${tag}^{}`) peeled = sha;
+  }
+  return { plain, peeled };
+}
+
 function main() {
   const tag = process.env.TAG ?? "";
   const expected = process.env.EXPECTED_SHA ?? "";
@@ -53,21 +74,27 @@ function main() {
   }
 
   const ref = `refs/tags/${tag}`;
-  const peelArgs = ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`];
-  const peeled = git(peelArgs);
-  if (peeled.status === 1) {
-    refuse(`tag ${tag} does not resolve to a commit; expected ${expected}`);
-  }
-  if (peeled.status !== 0) {
-    const detail = peeled.stderr || peeled.error?.message || "no output";
-    fail(`git ${peelArgs.join(" ")} failed: ${detail}`);
+  const lsArgs = ["ls-remote", "origin", ref, `${ref}^{}`];
+  const listed = git(lsArgs);
+  if (listed.status !== 0) {
+    const detail = listed.stderr || listed.error?.message || "no output";
+    refuse(
+      `tag ${tag} is unreadable from origin; expected ${expected}; git ${lsArgs.join(" ")} failed: ${detail}`,
+    );
   }
 
-  const resolved = peeled.stdout;
-  if (resolved !== expected) {
-    refuse(`tag ${tag} now resolves to ${resolved}; expected ${expected}`);
+  const { plain, peeled } = parseRemote(listed.stdout, tag);
+  if (plain === null) {
+    refuse(`tag ${tag} is missing from origin; expected ${expected}`);
   }
-  console.log(`  ok tag ${tag} still resolves to ${expected}`);
+
+  // Annotated tags carry a peeled `^{}` ref naming the commit; a lightweight
+  // tag has no peeled line and its plain ref is the commit.
+  const resolved = peeled ?? plain;
+  if (resolved !== expected) {
+    refuse(`tag ${tag} resolves to ${resolved} on origin; expected ${expected}`);
+  }
+  console.log(`  ok tag ${tag} resolved to ${expected} on origin at this check`);
 }
 
 main();

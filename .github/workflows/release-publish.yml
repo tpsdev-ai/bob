@@ -265,10 +265,11 @@ jobs:
           node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > release-notes.md
           echo "Extracted $(wc -l < release-notes.md) lines for v$VERSION"
 
-      - name: Verify the tag still resolves to the verified commit
-        # A tag can move after the guard resolved it. Refuse before touching the
-        # release when it no longer points at the verified commit; the tag and
-        # both shas flow through env, never into the command text.
+      - name: Compare the remote tag with the verified commit just before the release
+        # The tag is read from origin and compared with the verified commit just
+        # before the release is created or edited; a tag moved after that
+        # comparison is not detected (tag immutability is a separate policy, not
+        # this workflow).
         env:
           TAG: ${{ needs.verify-ancestry.outputs.tag }}
           EXPECTED_SHA: ${{ needs.verify-ancestry.outputs.sha }}
