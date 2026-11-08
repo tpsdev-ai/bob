@@ -534,6 +534,25 @@ const TAG_CHECK = "Compare the remote tag with the verified commit just before t
 const TAG_COMMAND = "bun --no-install scripts/verify-release-tag.mjs";
 const EXTRACT_STEP = "Extract CHANGELOG section";
 const CREATE_RELEASE = "Create or update GitHub release";
+const EXTRACT_COMMAND = `set -euo pipefail
+node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > release-notes.md
+echo "Extracted $(wc -l < release-notes.md) lines for v$VERSION"
+`;
+const CREATE_RELEASE_COMMAND = `set -euo pipefail
+if gh release view "$TAG" >/dev/null 2>&1; then
+  echo "Release $TAG exists — updating notes."
+  gh release edit "$TAG" \\
+    --title "v$VERSION" \\
+    --notes-file release-notes.md
+else
+  echo "Creating release $TAG."
+  gh release create "$TAG" \\
+    --title "v$VERSION" \\
+    --notes-file release-notes.md \\
+    --verify-tag
+fi
+echo "Release URL: $(gh release view "$TAG" --json url --jq .url)"
+`;
 
 function assertRequiredStep(
   workflow: Workflow,
@@ -600,23 +619,18 @@ function assertVersionCheck(workflow: Workflow): void {
 
 function assertChangelogExtraction(workflow: Workflow): string {
   const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
-  expect(extract.env?.VERSION).toBe(GUARD_VERSION);
-  const command =
-    /^\s*node scripts\/changelog-extract\.mjs "\$VERSION" CHANGELOG\.md > ([A-Za-z0-9._/-]+)\s*$/m.exec(
-      extract.run ?? "",
-    );
-  expect(
-    command,
-    "extraction must invoke changelog-extract.mjs with VERSION and redirect notes",
-  ).not.toBeNull();
-  const notesFile = command?.[1] ?? "";
+  expect(extract.env).toEqual({ VERSION: GUARD_VERSION });
+  expect(extract.run).toBe(EXTRACT_COMMAND);
   const create = workflow.jobs?.["github-release"]?.steps?.find(
     (step) => step.name === CREATE_RELEASE,
   );
-  const notesArguments = [...(create?.run ?? "").matchAll(/--notes-file\s+([^\s\\]+)/g)];
-  expect(notesArguments.length, "release must read a notes file").toBeGreaterThan(0);
-  for (const argument of notesArguments) expect(argument[1]).toBe(notesFile);
-  return notesFile;
+  expect(create?.run).toBe(CREATE_RELEASE_COMMAND);
+  expect(create?.env).toEqual({
+    GH_TOKEN: "$" + "{{ github.token }}",
+    TAG: GUARD_TAG,
+    VERSION: GUARD_VERSION,
+  });
+  return "release-notes.md";
 }
 
 const REQUIRED_STEPS = [
@@ -753,6 +767,52 @@ test.each([
   expect(() => assertChangelogExtraction(workflow)).toThrow();
 });
 
+test.each([
+  {
+    name: "an extra extraction env key",
+    step: EXTRACT_STEP,
+    key: "env",
+    value: { VERSION: GUARD_VERSION, GH_TOKEN: "$" + "{{ github.token }}" },
+  },
+  {
+    name: "a release-creating extraction line",
+    step: EXTRACT_STEP,
+    key: "run",
+    value: `${EXTRACT_COMMAND}gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"\n`,
+  },
+  {
+    name: "an extraction PATH shim",
+    step: EXTRACT_STEP,
+    key: "run",
+    value: `${EXTRACT_COMMAND}echo "$PWD/shims" >> "$GITHUB_PATH"\n`,
+  },
+  {
+    name: "an extra create env key",
+    step: CREATE_RELEASE,
+    key: "env",
+    value: {
+      GH_TOKEN: "$" + "{{ github.token }}",
+      TAG: GUARD_TAG,
+      VERSION: GUARD_VERSION,
+      EXTRA: "value",
+    },
+  },
+  {
+    name: "a trailing create line",
+    step: CREATE_RELEASE,
+    key: "run",
+    value: `${CREATE_RELEASE_COMMAND}echo trailing\n`,
+  },
+])("release command pins refuse $name", ({ step, key, value }) => {
+  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  assertChangelogExtraction(workflow);
+  const target = workflow.jobs?.["github-release"]?.steps?.find(
+    (candidate) => candidate.name === step,
+  );
+  Object.assign(target ?? {}, { [key]: value });
+  expect(() => assertChangelogExtraction(workflow)).toThrow();
+});
+
 // A checkout step is identified by the action it runs, not by the pin after the
 // `@`: GitHub resolves the owner and repository case-insensitively, so
 // `Actions/checkout@<sha>` runs the checkout action. The pin itself must be a
@@ -847,17 +907,44 @@ function assertReleaseStructure(workflow: Workflow): void {
     if (name !== GUARD_JOB)
       expect(afterGuard(jobs, name), `${name} must need the guard`).toBe(true);
   }
-  expect((jobs["github-release"].steps ?? []).map(({ name, uses }) => ({ name, uses }))).toEqual([
-    { uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" },
-    { uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6" },
-    { name: "Lockfile release-age bake" },
-    { name: EXTRACT_STEP },
-    { name: TAG_CHECK },
-    { name: CREATE_RELEASE },
+  expect(
+    (jobs["github-release"].steps ?? []).map(({ name, uses, run, env }) => ({
+      name,
+      uses,
+      run,
+      env,
+    })),
+  ).toEqual([
+    {
+      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      run: undefined,
+      env: undefined,
+    },
+    {
+      uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+      run: undefined,
+      env: undefined,
+    },
+    {
+      name: "Lockfile release-age bake",
+      run: "bun --no-install scripts/check-lockfile-release-age.mjs",
+      env: undefined,
+    },
+    { name: EXTRACT_STEP, run: EXTRACT_COMMAND, env: { VERSION: GUARD_VERSION } },
+    { name: TAG_CHECK, run: TAG_COMMAND, env: { TAG: GUARD_TAG, EXPECTED_SHA: GUARD_SHA } },
+    {
+      name: CREATE_RELEASE,
+      run: CREATE_RELEASE_COMMAND,
+      env: {
+        GH_TOKEN: "$" + "{{ github.token }}",
+        TAG: GUARD_TAG,
+        VERSION: GUARD_VERSION,
+      },
+    },
   ]);
 }
 
-test("release workflow pins permissions, guarded job graph and GitHub release steps", () => {
+test("every github-release step body and env map is equality-pinned with permissions and guard dependencies", () => {
   const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
   assertReleaseStructure(workflow);
 });
