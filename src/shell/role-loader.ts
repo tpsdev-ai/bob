@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseFinalMarkers } from "./compaction-contract.js";
+import { firstInvalidFinalMarker, parseFinalMarkers } from "./compaction-contract.js";
 import { ExplorationBudgetError, parseExplorationBudget } from "./exploration-budget.js";
 import type { BobRole } from "./index.js";
 import { ModelBudgetError, parseSessionBudget, type SessionBudget } from "./session-budget.js";
@@ -118,8 +118,9 @@ export function loadRoleFrom(roots: readonly string[], role: BobRole): RoleTempl
     if (config.final_markers !== undefined) {
       finalMarkers = parseFinalMarkers(config.final_markers);
       if (finalMarkers === undefined) {
+        const invalidMarker = firstInvalidFinalMarker(config.final_markers);
         throw new Error(
-          `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace.`,
+          `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.${invalidMarker !== undefined ? ` Invalid marker: ${JSON.stringify(invalidMarker)}.` : ""}`,
         );
       }
     }

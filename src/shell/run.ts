@@ -78,6 +78,7 @@ import {
   DEFAULT_MAX_NARRATION_REPROMPTS,
   DEFAULT_MAX_REASONING_REPROMPTS,
   evaluateCompletion,
+  firstInvalidFinalMarker,
   isNarrationEnding,
   parseFinalMarkers,
   readWorktreeStatus,
@@ -947,8 +948,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // bob#365: a malformed final-marker list is refused here, before the session
   // starts, rather than silently disabling (or narrowing) the narration check.
   if (opts.finalMarkers !== undefined && parseFinalMarkers(opts.finalMarkers) === undefined) {
+    const invalidMarker = firstInvalidFinalMarker(opts.finalMarkers);
     throw new Error(
-      "runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace",
+      `runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.${invalidMarker !== undefined ? ` Invalid marker: ${JSON.stringify(invalidMarker)}.` : ""}`,
     );
   }
 
@@ -971,8 +973,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     resolved.finalMarkers !== undefined &&
     parseFinalMarkers(resolved.finalMarkers) === undefined
   ) {
+    const invalidMarker = firstInvalidFinalMarker(resolved.finalMarkers);
     throw new Error(
-      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace`,
+      `runAgent: the final_markers of role "${resolved.agent.role ?? "(unnamed)"}" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.${invalidMarker !== undefined ? ` Invalid marker: ${JSON.stringify(invalidMarker)}.` : ""}`,
     );
   }
   // bob#135 — the one-shot run's bounds: bob.yaml `run:` overlaid with the

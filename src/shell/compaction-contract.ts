@@ -267,18 +267,32 @@ export function classifyAssistantEnding(content: unknown): AssistantEnding {
 
 /**
  * Validate a declared list of final-report markers (bob#365): a non-empty list
- * of non-empty strings, each without leading or trailing whitespace. Returns a
- * copy, or undefined when the value is not such a list — the caller names where
- * it came from in its own error.
+ * of non-empty strings, each without leading or trailing whitespace, commas
+ * or line breaks (a comma or line break would make the re-prompt's marker list
+ * ambiguous, bob#464). Returns a copy, or undefined when the value is not such
+ * a list — the caller names where it came from in its own error.
  */
 export function parseFinalMarkers(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
   const markers: string[] = [];
   for (const m of value) {
     if (typeof m !== "string" || m.length === 0 || m.trim() !== m) return undefined;
+    if (m.includes(",")) return undefined;
+    if (/[\n\r\u2028\u2029]/u.test(m)) return undefined;
     markers.push(m);
   }
   return markers;
+}
+
+/** The first string entry of `value` that `parseFinalMarkers` would refuse on
+ *  its own, for a caller's error text; undefined when `value` is not an array
+ *  or no single string entry is invalid (bob#464). */
+export function firstInvalidFinalMarker(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.find(
+    (marker): marker is string =>
+      typeof marker === "string" && parseFinalMarkers([marker]) === undefined,
+  );
 }
 
 /** True when `text`, trimmed, STARTS WITH one of `markers` (case-sensitive,

@@ -414,6 +414,11 @@ describe("narration turn (#365)", () => {
     ["an empty marker", [""]],
     ["a marker with leading whitespace", [" DONE"]],
     ["a marker with trailing whitespace", ["DONE "]],
+    ["a comma", ["DONE, BLOCKED"]],
+    ["a newline", ["DONE\nX"]],
+    ["a carriage return", ["DONE\rX"]],
+    ["a Unicode line separator", ["A\u2028B"]],
+    ["a Unicode paragraph separator", ["A\u2029B"]],
   ] as const)(
     "a malformed finalMarkers option is refused before the session starts: %s",
     async (_label, markers) => {
@@ -429,7 +434,14 @@ describe("narration turn (#365)", () => {
             return stubSession(() => [TEXT_FINAL("DONE")]).session;
           },
         }),
-      ).rejects.toThrow(/finalMarkers must be a non-empty list/);
+      ).rejects.toThrow(
+        "runAgent: finalMarkers must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.",
+      );
+      if (markers.length > 0) {
+        await expect(
+          runAgent({ name: "testbot", prompt: "do the thing", finalMarkers: markers, agentsRoot }),
+        ).rejects.toThrow(`Invalid marker: ${JSON.stringify(markers[0])}.`);
+      }
       expect(factoryCalls).toBe(0);
     },
     10_000,
@@ -442,6 +454,11 @@ describe("narration turn (#365)", () => {
   it.each([
     ["an empty marker", [""], {}],
     ["a string instead of a list", "DONE", {}],
+    ["a comma", ["DONE, BLOCKED"], {}],
+    ["a newline", ["DONE\nX"], {}],
+    ["a carriage return", ["DONE\rX"], {}],
+    ["a Unicode line separator", ["A\u2028B"], {}],
+    ["a Unicode paragraph separator", ["A\u2029B"], {}],
     ["an empty marker under a valid finalMarkers option", [""], { finalMarkers: MARKERS }],
     ["an empty marker on a mail turn", [""], { mailTurn: true }],
   ] as const)(
@@ -465,8 +482,13 @@ describe("narration turn (#365)", () => {
             },
           }),
         ).rejects.toThrow(
-          'runAgent: the final_markers of role "reviewer" (its role.json) must be a non-empty list',
+          'runAgent: the final_markers of role "reviewer" (its role.json) must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.',
         );
+        if (Array.isArray(markers)) {
+          await expect(
+            runAgent({ name: "testbot", prompt: "do the thing", agentsRoot, ...extra }),
+          ).rejects.toThrow(`Invalid marker: ${JSON.stringify(markers[0])}.`);
+        }
         // The replacement was what the run resolved (so the refusal is runAgent's).
         expect(spy).toHaveBeenCalled();
       } finally {
@@ -683,10 +705,26 @@ describe("the final-report decision is structural (#365)", () => {
       expect(text).toMatch(/\bbegin\b/i);
       expect(text).toContain("next tool call");
       expect(text).toContain("final message");
+      expect(text).toBe(
+        "Your last message did not satisfy this run's final-report contract. " +
+          "If the task is not finished, make your next tool call now. " +
+          "If it is finished, send your final message; it must begin with one of: " +
+          `${markers.join(", ")}.`,
+      );
     },
   );
 
-  it("parseFinalMarkers accepts a non-empty list of trimmed non-empty strings and nothing else", () => {
+  it.each([
+    ["a comma", "DONE, BLOCKED"],
+    ["a newline", "DONE\nX"],
+    ["a carriage return", "DONE\rX"],
+    ["a Unicode line separator", "A\u2028B"],
+    ["a Unicode paragraph separator", "A\u2029B"],
+  ])("parseFinalMarkers refuses %s", (_label, marker) => {
+    expect(parseFinalMarkers([marker])).toBeUndefined();
+  });
+
+  it("parseFinalMarkers validates list shape and edge whitespace", () => {
     expect(parseFinalMarkers(["DONE", "BLOCKED"])).toEqual(["DONE", "BLOCKED"]);
     expect(parseFinalMarkers(["DONE:"])).toEqual(["DONE:"]);
     for (const bad of [undefined, null, "DONE", [], [""], [" DONE"], ["DONE\n"], [3], [["DONE"]]]) {

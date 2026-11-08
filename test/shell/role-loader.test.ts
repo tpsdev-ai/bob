@@ -133,6 +133,11 @@ describe("role.json final_markers validation (#365)", () => {
     ["a marker with leading whitespace", [" DONE"]],
     ["a marker with trailing whitespace", ["DONE "]],
     ["a marker with a trailing newline", ["DONE\n"]],
+    ["a comma", ["DONE, BLOCKED"]],
+    ["a newline", ["DONE\nX"]],
+    ["a carriage return", ["DONE\rX"]],
+    ["a Unicode line separator", ["A\u2028B"]],
+    ["a Unicode paragraph separator", ["A\u2029B"]],
     ["an empty marker after a valid one", ["DONE", ""]],
     ["a string instead of a list", "DONE"],
     ["a number element", [1]],
@@ -144,8 +149,16 @@ describe("role.json final_markers validation (#365)", () => {
   ] as const)("refuses %s, naming the file and the key", (_label, value) => {
     const configPath = writeRole({ final_markers: value });
     expect(() => loadRoleFrom([rolesRoot], "custom")).toThrow(
-      `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace.`,
+      `${configPath}: "final_markers" must be a non-empty list of non-empty strings without leading or trailing whitespace, commas or line breaks.`,
     );
+    if (Array.isArray(value)) {
+      const invalidMarker = value.find((marker) => typeof marker === "string" && marker !== "DONE");
+      if (invalidMarker !== undefined) {
+        expect(() => loadRoleFrom([rolesRoot], "custom")).toThrow(
+          `Invalid marker: ${JSON.stringify(invalidMarker)}.`,
+        );
+      }
+    }
   });
 
   it.each([[["DONE"]], [["DONE", "BLOCKED"]]] as const)(
