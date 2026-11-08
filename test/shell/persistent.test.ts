@@ -248,7 +248,7 @@ describe("runPersistent / startPersistent", () => {
     ).rejects.toThrow(/agent dir not found/);
   });
 
-  it("a real SIGTERM triggers a graceful dispose then exit(0)", async () => {
+  it("the SIGTERM handler triggers a graceful dispose then exit(0)", async () => {
     const fake = fakeWarmSession();
     let exited: number | undefined;
     let keepAliveResolve: (() => void) | undefined;
@@ -257,6 +257,7 @@ describe("runPersistent / startPersistent", () => {
         keepAliveResolve = resolve;
       });
 
+    const listenersBefore = new Set(process.rawListeners("SIGTERM"));
     const done = runPersistent({
       name: "pulse",
       agentsRoot: root,
@@ -273,9 +274,11 @@ describe("runPersistent / startPersistent", () => {
 
     // Let startPersistent + handler registration settle.
     await new Promise((r) => setTimeout(r, 10));
-    // Fire a real SIGTERM at this process; runPersistent registered a
-    // process.once("SIGTERM") handler that disposes + exits.
-    process.emit("SIGTERM");
+    const onSignal = process
+      .rawListeners("SIGTERM")
+      .find((listener) => !listenersBefore.has(listener));
+    expect(onSignal).toBeDefined();
+    onSignal?.call(process);
 
     await done;
     expect(exited).toBe(0);
