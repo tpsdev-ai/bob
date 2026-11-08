@@ -1,0 +1,1 @@
+- **Detach dropped-attempt usage reporting during run teardown (#429).** The callback is detached before the terminal log record.
