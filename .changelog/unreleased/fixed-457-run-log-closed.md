@@ -1,0 +1,1 @@
+- **Close the run log after its terminal record (#457).** Later writes are dropped with a stderr warning once per run naming the dropped record kind.

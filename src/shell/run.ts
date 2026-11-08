@@ -1199,6 +1199,8 @@ async function runBoundedSession(
     const capBytes = opts.runLogCapBytes ?? DEFAULT_RUNLOG_DELTA_CAP_BYTES;
     let logBytes = 0; // running total of bytes committed to this log
     let deltaCapHit = false; // set once the marker below is written; then deltas stop
+    let logClosed = false;
+    let lateWriteWarned = false;
 
     // Synchronous writer: appendFileSync puts each record in the page cache when it
     // returns: every reader sees it and it survives the process dying, but power
@@ -1210,6 +1212,16 @@ async function runBoundedSession(
     // perms) is swallowed: logging is best-effort and never throws into the run.
     writeRunLog = (record: unknown, isDelta: boolean): void => {
       try {
+        const entry = record as { done?: boolean; event?: { type?: string } };
+        if (logClosed) {
+          if (!lateWriteWarned) {
+            lateWriteWarned = true;
+            const kind =
+              entry.event?.type ?? Object.keys(entry).find((key) => key !== "t") ?? "unknown";
+            process.stderr.write(`bob run ${opts.name}: run log closed; dropped ${kind} record\n`);
+          }
+          return;
+        }
         // Past the delta cap the STREAMED DELTAS are dropped; every non-delta event
         // keeps coming, so the log stays a faithful post-mortem.
         if (isDelta && deltaCapHit) return;
@@ -1217,6 +1229,10 @@ async function runBoundedSession(
         const n = Buffer.byteLength(line);
         appendFileSync(runLogPath, line);
         logBytes += n;
+        if (entry.done === true) {
+          logClosed = true;
+          return;
+        }
         if (!deltaCapHit && logBytes >= capBytes) {
           // One line, ever, recording that the delta cap was hit — written BEFORE
           // the flag is set, so the flag never claims "delta cap hit" without the
