@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeEach, expect } from "bun:test";
-import { lstatSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { lstatSync, readdirSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { trackedTempRoots } from "./tracked-temp-roots.js";
 
 function snapshot(path: string): unknown {
   try {
@@ -30,12 +31,13 @@ const homeRoots = [
   join(homedir(), "Library", "Application Support", "bob"),
 ];
 const homeBefore = homeRoots.map(snapshot);
+const createRoot = trackedTempRoots();
 let isolated: string;
 let saved: string | undefined;
 
 beforeEach(() => {
   saved = process.env.BOB_STATE_DIR;
-  isolated = mkdtempSync(join(tmpdir(), "bob-test-state-"));
+  isolated = createRoot("bob-test-state-");
   process.env.BOB_STATE_DIR = isolated;
 });
 

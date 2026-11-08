@@ -5,11 +5,17 @@ import { join } from "node:path";
 
 const roots = new Set<string>();
 
+function diagnostic(message: string): void {
+  try {
+    writeSync(2, message);
+  } catch {}
+}
+
 function remove(root: string): void {
   try {
     rmSync(root, { recursive: true, force: true });
   } catch (error) {
-    writeSync(2, `test root cleanup failed: ${root}: ${error}\n`);
+    diagnostic(`test root cleanup failed: ${root}: ${error}\n`);
   }
 }
 
@@ -47,17 +53,17 @@ function size(path: string): number {
 
 function report(root: string): void {
   if (!existsSync(root)) return;
-  writeSync(2, `leftover test root: ${root}\n`);
+  diagnostic(`leftover test root: ${root}\n`);
   try {
     const entries = readdirSync(root)
       .map((name) => ({ name, bytes: size(join(root, name)) }))
       .sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name))
       .slice(0, 5);
     for (const { name, bytes } of entries) {
-      writeSync(2, `  ${bytes} bytes\t${join(root, name)}\n`);
+      diagnostic(`  ${bytes} bytes\t${join(root, name)}\n`);
     }
   } catch (error) {
-    writeSync(2, `  inventory failed: ${error}\n`);
+    diagnostic(`  inventory failed: ${error}\n`);
   }
 }
 

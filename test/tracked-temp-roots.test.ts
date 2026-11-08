@@ -16,7 +16,7 @@ function fixture(body: string, beforeReport = ""): string {
   writeFileSync(
     file,
     `import { afterAll, beforeEach, it } from "bun:test";
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { trackedTempRoots } from ${JSON.stringify(new URL("./tracked-temp-roots.ts", import.meta.url).href)};
 let root;
@@ -62,10 +62,9 @@ it("afterEach removes a case's root before afterAll", () => {
 it("afterAll releases its signal handlers", () => {
   const file = fixture(`it("case", () => {});
 afterAll(() => {
-  for (const signal of ["SIGTERM", "SIGINT"]) {
-    process.once(signal, () => writeFileSync(join(root, "..", signal), "handled"));
-    process.emit(signal);
-  }
+  writeFileSync(${JSON.stringify(join(sandbox, "listeners"))}, JSON.stringify(
+    ["SIGTERM", "SIGINT"].flatMap(signal => process.listeners(signal).map(listener => listener.name))
+  ));
 });`);
   const run = spawnSync(process.execPath, ["test", file], {
     ...options(),
@@ -74,9 +73,7 @@ afterAll(() => {
     killSignal: "SIGKILL",
   });
   expect(run.status).toBe(0);
-  for (const signal of ["SIGTERM", "SIGINT"]) {
-    expect(readFileSync(join(sandbox, signal), "utf8")).toBe("handled");
-  }
+  expect(JSON.parse(readFileSync(join(sandbox, "listeners"), "utf8"))).toEqual([]);
 });
 
 it("a timed out case removes its root before afterAll", () => {
@@ -172,3 +169,96 @@ symlinkSync(root, join(root, "loop"));`,
   expect(run.stdout).not.toContain("leftover test root:");
   expect(existsSync(root())).toBe(false);
 });
+
+it("afterAll tolerates closed stderr with a planted leftover", () => {
+  const file = fixture(
+    'it("case", () => {});',
+    `mkdirSync(root, { recursive: true });
+writeFileSync(join(root, "leftover"), "data");
+closeSync(2);`,
+  );
+  const run = spawnSync(process.execPath, ["test", file], {
+    ...options(),
+    encoding: "utf8",
+    timeout: 10_000,
+    killSignal: "SIGKILL",
+  });
+  expect(run.status).toBe(0);
+  expect(existsSync(root())).toBe(false);
+});
+
+for (const [signal, code] of [
+  ["SIGTERM", 143],
+  ["SIGINT", 130],
+] as const) {
+  for (const mode of ["preload", "two files"] as const) {
+    it(`${signal} removes roots with ${mode}`, async () => {
+      const preload = new URL("./state-root.setup.ts", import.meta.url).pathname;
+      const files = [];
+      for (let index = 0; index < (mode === "two files" ? 2 : 1); index++) {
+        const file = join(sandbox, `${index}.test.ts`);
+        files.push(file);
+        writeFileSync(
+          file,
+          `import { it } from "bun:test";
+import { writeFileSync } from "node:fs";
+${
+  mode === "two files"
+    ? `import { trackedTempRoots } from ${JSON.stringify(new URL("./tracked-temp-roots.ts", import.meta.url).href)};
+const createRoot = trackedTempRoots();`
+    : ""
+}
+it("state root", async () => {
+  ${
+    mode === "two files"
+      ? `const root = createRoot("bob-cross-file-");
+  writeFileSync(${JSON.stringify(join(sandbox, `root-${index}`))}, root);`
+      : ""
+  }
+  ${mode === "preload" ? `writeFileSync(${JSON.stringify(join(sandbox, `state-${index}`))}, process.env.BOB_STATE_DIR);` : ""}
+  ${index === (mode === "two files" ? 1 : 0) ? 'console.log("CASE_READY"); await new Promise(() => {});' : ""}
+}, 10000);
+`,
+        );
+      }
+      const child = spawn(
+        process.execPath,
+        ["test", ...(mode === "preload" ? ["--preload", preload] : []), ...files],
+        options(),
+      );
+      let stdout = "";
+      let stderr = "";
+      let sent = false;
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (!sent && stdout.includes("CASE_READY")) {
+          sent = true;
+          child.kill(signal);
+        }
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      try {
+        const result = await new Promise<{ code: number | null; signal: string | null }>(
+          (resolve, reject) => {
+            child.on("error", reject);
+            child.on("close", (code, signal) => resolve({ code, signal }));
+          },
+        );
+        expect(sent, stderr).toBe(true);
+        for (let index = 0; index < files.length; index++) {
+          for (const kind of mode === "two files" ? ["root"] : ["state"]) {
+            const path = readFileSync(join(sandbox, `${kind}-${index}`), "utf8");
+            expect(existsSync(path), `${signal} left the ${kind} root ${path}`).toBe(false);
+          }
+        }
+        expect(result).toEqual({ code, signal: null });
+      } finally {
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+      }
+    }, 15_000);
+  }
+}
