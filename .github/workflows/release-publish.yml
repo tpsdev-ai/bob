@@ -120,27 +120,6 @@ jobs:
       - name: npm pin release-age bake
         run: bun --no-install scripts/check-npm-pin-release-age.mjs
 
-      - name: Resolve version
-        id: ver
-        env:
-          EVENT: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            VERSION="$INPUT_VERSION"
-          else
-            # tag push: github.ref_name is the tag (vX.Y.Z)
-            VERSION="${REF_NAME#v}"
-          fi
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
-            echo "::error::Invalid version '$VERSION'. Expected semver (e.g. 0.3.0 or 1.0.0-rc.1)."
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: $VERSION"
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -174,7 +153,7 @@ jobs:
         # All values flow through env, never ${{ }} interpolation inside the
         # script body — keeps the resolved version out of the shell parser.
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.verify-ancestry.outputs.version }}
         run: |
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
@@ -214,7 +193,7 @@ jobs:
 
       - name: Summary
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.verify-ancestry.outputs.version }}
         run: |
           {
             echo "### 🚀 v$VERSION staged for release"

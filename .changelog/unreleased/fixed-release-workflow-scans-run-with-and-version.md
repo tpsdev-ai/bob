@@ -1,0 +1,1 @@
+- **The release workflow's structure test fails on a `run:` or `with:` expression that is not on an allowlist.** The allowlist holds whitespace-normalised expression text; a failure names the job, step, key and expression. `stage-publish` reads its version from `needs.verify-ancestry.outputs.version`.
