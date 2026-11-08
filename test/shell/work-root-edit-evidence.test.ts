@@ -103,6 +103,14 @@ function probeSha256Init(): Sha256InitProbe {
   return sha256InitProbe;
 }
 
+function sha256InitForRealRepository(): Sha256InitProbe {
+  const probe = probeSha256Init();
+  if (!probe.supported && process.env.CI) {
+    throw new Error(`git init --object-format=sha256 failed in CI (${probe.reason})`);
+  }
+  return probe;
+}
+
 function gitInHome(home: string, cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -1157,12 +1165,30 @@ describe("raw amend reflog record matching", () => {
   it("denies credit for a sha256 raw record with a different subject", () => {
     const before = "1".repeat(64);
     const after = "2".repeat(64);
-    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\treset: moving to ${after}\n`;
+    const subject = `reset: moving to ${after}`;
+    const raw = `${before} ${after} Test <test@example.invalid> 1700000000 +0000\t${subject}\n`;
+    expect(replacedCommitFromReflog(raw, selector, after, subject)).toBe(before);
     expect(replacedCommitFromReflog(raw, selector, after, action)).toBeUndefined();
   });
 
+  it("fails the real-repository sha256 support check in CI with the probe reason", () => {
+    const savedCI = process.env.CI;
+    const savedProbe = sha256InitProbe;
+    try {
+      process.env.CI = "1";
+      sha256InitProbe = { supported: false, reason: "forced sha256 init failure" };
+      expect(() => sha256InitForRealRepository()).toThrow(
+        "git init --object-format=sha256 failed in CI (forced sha256 init failure)",
+      );
+    } finally {
+      if (savedCI === undefined) delete process.env.CI;
+      else process.env.CI = savedCI;
+      sha256InitProbe = savedProbe;
+    }
+  });
+
   it("credits a git-generated sha256 amend record from a real repository", () => {
-    const probe = probeSha256Init();
+    const probe = sha256InitForRealRepository();
     if (!probe.supported) {
       // The probe cannot run here, so assert the hand-built sha256 fallback the
       // matcher relies on and say so: this case must not render as a silent pass.
