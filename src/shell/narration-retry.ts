@@ -6,8 +6,9 @@
 // 282-284:") instead of reporting. When the run DECLARES final-report markers
 // (role.json `final_markers`, or the run's `finalMarkers` option), such a turn
 // is decided structurally: its trimmed text does not start with a marker, so it
-// is not a final report, and bob re-prompts the SAME session with a fixed
-// continuation instead of letting it end the run. The caller owns that
+// is not a final report, and bob re-prompts the SAME session with a
+// continuation the caller builds once per run from the declared markers (never
+// from model output) instead of letting it end the run. The caller owns that
 // classification (`narrating`), so the loop and the run's outcome use ONE rule.
 // A run that declares no markers is unchanged.
 //
@@ -18,7 +19,7 @@
 // sends every re-prompt through its bounded sender. The caller sends the first
 // prompt and then calls repromptWhileNarrating, which only continues it.
 
-import { DEFAULT_MAX_NARRATION_REPROMPTS, NARRATION_CONTINUE_TURN } from "./compaction-contract.js";
+import { DEFAULT_MAX_NARRATION_REPROMPTS } from "./compaction-contract.js";
 import type { RunSession } from "./run.js";
 import { promptSession } from "./session.js";
 
@@ -31,6 +32,7 @@ export interface NarrationRetryResult {
 
 export interface NarrationRetryOptions {
   session: RunSession;
+  continuation: string;
   /** Whether the run's current ending is narration rather than a final report.
    *  run.ts passes its one classifier, the same function its outcome calls, so
    *  the loop and the outcome apply the same rule to the same ending. */
@@ -75,7 +77,7 @@ export function resolveMaxNarrationReprompts(value?: number): number {
  * Re-prompt the session while its last turn ended with narration, bounded.
  *
  * The first prompt has already been sent. Each iteration sends
- * NARRATION_CONTINUE_TURN as its own turn, runs `afterTurn`, and asks
+ * the supplied continuation as its own turn, runs `afterTurn`, and asks
  * `narrating` again. The loop stops when the ending is no longer narration OR
  * the bound is reached — the bound is checked before every send, so it can
  * never spin past it.
@@ -90,7 +92,7 @@ export async function repromptWhileNarrating(
     reprompts += 1;
     opts.onReprompt?.(reprompts, max);
     opts.beginTurn?.();
-    await send(NARRATION_CONTINUE_TURN);
+    await send(opts.continuation);
     await opts.afterTurn?.();
   }
   return { reprompts, endedNarrating: opts.narrating() };

@@ -25,8 +25,8 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
+  buildNarrationContinueTurn,
   DEFAULT_MAX_NARRATION_REPROMPTS,
-  NARRATION_CONTINUE_TURN,
 } from "../../src/shell/compaction-contract.js";
 import { type RunSession, type RunSessionFactory, runAgent } from "../../src/shell/run.js";
 import { createBobRuntimeFactory } from "../../src/shell/session.js";
@@ -221,9 +221,9 @@ async function liveFactory(
 }
 
 describe("narration turn through a REAL pi session (#365)", () => {
-  it("narration → the fixed continuation as a new user turn → a final report starting with DONE completes", async () => {
+  it("an unmarked summary completes after a continuation naming the final markers", async () => {
     const live = await liveFactory((call) =>
-      call === 1 ? "The spec says … Let me fix lines 282-284:" : "DONE: lines 282-284 fixed.",
+      call === 1 ? "All 5 steps completed…" : "DONE: lines 282-284 fixed.",
     );
     const res = await runAgent({
       name: "testbot",
@@ -234,9 +234,12 @@ describe("narration turn through a REAL pi session (#365)", () => {
       sessionFactory: live.factory,
     });
     // Two provider requests in ONE session: the task, then bob's continuation.
+    expect(live.seen).toHaveLength(2);
+    expect(live.seen[1].lastUserText).toContain("DONE, BLOCKED");
+    expect(live.seen[1].lastUserText).not.toContain("All 5 steps completed");
     expect(live.seen.map((r) => r.lastUserText)).toEqual([
       "Fix lines 282-284.",
-      NARRATION_CONTINUE_TURN,
+      buildNarrationContinueTurn(["DONE", "BLOCKED"]),
     ]);
     expect(live.seen.every((r) => r.hadSystemPrompt)).toBe(true);
     expect(res.exitCode).toBe(0);
@@ -258,7 +261,9 @@ describe("narration turn through a REAL pi session (#365)", () => {
     });
     expect(live.seen.map((r) => r.lastUserText)).toEqual([
       "Fix lines 282-284.",
-      ...Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(NARRATION_CONTINUE_TURN),
+      ...Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(
+        buildNarrationContinueTurn(["DONE", "BLOCKED"]),
+      ),
     ]);
     expect(res.exitCode).toBe(1);
     expect(res.reason).toBe("narration_only");
