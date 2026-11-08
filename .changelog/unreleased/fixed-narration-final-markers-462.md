@@ -1,0 +1,1 @@
+- **Narration re-prompts name the declared final markers** so a completed builder run can send its final report in the required shape.

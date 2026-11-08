@@ -28,12 +28,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildNarrationContinueTurn,
   CONTINUE_TURN,
   classifyAssistantEnding,
   DEFAULT_MAX_NARRATION_REPROMPTS,
   DEFAULT_MAX_REASONING_REPROMPTS,
   isNarrationEnding,
-  NARRATION_CONTINUE_TURN,
   parseFinalMarkers,
   REASONING_CONTINUE_TURN,
   startsWithFinalMarker,
@@ -185,12 +185,53 @@ describe("narration turn (#365)", () => {
       agentsRoot,
       sessionFactory: factoryReturning(stub.session),
     });
-    expect(stub.promptCalls).toEqual(["do the thing", NARRATION_CONTINUE_TURN]);
+    expect(stub.promptCalls).toEqual(["do the thing", buildNarrationContinueTurn(MARKERS)]);
     expect(res.exitCode).toBe(0);
     expect(res.reason).toBeUndefined();
     expect(res.failed).toBeUndefined();
     expect(res.stdout).toBe("DONE: lines 282-284 fixed.");
     expect(outcomeRecord(agentsRoot, "testbot")).toBeUndefined();
+  }, 10_000);
+
+  it("an unmarked summary completes after one re-prompt naming the declared markers", async () => {
+    const stub = stubSession((call) =>
+      call === 1 ? [TEXT_FINAL("All 5 steps completed…")] : [TEXT_FINAL("DONE: task completed.")],
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      finalMarkers: MARKERS,
+      captureStdout: true,
+      agentsRoot,
+      sessionFactory: factoryReturning(stub.session),
+    });
+    expect(stub.promptCalls).toHaveLength(2);
+    for (const marker of MARKERS) expect(stub.promptCalls[1]).toContain(marker);
+    expect(stub.promptCalls).toEqual(["do the thing", buildNarrationContinueTurn(MARKERS)]);
+    expect(res.exitCode).toBe(0);
+    expect(res.reason).toBeUndefined();
+    expect(res.failed).toBeUndefined();
+    expect(res.stdout).toBe("DONE: task completed.");
+  }, 10_000);
+
+  it("the re-prompt excludes the model's ending text", async () => {
+    const summary = "All 5 steps completed… MODEL_ENDING_SENTINEL_462";
+    const stub = stubSession((call) =>
+      call === 1 ? [TEXT_FINAL(summary)] : [TEXT_FINAL("DONE: task completed.")],
+    );
+    const res = await runAgent({
+      name: "testbot",
+      prompt: "do the thing",
+      finalMarkers: MARKERS,
+      agentsRoot,
+      sessionFactory: factoryReturning(stub.session),
+    });
+    expect(stub.promptCalls).toHaveLength(2);
+    expect(stub.promptCalls[1]).not.toContain(summary);
+    expect(stub.promptCalls[1]).not.toContain("All 5 steps completed");
+    expect(stub.promptCalls[1]).not.toContain("MODEL_ENDING_SENTINEL_462");
+    expect(stub.promptCalls[1]).toBe(buildNarrationContinueTurn(MARKERS));
+    expect(res.exitCode).toBe(0);
   }, 10_000);
 
   it("b: narrating past the bound fails the run with narration_only (3 re-prompts → 4 prompt calls)", async () => {
@@ -205,7 +246,7 @@ describe("narration turn (#365)", () => {
     });
     expect(stub.promptCalls).toHaveLength(DEFAULT_MAX_NARRATION_REPROMPTS + 1);
     expect(stub.promptCalls.slice(1)).toEqual(
-      Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(NARRATION_CONTINUE_TURN),
+      Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(buildNarrationContinueTurn(MARKERS)),
     );
     expect(res.exitCode).toBe(1);
     expect(res.reason).toBe("narration_only");
@@ -305,7 +346,7 @@ describe("narration turn (#365)", () => {
     });
     expect(stub.promptCalls).toEqual([
       "do the thing",
-      NARRATION_CONTINUE_TURN,
+      buildNarrationContinueTurn(MARKERS),
       REASONING_CONTINUE_TURN,
     ]);
     expect(res.exitCode).toBe(0);
@@ -335,7 +376,7 @@ describe("narration turn (#365)", () => {
     expect(stub.promptCalls).toEqual([
       "do the thing",
       ...Array(reasoningTurns).fill(REASONING_CONTINUE_TURN),
-      ...Array(narrationTurns).fill(NARRATION_CONTINUE_TURN),
+      ...Array(narrationTurns).fill(buildNarrationContinueTurn(MARKERS)),
     ]);
     expect(res.exitCode).toBe(0);
   }, 10_000);
@@ -356,9 +397,9 @@ describe("narration turn (#365)", () => {
     });
     expect(stub.promptCalls).toEqual([
       "do the thing",
-      NARRATION_CONTINUE_TURN,
+      buildNarrationContinueTurn(MARKERS),
       CONTINUE_TURN,
-      ...Array(DEFAULT_MAX_NARRATION_REPROMPTS - 1).fill(NARRATION_CONTINUE_TURN),
+      ...Array(DEFAULT_MAX_NARRATION_REPROMPTS - 1).fill(buildNarrationContinueTurn(MARKERS)),
     ]);
     expect(res.exitCode).toBe(1);
     expect(res.reason).toBe("narration_only");
@@ -510,7 +551,7 @@ describe("final text with no observed assistant ending (#365)", () => {
       });
       expect(stub.promptCalls).toEqual([
         "do the thing",
-        ...Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(NARRATION_CONTINUE_TURN),
+        ...Array(DEFAULT_MAX_NARRATION_REPROMPTS).fill(buildNarrationContinueTurn(MARKERS)),
       ]);
       expect(res.exitCode).toBe(1);
       expect(res.reason).toBe("narration_only");
@@ -537,7 +578,7 @@ describe("final text with no observed assistant ending (#365)", () => {
       agentsRoot,
       sessionFactory: factoryReturning(stub.session),
     });
-    expect(stub.promptCalls).toEqual(["do the thing", NARRATION_CONTINUE_TURN]);
+    expect(stub.promptCalls).toEqual(["do the thing", buildNarrationContinueTurn(MARKERS)]);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toBe("DONE: they are pre-existing.");
   }, 10_000);
@@ -593,7 +634,7 @@ describe("builder-local declares DONE and BLOCKED (#365)", () => {
       agentsRoot,
       sessionFactory: factoryReturning(stub.session),
     });
-    expect(stub.promptCalls).toEqual(["do the task", NARRATION_CONTINUE_TURN]);
+    expect(stub.promptCalls).toEqual(["do the task", buildNarrationContinueTurn(MARKERS)]);
     expect(res.exitCode).toBe(0);
     expect(res.reason).toBeUndefined();
     expect(res.noEditNoBlocked).toBeUndefined();
@@ -627,12 +668,24 @@ describe("builder-local declares DONE and BLOCKED (#365)", () => {
       agentsRoot,
       sessionFactory: factoryReturning(stub.session),
     });
-    expect(stub.promptCalls).toEqual(["do the task", NARRATION_CONTINUE_TURN]);
+    expect(stub.promptCalls).toEqual(["do the task", buildNarrationContinueTurn(["BLOCKED"])]);
     expect(res.exitCode).toBe(0);
   }, 10_000);
 });
 
 describe("the final-report decision is structural (#365)", () => {
+  it.each([["FINISHED", "NEEDS_INPUT"], ["COMPLETE"]])(
+    "buildNarrationContinueTurn tells the model to begin with a declared marker: %j",
+    (...markers) => {
+      const text = buildNarrationContinueTurn(markers);
+      for (const marker of markers) expect(text).toContain(marker);
+      expect(text).toContain(markers.join(", "));
+      expect(text).toMatch(/\bbegin\b/i);
+      expect(text).toContain("next tool call");
+      expect(text).toContain("final message");
+    },
+  );
+
   it("parseFinalMarkers accepts a non-empty list of trimmed non-empty strings and nothing else", () => {
     expect(parseFinalMarkers(["DONE", "BLOCKED"])).toEqual(["DONE", "BLOCKED"]);
     expect(parseFinalMarkers(["DONE:"])).toEqual(["DONE:"]);
@@ -691,6 +744,7 @@ describe("the final-report decision is structural (#365)", () => {
       const sent: string[] = [];
       const res = await repromptWhileNarrating({
         session: {} as RunSession,
+        continuation: buildNarrationContinueTurn(MARKERS),
         narrating: () => true,
         ...(maxReprompts !== undefined ? { maxReprompts } : {}),
         send: async (text) => {
@@ -699,7 +753,7 @@ describe("the final-report decision is structural (#365)", () => {
           if (sent.length > 20) throw new Error("unbounded narration loop");
         },
       });
-      expect(sent).toEqual(Array(expected).fill(NARRATION_CONTINUE_TURN));
+      expect(sent).toEqual(Array(expected).fill(buildNarrationContinueTurn(MARKERS)));
       expect(res).toEqual({ reprompts: expected, endedNarrating: true });
     },
   );

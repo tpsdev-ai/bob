@@ -72,6 +72,7 @@ import {
   resolveCapabilities,
 } from "./capability-loader.js";
 import {
+  buildNarrationContinueTurn,
   CONTINUE_TURN,
   createCompactionObserver,
   DEFAULT_MAX_NARRATION_REPROMPTS,
@@ -1022,6 +1023,8 @@ async function runBoundedSession(
   // reasoning-only re-prompt (bob#256) still runs. Undefined: no narration check.
   const finalMarkers =
     opts.mailTurn === true ? undefined : (opts.finalMarkers ?? resolved.finalMarkers);
+  const narrationContinueTurn =
+    finalMarkers === undefined ? undefined : buildNarrationContinueTurn(finalMarkers);
   const repositoryAtLaunch: RepositoryState =
     requireEditOrBlocked || explorationLimit !== undefined
       ? captureRepositoryState(config.cwd)
@@ -1625,9 +1628,10 @@ async function runBoundedSession(
     const drainNonFinal = async (): Promise<void> => {
       if (observer.emptyResponseExhausted()) return;
       await drainReasoningOnly();
-      if (finalMarkers === undefined || narrationBudgetLeft() <= 0) return;
+      if (narrationContinueTurn === undefined || narrationBudgetLeft() <= 0) return;
       const spent = await repromptWhileNarrating({
         session,
+        continuation: narrationContinueTurn,
         // The SAME bounded sender as the first prompt and the reasoning re-prompts.
         send: (text) => raceLoop(boundedPrompt(session, text, bounds, loopController.signal)),
         narrating,

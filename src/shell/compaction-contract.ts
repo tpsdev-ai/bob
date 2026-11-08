@@ -49,14 +49,15 @@ export const REASONING_CONTINUE_TURN = "Continue: take the next action, or give 
  *  a still-reasoning-only ending fails the run, or rejects that admitted turn. */
 export const DEFAULT_MAX_REASONING_REPROMPTS = 3;
 
-/** The continuation sent when a run that declares final markers ends a turn with
- *  text, no tool call, and text that does not begin with one of those markers
- *  (bob#365): the model announced a step instead of reporting. Also sent when
- *  such a run's final text comes from session state with no observed assistant
- *  ending. FIXED text: it does not interpolate any model output. Bounded by
- *  DEFAULT_MAX_NARRATION_REPROMPTS. */
-export const NARRATION_CONTINUE_TURN =
-  "You announced a step but made no tool call. Continue the task; end only with your final message.";
+/** Build a continuation from the run's validated final markers. */
+export function buildNarrationContinueTurn(markers: readonly string[]): string {
+  return (
+    "Your last message did not satisfy this run's final-report contract. " +
+    "If the task is not finished, make your next tool call now. " +
+    "If it is finished, send your final message; it must begin with one of: " +
+    `${markers.join(", ")}.`
+  );
+}
 
 /** The most narration re-prompts in one one-shot run (the compaction retry
  *  included). Its own budget, separate from the reasoning-only one. A CONSTANT,
