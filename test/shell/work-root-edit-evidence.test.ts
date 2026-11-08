@@ -1070,24 +1070,43 @@ describe("completion gate under a declared work root", () => {
     });
   });
 
-  it("records the directories excluded by the cap in the no_edit_no_blocked outcome", async () => {
-    for (let i = 0; i < WORK_ROOT_MAX_CHILD_DIRECTORIES + 2; i++) {
-      mkdirSync(join(workRoot, `child-${i}`));
-    }
-    const result = await run([]);
-    expect(result.noEditNoBlocked).toBe(true);
-    const runsDir = join(agentsRoot, "builder", "runs");
-    const records = readdirSync(runsDir)
-      .filter((name) => name.endsWith(".jsonl"))
-      .flatMap((name) => readFileSync(join(runsDir, name), "utf8").trim().split("\n"))
-      .map((line) => JSON.parse(line));
-    expect(
-      records.find((record) => record.outcome?.reason === "no_edit_no_blocked")?.outcome,
-    ).toEqual({
-      reason: "no_edit_no_blocked",
-      workRootDirectoriesNotExamined: 2,
-    });
-  });
+  it.each([0, 1, 2])(
+    "records launch-cap exclusions after removing %i earlier children",
+    async (removed) => {
+      for (let i = 0; i < WORK_ROOT_MAX_CHILD_DIRECTORIES; i++) {
+        mkdirSync(join(workRoot, `child-${i}`));
+      }
+      const repo = join(workRoot, "z-repo");
+      init(repo);
+      init(join(workRoot, "z-second"));
+      const result = await run([
+        {
+          toolName: "run",
+          action: () => {
+            for (let i = 0; i < removed; i++) {
+              rmSync(join(workRoot, `child-${i}`), { recursive: true });
+            }
+            writeFileSync(join(repo, "tracked"), "edited\n");
+            seedSuccessor(repo);
+          },
+        },
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.noEditNoBlocked).toBe(true);
+      const runsDir = join(agentsRoot, "builder", "runs");
+      const records = readdirSync(runsDir)
+        .filter((name) => name.endsWith(".jsonl"))
+        .flatMap((name) => readFileSync(join(runsDir, name), "utf8").trim().split("\n"))
+        .map((line) => JSON.parse(line));
+      expect(
+        records.find((record) => record.outcome?.reason === "no_edit_no_blocked")?.outcome,
+      ).toEqual({
+        reason: "no_edit_no_blocked",
+        workRootDirectoriesNotExamined: 2,
+      });
+    },
+    30_000,
+  );
 
   it("marks the over-bound directory unknown", () => {
     init(join(workRoot, "z-repo"));

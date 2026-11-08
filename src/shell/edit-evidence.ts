@@ -623,7 +623,7 @@ export type WorkTreeLaunchState =
     }
   | { kind: "not a repo"; emptyAtLaunch: boolean }
   | { kind: "unborn" }
-  | { kind: "unknown" };
+  | { kind: "unknown"; excludedByCap?: true };
 
 export interface WorkRootLaunchSnapshot {
   root: string;
@@ -838,7 +838,9 @@ export function captureWorkRootSnapshot(
     directoryNames.set(directoryId, name);
     trees.set(
       name,
-      index >= maxChildren ? { kind: "unknown" } : captureWorkTree(join(root, name), timeoutMs),
+      index >= maxChildren
+        ? { kind: "unknown", excludedByCap: true }
+        : captureWorkTree(join(root, name), timeoutMs),
     );
   }
   return { root, launchedAtSeconds, trees, directoryNames };
@@ -853,6 +855,8 @@ export function captureWorkRootSnapshot(
  * states never count. New children are checked first in name order; launch
  * children fill remaining maxChildDirectories slots in name order. Qualifying
  * trees may be unrelated to the task. Reflog labels and local times can be forged.
+ * Failed edit gates report cap exclusions in a best-effort outcome record when
+ * the run log is available.
  */
 export function isWorkRootEditVerified(
   snapshot: WorkRootLaunchSnapshot,
@@ -893,7 +897,11 @@ export function checkWorkRootEditEvidence(
     ...newChildren.slice(0, maxChildren),
     ...launchChildren.slice(0, Math.max(0, maxChildren - newChildren.length)),
   ];
-  result.notExamined = launchChildren.length + newChildren.length - candidates.length;
+  result.notExamined =
+    launchChildren.length +
+    newChildren.length -
+    candidates.length +
+    candidates.filter(({ launch }) => launch?.kind === "unknown" && launch.excludedByCap).length;
   for (const { name, launch } of candidates) {
     if (launch?.kind === "unknown" || launch?.kind === "unborn") continue;
     const path = join(snapshot.root, name);
