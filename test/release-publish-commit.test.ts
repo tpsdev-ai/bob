@@ -2,7 +2,7 @@
 // it unless it is on main. A manual dispatch must use the v<version> tag's
 // commit, not the dispatched ref's commit; the workflow test below pins that
 // every job after the guard checks out the guard's output sha.
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -19,6 +19,7 @@ import { parse as parseYaml } from "yaml";
 
 const REPO = join(import.meta.dir, "..");
 const WORKFLOW = join(REPO, ".github", "workflows", "release-publish.yml");
+const WORKFLOW_FIXTURE = join(REPO, "test", "fixtures", "release-publish.workflow.json");
 const SCRIPT = join(REPO, "scripts", "resolve-release-commit.mjs");
 const VERIFY_TAG = join(REPO, "scripts", "verify-release-tag.mjs");
 const EXTRACT = join(REPO, "scripts", "changelog-extract.mjs");
@@ -639,597 +640,623 @@ const REQUIRED_STEPS = [
   ["github-release", EXTRACT_STEP, CREATE_RELEASE],
 ] as const;
 
-test.each(REQUIRED_STEPS)("%s requires %s before %s", (job, step, before) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertRequiredStep(workflow, job, step, before);
+test("the parsed release workflow matches the committed fixture", () => {
+  expect(
+    parseYaml(readFileSync(WORKFLOW, "utf8")),
+    "release-publish.yml changed; update test/fixtures/release-publish.workflow.json in the same PR on purpose",
+  ).toEqual(JSON.parse(readFileSync(WORKFLOW_FIXTURE, "utf8")));
 });
 
-for (const [job, step, before] of REQUIRED_STEPS) {
-  test.each(["workflow", "job", "step"])(`${step} refuses a %s shell override`, (scope) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const required = assertRequiredStep(workflow, job, step, before);
-    if (scope === "step") Object.assign(required, { shell: "echo {0}" });
-    else {
-      Object.assign(scope === "workflow" ? workflow : workflow.jobs?.[job], {
-        defaults: { run: { shell: "echo {0}" } },
+describe.each(["live workflow", "committed fixture"])("%s semantics", (source) => {
+  const loadWorkflow = (): Workflow =>
+    source === "live workflow"
+      ? (parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow)
+      : (JSON.parse(readFileSync(WORKFLOW_FIXTURE, "utf8")) as Workflow);
+
+  test.each(REQUIRED_STEPS)("%s requires %s before %s", (job, step, before) => {
+    const workflow = loadWorkflow();
+    assertRequiredStep(workflow, job, step, before);
+  });
+
+  for (const [job, step, before] of REQUIRED_STEPS) {
+    test.each(["workflow", "job", "step"])(`${step} refuses a %s shell override`, (scope) => {
+      const workflow = loadWorkflow();
+      const required = assertRequiredStep(workflow, job, step, before);
+      if (scope === "step") Object.assign(required, { shell: "echo {0}" });
+      else {
+        Object.assign(scope === "workflow" ? workflow : workflow.jobs?.[job], {
+          defaults: { run: { shell: "echo {0}" } },
+        });
+      }
+      expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    });
+
+    test.each([
+      ["if", false],
+      ["if", "github.event_name == 'push'"],
+      ["continue-on-error", true],
+      ["continue-on-error", false],
+    ] as const)(`${step} refuses %s: %j`, (key, value) => {
+      const workflow = loadWorkflow();
+      const required = assertRequiredStep(workflow, job, step, before);
+      required[key] = value;
+      expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    });
+
+    test(`${job} refuses continue-on-error for ${step}`, () => {
+      const workflow = loadWorkflow();
+      const spec = workflow.jobs?.[job];
+      if (spec === undefined) throw new Error(`Missing ${job}`);
+      spec["continue-on-error"] = true;
+      expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    });
+
+    test(`${job} refuses a job condition for ${step}`, () => {
+      const workflow = loadWorkflow();
+      const spec = workflow.jobs?.[job];
+      if (spec === undefined) throw new Error(`Missing ${job}`);
+      Object.assign(spec, { if: false });
+      expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    });
+
+    test(`${step} refuses placement after ${before}`, () => {
+      const workflow = loadWorkflow();
+      const required = assertRequiredStep(workflow, job, step, before);
+      const steps = workflow.jobs?.[job]?.steps ?? [];
+      steps.splice(steps.indexOf(required), 1);
+      steps.splice(steps.findIndex((candidate) => candidate.name === before) + 1, 0, required);
+      expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    });
+  }
+
+  test.each(["create", "edit"])(
+    "tag comparison refuses an earlier gh release %s step",
+    (command) => {
+      const workflow = loadWorkflow();
+      const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+      const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+      steps.splice(steps.indexOf(required), 0, {
+        name: "Early release",
+        run: `gh release ${command} "$TAG"`,
       });
+      expect(() =>
+        assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE),
+      ).toThrow();
+    },
+  );
+
+  test.each([
+    "renamed conditional verifier",
+    "renamed failure-tolerant verifier",
+    "failure-tolerant verifier",
+    "duplicate name",
+    "duplicate command",
+    "wrong env",
+  ])("tag comparison refuses %s", (mutation) => {
+    const workflow = loadWorkflow();
+    const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+    const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+    if (
+      mutation === "renamed conditional verifier" ||
+      mutation === "renamed failure-tolerant verifier"
+    ) {
+      required.name = "Renamed verifier";
+      if (mutation === "renamed conditional verifier") required.if = false;
+      else required["continue-on-error"] = true;
+      steps.splice(steps.indexOf(required), 0, { name: TAG_CHECK, run: "echo verified" });
+    } else if (mutation === "failure-tolerant verifier") {
+      required["continue-on-error"] = true;
+    } else if (mutation === "duplicate name") {
+      steps.push({ name: TAG_CHECK, run: "echo verified" });
+    } else if (mutation === "duplicate command") {
+      steps.push({ name: "Duplicate verifier", run: TAG_COMMAND, env: required.env });
+    } else {
+      required.env = { TAG: GUARD_TAG, EXPECTED_SHA: INPUT_VERSION };
     }
-    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    expect(() =>
+      assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE),
+    ).toThrow();
+  });
+
+  test("workflow version script accepts a matching package and refuses a mismatch", () => {
+    const workflow = loadWorkflow();
+    assertVersionCheck(workflow);
+  });
+
+  test.each(["exit 0", "echo verified"])(
+    "version check refuses a script bypass: %s",
+    (mutation) => {
+      const workflow = loadWorkflow();
+      const step = assertRequiredStep(workflow, "stage-publish", VERSION_CHECK, "Stage-publish");
+      step.run = mutation === "exit 0" ? `exit 0\n${step.run}` : "echo verified";
+      expect(() => assertVersionCheck(workflow)).toThrow();
+    },
+  );
+
+  test("changelog extraction writes the release notes file", () => {
+    const workflow = loadWorkflow();
+    assertChangelogExtraction(workflow);
   });
 
   test.each([
-    ["if", false],
-    ["if", "github.event_name == 'push'"],
-    ["continue-on-error", true],
-    ["continue-on-error", false],
-  ] as const)(`${step} refuses %s: %j`, (key, value) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const required = assertRequiredStep(workflow, job, step, before);
-    required[key] = value;
-    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
+    ["run", 'echo "Release v$VERSION" > release-notes.md'],
+    ["run", 'node scripts/changelog-extract.mjs "1.2.3" CHANGELOG.md > release-notes.md'],
+    ["run", 'node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > different-notes.md'],
+    ["env", { VERSION: INPUT_VERSION }],
+  ] as const)("changelog extraction refuses mismatched %s: %j", (key, value) => {
+    const workflow = loadWorkflow();
+    assertChangelogExtraction(workflow);
+    const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
+    Object.assign(extract, { [key]: value });
+    expect(() => assertChangelogExtraction(workflow)).toThrow();
   });
 
-  test(`${job} refuses continue-on-error for ${step}`, () => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const spec = workflow.jobs?.[job];
-    if (spec === undefined) throw new Error(`Missing ${job}`);
-    spec["continue-on-error"] = true;
-    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
-  });
-
-  test(`${job} refuses a job condition for ${step}`, () => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const spec = workflow.jobs?.[job];
-    if (spec === undefined) throw new Error(`Missing ${job}`);
-    Object.assign(spec, { if: false });
-    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
-  });
-
-  test(`${step} refuses placement after ${before}`, () => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const required = assertRequiredStep(workflow, job, step, before);
-    const steps = workflow.jobs?.[job]?.steps ?? [];
-    steps.splice(steps.indexOf(required), 1);
-    steps.splice(steps.findIndex((candidate) => candidate.name === before) + 1, 0, required);
-    expect(() => assertRequiredStep(workflow, job, step, before)).toThrow();
-  });
-}
-
-test.each(["create", "edit"])("tag comparison refuses an earlier gh release %s step", (command) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
-  const steps = workflow.jobs?.["github-release"]?.steps ?? [];
-  steps.splice(steps.indexOf(required), 0, {
-    name: "Early release",
-    run: `gh release ${command} "$TAG"`,
-  });
-  expect(() => assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE)).toThrow();
-});
-
-test.each([
-  "renamed conditional verifier",
-  "renamed failure-tolerant verifier",
-  "failure-tolerant verifier",
-  "duplicate name",
-  "duplicate command",
-  "wrong env",
-])("tag comparison refuses %s", (mutation) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const required = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
-  const steps = workflow.jobs?.["github-release"]?.steps ?? [];
-  if (
-    mutation === "renamed conditional verifier" ||
-    mutation === "renamed failure-tolerant verifier"
-  ) {
-    required.name = "Renamed verifier";
-    if (mutation === "renamed conditional verifier") required.if = false;
-    else required["continue-on-error"] = true;
-    steps.splice(steps.indexOf(required), 0, { name: TAG_CHECK, run: "echo verified" });
-  } else if (mutation === "failure-tolerant verifier") {
-    required["continue-on-error"] = true;
-  } else if (mutation === "duplicate name") {
-    steps.push({ name: TAG_CHECK, run: "echo verified" });
-  } else if (mutation === "duplicate command") {
-    steps.push({ name: "Duplicate verifier", run: TAG_COMMAND, env: required.env });
-  } else {
-    required.env = { TAG: GUARD_TAG, EXPECTED_SHA: INPUT_VERSION };
-  }
-  expect(() => assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE)).toThrow();
-});
-
-test("workflow version script accepts a matching package and refuses a mismatch", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertVersionCheck(workflow);
-});
-
-test.each(["exit 0", "echo verified"])("version check refuses a script bypass: %s", (mutation) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const step = assertRequiredStep(workflow, "stage-publish", VERSION_CHECK, "Stage-publish");
-  step.run = mutation === "exit 0" ? `exit 0\n${step.run}` : "echo verified";
-  expect(() => assertVersionCheck(workflow)).toThrow();
-});
-
-test("changelog extraction writes the release notes file", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertChangelogExtraction(workflow);
-});
-
-test.each([
-  ["run", 'echo "Release v$VERSION" > release-notes.md'],
-  ["run", 'node scripts/changelog-extract.mjs "1.2.3" CHANGELOG.md > release-notes.md'],
-  ["run", 'node scripts/changelog-extract.mjs "$VERSION" CHANGELOG.md > different-notes.md'],
-  ["env", { VERSION: INPUT_VERSION }],
-] as const)("changelog extraction refuses mismatched %s: %j", (key, value) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertChangelogExtraction(workflow);
-  const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
-  Object.assign(extract, { [key]: value });
-  expect(() => assertChangelogExtraction(workflow)).toThrow();
-});
-
-test.each([
-  {
-    name: "an extra extraction env key",
-    step: EXTRACT_STEP,
-    key: "env",
-    value: { VERSION: GUARD_VERSION, GH_TOKEN: "$" + "{{ github.token }}" },
-  },
-  {
-    name: "a release-creating extraction line",
-    step: EXTRACT_STEP,
-    key: "run",
-    value: `${EXTRACT_COMMAND}gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"\n`,
-  },
-  {
-    name: "an extraction PATH shim",
-    step: EXTRACT_STEP,
-    key: "run",
-    value: `${EXTRACT_COMMAND}echo "$PWD/shims" >> "$GITHUB_PATH"\n`,
-  },
-  {
-    name: "an extra create env key",
-    step: CREATE_RELEASE,
-    key: "env",
-    value: {
-      GH_TOKEN: "$" + "{{ github.token }}",
-      TAG: GUARD_TAG,
-      VERSION: GUARD_VERSION,
-      EXTRA: "value",
-    },
-  },
-  {
-    name: "a trailing create line",
-    step: CREATE_RELEASE,
-    key: "run",
-    value: `${CREATE_RELEASE_COMMAND}echo trailing\n`,
-  },
-])("release command pins refuse $name", ({ step, key, value }) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertChangelogExtraction(workflow);
-  const target = workflow.jobs?.["github-release"]?.steps?.find(
-    (candidate) => candidate.name === step,
-  );
-  Object.assign(target ?? {}, { [key]: value });
-  expect(() => assertChangelogExtraction(workflow)).toThrow();
-});
-
-// A checkout step is identified by the action it runs, not by the pin after the
-// `@`: GitHub resolves the owner and repository case-insensitively, so
-// `Actions/checkout@<sha>` runs the checkout action. The pin itself must be a
-// full commit sha, which check-action-pins.mjs enforces.
-function isCheckout(step: Step): boolean {
-  const uses = step.uses ?? "";
-  const at = uses.indexOf("@");
-  return at > 0 && uses.slice(0, at).toLowerCase() === "actions/checkout";
-}
-
-const FORBIDDEN_INTERPOLATIONS: ReadonlyArray<{ expression: string; pattern: RegExp }> = [
-  { expression: "$" + "{{ github.ref_name }}", pattern: /\$\{\{\s*github\.ref_name\s*\}\}/ },
-  { expression: "$" + "{{ github.ref }}", pattern: /\$\{\{\s*github\.ref\s*\}\}/ },
-  { expression: "$" + "{{ inputs.* }}", pattern: /\$\{\{\s*inputs\.[^}]*\}\}/ },
-];
-
-// Every `${{ }}` expression in a `run:` body or a `with:` value must be listed
-// here, compared on whitespace-normalised text. A run body takes no
-// branch- or input-derived value: those go through `env:`, which puts the value
-// in the environment rather than in the script text, and the command quotes the
-// variable.
-const ALLOWED_IN_RUN: readonly string[] = [];
-
-const ALLOWED_IN_WITH: ReadonlyArray<{ expression: string; keys: readonly string[] }> = [
-  // The guard's verified sha, as a checkout `ref`: the commit a later job
-  // builds and stages is the one the guard checked is on main.
-  { expression: "needs.verify-ancestry.outputs.sha", keys: ["ref"] },
-  // Cache-key material: the runner OS and a lockfile hash, used to name a
-  // cache entry.
-  { expression: "runner.os", keys: ["key", "restore-keys"] },
-  { expression: "hashFiles('bun.lock')", keys: ["key"] },
-];
-
-function allowedWithExpressions(key: string): string[] {
-  return ALLOWED_IN_WITH.filter((entry) => entry.keys.includes(key)).map(
-    (entry) => entry.expression,
-  );
-}
-
-const EXPRESSION = /\$\{\{([\s\S]*?)\}\}/g;
-
-function expressionsIn(text: string): string[] {
-  return [...text.matchAll(EXPRESSION)].map((match) => match[1].replace(/\s+/g, " ").trim());
-}
-
-function stepLabel(step: Step, index: number): string {
-  return step.name ?? step.uses ?? `step ${index + 1}`;
-}
-
-// A `run:` body is command text and a `with:` value is passed to an action.
-// `env:` keeps a value out of the script text, and the command still has to
-// quote the variable.
-function interpolationProblems(job: string, step: Step, index: number): string[] {
-  const problems: string[] = [];
-  const check = (key: string, value: unknown, allowed: readonly string[]): void => {
-    if (typeof value !== "string") return;
-    for (const expression of expressionsIn(value)) {
-      if (!allowed.includes(expression)) {
-        problems.push(`${job} / ${stepLabel(step, index)} / ${key}: ${expression}`);
-      }
-    }
-  };
-  if (step.run !== undefined) check("run", step.run, ALLOWED_IN_RUN);
-  for (const [key, value] of Object.entries(step.with ?? {})) {
-    check(key, value, allowedWithExpressions(key));
-  }
-  return problems;
-}
-
-function needsOf(job: Job | undefined): string[] {
-  if (job?.needs === undefined) return [];
-  return Array.isArray(job.needs) ? job.needs : [job.needs];
-}
-
-function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<string>()): boolean {
-  if (seen.has(name)) return false;
-  seen.add(name);
-  for (const need of needsOf(jobs[name])) {
-    if (need === GUARD_JOB || afterGuard(jobs, need, seen)) return true;
-  }
-  return false;
-}
-
-function assertReleaseStructure(workflow: Workflow): void {
-  expect(workflow.permissions).toEqual({ contents: "read" });
-  const jobs = workflow.jobs ?? {};
-  expect(Object.keys(jobs).sort()).toEqual(["github-release", "stage-publish", GUARD_JOB]);
-  expect(jobs[GUARD_JOB].permissions).toEqual({ contents: "read" });
-  expect(jobs["stage-publish"].permissions).toEqual({ "id-token": "write", contents: "read" });
-  expect(jobs["github-release"].permissions).toEqual({ contents: "write" });
-  for (const name of Object.keys(jobs)) {
-    if (name !== GUARD_JOB)
-      expect(afterGuard(jobs, name), `${name} must need the guard`).toBe(true);
-  }
-  expect(
-    (jobs["github-release"].steps ?? []).map(({ name, uses, run, env }) => ({
-      name,
-      uses,
-      run,
-      env,
-    })),
-  ).toEqual([
+  test.each([
     {
-      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-      run: undefined,
-      env: undefined,
+      name: "an extra extraction env key",
+      step: EXTRACT_STEP,
+      key: "env",
+      value: { VERSION: GUARD_VERSION, GH_TOKEN: "$" + "{{ github.token }}" },
     },
     {
-      uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
-      run: undefined,
-      env: undefined,
+      name: "a release-creating extraction line",
+      step: EXTRACT_STEP,
+      key: "run",
+      value: `${EXTRACT_COMMAND}gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"\n`,
     },
     {
-      name: "Lockfile release-age bake",
-      run: "bun --no-install scripts/check-lockfile-release-age.mjs",
-      env: undefined,
+      name: "an extraction PATH shim",
+      step: EXTRACT_STEP,
+      key: "run",
+      value: `${EXTRACT_COMMAND}echo "$PWD/shims" >> "$GITHUB_PATH"\n`,
     },
-    { name: EXTRACT_STEP, run: EXTRACT_COMMAND, env: { VERSION: GUARD_VERSION } },
-    { name: TAG_CHECK, run: TAG_COMMAND, env: { TAG: GUARD_TAG, EXPECTED_SHA: GUARD_SHA } },
     {
-      name: CREATE_RELEASE,
-      run: CREATE_RELEASE_COMMAND,
-      env: {
+      name: "an extra create env key",
+      step: CREATE_RELEASE,
+      key: "env",
+      value: {
         GH_TOKEN: "$" + "{{ github.token }}",
         TAG: GUARD_TAG,
         VERSION: GUARD_VERSION,
+        EXTRA: "value",
       },
     },
-  ]);
-}
-
-test("every github-release step body and env map is equality-pinned with permissions and guard dependencies", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertReleaseStructure(workflow);
-});
-
-test.each([
-  {
-    name: "Early API release",
-    run: 'gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"',
-  },
-  { name: "Early action release", uses: "softprops/action-gh-release@v2" },
-])("release structure refuses an added $name step", (step) => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertReleaseStructure(workflow);
-  workflow.jobs?.["github-release"]?.steps?.splice(3, 0, step);
-  expect(() => assertReleaseStructure(workflow)).toThrow();
-});
-
-test("release structure refuses a new contents-write job without the guard", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertReleaseStructure(workflow);
-  Object.assign(workflow.jobs ?? {}, {
-    "early-release": {
-      permissions: { contents: "write" },
-      steps: [{ run: 'gh release create "$TAG"' }],
+    {
+      name: "a trailing create line",
+      step: CREATE_RELEASE,
+      key: "run",
+      value: `${CREATE_RELEASE_COMMAND}echo trailing\n`,
     },
+  ])("release command pins refuse $name", ({ step, key, value }) => {
+    const workflow = loadWorkflow();
+    assertChangelogExtraction(workflow);
+    const target = workflow.jobs?.["github-release"]?.steps?.find(
+      (candidate) => candidate.name === step,
+    );
+    Object.assign(target ?? {}, { [key]: value });
+    expect(() => assertChangelogExtraction(workflow)).toThrow();
   });
-  expect(() => assertReleaseStructure(workflow)).toThrow();
-});
 
-test.each(["workflow", GUARD_JOB, "stage-publish", "github-release"])(
-  "release structure refuses changed %s permissions",
-  (scope) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  // A checkout step is identified by the action it runs, not by the pin after the
+  // `@`: GitHub resolves the owner and repository case-insensitively, so
+  // `Actions/checkout@<sha>` runs the checkout action. The pin itself must be a
+  // full commit sha, which check-action-pins.mjs enforces.
+  function isCheckout(step: Step): boolean {
+    const uses = step.uses ?? "";
+    const at = uses.indexOf("@");
+    return at > 0 && uses.slice(0, at).toLowerCase() === "actions/checkout";
+  }
+
+  const FORBIDDEN_INTERPOLATIONS: ReadonlyArray<{ expression: string; pattern: RegExp }> = [
+    { expression: "$" + "{{ github.ref_name }}", pattern: /\$\{\{\s*github\.ref_name\s*\}\}/ },
+    { expression: "$" + "{{ github.ref }}", pattern: /\$\{\{\s*github\.ref\s*\}\}/ },
+    { expression: "$" + "{{ inputs.* }}", pattern: /\$\{\{\s*inputs\.[^}]*\}\}/ },
+  ];
+
+  // Every `${{ }}` expression in a `run:` body or a `with:` value must be listed
+  // here, compared on whitespace-normalised text. A run body takes no
+  // branch- or input-derived value: those go through `env:`, which puts the value
+  // in the environment rather than in the script text, and the command quotes the
+  // variable.
+  const ALLOWED_IN_RUN: readonly string[] = [];
+
+  const ALLOWED_IN_WITH: ReadonlyArray<{ expression: string; keys: readonly string[] }> = [
+    // The guard's verified sha, as a checkout `ref`: the commit a later job
+    // builds and stages is the one the guard checked is on main.
+    { expression: "needs.verify-ancestry.outputs.sha", keys: ["ref"] },
+    // Cache-key material: the runner OS and a lockfile hash, used to name a
+    // cache entry.
+    { expression: "runner.os", keys: ["key", "restore-keys"] },
+    { expression: "hashFiles('bun.lock')", keys: ["key"] },
+  ];
+
+  function allowedWithExpressions(key: string): string[] {
+    return ALLOWED_IN_WITH.filter((entry) => entry.keys.includes(key)).map(
+      (entry) => entry.expression,
+    );
+  }
+
+  const EXPRESSION = /\$\{\{([\s\S]*?)\}\}/g;
+
+  function expressionsIn(text: string): string[] {
+    return [...text.matchAll(EXPRESSION)].map((match) => match[1].replace(/\s+/g, " ").trim());
+  }
+
+  function stepLabel(step: Step, index: number): string {
+    return step.name ?? step.uses ?? `step ${index + 1}`;
+  }
+
+  // A `run:` body is command text and a `with:` value is passed to an action.
+  // `env:` keeps a value out of the script text, and the command still has to
+  // quote the variable.
+  function interpolationProblems(job: string, step: Step, index: number): string[] {
+    const problems: string[] = [];
+    const check = (key: string, value: unknown, allowed: readonly string[]): void => {
+      if (typeof value !== "string") return;
+      for (const expression of expressionsIn(value)) {
+        if (!allowed.includes(expression)) {
+          problems.push(`${job} / ${stepLabel(step, index)} / ${key}: ${expression}`);
+        }
+      }
+    };
+    if (step.run !== undefined) check("run", step.run, ALLOWED_IN_RUN);
+    for (const [key, value] of Object.entries(step.with ?? {})) {
+      check(key, value, allowedWithExpressions(key));
+    }
+    return problems;
+  }
+
+  function needsOf(job: Job | undefined): string[] {
+    if (job?.needs === undefined) return [];
+    return Array.isArray(job.needs) ? job.needs : [job.needs];
+  }
+
+  function afterGuard(jobs: Record<string, Job>, name: string, seen = new Set<string>()): boolean {
+    if (seen.has(name)) return false;
+    seen.add(name);
+    for (const need of needsOf(jobs[name])) {
+      if (need === GUARD_JOB || afterGuard(jobs, need, seen)) return true;
+    }
+    return false;
+  }
+
+  function assertReleaseStructure(workflow: Workflow): void {
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    const jobs = workflow.jobs ?? {};
+    expect(Object.keys(jobs).sort()).toEqual(["github-release", "stage-publish", GUARD_JOB]);
+    expect(jobs[GUARD_JOB].permissions).toEqual({ contents: "read" });
+    expect(jobs["stage-publish"].permissions).toEqual({ "id-token": "write", contents: "read" });
+    expect(jobs["github-release"].permissions).toEqual({ contents: "write" });
+    for (const name of Object.keys(jobs)) {
+      if (name !== GUARD_JOB)
+        expect(afterGuard(jobs, name), `${name} must need the guard`).toBe(true);
+    }
+    expect(
+      (jobs["github-release"].steps ?? []).map(({ name, uses, run, env }) => ({
+        name,
+        uses,
+        run,
+        env,
+      })),
+    ).toEqual([
+      {
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        run: undefined,
+        env: undefined,
+      },
+      {
+        uses: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+        run: undefined,
+        env: undefined,
+      },
+      {
+        name: "Lockfile release-age bake",
+        run: "bun --no-install scripts/check-lockfile-release-age.mjs",
+        env: undefined,
+      },
+      { name: EXTRACT_STEP, run: EXTRACT_COMMAND, env: { VERSION: GUARD_VERSION } },
+      { name: TAG_CHECK, run: TAG_COMMAND, env: { TAG: GUARD_TAG, EXPECTED_SHA: GUARD_SHA } },
+      {
+        name: CREATE_RELEASE,
+        run: CREATE_RELEASE_COMMAND,
+        env: {
+          GH_TOKEN: "$" + "{{ github.token }}",
+          TAG: GUARD_TAG,
+          VERSION: GUARD_VERSION,
+        },
+      },
+    ]);
+  }
+
+  test("every github-release step body and env map is equality-pinned with permissions and guard dependencies", () => {
+    const workflow = loadWorkflow();
     assertReleaseStructure(workflow);
-    const target = scope === "workflow" ? workflow : workflow.jobs?.[scope];
-    Object.assign(target ?? {}, {
-      permissions:
-        scope === "github-release"
-          ? { contents: "write", actions: "write" }
-          : { contents: "write" },
+  });
+
+  test.each([
+    {
+      name: "Early API release",
+      run: 'gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG"',
+    },
+    { name: "Early action release", uses: "softprops/action-gh-release@v2" },
+  ])("release structure refuses an added $name step", (step) => {
+    const workflow = loadWorkflow();
+    assertReleaseStructure(workflow);
+    workflow.jobs?.["github-release"]?.steps?.splice(3, 0, step);
+    expect(() => assertReleaseStructure(workflow)).toThrow();
+  });
+
+  test("release structure refuses a new contents-write job without the guard", () => {
+    const workflow = loadWorkflow();
+    assertReleaseStructure(workflow);
+    Object.assign(workflow.jobs ?? {}, {
+      "early-release": {
+        permissions: { contents: "write" },
+        steps: [{ run: 'gh release create "$TAG"' }],
+      },
     });
     expect(() => assertReleaseStructure(workflow)).toThrow();
-  },
-);
+  });
 
-test("release structure refuses missing workflow permissions", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertReleaseStructure(workflow);
-  delete workflow.permissions;
-  expect(() => assertReleaseStructure(workflow)).toThrow();
-});
+  test.each(["workflow", GUARD_JOB, "stage-publish", "github-release"])(
+    "release structure refuses changed %s permissions",
+    (scope) => {
+      const workflow = loadWorkflow();
+      assertReleaseStructure(workflow);
+      const target = scope === "workflow" ? workflow : workflow.jobs?.[scope];
+      Object.assign(target ?? {}, {
+        permissions:
+          scope === "github-release"
+            ? { contents: "write", actions: "write" }
+            : { contents: "write" },
+      });
+      expect(() => assertReleaseStructure(workflow)).toThrow();
+    },
+  );
 
-test.each(["stage-publish", "github-release"])(
-  "release structure refuses %s without a guard dependency",
-  (name) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  test("release structure refuses missing workflow permissions", () => {
+    const workflow = loadWorkflow();
     assertReleaseStructure(workflow);
-    const job = workflow.jobs?.[name];
-    if (job === undefined) throw new Error(`Missing ${name}`);
-    delete job.needs;
+    delete workflow.permissions;
     expect(() => assertReleaseStructure(workflow)).toThrow();
-  },
-);
+  });
 
-test.each(["removed", "reordered", "renamed", "re-pointed"])(
-  "release structure refuses a %s GitHub release step",
-  (mutation) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    assertReleaseStructure(workflow);
-    const steps = workflow.jobs?.["github-release"]?.steps ?? [];
-    if (mutation === "removed") steps.splice(2, 1);
-    else if (mutation === "reordered") [steps[2], steps[3]] = [steps[3], steps[2]];
-    else if (mutation === "renamed") steps[2].name = "Renamed bake";
-    else steps[0].uses = "actions/checkout@main";
-    expect(() => assertReleaseStructure(workflow)).toThrow();
-  },
-);
+  test.each(["stage-publish", "github-release"])(
+    "release structure refuses %s without a guard dependency",
+    (name) => {
+      const workflow = loadWorkflow();
+      assertReleaseStructure(workflow);
+      const job = workflow.jobs?.[name];
+      if (job === undefined) throw new Error(`Missing ${name}`);
+      delete job.needs;
+      expect(() => assertReleaseStructure(workflow)).toThrow();
+    },
+  );
 
-function assertGuardJobConditions(workflow: Workflow): void {
-  const jobs = workflow.jobs ?? {};
-  for (const [name, job] of Object.entries(jobs)) {
-    if (name === GUARD_JOB || afterGuard(jobs, name)) {
-      expect(job, name).not.toHaveProperty("if");
-    }
-  }
-}
+  test.each(["removed", "reordered", "renamed", "re-pointed"])(
+    "release structure refuses a %s GitHub release step",
+    (mutation) => {
+      const workflow = loadWorkflow();
+      assertReleaseStructure(workflow);
+      const steps = workflow.jobs?.["github-release"]?.steps ?? [];
+      if (mutation === "removed") steps.splice(2, 1);
+      else if (mutation === "reordered") [steps[2], steps[3]] = [steps[3], steps[2]];
+      else if (mutation === "renamed") steps[2].name = "Renamed bake";
+      else steps[0].uses = "actions/checkout@main";
+      expect(() => assertReleaseStructure(workflow)).toThrow();
+    },
+  );
 
-test("the guard and its dependent jobs carry no condition", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  assertGuardJobConditions(workflow);
-});
-
-test.each([GUARD_JOB, "stage-publish", "github-release", "indirect-release"])(
-  "%s refuses a job condition in the guard graph",
-  (name) => {
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
+  function assertGuardJobConditions(workflow: Workflow): void {
     const jobs = workflow.jobs ?? {};
-    jobs["indirect-release"] = { needs: "github-release" };
-    assertGuardJobConditions(workflow);
-    Object.assign(jobs[name], { if: false });
-    expect(() => assertGuardJobConditions(workflow)).toThrow();
-  },
-);
-
-test("every release-publish checkout leaves no credentials in .git/config", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const checkouts = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
-    (spec.steps ?? []).filter((step) => isCheckout(step)).map((step) => ({ job, step })),
-  );
-  expect(checkouts.length).toBeGreaterThan(0);
-  for (const { job, step } of checkouts) {
-    expect(step.with?.["persist-credentials"], `${job} checkout keeps the token`).toBe(false);
-  }
-});
-
-test("every job after the guard checks out the guard's output sha", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const jobs = workflow.jobs ?? {};
-  const guard = jobs[GUARD_JOB];
-  expect(guard).toBeDefined();
-  const guardStep = guard?.steps?.find(
-    (step) => step.run === "bun --no-install scripts/resolve-release-commit.mjs",
-  );
-  expect(guardStep?.id).toBeDefined();
-  expect(guard?.outputs?.sha).toBe(`\${{ steps.${guardStep?.id}.outputs.sha }}`);
-  expect(guard?.outputs?.version).toBe(`\${{ steps.${guardStep?.id}.outputs.version }}`);
-  expect(guard?.outputs?.tag).toBe(`\${{ steps.${guardStep?.id}.outputs.tag }}`);
-  // The manual path reads the version input; the tag-push path reads the
-  // runner's own GITHUB_REF, so VERSION is the only env the step maps.
-  expect(guardStep?.env?.VERSION).toBe(INPUT_VERSION);
-  // A manual dispatch resolves from the v<version> tag, not from the run's ref;
-  // the guard is not itself pinned to a ref that came from a job output.
-  const guardCheckouts = (guard?.steps ?? []).filter((step) => isCheckout(step));
-  expect(guardCheckouts.length).toBe(1);
-  expect("ref" in (guardCheckouts[0].with ?? {})).toBe(false);
-
-  const dependents = Object.keys(jobs).filter(
-    (name) => name !== GUARD_JOB && afterGuard(jobs, name),
-  );
-  expect(dependents.sort()).toEqual(["github-release", "stage-publish"]);
-  for (const name of dependents) {
-    const checkouts = (jobs[name].steps ?? []).filter((step) => isCheckout(step));
-    expect(checkouts.length, `${name} has no checkout`).toBeGreaterThan(0);
-    for (const step of checkouts) {
-      expect(step.with?.ref, `${name} must check out the guard's sha`).toBe(GUARD_SHA);
-      const ref = String(step.with?.ref ?? "");
-      expect(ref).not.toContain("github.sha");
-      expect(ref).not.toContain("github.ref_name");
-    }
-  }
-});
-
-test("run bodies and with values hold no expression outside the allowlist", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const problems = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
-    (spec.steps ?? []).flatMap((step, index) => interpolationProblems(job, step, index)),
-  );
-  expect(problems, `expressions outside the allowlist:\n${problems.join("\n")}`).toEqual([]);
-});
-
-test("stage-publish does not resolve the ref itself; the guard derives the version from GITHUB_REF on a tag push", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const stage = workflow.jobs?.["stage-publish"];
-  expect(stage).toBeDefined();
-  const steps = stage?.steps ?? [];
-
-  for (const [index, step] of steps.entries()) {
-    for (const [key, value] of Object.entries(step.env ?? {})) {
-      for (const { expression, pattern } of FORBIDDEN_INTERPOLATIONS) {
-        expect(
-          pattern.test(String(value)),
-          `stage-publish ${stepLabel(step, index)} ${key} must not interpolate ${expression}`,
-        ).toBe(false);
+    for (const [name, job] of Object.entries(jobs)) {
+      if (name === GUARD_JOB || afterGuard(jobs, name)) {
+        expect(job, name).not.toHaveProperty("if");
       }
     }
   }
 
-  for (const name of ["Verify the package version matches the resolved version", "Summary"]) {
-    const step = steps.find((candidate) => candidate.name === name);
-    expect(step, `${name} is missing`).toBeDefined();
-    expect(step?.env?.VERSION, `${name} must take the guard's version`).toBe(GUARD_VERSION);
-  }
-});
+  test("the guard and its dependent jobs carry no condition", () => {
+    const workflow = loadWorkflow();
+    assertGuardJobConditions(workflow);
+  });
 
-test("the GitHub release job takes its version and tag from the guard outputs", () => {
-  const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-  const jobs = workflow.jobs ?? {};
-  const release = jobs["github-release"];
-  expect(release).toBeDefined();
-  // A tag push must not be the only release path.
-  expect(release?.if).toBeUndefined();
+  test.each([GUARD_JOB, "stage-publish", "github-release", "indirect-release"])(
+    "%s refuses a job condition in the guard graph",
+    (name) => {
+      const workflow = loadWorkflow();
+      const jobs = workflow.jobs ?? {};
+      jobs["indirect-release"] = { needs: "github-release" };
+      assertGuardJobConditions(workflow);
+      Object.assign(jobs[name], { if: false });
+      expect(() => assertGuardJobConditions(workflow)).toThrow();
+    },
+  );
 
-  const steps = release?.steps ?? [];
-  for (const step of steps) {
-    for (const [key, value] of Object.entries(step.env ?? {})) {
-      expect(
-        String(value),
-        `${step.name ?? step.uses} ${key} must not read the dispatched ref`,
-      ).not.toContain("github.ref_name");
+  test("every release-publish checkout leaves no credentials in .git/config", () => {
+    const workflow = loadWorkflow();
+    const checkouts = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
+      (spec.steps ?? []).filter((step) => isCheckout(step)).map((step) => ({ job, step })),
+    );
+    expect(checkouts.length).toBeGreaterThan(0);
+    for (const { job, step } of checkouts) {
+      expect(step.with?.["persist-credentials"], `${job} checkout keeps the token`).toBe(false);
     }
+  });
+
+  test("every job after the guard checks out the guard's output sha", () => {
+    const workflow = loadWorkflow();
+    const jobs = workflow.jobs ?? {};
+    const guard = jobs[GUARD_JOB];
+    expect(guard).toBeDefined();
+    const guardStep = guard?.steps?.find(
+      (step) => step.run === "bun --no-install scripts/resolve-release-commit.mjs",
+    );
+    expect(guardStep?.id).toBeDefined();
+    expect(guard?.outputs?.sha).toBe(`\${{ steps.${guardStep?.id}.outputs.sha }}`);
+    expect(guard?.outputs?.version).toBe(`\${{ steps.${guardStep?.id}.outputs.version }}`);
+    expect(guard?.outputs?.tag).toBe(`\${{ steps.${guardStep?.id}.outputs.tag }}`);
+    // The manual path reads the version input; the tag-push path reads the
+    // runner's own GITHUB_REF, so VERSION is the only env the step maps.
+    expect(guardStep?.env?.VERSION).toBe(INPUT_VERSION);
+    // A manual dispatch resolves from the v<version> tag, not from the run's ref;
+    // the guard is not itself pinned to a ref that came from a job output.
+    const guardCheckouts = (guard?.steps ?? []).filter((step) => isCheckout(step));
+    expect(guardCheckouts.length).toBe(1);
+    expect("ref" in (guardCheckouts[0].with ?? {})).toBe(false);
+
+    const dependents = Object.keys(jobs).filter(
+      (name) => name !== GUARD_JOB && afterGuard(jobs, name),
+    );
+    expect(dependents.sort()).toEqual(["github-release", "stage-publish"]);
+    for (const name of dependents) {
+      const checkouts = (jobs[name].steps ?? []).filter((step) => isCheckout(step));
+      expect(checkouts.length, `${name} has no checkout`).toBeGreaterThan(0);
+      for (const step of checkouts) {
+        expect(step.with?.ref, `${name} must check out the guard's sha`).toBe(GUARD_SHA);
+        const ref = String(step.with?.ref ?? "");
+        expect(ref).not.toContain("github.sha");
+        expect(ref).not.toContain("github.ref_name");
+      }
+    }
+  });
+
+  test("run bodies and with values hold no expression outside the allowlist", () => {
+    const workflow = loadWorkflow();
+    const problems = Object.entries(workflow.jobs ?? {}).flatMap(([job, spec]) =>
+      (spec.steps ?? []).flatMap((step, index) => interpolationProblems(job, step, index)),
+    );
+    expect(problems, `expressions outside the allowlist:\n${problems.join("\n")}`).toEqual([]);
+  });
+
+  test("stage-publish does not resolve the ref itself; the guard derives the version from GITHUB_REF on a tag push", () => {
+    const workflow = loadWorkflow();
+    const stage = workflow.jobs?.["stage-publish"];
+    expect(stage).toBeDefined();
+    const steps = stage?.steps ?? [];
+
+    for (const [index, step] of steps.entries()) {
+      for (const [key, value] of Object.entries(step.env ?? {})) {
+        for (const { expression, pattern } of FORBIDDEN_INTERPOLATIONS) {
+          expect(
+            pattern.test(String(value)),
+            `stage-publish ${stepLabel(step, index)} ${key} must not interpolate ${expression}`,
+          ).toBe(false);
+        }
+      }
+    }
+
+    for (const name of ["Verify the package version matches the resolved version", "Summary"]) {
+      const step = steps.find((candidate) => candidate.name === name);
+      expect(step, `${name} is missing`).toBeDefined();
+      expect(step?.env?.VERSION, `${name} must take the guard's version`).toBe(GUARD_VERSION);
+    }
+  });
+
+  test("the GitHub release job takes its version and tag from the guard outputs", () => {
+    const workflow = loadWorkflow();
+    const jobs = workflow.jobs ?? {};
+    const release = jobs["github-release"];
+    expect(release).toBeDefined();
+    // A tag push must not be the only release path.
+    expect(release?.if).toBeUndefined();
+
+    const steps = release?.steps ?? [];
+    for (const step of steps) {
+      for (const [key, value] of Object.entries(step.env ?? {})) {
+        expect(
+          String(value),
+          `${step.name ?? step.uses} ${key} must not read the dispatched ref`,
+        ).not.toContain("github.ref_name");
+      }
+    }
+
+    const create = steps.find((step) => step.name === "Create or update GitHub release");
+    expect(create).toBeDefined();
+    expect(create?.env?.TAG).toBe(GUARD_TAG);
+    expect(create?.env?.VERSION).toBe(GUARD_VERSION);
+
+    const verifier = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
+    const verify = steps.indexOf(verifier);
+    const createAt = steps.indexOf(create as Step);
+    expect(verify, "the release job must call the tag check").toBeGreaterThanOrEqual(0);
+    expect(verify, "the tag check must precede the release command").toBeLessThan(createAt);
+    expect(steps[verify].env?.TAG).toBe(GUARD_TAG);
+    expect(steps[verify].env?.EXPECTED_SHA).toBe(GUARD_SHA);
+  });
+
+  function versionOutputKey(workflow: Workflow, job: string, stepName: string): string {
+    const step = (workflow.jobs?.[job]?.steps ?? []).find(
+      (candidate) => candidate.name === stepName,
+    );
+    const expression = String(step?.env?.VERSION ?? "");
+    const match = /needs\.verify-ancestry\.outputs\.([A-Za-z0-9_]+)/.exec(expression);
+    expect(match, `${stepName} VERSION is ${JSON.stringify(expression)}`).not.toBeNull();
+    return match?.[1] ?? "";
   }
 
-  const create = steps.find((step) => step.name === "Create or update GitHub release");
-  expect(create).toBeDefined();
-  expect(create?.env?.TAG).toBe(GUARD_TAG);
-  expect(create?.env?.VERSION).toBe(GUARD_VERSION);
+  test("the guard's written version feeds the real changelog extractor", () => {
+    const repo = makeRepo();
+    try {
+      git(repo.work, "tag", "v1.2.3");
+      const output = join(repo.root, "github-output");
+      writeFileSync(output, "");
+      const guarded = guard(repo, {
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        VERSION: "1.2.3",
+        GITHUB_ACTIONS: "true",
+        GITHUB_OUTPUT: output,
+      });
+      expect(guarded.status, guarded.stderr).toBe(0);
 
-  const verifier = assertRequiredStep(workflow, "github-release", TAG_CHECK, CREATE_RELEASE);
-  const verify = steps.indexOf(verifier);
-  const createAt = steps.indexOf(create as Step);
-  expect(verify, "the release job must call the tag check").toBeGreaterThanOrEqual(0);
-  expect(verify, "the tag check must precede the release command").toBeLessThan(createAt);
-  expect(steps[verify].env?.TAG).toBe(GUARD_TAG);
-  expect(steps[verify].env?.EXPECTED_SHA).toBe(GUARD_SHA);
+      // Read the version the resolver wrote under the key the release job's
+      // extractor step names, so a wrong key in either place fails this test.
+      const workflow = loadWorkflow();
+      const key = versionOutputKey(workflow, "github-release", "Extract CHANGELOG section");
+      const written = Object.fromEntries(
+        readFileSync(output, "utf8")
+          .split("\n")
+          .filter((line) => line.includes("="))
+          .map((line) => {
+            const at = line.indexOf("=");
+            return [line.slice(0, at), line.slice(at + 1)];
+          }),
+      );
+      const version = written[key] ?? "";
+      expect(version).toBe("1.2.3");
+
+      const changelog = join(repo.root, "CHANGELOG.md");
+      writeFileSync(
+        changelog,
+        "## [1.2.3] - 2026-01-01\n\n### Fixed\n\n- Something.\n\n## [1.2.2] - 2025-12-01\n\n- Older.\n",
+      );
+      const notesFile = assertChangelogExtraction(workflow);
+      const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
+      mkdirSync(join(repo.root, "scripts"));
+      copyFileSync(EXTRACT, join(repo.root, "scripts", "changelog-extract.mjs"));
+      const matched = spawnSync("bash", ["-c", extract.run ?? ""], {
+        cwd: repo.root,
+        env: { ...BASE_ENV, VERSION: version },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      expect(matched.status, matched.stderr).toBe(0);
+      const notes = readFileSync(join(repo.root, notesFile), "utf8");
+      expect(notes).toContain("### Fixed");
+      expect(notes).toContain("- Something.");
+      expect(notes).not.toContain("- Older.");
+
+      writeFileSync(changelog, "## [1.2.2] - 2025-12-01\n\n- Older.\n");
+      const missing = spawnSync("bash", ["-c", extract.run ?? ""], {
+        cwd: repo.root,
+        env: { ...BASE_ENV, VERSION: version },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      expect(missing.status).toBe(1);
+      expect(missing.stderr).toContain("changelog-extract: no '## [1.2.3]' section found");
+    } finally {
+      rmSync(repo.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
-
-function versionOutputKey(workflow: Workflow, job: string, stepName: string): string {
-  const step = (workflow.jobs?.[job]?.steps ?? []).find((candidate) => candidate.name === stepName);
-  const expression = String(step?.env?.VERSION ?? "");
-  const match = /needs\.verify-ancestry\.outputs\.([A-Za-z0-9_]+)/.exec(expression);
-  expect(match, `${stepName} VERSION is ${JSON.stringify(expression)}`).not.toBeNull();
-  return match?.[1] ?? "";
-}
-
-test("the guard's written version feeds the real changelog extractor", () => {
-  const repo = makeRepo();
-  try {
-    git(repo.work, "tag", "v1.2.3");
-    const output = join(repo.root, "github-output");
-    writeFileSync(output, "");
-    const guarded = guard(repo, {
-      GITHUB_EVENT_NAME: "workflow_dispatch",
-      VERSION: "1.2.3",
-      GITHUB_ACTIONS: "true",
-      GITHUB_OUTPUT: output,
-    });
-    expect(guarded.status, guarded.stderr).toBe(0);
-
-    // Read the version the resolver wrote under the key the release job's
-    // extractor step names, so a wrong key in either place fails this test.
-    const workflow = parseYaml(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const key = versionOutputKey(workflow, "github-release", "Extract CHANGELOG section");
-    const written = Object.fromEntries(
-      readFileSync(output, "utf8")
-        .split("\n")
-        .filter((line) => line.includes("="))
-        .map((line) => {
-          const at = line.indexOf("=");
-          return [line.slice(0, at), line.slice(at + 1)];
-        }),
-    );
-    const version = written[key] ?? "";
-    expect(version).toBe("1.2.3");
-
-    const changelog = join(repo.root, "CHANGELOG.md");
-    writeFileSync(
-      changelog,
-      "## [1.2.3] - 2026-01-01\n\n### Fixed\n\n- Something.\n\n## [1.2.2] - 2025-12-01\n\n- Older.\n",
-    );
-    const notesFile = assertChangelogExtraction(workflow);
-    const extract = assertRequiredStep(workflow, "github-release", EXTRACT_STEP, CREATE_RELEASE);
-    mkdirSync(join(repo.root, "scripts"));
-    copyFileSync(EXTRACT, join(repo.root, "scripts", "changelog-extract.mjs"));
-    const matched = spawnSync("bash", ["-c", extract.run ?? ""], {
-      cwd: repo.root,
-      env: { ...BASE_ENV, VERSION: version },
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-    expect(matched.status, matched.stderr).toBe(0);
-    const notes = readFileSync(join(repo.root, notesFile), "utf8");
-    expect(notes).toContain("### Fixed");
-    expect(notes).toContain("- Something.");
-    expect(notes).not.toContain("- Older.");
-
-    writeFileSync(changelog, "## [1.2.2] - 2025-12-01\n\n- Older.\n");
-    const missing = spawnSync("bash", ["-c", extract.run ?? ""], {
-      cwd: repo.root,
-      env: { ...BASE_ENV, VERSION: version },
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-    expect(missing.status).toBe(1);
-    expect(missing.stderr).toContain("changelog-extract: no '## [1.2.3]' section found");
-  } finally {
-    rmSync(repo.root, { recursive: true, force: true });
-  }
-}, 30_000);

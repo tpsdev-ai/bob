@@ -1,0 +1,203 @@
+{
+  "concurrency": {
+    "cancel-in-progress": false,
+    "group": "release-publish"
+  },
+  "jobs": {
+    "github-release": {
+      "name": "Cut GitHub release from CHANGELOG",
+      "needs": "verify-ancestry",
+      "permissions": {
+        "contents": "write"
+      },
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "fetch-tags": true,
+            "persist-credentials": false,
+            "ref": "${{ needs.verify-ancestry.outputs.sha }}"
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.4"
+          }
+        },
+        {
+          "name": "Lockfile release-age bake",
+          "run": "bun --no-install scripts/check-lockfile-release-age.mjs"
+        },
+        {
+          "env": {
+            "VERSION": "${{ needs.verify-ancestry.outputs.version }}"
+          },
+          "name": "Extract CHANGELOG section",
+          "run": "set -euo pipefail\nnode scripts/changelog-extract.mjs \"$VERSION\" CHANGELOG.md > release-notes.md\necho \"Extracted $(wc -l < release-notes.md) lines for v$VERSION\"\n"
+        },
+        {
+          "env": {
+            "EXPECTED_SHA": "${{ needs.verify-ancestry.outputs.sha }}",
+            "TAG": "${{ needs.verify-ancestry.outputs.tag }}"
+          },
+          "name": "Compare the remote tag with the verified commit just before the release",
+          "run": "bun --no-install scripts/verify-release-tag.mjs"
+        },
+        {
+          "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "TAG": "${{ needs.verify-ancestry.outputs.tag }}",
+            "VERSION": "${{ needs.verify-ancestry.outputs.version }}"
+          },
+          "name": "Create or update GitHub release",
+          "run": "set -euo pipefail\nif gh release view \"$TAG\" >/dev/null 2>&1; then\n  echo \"Release $TAG exists — updating notes.\"\n  gh release edit \"$TAG\" \\\n    --title \"v$VERSION\" \\\n    --notes-file release-notes.md\nelse\n  echo \"Creating release $TAG.\"\n  gh release create \"$TAG\" \\\n    --title \"v$VERSION\" \\\n    --notes-file release-notes.md \\\n    --verify-tag\nfi\necho \"Release URL: $(gh release view \"$TAG\" --json url --jq .url)\"\n"
+        }
+      ]
+    },
+    "stage-publish": {
+      "environment": "release",
+      "name": "Stage-publish @tpsdev-ai/bob",
+      "needs": "verify-ancestry",
+      "permissions": {
+        "contents": "read",
+        "id-token": "write"
+      },
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "fetch-depth": 0,
+            "persist-credentials": false,
+            "ref": "${{ needs.verify-ancestry.outputs.sha }}"
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.4"
+          }
+        },
+        {
+          "name": "Lockfile release-age bake",
+          "run": "bun --no-install scripts/check-lockfile-release-age.mjs"
+        },
+        {
+          "name": "npm pin release-age bake",
+          "run": "bun --no-install scripts/check-npm-pin-release-age.mjs"
+        },
+        {
+          "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "with": {
+            "node-version": "22"
+          }
+        },
+        {
+          "name": "Upgrade npm to a staging-capable version",
+          "run": "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org\n"
+        },
+        {
+          "uses": "socketdev/action@ba6de6cc0565af1f42295590380973573297e31f",
+          "with": {
+            "mode": "firewall-free"
+          }
+        },
+        {
+          "name": "Cache bun install",
+          "uses": "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+          "with": {
+            "key": "bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}",
+            "path": "~/.bun/install/cache",
+            "restore-keys": "bun-cache-${{ runner.os }}-\n"
+          }
+        },
+        {
+          "name": "Install",
+          "run": "sfw bun install --frozen-lockfile"
+        },
+        {
+          "env": {
+            "VERSION": "${{ needs.verify-ancestry.outputs.version }}"
+          },
+          "name": "Verify the package version matches the resolved version",
+          "run": "set -euo pipefail\nname=\"$(node -p \"require('./package.json').name\")\"\npv=\"$(node -p \"require('./package.json').version\")\"\nif [ \"$pv\" != \"$VERSION\" ]; then\n  echo \"::error::$name is at $pv, expected $VERSION. Release the version the package declares, or merge a release PR that sets it to $VERSION first.\"\n  exit 1\nfi\necho \"  ok $name @ $pv\"\n"
+        },
+        {
+          "name": "Build",
+          "run": "bun run build"
+        },
+        {
+          "name": "Preflight — pack, install and run the artifact this will stage",
+          "run": "sfw node scripts/verify-pack.mjs"
+        },
+        {
+          "name": "Stage-publish",
+          "run": "set -euo pipefail\nname=\"$(node -p \"require('./package.json').name\")\"\necho \"::group::npm stage publish — $name\"\nv=$(npm --version) || { echo \"npm --version failed\" >&2; exit 1; }; test \"$v\" = \"11.21.1\" || { echo \"npm is $v, expected the pinned 11.21.1\" >&2; exit 1; }\nnpm stage publish\necho \"::endgroup::\"\n"
+        },
+        {
+          "env": {
+            "VERSION": "${{ needs.verify-ancestry.outputs.version }}"
+          },
+          "name": "Summary",
+          "run": "{\n  echo \"### 🚀 v$VERSION staged for release\"\n  echo \"\"\n  echo \"\\`@tpsdev-ai/bob\\` submitted to npm **staging** with provenance.\"\n  echo \"It is **not live yet**.\"\n  echo \"\"\n  echo \"**To release:** open [npmjs.com → Staged Packages](https://www.npmjs.com/settings/tpsdev-ai/staging),\"\n  echo \"review the tarball, and approve with 2FA.\"\n  echo \"Or: \\`npm stage list\\` then \\`npm stage approve <id>\\`.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
+        }
+      ]
+    },
+    "verify-ancestry": {
+      "name": "Resolve and verify the release commit",
+      "outputs": {
+        "sha": "${{ steps.commit.outputs.sha }}",
+        "tag": "${{ steps.commit.outputs.tag }}",
+        "version": "${{ steps.commit.outputs.version }}"
+      },
+      "permissions": {
+        "contents": "read"
+      },
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "fetch-depth": 0,
+            "fetch-tags": true,
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.4"
+          }
+        },
+        {
+          "env": {
+            "VERSION": "${{ inputs.version }}"
+          },
+          "id": "commit",
+          "name": "Resolve the release commit",
+          "run": "bun --no-install scripts/resolve-release-commit.mjs"
+        }
+      ]
+    }
+  },
+  "name": "Release — stage-publish (OIDC) + GitHub release",
+  "on": {
+    "push": {
+      "tags": ["v*"]
+    },
+    "workflow_dispatch": {
+      "inputs": {
+        "version": {
+          "description": "Fallback only: the v<version> tag to stage; its commit must be on main",
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  }
+}
