@@ -10,7 +10,7 @@
 // the `voice` profile still exposes no body tool.
 import { afterAll, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -203,8 +203,18 @@ async function connectBob(
     pending.push(wired.handleLine(line));
   });
   client.onClose(() => wired.disconnected());
-  await waitFor(() => existsSync(sidecar.socketPath), "the socket file");
-  await client.connect();
+  // Connect, retrying until the fake sidecar has bound its socket. No stat of
+  // the path: the connect itself is the only probe (and the only reader).
+  const deadline = Date.now() + 8_000;
+  for (;;) {
+    try {
+      await client.connect();
+      break;
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      await wait(10);
+    }
+  }
   await wired.connected();
   await waitFor(() => wired.link().phase === "ready", "the reachy-voice/1 handshake");
   const settle = async () => {
