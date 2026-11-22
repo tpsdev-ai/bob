@@ -2899,6 +2899,9 @@ export async function createPiRunSession(
   config: RunSessionConfig,
   sessionManagerFactory?: (cwd: string) => SessionManagerLike,
   registry?: ProviderRegistry,
+  // bob#356 V2a: one runtime's shared provider-key custody (see
+  // BobFactoryInput.custodyKeys). Omitted: the factory keeps its own.
+  custodyKeys?: Map<string, string>,
 ): Promise<RunSession> {
   assertToolPolicy(config);
   const policy: ToolPolicy = {
@@ -2918,6 +2921,7 @@ export async function createPiRunSession(
     config,
     policy,
     ...(registry !== undefined ? { registry } : {}),
+    ...(custodyKeys !== undefined ? { custodyKeys } : {}),
   });
   const { session } = await factory({
     cwd: config.cwd,

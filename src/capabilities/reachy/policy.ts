@@ -12,10 +12,11 @@
 //   * A memory is written ONLY when addressed AND speakerVerified — visibility
 //     `private`, author `jarvis`, speakerId in metadata. Non-member speech is
 //     EPHEMERAL (no write, never recallable).
-//     bob#356 V2a: under `voice` this path is not reached at all. An addressed
-//     transcript there becomes a voice turn and is INELIGIBLE for a memory write
-//     regardless of the sidecar's speakerId, because speaker authentication does
-//     not exist until V3. The rule above governs the `reachy` body profile.
+//     bob#356 V2a: under `voice` this path is not reached at all. An eligible
+//     addressed transcript there is submitted for admission as a voice turn, and
+//     no voice transcript is eligible for a memory write, whatever the sidecar's
+//     speakerId, because speaker authentication does not exist until V3. The
+//     rule above governs the `reachy` body profile.
 //   * Memory-backed speech is OFF outright (a `say` whose inputs reference a
 //     memory is refused); `answer` is OFF in v1.
 //   * `mute` drops every event — no transcripts, no proposals, no frames, no
@@ -215,11 +216,11 @@ export type Decision =
   | { kind: "refused"; action: string; reason: string };
 
 /** `addressed` = the wake name appears in the transcript text, recomputed in
- *  bob and never taken from the sidecar's `wakeHeard` flag. The match is the
- *  normalized phrase itself, or a near-miss of the name token allowed by edit
- *  distance: measured wake models fire on near-names ("Hey Dervis" for jarvis),
- *  and the sidecar's STT renders those. The bound accepts "dervis" (two edits
- *  from a six-letter name) and rejects "travis" (three). */
+ *  bob and never taken from the sidecar's `wakeHeard` flag. This is a TEXT
+ *  matcher: the normalized name phrase itself, or a window of words within a
+ *  length-based edit allowance of it, so a transcript that renders the name as
+ *  a near-miss ("Hey Dervis" for jarvis) still counts. It accepts "dervis" (two
+ *  edits from a six-letter name) and rejects "travis" (three). */
 export function addressed(text: string, wakeName: string): boolean {
   if (!wakeName) return false;
   const name = normalizeSpeech(wakeName).split(" ").filter(Boolean);
@@ -227,9 +228,9 @@ export function addressed(text: string, wakeName: string): boolean {
   const words = normalizeSpeech(text).split(" ").filter(Boolean);
   if (words.length < name.length) return false;
   const phrase = name.join(" ");
-  // The bound: 1 edit for a name of four characters or fewer, 2 up to eight,
-  // 3 beyond that. It accepts the measured near-name ("dervis" for jarvis) and
-  // rejects "travis" (three edits from a six-letter name).
+  // The bound, by the normalized phrase's length: 1 edit for four characters or
+  // fewer, 2 up to eight, 3 beyond that. It accepts "dervis" for jarvis (two
+  // edits) and rejects "travis" (three edits from a six-letter name).
   const maxEdits = phrase.length <= 4 ? 1 : phrase.length <= 8 ? 2 : 3;
   for (let i = 0; i + name.length <= words.length; i++) {
     if (name.every((part, k) => words[i + k] === part)) return true;

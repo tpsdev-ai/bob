@@ -26,8 +26,9 @@ export type AdmissionToken = object;
 
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
-  // `preflight.beforeStart` is re-checked after the operation leaves the queue
-  // and immediately before its prompt starts; a non-null string refuses it.
+  // `preflight.beforeStart` is checked for every admitted turn, after the
+  // operation leaves the queue and immediately before its prompt starts; a
+  // non-null string refuses it, and nothing is prompted.
   admitTurn(
     origin: TurnOrigin,
     text: string,
@@ -78,10 +79,11 @@ export function createTurnAdmission(
     // fresh compaction boundary and clear its empty-response latch; the
     // admission's own latch is per Turn and needs no reset.
     onTurnStart?: () => void;
-    // bob#356 V2a: create the FRESH session a voice-origin turn runs in. Each
-    // call returns a session with no resident history and no private bootstrap
-    // context. Absent: a voice turn is refused (fail closed) — no voice prompt
-    // can fall back to the resident session.
+    // bob#356 V2a: create the FRESH session a voice-origin turn runs in, one per
+    // call, never the resident one. The runtime that supplies it decides what
+    // that session carries (persistent.ts: no Flair bootstrap, no prior-round
+    // memory, reachy_say only). Absent: a voice turn is refused (fail closed) —
+    // no voice prompt can fall back to the resident session.
     voiceSession?: () => Promise<RunSession>;
   } = {},
 ) {
@@ -186,16 +188,17 @@ export function createTurnAdmission(
         return Promise.reject(err);
       }
       const isVoice = approved.kind === "voice";
-      // bob#356 V2a: a voice-origin turn IS admitted now. Its origin carries
-      // `speakerVerified` (bob's own enrolment; false until V3), and the
-      // utterance/correlation ids bob issued for this transcript. It runs in a
-      // FRESH session (opts.voiceSession), never the resident one: no durable
-      // resident history and no private bootstrap context is in front of the
-      // model. bob's tool-admission gate (session.ts, tool-admission.ts)
-      // restricts its reach to `reachy_say` — no recall, no writes, no grants —
-      // and the reachy capability's speech gate accepts a voice-origin `say`
-      // only for this turn's own current addressed utterance (policy.ts), so
-      // no later caller inherits the room's speech.
+      // bob#356 V2a: a voice-origin turn can be admitted now. Its origin carries
+      // `speakerVerified`, which is false in V2a (bob has no speaker
+      // authentication until V3), and the utterance/correlation ids bob issued
+      // for this transcript. It runs in a FRESH session (opts.voiceSession),
+      // never the resident one, so the resident session's history is not in
+      // front of the model; persistent.ts builds that session without the Flair
+      // bootstrap or prior-round memory. bob's tool-admission gate (session.ts,
+      // tool-admission.ts) restricts its reach to `reachy_say`: no recall, no
+      // memory writes, no grant tools. The reachy capability's speech gate
+      // accepts a voice-origin `say` only for this turn's own current addressed
+      // utterance (policy.ts), so no later caller inherits the room's speech.
       const run = async (): Promise<unknown[]> => {
         await bound;
         if (closed) throw new Error("bob: turn admission is closed");
@@ -229,12 +232,10 @@ export function createTurnAdmission(
           discardVoice();
           throw new Error("bob: turn admission is closed");
         }
-        if (isVoice) {
-          const refusal = preflight?.beforeStart?.() ?? null;
-          if (refusal !== null) {
-            discardVoice();
-            throw new Error(`bob: voice turn not admitted: ${refusal}`);
-          }
+        const refusal = preflight?.beforeStart?.() ?? null;
+        if (refusal !== null) {
+          discardVoice();
+          throw new Error(`bob: ${isVoice ? "voice turn" : "turn"} not admitted: ${refusal}`);
         }
         const turn: Turn = {
           origin: approved,

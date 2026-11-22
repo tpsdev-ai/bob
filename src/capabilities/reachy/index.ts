@@ -55,15 +55,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // bob#356 V2a: a FRESH voice session loads this capability with the resident
   // capability's speech bridge on the loader bus. The sidecar accepts one
   // connection, and the resident instance owns it; this session registers only
-  // the speech tool and sends through that link. The bound voice origin and the
-  // capability's per-turn utterance still decide whether the line is spoken.
+  // the speech tool and sends through that link. The resident capability's
+  // speech policy decides whether the line is spoken, from the origin the call
+  // is bound to (for a voice turn: its own current addressed utterance).
   const voiceSpeech = getVoiceSpeech(pi);
   if (voiceSpeech !== undefined) {
     pi.registerTool({
       name: "reachy_say",
       label: "Reachy Say",
       description:
-        "Speak one short line in the room through the speaker. Only from a turn the operator granted room speech; no memory reference.",
+        "Speak one short line in the room through the speaker. Allowed for the voice turn whose addressed utterance opened it, or for a turn whose origin the operator granted room speech; no memory reference.",
       parameters: ACTION_ARG_SCHEMAS.say,
       async execute(_id: string, params: Record<string, unknown>) {
         if (typeof params.text !== "string")
@@ -122,8 +123,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // call to, read from pi's per-loader event bus. In the persistent runtime
   // only an admitted turn binds one; in a one-shot `bob run` the runtime
   // declares `run` for the session; anywhere else nothing is bound and speech
-  // refuses. A missing admission never passes as `run`. bob#356 V2a: the same
-  // admission admits an addressed transcript as a voice-origin turn.
+  // refuses. A missing admission never passes as `run`. bob#356 V2a: an
+  // eligible addressed transcript is submitted to the same admission as a
+  // voice-origin turn.
   const admission = getTurnAdmission(pi);
   const sessionOrigin = getSessionOrigin(pi);
 
@@ -144,8 +146,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // The resident instance owns the sidecar link and hands its speech path to the
   // runtime, for the fresh sessions a voice turn runs in (see the bridge branch
-  // above). The path still reads the admitted voice origin from the calling
-  // turn, so the fresh session cannot speak as anything else.
+  // above). The path reads the origin of the turn the call is bound to, so the
+  // fresh session speaks as that voice turn and as nothing else.
   if (admission) registerVoiceSpeech(admission, (text) => wired.speak(text));
 
   if (config.mute) {

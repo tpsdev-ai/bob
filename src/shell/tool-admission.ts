@@ -7,16 +7,19 @@
 //
 // The rule is an ALLOWLIST, keyed on origin, not a denylist of today's grant
 // names (bob#356 Kern N2). A voice-origin turn — speech heard in the room, from
-// a speaker bob has not verified — reaches exactly `reachy_say`. Everything
-// else refuses, including tools that do not exist yet: a future grant tool is
-// unreachable from voice the day it lands, without anyone remembering to list
-// it here.
+// a speaker bob has not verified — may reach `reachy_say` and nothing else.
+// Everything else refuses, including tools that do not exist yet: a future
+// grant tool is unreachable from voice the day it lands, without anyone
+// remembering to list it here.
 //
-// A grant-class tool (mail send, calendar accept, payment) is therefore never
-// executed on a voice-origin turn. The refusal is deterministic and content-
-// free; bob does not ship a confirmation broker (bob#356 D1). The member makes
-// the request again on an authenticated text channel, as an ordinary turn under
-// the normal grants, and acts only there.
+// So in a session bob's factory built with this gate (every session a turn
+// admission serves; the factory refuses one whose gate did not load), a
+// grant-class tool (mail send, calendar accept, payment) is not executed on a
+// voice-origin turn. The refusal is fixed and content-free, and it tells the
+// model that the member can ask again on an authenticated text channel. bob
+// ships no confirmation broker (bob#356 D1): nothing links that later request
+// to this refusal. Every non-voice origin (run, mail, cron, discord) passes
+// this gate unchanged, under its own turn's policy.
 
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { boundOrigin, getSessionOrigin, getTurnAdmission } from "./turn-admission.js";
@@ -33,13 +36,12 @@ export const GRANT_TOOLS: readonly string[] = Object.freeze([
   "payment_send",
 ]);
 
-/** The fixed, deterministic refusal a grant tool gets on a voice-origin turn. */
 /** The fixed, deterministic refusal a LISTED grant tool gets on a voice-origin
  *  turn. It differs from the generic allowlist refusal below: this one names the
  *  authenticated text channel and says nothing was executed; the generic one
  *  names the tool and the single tool a voice turn may reach. */
 export const VOICE_GRANT_REFUSAL =
-  "a voice-origin turn cannot use a grant tool; ask on the authenticated text channel and confirm there — nothing was executed";
+  "a voice-origin turn cannot use a grant tool; ask again on an authenticated text channel — nothing was executed";
 
 export interface ToolAdmissionDecision {
   allow: boolean;

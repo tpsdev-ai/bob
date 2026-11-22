@@ -4,21 +4,24 @@
 // cancellation is required on the device, but bob cannot verify a device
 // property, so it keeps its own backstop:
 //
-//   * PLAYBACK INTERLOCK: a transcript that arrives during bob's playback
-//     window is dropped. The window is estimated from the spoken text (a bound,
-//     never a sidecar assertion).
-//   * SAY-MATCH: a transcript whose text closely matches something bob said
-//     within the last `windowMs` (measured from the end of its PLAYBACK, so a
-//     long line's window cannot expire while it is still being spoken) is
-//     dropped. Normalization is NFKC, lowercase, punctuation and whitespace
-//     folded to single spaces. A line matches when its edit distance is within
-//     a fixed length-based allowance: `floor((1 - 0.9) * max(length))` edits.
-//     Two empty strings compare equal (similarity 1), but an empty transcript
+//   * PLAYBACK INTERLOCK: a transcript that arrives during bob's ESTIMATED
+//     playback window is dropped. The window is estimated from the spoken text
+//     (`estimatedPlaybackMs`, capped at 15 s), never asserted by the sidecar;
+//     bob observes no actual playback completion.
+//   * SAY-MATCH: a transcript whose text closely matches something bob said is
+//     dropped for `windowMs` after that line's ESTIMATED playback end. A line
+//     that plays longer than its estimate can therefore be heard after the
+//     window has ended; the estimate, not the speaker, sets the bound.
+//     Normalization is NFKC, lowercase, punctuation and whitespace folded to
+//     single spaces. A line matches when its edit distance is within a fixed
+//     length-based allowance, `floor((1 - 0.9) * length + 1e-9)` edits, where
+//     length is the longer of the two normalized lines. An empty transcript
 //     never matches: there is nothing to hear.
 //
-// This heuristic does not certify AEC. It is a deterministic drop, applied
-// before a transcript is retained or admitted, and it is deliberately
-// conservative: genuine barge-in during playback is dropped too.
+// This heuristic does not certify AEC. Under the `voice` profile it is a
+// deterministic drop, applied before a transcript is retained or submitted for
+// admission, and it is deliberately conservative: genuine barge-in during the
+// estimated playback is dropped too.
 
 /** How long bob remembers its own speech for the say-match guard. */
 export const ECHO_WINDOW_MS = 10_000;
@@ -58,7 +61,9 @@ export function editDistance(a: string, b: string): number {
   return levenshtein(a, b);
 }
 
-/** 1 for identical strings, 1 when both are empty, otherwise 1 - distance/max. */
+/** 1 for identical strings (two empty strings included); 0 when the length gap
+ *  alone exceeds `editAllowance` of the longer length, because no such pair can
+ *  match (the walk is skipped); otherwise `1 - distance / max`. */
 export function editSimilarity(a: string, b: string): number {
   if (a === b) return 1;
   const max = Math.max(a.length, b.length);
@@ -95,7 +100,8 @@ interface Spoken {
 export type EchoReason = "playback" | "say-match";
 
 /** The guard's state. One instance per capability; the capability clears it on
- *  every link change, so records never cross a connection. */
+ *  every link change (a refused link, a disconnect, a new connection, a device
+ *  mute flip), so records never cross a connection. */
 export class EchoGuard {
   private readonly spoken: Spoken[] = [];
 
@@ -111,18 +117,22 @@ export class EchoGuard {
       atMs: nowMs,
       playbackUntilMs: nowMs + this.playbackMs(text),
     });
-    // Bound the list by the same window, not by a model-controlled count.
+    // Drop expired lines from the front (oldest first) on each record. This is
+    // a time bound, not a count cap: lines recorded within one window all stay,
+    // and an expired line behind an unexpired older one stays until that one
+    // expires and a later record prunes both.
     this.prune(nowMs);
   }
 
-  /** Playback interlock: bob's own speech is still playing. */
+  /** Playback interlock: bob's own speech is still inside its estimated
+   *  playback window. */
   playbackActive(nowMs: number): boolean {
     return this.spoken.some((s) => nowMs < s.playbackUntilMs);
   }
 
   /** Say-match: the transcript is one of bob's own recent lines. The window
-   *  starts when that line's playback ENDS, so a multi-sentence line cannot
-   *  outlast its own echo guard. */
+   *  starts at that line's ESTIMATED playback end (`playbackMs`), so a long line
+   *  keeps its window for as long as its estimate says it plays. */
   matchesRecentSay(text: string, nowMs: number): boolean {
     const normalized = normalizeSpeech(text);
     if (normalized.length === 0) return false;

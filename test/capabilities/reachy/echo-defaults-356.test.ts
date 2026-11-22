@@ -3,7 +3,7 @@
 // These cases replace neither constructor argument: they exercise
 // estimatedPlaybackMs and the recent-speech window as shipped. The boundary
 // cases pin the fixed length-based edit allowance in float64, and the long
-// multi-sentence line pins the say-match window to the END of playback.
+// multi-sentence line pins the say-match window to the ESTIMATED playback end.
 import { describe, expect, it } from "bun:test";
 import {
   ECHO_SIMILARITY,
@@ -27,8 +27,8 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     guard.record(text, at);
     expect(guard.playbackActive(at + playback - 1)).toBe(true);
     expect(guard.check(text, at + playback - 1)).toBe("playback");
-    // Playback is over; the identical line is still bob's own words because the
-    // say-match window is measured from the END of playback.
+    // The estimated playback is over; the identical line is still bob's own
+    // words because the say-match window is measured from the estimated end.
     expect(guard.playbackActive(at + playback)).toBe(false);
     expect(guard.matchesRecentSay(text, at + playback)).toBe(true);
     expect(guard.matchesRecentSay(text, at + playback + ECHO_WINDOW_MS)).toBe(true);
@@ -56,6 +56,16 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     expect(ECHO_SIMILARITY).toBe(0.9);
   });
 
+  it("editSimilarity is 0 when the length gap alone exceeds the allowance, else 1 - distance/max", () => {
+    // 5 vs 4 characters: the allowance for 5 is 0 edits, the gap is 1, so 0 —
+    // not 1 - 1/5. No such pair can match, so the walk is skipped.
+    expect(editAllowance(5)).toBe(0);
+    expect(editSimilarity("hello", "hell")).toBe(0);
+    expect(editSimilarity("hello there", "hi")).toBe(0);
+    // Inside the allowance the ratio is the plain one: 10 vs 9, one edit.
+    expect(editSimilarity("abcdefghij", "abcdefghi")).toBeCloseTo(0.9, 12);
+  });
+
   it("two empty strings have similarity 1, but an empty transcript matches nothing", () => {
     expect(editSimilarity("", "")).toBe(1);
     const guard = new EchoGuard();
@@ -64,7 +74,7 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     expect(guard.playbackActive(1_000)).toBe(true); // an empty line still plays its 1 s floor
   });
 
-  it("one guard is reused across links: clearing it forgets the previous link", () => {
+  it("clearing the guard forgets every recorded line", () => {
     const guard = new EchoGuard();
     guard.record("The meeting is at noon today.", 1_000);
     expect(guard.check("The meeting is at noon today.", 1_000)).toBe("playback");

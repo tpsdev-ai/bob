@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """driven-sidecar — a FAKE reachy-voice/1 sidecar for bob#356 V2a tests.
 
-It is a real process on a real UNIX socket, and it has no ears: the test drives
-every line it sends. After bob connects and sends `configure`, the stub answers
-with a strict health line and prints `READY` on stdout. Then it reads one JSON
-instruction per stdin line:
+It is a real process on a real UNIX socket, and it has no ears: apart from the
+health line it answers `configure` with, the test supplies every line it sends.
+After bob connects and sends `configure`, the stub answers with a strict health
+line and prints `READY` on stdout. Then it reads one JSON instruction per stdin
+line:
 
     {"send": <object>}      write one JSON line to bob
     {"sleep": <seconds>}    wait (bounded)
@@ -26,7 +27,8 @@ PROTOCOL = "reachy-voice/1"
 
 
 def main() -> int:
-    # A fixture never outlives its test.
+    # A bounded 60 s self-exit watchdog, for when the test's cleanup does not
+    # close it first (the test files kill it in afterAll/afterEach).
     watchdog = threading.Timer(60, lambda: os._exit(3))
     watchdog.daemon = True
     watchdog.start()

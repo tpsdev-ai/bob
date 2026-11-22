@@ -208,24 +208,50 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 
   const factory = opts.sessionFactory ?? defaultPersistentFactory(opts.registry);
   // bob#356 V2a: every voice turn runs in its OWN session, built fresh from the
-  // same factory. It carries no durable resident history and no private
-  // bootstrap (flairBootstrap) or prior-round (prMemory) context, and its tool
-  // allowlist is exactly the speech tool. The resident reachy capability's
-  // speech bridge is handed along so the one live sidecar link does the talking.
+  // same factory. Its config drops the private bootstrap (flairBootstrap) and
+  // prior-round (prMemory) context, loads only the reachy capability, and allows
+  // exactly the speech tool, which the agent's own policy must already allow.
+  // It is not persistent, so the default factory keeps its history in memory,
+  // never in the resident session directory. The resident reachy capability's
+  // speech bridge is handed along so the one live sidecar link does the
+  // talking. The soul, the standing contract and pi's own prompt template
+  // (which names the working directory) still reach its system prompt.
   async function voiceSession(): Promise<RunSession> {
     const speak = getRegisteredVoiceSpeech(admission);
     if (speak === undefined)
       throw new Error(
         "bob: no reachy speech bridge is registered; refusing to start a voice turn that could not speak",
       );
+    // A voice session never WIDENS the agent's own policy: its one tool must be
+    // in the agent's resolved allowlist and not in its exclusions (a declared
+    // exclusion wins over every allowlist). Otherwise the turn is refused by
+    // name, not started.
+    if (!config.tools.includes("reachy_say") || (config.excludeTools ?? []).includes("reachy_say"))
+      throw new Error(
+        "bob: this agent's tool policy does not allow reachy_say (absent from its allowlist, or excluded); refusing to start a voice turn that could not speak",
+      );
     const { flairBootstrap: _bootstrap, prMemory: _prMemory, ...base } = config;
-    return factory({
-      ...base,
-      persistent: false,
-      tools: ["reachy_say"],
-      turnAdmission: admission,
-      voiceSpeech: speak,
-    });
+    const reachySources = config.extensionSources.filter(
+      (source) => config.capabilityBySource?.[source] === "reachy",
+    );
+    // The factory sets BOB_PERSISTENT from the config it builds (empty here), and
+    // the warm session's extensions read it again on a reload: restore it.
+    const persistentFlag = process.env.BOB_PERSISTENT;
+    try {
+      return await factory({
+        ...base,
+        extensionSources: reachySources,
+        capabilityBySource: Object.fromEntries(reachySources.map((source) => [source, "reachy"])),
+        persistent: false,
+        tools: ["reachy_say"],
+        excludeTools: [],
+        turnAdmission: admission,
+        voiceSpeech: speak,
+      });
+    } finally {
+      if (persistentFlag === undefined) delete process.env.BOB_PERSISTENT;
+      else process.env.BOB_PERSISTENT = persistentFlag;
+    }
   }
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
@@ -364,13 +390,22 @@ export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
 // AgentSession exposes the idle barrier as `session.agent.waitForIdle()` (SDK
 // docs), not as a top-level method, so we adapt it here. Best-effort — if the
 // shape ever changes, shutdown still proceeds to dispose().
-const defaultPersistentFactory =
-  (registry?: ProviderRegistry): RunSessionFactory =>
-  async (config: RunSessionConfig) => {
+//
+// bob#356 V2a: one factory serves the warm session AND every fresh voice session
+// of a runtime. They share ONE provider-key custody (a keyed row's variable is
+// read and deleted once, by the warm session), and only the persistent session
+// is durable: a non-persistent one (a voice turn) gets an in-memory manager, so
+// nothing it says is written under .pi-agent/sessions.
+export const defaultPersistentFactory = (registry?: ProviderRegistry): RunSessionFactory => {
+  const custodyKeys = new Map<string, string>();
+  return async (config: RunSessionConfig) => {
     const session = await createPiRunSession(
       config,
-      (cwd) => SessionManager.create(cwd, join(config.piAgentDir, "sessions")),
+      config.persistent === true
+        ? (cwd) => SessionManager.create(cwd, join(config.piAgentDir, "sessions"))
+        : (cwd) => SessionManager.inMemory(cwd),
       registry,
+      custodyKeys,
     );
     if (typeof session.waitForIdle !== "function") {
       const agent = (session as unknown as { agent?: { waitForIdle?: () => Promise<void> } }).agent;
@@ -380,3 +415,4 @@ const defaultPersistentFactory =
     }
     return session;
   };
+};

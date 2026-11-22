@@ -1,16 +1,20 @@
 // bob#356 V2a — the BOB SIDE of the ears: gates before inputs.
 //
 // The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
-// a real UNIX socket: an addressed transcript is admitted as a voice-origin turn
-// with bob-issued ids and `speakerVerified:false`; `wakeHeard` alone never
-// addresses; a malformed transcript is dropped with a named log line; a report of
-// hardware mute drops the next transcript; and bob's own words are dropped by the
-// echo guard (during playback and as a recent say-match). The remaining cases
-// call the real modules directly: wire decoding, memory eligibility under a real
-// parsed config, per-turn utterance cleanup, the queued-turn recheck, a fresh
-// session's context isolation, and the tool-admission gate (stub tools through
-// the real extension; the `voice` profile still exposes no body tool).
-import { afterAll, describe, expect, it } from "bun:test";
+// a real UNIX socket: an addressed transcript is submitted for admission as a
+// voice-origin turn with bob-issued ids and `speakerVerified:false`; `wakeHeard`
+// alone never addresses; a malformed transcript is dropped with a named log
+// line; a report of hardware mute drops the next transcript; and bob's own words
+// are dropped by the echo guard (during the estimated playback and as a recent
+// say-match). The remaining cases call the real modules directly: the wake-name
+// edit tiers, wire decoding, memory eligibility under a real parsed config,
+// per-turn utterance cleanup, the queued-turn recheck (mute, disconnect, and a
+// link that comes back before the turn starts), the admission's beforeStart for
+// a non-voice turn, the echo guard's clearing on link changes, context isolation
+// with fake sessions (the production path is voice-v2a-production-356.test.ts),
+// and the tool-admission gate (stub tools through the real extension; the
+// `voice` profile still exposes no body tool).
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +29,7 @@ import {
 } from "../../../src/capabilities/reachy/capability.js";
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import { parseConfig } from "../../../src/capabilities/reachy/config.js";
+import { EchoGuard } from "../../../src/capabilities/reachy/echo.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { addressed } from "../../../src/capabilities/reachy/policy.js";
 import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
@@ -208,19 +213,27 @@ async function connectBob(
   });
   client.onClose(() => wired.disconnected());
   // Connect, retrying until the fake sidecar has bound its socket. No stat of
-  // the path: the connect itself is the only probe (and the only reader).
-  const deadline = Date.now() + 8_000;
-  for (;;) {
-    try {
-      await client.connect();
-      break;
-    } catch (err) {
-      if (Date.now() > deadline) throw err;
-      await wait(10);
+  // the path: the connect itself is the only probe (and the only reader). If the
+  // link never comes up, close the client and the sidecar here: the caller's
+  // try/finally starts only once this returns.
+  try {
+    const deadline = Date.now() + 8_000;
+    for (;;) {
+      try {
+        await client.connect();
+        break;
+      } catch (err) {
+        if (Date.now() > deadline) throw err;
+        await wait(10);
+      }
     }
+    await wired.connected();
+    await waitFor(() => wired.link().phase === "ready", "the reachy-voice/1 handshake");
+  } catch (err) {
+    client.close();
+    sidecar.close();
+    throw err;
   }
-  await wired.connected();
-  await waitFor(() => wired.link().phase === "ready", "the reachy-voice/1 handshake");
   const settle = async () => {
     for (;;) {
       const batch = pending;
@@ -251,14 +264,36 @@ async function connectBob(
 
 // ── the addressed recompute ──────────────────────────────────────────────────
 describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone never addresses", () => {
-  it("accepts the name and the measured near-name, and rejects a different near-name", () => {
+  it("accepts the name and the near-name dervis, and rejects travis", () => {
     expect(addressed("hey jarvis, what time is it", "jarvis")).toBe(true);
     expect(addressed("Hey JARVIS what time is it", "jarvis")).toBe(true);
-    // Measured on the device: the wake model fired on this near-name.
+    // A near-name transcript: two edits from jarvis, inside the allowance.
     expect(addressed("Hey Dervis, what time is it?", "jarvis")).toBe(true);
-    // The other measured false positive: three edits from jarvis.
+    // Three edits from jarvis: outside the allowance.
     expect(addressed("Hey Travis, what time is it?", "jarvis")).toBe(false);
     expect(addressed("what time is it", "jarvis")).toBe(false);
+  });
+
+  // The allowance is tiered by the normalized name's length: 1 edit up to four
+  // characters, 2 up to eight, 3 beyond. Each pair sits on a tier's edge, so
+  // moving either boundary or flattening the tiers turns one of them over.
+  it("the edit allowance is tiered by the name's length, at each boundary", () => {
+    const heard = (word: string, name: string) => addressed(`${word}, good morning`, name);
+    // 4 characters: one edit, not two.
+    expect(heard("iras", "iris")).toBe(true);
+    expect(heard("uras", "iris")).toBe(false);
+    // 5 characters: two edits, not three.
+    expect(heard("rubyn", "robin")).toBe(true);
+    expect(heard("rubyx", "robin")).toBe(false);
+    // 8 characters: two edits, not three.
+    expect(heard("kangslay", "kingsley")).toBe(true);
+    expect(heard("kangslax", "kingsley")).toBe(false);
+    // 9 characters: three edits, not four.
+    expect(heard("alaxundar", "alexander")).toBe(true);
+    expect(heard("ulaxundar", "alexander")).toBe(false);
+    // A two-word name is sized as its normalized phrase ("hey rocky", 9).
+    expect(addressed("hay rucku, good morning", "hey-rocky")).toBe(true);
+    expect(addressed("hay ruckuu, good morning", "hey-rocky")).toBe(false);
   });
 
   it("a socket transcript with wakeHeard but no name is dropped, not admitted", async () => {
@@ -276,9 +311,9 @@ describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone never addr
   }, 30_000);
 });
 
-// ── gate 3: an addressed transcript is admitted as a voice-origin turn ───────
+// ── gate 3: an addressed transcript is submitted for admission as voice ─────
 describe("bob#356 V2a — an addressed transcript goes through admitTurn as voice", () => {
-  it("admits with speakerVerified:false and bob-issued utterance/correlation ids", async () => {
+  it("submits with speakerVerified:false and bob-issued utterance/correlation ids", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar);
     try {
@@ -298,7 +333,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     }
   }, 30_000);
 
-  it("an unverified speaker's addressed transcript is admitted and writes no memory", async () => {
+  it("an unverified speaker's addressed transcript is submitted and writes no memory", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar, { enrolment: {} });
     try {
@@ -313,7 +348,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     }
   }, 30_000);
 
-  it("the admitted origin is projected by the REAL admission; its tool reach is reachy_say only", async () => {
+  it("the admitted origin is projected by the REAL admission into the fresh session's prompt", async () => {
     // A voice turn runs in a FRESH session; this one is the only prompt target.
     const seen: TurnOrigin[] = [];
     let admission!: ReturnType<typeof createTurnAdmission>;
@@ -408,7 +443,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     expect(spoken).toBe("say: It is noon.");
     expect(bridgedKinds).toEqual(["admitted"]);
     expect(sent.filter((c) => c.command === "say")).toHaveLength(2);
-    // After the turn, a voice-origin call with no current utterance refuses.
+    // After the turn, a sidecar say proposal is refused and nothing is sent.
     const later = await wired.handleLine({
       type: "proposal",
       action: "say",
@@ -473,7 +508,7 @@ describe("bob#356 V2a — a transcript after a hardware-mute report is not admit
 
 // ── gate 5: the echo guard ───────────────────────────────────────────────────
 describe("bob#356 V2a — the echo guard drops bob's own words", () => {
-  it("say-match: a transcript that matches recent speech is dropped; a different one is admitted", async () => {
+  it("say-match: a transcript that matches recent speech is dropped; a different one is submitted", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar, { echoWindowMs: 10_000, playbackMs: () => 0 });
     try {
@@ -587,7 +622,8 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
     expect(executed).toEqual(["reachy_say"]);
     expect(results[1]?.result).toMatchObject({ block: true, reason: VOICE_GRANT_REFUSAL });
 
-    // CONTROL: the same grant tool runs on an authenticated cron turn.
+    // CONTROL: the same grant tool runs on a cron turn (the gate restricts only
+    // voice origins).
     results.length = 0;
     executed = [];
     await admission.admitTurn({ kind: "cron", job: "digest" }, "send the report by mail");
@@ -914,9 +950,95 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     expect(result.kind).toBe("drop");
     expect(world.voicePrompts).toEqual([]);
   });
+
+  // The link comes BACK before the turn starts: effective mute is off again, so
+  // only the epoch says the transcript belongs to a link that is gone.
+  async function queuedThenRestored(
+    restore: (world: ReturnType<typeof queuedWorld>) => Promise<void>,
+  ) {
+    const world = queuedWorld();
+    await world.wired.connected();
+    await world.wired.handleLine(healthLine(world.wired, world.state));
+    const holding = world.admission.admitTurn({ kind: "cron", job: "hold" }, "hold");
+    const queued = world.wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    await wait(20);
+    await restore(world);
+    expect(world.wired.link().phase).toBe("ready");
+    expect(world.wired.link().effectiveMuted).toBe(false);
+    world.releaseResident();
+    await holding;
+    return { world, result: await queued };
+  }
+
+  it("a reconnect to a fresh READY link while the voice turn waits refuses it as stale", async () => {
+    const { world, result } = await queuedThenRestored(async (w) => {
+      w.wired.disconnected();
+      await w.wired.connected();
+      await w.wired.handleLine(healthLine(w.wired, w.state));
+    });
+    expect(result).toMatchObject({ kind: "refused", action: "voice" });
+    expect(JSON.stringify(result)).toContain(
+      "stale: the sidecar link changed while the voice turn waited",
+    );
+    expect(world.voicePrompts).toEqual([]);
+  });
+
+  it("a device mute and unmute while the voice turn waits refuses it as stale", async () => {
+    const { world, result } = await queuedThenRestored(async (w) => {
+      await w.wired.handleLine(healthLine(w.wired, w.state, { muted: true }));
+      expect(w.wired.link().effectiveMuted).toBe(true);
+      await w.wired.handleLine(healthLine(w.wired, w.state, { muted: false }));
+    });
+    expect(result).toMatchObject({ kind: "refused", action: "voice" });
+    expect(JSON.stringify(result)).toContain(
+      "stale: the sidecar link changed while the voice turn waited",
+    );
+    expect(world.voicePrompts).toEqual([]);
+  });
+
+  it("beforeStart is checked for a queued NON-voice turn too, when it leaves the queue", async () => {
+    const prompts: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const admission = createTurnAdmission({ log: () => {} });
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt(text: string) {
+        prompts.push(text);
+        if (text === "hold") await held;
+      },
+    });
+    const holding = admission.admitTurn({ kind: "cron", job: "hold" }, "hold");
+    let checks = 0;
+    const refused = admission.admitTurn({ kind: "cron", job: "digest" }, "digest", {
+      beforeStart: () => {
+        checks += 1;
+        return "the digest is no longer due";
+      },
+    });
+    const allowed = admission.admitTurn({ kind: "cron", job: "later" }, "later", {
+      beforeStart: () => null,
+    });
+    await wait(20);
+    expect(checks).toBe(0); // still queued behind the held turn
+    release();
+    await holding;
+    await expect(refused).rejects.toThrow("bob: turn not admitted: the digest is no longer due");
+    await allowed;
+    expect(checks).toBe(1);
+    expect(prompts).toEqual(["hold", "later"]);
+  });
 });
 
-// ── no private context in a voice turn ──────────────────────────────────────
+// ── no resident history in a voice turn (fake sessions) ─────────────────────
 describe("bob#356 V2a — a voice turn sees no resident history", () => {
   it("a model that saw a private value in the resident session cannot say it from a voice turn", async () => {
     const pi = new FakePi();
@@ -1011,5 +1133,122 @@ describe("bob#356 V2a — a voice turn sees no resident history", () => {
     // ...so its model could not hand the value to reachy_say.
     expect(sent.join("\n")).not.toContain("PRIVATE-42");
     expect(sent).toContain("It is noon.");
+  });
+});
+
+// ── the capability clears its echo guard on every link change ───────────────
+describe("bob#356 V2a — wireReachyCapability clears its echo guard on link changes", () => {
+  const SAID = "jarvis, the meeting moved to noon";
+
+  /** A capability on a recorder channel whose speech is granted to `run`; the
+   *  echo window outlasts the test and playback ends at once, so only the
+   *  say-match can drop the line bob said. */
+  async function echoWorld() {
+    const pi = new FakePi();
+    const admissions: Admissions = [];
+    const logs: string[] = [];
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: ["run"],
+    };
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send() {
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store: new FakeStore(),
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => ({ kind: "run" }),
+      admitVoiceTurn: async (origin, text) => {
+        admissions.push({ origin, text });
+        return [];
+      },
+      echoWindowMs: 600_000,
+      playbackMs: () => 0,
+      log: (m) => logs.push(m),
+    });
+    const handshake = async () => {
+      await wired.connected();
+      await wired.handleLine(healthLine(wired, state));
+      expect(wired.link().phase).toBe("ready");
+    };
+    const hear = (text: string) =>
+      wired.handleLine({ type: "transcript", text, ts: "t", wakeHeard: true });
+    await handshake();
+    // bob says the line, and hearing it back is dropped: the control.
+    expect(await pi.call("reachy_say", { text: SAID })).toBe(`say: ${SAID}`);
+    expect(await hear(SAID)).toEqual({ kind: "none" });
+    expect(logs.some((m) => m.includes("echo guard: say-match"))).toBe(true);
+    expect(admissions).toEqual([]);
+    return { wired, state, admissions, handshake, hear };
+  }
+
+  it("a disconnect and a fresh handshake: bob's earlier line is no longer an echo", async () => {
+    const world = await echoWorld();
+    world.wired.disconnected();
+    await world.handshake();
+    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(world.admissions).toHaveLength(1);
+  });
+
+  it("a new connection without a disconnect notice: the handshake alone clears it", async () => {
+    const world = await echoWorld();
+    await world.handshake();
+    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+  });
+
+  it("a refused link (health mismatch) and a reconnect: cleared", async () => {
+    const world = await echoWorld();
+    await world.wired.handleLine(
+      healthLine(world.wired, world.state, { version: "another-sidecar" }),
+    );
+    expect(world.wired.link().phase).toBe("disconnected");
+    await world.handshake();
+    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+  });
+
+  it("a device mute flip (unmuted, muted, unmuted) on the same link: cleared", async () => {
+    const world = await echoWorld();
+    await world.wired.handleLine(healthLine(world.wired, world.state, { muted: true }));
+    expect(world.wired.link().effectiveMuted).toBe(true);
+    await world.wired.handleLine(healthLine(world.wired, world.state, { muted: false }));
+    expect(world.wired.link().phase).toBe("ready");
+    expect(world.wired.link().effectiveMuted).toBe(false);
+    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+  });
+
+  it("each of the four link changes clears the guard itself", async () => {
+    // A later handshake also clears, so the behaviour above cannot tell a
+    // disconnect's or a refusal's own clear from the reconnect's. Count them.
+    const clears = spyOn(EchoGuard.prototype, "clear");
+    try {
+      const world = await echoWorld();
+      const count = () => clears.mock.calls.length;
+      const at = count();
+      world.wired.disconnected();
+      expect(count()).toBe(at + 1);
+      await world.wired.connected();
+      expect(count()).toBe(at + 2);
+      await world.wired.handleLine(healthLine(world.wired, world.state));
+      expect(count()).toBe(at + 2); // the first health line of a link is no change
+      await world.wired.handleLine(healthLine(world.wired, world.state, { muted: true }));
+      expect(count()).toBe(at + 3);
+      await world.wired.handleLine(healthLine(world.wired, world.state, { muted: true }));
+      expect(count()).toBe(at + 3); // no flip, no clear
+      await world.wired.handleLine(
+        healthLine(world.wired, world.state, { version: "another-sidecar" }),
+      );
+      expect(count()).toBe(at + 4);
+    } finally {
+      clears.mockRestore();
+    }
   });
 });

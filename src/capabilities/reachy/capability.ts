@@ -102,11 +102,12 @@ export interface WireOptions {
    *  undefined, which refuses speech. Absent: nothing is bound, everything
    *  refuses. Never read from the tool's arguments, never defaulted. */
   readOrigin?: () => TurnOrigin | undefined;
-  /** bob#356 V2a: admit an addressed, unverified transcript as a voice-origin
-   *  turn (origin `{kind:"voice", speakerVerified:false}`, ids issued here).
-   *  `beforeStart` is re-checked by the admission after it leaves the queue and
-   *  immediately before the prompt starts; a non-null string refuses the turn.
-   *  Absent on the V1 core: an addressed transcript is then not admitted. */
+  /** bob#356 V2a: submit an eligible addressed transcript for admission as a
+   *  voice-origin turn (origin `{kind:"voice", speakerVerified:false}`, ids
+   *  issued here). The admission checks `beforeStart` after the turn leaves the
+   *  queue and immediately before the prompt starts; a non-null string refuses
+   *  the turn. Absent on the V1 core: an addressed transcript is then not
+   *  submitted. */
   admitVoiceTurn?: (
     origin: TurnOrigin,
     text: string,
@@ -154,9 +155,11 @@ export interface WiredReachy {
   /** The connection is gone: muted until a fresh handshake. */
   disconnected(): void;
   link(): LinkState;
-  /** Speak one line through THIS capability's link, as the current admitted
-   *  turn. The tool gate and the speech policy still decide; the caller must be
-   *  a voice-origin turn with its own current addressed utterance. */
+  /** Speak one line through THIS capability's link, as the turn the call is
+   *  bound to (the bridge a fresh voice session's `reachy_say` uses). The speech
+   *  policy decides exactly as for the resident `reachy_say`: a voice-origin turn
+   *  speaks only with its own current addressed utterance, and any other origin
+   *  only with an operator room-speech grant (`roomSpeechOrigins`). */
   speak(text: string): Promise<DecisionSummary>;
   /** The tool names registered for the configured profile. */
   tools: readonly string[];
@@ -276,9 +279,13 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
 
   /** Attempt a `reachy.malformed` audit; return malformed even if it fails. The
    *  log line names the drop (bob#356 V2a), so it is visible without an audit read.
-   *  Reachable only in the ready, unmuted state: bob's mute drops a line before
-   *  this, and a pre-handshake line is a link failure, so neither is a malformed
-   *  transcript and neither is audited or logged as one. */
+   *  A malformed sidecar LINE reaches this only on a ready link with bob's mute
+   *  and the sidecar-reported mute both off: bob's mute, a pre-handshake line, a
+   *  malformed health line (a link failure) and the sidecar-reported mute all
+   *  take other paths first. Two other callers reach it in any link state: an
+   *  action whose arguments fail their schema (admitAndRun), and a `presence`
+   *  line under the `voice` profile (ready link, bob's mute off, whatever the
+   *  sidecar-reported mute). */
   async function malformed(reason: string): Promise<DecisionSummary> {
     log(`reachy: dropped a malformed sidecar line: ${reason}`);
     const tsMs = state.nowMs();
@@ -399,9 +406,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           : decision.action === "frame"
             ? "frame"
             : "say";
-    // bob#356 V2a: remember what bob is about to play. The echo guard drops a
-    // transcript that arrives during this playback window or closely matches
-    // this text afterwards, before the transcript is retained or admitted.
+    // bob#356 V2a: remember what bob is about to play. Under the `voice`
+    // profile the echo guard drops a transcript that arrives during this line's
+    // estimated playback window or closely matches this text afterwards, before
+    // the transcript is retained or submitted for admission.
     if (isSpeech && typeof args.text === "string") echo.record(args.text, state.nowMs());
     // The audit said ADMITTED, so a send that then fails must not look like a
     // delivered command: catch it, log it, and return a LINKED refusal so the
@@ -532,12 +540,14 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     link.health = health;
   }
 
-  /** bob#356 V2a: admit ONE addressed, unverified transcript as a voice-origin
-   *  turn. bob issues the utterance and correlation ids; the origin is built
-   *  here and goes through `admitTurn`, which validates and projects it. The
-   *  capability keeps this turn's addressed assertion only while the admission
-   *  runs, so the turn's own `reachy_say` is the only speech it can authorize
-   *  and no later caller inherits it. */
+  /** bob#356 V2a: submit ONE eligible addressed, unverified transcript for
+   *  admission as a voice-origin turn. bob issues the utterance and correlation
+   *  ids; the origin is built here and goes through `admitTurn`, which
+   *  validates and projects it, and may still refuse it (a closed admission, a
+   *  stale or muted link when it is due, a voice session that cannot start).
+   *  The capability keeps this turn's addressed assertion only while the
+   *  admission runs, so only a call bound to this turn's correlation id can use
+   *  it and no later caller inherits it. */
   async function admitVoiceTranscript(transcript: Transcript): Promise<DecisionSummary> {
     if (opts.admitVoiceTurn === undefined) {
       log("reachy: an addressed transcript has no voice admission in this core; not admitted");
@@ -649,8 +659,9 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       // before the memory write.
       const epoch = link.epoch;
       // bob#356 V2a — the VOICE-profile transcript path, gated before admission:
-      // echo guard, then bob's own `addressed` recompute. EVERY addressed
-      // transcript is admitted as a voice-origin turn. Until speaker
+      // echo guard, then bob's own `addressed` recompute. An addressed
+      // transcript that passes both is submitted for admission as a voice-origin
+      // turn (the admission can still refuse it). Until speaker
       // authentication exists (V3), a sidecar-supplied `speakerId` never makes a
       // room transcript eligible for a memory write, even when it matches the
       // enrolment map: the memory path below stays unreachable under `voice`.

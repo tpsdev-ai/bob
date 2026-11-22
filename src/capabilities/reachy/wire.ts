@@ -1,9 +1,11 @@
 // reachy/wire.ts — the ONE wire shape for the sidecar's inbound JSON lines, and
 // its validation. Decoding happens HERE, before policy: a line that does not match
-// the schema is MALFORMED; in the ready, unmuted state the caller audits it as
-// `reachy.malformed` and logs the reason, never throwing into the handler. A line
-// dropped by bob's own mute, or one that arrives before the handshake, is not a
-// malformed-transcript decision: it gets neither that audit nor that log line.
+// the schema is MALFORMED, never thrown into the handler. On a ready link with
+// bob's mute and the sidecar-reported mute both off, the caller audits a
+// malformed NON-health line as `reachy.malformed` and logs the reason; a
+// malformed health line (`protocol` set) fails the link instead
+// (`reachy.link.refused`). A line dropped by either mute, or one that arrives
+// before the handshake, gets neither that audit nor that log line.
 //
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:

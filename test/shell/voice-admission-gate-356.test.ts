@@ -4,6 +4,13 @@
 // extension registers an allowed `reachy_say` and a grant-class `mail_send`;
 // the gate must let the first run inside a voice turn and refuse the second
 // with the fixed, named reason. No network: the provider is scripted.
+//
+// The gate also fails closed THROUGH the factory: a second fixture extension
+// (loaded before bob's inline extensions, as pi orders them) answers the
+// turn-admission service request with nothing, so the gate's own factory throws
+// on load. Session creation then refuses before pi builds a session, and a
+// session.reload() that loses the gate disposes the session and ends the
+// process (the exit is a recorder here).
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,11 +24,12 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
+  createAgentSessionFromServices,
   createAgentSessionRuntime,
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { RunSession, RunSessionFactory } from "../../src/shell/run.js";
+import type { RunSession, RunSessionConfig, RunSessionFactory } from "../../src/shell/run.js";
 import { assertToolAdmissionGateLoaded, createBobRuntimeFactory } from "../../src/shell/session.js";
 import {
   createToolAdmissionExtension,
@@ -35,6 +43,7 @@ const STUB_API = "bob-voice-gate-356-api";
 const STUB_MODEL = "claude-sonnet-4-6";
 const CONTEXT_WINDOW = 100_000;
 const TOOL_LOG = "BOB_TEST_VOICE_TOOL_LOG";
+const SABOTAGE_FLAG = "BOB_TEST_GATE_SABOTAGE";
 
 let root: string;
 const roots: string[] = [];
@@ -49,6 +58,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  delete process.env[SABOTAGE_FLAG];
   try {
     for (const r of runtimes.splice(0)) await r.dispose();
   } finally {
@@ -133,6 +143,101 @@ export default function (pi) {
   });
 }
 `;
+
+// A FAULT, not a capability: when the flag is set as it loads, this extension
+// answers bob's turn-admission service request with nothing. pi loads path
+// extensions before bob's inline ones and calls the bus handlers in order, so the
+// gate's factory then reads no admission and throws, which pi records as an
+// inline extension load error. pi unsubscribes a reloaded extension's bus
+// handlers, so a reload with the flag unset loads the gate again.
+const SABOTAGE = `export default function (pi) {
+  if (process.env.${SABOTAGE_FLAG} === "1") {
+    pi.events.on("bob:turn-admission", (receive) => receive(undefined));
+  }
+}
+`;
+
+/** A model runtime whose only provider is the scripted one. */
+async function scriptedRuntime(steps: Step[], seen: Context[]): Promise<ModelRuntime> {
+  const modelRuntime = await ModelRuntime.create({
+    authPath: join(root, "testbot", ".pi-agent", "auth.json"),
+    modelsPath: null,
+  });
+  modelRuntime.registerProvider(STUB_PROVIDER, {
+    name: "Stub",
+    apiKey: "stub-key",
+    api: STUB_API,
+    baseUrl: "http://localhost:0",
+    streamSimple: scriptedProvider(steps, seen),
+    models: [
+      {
+        id: STUB_MODEL,
+        name: "Stub",
+        api: STUB_API,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: CONTEXT_WINDOW,
+        maxTokens: 4096,
+      },
+    ],
+  });
+  return modelRuntime;
+}
+
+/** The session config for a fixture agent served by `admission`. */
+function fixtureConfig(
+  sources: Record<string, string>,
+  admission: ReturnType<typeof createTurnAdmission>,
+): RunSessionConfig {
+  return {
+    provider: STUB_PROVIDER,
+    model: STUB_MODEL,
+    appendSystemPrompt: "",
+    cwd: join(root, "testbot", "work"),
+    piAgentDir: join(root, "testbot", ".pi-agent"),
+    extensionSources: Object.keys(sources),
+    capabilityBySource: sources,
+    capabilityEnv: {},
+    turnAdmission: admission,
+    tools: ["reachy_say", "mail_send"],
+    excludeTools: [],
+  };
+}
+
+/** bob's REAL runtime factory for `config`, with the scripted model. */
+function bobFactoryFor(
+  config: RunSessionConfig,
+  modelRuntime: ModelRuntime,
+  deps: { log: (m: string) => void; exit: (code: number) => void },
+  buildSession?: typeof createAgentSessionFromServices,
+) {
+  return createBobRuntimeFactory({
+    config: {
+      ...config,
+      providerRecord: undefined,
+      modelLimits: { provider: STUB_PROVIDER, model: config.model, contextWindow: CONTEXT_WINDOW },
+    },
+    policy: {
+      tools: config.tools,
+      excludeTools: config.excludeTools ?? [],
+      resident: false,
+      allowResidentShell: false,
+    },
+    deps,
+    modelRuntime,
+    ...(buildSession !== undefined ? { buildSession } : {}),
+  });
+}
+
+/** Write the two fixture extensions; returns their sources → capability names. */
+function writeFixtures(): Record<string, string> {
+  const fixture = join(root, "voice-fixture.ts");
+  writeFileSync(fixture, FIXTURE);
+  const sabotage = join(root, "gate-sabotage.ts");
+  writeFileSync(sabotage, SABOTAGE);
+  return { [fixture]: "voice-fixture", [sabotage]: "gate-sabotage" };
+}
 
 describe("bob#356 V2a — the admission gate through the real session factory", () => {
   it("a voice turn runs reachy_say and refuses the grant tool with the named reason", async () => {
@@ -259,17 +364,108 @@ describe("bob#356 V2a — the gate fails closed", () => {
     expect(handlers).toEqual([]);
   });
 
-  it("session creation refuses when the gate extension failed to load", () => {
-    const loaderWith = (errors: Array<{ path: string; error: string }>) =>
-      ({ getExtensions: () => ({ errors }) }) as never;
+  it("the gate check refuses a load error AND a gate that is simply not loaded", () => {
+    const gate = { name: "bob-tool-admission" } as never;
+    const loaderWith = (
+      errors: Array<{ path: string; error: string }>,
+      extensions: Array<{ path: string }>,
+    ) => ({ getExtensions: () => ({ errors, extensions }) });
+    const loaded = [{ path: "<inline:bob-tool-admission>" }];
     expect(() =>
-      assertToolAdmissionGateLoaded(loaderWith([{ path: "<inline:1>", error: "boom" }]), {
-        name: "bob-tool-admission",
-      } as never),
+      assertToolAdmissionGateLoaded(
+        loaderWith([{ path: "<inline:bob-tool-admission>", error: "boom" }], []),
+        gate,
+      ),
     ).toThrow(/tool-admission gate/);
+    // No error recorded, and no gate either: still refused, by name.
+    expect(() => assertToolAdmissionGateLoaded(loaderWith([], []), gate)).toThrow(
+      /the tool-admission gate <inline:bob-tool-admission> is not among the loaded extensions/,
+    );
     expect(() =>
-      assertToolAdmissionGateLoaded(loaderWith([]), { name: "bob-tool-admission" } as never),
-    ).not.toThrow();
-    expect(() => assertToolAdmissionGateLoaded(loaderWith([]), undefined)).not.toThrow();
+      assertToolAdmissionGateLoaded(loaderWith([], [{ path: "<inline:other>" }]), gate),
+    ).toThrow(/not among the loaded extensions/);
+    expect(() => assertToolAdmissionGateLoaded(loaderWith([], loaded), gate)).not.toThrow();
+    // A session that needs no gate (no turn admission) is not checked.
+    expect(() => assertToolAdmissionGateLoaded(loaderWith([], []), undefined)).not.toThrow();
   });
+
+  it("THROUGH the factory: a gate that fails to load refuses session creation before pi builds a session", async () => {
+    const seen: Context[] = [];
+    const modelRuntime = await scriptedRuntime([{ kind: "text", text: "never" }], seen);
+    const admission = createTurnAdmission({ log: () => {} });
+    const config = fixtureConfig(writeFixtures(), admission);
+    process.env[SABOTAGE_FLAG] = "1";
+    let built = 0;
+    const exits: number[] = [];
+    const bobFactory = bobFactoryFor(
+      config,
+      modelRuntime,
+      { log: () => {}, exit: (code) => exits.push(code) },
+      async (options) => {
+        built += 1;
+        return createAgentSessionFromServices(options);
+      },
+    );
+    const creation = createAgentSessionRuntime(bobFactory, {
+      cwd: config.cwd,
+      agentDir: config.piAgentDir,
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
+    await expect(creation).rejects.toThrow(/tool-admission gate/);
+    await expect(creation).rejects.toThrow(
+      /<inline:bob-tool-admission>: bob: tool admission gate has no turn-admission service/,
+    );
+    // Refused before the session existed: pi never built one, so nothing was
+    // prompted and nothing could be.
+    expect(built).toBe(0);
+    expect(seen).toEqual([]);
+    expect(exits).toEqual([]);
+  }, 60_000);
+
+  it("THROUGH the factory: a reload that loses the gate disposes the session and ends the process", async () => {
+    const seen: Context[] = [];
+    const modelRuntime = await scriptedRuntime([{ kind: "text", text: "never" }], seen);
+    const admission = createTurnAdmission({ log: () => {} });
+    const config = fixtureConfig(writeFixtures(), admission);
+    const exits: number[] = [];
+    const logs: string[] = [];
+    const bobFactory = bobFactoryFor(config, modelRuntime, {
+      log: (m) => logs.push(m),
+      exit: (code) => exits.push(code),
+    });
+    // Created with the gate loaded: the control.
+    const runtime = await createAgentSessionRuntime(bobFactory, {
+      cwd: config.cwd,
+      agentDir: config.piAgentDir,
+      sessionManager: SessionManager.inMemory(config.cwd),
+    });
+    runtimes.push(runtime);
+    const loaded = () =>
+      (
+        runtime.session as unknown as {
+          resourceLoader: { getExtensions(): { extensions: Array<{ path: string }> } };
+        }
+      ).resourceLoader
+        .getExtensions()
+        .extensions.map((e) => e.path);
+    expect(loaded()).toContain("<inline:bob-tool-admission>");
+    let disposed = 0;
+    const session = runtime.session as unknown as {
+      reload(): Promise<void>;
+      dispose(): void;
+    };
+    const dispose = session.dispose.bind(session);
+    session.dispose = () => {
+      disposed += 1;
+      dispose();
+    };
+
+    process.env[SABOTAGE_FLAG] = "1";
+    await expect(session.reload()).rejects.toThrow(/tool-admission gate/);
+    expect(loaded()).not.toContain("<inline:bob-tool-admission>");
+    expect(exits).toEqual([1]);
+    expect(disposed).toBe(1);
+    expect(logs.join("\n")).toContain("<inline:bob-tool-admission>");
+    expect(seen).toEqual([]);
+  }, 60_000);
 });

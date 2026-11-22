@@ -113,8 +113,9 @@ export const BOB_EXTENSION_DATA_CLASS: Readonly<Record<string, DataClass>> = Obj
   // bob#204's setup-only `write_soul`: it holds and rewrites the agent's soul.
   "bob-write-soul": "private",
   // bob#356 V2a's tool-admission gate: it reads the bound turn origin and
-  // blocks a voice-origin call. It registers no tool and adds nothing to the
-  // model-visible context.
+  // blocks a voice-origin call. It registers no tool and carries no private
+  // data; its only model-visible output is the fixed refusal a blocked call
+  // returns.
   "bob-tool-admission": "public",
 });
 

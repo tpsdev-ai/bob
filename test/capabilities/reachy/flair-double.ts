@@ -7,6 +7,8 @@
 //   * the Memory OWNER guard: a non-admin agent may only write a Memory whose
 //     body `agentId` is itself (403 otherwise — what Flair's Memory.put does
 //     for a body owned by another agent).
+// When it is given a bootstrap context, a signed POST /BootstrapMemories answers
+// `{ context }` with it (bob#356 V2a: the session bootstrap a warm session loads).
 // An unsigned or badly signed request gets 401 first, on any route; a signed
 // request to any other route gets 404. It accepts no admin credential: every
 // caller here is an ordinary agent.
@@ -23,7 +25,10 @@ export interface FlairDouble {
   close(): void;
 }
 
-export async function startFlairDouble(agents: Record<string, KeyObject>): Promise<FlairDouble> {
+export async function startFlairDouble(
+  agents: Record<string, KeyObject>,
+  opts: { bootstrap?: string } = {},
+): Promise<FlairDouble> {
   const audits: FlairDouble["audits"] = [];
   const refusals: FlairDouble["refusals"] = [];
   const keys = new Map(Object.entries(agents).map(([id, k]) => [id, createPublicKey(k)]));
@@ -47,6 +52,11 @@ export async function startFlairDouble(agents: Record<string, KeyObject>): Promi
       const payload = `${agentId}:${ts}:${nonce}:${req.method}:${path}`;
       if (!key || !verify(null, Buffer.from(payload), key, Buffer.from(sig ?? "", "base64"))) {
         return refuse(401, "signature does not verify");
+      }
+      if (req.method === "POST" && path === "/BootstrapMemories" && opts.bootstrap !== undefined) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ context: opts.bootstrap }));
+        return;
       }
       if (req.method === "PUT" && path.startsWith("/Memory/")) {
         let parsed: { agentId?: string; content?: string };
