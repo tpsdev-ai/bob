@@ -561,20 +561,30 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     const correlationId = `corr_${uuid()}`;
     voiceUtterances.set(correlationId, { addressed: true });
     // The link state at acceptance. The admission is queued behind any running
-    // turn, so it re-checks this immediately before the prompt starts: a mute
-    // or a reconnect while it waited means the transcript belongs to a link
-    // that is gone.
+    // turn, so it checks this again immediately before the prompt starts: a
+    // mute or a reconnect while it waited means the transcript belongs to a
+    // link that is gone.
     const epoch = link.epoch;
+    // Set ONLY when beforeStart refuses the turn because the link is
+    // effectively muted at the starting line (bob's mute, the sidecar-reported
+    // mute, or no ready link). That one refusal is a drop: nothing reached the
+    // room and there is no action to judge.
+    let droppedAtStart = false;
     try {
       await opts.admitVoiceTurn(
         { kind: "voice", speakerVerified: false, utteranceId, correlationId },
         transcript.text,
         {
           beforeStart: () => {
+            // Mute first, so a queued mute or a queued disconnect with no
+            // reconnect is a drop; a link that came back ready and unmuted in
+            // a NEW epoch is refused as stale.
+            if (effectiveMuted()) {
+              droppedAtStart = true;
+              return "muted: bob mute, sidecar-reported mute, or no ready link when the voice turn was due";
+            }
             if (link.epoch !== epoch)
               return "stale: the sidecar link changed while the voice turn waited";
-            if (effectiveMuted())
-              return "muted: bob mute, sidecar-reported mute, or no ready link when the voice turn was due";
             return null;
           },
         },
@@ -583,13 +593,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log(`reachy: voice turn admission failed: ${detail}`);
-      // The rule is the link state when the failure is CAUGHT, not the error:
-      // if the link is effectively muted then (bob's mute, the sidecar-reported
-      // mute, or no ready link), ANY admission failure is a drop with no audit,
-      // the expected case being a turn refused at the starting line because the
-      // link went away. Otherwise the failure is recorded as a refusal, including
-      // a stale-epoch refusal on a link that is ready again.
-      if (effectiveMuted()) return { kind: "drop" };
+      // Only the starting-line mute refusal above is a drop. Every other
+      // failure is recorded as a refusal (`reachy.refused`), whatever the link
+      // state when it is caught: a stale epoch, a voice session that could not
+      // start, or a turn that started (and may have spoken) and then failed,
+      // even if the link muted or disconnected before this catch runs.
+      if (droppedAtStart) return { kind: "drop" };
       return await refuse("voice", `admission failed: ${detail}`);
     } finally {
       voiceUtterances.delete(correlationId);

@@ -2,18 +2,20 @@
 //
 // The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
 // a real UNIX socket: an addressed transcript is submitted for admission as a
-// voice-origin turn with bob-issued ids and `speakerVerified:false`; `wakeHeard`
-// alone never addresses; a malformed transcript is dropped with a named log
-// line; a report of hardware mute drops the next transcript; and bob's own words
-// are dropped by the echo guard (during the estimated playback and as a recent
-// say-match). The remaining cases call the real modules directly: the wake-name
-// edit tiers, wire decoding, memory eligibility under a real parsed config,
-// per-turn utterance cleanup, the queued-turn recheck (mute, disconnect, and a
-// link that comes back before the turn starts), the admission's beforeStart for
-// a non-voice turn, the echo guard's clearing on link changes, context isolation
-// with fake sessions (the production path is voice-v2a-production-356.test.ts),
-// and the tool-admission gate (stub tools through the real extension; the
-// `voice` profile still exposes no body tool).
+// voice-origin turn with bob-issued ids and `speakerVerified:false`;
+// `wakeHeard` alone never addresses; a malformed transcript is dropped with a
+// named log line; a report of hardware mute drops the next transcript; and
+// bob's own words are dropped by the echo guard (during the estimated playback
+// and as a recent say-match). The remaining cases call the real modules
+// directly: the wake-name edit tiers, wire decoding, a malformed line that a
+// mute or the handshake drops (no malformed audit), memory eligibility under a
+// real parsed config, per-turn utterance cleanup, the queued-turn recheck (a
+// mute or a disconnect drops it; a link that comes back first refuses it as
+// stale), a turn that fails after it started (refused on the record), the
+// admission's beforeStart for a non-voice turn, the echo guard's clearing on
+// link changes, context isolation with fake sessions (the production path is
+// voice-v2a-production-356.test.ts), and the tool-admission gate (stub tools
+// through the real extension; the `voice` profile still exposes no body tool).
 import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -482,6 +484,81 @@ describe("bob#356 V2a — a malformed transcript is dropped, never admitted", ()
   }, 30_000);
 });
 
+// ── a malformed line that a mute or the handshake drops is not "malformed" ──
+describe("bob#356 V2a — a malformed line dropped by a mute or before the handshake gets no malformed audit or log", () => {
+  // Wire-malformed: empty text fails the transcript schema.
+  const BAD = { type: "transcript", text: "", ts: "t", wakeHeard: true };
+  function recorderWorld() {
+    const store = new FakeStore();
+    const logs: string[] = [];
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    const wired = wireReachyCapability({
+      pi: new FakePi(),
+      commands: {
+        async send() {
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store,
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => undefined,
+      log: (m) => logs.push(m),
+    });
+    const ready = async (over: Record<string, unknown> = {}) => {
+      await wired.connected();
+      await wired.handleLine(healthLine(wired, state, over));
+      expect(wired.link().phase).toBe("ready");
+    };
+    const traces = () => ({
+      audits: store.all.filter((e) => e.kind === "reachy.malformed").length,
+      logs: logs.filter((m) => m.includes("dropped malformed input")).length,
+    });
+    return { wired, state, store, ready, traces };
+  }
+
+  it("CONTROL: on a ready link with both mutes off it IS audited and logged", async () => {
+    const w = recorderWorld();
+    await w.ready();
+    expect((await w.wired.handleLine(BAD)).kind).toBe("malformed");
+    expect(w.traces()).toEqual({ audits: 1, logs: 1 });
+  });
+
+  it("under bob's mute: dropped, with neither", async () => {
+    const w = recorderWorld();
+    await w.ready();
+    w.state.mute = true;
+    expect((await w.wired.handleLine(BAD)).kind).toBe("drop");
+    expect(w.traces()).toEqual({ audits: 0, logs: 0 });
+  });
+
+  it("on a ready link the sidecar reports muted: dropped, with neither", async () => {
+    const w = recorderWorld();
+    await w.ready({ muted: true });
+    expect(w.wired.link().effectiveMuted).toBe(true);
+    expect((await w.wired.handleLine(BAD)).kind).toBe("drop");
+    expect(w.traces()).toEqual({ audits: 0, logs: 0 });
+  });
+
+  it("while handshaking, before the first health line: the LINK is refused instead", async () => {
+    const w = recorderWorld();
+    await w.wired.connected();
+    expect(w.wired.link().phase).toBe("handshaking");
+    await w.wired.handleLine(BAD);
+    expect(w.wired.link().phase).toBe("disconnected");
+    expect(w.store.all.some((e) => e.kind === "reachy.link.refused")).toBe(true);
+    expect(w.traces()).toEqual({ audits: 0, logs: 0 });
+  });
+});
+
 // ── gate 4: hardware mute drops the next transcript ──────────────────────────
 describe("bob#356 V2a — a transcript after a hardware-mute report is not admitted", () => {
   it("admits before the mute, drops after it", async () => {
@@ -563,10 +640,21 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
       grant: true,
       reason: VOICE_GRANT_REFUSAL,
     });
-    expect(admitToolCall("calendar_accept", voice()).allow).toBe(false);
-    expect(admitToolCall("payment_send", voice()).allow).toBe(false);
-    // Default-deny: a tool that does not exist yet is unreachable from voice.
-    expect(admitToolCall("some_future_tool", voice()).allow).toBe(false);
+    // Every LISTED grant tool gets the same fixed grant refusal.
+    for (const grant of ["calendar_accept", "payment_send"]) {
+      expect(admitToolCall(grant, voice())).toEqual({
+        allow: false,
+        grant: true,
+        reason: VOICE_GRANT_REFUSAL,
+      });
+    }
+    // Default-deny: a tool that does not exist yet is unreachable from voice,
+    // with the generic refusal that names the one reachable tool and this one.
+    expect(admitToolCall("some_future_tool", voice())).toEqual({
+      allow: false,
+      reason:
+        "a voice-origin turn may use only reachy_say; some_future_tool is not reachable from the room",
+    });
     // Every non-voice origin is unchanged.
     expect(admitToolCall("mail_send", { kind: "run" }).allow).toBe(true);
     expect(admitToolCall("mail_send", { kind: "cron", job: "digest" }).allow).toBe(true);
@@ -910,7 +998,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     return { wired, state, admission, voicePrompts, releaseResident };
   }
 
-  it("a mute while the voice turn waits refuses it", async () => {
+  it("a mute while the voice turn waits drops it: nothing is prompted or audited as refused", async () => {
     const world = queuedWorld();
     await world.wired.connected();
     await world.wired.handleLine(healthLine(world.wired, world.state));
@@ -931,7 +1019,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     expect(world.voicePrompts).toEqual([]);
   });
 
-  it("a disconnect while the voice turn waits refuses it", async () => {
+  it("a disconnect while the voice turn waits drops it: nothing is prompted or audited as refused", async () => {
     const world = queuedWorld();
     await world.wired.connected();
     await world.wired.handleLine(healthLine(world.wired, world.state));
@@ -999,6 +1087,93 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
       "stale: the sidecar link changed while the voice turn waited",
     );
     expect(world.voicePrompts).toEqual([]);
+  });
+
+  // Only the starting-line mute is a drop. A turn that failed for any other
+  // reason is a refusal on the record, even when the link went quiet before the
+  // failure was caught.
+  type Wired = ReturnType<typeof wireReachyCapability>;
+  type AdmitVoice = (
+    origin: TurnOrigin,
+    text: string,
+    opts?: { beforeStart?: () => string | null },
+  ) => Promise<unknown[]>;
+  /** A capability on a recorder channel whose voice admission `make` builds;
+   *  `wired()` reads the capability lazily, so the admission can drive it. */
+  function failingWorld(make: (world: { wired: () => Wired; state: PolicyState }) => AdmitVoice) {
+    const store = new FakeStore();
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    let wired!: Wired;
+    const admitVoiceTurn = make({ wired: () => wired, state });
+    wired = wireReachyCapability({
+      pi: new FakePi(),
+      commands: {
+        async send() {
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store,
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => undefined,
+      admitVoiceTurn,
+      log: () => {},
+    });
+    return { wired, state, store };
+  }
+  const addressedLine = {
+    type: "transcript",
+    text: "jarvis, what time is it",
+    ts: "t",
+    wakeHeard: true,
+  };
+
+  it("a turn that passed beforeStart and then failed after a disconnect is REFUSED on the record", async () => {
+    const world = failingWorld(({ wired }) => async (_origin, _text, opts) => {
+      expect(opts?.beforeStart?.()).toBeNull(); // the turn starts
+      wired().disconnected(); // the link goes away mid-turn
+      throw new Error("the voice turn failed after it started");
+    });
+    await world.wired.connected();
+    await world.wired.handleLine(healthLine(world.wired, world.state));
+    const result = await world.wired.handleLine(addressedLine);
+    expect(world.wired.link().effectiveMuted).toBe(true); // quiet when caught
+    expect(result).toMatchObject({ kind: "refused", action: "voice" });
+    const refused = world.store.all.filter((e) => e.kind === "reachy.refused");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.summary).toContain("the voice turn failed after it started");
+  });
+
+  it("a voice session that failed to start after a device mute is REFUSED on the record", async () => {
+    // The REAL admission: voiceSession() runs before beforeStart, so a session
+    // that cannot start never reaches the starting-line check.
+    const world = failingWorld(({ wired, state }) => {
+      const admission = createTurnAdmission({
+        log: () => {},
+        voiceSession: async () => {
+          await wired().handleLine(healthLine(wired(), state, { muted: true }));
+          throw new Error("the voice session could not start");
+        },
+      });
+      admission.bind({ subscribe: () => () => {}, dispose() {}, async prompt() {} });
+      return admission.admitTurn;
+    });
+    await world.wired.connected();
+    await world.wired.handleLine(healthLine(world.wired, world.state));
+    const result = await world.wired.handleLine(addressedLine);
+    expect(world.wired.link().effectiveMuted).toBe(true); // quiet when caught
+    expect(result).toMatchObject({ kind: "refused", action: "voice" });
+    const refused = world.store.all.filter((e) => e.kind === "reachy.refused");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.summary).toContain("the voice session could not start");
   });
 
   it("beforeStart is checked for a queued NON-voice turn too, when it leaves the queue", async () => {
