@@ -36,7 +36,6 @@ import {
   type OrgEvent,
   type PolicyState,
   type ProposalAction,
-  speakerVerified,
   type Transcript,
 } from "./policy.js";
 import {
@@ -105,8 +104,14 @@ export interface WireOptions {
   readOrigin?: () => TurnOrigin | undefined;
   /** bob#356 V2a: admit an addressed, unverified transcript as a voice-origin
    *  turn (origin `{kind:"voice", speakerVerified:false}`, ids issued here).
+   *  `beforeStart` is re-checked by the admission after it leaves the queue and
+   *  immediately before the prompt starts; a non-null string refuses the turn.
    *  Absent on the V1 core: an addressed transcript is then not admitted. */
-  admitVoiceTurn?: (origin: TurnOrigin, text: string) => Promise<unknown[]>;
+  admitVoiceTurn?: (
+    origin: TurnOrigin,
+    text: string,
+    opts?: { beforeStart?: () => string | null },
+  ) => Promise<unknown[]>;
   /** Echo-guard seams (tests): the say-match window and the playback estimate. */
   echoWindowMs?: number;
   playbackMs?: (text: string) => number;
@@ -149,6 +154,10 @@ export interface WiredReachy {
   /** The connection is gone: muted until a fresh handshake. */
   disconnected(): void;
   link(): LinkState;
+  /** Speak one line through THIS capability's link, as the current admitted
+   *  turn. The tool gate and the speech policy still decide; the caller must be
+   *  a voice-origin turn with its own current addressed utterance. */
+  speak(text: string): Promise<DecisionSummary>;
   /** The tool names registered for the configured profile. */
   tools: readonly string[];
 }
@@ -266,7 +275,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   }
 
   /** Attempt a `reachy.malformed` audit; return malformed even if it fails. The
-   *  log line names the drop (bob#356 V2a), so it is visible without an audit read. */
+   *  log line names the drop (bob#356 V2a), so it is visible without an audit read.
+   *  Reachable only in the ready, unmuted state: bob's mute drops a line before
+   *  this, and a pre-handshake line is a link failure, so neither is a malformed
+   *  transcript and neither is audited or logged as one. */
   async function malformed(reason: string): Promise<DecisionSummary> {
     log(`reachy: dropped a malformed sidecar line: ${reason}`);
     const tsMs = state.nowMs();
@@ -534,15 +546,33 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     const utteranceId = `utt_${uuid()}`;
     const correlationId = `corr_${uuid()}`;
     voiceUtterances.set(correlationId, { addressed: true });
+    // The link state at acceptance. The admission is queued behind any running
+    // turn, so it re-checks this immediately before the prompt starts: a mute
+    // or a reconnect while it waited means the transcript belongs to a link
+    // that is gone.
+    const epoch = link.epoch;
     try {
       await opts.admitVoiceTurn(
         { kind: "voice", speakerVerified: false, utteranceId, correlationId },
         transcript.text,
+        {
+          beforeStart: () => {
+            if (link.epoch !== epoch)
+              return "stale: the sidecar link changed while the voice turn waited";
+            if (effectiveMuted())
+              return "muted: bob mute, sidecar-reported mute, or no ready link when the voice turn was due";
+            return null;
+          },
+        },
       );
       return { kind: "admitted", action: "voice" };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log(`reachy: voice turn admission failed: ${detail}`);
+      // A turn refused at the starting line because the link went away is a
+      // drop, not a refusal: nothing reached the room and there is no action to
+      // judge. Anything else is recorded as a refusal.
+      if (effectiveMuted()) return { kind: "drop" };
       return await refuse("voice", `admission failed: ${detail}`);
     } finally {
       voiceUtterances.delete(correlationId);
@@ -619,9 +649,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       // before the memory write.
       const epoch = link.epoch;
       // bob#356 V2a — the VOICE-profile transcript path, gated before admission:
-      // echo guard, then bob's own `addressed` recompute. An unverified, addressed
-      // transcript is admitted as a voice-origin turn; a verified one keeps the
-      // S3 memory path below (enrolment is V3).
+      // echo guard, then bob's own `addressed` recompute. EVERY addressed
+      // transcript is admitted as a voice-origin turn. Until speaker
+      // authentication exists (V3), a sidecar-supplied `speakerId` never makes a
+      // room transcript eligible for a memory write, even when it matches the
+      // enrolment map: the memory path below stays unreachable under `voice`.
       if (state.profile === "voice") {
         const echoReason = echo.check(decoded.transcript.text, state.nowMs());
         if (echoReason !== null) {
@@ -635,9 +667,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           );
           return { kind: "none" };
         }
-        if (!speakerVerified(decoded.transcript.speakerId, state.enrolment)) {
-          return await admitVoiceTranscript(decoded.transcript);
-        }
+        return await admitVoiceTranscript(decoded.transcript);
       }
       lastTranscript = decoded.transcript;
       const decision = decideTranscript(decoded.transcript, state);
@@ -865,6 +895,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       effectiveMuted: effectiveMuted(),
       health: link.health,
     }),
+    speak: (text: string) => admitAndRun("say", { text }, 1, [], toolCaller()),
     tools,
   };
 }

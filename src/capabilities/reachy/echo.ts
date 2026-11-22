@@ -8,9 +8,13 @@
 //     window is dropped. The window is estimated from the spoken text (a bound,
 //     never a sidecar assertion).
 //   * SAY-MATCH: a transcript whose text closely matches something bob said
-//     within the last `windowMs` is dropped. Normalization is NFKC, lowercase,
-//     punctuation and whitespace folded to single spaces; similarity is
-//     `1 - levenshtein / max(length)` and the threshold is 0.9.
+//     within the last `windowMs` (measured from the end of its PLAYBACK, so a
+//     long line's window cannot expire while it is still being spoken) is
+//     dropped. Normalization is NFKC, lowercase, punctuation and whitespace
+//     folded to single spaces. A line matches when its edit distance is within
+//     a fixed length-based allowance: `floor((1 - 0.9) * max(length))` edits.
+//     Two empty strings compare equal (similarity 1), but an empty transcript
+//     never matches: there is nothing to hear.
 //
 // This heuristic does not certify AEC. It is a deterministic drop, applied
 // before a transcript is retained or admitted, and it is deliberately
@@ -54,14 +58,27 @@ export function editDistance(a: string, b: string): number {
   return levenshtein(a, b);
 }
 
-/** 1 for identical strings, 0 when either is empty; otherwise 1 - distance/max. */
+/** 1 for identical strings, 1 when both are empty, otherwise 1 - distance/max. */
 export function editSimilarity(a: string, b: string): number {
   if (a === b) return 1;
   const max = Math.max(a.length, b.length);
   if (max === 0) return 1;
-  // A length gap alone bounds the similarity: skip the quadratic walk.
-  if (Math.abs(a.length - b.length) / max > 1 - ECHO_SIMILARITY) return 0;
+  // A length gap larger than the edit allowance cannot match: skip the walk.
+  if (Math.abs(a.length - b.length) > editAllowance(max)) return 0;
   return 1 - levenshtein(a, b) / max;
+}
+
+/**
+ * The fixed number of edits a normalized line may contain and still count as
+ * bob's own words: `floor((1 - ECHO_SIMILARITY) * length)`.
+ *
+ * The epsilon keeps the exact boundary in float64: `1 - 0.9` is
+ * 0.09999999999999998, so for a 10-character line the product is
+ * 0.9999999999999998 and a plain floor would allow ZERO edits, rejecting a
+ * transcript one edit away — exactly similarity 0.9, which must match.
+ */
+export function editAllowance(length: number, threshold: number = ECHO_SIMILARITY): number {
+  return Math.floor((1 - threshold) * length + 1e-9);
 }
 
 /** The bounded window a spoken line is estimated to play for. */
@@ -77,7 +94,8 @@ interface Spoken {
 
 export type EchoReason = "playback" | "say-match";
 
-/** The guard's state. One instance per sidecar link. */
+/** The guard's state. One instance per capability; the capability clears it on
+ *  every link change, so records never cross a connection. */
 export class EchoGuard {
   private readonly spoken: Spoken[] = [];
 
@@ -102,16 +120,20 @@ export class EchoGuard {
     return this.spoken.some((s) => nowMs < s.playbackUntilMs);
   }
 
-  /** Say-match: the transcript is one of bob's own recent lines. */
+  /** Say-match: the transcript is one of bob's own recent lines. The window
+   *  starts when that line's playback ENDS, so a multi-sentence line cannot
+   *  outlast its own echo guard. */
   matchesRecentSay(text: string, nowMs: number): boolean {
     const normalized = normalizeSpeech(text);
     if (normalized.length === 0) return false;
-    return this.spoken.some(
-      (s) =>
-        nowMs - s.atMs <= this.windowMs &&
-        s.normalized.length > 0 &&
-        editSimilarity(normalized, s.normalized) >= ECHO_SIMILARITY,
-    );
+    return this.spoken.some((s) => {
+      if (s.normalized.length === 0) return false;
+      if (nowMs > s.playbackUntilMs + this.windowMs) return false;
+      return (
+        editDistance(normalized, s.normalized) <=
+        editAllowance(Math.max(normalized.length, s.normalized.length))
+      );
+    });
   }
 
   /** The drop reason for a transcript, or null when it is not bob's echo. */
@@ -127,8 +149,9 @@ export class EchoGuard {
   }
 
   private prune(nowMs: number): void {
-    const horizon = nowMs - this.windowMs;
-    while (this.spoken.length > 0 && (this.spoken[0]?.atMs ?? 0) < horizon) {
+    while (this.spoken.length > 0) {
+      const oldest = this.spoken[0];
+      if (oldest === undefined || nowMs <= oldest.playbackUntilMs + this.windowMs) return;
       this.spoken.shift();
     }
   }

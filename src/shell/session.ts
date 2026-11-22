@@ -1025,6 +1025,7 @@ export function isolatedLoaderOptions(
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
     sessionOrigin?: RunSessionConfig["sessionOrigin"];
+    voiceSpeech?: RunSessionConfig["voiceSpeech"];
   },
   extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[]; webSession?: boolean },
 ): LoaderOptions {
@@ -1045,11 +1046,12 @@ export function isolatedLoaderOptions(
     additionalExtensionPaths: [...config.extensionSources],
     // bob#356: the runtime services a capability may read at load — the turn
     // admission (persistent) and the declared session origin (one-shot run).
-    ...(config.turnAdmission || config.sessionOrigin
+    ...(config.turnAdmission || config.sessionOrigin || config.voiceSpeech
       ? {
           eventBus: runtimeEventBus({
             ...(config.turnAdmission ? { admission: config.turnAdmission } : {}),
             ...(config.sessionOrigin ? { sessionOrigin: config.sessionOrigin } : {}),
+            ...(config.voiceSpeech ? { voiceSpeech: config.voiceSpeech } : {}),
           }),
         }
       : {}),
@@ -1377,8 +1379,27 @@ export function assertContractGuardLoaded(
   );
 }
 
+export function assertToolAdmissionGateLoaded(
+  loader: ExtensionErrorSource,
+  gate: InlineExtension | undefined,
+): void {
+  if (gate === undefined) return;
+  const failures = (loader.getExtensions().errors ?? []).filter((e) =>
+    e.path.startsWith("<inline:"),
+  );
+  if (failures.length === 0) return;
+  throw new Error(
+    [
+      `bob: ${failures.length} of bob's own inline extension${failures.length === 1 ? " did" : "s did"} not load:`,
+      ...failures.map((f) => `  ${f.path}: ${f.error}`),
+      "",
+      "The tool-admission gate is registered as an inline extension; without it a voice-origin",
+      "turn would reach every tool, so the session is refused rather than run ungated.",
+    ].join("\n"),
+  );
+}
+
 /**
- * The literal contract block a session carries in its system prompt, or
  * undefined when it carries none. The one-shot task and the persistent standing
  * contract are mutually exclusive: a session that was started for one task and
  * also claims a standing contract would be carrying two answers to "what am I
@@ -1717,6 +1738,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
+    assertToolAdmissionGateLoaded(services.resourceLoader, toolAdmissionExt);
     if (keyedProvider !== undefined && keyedRow !== undefined) {
       await assertKeyedRuntimeUnchanged(modelRuntime as ModelRuntime, {
         row: keyedRow,

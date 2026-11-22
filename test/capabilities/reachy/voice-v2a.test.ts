@@ -1,13 +1,15 @@
 // bob#356 V2a — the BOB SIDE of the ears: gates before inputs.
 //
-// A FAKE sidecar process, speaking reachy-voice/1 on a real UNIX socket, drives
-// every case: an addressed transcript is admitted as a voice-origin turn with
-// bob-issued ids and `speakerVerified:false`; `wakeHeard` alone never addresses;
-// a malformed transcript is dropped with a named log line; a report of hardware
-// mute drops the next transcript; bob's own words are dropped by the echo guard
-// (during playback and as a recent say-match); a voice turn cannot execute a
-// grant tool (stub grant tool through the real tool-admission extension); and
-// the `voice` profile still exposes no body tool.
+// The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
+// a real UNIX socket: an addressed transcript is admitted as a voice-origin turn
+// with bob-issued ids and `speakerVerified:false`; `wakeHeard` alone never
+// addresses; a malformed transcript is dropped with a named log line; a report of
+// hardware mute drops the next transcript; and bob's own words are dropped by the
+// echo guard (during playback and as a recent say-match). The remaining cases
+// call the real modules directly: wire decoding, memory eligibility under a real
+// parsed config, per-turn utterance cleanup, the queued-turn recheck, a fresh
+// session's context isolation, and the tool-admission gate (stub tools through
+// the real extension; the `voice` profile still exposes no body tool).
 import { afterAll, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -22,8 +24,10 @@ import {
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
 import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
+import { parseConfig } from "../../../src/capabilities/reachy/config.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { addressed } from "../../../src/capabilities/reachy/policy.js";
+import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
 import {
   admitToolCall,
   createToolAdmissionExtension,
@@ -310,14 +314,23 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
   }, 30_000);
 
   it("the admitted origin is projected by the REAL admission; its tool reach is reachy_say only", async () => {
-    const admission = createTurnAdmission({ log: () => {} });
+    // A voice turn runs in a FRESH session; this one is the only prompt target.
     const seen: TurnOrigin[] = [];
+    let admission!: ReturnType<typeof createTurnAdmission>;
+    admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt() {
+          seen.push(admission.readOrigin());
+        },
+      }),
+    });
     admission.bind({
       subscribe: () => () => {},
       dispose() {},
-      async prompt() {
-        seen.push(admission.readOrigin());
-      },
+      async prompt() {},
     });
     const origin: TurnOrigin = {
       kind: "voice",
@@ -332,8 +345,24 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
   it("inside its own voice turn the admitted say is authorized; a later call is not", async () => {
     // The real admission binds the origin; the real capability supplies the
     // utterance it recorded for THIS turn. No socket: the command channel is a
-    // recorder, so the assertion is about the gates.
-    const admission = createTurnAdmission({ log: () => {} });
+    // recorder, so the assertion is about the gates. The voice prompt runs in a
+    // FRESH session, never the resident one.
+    let spoken: string | undefined;
+    const bridgedKinds: string[] = [];
+    let admission!: ReturnType<typeof createTurnAdmission>;
+    admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt() {
+          spoken = await pi.call("reachy_say", { text: "It is noon." });
+          // The FRESH session's reachy_say goes through this function (the
+          // runtime hands it the resident capability's speech bridge).
+          bridgedKinds.push((await wired.speak("It is noon.")).kind);
+        },
+      }),
+    });
     const pi = new FakePi();
     const sent: Array<{ command: string }> = [];
     const store = new FakeStore();
@@ -364,13 +393,10 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     await wired.connected();
     await wired.handleLine(healthLine(wired, state));
     expect(wired.link().phase).toBe("ready");
-    let spoken: string | undefined;
     admission.bind({
       subscribe: () => () => {},
       dispose() {},
-      async prompt() {
-        spoken = await pi.call("reachy_say", { text: "It is noon." });
-      },
+      async prompt() {},
     });
     const summary = await wired.handleLine({
       type: "transcript",
@@ -380,7 +406,8 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     });
     expect(summary).toMatchObject({ kind: "admitted", action: "voice" });
     expect(spoken).toBe("say: It is noon.");
-    expect(sent.filter((c) => c.command === "say")).toHaveLength(1);
+    expect(bridgedKinds).toEqual(["admitted"]);
+    expect(sent.filter((c) => c.command === "say")).toHaveLength(2);
     // After the turn, a voice-origin call with no current utterance refuses.
     const later = await wired.handleLine({
       type: "proposal",
@@ -390,7 +417,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
       inputs: [],
     });
     expect(later).toMatchObject({ kind: "refused" });
-    expect(sent.filter((c) => c.command === "say")).toHaveLength(1);
+    expect(sent.filter((c) => c.command === "say")).toHaveLength(2);
   }, 30_000);
 });
 
@@ -512,7 +539,19 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
   });
 
   it("the REAL extension blocks a stub grant tool inside a voice turn, and allows it on a cron turn", async () => {
-    const admission = createTurnAdmission({ log: () => {} });
+    // The voice prompt runs in a FRESH session; the CONTROL cron turn runs in
+    // the resident one. Both exercise the same real tool_call handler.
+    let runCalls: () => Promise<void> = async () => {};
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt() {
+          await runCalls();
+        },
+      }),
+    });
     const handlers = new Map<string, Array<(event: unknown) => unknown>>();
     const pi = {
       events: runtimeEventBus({ admission }),
@@ -532,12 +571,15 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
       return result;
     };
     const results: Array<{ tool: string; result: unknown }> = [];
+    runCalls = async () => {
+      results.push({ tool: "reachy_say", result: await callTool("reachy_say") });
+      results.push({ tool: "mail_send", result: await callTool("mail_send") });
+    };
     admission.bind({
       subscribe: () => () => {},
       dispose() {},
       async prompt() {
-        results.push({ tool: "reachy_say", result: await callTool("reachy_say") });
-        results.push({ tool: "mail_send", result: await callTool("mail_send") });
+        await runCalls();
       },
     });
     executed = [];
@@ -587,4 +629,387 @@ describe("bob#356 V2a — under `voice` the body tools remain absent", () => {
       bob.close();
     }
   }, 30_000);
+});
+
+// ── wire bounds and the reason that names every failed field ────────────────
+describe("bob#356 V2a — the transcript line's bounds and its named failure reason", () => {
+  const line = (over: Record<string, unknown> = {}) => ({
+    type: "transcript",
+    text: "jarvis, what time is it",
+    ts: "2026-01-01T00:00:00Z",
+    wakeHeard: true,
+    ...over,
+  });
+  const reasonOf = (raw: unknown): string => {
+    const decoded = decodeLine(raw);
+    if (decoded.kind !== "malformed") throw new Error(`expected malformed, got ${decoded.kind}`);
+    return decoded.reason;
+  };
+
+  it("bounds the timestamp (1..64) without echoing it", () => {
+    expect(decodeLine(line({ ts: "" })).kind).toBe("malformed");
+    expect(decodeLine(line({ ts: "x".repeat(65) })).kind).toBe("malformed");
+    expect(decodeLine(line({ ts: "x".repeat(64) })).kind).toBe("transcript");
+    expect(reasonOf(line({ ts: "x".repeat(65) }))).toBe("transcript line failed its schema (ts)");
+  });
+
+  it("bounds the speakerId (1..128) and names it in the reason", () => {
+    expect(decodeLine(line({ speakerId: "" })).kind).toBe("malformed");
+    expect(decodeLine(line({ speakerId: "s".repeat(129) })).kind).toBe("malformed");
+    expect(decodeLine(line({ speakerId: "s".repeat(128) })).kind).toBe("transcript");
+    expect(reasonOf(line({ speakerId: "s".repeat(129) }))).toContain("speakerId");
+  });
+
+  it("rejects an unknown field", () => {
+    const reason = reasonOf(line({ transcript: "extra" }));
+    expect(reason).toContain("unknown field");
+  });
+
+  it("enforces ONE line of text and names text when it is not", () => {
+    expect(decodeLine(line({ text: "one line\nsecond line" })).kind).toBe("malformed");
+    expect(decodeLine(line({ text: "one line\r\nsecond line" })).kind).toBe("malformed");
+    expect(reasonOf(line({ text: "one\nline" }))).toContain("text");
+    expect(decodeLine(line({ text: "one line" })).kind).toBe("transcript");
+  });
+
+  it("names EVERY failed field, including speakerId", () => {
+    const reason = reasonOf({
+      type: "transcript",
+      text: "",
+      ts: "",
+      wakeHeard: "yes",
+      speakerId: "",
+    });
+    for (const field of ["text", "ts", "wakeHeard", "speakerId"]) {
+      expect(reason).toContain(field);
+    }
+  });
+});
+
+// ── no memory write from a voice transcript, even for an enrolled id ────────
+describe("bob#356 V2a — a voice transcript is ineligible for a memory write", () => {
+  it("a real parsed config with a nonempty enrolment and a forged matching speakerId writes nothing", async () => {
+    const config = parseConfig({
+      socket: "/tmp/reachy.sock",
+      sidecarVersion: "reachy-voice-test",
+      enrolledSpeakers: { "spk-a": "member-a" },
+    });
+    expect(config.enrolledSpeakers).toEqual({ "spk-a": "member-a" });
+    const pi = new FakePi();
+    const memory = new FakeMemory();
+    const store = new FakeStore();
+    const state: PolicyState = {
+      profile: config.profile,
+      wakeName: config.wakeName,
+      enrolment: config.enrolledSpeakers,
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    const admissions: Admissions = [];
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send() {
+          return null;
+        },
+      },
+      memory,
+      store,
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => ({ kind: "run" }),
+      admitVoiceTurn: async (origin, text) => {
+        admissions.push({ origin, text });
+        return [];
+      },
+      log: () => {},
+    });
+    await wired.connected();
+    await wired.handleLine(healthLine(wired, state));
+    expect(wired.link().phase).toBe("ready");
+    const summary = await wired.handleLine({
+      type: "transcript",
+      text: "jarvis, remember the fire drill",
+      ts: "t",
+      wakeHeard: true,
+      speakerId: "spk-a",
+    });
+    expect(summary).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(memory.writes).toEqual([]);
+    expect(store.all.some((e) => e.kind === "reachy.memory.attempt")).toBe(false);
+  });
+});
+
+// ── a voice turn is its own turn: cleanup and correlation binding ───────────
+describe("bob#356 V2a — a voice utterance authorizes only its own turn", () => {
+  it("a call AFTER the admitted turn fails, and a foreign correlationId never matches", async () => {
+    const pi = new FakePi();
+    const sent: string[] = [];
+    let correlationId = "";
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send(command: string, args?: Record<string, unknown>) {
+          if (command === "say" && typeof args?.text === "string") sent.push(args.text);
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store: new FakeStore(),
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      // A voice origin that STAYS bound after the turn: the stale reader the
+      // cleanup must defeat on its own.
+      readOrigin: () => ({
+        kind: "voice",
+        speakerVerified: false,
+        utteranceId: "utt_1",
+        correlationId,
+      }),
+      admitVoiceTurn: async (origin) => {
+        if (origin.kind === "voice") {
+          correlationId = origin.correlationId;
+          // While THIS turn's utterance is live, a call bound to a DIFFERENT
+          // correlation id must not inherit it: the binding is by id, not by
+          // "some voice turn is running".
+          const issued = correlationId;
+          correlationId = "corr_other";
+          const foreignDuring = await pi.call("reachy_say", { text: "foreign" });
+          expect(foreignDuring).toContain("needs its own current addressed utterance");
+          correlationId = issued;
+        }
+        return [];
+      },
+      log: () => {},
+      // Deterministic ids, so the stale reader below uses the SAME correlation id
+      // the capability issued for the turn.
+      uuid: (() => {
+        let n = 0;
+        return () => `u${++n}`;
+      })(),
+    });
+    await wired.connected();
+    await wired.handleLine(healthLine(wired, state));
+    expect(wired.link().phase).toBe("ready");
+    const summary = await wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    expect(summary).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(correlationId).toMatch(/^corr_u\d+$/);
+    // AFTER the turn: the capability's record is gone, so this call refuses.
+    const after = await pi.call("reachy_say", { text: "It is noon." });
+    expect(after).toContain(
+      "refused: a voice-origin call needs its own current addressed utterance",
+    );
+    expect(sent).toEqual([]);
+    // A forged/other correlation id never had a record at all.
+    correlationId = "corr_other";
+    const foreign = await pi.call("reachy_say", { text: "It is noon." });
+    expect(foreign).toContain("needs its own current addressed utterance");
+    expect(sent).toEqual([]);
+  });
+});
+
+// ── a queued voice turn rechecks the link before it starts ──────────────────
+describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () => {
+  function queuedWorld() {
+    const pi = new FakePi();
+    const voicePrompts: string[] = [];
+    let releaseResident!: () => void;
+    const residentGate = new Promise<void>((resolve) => {
+      releaseResident = resolve;
+    });
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt(text: string) {
+          voicePrompts.push(text);
+        },
+      }),
+    });
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt() {
+        await residentGate;
+      },
+    });
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send() {
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store: new FakeStore(),
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => boundOrigin({ admission }),
+      admitVoiceTurn: admission.admitTurn,
+      log: () => {},
+    });
+    return { wired, state, admission, voicePrompts, releaseResident };
+  }
+
+  it("a mute while the voice turn waits refuses it", async () => {
+    const world = queuedWorld();
+    await world.wired.connected();
+    await world.wired.handleLine(healthLine(world.wired, world.state));
+    expect(world.wired.link().phase).toBe("ready");
+    const holding = world.admission.admitTurn({ kind: "cron", job: "hold" }, "hold");
+    const queued = world.wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    await wait(20);
+    world.state.mute = true;
+    world.releaseResident();
+    await holding;
+    const result = await queued;
+    expect(result.kind).toBe("drop");
+    expect(world.voicePrompts).toEqual([]);
+  });
+
+  it("a disconnect while the voice turn waits refuses it", async () => {
+    const world = queuedWorld();
+    await world.wired.connected();
+    await world.wired.handleLine(healthLine(world.wired, world.state));
+    const holding = world.admission.admitTurn({ kind: "cron", job: "hold" }, "hold");
+    const queued = world.wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    await wait(20);
+    world.wired.disconnected();
+    world.releaseResident();
+    await holding;
+    const result = await queued;
+    expect(result.kind).toBe("drop");
+    expect(world.voicePrompts).toEqual([]);
+  });
+});
+
+// ── no private context in a voice turn ──────────────────────────────────────
+describe("bob#356 V2a — a voice turn sees no resident history", () => {
+  it("a model that saw a private value in the resident session cannot say it from a voice turn", async () => {
+    const pi = new FakePi();
+    const sent: string[] = [];
+    const residentHistory: string[] = [];
+    const voiceHistories: string[][] = [];
+    let inVoice = false;
+    let admission!: ReturnType<typeof createTurnAdmission>;
+
+    const modelReply = (history: string[]): string =>
+      history.some((line) => line.includes("PRIVATE-42")) ? "PRIVATE-42" : "It is noon.";
+
+    const resident = {
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt(text: string) {
+        residentHistory.push(text);
+      },
+    };
+    admission = createTurnAdmission({
+      log: () => {},
+      // FRESH: a new session per voice turn, with its own empty history.
+      voiceSession: async () => {
+        const history: string[] = [];
+        voiceHistories.push(history);
+        return {
+          subscribe: () => () => {},
+          dispose() {},
+          async prompt(text: string) {
+            history.push(text);
+            const reply = modelReply(history);
+            inVoice = true;
+            try {
+              const spoken = await pi.call("reachy_say", { text: reply });
+              if (inVoice) sent.push(spoken);
+            } finally {
+              inVoice = false;
+            }
+          },
+        };
+      },
+    });
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send(command: string, args?: Record<string, unknown>) {
+          if (command === "say" && typeof args?.text === "string") sent.push(String(args.text));
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store: new FakeStore(),
+      state: {
+        profile: "voice",
+        wakeName: "jarvis",
+        enrolment: {},
+        mute: false,
+        nowMs: () => Date.now(),
+        roomSpeechOrigins: ["run"],
+      },
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => boundOrigin({ admission }),
+      admitVoiceTurn: admission.admitTurn,
+      log: () => {},
+    });
+    await wired.connected();
+    await wired.handleLine(
+      healthLine(wired, {
+        profile: "voice",
+        wakeName: "jarvis",
+        enrolment: {},
+        mute: false,
+        nowMs: () => Date.now(),
+        roomSpeechOrigins: ["run"],
+      }),
+    );
+    admission.bind(resident);
+    // The resident session has seen the private value.
+    await admission.admitTurn({ kind: "run" }, "PRIVATE-42 is your context");
+    expect(residentHistory.join("\n")).toContain("PRIVATE-42");
+
+    const summary = await wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    expect(summary).toMatchObject({ kind: "admitted", action: "voice" });
+    // The fresh voice session never carried the resident history...
+    expect(voiceHistories).toHaveLength(1);
+    expect(voiceHistories[0]?.join("\n")).not.toContain("PRIVATE-42");
+    // ...so its model could not hand the value to reachy_say.
+    expect(sent.join("\n")).not.toContain("PRIVATE-42");
+    expect(sent).toContain("It is noon.");
+  });
 });

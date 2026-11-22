@@ -628,6 +628,10 @@ export interface RunSessionConfig {
   persistent?: boolean;
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
+  // bob#356 V2a: the resident reachy capability's speech bridge. Set ONLY on a
+  // fresh voice session, so its `reachy_say` reaches the one live sidecar link
+  // instead of opening a second connection. Absent everywhere else.
+  voiceSpeech?: (text: string) => Promise<unknown>;
   // bob#356: the origin the runtime DECLARES for a session no admission serves:
   // `{kind:"run"}` only for an operator's one-shot `bob run` (the CLI entry
   // passes RunOptions.sessionOrigin); absent for `bob launch`, a mail turn and

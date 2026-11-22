@@ -34,6 +34,10 @@ export const GRANT_TOOLS: readonly string[] = Object.freeze([
 ]);
 
 /** The fixed, deterministic refusal a grant tool gets on a voice-origin turn. */
+/** The fixed, deterministic refusal a LISTED grant tool gets on a voice-origin
+ *  turn. It differs from the generic allowlist refusal below: this one names the
+ *  authenticated text channel and says nothing was executed; the generic one
+ *  names the tool and the single tool a voice turn may reach. */
 export const VOICE_GRANT_REFUSAL =
   "a voice-origin turn cannot use a grant tool; ask on the authenticated text channel and confirm there — nothing was executed";
 
@@ -90,12 +94,20 @@ export function createToolAdmissionExtension(
     factory: ((pi: ToolAdmissionPi) => {
       const admission = getTurnAdmission(pi);
       const sessionOrigin = getSessionOrigin(pi);
-      // No admission and no declared session origin: nothing can bind a voice
-      // origin in this session, so the gate has nothing to read.
-      if (admission === undefined && sessionOrigin === undefined) return;
+      // The gate is installed ONLY for a session a turn admission serves (see
+      // createBobRuntimeFactory). A missing admission therefore means the runtime
+      // service did not reach the loader: refuse the session rather than install
+      // no handler, because a session with no gate would execute every tool a
+      // voice turn asked for. This throw is an extension-load failure; the
+      // factory's assertToolAdmissionGateLoaded refuses session creation on it.
+      if (admission === undefined) {
+        throw new Error(
+          "bob: tool admission gate has no turn-admission service; refusing a session that would run ungated",
+        );
+      }
       pi.on("tool_call", (event) => {
         const origin = boundOrigin({
-          ...(admission ? { admission } : {}),
+          admission,
           ...(sessionOrigin ? { sessionOrigin } : {}),
         });
         const decision = admitToolCall(event.toolName, origin);

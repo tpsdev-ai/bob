@@ -50,7 +50,11 @@ import {
   type RunSessionFactory,
   resolveRunConfig,
 } from "./run.js";
-import { createTurnAdmission, type TurnAdmission } from "./turn-admission.js";
+import {
+  createTurnAdmission,
+  getRegisteredVoiceSpeech,
+  type TurnAdmission,
+} from "./turn-admission.js";
 
 export interface RunPersistentOptions {
   // Agent name. Config lives at <agentsRoot>/<name>/.
@@ -203,6 +207,26 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   }
 
   const factory = opts.sessionFactory ?? defaultPersistentFactory(opts.registry);
+  // bob#356 V2a: every voice turn runs in its OWN session, built fresh from the
+  // same factory. It carries no durable resident history and no private
+  // bootstrap (flairBootstrap) or prior-round (prMemory) context, and its tool
+  // allowlist is exactly the speech tool. The resident reachy capability's
+  // speech bridge is handed along so the one live sidecar link does the talking.
+  async function voiceSession(): Promise<RunSession> {
+    const speak = getRegisteredVoiceSpeech(admission);
+    if (speak === undefined)
+      throw new Error(
+        "bob: no reachy speech bridge is registered; refusing to start a voice turn that could not speak",
+      );
+    const { flairBootstrap: _bootstrap, prMemory: _prMemory, ...base } = config;
+    return factory({
+      ...base,
+      persistent: false,
+      tools: ["reachy_say"],
+      turnAdmission: admission,
+      voiceSpeech: speak,
+    });
+  }
   // bob#147's FIFO admission is for the WARM session only (cron and Discord).
   // Mail turns never enter it (bob#200 §1): each runs in a fresh session through
   // the launcher, so the consumer above neither holds nor submits to it.
@@ -212,6 +236,7 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
     toolLoopLimit,
     name: opts.name,
     onTurnStart: () => observer?.beginOperation(),
+    voiceSession,
   });
   config.turnAdmission = admission;
   let session: RunSession;

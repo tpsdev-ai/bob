@@ -36,6 +36,9 @@ const EXPECTED_MALFORMED = 0;
 // refuses the look proposal.
 const VOICE_EXPECTED_MALFORMED = 1;
 const VOICE_EXPECTED_BODY_REFUSALS = 1;
+// V2a: a voice-profile transcript is never eligible for a memory write, even
+// for an enrolled speakerId the sidecar claims.
+const VOICE_EXPECTED_MEMORY_WRITES = 0;
 const STUB_VERSION = "reachy-stub-1";
 
 const REPO = join(import.meta.dirname, "..", "..", "..");
@@ -208,7 +211,7 @@ describe("reachy S3 — the real stub sidecar over a UNIX socket", () => {
         (e) => e.kind === "reachy.refused" && e.summary.includes("body actions are absent"),
       );
       expect(bodyRefusals.length).toBe(VOICE_EXPECTED_BODY_REFUSALS);
-      expect(h.memory.writes.length).toBe(EXPECTED_MEMORY_WRITES);
+      expect(h.memory.writes.length).toBe(VOICE_EXPECTED_MEMORY_WRITES);
     } finally {
       h.stop();
     }

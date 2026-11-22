@@ -12,6 +12,10 @@
 //   * A memory is written ONLY when addressed AND speakerVerified — visibility
 //     `private`, author `jarvis`, speakerId in metadata. Non-member speech is
 //     EPHEMERAL (no write, never recallable).
+//     bob#356 V2a: under `voice` this path is not reached at all. An addressed
+//     transcript there becomes a voice turn and is INELIGIBLE for a memory write
+//     regardless of the sidecar's speakerId, because speaker authentication does
+//     not exist until V3. The rule above governs the `reachy` body profile.
 //   * Memory-backed speech is OFF outright (a `say` whose inputs reference a
 //     memory is refused); `answer` is OFF in v1.
 //   * `mute` drops every event — no transcripts, no proposals, no frames, no

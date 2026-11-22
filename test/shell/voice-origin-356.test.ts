@@ -21,6 +21,7 @@ import {
   createTurnAdmission,
   getSessionOrigin,
   getTurnAdmission,
+  getVoiceSpeech,
   runtimeEventBus,
 } from "../../src/shell/turn-admission.js";
 import {
@@ -64,22 +65,33 @@ describe("bob#356 — the voice turn origin", () => {
   });
 
   it("is admitted in V2a: the projected origin reaches the prompt and the FIFO stays intact", async () => {
-    const admission = createTurnAdmission();
     const prompts: string[] = [];
     const origins: Array<TurnOrigin | undefined> = [];
+    const residentPrompts: string[] = [];
+    const admission = createTurnAdmission({
+      // A voice turn runs in a FRESH session; the resident one must not receive it.
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt(text: string) {
+          prompts.push(text);
+          origins.push(admission.readAdmittedOrigin());
+        },
+      }),
+    });
     admission.bind({
       subscribe: () => () => {},
       dispose() {},
       async prompt(text: string) {
-        prompts.push(text);
-        origins.push(admission.readAdmittedOrigin());
+        residentPrompts.push(text);
       },
     });
     await admission.admitTurn(voice(), "jarvis, read my mail");
     expect(prompts).toEqual(["jarvis, read my mail"]);
     expect(origins).toEqual([voice()]);
     await admission.admitTurn({ kind: "run" }, "next");
-    expect(prompts).toEqual(["jarvis, read my mail", "next"]);
+    expect(prompts).toEqual(["jarvis, read my mail"]);
+    expect(residentPrompts).toEqual(["next"]);
   });
 });
 
@@ -115,6 +127,10 @@ describe("bob#356 round 1 — the origin a tool call is BOUND to, never defaulte
     expect(getTurnAdmission(runOnly)).toBeUndefined();
     const none = { events: runtimeEventBus({}) };
     expect(getSessionOrigin(none)).toBeUndefined();
+    // the fresh voice session's speech bridge travels the same way
+    const speak = async () => ({ kind: "admitted", action: "say" });
+    expect(getVoiceSpeech({ events: runtimeEventBus({ voiceSpeech: speak }) })).toBe(speak);
+    expect(getVoiceSpeech(none)).toBeUndefined();
     // a declared origin is validated and copied: an extra field never travels
     expect(
       getSessionOrigin({
