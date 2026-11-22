@@ -7,8 +7,8 @@
 // provider row whose key is read and deleted once, pi's AgentSession and tool
 // loop, the BUILT reachy extension in both sessions, bob's Flair client, and a
 // sidecar PROCESS on a real UNIX socket. The runtime is imported from the build
-// too, so the extension pi loads and the runtime share bob's modules exactly as
-// in production (the speech bridge is registered in one and read in the other).
+// too, so the extension pi loads and the runtime share bob's modules as in
+// production (the speech bridge is registered in one and read in the other).
 //
 // Not production: the model (the provider's fetch is stubbed at its endpoint and
 // answers from a script, so the test reads the exact request body a model would
@@ -279,6 +279,7 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
     // seeds prMemory on the runtime's config, as a launcher's PR recall would,
     // and grants the reachy tools (see the header).
     const builds: Build[] = [];
+    let voiceDisposals = 0;
     const realFactory = defaultPersistentFactory(registry);
     const sessionFactory = async (config: RunSessionConfig): Promise<RunSession> => {
       if (config.persistent === true) {
@@ -296,6 +297,14 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
         config: snapshot,
         loaded: loader.getExtensions().extensions.map((e) => e.path),
       });
+      if (config.voiceSpeech !== undefined) {
+        // Count the admission's dispose of the fresh voice session.
+        const dispose = session.dispose.bind(session);
+        session.dispose = () => {
+          voiceDisposals += 1;
+          dispose();
+        };
+      }
       return session;
     };
 
@@ -312,7 +321,8 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
       await waitFor(() => room.out().includes("READY"), "the reachy-voice/1 handshake");
       expect(process.env[VARIABLE]).toBeUndefined(); // the warm session took the key
 
-      // ── the CONTROL: a resident cron turn carries every private source ──
+      // ── the CONTROL: a resident cron turn carries the bootstrap, the
+      // prior-round memory and the turn ──
       await handle.admitTurn({ kind: "cron", job: "standup" }, RESIDENT_PROMPT);
       const resident = must(requests[0], "the resident request");
       expect(resident.text).toContain(BOOTSTRAP);
@@ -335,8 +345,9 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
       await waitFor(() => room.commands("say").length === 1, "the say on the sidecar");
       expect(room.commands("say")[0]?.args?.text).toBe(SPOKEN);
       // A second admitted turn queues behind the voice turn, so once it returns
-      // the voice turn has settled and its session is disposed.
+      // the voice turn has settled.
       await handle.admitTurn({ kind: "cron", job: "after" }, "after the voice turn");
+      expect(voiceDisposals).toBe(1); // the fresh voice session lived one turn
 
       const voice = requests.filter((r) => r.text.includes(TRANSCRIPT));
       expect(voice).toHaveLength(2); // the tool call, then the turn's end
@@ -396,12 +407,12 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
   }, 90_000);
 });
 
-describe("bob#356 V2a — a voice turn never widens the agent's own tool policy", () => {
+describe("bob#356 V2a — a voice session needs the agent's tool policy and a speech bridge", () => {
   /** A reviewer agent (no reachy tool in its role) under a scripted resident
    *  session; `grant` adds reachy_say to the warm config, as a role that allowed
-   *  it would, and a resident speech bridge is registered as the reachy
-   *  capability does, so the policy is the only reason left to refuse. */
-  async function policyWorld(name: string, extraYaml: string[], grant: boolean) {
+   *  it would, and `bridge` registers a resident speech bridge as the reachy
+   *  capability does. */
+  async function policyWorld(name: string, extraYaml: string[], grant: boolean, bridge = true) {
     const dir = join(root, "agents", name);
     mkdirSync(join(dir, "work"), { recursive: true });
     mkdirSync(join(dir, ".pi-agent"), { recursive: true });
@@ -436,7 +447,8 @@ describe("bob#356 V2a — a voice turn never widens the agent's own tool policy"
       sessionFactory: async (config: RunSessionConfig): Promise<RunSession> => {
         configs.push(config);
         if (grant && config.persistent === true) config.tools = [...config.tools, "reachy_say"];
-        if (config.turnAdmission) registerVoiceSpeech(config.turnAdmission, async () => ({}));
+        if (bridge && config.turnAdmission)
+          registerVoiceSpeech(config.turnAdmission, async () => ({}));
         return { subscribe: () => () => {}, dispose() {}, async prompt() {} };
       },
     });
@@ -469,6 +481,17 @@ describe("bob#356 V2a — a voice turn never widens the agent's own tool policy"
       await expect(world.voiceTurn()).rejects.toThrow(
         "this agent's tool policy does not allow reachy_say",
       );
+      expect(world.configs).toHaveLength(1);
+    } finally {
+      await world.handle.shutdown();
+    }
+  });
+
+  it("refuses by name when no speech bridge is registered, before building a session", async () => {
+    const world = await policyWorld("unbridged", [], true, false);
+    try {
+      expect(world.configs[0]?.tools).toContain("reachy_say");
+      await expect(world.voiceTurn()).rejects.toThrow("no reachy speech bridge is registered");
       expect(world.configs).toHaveLength(1);
     } finally {
       await world.handle.shutdown();

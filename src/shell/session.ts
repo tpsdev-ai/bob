@@ -1349,8 +1349,8 @@ export interface BobFactoryInput {
   // the factory's dispose-on-refusal catch without a process-global module mock.
   buildSession?: typeof createAgentSessionFromServices;
   // bob#356 V2a: provider-key custody SHARED with the other factories of one
-  // runtime. The persistent runtime builds a fresh session for every voice turn,
-  // each through a new factory; the warm session's factory already read and
+  // runtime. The persistent runtime builds each voice session through a new
+  // factory; the warm session's factory already read and
   // deleted a keyed row's variable, so those factories reuse the key this map
   // holds instead of reading the environment again. The map lives in the
   // runtime's factory closure, never in a config object or at module scope.

@@ -155,11 +155,9 @@ export interface WiredReachy {
   /** The connection is gone: muted until a fresh handshake. */
   disconnected(): void;
   link(): LinkState;
-  /** Speak one line through THIS capability's link, as the turn the call is
-   *  bound to (the bridge a fresh voice session's `reachy_say` uses). The speech
-   *  policy decides exactly as for the resident `reachy_say`: a voice-origin turn
-   *  speaks only with its own current addressed utterance, and any other origin
-   *  only with an operator room-speech grant (`roomSpeechOrigins`). */
+  /** Run a `say` through this capability's speech policy and link, as the turn
+   *  the call is bound to (the bridge a fresh voice session's `reachy_say`
+   *  uses). */
   speak(text: string): Promise<DecisionSummary>;
   /** The tool names registered for the configured profile. */
   tools: readonly string[];
@@ -410,10 +408,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           : decision.action === "frame"
             ? "frame"
             : "say";
-    // bob#356 V2a: remember what bob is about to play. Under the `voice`
-    // profile the echo guard drops a transcript that arrives during this line's
-    // estimated playback window or closely matches this text afterwards, before
-    // the transcript is retained or submitted for admission.
+    // bob#356 V2a: record the text of this attempted say for the echo guard,
+    // before the send (which can fail).
     if (isSpeech && typeof args.text === "string") echo.record(args.text, state.nowMs());
     // The audit said ADMITTED, so a send that then fails must not look like a
     // delivered command: catch it, log it, and return a LINKED refusal so the

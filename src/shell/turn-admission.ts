@@ -313,8 +313,8 @@ export function createTurnAdmission(
             turn.released = true;
             if (active === turn) active = undefined;
           };
-          // A fresh voice session lives exactly one turn: unsubscribe, release
-          // the binding, then dispose. A loop-broken prompt that has not settled
+          // A fresh voice session serves one turn: release the binding,
+          // unsubscribe, then dispose. A loop-broken prompt that has not settled
           // keeps all three until it does, so its in-flight tool calls still see
           // the turn's origin.
           const finish = (): void => {

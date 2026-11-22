@@ -148,20 +148,23 @@ function transcriptFieldFailures(obj: Record<string, unknown>): string[] {
   return bad.length > 0 ? bad : ["type"];
 }
 
+/** What the socket client hands the decoder for a line over the 64 KiB bound
+ *  (the line itself is not buffered). JSON.parse cannot produce a symbol, so no
+ *  line from the wire equals it. */
+export const OVERSIZED_LINE: unique symbol = Symbol("reachy.oversized-line");
+
 /** The fixed reason for a line whose `type` is missing or not one bob knows. */
 export const UNRECOGNISED_LINE_REASON =
   "unrecognised line type (not transcript, proposal, presence or health)";
 
 /** Decode one line (a raw string or an already-parsed object) into a DecodedLine. */
 export function decodeLine(raw: unknown): DecodedLine {
+  if (raw === OVERSIZED_LINE) return { kind: "malformed", reason: "line exceeds the 64 KiB bound" };
   const line = typeof raw === "string" ? safeJson(raw) : raw;
   if (line === null || typeof line !== "object")
     return { kind: "malformed", reason: "not a JSON object" };
   const obj = line as Record<string, unknown>;
   const type = obj.type;
-  // The socket client hands an oversized line as this marker (never buffered).
-  if (type === "__oversized__")
-    return { kind: "malformed", reason: "line exceeds the 64 KiB bound" };
   if (type === "transcript" && Value.Check(TRANSCRIPT_LINE, obj)) {
     return {
       kind: "transcript",

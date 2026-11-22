@@ -95,6 +95,27 @@ describe("bob#356 — the voice turn origin", () => {
   });
 });
 
+describe("bob#356 V2a — an admission with no voice session refuses a voice turn", () => {
+  it("rejects it by name, and the resident session is not prompted", async () => {
+    const residentPrompts: string[] = [];
+    const admission = createTurnAdmission({ log: () => {} });
+    admission.bind({
+      subscribe: () => () => {},
+      dispose() {},
+      async prompt(text: string) {
+        residentPrompts.push(text);
+      },
+    });
+    await expect(admission.admitTurn(voice(), "jarvis, hi")).rejects.toThrow(
+      /needs a fresh voice session/,
+    );
+    expect(residentPrompts).toEqual([]);
+    // CONTROL: the same resident session serves a non-voice turn.
+    await admission.admitTurn({ kind: "run" }, "next");
+    expect(residentPrompts).toEqual(["next"]);
+  });
+});
+
 describe("bob#356 round 1 — the origin a tool call is BOUND to, never defaulted", () => {
   it("readAdmittedOrigin: the admitted turn's origin inside it; undefined outside and after it settled", async () => {
     const admission = createTurnAdmission();

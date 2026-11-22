@@ -1,10 +1,8 @@
 // reachy/echo.ts — the ECHO GUARD (bob#356 V2a, gate 5 / design §9).
 //
-// A sidecar that transcribes the room could transcribe bob's own speech from
-// its speaker. The shipped sidecar sends no transcripts (V2b adds that
-// producer); V2a's transcripts come from tests. The design requires hardware
-// echo cancellation on such a device, but bob cannot verify a device property,
-// so it keeps its own backstop:
+// A sidecar that transcribes the room could transcribe what its speaker plays.
+// The shipped sidecar sends no transcripts (V2b adds that producer); V2a's
+// transcripts come from tests. bob keeps a text heuristic as a backstop:
 //
 //   * PLAYBACK INTERLOCK: a transcript that arrives during bob's ESTIMATED
 //     playback window is dropped. The window is estimated from the line's text
@@ -27,7 +25,7 @@
 // admission, and it is deliberately conservative: genuine barge-in during the
 // estimated playback is dropped too.
 
-/** How long bob remembers its own speech for the say-match guard. */
+/** How long recorded text stays in the say-match guard. */
 export const ECHO_WINDOW_MS = 10_000;
 /** Similarity at or above which a transcript counts as a recorded line. */
 export const ECHO_SIMILARITY = 0.9;
@@ -129,13 +127,13 @@ export class EchoGuard {
     this.prune(nowMs);
   }
 
-  /** Playback interlock: bob's own speech is still inside its estimated
+  /** Playback interlock: some recorded text is still inside its estimated
    *  playback window. */
   playbackActive(nowMs: number): boolean {
     return this.spoken.some((s) => nowMs < s.playbackUntilMs);
   }
 
-  /** Say-match: the transcript is one of bob's own recent lines. The window
+  /** Say-match: the transcript matches text recorded for an attempted say. The window
    *  starts at that line's ESTIMATED playback end (`playbackMs`), so a long line
    *  keeps its window for as long as its estimated playback lasts. */
   matchesRecentSay(text: string, nowMs: number): boolean {
@@ -151,7 +149,7 @@ export class EchoGuard {
     });
   }
 
-  /** The drop reason for a transcript, or null when it is not bob's echo. */
+  /** The drop reason for a transcript that matches the guard, or null. */
   check(text: string, nowMs: number): EchoReason | null {
     if (this.playbackActive(nowMs)) return "playback";
     if (this.matchesRecentSay(text, nowMs)) return "say-match";

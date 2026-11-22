@@ -32,12 +32,16 @@ import {
   type ReachyCommands,
   wireReachyCapability,
 } from "../../../src/capabilities/reachy/capability.js";
-import { UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
+import { MAX_LINE_BYTES, UnixSocketReachyClient } from "../../../src/capabilities/reachy/client.js";
 import { parseConfig } from "../../../src/capabilities/reachy/config.js";
 import { EchoGuard } from "../../../src/capabilities/reachy/echo.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { addressed } from "../../../src/capabilities/reachy/policy.js";
-import { decodeLine, UNRECOGNISED_LINE_REASON } from "../../../src/capabilities/reachy/wire.js";
+import {
+  decodeLine,
+  OVERSIZED_LINE,
+  UNRECOGNISED_LINE_REASON,
+} from "../../../src/capabilities/reachy/wire.js";
 import {
   admitToolCall,
   createToolAdmissionExtension,
@@ -567,10 +571,42 @@ describe("bob#356 V2a — a malformed line dropped by a mute or before the hands
 describe("bob#356 V2a — an unrecognised line type gets a fixed, content-free reason", () => {
   const MARKER = "MARKER-6f1c";
 
-  it("decoding: any type bob does not know, or none, gets the one fixed reason", () => {
+  it("decoding: an unknown, non-string or missing type gets the fixed reason", () => {
     for (const line of [{ type: `${MARKER} words` }, { type: { inner: MARKER } }, {}]) {
       expect(decodeLine(line)).toEqual({ kind: "malformed", reason: UNRECOGNISED_LINE_REASON });
     }
+  });
+
+  it("decoding: a proposal or presence line that fails its schema is named by its type", () => {
+    expect(decodeLine({ type: "proposal", extra: MARKER })).toEqual({
+      kind: "malformed",
+      reason: "proposal line failed its schema",
+    });
+    expect(decodeLine({ type: "presence", extra: MARKER })).toEqual({
+      kind: "malformed",
+      reason: "presence line failed its schema",
+    });
+  });
+
+  it('the client\'s oversized-line symbol gets the size reason; a line typed "__oversized__" is unrecognised', () => {
+    expect(decodeLine(OVERSIZED_LINE)).toEqual({
+      kind: "malformed",
+      reason: "line exceeds the 64 KiB bound",
+    });
+    // Through the real socket client: a short line that names the old marker
+    // string arrives as that object, and an over-bound line as the symbol.
+    const client = new UnixSocketReachyClient({ socket: "/unused" });
+    const lines: unknown[] = [];
+    client.onLine((l) => lines.push(l));
+    client.ingest('{"type":"__oversized__"}\n');
+    client.ingest(`${"x".repeat(MAX_LINE_BYTES + 1)}\n`);
+    expect(lines).toHaveLength(2);
+    expect(decodeLine(lines[0])).toEqual({ kind: "malformed", reason: UNRECOGNISED_LINE_REASON });
+    expect(lines[1]).toBe(OVERSIZED_LINE);
+    expect(decodeLine('{"type":"__oversized__"}')).toEqual({
+      kind: "malformed",
+      reason: UNRECOGNISED_LINE_REASON,
+    });
   });
 
   it("on a ready link: the malformed log line and audit carry the fixed reason, not the type", async () => {
@@ -685,7 +721,7 @@ describe("bob#356 V2a — a transcript after a sidecar-reported mute is not admi
 
 // ── gate 5: the echo guard ───────────────────────────────────────────────────
 describe("bob#356 V2a — the echo guard drops text recorded for an attempted say", () => {
-  it("say-match: a transcript that matches recent speech is dropped; a different one is submitted", async () => {
+  it("say-match: a transcript matching text recorded for a say is dropped; a different one is submitted", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar, { echoWindowMs: 10_000, playbackMs: () => 0 });
     try {
@@ -722,6 +758,58 @@ describe("bob#356 V2a — the echo guard drops text recorded for an attempted sa
       bob.close();
     }
   }, 30_000);
+});
+
+// ── the echo guard records before the send ──────────────────────────────────
+describe("bob#356 V2a — the echo guard records a say's text before the send", () => {
+  it("a say whose send fails still records its text: that transcript matches the guard", async () => {
+    const SAID = "jarvis, the meeting moved to noon";
+    const pi = new FakePi();
+    const logs: string[] = [];
+    const admissions: Admissions = [];
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: ["run"],
+    };
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send(command: string) {
+          if (command === "say") throw new Error("the sidecar write failed");
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store: new FakeStore(),
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => ({ kind: "run" }),
+      admitVoiceTurn: async (origin, text) => {
+        admissions.push({ origin, text });
+        return [];
+      },
+      echoWindowMs: 600_000,
+      playbackMs: () => 0,
+      log: (m) => logs.push(m),
+    });
+    await wired.connected();
+    await wired.handleLine(healthLine(wired, state));
+    expect(wired.link().phase).toBe("ready");
+    expect(await pi.call("reachy_say", { text: SAID })).toContain("sidecar send failed");
+    const result = await wired.handleLine({
+      type: "transcript",
+      text: SAID,
+      ts: "t",
+      wakeHeard: true,
+    });
+    expect(result).toEqual({ kind: "none" });
+    expect(logs.some((m) => m.includes("echo guard: say-match"))).toBe(true);
+    expect(admissions).toEqual([]);
+  });
 });
 
 // ── gate 6: grants never ride on voice ───────────────────────────────────────
@@ -1051,6 +1139,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
   function queuedWorld() {
     const pi = new FakePi();
     const voicePrompts: string[] = [];
+    let disposals = 0;
     let releaseResident!: () => void;
     const residentGate = new Promise<void>((resolve) => {
       releaseResident = resolve;
@@ -1059,7 +1148,9 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
       log: () => {},
       voiceSession: async () => ({
         subscribe: () => () => {},
-        dispose() {},
+        dispose() {
+          disposals += 1;
+        },
         async prompt(text: string) {
           voicePrompts.push(text);
         },
@@ -1095,10 +1186,10 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
       admitVoiceTurn: admission.admitTurn,
       log: () => {},
     });
-    return { wired, state, admission, voicePrompts, releaseResident };
+    return { wired, state, admission, voicePrompts, releaseResident, disposed: () => disposals };
   }
 
-  it("a mute while the voice turn waits drops it: nothing is prompted or audited as refused", async () => {
+  it("a mute while the voice turn waits drops it before its prompt", async () => {
     const world = queuedWorld();
     await world.wired.connected();
     await world.wired.handleLine(healthLine(world.wired, world.state));
@@ -1117,9 +1208,10 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     const result = await queued;
     expect(result.kind).toBe("drop");
     expect(world.voicePrompts).toEqual([]);
+    expect(world.disposed()).toBe(1); // the fresh session, built then discarded
   });
 
-  it("a disconnect while the voice turn waits drops it: nothing is prompted or audited as refused", async () => {
+  it("a disconnect while the voice turn waits drops it before its prompt", async () => {
     const world = queuedWorld();
     await world.wired.connected();
     await world.wired.handleLine(healthLine(world.wired, world.state));
@@ -1137,6 +1229,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     const result = await queued;
     expect(result.kind).toBe("drop");
     expect(world.voicePrompts).toEqual([]);
+    expect(world.disposed()).toBe(1); // the fresh session, built then discarded
   });
 
   // The link comes BACK before the turn starts: effective mute is off again, so
@@ -1174,6 +1267,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
       "stale: the sidecar link changed while the voice turn waited",
     );
     expect(world.voicePrompts).toEqual([]);
+    expect(world.disposed()).toBe(1); // the fresh session, built then discarded
   });
 
   it("a device mute and unmute while the voice turn waits refuses it as stale", async () => {
@@ -1187,6 +1281,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
       "stale: the sidecar link changed while the voice turn waited",
     );
     expect(world.voicePrompts).toEqual([]);
+    expect(world.disposed()).toBe(1); // the fresh session, built then discarded
   });
 
   // Only the starting-line mute is a drop. A turn that failed for any other
@@ -1418,8 +1513,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
 
   /** A capability on a recorder channel (no device, no audio) whose speech is
    *  granted to `run`. The say-match window outlasts the test and the ESTIMATED
-   *  playback window is zero, so only the say-match can drop the line bob
-   *  sent. */
+   *  playback window is zero, so the say-match is the guard under test. */
   async function echoWorld() {
     const pi = new FakePi();
     const admissions: Admissions = [];
@@ -1469,7 +1563,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
     return { wired, state, admissions, handshake, receive };
   }
 
-  it("a disconnect and a fresh handshake: bob's earlier line is no longer an echo", async () => {
+  it("a disconnect and a fresh handshake: the recorded text no longer matches the guard", async () => {
     const world = await echoWorld();
     world.wired.disconnected();
     await world.handshake();

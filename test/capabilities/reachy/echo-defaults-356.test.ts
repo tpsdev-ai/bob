@@ -1,7 +1,7 @@
 // bob#356 V2a — the echo guard under its PRODUCTION defaults.
 //
 // These cases replace neither constructor argument: they exercise
-// estimatedPlaybackMs and the recent-speech window as shipped. The boundary
+// estimatedPlaybackMs and the say-match window as shipped. The boundary
 // cases pin the fixed length-based edit allowance in float64, and the long
 // multi-sentence line pins the say-match window to the ESTIMATED playback end.
 import { describe, expect, it } from "bun:test";
