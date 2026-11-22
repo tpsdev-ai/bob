@@ -284,6 +284,21 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     }
   }, 30_000);
 
+  it("an unverified speaker's addressed transcript is admitted and writes no memory", async () => {
+    const sidecar = startSidecar();
+    const bob = await connectBob(sidecar, { enrolment: {} });
+    try {
+      sidecar.send(bob.transcript("jarvis, remember the fire drill", { speakerId: "spk-visitor" }));
+      await waitFor(() => bob.admissions.length === 1, "the voice admission");
+      await bob.settle();
+      expect(bob.memory.writes).toEqual([]);
+      expect(bob.store.all.some((e) => e.kind === "reachy.memory.attempt")).toBe(false);
+      expect(bob.admissions[0]?.origin).toMatchObject({ kind: "voice", speakerVerified: false });
+    } finally {
+      bob.close();
+    }
+  }, 30_000);
+
   it("the admitted origin is projected by the REAL admission; its tool reach is reachy_say only", async () => {
     const admission = createTurnAdmission({ log: () => {} });
     const seen: TurnOrigin[] = [];
