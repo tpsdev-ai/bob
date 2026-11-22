@@ -1,0 +1,110 @@
+// tool-admission.ts — bob's TOOL-ADMISSION gate (bob#356 V2a, D1).
+//
+// Runtime origins are metadata set AT ADMISSION; prompt, model and tool text
+// cannot supply one (turn-origin.ts). This gate reads the origin a tool call is
+// BOUND to and answers one question before the executor runs: may this origin
+// reach this tool?
+//
+// The rule is an ALLOWLIST, keyed on origin, not a denylist of today's grant
+// names (bob#356 Kern N2). A voice-origin turn — speech heard in the room, from
+// a speaker bob has not verified — reaches exactly `reachy_say`. Everything
+// else refuses, including tools that do not exist yet: a future grant tool is
+// unreachable from voice the day it lands, without anyone remembering to list
+// it here.
+//
+// A grant-class tool (mail send, calendar accept, payment) is therefore never
+// executed on a voice-origin turn. The refusal is deterministic and content-
+// free; bob does not ship a confirmation broker (bob#356 D1). The member makes
+// the request again on an authenticated text channel, as an ordinary turn under
+// the normal grants, and acts only there.
+
+import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+import { boundOrigin, getSessionOrigin, getTurnAdmission } from "./turn-admission.js";
+import type { TurnOrigin } from "./turn-origin.js";
+
+/** The ONLY tools a voice-origin turn may reach (bob#356 rev 2.1 D1). */
+export const VOICE_TOOL_ALLOWLIST: readonly string[] = Object.freeze(["reachy_say"]);
+
+/** The audit classes named by the spec. They are labels for reporting, NOT the
+ *  enforcement set: enforcement is the allowlist above (Kern N2). */
+export const GRANT_TOOLS: readonly string[] = Object.freeze([
+  "mail_send",
+  "calendar_accept",
+  "payment_send",
+]);
+
+/** The fixed, deterministic refusal a grant tool gets on a voice-origin turn. */
+export const VOICE_GRANT_REFUSAL =
+  "a voice-origin turn cannot use a grant tool; ask on the authenticated text channel and confirm there — nothing was executed";
+
+export interface ToolAdmissionDecision {
+  allow: boolean;
+  /** True when the refusal is for a grant-class tool (audit label). */
+  grant?: boolean;
+  /** The refusal the model sees as the tool result; deterministic and fixed. */
+  reason?: string;
+}
+
+export function isGrantTool(toolName: string): boolean {
+  return GRANT_TOOLS.includes(toolName);
+}
+
+/**
+ * Decide whether a tool call may execute. Only a bound `voice` origin is
+ * restricted: every other origin (run, mail, cron, discord) and an unbound call
+ * (a session with no admission and no declared origin) are unchanged.
+ */
+export function admitToolCall(
+  toolName: string,
+  origin: TurnOrigin | undefined,
+): ToolAdmissionDecision {
+  if (origin === undefined || origin.kind !== "voice") return { allow: true };
+  if (VOICE_TOOL_ALLOWLIST.includes(toolName)) return { allow: true };
+  if (isGrantTool(toolName)) {
+    return { allow: false, grant: true, reason: VOICE_GRANT_REFUSAL };
+  }
+  return {
+    allow: false,
+    reason: `a voice-origin turn may use only ${VOICE_TOOL_ALLOWLIST.join(", ")}; ${toolName} is not reachable from the room`,
+  };
+}
+
+export interface ToolAdmissionPi {
+  on(event: "tool_call", handler: (event: { toolName: string }) => unknown): void;
+  events: Parameters<typeof getTurnAdmission>[0]["events"];
+}
+
+/**
+ * The inline pi extension that refuses a blocked tool call BEFORE its executor
+ * runs. bob's session factory loads it into every session that carries a turn
+ * admission, so a voice-origin turn cannot reach a tool the gate refuses even if
+ * a capability registered it.
+ */
+export function createToolAdmissionExtension(
+  opts: { log?: (message: string) => void } = {},
+): InlineExtension {
+  const log = opts.log ?? ((message: string) => console.error(message));
+  return {
+    name: "bob-tool-admission",
+    hidden: true,
+    factory: ((pi: ToolAdmissionPi) => {
+      const admission = getTurnAdmission(pi);
+      const sessionOrigin = getSessionOrigin(pi);
+      // No admission and no declared session origin: nothing can bind a voice
+      // origin in this session, so the gate has nothing to read.
+      if (admission === undefined && sessionOrigin === undefined) return;
+      pi.on("tool_call", (event) => {
+        const origin = boundOrigin({
+          ...(admission ? { admission } : {}),
+          ...(sessionOrigin ? { sessionOrigin } : {}),
+        });
+        const decision = admitToolCall(event.toolName, origin);
+        if (decision.allow) return undefined;
+        log(
+          `bob: tool admission refused ${event.toolName} on a voice-origin turn: ${decision.reason}`,
+        );
+        return { block: true, reason: decision.reason };
+      });
+    }) as (pi: unknown) => void,
+  };
+}

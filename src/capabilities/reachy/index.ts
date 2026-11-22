@@ -76,7 +76,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // call to, read from pi's per-loader event bus. In the persistent runtime
   // only an admitted turn binds one; in a one-shot `bob run` the runtime
   // declares `run` for the session; anywhere else nothing is bound and speech
-  // refuses. A missing admission never passes as `run`.
+  // refuses. A missing admission never passes as `run`. bob#356 V2a: the same
+  // admission admits an addressed transcript as a voice-origin turn.
   const admission = getTurnAdmission(pi);
   const sessionOrigin = getSessionOrigin(pi);
 
@@ -92,6 +93,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         ...(admission ? { admission } : {}),
         ...(sessionOrigin ? { sessionOrigin } : {}),
       }),
+    ...(admission ? { admitVoiceTurn: admission.admitTurn } : {}),
   });
 
   if (config.mute) {

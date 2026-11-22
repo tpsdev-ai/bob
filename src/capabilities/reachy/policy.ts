@@ -144,7 +144,10 @@ export interface PolicyState {
 export type Caller =
   // `origin` undefined: the call is bound to no admitted turn and no
   // runtime-declared session origin (shell/turn-admission.ts `boundOrigin`).
-  | { path: "tool"; origin: TurnOrigin | undefined }
+  // `voiceUtterance` is supplied ONLY by the capability, from ITS record of the
+  // addressed transcript that opened this voice turn (keyed by the origin's
+  // correlationId). It is never read from the call's arguments.
+  | { path: "tool"; origin: TurnOrigin | undefined; voiceUtterance?: { addressed: boolean } }
   | { path: "proposal"; transcript: Transcript | null };
 
 /** The body actions (bob#356 delta 1): present only under the `reachy` profile. */
@@ -177,7 +180,8 @@ export function speechCallerRefusal(caller: Caller, state: PolicyState): string 
     return "this call is bound to no admitted turn and no runtime-declared run, so it has no origin to grant";
   }
   if (origin.kind === "voice") {
-    return "a voice-origin call needs its own current addressed utterance, which V1 does not have";
+    if (caller.voiceUtterance?.addressed === true) return null;
+    return "a voice-origin call needs its own current addressed utterance from this turn";
   }
   const grant = roomSpeechGrant(origin);
   if (grant === null || !state.roomSpeechOrigins.includes(grant)) {
@@ -189,6 +193,7 @@ export function speechCallerRefusal(caller: Caller, state: PolicyState): string 
 import type { TurnOrigin } from "../../shell/turn-origin.js";
 import type { OrgEventRecord } from "../observatory/snapshot.js";
 import type { ReachyProfile } from "./config.js";
+import { editDistance, normalizeSpeech } from "./echo.js";
 /** The reachy audit event IS the record the rest of bob emits (observatory). */
 export type OrgEvent = OrgEventRecord;
 
@@ -205,10 +210,29 @@ export type Decision =
   | { kind: "admitted"; action: string; orgEvent: OrgEvent }
   | { kind: "refused"; action: string; reason: string };
 
-/** `addressed` = the wake name appears in the transcript text (string compare). */
+/** `addressed` = the wake name appears in the transcript text, recomputed in
+ *  bob and never taken from the sidecar's `wakeHeard` flag. The match is the
+ *  normalized phrase itself, or a near-miss of the name token allowed by edit
+ *  distance: measured wake models fire on near-names ("Hey Dervis" for jarvis),
+ *  and the sidecar's STT renders those. The bound accepts "dervis" (two edits
+ *  from a six-letter name) and rejects "travis" (three). */
 export function addressed(text: string, wakeName: string): boolean {
   if (!wakeName) return false;
-  return text.toLowerCase().includes(wakeName.toLowerCase());
+  const name = normalizeSpeech(wakeName).split(" ").filter(Boolean);
+  if (name.length === 0) return false;
+  const words = normalizeSpeech(text).split(" ").filter(Boolean);
+  if (words.length < name.length) return false;
+  const phrase = name.join(" ");
+  // The bound: 1 edit for a name of four characters or fewer, 2 up to eight,
+  // 3 beyond that. It accepts the measured near-name ("dervis" for jarvis) and
+  // rejects "travis" (three edits from a six-letter name).
+  const maxEdits = phrase.length <= 4 ? 1 : phrase.length <= 8 ? 2 : 3;
+  for (let i = 0; i + name.length <= words.length; i++) {
+    if (name.every((part, k) => words[i + k] === part)) return true;
+    const window = words.slice(i, i + name.length).join(" ");
+    if (editDistance(window, phrase) <= maxEdits) return true;
+  }
+  return false;
 }
 
 /** `speakerVerified` = speakerId maps to an enrolled member in BOB's enrolment. */

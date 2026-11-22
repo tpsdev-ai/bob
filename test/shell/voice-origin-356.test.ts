@@ -63,22 +63,23 @@ describe("bob#356 — the voice turn origin", () => {
     expect(() => approvedOrigin(voice(over))).toThrow(reason);
   });
 
-  it("is NOT admitted in V1: refused before queuing, nothing prompted, the FIFO unharmed", async () => {
+  it("is admitted in V2a: the projected origin reaches the prompt and the FIFO stays intact", async () => {
     const admission = createTurnAdmission();
     const prompts: string[] = [];
+    const origins: Array<TurnOrigin | undefined> = [];
     admission.bind({
       subscribe: () => () => {},
       dispose() {},
       async prompt(text: string) {
         prompts.push(text);
+        origins.push(admission.readAdmittedOrigin());
       },
     });
-    await expect(admission.admitTurn(voice(), "jarvis, read my mail")).rejects.toThrow(
-      /voice-origin turns are not admitted yet/,
-    );
-    expect(prompts).toEqual([]);
+    await admission.admitTurn(voice(), "jarvis, read my mail");
+    expect(prompts).toEqual(["jarvis, read my mail"]);
+    expect(origins).toEqual([voice()]);
     await admission.admitTurn({ kind: "run" }, "next");
-    expect(prompts).toEqual(["next"]);
+    expect(prompts).toEqual(["jarvis, read my mail", "next"]);
   });
 });
 

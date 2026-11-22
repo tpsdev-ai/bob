@@ -96,6 +96,7 @@ import {
   type ContractGuardDeps,
   createContractGuardExtension,
 } from "./system-prompt-contract.js";
+import { createToolAdmissionExtension } from "./tool-admission.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
 import { runtimeEventBus } from "./turn-admission.js";
 import { createWriteSoulExtension } from "./write-soul.js";
@@ -1469,6 +1470,13 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // exactly where the setup policy grants it.
   const writeSoulExt =
     config.setupSoulPath !== undefined ? createWriteSoulExtension(config.setupSoulPath) : undefined;
+  // bob#356 V2a: a session served by a turn admission gets the TOOL-ADMISSION
+  // gate. It reads the origin the current tool call is bound to and refuses a
+  // voice-origin call to anything but reachy_say, before the executor runs.
+  // A one-shot run, a mail turn and the setup sessions carry no admission and
+  // load no gate (nothing there can bind a voice origin).
+  const toolAdmissionExt =
+    config.turnAdmission !== undefined ? createToolAdmissionExtension() : undefined;
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
   // (round 8, item 4) pi calls this factory AGAIN for `/new`, `/resume`, `/fork`,
@@ -1688,7 +1696,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
           { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
           {
             ...(guard !== undefined ? { guard } : {}),
-            ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
+            ...(writeSoulExt !== undefined || toolAdmissionExt !== undefined
+              ? {
+                  toolExtensions: [
+                    ...(writeSoulExt !== undefined ? [writeSoulExt] : []),
+                    ...(toolAdmissionExt !== undefined ? [toolAdmissionExt] : []),
+                  ],
+                }
+              : {}),
             ...(webSession ? { webSession: true } : {}),
           },
         ),

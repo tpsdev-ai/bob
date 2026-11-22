@@ -25,8 +25,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
 import type { TurnOrigin } from "../../shell/turn-origin.js";
 import { PROFILE_TOOLS } from "./config.js";
+import { EchoGuard } from "./echo.js";
 import {
   ACTION_ARG_SCHEMAS,
+  addressed,
   admitAction,
   type Caller,
   decideTranscript,
@@ -34,6 +36,7 @@ import {
   type OrgEvent,
   type PolicyState,
   type ProposalAction,
+  speakerVerified,
   type Transcript,
 } from "./policy.js";
 import {
@@ -100,6 +103,13 @@ export interface WireOptions {
    *  undefined, which refuses speech. Absent: nothing is bound, everything
    *  refuses. Never read from the tool's arguments, never defaulted. */
   readOrigin?: () => TurnOrigin | undefined;
+  /** bob#356 V2a: admit an addressed, unverified transcript as a voice-origin
+   *  turn (origin `{kind:"voice", speakerVerified:false}`, ids issued here).
+   *  Absent on the V1 core: an addressed transcript is then not admitted. */
+  admitVoiceTurn?: (origin: TurnOrigin, text: string) => Promise<unknown[]>;
+  /** Echo-guard seams (tests): the say-match window and the playback estimate. */
+  echoWindowMs?: number;
+  playbackMs?: (text: string) => number;
   log?: (msg: string) => void;
   /** Id seam (tests): every generated id and nonce comes from here. */
   uuid?: () => string;
@@ -164,6 +174,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   // The last transcript: read ONLY by the body's rate limit and the memory path,
   // never by speech, and cleared whenever the link or the mute changes.
   let lastTranscript: Transcript | null = null;
+  // bob#356 V2a: the echo guard, and the voiced utterances bob issued for turns
+  // in flight (correlationId → the addressed assertion this capability recorded).
+  const echo = new EchoGuard(opts.echoWindowMs, opts.playbackMs);
+  const voiceUtterances = new Map<string, { addressed: boolean }>();
 
   // --- the sidecar link (bob#356) ---
   const link: {
@@ -206,6 +220,20 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     generation: link.generation,
   });
   const callerOrigin = (): TurnOrigin | undefined => opts.readOrigin?.();
+  /** The tool-path caller: an admitted turn's origin, plus (for a voice turn)
+   *  THIS turn's own addressed utterance. Never read from the call's args. */
+  const toolCaller = (): Caller => {
+    const origin = callerOrigin();
+    if (origin?.kind === "voice") {
+      const voiceUtterance = voiceUtterances.get(origin.correlationId);
+      return {
+        path: "tool",
+        origin,
+        ...(voiceUtterance !== undefined ? { voiceUtterance } : {}),
+      };
+    }
+    return { path: "tool", origin };
+  };
 
   async function audit(event: OrgEvent): Promise<boolean> {
     try {
@@ -237,8 +265,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     return { kind: "refused", action, reason };
   }
 
-  /** Attempt a `reachy.malformed` audit; return malformed even if it fails. */
+  /** Attempt a `reachy.malformed` audit; return malformed even if it fails. The
+   *  log line names the drop (bob#356 V2a), so it is visible without an audit read. */
   async function malformed(reason: string): Promise<DecisionSummary> {
+    log(`reachy: dropped a malformed sidecar line: ${reason}`);
     const tsMs = state.nowMs();
     await audit({
       id: `evt_reachy.malformed_${uuid()}`,
@@ -270,6 +300,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     link.deviceMuted = undefined;
     link.health = null;
     lastTranscript = null;
+    echo.clear();
+    voiceUtterances.clear();
     try {
       commands.disconnect?.();
     } catch (err) {
@@ -355,6 +387,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           : decision.action === "frame"
             ? "frame"
             : "say";
+    // bob#356 V2a: remember what bob is about to play. The echo guard drops a
+    // transcript that arrives during this playback window or closely matches
+    // this text afterwards, before the transcript is retained or admitted.
+    if (isSpeech && typeof args.text === "string") echo.record(args.text, state.nowMs());
     // The audit said ADMITTED, so a send that then fails must not look like a
     // delivered command: catch it, log it, and return a LINKED refusal so the
     // caller gets a refusal rather than a rejected promise (round 5 review).
@@ -392,10 +428,13 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         // an input the runtime rejects as malformed.
         parameters: ACTION_ARG_SCHEMAS.look,
         async execute(_id, params) {
-          const r = await admitAndRun("look", { yaw: params.yaw, pitch: params.pitch }, 1, [], {
-            path: "tool",
-            origin: callerOrigin(),
-          });
+          const r = await admitAndRun(
+            "look",
+            { yaw: params.yaw, pitch: params.pitch },
+            1,
+            [],
+            toolCaller(),
+          );
           return ok(toolText(r, `look_at yaw=${params.yaw} pitch=${params.pitch}`));
         },
       }),
@@ -424,10 +463,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
           }
           // bob#356: the TOOL path. The caller is the admitted turn this call
           // runs inside (runtime metadata), never anything the room said.
-          const r = await admitAndRun("say", { text: params.text }, 1, [], {
-            path: "tool",
-            origin: callerOrigin(),
-          });
+          const r = await admitAndRun("say", { text: params.text }, 1, [], toolCaller());
           return ok(toolText(r, `say: ${params.text}`));
         },
       }),
@@ -457,7 +493,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
         description: "Request `frame` through the policy gate.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
-          const r = await admitAndRun("frame", {}, 1, [], { path: "tool", origin: callerOrigin() });
+          const r = await admitAndRun("frame", {}, 1, [], toolCaller());
           return ok(toolText(r, "frame requested"));
         },
       }),
@@ -476,10 +512,41 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     // flips back before its audit returns — is refused as stale (bob#356).
     if (link.deviceMuted !== undefined && link.deviceMuted !== health.muted) {
       lastTranscript = null;
+      echo.clear();
+      voiceUtterances.clear();
       link.epoch++;
     }
     link.deviceMuted = health.muted;
     link.health = health;
+  }
+
+  /** bob#356 V2a: admit ONE addressed, unverified transcript as a voice-origin
+   *  turn. bob issues the utterance and correlation ids; the origin is built
+   *  here and goes through `admitTurn`, which validates and projects it. The
+   *  capability keeps this turn's addressed assertion only while the admission
+   *  runs, so the turn's own `reachy_say` is the only speech it can authorize
+   *  and no later caller inherits it. */
+  async function admitVoiceTranscript(transcript: Transcript): Promise<DecisionSummary> {
+    if (opts.admitVoiceTurn === undefined) {
+      log("reachy: an addressed transcript has no voice admission in this core; not admitted");
+      return { kind: "none" };
+    }
+    const utteranceId = `utt_${uuid()}`;
+    const correlationId = `corr_${uuid()}`;
+    voiceUtterances.set(correlationId, { addressed: true });
+    try {
+      await opts.admitVoiceTurn(
+        { kind: "voice", speakerVerified: false, utteranceId, correlationId },
+        transcript.text,
+      );
+      return { kind: "admitted", action: "voice" };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      log(`reachy: voice turn admission failed: ${detail}`);
+      return await refuse("voice", `admission failed: ${detail}`);
+    } finally {
+      voiceUtterances.delete(correlationId);
+    }
   }
 
   async function handleLine(raw: unknown): Promise<DecisionSummary> {
@@ -551,6 +618,27 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       // the effective mute at the recheck. Both are rechecked after the audit,
       // before the memory write.
       const epoch = link.epoch;
+      // bob#356 V2a — the VOICE-profile transcript path, gated before admission:
+      // echo guard, then bob's own `addressed` recompute. An unverified, addressed
+      // transcript is admitted as a voice-origin turn; a verified one keeps the
+      // S3 memory path below (enrolment is V3).
+      if (state.profile === "voice") {
+        const echoReason = echo.check(decoded.transcript.text, state.nowMs());
+        if (echoReason !== null) {
+          log(`reachy: dropped a transcript (echo guard: ${echoReason}); not admitted`);
+          return { kind: "none" };
+        }
+        lastTranscript = decoded.transcript;
+        if (!addressed(decoded.transcript.text, state.wakeName)) {
+          log(
+            `reachy: dropped an un-addressed transcript (bob recomputed addressed=false; wakeHeard=${decoded.transcript.wakeHeard} alone is not addressing)`,
+          );
+          return { kind: "none" };
+        }
+        if (!speakerVerified(decoded.transcript.speakerId, state.enrolment)) {
+          return await admitVoiceTranscript(decoded.transcript);
+        }
+      }
       lastTranscript = decoded.transcript;
       const decision = decideTranscript(decoded.transcript, state);
       if (decision.kind === "drop") return { kind: "drop" };
@@ -732,6 +820,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     link.deviceMuted = undefined;
     link.health = null;
     lastTranscript = null;
+    echo.clear();
+    voiceUtterances.clear();
     const epoch = link.epoch;
     try {
       // Configure is the first command; its write must succeed before health
@@ -758,6 +848,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     link.deviceMuted = undefined;
     link.health = null;
     lastTranscript = null;
+    echo.clear();
+    voiceUtterances.clear();
   }
 
   log(`reachy capability: profile ${state.profile}; registered ${tools.join(" / ")}`);

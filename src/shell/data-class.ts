@@ -112,6 +112,10 @@ export const BOB_EXTENSION_DATA_CLASS: Readonly<Record<string, DataClass>> = Obj
   "bob-contract-guard": "public",
   // bob#204's setup-only `write_soul`: it holds and rewrites the agent's soul.
   "bob-write-soul": "private",
+  // bob#356 V2a's tool-admission gate: it reads the bound turn origin and
+  // blocks a voice-origin call. It registers no tool and adds nothing to the
+  // model-visible context.
+  "bob-tool-admission": "public",
 });
 
 // The startup context bob's factory composes into a session, one reviewed row

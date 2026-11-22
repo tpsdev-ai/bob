@@ -6,6 +6,8 @@
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:
 //   {"type":"transcript","text":…,"ts":…,"wakeHeard":bool,"speakerId"?:id}
+//     (bob#356 V2a: text, timing and speakerId are BOUNDED; a malformed
+//     transcript is dropped with a named log line, never admitted)
 //   {"type":"proposal","action":…,"args":{…},"confidence":num,"inputs":[id]}
 //   {"type":"presence","count":n,"known":[id]}
 //   {"type":"health","protocol":"reachy-voice/1",…}   (bob#356, below)
@@ -43,10 +45,12 @@ export type WakeMode = (typeof WAKE_MODES)[number];
 const TRANSCRIPT_LINE = Type.Object(
   {
     type: Type.Literal("transcript"),
-    text: Type.String(),
-    ts: Type.String(),
+    // The transcript is untrusted text from the room: bounded, one line.
+    text: Type.String({ minLength: 1, maxLength: 4096 }),
+    // Timing is carried, not trusted: a bounded opaque timestamp string.
+    ts: Type.String({ minLength: 1, maxLength: 64 }),
     wakeHeard: Type.Boolean(),
-    speakerId: Type.Optional(Type.String()),
+    speakerId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   // A trust boundary is STRICT: an unknown field is malformed (round 3 item 4).
   { additionalProperties: false },
@@ -136,6 +140,13 @@ export function decodeLine(raw: unknown): DecodedLine {
         wakeHeard: obj.wakeHeard as boolean,
         speakerId: (obj.speakerId as string | undefined) ?? undefined,
       },
+    };
+  }
+  if (type === "transcript") {
+    // Content-free: name the shape that failed, never echo the room's text.
+    return {
+      kind: "malformed",
+      reason: "transcript line failed its schema (text/ts/wakeHeard bounds or an unknown field)",
     };
   }
   if (type === "proposal" && Value.Check(PROPOSAL_LINE, obj)) {

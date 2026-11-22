@@ -164,23 +164,14 @@ export function createTurnAdmission(
       } catch (err) {
         return Promise.reject(err);
       }
-      // bob#356 V1: the `voice` kind exists so the union, its validation, its
-      // projection and its label land together, but no voice-origin turn is
-      // admitted yet. A voice turn needs the tool admission that leaves it only
-      // `reachy_say` (D1) and the fresh, allowlisted session it runs in (D2);
-      // neither ships in V1, and the resident session holds every other tool
-      // and the private context. Refused before queuing, so nothing is prompted.
-      // Pinned for V2 (Sherlock NEW-7): that disposable session REPLACES pi's
-      // assembled system prompt — `systemPromptOverride` set to bob's fixed
-      // voice instruction, as the web session does (session.ts, bob#244) —
-      // because pi's own template names workspace paths.
-      if (approved.kind === "voice") {
-        return Promise.reject(
-          new Error(
-            "bob: voice-origin turns are not admitted yet: they need the voice tool admission and disposable session of bob#356 V2",
-          ),
-        );
-      }
+      // bob#356 V2a: a voice-origin turn IS admitted now. Its origin carries
+      // `speakerVerified` (bob's own enrolment; false until V3), and the
+      // utterance/correlation ids bob issued for this transcript. The turn runs
+      // in the resident session, and bob's tool-admission gate (session.ts,
+      // tool-admission.ts) restricts its tool reach to `reachy_say` — no recall,
+      // no writes, no grants. The reachy capability's speech gate accepts a
+      // voice-origin `say` only for this turn's own current addressed utterance
+      // (policy.ts), so no later caller inherits the room's speech.
       const run = async (): Promise<unknown[]> => {
         await bound;
         if (closed) throw new Error("bob: turn admission is closed");

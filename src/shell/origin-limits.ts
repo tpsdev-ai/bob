@@ -5,7 +5,7 @@ export const ORIGIN_FIELD_LIMITS = {
   mailFrom: 64,
   cronJob: 64,
   discordChannelId: 20,
-  // V2 will have bob issue both voice identifiers; V1 refuses voice turns.
+  // bob issues both voice identifiers at admission (bob#356 V2a).
   voiceUtteranceId: 64,
   voiceCorrelationId: 64,
 } as const;
