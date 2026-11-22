@@ -4,9 +4,9 @@
 // cancellation is required on the device, but bob cannot verify a device
 // property, so it keeps its own backstop:
 //
-//   * PLAYBACK INTERLOCK: a transcript that arrives while bob's own speech is
-//     still playing is dropped. The playback window is estimated from the
-//     spoken text (a bound, never a sidecar assertion).
+//   * PLAYBACK INTERLOCK: a transcript that arrives during bob's playback
+//     window is dropped. The window is estimated from the spoken text (a bound,
+//     never a sidecar assertion).
 //   * SAY-MATCH: a transcript whose text closely matches something bob said
 //     within the last `windowMs` is dropped. Normalization is NFKC, lowercase,
 //     punctuation and whitespace folded to single spaces; similarity is
