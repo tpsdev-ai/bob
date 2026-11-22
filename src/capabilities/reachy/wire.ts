@@ -1,11 +1,13 @@
 // reachy/wire.ts — the ONE wire shape for the sidecar's inbound JSON lines, and
 // its validation. Decoding happens HERE, before policy: a line that does not match
 // the schema is MALFORMED, never thrown into the handler. On a ready link with
-// bob's mute and the sidecar-reported mute both off, the caller audits a
-// malformed NON-health line as `reachy.malformed` and logs the reason; a
-// malformed health line (`protocol` set) fails the link instead
-// (`reachy.link.refused`). A line dropped by either mute, or one that arrives
-// before the handshake, gets neither that audit nor that log line.
+// bob's mute and the sidecar-reported mute both off, the caller logs the reason
+// for a malformed NON-health line and attempts a `reachy.malformed` audit (the
+// write can fail); a malformed health line (`protocol` set) fails the link
+// instead (`reachy.link.refused`). A line dropped by either mute, or one that
+// arrives before the handshake, gets neither that audit attempt nor that log
+// line. Every reason is content-free: it names fields or a fixed label, never
+// a value from the line.
 //
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:
@@ -146,6 +148,10 @@ function transcriptFieldFailures(obj: Record<string, unknown>): string[] {
   return bad.length > 0 ? bad : ["type"];
 }
 
+/** The fixed reason for a line whose `type` is missing or not one bob knows. */
+export const UNRECOGNISED_LINE_REASON =
+  "unrecognised line type (not transcript, proposal, presence or health)";
+
 /** Decode one line (a raw string or an already-parsed object) into a DecodedLine. */
 export function decodeLine(raw: unknown): DecodedLine {
   const line = typeof raw === "string" ? safeJson(raw) : raw;
@@ -202,7 +208,12 @@ export function decodeLine(raw: unknown): DecodedLine {
       protocol: true,
     };
   }
-  return { kind: "malformed", reason: `unrecognised line (type=${JSON.stringify(type)})` };
+  // Content-free: a known type that failed its schema is named by that type;
+  // any other `type` gets one fixed reason, so nothing from the line is copied
+  // into the reason, the log or the audit.
+  if (type === "proposal" || type === "presence")
+    return { kind: "malformed", reason: `${type} line failed its schema` };
+  return { kind: "malformed", reason: UNRECOGNISED_LINE_REASON };
 }
 
 /** What bob expects the sidecar to repeat on this connection. */

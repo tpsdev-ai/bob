@@ -3,19 +3,22 @@
 // The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
 // a real UNIX socket: an addressed transcript is submitted for admission as a
 // voice-origin turn with bob-issued ids and `speakerVerified:false`;
-// `wakeHeard` alone never addresses; a malformed transcript is dropped with a
-// named log line; a report of hardware mute drops the next transcript; and
-// bob's own words are dropped by the echo guard (during the estimated playback
-// and as a recent say-match). The remaining cases call the real modules
-// directly: the wake-name edit tiers, wire decoding, a malformed line that a
-// mute or the handshake drops (no malformed audit), memory eligibility under a
-// real parsed config, per-turn utterance cleanup, the queued-turn recheck (a
-// mute or a disconnect drops it; a link that comes back first refuses it as
-// stale), a turn that fails after it started (refused on the record), the
-// admission's beforeStart for a non-voice turn, the echo guard's clearing on
-// link changes, context isolation with fake sessions (the production path is
-// voice-v2a-production-356.test.ts), and the tool-admission gate (stub tools
-// through the real extension; the `voice` profile still exposes no body tool).
+// `wakeHeard` alone never addresses; on a ready, unmuted link a malformed
+// transcript is dropped with a named log line; a sidecar-reported mute drops
+// the next transcript; and text recorded for an attempted say is dropped by the
+// echo guard (during the estimated playback and as a recent say-match). The
+// remaining cases call the real modules directly: the wake-name edit tiers,
+// wire decoding, a malformed line that a mute or the handshake drops (no
+// malformed audit), an unrecognised line type (a fixed, content-free reason), a
+// failing audit store (refusals stand, nothing is sent), memory eligibility
+// under a real parsed config, per-turn utterance cleanup, the queued-turn
+// recheck (a mute or a disconnect drops it; a link that comes back first
+// refuses it as stale), a turn that fails after it started (it returns a
+// refusal), the admission's beforeStart for a non-voice turn, the echo guard's
+// clearing on link changes, context isolation with fake sessions (the
+// production path is voice-v2a-production-356.test.ts), and the tool-admission
+// gate (stub tools through the real extension; the `voice` profile still
+// exposes no body tool).
 import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -34,7 +37,7 @@ import { parseConfig } from "../../../src/capabilities/reachy/config.js";
 import { EchoGuard } from "../../../src/capabilities/reachy/echo.js";
 import type { OrgEvent, PolicyState } from "../../../src/capabilities/reachy/policy.js";
 import { addressed } from "../../../src/capabilities/reachy/policy.js";
-import { decodeLine } from "../../../src/capabilities/reachy/wire.js";
+import { decodeLine, UNRECOGNISED_LINE_REASON } from "../../../src/capabilities/reachy/wire.js";
 import {
   admitToolCall,
   createToolAdmissionExtension,
@@ -484,47 +487,48 @@ describe("bob#356 V2a — a malformed transcript is dropped, never admitted", ()
   }, 30_000);
 });
 
+/** A voice-profile capability on a recorder channel, for single-line cases. */
+function recorderWorld() {
+  const store = new FakeStore();
+  const logs: string[] = [];
+  const state: PolicyState = {
+    profile: "voice",
+    wakeName: "jarvis",
+    enrolment: {},
+    mute: false,
+    nowMs: () => Date.now(),
+    roomSpeechOrigins: [],
+  };
+  const wired = wireReachyCapability({
+    pi: new FakePi(),
+    commands: {
+      async send() {
+        return null;
+      },
+    },
+    memory: new FakeMemory(),
+    store,
+    state,
+    sidecarVersion: TEST_SIDECAR_VERSION,
+    readOrigin: () => undefined,
+    log: (m) => logs.push(m),
+  });
+  const ready = async (over: Record<string, unknown> = {}) => {
+    await wired.connected();
+    await wired.handleLine(healthLine(wired, state, over));
+    expect(wired.link().phase).toBe("ready");
+  };
+  const traces = () => ({
+    audits: store.all.filter((e) => e.kind === "reachy.malformed").length,
+    logs: logs.filter((m) => m.includes("dropped malformed input")).length,
+  });
+  return { wired, state, store, logs, ready, traces };
+}
+
 // ── a malformed line that a mute or the handshake drops is not "malformed" ──
 describe("bob#356 V2a — a malformed line dropped by a mute or before the handshake gets no malformed audit or log", () => {
   // Wire-malformed: empty text fails the transcript schema.
   const BAD = { type: "transcript", text: "", ts: "t", wakeHeard: true };
-  function recorderWorld() {
-    const store = new FakeStore();
-    const logs: string[] = [];
-    const state: PolicyState = {
-      profile: "voice",
-      wakeName: "jarvis",
-      enrolment: {},
-      mute: false,
-      nowMs: () => Date.now(),
-      roomSpeechOrigins: [],
-    };
-    const wired = wireReachyCapability({
-      pi: new FakePi(),
-      commands: {
-        async send() {
-          return null;
-        },
-      },
-      memory: new FakeMemory(),
-      store,
-      state,
-      sidecarVersion: TEST_SIDECAR_VERSION,
-      readOrigin: () => undefined,
-      log: (m) => logs.push(m),
-    });
-    const ready = async (over: Record<string, unknown> = {}) => {
-      await wired.connected();
-      await wired.handleLine(healthLine(wired, state, over));
-      expect(wired.link().phase).toBe("ready");
-    };
-    const traces = () => ({
-      audits: store.all.filter((e) => e.kind === "reachy.malformed").length,
-      logs: logs.filter((m) => m.includes("dropped malformed input")).length,
-    });
-    return { wired, state, store, ready, traces };
-  }
-
   it("CONTROL: on a ready link with both mutes off it IS audited and logged", async () => {
     const w = recorderWorld();
     await w.ready();
@@ -559,8 +563,104 @@ describe("bob#356 V2a — a malformed line dropped by a mute or before the hands
   });
 });
 
-// ── gate 4: hardware mute drops the next transcript ──────────────────────────
-describe("bob#356 V2a — a transcript after a hardware-mute report is not admitted", () => {
+// ── an unrecognised line type gets a fixed reason ───────────────────────────
+describe("bob#356 V2a — an unrecognised line type gets a fixed, content-free reason", () => {
+  const MARKER = "MARKER-6f1c";
+
+  it("decoding: any type bob does not know, or none, gets the one fixed reason", () => {
+    for (const line of [{ type: `${MARKER} words` }, { type: { inner: MARKER } }, {}]) {
+      expect(decodeLine(line)).toEqual({ kind: "malformed", reason: UNRECOGNISED_LINE_REASON });
+    }
+  });
+
+  it("on a ready link: the malformed log line and audit carry the fixed reason, not the type", async () => {
+    const w = recorderWorld();
+    await w.ready();
+    const result = await w.wired.handleLine({ type: `${MARKER} words from the line`, text: "x" });
+    expect(result).toEqual({ kind: "malformed", reason: UNRECOGNISED_LINE_REASON });
+    expect(w.traces()).toEqual({ audits: 1, logs: 1 }); // both were written
+    expect(w.logs.join("\n")).not.toContain(MARKER);
+    expect(JSON.stringify(w.store.all)).not.toContain(MARKER);
+    expect(w.logs.join("\n")).toContain(UNRECOGNISED_LINE_REASON);
+  });
+});
+
+// ── an audit store that fails: refusals stand, nothing is sent ──────────────
+describe("bob#356 V2a — with the audit store failing, a voice turn still refuses and sends nothing", () => {
+  it("the turn's reachy_say is refused unsent, and the failed turn still returns a refusal", async () => {
+    const pi = new FakePi();
+    const sent: string[] = [];
+    const logs: string[] = [];
+    let writes = 0;
+    const store: OrgEventStore = {
+      async write() {
+        writes += 1;
+        throw new Error("the audit store is down");
+      },
+      async getById() {
+        return null;
+      },
+    };
+    const state: PolicyState = {
+      profile: "voice",
+      wakeName: "jarvis",
+      enrolment: {},
+      mute: false,
+      nowMs: () => Date.now(),
+      roomSpeechOrigins: [],
+    };
+    let spoken: string | undefined;
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => ({
+        subscribe: () => () => {},
+        dispose() {},
+        async prompt() {
+          spoken = await pi.call("reachy_say", { text: "It is noon." });
+          throw new Error("the voice turn failed after it tried to speak");
+        },
+      }),
+    });
+    admission.bind({ subscribe: () => () => {}, dispose() {}, async prompt() {} });
+    const wired = wireReachyCapability({
+      pi,
+      commands: {
+        async send(command: string) {
+          sent.push(command);
+          return null;
+        },
+      },
+      memory: new FakeMemory(),
+      store,
+      state,
+      sidecarVersion: TEST_SIDECAR_VERSION,
+      readOrigin: () => boundOrigin({ admission }),
+      admitVoiceTurn: admission.admitTurn,
+      log: (m) => logs.push(m),
+    });
+    await wired.connected();
+    await wired.handleLine(healthLine(wired, state));
+    expect(wired.link().phase).toBe("ready");
+    sent.length = 0; // only what the voice turn causes
+
+    const result = await wired.handleLine({
+      type: "transcript",
+      text: "jarvis, what time is it",
+      ts: "t",
+      wakeHeard: true,
+    });
+    // The say was admitted by policy, but its audit failed: refused, unsent.
+    expect(spoken).toBe("refused: audit write failed");
+    expect(sent).toEqual([]);
+    // The failed turn still returns a refusal, though its audit failed too.
+    expect(result).toMatchObject({ kind: "refused", action: "voice" });
+    expect(writes).toBeGreaterThanOrEqual(2); // both audits were attempted
+    expect(logs.filter((m) => m.includes("could not persist OrgEvent")).length).toBe(writes);
+  });
+});
+
+// ── gate 4: a sidecar-reported mute drops the next transcript ────────────────
+describe("bob#356 V2a — a transcript after a sidecar-reported mute is not admitted", () => {
   it("admits before the mute, drops after it", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar);
@@ -584,7 +684,7 @@ describe("bob#356 V2a — a transcript after a hardware-mute report is not admit
 });
 
 // ── gate 5: the echo guard ───────────────────────────────────────────────────
-describe("bob#356 V2a — the echo guard drops bob's own words", () => {
+describe("bob#356 V2a — the echo guard drops text recorded for an attempted say", () => {
   it("say-match: a transcript that matches recent speech is dropped; a different one is submitted", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar, { echoWindowMs: 10_000, playbackMs: () => 0 });
@@ -1090,8 +1190,9 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
   });
 
   // Only the starting-line mute is a drop. A turn that failed for any other
-  // reason is a refusal on the record, even when the link went quiet before the
-  // failure was caught.
+  // reason returns a refusal and attempts its audit (the store works here, so
+  // the audit is written), even when the link went quiet before the failure
+  // was caught.
   type Wired = ReturnType<typeof wireReachyCapability>;
   type AdmitVoice = (
     origin: TurnOrigin,
@@ -1136,7 +1237,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     wakeHeard: true,
   };
 
-  it("a turn that passed beforeStart and then failed after a disconnect is REFUSED on the record", async () => {
+  it("a turn that passed beforeStart and then failed after a disconnect is REFUSED, with its audit written", async () => {
     const world = failingWorld(({ wired }) => async (_origin, _text, opts) => {
       expect(opts?.beforeStart?.()).toBeNull(); // the turn starts
       wired().disconnected(); // the link goes away mid-turn
@@ -1152,7 +1253,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     expect(refused[0]?.summary).toContain("the voice turn failed after it started");
   });
 
-  it("a voice session that failed to start after a device mute is REFUSED on the record", async () => {
+  it("a voice session that failed to start after a device mute is REFUSED, with its audit written", async () => {
     // The REAL admission: voiceSession() runs before beforeStart, so a session
     // that cannot start never reaches the starting-line check.
     const world = failingWorld(({ wired, state }) => {

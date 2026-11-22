@@ -15,7 +15,7 @@ import {
 } from "../../../src/capabilities/reachy/echo.js";
 
 describe("bob#356 V2a — EchoGuard with its production defaults", () => {
-  it("a multi-sentence say is guarded through its estimated playback and the window after it", () => {
+  it("a multi-sentence recorded line is guarded through its estimated playback and the window after it", () => {
     const guard = new EchoGuard();
     const text =
       "The meeting is at noon today. Bring the printed agenda and the two signed pages. " +
@@ -27,8 +27,9 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     guard.record(text, at);
     expect(guard.playbackActive(at + playback - 1)).toBe(true);
     expect(guard.check(text, at + playback - 1)).toBe("playback");
-    // The estimated playback is over; the identical line is still bob's own
-    // words because the say-match window is measured from the estimated end.
+    // The estimated playback is over; the identical text still matches the
+    // recorded text, because the say-match window is measured from the
+    // estimated end.
     expect(guard.playbackActive(at + playback)).toBe(false);
     expect(guard.matchesRecentSay(text, at + playback)).toBe(true);
     expect(guard.matchesRecentSay(text, at + playback + ECHO_WINDOW_MS)).toBe(true);

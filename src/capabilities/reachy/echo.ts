@@ -7,11 +7,12 @@
 // so it keeps its own backstop:
 //
 //   * PLAYBACK INTERLOCK: a transcript that arrives during bob's ESTIMATED
-//     playback window is dropped. The window is estimated from the spoken text
+//     playback window is dropped. The window is estimated from the line's text
 //     (`estimatedPlaybackMs`, capped at 15 s), never asserted by the sidecar;
 //     bob observes no actual playback completion.
-//   * SAY-MATCH: a transcript whose text closely matches a line bob sent as a
-//     `say` is dropped for `windowMs` after that line's ESTIMATED playback end.
+//   * SAY-MATCH: a transcript whose text closely matches a line recorded for
+//     an attempted `say` (recorded BEFORE the send, which can fail) is dropped
+//     for `windowMs` after that line's ESTIMATED playback end.
 //     If a device takes longer to play a line than its estimate, a transcript
 //     of it can arrive after the window has ended; the estimate, not the
 //     device, sets the bound.
@@ -28,7 +29,7 @@
 
 /** How long bob remembers its own speech for the say-match guard. */
 export const ECHO_WINDOW_MS = 10_000;
-/** Similarity at or above which a transcript counts as bob's own words. */
+/** Similarity at or above which a transcript counts as a recorded line. */
 export const ECHO_SIMILARITY = 0.9;
 
 /** NFKC + lowercase, punctuation folded to spaces, whitespace collapsed. */
@@ -78,7 +79,7 @@ export function editSimilarity(a: string, b: string): number {
 
 /**
  * The fixed number of edits a normalized line may contain and still count as
- * bob's own words: `floor((1 - ECHO_SIMILARITY) * length)`.
+ * a recorded line: `floor((1 - ECHO_SIMILARITY) * length)`.
  *
  * The epsilon keeps the exact boundary in float64: `1 - 0.9` is
  * 0.09999999999999998, so for a 10-character line the product is
@@ -89,7 +90,7 @@ export function editAllowance(length: number, threshold: number = ECHO_SIMILARIT
   return Math.floor((1 - threshold) * length + 1e-9);
 }
 
-/** The bounded window a spoken line is estimated to play for. */
+/** The bounded window a recorded line is estimated to play for. */
 export function estimatedPlaybackMs(text: string): number {
   return Math.min(15_000, Math.max(1_000, 600 + 60 * text.length));
 }
@@ -113,7 +114,8 @@ export class EchoGuard {
     private readonly playbackMs: (text: string) => number = estimatedPlaybackMs,
   ) {}
 
-  /** Record speech bob is about to emit (say or ask). */
+  /** Record the text of an attempted say or ask, before it is sent (the send
+   *  can still fail; the record stands either way). */
   record(text: string, nowMs: number): void {
     this.spoken.push({
       normalized: normalizeSpeech(text),

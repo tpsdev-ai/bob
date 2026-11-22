@@ -207,15 +207,16 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
   }
 
   const factory = opts.sessionFactory ?? defaultPersistentFactory(opts.registry);
-  // bob#356 V2a: every voice turn runs in its OWN session, built fresh from the
-  // same factory. Its config drops the private bootstrap (flairBootstrap) and
-  // prior-round (prMemory) context, loads only the reachy capability, and allows
-  // exactly the speech tool, which the agent's own policy must already allow.
-  // It is not persistent, so the default factory keeps its history in memory,
-  // never in the resident session directory. The resident reachy capability's
-  // speech bridge is handed along so the one live sidecar link does the
-  // talking. The soul, the standing contract and pi's own prompt template
-  // (which names the working directory) still reach its system prompt.
+  // bob#356 V2a: a voice turn that starts runs in its OWN session, built fresh
+  // from the same factory (a turn refused before that never runs). Its config
+  // drops the private bootstrap (flairBootstrap) and prior-round (prMemory)
+  // context, loads only the reachy capability, and allows exactly the speech
+  // tool, which the agent's own policy must already allow. It is not persistent,
+  // so the default factory keeps its history in memory, never in the resident
+  // session directory. The resident reachy capability's speech bridge is handed
+  // along so the one live sidecar link does the talking. The soul, the standing
+  // contract and pi's own prompt template (which names the working directory)
+  // still reach its system prompt.
   async function voiceSession(): Promise<RunSession> {
     const speak = getRegisteredVoiceSpeech(admission);
     if (speak === undefined)

@@ -594,9 +594,10 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       const detail = err instanceof Error ? err.message : String(err);
       log(`reachy: voice turn admission failed: ${detail}`);
       // Only the starting-line mute refusal above is a drop. Every other
-      // failure is recorded as a refusal (`reachy.refused`), whatever the link
-      // state when it is caught: a stale epoch, a voice session that could not
-      // start, or a turn that started (and may have spoken) and then failed,
+      // failure returns a refusal and attempts a `reachy.refused` audit (the
+      // refusal is returned even if that audit fails), whatever the link state
+      // when it is caught: a stale epoch, a voice session that could not start,
+      // or a turn that started (and may have attempted a `say`) and then failed,
       // even if the link muted or disconnected before this catch runs.
       if (droppedAtStart) return { kind: "drop" };
       return await refuse("voice", `admission failed: ${detail}`);
