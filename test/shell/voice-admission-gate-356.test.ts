@@ -4,7 +4,7 @@
 // extension registers an allowed `reachy_say` and a grant-class `mail_send`;
 // the gate must let the first run inside a voice turn and refuse the second
 // with the fixed, named reason. No network: the provider is scripted.
-import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,18 +37,23 @@ const CONTEXT_WINDOW = 100_000;
 const TOOL_LOG = "BOB_TEST_VOICE_TOOL_LOG";
 
 let root: string;
+const roots: string[] = [];
 const runtimes: Array<{ dispose(): Promise<void> }> = [];
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "bob-voice-gate-356-"));
+  roots.push(root);
   const agentDir = join(root, "testbot");
   mkdirSync(join(agentDir, "work"), { recursive: true });
   mkdirSync(join(agentDir, ".pi-agent"));
 });
 
-afterAll(async () => {
-  for (const r of runtimes.splice(0)) await r.dispose();
-  if (root) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  try {
+    for (const r of runtimes.splice(0)) await r.dispose();
+  } finally {
+    for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 function usage(input: number, output: number): AssistantMessage["usage"] {
