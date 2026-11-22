@@ -1,1 +1,0 @@
-- **`fast-xml-parser` is pinned to 5.12.1.** It reaches bob through the AWS SDK that `@earendil-works/pi-ai` depends on, whose XML builder pins an affected 5.7.3 (GHSA-474x-hrwr-fgx4, low). The override moves every install to the patched release.
