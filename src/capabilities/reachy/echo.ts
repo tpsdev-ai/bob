@@ -1,22 +1,25 @@
 // reachy/echo.ts — the ECHO GUARD (bob#356 V2a, gate 5 / design §9).
 //
-// The sidecar's microphone can hear bob's own speaker. Hardware echo
-// cancellation is required on the device, but bob cannot verify a device
-// property, so it keeps its own backstop:
+// A sidecar that transcribes the room could transcribe bob's own speech from
+// its speaker. The shipped sidecar sends no transcripts (V2b adds that
+// producer); V2a's transcripts come from tests. The design requires hardware
+// echo cancellation on such a device, but bob cannot verify a device property,
+// so it keeps its own backstop:
 //
 //   * PLAYBACK INTERLOCK: a transcript that arrives during bob's ESTIMATED
 //     playback window is dropped. The window is estimated from the spoken text
 //     (`estimatedPlaybackMs`, capped at 15 s), never asserted by the sidecar;
 //     bob observes no actual playback completion.
-//   * SAY-MATCH: a transcript whose text closely matches something bob said is
-//     dropped for `windowMs` after that line's ESTIMATED playback end. A line
-//     that plays longer than its estimate can therefore be heard after the
-//     window has ended; the estimate, not the speaker, sets the bound.
+//   * SAY-MATCH: a transcript whose text closely matches a line bob sent as a
+//     `say` is dropped for `windowMs` after that line's ESTIMATED playback end.
+//     If a device takes longer to play a line than its estimate, a transcript
+//     of it can arrive after the window has ended; the estimate, not the
+//     device, sets the bound.
 //     Normalization is NFKC, lowercase, punctuation and whitespace folded to
 //     single spaces. A line matches when its edit distance is within a fixed
 //     length-based allowance, `floor((1 - 0.9) * length + 1e-9)` edits, where
 //     length is the longer of the two normalized lines. An empty transcript
-//     never matches: there is nothing to hear.
+//     never matches: there is no text to compare.
 //
 // This heuristic does not certify AEC. Under the `voice` profile it is a
 // deterministic drop, applied before a transcript is retained or submitted for
@@ -132,7 +135,7 @@ export class EchoGuard {
 
   /** Say-match: the transcript is one of bob's own recent lines. The window
    *  starts at that line's ESTIMATED playback end (`playbackMs`), so a long line
-   *  keeps its window for as long as its estimate says it plays. */
+   *  keeps its window for as long as its estimated playback lasts. */
   matchesRecentSay(text: string, nowMs: number): boolean {
     const normalized = normalizeSpeech(text);
     if (normalized.length === 0) return false;

@@ -6,8 +6,9 @@
 // reach this tool?
 //
 // The rule is an ALLOWLIST, keyed on origin, not a denylist of today's grant
-// names (bob#356 Kern N2). A voice-origin turn — speech heard in the room, from
-// a speaker bob has not verified — may reach `reachy_say` and nothing else.
+// names (bob#356 Kern N2). A voice-origin turn — one a sidecar transcript of
+// room speech opened, from a speaker bob has not verified — may reach
+// `reachy_say` and nothing else.
 // Everything else refuses, including tools that do not exist yet: a future
 // grant tool is unreachable from voice the day it lands, without anyone
 // remembering to list it here.

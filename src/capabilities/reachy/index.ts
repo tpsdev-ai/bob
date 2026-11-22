@@ -56,8 +56,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // capability's speech bridge on the loader bus. The sidecar accepts one
   // connection, and the resident instance owns it; this session registers only
   // the speech tool and sends through that link. The resident capability's
-  // speech policy decides whether the line is spoken, from the origin the call
-  // is bound to (for a voice turn: its own current addressed utterance).
+  // speech policy decides whether the line is sent as a `say`, from the origin
+  // the call is bound to (for a voice turn: its own current addressed
+  // utterance).
   const voiceSpeech = getVoiceSpeech(pi);
   if (voiceSpeech !== undefined) {
     pi.registerTool({

@@ -278,16 +278,20 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   }
 
   /** Attempt a `reachy.malformed` audit; return malformed even if it fails. The
-   *  log line names the drop (bob#356 V2a), so it is visible without an audit read.
-   *  A malformed sidecar LINE reaches this only on a ready link with bob's mute
-   *  and the sidecar-reported mute both off: bob's mute, a pre-handshake line, a
-   *  malformed health line (a link failure) and the sidecar-reported mute all
-   *  take other paths first. Two other callers reach it in any link state: an
-   *  action whose arguments fail their schema (admitAndRun), and a `presence`
-   *  line under the `voice` profile (ready link, bob's mute off, whatever the
-   *  sidecar-reported mute). */
+   *  log line names the drop (bob#356 V2a), so it is visible without an audit
+   *  read; the reason says which input it was. Three callers, each with its own
+   *  condition:
+   *   - a malformed sidecar LINE (handleLine): only on a ready link with bob's
+   *     mute and the sidecar-reported mute both off; bob's mute, a pre-handshake
+   *     line, a malformed health line (a link failure) and the sidecar-reported
+   *     mute all take other paths first;
+   *   - a `presence` line under the `voice` profile (handleLine): only on a
+   *     ready link with bob's mute off, whatever the sidecar-reported mute;
+   *   - an action whose arguments fail their schema (admitAndRun, which checks
+   *     them first): from a TOOL call in any link state and under either mute,
+   *     or from a sidecar proposal only on a ready link with both mutes off. */
   async function malformed(reason: string): Promise<DecisionSummary> {
-    log(`reachy: dropped a malformed sidecar line: ${reason}`);
+    log(`reachy: dropped malformed input: ${reason}`);
     const tsMs = state.nowMs();
     await audit({
       id: `evt_reachy.malformed_${uuid()}`,
@@ -579,9 +583,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log(`reachy: voice turn admission failed: ${detail}`);
-      // A turn refused at the starting line because the link went away is a
-      // drop, not a refusal: nothing reached the room and there is no action to
-      // judge. Anything else is recorded as a refusal.
+      // The rule is the link state when the failure is CAUGHT, not the error:
+      // if the link is effectively muted then (bob's mute, the sidecar-reported
+      // mute, or no ready link), ANY admission failure is a drop with no audit,
+      // the expected case being a turn refused at the starting line because the
+      // link went away. Otherwise the failure is recorded as a refusal, including
+      // a stale-epoch refusal on a link that is ready again.
       if (effectiveMuted()) return { kind: "drop" };
       return await refuse("voice", `admission failed: ${detail}`);
     } finally {

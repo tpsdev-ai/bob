@@ -215,11 +215,11 @@ export type Decision =
   | { kind: "admitted"; action: string; orgEvent: OrgEvent }
   | { kind: "refused"; action: string; reason: string };
 
-/** `addressed` = the wake name appears in the transcript text, recomputed in
- *  bob and never taken from the sidecar's `wakeHeard` flag. This is a TEXT
- *  matcher: the normalized name phrase itself, or a window of words within a
- *  length-based edit allowance of it, so a transcript that renders the name as
- *  a near-miss ("Hey Dervis" for jarvis) still counts. It accepts "dervis" (two
+/** `addressed` = the transcript text contains the wake name OR a window of
+ *  words within the length-based edit allowance below of it, recomputed in bob
+ *  and never taken from the sidecar's `wakeHeard` flag. This is a TEXT matcher
+ *  over normalized words, so a transcript that renders the name as a near-miss
+ *  ("Hey Dervis" for jarvis) still counts. It accepts "dervis" (two
  *  edits from a six-letter name) and rejects "travis" (three). */
 export function addressed(text: string, wakeName: string): boolean {
   if (!wakeName) return false;

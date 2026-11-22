@@ -7,8 +7,12 @@
 //   * the Memory OWNER guard: a non-admin agent may only write a Memory whose
 //     body `agentId` is itself (403 otherwise — what Flair's Memory.put does
 //     for a body owned by another agent).
-// When it is given a bootstrap context, a signed POST /BootstrapMemories answers
-// `{ context }` with it (bob#356 V2a: the session bootstrap a warm session loads).
+// When it is given a bootstrap context, it also models Flair's MemoryBootstrap
+// identity check (bob#356 V2a: the session bootstrap a warm session loads): a
+// signed POST /BootstrapMemories whose body `agentId` is the SIGNING agent, or
+// names no agent (Flair then pins the request to the signer), answers
+// `{ context }` with it; a body naming ANOTHER agent gets 403, as Flair answers
+// a non-admin signer (resources/MemoryBootstrap.ts), and no context.
 // An unsigned or badly signed request gets 401 first, on any route; a signed
 // request to any other route gets 404. It accepts no admin credential: every
 // caller here is an ordinary agent.
@@ -54,6 +58,17 @@ export async function startFlairDouble(
         return refuse(401, "signature does not verify");
       }
       if (req.method === "POST" && path === "/BootstrapMemories" && opts.bootstrap !== undefined) {
+        let parsed: { agentId?: unknown };
+        try {
+          parsed = JSON.parse(body === "" ? "{}" : body);
+        } catch {
+          return refuse(400, "not JSON");
+        }
+        // Flair: `bodyAgentId && bodyAgentId !== authenticatedAgent` → 403 for a
+        // non-admin signer, and this double has no admin.
+        if (parsed.agentId && parsed.agentId !== agentId) {
+          return refuse(403, "forbidden: agentId must match authenticated agent");
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ context: opts.bootstrap }));
         return;

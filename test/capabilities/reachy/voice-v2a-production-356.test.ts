@@ -14,9 +14,10 @@
 // answers from a script, so the test reads the exact request body a model would
 // receive); the sidecar (driven-sidecar.py: the test supplies the transcript it
 // sends); Flair (flair-double.ts, which verifies signatures and serves the
-// bootstrap context); and prMemory, which the persistent runtime never loads
-// itself (it comes from a launcher's PR recall), so the factory seam seeds it on
-// the warm config before the warm session is built. The same seam hands the
+// bootstrap context only to the signing agent, refusing a request that names
+// another agent as Flair does); and prMemory, which the persistent runtime
+// never loads itself (it comes from a launcher's PR recall), so the factory seam
+// seeds it on the warm config before the warm session is built. The same seam hands the
 // warm config the reachy tools, as voice-session.test.ts does: no shipped role
 // allows a reachy tool yet, and a voice session may only use a tool the agent's
 // own policy allows.
@@ -322,7 +323,7 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
       expect(filesBefore.length).toBeGreaterThan(0); // the warm session is durable
       expect(process.env.BOB_PERSISTENT).toBe("1");
 
-      // ── the voice turn: the sidecar hears an addressed transcript ──
+      // ── the voice turn: the fixture SENDS an addressed transcript ──
       room.send({
         send: {
           type: "transcript",

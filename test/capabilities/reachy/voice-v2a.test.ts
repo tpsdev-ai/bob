@@ -1,4 +1,4 @@
-// bob#356 V2a — the BOB SIDE of the ears: gates before inputs.
+// bob#356 V2a — the BOB SIDE of transcript intake: gates before inputs.
 //
 // The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
 // a real UNIX socket: an addressed transcript is submitted for admission as a
@@ -278,19 +278,19 @@ describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone never addr
   // characters, 2 up to eight, 3 beyond. Each pair sits on a tier's edge, so
   // moving either boundary or flattening the tiers turns one of them over.
   it("the edit allowance is tiered by the name's length, at each boundary", () => {
-    const heard = (word: string, name: string) => addressed(`${word}, good morning`, name);
+    const matches = (word: string, name: string) => addressed(`${word}, good morning`, name);
     // 4 characters: one edit, not two.
-    expect(heard("iras", "iris")).toBe(true);
-    expect(heard("uras", "iris")).toBe(false);
+    expect(matches("iras", "iris")).toBe(true);
+    expect(matches("uras", "iris")).toBe(false);
     // 5 characters: two edits, not three.
-    expect(heard("rubyn", "robin")).toBe(true);
-    expect(heard("rubyx", "robin")).toBe(false);
+    expect(matches("rubyn", "robin")).toBe(true);
+    expect(matches("rubyx", "robin")).toBe(false);
     // 8 characters: two edits, not three.
-    expect(heard("kangslay", "kingsley")).toBe(true);
-    expect(heard("kangslax", "kingsley")).toBe(false);
+    expect(matches("kangslay", "kingsley")).toBe(true);
+    expect(matches("kangslax", "kingsley")).toBe(false);
     // 9 characters: three edits, not four.
-    expect(heard("alaxundar", "alexander")).toBe(true);
-    expect(heard("ulaxundar", "alexander")).toBe(false);
+    expect(matches("alaxundar", "alexander")).toBe(true);
+    expect(matches("ulaxundar", "alexander")).toBe(false);
     // A two-word name is sized as its normalized phrase ("hey rocky", 9).
     expect(addressed("hay rucku, good morning", "hey-rocky")).toBe(true);
     expect(addressed("hay ruckuu, good morning", "hey-rocky")).toBe(false);
@@ -530,7 +530,7 @@ describe("bob#356 V2a — the echo guard drops bob's own words", () => {
     }
   }, 30_000);
 
-  it("playback interlock: a different transcript arriving during playback is dropped", async () => {
+  it("playback interlock: a different transcript arriving inside the estimated playback window is dropped", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar, { playbackMs: () => 60_000 });
     try {
@@ -1140,9 +1140,10 @@ describe("bob#356 V2a — a voice turn sees no resident history", () => {
 describe("bob#356 V2a — wireReachyCapability clears its echo guard on link changes", () => {
   const SAID = "jarvis, the meeting moved to noon";
 
-  /** A capability on a recorder channel whose speech is granted to `run`; the
-   *  echo window outlasts the test and playback ends at once, so only the
-   *  say-match can drop the line bob said. */
+  /** A capability on a recorder channel (no device, no audio) whose speech is
+   *  granted to `run`. The say-match window outlasts the test and the ESTIMATED
+   *  playback window is zero, so only the say-match can drop the line bob
+   *  sent. */
   async function echoWorld() {
     const pi = new FakePi();
     const admissions: Admissions = [];
@@ -1180,29 +1181,30 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
       await wired.handleLine(healthLine(wired, state));
       expect(wired.link().phase).toBe("ready");
     };
-    const hear = (text: string) =>
+    const receive = (text: string) =>
       wired.handleLine({ type: "transcript", text, ts: "t", wakeHeard: true });
     await handshake();
-    // bob says the line, and hearing it back is dropped: the control.
+    // bob sends the line as a `say`, and the same text sent back as a
+    // transcript is dropped by the say-match: the control.
     expect(await pi.call("reachy_say", { text: SAID })).toBe(`say: ${SAID}`);
-    expect(await hear(SAID)).toEqual({ kind: "none" });
+    expect(await receive(SAID)).toEqual({ kind: "none" });
     expect(logs.some((m) => m.includes("echo guard: say-match"))).toBe(true);
     expect(admissions).toEqual([]);
-    return { wired, state, admissions, handshake, hear };
+    return { wired, state, admissions, handshake, receive };
   }
 
   it("a disconnect and a fresh handshake: bob's earlier line is no longer an echo", async () => {
     const world = await echoWorld();
     world.wired.disconnected();
     await world.handshake();
-    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(await world.receive(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
     expect(world.admissions).toHaveLength(1);
   });
 
   it("a new connection without a disconnect notice: the handshake alone clears it", async () => {
     const world = await echoWorld();
     await world.handshake();
-    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(await world.receive(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
   });
 
   it("a refused link (health mismatch) and a reconnect: cleared", async () => {
@@ -1212,7 +1214,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
     );
     expect(world.wired.link().phase).toBe("disconnected");
     await world.handshake();
-    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(await world.receive(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
   });
 
   it("a device mute flip (unmuted, muted, unmuted) on the same link: cleared", async () => {
@@ -1222,7 +1224,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
     await world.wired.handleLine(healthLine(world.wired, world.state, { muted: false }));
     expect(world.wired.link().phase).toBe("ready");
     expect(world.wired.link().effectiveMuted).toBe(false);
-    expect(await world.hear(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
+    expect(await world.receive(SAID)).toMatchObject({ kind: "admitted", action: "voice" });
   });
 
   it("each of the four link changes clears the guard itself", async () => {

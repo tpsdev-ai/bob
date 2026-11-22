@@ -71,7 +71,8 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     const guard = new EchoGuard();
     guard.record("", 1_000);
     expect(guard.matchesRecentSay("", 1_000)).toBe(false);
-    expect(guard.playbackActive(1_000)).toBe(true); // an empty line still plays its 1 s floor
+    // An empty line still gets the 1 s floor of its ESTIMATED playback window.
+    expect(guard.playbackActive(1_000)).toBe(true);
   });
 
   it("clearing the guard forgets every recorded line", () => {
