@@ -105,6 +105,9 @@ export function createTurnAdmission(
     // empty-response wrapper's typed exhaustion provenance. It is never cleared
     // by a later message or compaction: the operation has failed.
     exhaustion?: EmptyResponseExhaustion;
+    // Set when the loop breaker fired: the stopped prompt gets no reasoning-only
+    // continuation when it settles.
+    loopBroken?: boolean;
     abort?: (err: Error) => void;
     // The session this turn prompts (the resident one, or a fresh voice one).
     target?: RunSession;
@@ -145,6 +148,7 @@ export function createTurnAdmission(
         if (observation.fire && turn.abort) {
           const abort = turn.abort;
           turn.abort = undefined;
+          turn.loopBroken = true;
           log(loopBreakMessage(agentName, toolName, args, observation.count));
           abort(new ToolLoopError(toolName, observation.count));
           // Ask the session to stop. The binding does not depend on the
@@ -300,7 +304,7 @@ export function createTurnAdmission(
                 session: target,
                 readEnding: () => turn.endings.current(),
                 beginTurn: () => turn.endings.reset(),
-                shouldStop: () => turn.exhaustion !== undefined,
+                shouldStop: () => turn.exhaustion !== undefined || turn.loopBroken === true,
                 onReprompt: (n, max) =>
                   log(
                     `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,

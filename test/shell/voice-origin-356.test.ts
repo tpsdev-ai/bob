@@ -445,6 +445,57 @@ describe("bob#356 V2a — the fresh voice session is disposed when its startup f
   });
 });
 
+describe("bob#356 V2a — a loop-broken turn sends no reasoning-only continuation", () => {
+  /** A voice session whose first prompt may loop on a tool, then ends with
+   *  reasoning only; a continuation prompt ends in text. */
+  function reasoningWorld(loop: boolean) {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const voiceSide = scriptedSession(async (text, emit) => {
+      if (text === REASONING_CONTINUE_TURN) {
+        emit(ending(TEXT));
+        return;
+      }
+      if (loop) {
+        for (let i = 0; i < 2; i++) {
+          emit({ type: "tool_execution_start", toolName: "reachy_say", args: { text: "again" } });
+        }
+      }
+      emit(ending(REASONING_ONLY));
+      await held;
+    });
+    const admission = createTurnAdmission({
+      log: () => {},
+      toolLoopLimit: 2,
+      loopAbortGraceMs: 10,
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(scriptedSession(async () => {}).session);
+    return { admission, voiceSide, release };
+  }
+
+  it("a loop-broken voice prompt that settles reasoning-only is not continued", async () => {
+    const w = reasoningWorld(true);
+    await expect(w.admission.admitTurn(voice(), "jarvis, again")).rejects.toBeInstanceOf(
+      ToolLoopError,
+    );
+    w.release(); // the stopped prompt settles, ending with reasoning only
+    while (w.voiceSide.calls.disposals === 0) await tick();
+    expect(w.voiceSide.calls.prompts).toEqual(["jarvis, again"]);
+  });
+
+  it("CONTROL: the same reasoning-only ending without a loop break is continued", async () => {
+    const w = reasoningWorld(false);
+    const turn = w.admission.admitTurn(voice(), "jarvis, what time is it");
+    while (w.voiceSide.calls.prompts.length === 0) await tick();
+    w.release();
+    await turn;
+    expect(w.voiceSide.calls.prompts).toEqual(["jarvis, what time is it", REASONING_CONTINUE_TURN]);
+  });
+});
+
 describe("bob#356 V2a — each turn's reasoning-only check reads its own ending", () => {
   it("a loop-broken voice prompt that settles late does not take the next turn's ending", async () => {
     let releaseVoice!: () => void;
