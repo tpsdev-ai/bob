@@ -36,7 +36,7 @@ const EXPECTED_MALFORMED = 0;
 // refuses the look proposal.
 const VOICE_EXPECTED_MALFORMED = 1;
 const VOICE_EXPECTED_BODY_REFUSALS = 1;
-// V2a: a voice-profile transcript is never eligible for a memory write, even
+// V2a: a voice-profile transcript is not eligible for a memory write, even
 // for an enrolled speakerId the sidecar claims.
 const VOICE_EXPECTED_MEMORY_WRITES = 0;
 const STUB_VERSION = "reachy-stub-1";

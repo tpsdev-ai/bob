@@ -118,9 +118,9 @@ describe("bob#356 V2a — an admission with no voice session refuses a voice tur
   });
 });
 
-// A scripted session: `prompt` runs `onPrompt` with an `emit` that calls every
+// A scripted session: `prompt` runs `onPrompt` with an `emit` that calls each
 // subscriber synchronously, so an event is emitted under the caller's
-// AsyncLocalStorage store (inside a turn's prompt, or outside every turn).
+// AsyncLocalStorage store (inside a turn's prompt, or outside a turn).
 function scriptedSession(
   onPrompt: (text: string, emit: (event: unknown) => void) => Promise<void>,
 ) {
@@ -210,6 +210,63 @@ describe("bob#356 V2a — another session's events do not set the active voice t
     release();
     await turn;
     expect(voiceSide.calls.prompts).toEqual(["jarvis, what time is it", REASONING_CONTINUE_TURN]);
+  });
+});
+
+describe("bob#356 V2a — another session's tool calls and turn ends do not count for the active voice turn", () => {
+  it("two tool calls emitted outside the turn do not trip its loop breaker", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit(ending(TEXT));
+      await held;
+    });
+    const resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      toolLoopLimit: 2,
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    const turn = admission.admitTurn(voice(), "jarvis, what time is it");
+    while (voiceSide.calls.prompts.length === 0) await tick();
+    for (let i = 0; i < 2; i++) {
+      resident.emit({ type: "tool_execution_start", toolName: "reachy_say", args: { text: "x" } });
+    }
+    release();
+    await turn; // resolves: no ToolLoopError
+    expect(voiceSide.calls.aborts).toBe(0);
+    expect(resident.calls.aborts).toBe(0);
+  });
+
+  it("a turn end emitted outside the turn does not replace the turn's messages", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const own = { role: "assistant", content: TEXT, stopReason: "stop" };
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit({ type: "agent_end", messages: [own] });
+      await held;
+    });
+    const resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    const turn = admission.admitTurn(voice(), "jarvis, what time is it");
+    while (voiceSide.calls.prompts.length === 0) await tick();
+    resident.emit({
+      type: "agent_end",
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "foreign" }], stopReason: "stop" },
+      ],
+    });
+    release();
+    expect(await turn).toEqual([own]);
   });
 });
 

@@ -12,9 +12,9 @@
 //   * A memory is written ONLY when addressed AND speakerVerified — visibility
 //     `private`, author `jarvis`, speakerId in metadata. Non-member speech is
 //     EPHEMERAL (no write, never recallable).
-//     bob#356 V2a: under `voice` this path is not reached at all. An eligible
+//     bob#356 V2a: under `voice` this path is not reached. An eligible
 //     addressed transcript there is submitted for admission as a voice turn, and
-//     no voice transcript is eligible for a memory write, whatever the sidecar's
+//     a voice transcript is not eligible for a memory write, including by the sidecar's
 //     speakerId, because speaker authentication does not exist until V3. The
 //     rule above governs the `reachy` body profile.
 //   * Memory-backed speech is OFF outright (a `say` whose inputs reference a
@@ -149,9 +149,9 @@ export interface PolicyState {
 export type Caller =
   // `origin` undefined: the call is bound to no admitted turn and no
   // runtime-declared session origin (shell/turn-admission.ts `boundOrigin`).
-  // `voiceUtterance` is supplied ONLY by the capability, from ITS record of the
+  // `voiceUtterance` is supplied by the capability, from its record of the
   // addressed transcript that opened this voice turn (keyed by the origin's
-  // correlationId). It is never read from the call's arguments.
+  // correlationId). It is not read from the call's arguments.
   | { path: "tool"; origin: TurnOrigin | undefined; voiceUtterance?: { addressed: boolean } }
   | { path: "proposal"; transcript: Transcript | null };
 
@@ -217,7 +217,7 @@ export type Decision =
 
 /** `addressed` = the transcript text contains the wake name OR a window of
  *  words within the length-based edit allowance below of it, recomputed in bob
- *  and never taken from the sidecar's `wakeHeard` flag. This is a TEXT matcher
+ *  and not taken from the sidecar's `wakeHeard` flag. This is a TEXT matcher
  *  over normalized words, so a transcript that renders the name as a near-miss
  *  ("Hey Dervis" for jarvis) still counts. It accepts "dervis" (two
  *  edits from a six-letter name) and rejects "travis" (three). */

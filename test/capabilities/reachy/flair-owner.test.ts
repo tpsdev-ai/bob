@@ -66,7 +66,7 @@ describe("bob#356 round 2 — reachy's Flair writes are owned by the signing age
   });
 });
 
-describe("bob#356 V2a — the double's bootstrap serves only the signing agent, as Flair does", () => {
+describe("bob#356 V2a — the double models Flair's non-admin bootstrap guard", () => {
   const CONTEXT = "PRIVATE-BOOTSTRAP-356: the signing agent's own context";
   let bootDir: string;
   let boot: FlairDouble;

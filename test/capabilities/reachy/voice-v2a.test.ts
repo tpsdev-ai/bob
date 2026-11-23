@@ -3,7 +3,7 @@
 // The socket-backed cases run a FAKE sidecar process speaking reachy-voice/1 on
 // a real UNIX socket: an addressed transcript is submitted for admission as a
 // voice-origin turn with bob-issued ids and `speakerVerified:false`;
-// `wakeHeard` alone never addresses; on a ready, unmuted link a malformed
+// `wakeHeard` alone does not address; on a ready, unmuted link a malformed
 // transcript is dropped with a named log line; a sidecar-reported mute drops
 // the next transcript; and text recorded for an attempted say is dropped by the
 // echo guard (during the estimated playback and as a recent say-match). The
@@ -222,9 +222,9 @@ async function connectBob(
   });
   client.onClose(() => wired.disconnected());
   // Connect, retrying until the fake sidecar has bound its socket. No stat of
-  // the path: the connect itself is the only probe (and the only reader). If the
-  // link never comes up, close the client and the sidecar here: the caller's
-  // try/finally starts only once this returns.
+  // the path: the connect itself is the probe (and the reader). If the link does
+  // not come up, close the client and the sidecar here: the caller's
+  // try/finally starts after this returns.
   try {
     const deadline = Date.now() + 8_000;
     for (;;) {
@@ -272,7 +272,7 @@ async function connectBob(
 }
 
 // ── the addressed recompute ──────────────────────────────────────────────────
-describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone never addresses", () => {
+describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone does not address", () => {
   it("accepts the name and the near-name dervis, and rejects travis", () => {
     expect(addressed("hey jarvis, what time is it", "jarvis")).toBe(true);
     expect(addressed("Hey JARVIS what time is it", "jarvis")).toBe(true);
@@ -358,7 +358,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
   }, 30_000);
 
   it("the admitted origin is projected by the REAL admission into the fresh session's prompt", async () => {
-    // A voice turn runs in a FRESH session; this one is the only prompt target.
+    // A voice turn runs in a FRESH session; this one is the prompt target.
     const seen: TurnOrigin[] = [];
     let admission!: ReturnType<typeof createTurnAdmission>;
     admission = createTurnAdmission({
@@ -390,7 +390,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
     // The real admission binds the origin; the real capability supplies the
     // utterance it recorded for THIS turn. No socket: the command channel is a
     // recorder, so the assertion is about the gates. The voice prompt runs in a
-    // FRESH session, never the resident one.
+    // FRESH session, not the resident one.
     let spoken: string | undefined;
     const bridgedKinds: string[] = [];
     let admission!: ReturnType<typeof createTurnAdmission>;
@@ -466,7 +466,7 @@ describe("bob#356 V2a — an addressed transcript goes through admitTurn as voic
 });
 
 // ── gate 1: malformed transcript is dropped with a named line ────────────────
-describe("bob#356 V2a — a malformed transcript is dropped, never admitted", () => {
+describe("bob#356 V2a — a malformed transcript is dropped, not admitted", () => {
   it("empty text and an over-long text are malformed; a named audit and log line", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar);
@@ -813,8 +813,8 @@ describe("bob#356 V2a — the echo guard records a say's text before the send", 
   });
 });
 
-// ── gate 6: grants never ride on voice ───────────────────────────────────────
-describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn", () => {
+// ── gate 6: stub grant tools on a voice turn ───────────────────────────────────
+describe("bob#356 V2a — a stub grant tool is not executed on a voice-origin turn", () => {
   const voice = (): TurnOrigin => ({
     kind: "voice",
     speakerVerified: false,
@@ -822,14 +822,14 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
     correlationId: "corr_1",
   });
 
-  it("the allowlist is origin-keyed: voice reaches reachy_say only; a grant gets the fixed refusal", () => {
+  it("the allowlist is origin-keyed: voice is allowed reachy_say; a grant gets the fixed refusal", () => {
     expect(admitToolCall("reachy_say", voice())).toEqual({ allow: true });
     expect(admitToolCall("mail_send", voice())).toEqual({
       allow: false,
       grant: true,
       reason: VOICE_GRANT_REFUSAL,
     });
-    // Every LISTED grant tool gets the same fixed grant refusal.
+    // The other two listed grant tools get the same fixed grant refusal.
     for (const grant of ["calendar_accept", "payment_send"]) {
       expect(admitToolCall(grant, voice())).toEqual({
         allow: false,
@@ -844,7 +844,7 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
       reason:
         "a voice-origin turn may use only reachy_say; some_future_tool is not reachable from the room",
     });
-    // Every non-voice origin is unchanged.
+    // run, cron and no origin pass.
     expect(admitToolCall("mail_send", { kind: "run" }).allow).toBe(true);
     expect(admitToolCall("mail_send", { kind: "cron", job: "digest" }).allow).toBe(true);
     expect(admitToolCall("mail_send", undefined).allow).toBe(true);
@@ -899,7 +899,7 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
     expect(executed).toEqual(["reachy_say"]);
     expect(results[1]?.result).toMatchObject({ block: true, reason: VOICE_GRANT_REFUSAL });
 
-    // CONTROL: the same grant tool runs on a cron turn (the gate restricts only
+    // CONTROL: the same grant tool runs on a cron turn (the gate restricts
     // voice origins).
     results.length = 0;
     executed = [];
@@ -907,7 +907,7 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
     expect(executed).toEqual(["reachy_say", "mail_send"]);
   });
 
-  it("a socket-driven voice transcript cannot make the gate execute a stub grant tool", async () => {
+  it("a socket-driven voice transcript does not make the gate execute a stub grant tool", async () => {
     const sidecar = startSidecar();
     let executed = false;
     const bob = await connectBob(sidecar, {
@@ -930,7 +930,7 @@ describe("bob#356 V2a — a grant tool is never executed on a voice-origin turn"
 
 // ── gate 7: body tools stay absent under the voice profile ───────────────────
 describe("bob#356 V2a — under `voice` the body tools remain absent", () => {
-  it("registers only reachy_say and reachy_state", async () => {
+  it("registers reachy_say and reachy_state, and no body tool", async () => {
     const sidecar = startSidecar();
     const bob = await connectBob(sidecar);
     try {
@@ -944,7 +944,7 @@ describe("bob#356 V2a — under `voice` the body tools remain absent", () => {
   }, 30_000);
 });
 
-// ── wire bounds and the reason that names every failed field ────────────────
+// ── wire bounds and the reason that names each failed field ─────────────────
 describe("bob#356 V2a — the transcript line's bounds and its named failure reason", () => {
   const line = (over: Record<string, unknown> = {}) => ({
     type: "transcript",
@@ -985,7 +985,7 @@ describe("bob#356 V2a — the transcript line's bounds and its named failure rea
     expect(decodeLine(line({ text: "one line" })).kind).toBe("transcript");
   });
 
-  it("names EVERY failed field, including speakerId", () => {
+  it("names each failed field, including speakerId", () => {
     const reason = reasonOf({
       type: "transcript",
       text: "",
@@ -1055,8 +1055,8 @@ describe("bob#356 V2a — a voice transcript is ineligible for a memory write", 
 });
 
 // ── a voice turn is its own turn: cleanup and correlation binding ───────────
-describe("bob#356 V2a — a voice utterance authorizes only its own turn", () => {
-  it("a call AFTER the admitted turn fails, and a foreign correlationId never matches", async () => {
+describe("bob#356 V2a — a voice utterance authorizes its own turn, not a later call or another correlation id", () => {
+  it("a call AFTER the admitted turn fails, and a foreign correlationId does not match", async () => {
     const pi = new FakePi();
     const sent: string[] = [];
     let correlationId = "";
@@ -1127,7 +1127,7 @@ describe("bob#356 V2a — a voice utterance authorizes only its own turn", () =>
       "refused: a voice-origin call needs its own current addressed utterance",
     );
     expect(sent).toEqual([]);
-    // A forged/other correlation id never had a record at all.
+    // A forged/other correlation id had no record.
     correlationId = "corr_other";
     const foreign = await pi.call("reachy_say", { text: "It is noon." });
     expect(foreign).toContain("needs its own current addressed utterance");
@@ -1234,7 +1234,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
   });
 
   // The link comes BACK before the turn starts: effective mute is off again, so
-  // only the epoch says the transcript belongs to a link that is gone.
+  // the epoch says the transcript belongs to a link that is gone.
   async function queuedThenRestored(
     restore: (world: ReturnType<typeof queuedWorld>) => Promise<void>,
   ) {
@@ -1285,7 +1285,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
     expect(world.disposed()).toBe(1); // the fresh session, built then discarded
   });
 
-  // Only the starting-line mute is a drop. A turn that failed for any other
+  // The starting-line mute is a drop. A turn that failed for another
   // reason returns a refusal and attempts its audit (the store works here, so
   // the audit is written), even when the link went quiet before the failure
   // was caught.
@@ -1351,7 +1351,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
 
   it("a voice session that failed to start after a device mute is REFUSED, with its audit written", async () => {
     // The REAL admission: voiceSession() runs before beforeStart, so a session
-    // that cannot start never reaches the starting-line check.
+    // that fails to start does not reach the starting-line check.
     const world = failingWorld(({ wired, state }) => {
       const admission = createTurnAdmission({
         log: () => {},
@@ -1412,7 +1412,7 @@ describe("bob#356 V2a — mute or disconnect while a voice turn is queued", () =
 
 // ── no resident history in a voice turn (fake sessions) ─────────────────────
 describe("bob#356 V2a — a voice turn sees no resident history", () => {
-  it("a model that saw a private value in the resident session cannot say it from a voice turn", async () => {
+  it("the fresh voice session starts without the resident history, and this scripted reply does not repeat its marker", async () => {
     const pi = new FakePi();
     const sent: string[] = [];
     const residentHistory: string[] = [];
@@ -1499,16 +1499,16 @@ describe("bob#356 V2a — a voice turn sees no resident history", () => {
       wakeHeard: true,
     });
     expect(summary).toMatchObject({ kind: "admitted", action: "voice" });
-    // The fresh voice session never carried the resident history...
+    // The fresh voice session's history holds the transcript, not the resident turn...
     expect(voiceHistories).toHaveLength(1);
     expect(voiceHistories[0]?.join("\n")).not.toContain("PRIVATE-42");
-    // ...so its model could not hand the value to reachy_say.
+    // ...so this history-dependent scripted reply does not repeat the marker.
     expect(sent.join("\n")).not.toContain("PRIVATE-42");
     expect(sent).toContain("It is noon.");
   });
 });
 
-// ── the capability clears its echo guard on every link change ───────────────
+// ── the capability clears its echo guard on link changes ────────────────────
 describe("bob#356 V2a — wireReachyCapability clears its echo guard on link changes", () => {
   const SAID = "jarvis, the meeting moved to noon";
 
@@ -1564,7 +1564,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
     return { wired, state, admissions, handshake, receive };
   }
 
-  it("a disconnect and a fresh handshake: the recorded text no longer matches the guard", async () => {
+  it("a disconnect and a fresh handshake: the recorded text does not match the guard after it", async () => {
     const world = await echoWorld();
     world.wired.disconnected();
     await world.handshake();
@@ -1599,7 +1599,7 @@ describe("bob#356 V2a — wireReachyCapability clears its echo guard on link cha
   });
 
   it("each of the four link changes clears the guard itself", async () => {
-    // A later handshake also clears, so the behaviour above cannot tell a
+    // A later handshake also clears, so the behaviour above does not tell a
     // disconnect's or a refusal's own clear from the reconnect's. Count them.
     const clears = spyOn(EchoGuard.prototype, "clear");
     try {

@@ -26,7 +26,7 @@ export type AdmissionToken = object;
 
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
-  // `preflight.beforeStart` is checked for every admitted turn, after the
+  // `preflight.beforeStart` is checked for voice and non-voice turns, after the
   // operation leaves the queue and immediately before its prompt starts; a
   // non-null string refuses it, and nothing is prompted.
   admitTurn(
@@ -80,9 +80,9 @@ export function createTurnAdmission(
     // admission's own latch is per Turn and needs no reset.
     onTurnStart?: () => void;
     // bob#356 V2a: create the FRESH session a voice-origin turn runs in, one per
-    // call, never the resident one. The runtime that supplies it decides what
+    // call, not the resident one. The runtime that supplies it decides what
     // that session carries (persistent.ts: no Flair bootstrap, no prior-round
-    // memory, reachy_say only). Absent: a voice turn is refused (fail closed) —
+    // memory, reachy_say as its one tool). Absent: a voice turn is refused (fail closed) —
     // no voice prompt can fall back to the resident session.
     voiceSession?: () => Promise<RunSession>;
   } = {},
@@ -119,14 +119,14 @@ export function createTurnAdmission(
   const bound = new Promise<void>((resolve) => {
     ready = resolve;
   });
-  // One event handler for every session this runtime prompts: the resident one
+  // One event handler for the sessions this runtime prompts: the resident one
   // and each fresh voice session. An event counts for the active turn when the
   // AsyncLocalStorage store it was emitted under is that turn.
   const observe = (event: Parameters<Parameters<RunSession["subscribe"]>[0]>[0]): void => {
     if (event.type === "message_end" && event.message?.role === "assistant") {
       const endingTurn = context.getStore();
       if (endingTurn && endingTurn === active) {
-        // The reasoning-only ending this turn's re-prompt reads.
+        // The ending this turn's re-prompt check reads.
         endings.observe(event);
         const exhaustion = emptyResponseExhaustionOf(event.message);
         if (exhaustion !== undefined) endingTurn.exhaustion = exhaustion;
@@ -143,7 +143,7 @@ export function createTurnAdmission(
           log(loopBreakMessage(agentName, toolName, args, observation.count));
           abort(new ToolLoopError(toolName, observation.count));
           // Ask the session to stop. The binding does not depend on the
-          // answer: admitTurn releases it only when the prompt settles.
+          // answer: admitTurn releases it when the prompt settles.
           requestStop(turn.target, log);
         }
       }
@@ -152,7 +152,7 @@ export function createTurnAdmission(
     const turn = context.getStore();
     if (turn !== active || !turn) return;
     // agent_end fires INSIDE a prompt more than once (retries and
-    // continuations), so it only CAPTURES the turn's messages here — it must
+    // continuations), so it CAPTURES the turn's messages here — it must
     // not clear the origin. The admitted origin stays current from admission
     // until the admitted prompt settles, which readOrigin() relies on: the
     // discord tools bind a turn's outbound reach to readOrigin(), and a
@@ -193,12 +193,12 @@ export function createTurnAdmission(
       // `speakerVerified`, which is false in V2a (bob has no speaker
       // authentication until V3), and the utterance/correlation ids bob issued
       // for this transcript. It runs in a FRESH session (opts.voiceSession),
-      // never the resident one, so the resident session's history is not in
+      // not the resident one, so the resident session's history is not in
       // front of the model; persistent.ts builds that session without the Flair
       // bootstrap or prior-round memory. bob's tool-admission gate (session.ts,
       // tool-admission.ts) restricts its reach to `reachy_say`: no recall, no
       // memory writes, no grant tools. The reachy capability's speech gate
-      // accepts a voice-origin `say` only for this turn's own current addressed
+      // accepts a voice-origin `say` with this turn's own current addressed
       // utterance (policy.ts), so no later caller inherits the room's speech.
       const run = async (): Promise<unknown[]> => {
         await bound;
@@ -316,7 +316,7 @@ export function createTurnAdmission(
           };
           // A fresh voice session serves one turn: release the binding,
           // unsubscribe, then dispose. A loop-broken prompt that has not settled
-          // keeps all three until it does, so its in-flight tool calls still see
+          // keeps the three until it does, so its in-flight tool calls still see
           // the turn's origin.
           const finish = (): void => {
             release();
@@ -426,7 +426,7 @@ const SESSION_ORIGIN_SERVICE = "bob:session-origin";
 // bob#356 V2a: the resident reachy capability's speech bridge, handed to the
 // FRESH voice session so its `reachy_say` sends through the one live sidecar
 // link (the sidecar accepts one connection). The function is a runtime service,
-// never prompt or model text; it decides by the voice turn's bound origin.
+// not prompt or model text; it decides by the voice turn's bound origin.
 const VOICE_SPEECH_SERVICE = "bob:voice-speech";
 
 export type VoiceSpeech = (text: string) => Promise<unknown>;

@@ -208,11 +208,11 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
 
   const factory = opts.sessionFactory ?? defaultPersistentFactory(opts.registry);
   // bob#356 V2a: a voice turn that starts runs in its OWN session, built fresh
-  // from the same factory (a turn refused before that never runs). Its config
+  // from the same factory (a turn refused before that does not run). Its config
   // drops the private bootstrap (flairBootstrap) and prior-round (prMemory)
-  // context, loads only the reachy capability, and allows exactly the speech
+  // context, loads the reachy capability, and allows the speech
   // tool, which the agent's own policy must already allow. It is not persistent,
-  // so the default factory keeps its history in memory, never in the resident
+  // so the default factory keeps its history in memory, not in the resident
   // session directory. The resident reachy capability's speech bridge is handed
   // along so the one live sidecar link does the talking. The soul, the standing
   // contract and pi's own prompt template (which names the working directory)
@@ -223,9 +223,9 @@ export async function startPersistent(opts: RunPersistentOptions): Promise<Persi
       throw new Error(
         "bob: no reachy speech bridge is registered; refusing to start a voice turn that could not speak",
       );
-    // A voice session never WIDENS the agent's own policy: its one tool must be
+    // A voice session does not widen the agent's own policy: its one tool must be
     // in the agent's resolved allowlist and not in its exclusions (a declared
-    // exclusion wins over every allowlist). Otherwise the turn is refused by
+    // exclusion wins over an allowlist). Otherwise the turn is refused by
     // name, not started.
     if (!config.tools.includes("reachy_say") || (config.excludeTools ?? []).includes("reachy_say"))
       throw new Error(
@@ -392,9 +392,9 @@ export async function runPersistent(opts: RunPersistentOptions): Promise<void> {
 // docs), not as a top-level method, so we adapt it here. Best-effort — if the
 // shape ever changes, shutdown still proceeds to dispose().
 //
-// bob#356 V2a: one factory serves the warm session AND every fresh voice session
+// bob#356 V2a: one factory serves the warm session AND the fresh voice sessions
 // of a runtime. They share ONE provider-key custody (a keyed row's variable is
-// read and deleted once, by the warm session), and only the persistent session
+// read and deleted once, by the warm session), and the persistent session alone
 // is durable: a non-persistent one (a voice turn) gets an in-memory manager, so
 // nothing it says is written under .pi-agent/sessions.
 export const defaultPersistentFactory = (registry?: ProviderRegistry): RunSessionFactory => {

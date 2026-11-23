@@ -231,7 +231,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   });
   const callerOrigin = (): TurnOrigin | undefined => opts.readOrigin?.();
   /** The tool-path caller: an admitted turn's origin, plus (for a voice turn)
-   *  THIS turn's own addressed utterance. Never read from the call's args. */
+   *  THIS turn's own addressed utterance. */
   const toolCaller = (): Caller => {
     const origin = callerOrigin();
     if (origin?.kind === "voice") {
@@ -276,18 +276,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   }
 
   /** Attempt a `reachy.malformed` audit; return malformed even if it fails. The
-   *  log line names the drop (bob#356 V2a), so it is visible without an audit
-   *  read; the reason says which input it was. Three callers, each with its own
-   *  condition:
-   *   - a malformed sidecar LINE (handleLine): only on a ready link with bob's
-   *     mute and the sidecar-reported mute both off; bob's mute, a pre-handshake
-   *     line, a malformed health line (a link failure) and the sidecar-reported
-   *     mute all take other paths first;
-   *   - a `presence` line under the `voice` profile (handleLine): only on a
-   *     ready link with bob's mute off, whatever the sidecar-reported mute;
-   *   - an action whose arguments fail their schema (admitAndRun, which checks
-   *     them first): from a TOOL call in any link state and under either mute,
-   *     or from a sidecar proposal only on a ready link with both mutes off. */
+   *  log line names the drop (bob#356 V2a); the reason says which input it was.
+   *  Callers: handleLine, for a malformed sidecar line on a ready link with both
+   *  mutes off and for a `presence` line under the `voice` profile; and
+   *  admitAndRun, for an action whose arguments fail their schema (checked
+   *  before the policy). */
   async function malformed(reason: string): Promise<DecisionSummary> {
     log(`reachy: dropped malformed input: ${reason}`);
     const tsMs = state.nowMs();
@@ -544,10 +537,9 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
    *  admission as a voice-origin turn. bob issues the utterance and correlation
    *  ids; the origin is built here and goes through `admitTurn`, which
    *  validates and projects it, and may still refuse it (a closed admission, a
-   *  stale or muted link when it is due, a voice session that cannot start).
-   *  The capability keeps this turn's addressed assertion only while the
-   *  admission runs, so only a call bound to this turn's correlation id can use
-   *  it and no later caller inherits it. */
+   *  stale or muted link when it is due, a voice session that fails to start).
+   *  The capability keeps this turn's addressed assertion while the admission
+   *  runs and deletes it after; a call uses it by this turn's correlation id. */
   async function admitVoiceTranscript(transcript: Transcript): Promise<DecisionSummary> {
     if (opts.admitVoiceTurn === undefined) {
       log("reachy: an addressed transcript has no voice admission in this core; not admitted");
@@ -556,12 +548,12 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     const utteranceId = `utt_${uuid()}`;
     const correlationId = `corr_${uuid()}`;
     voiceUtterances.set(correlationId, { addressed: true });
-    // The link state at acceptance. The admission is queued behind any running
+    // The link state at acceptance. The admission is queued behind a running
     // turn, so it checks this again immediately before the prompt starts: a
     // mute or a reconnect while it waited means the transcript belongs to a
     // link that is gone.
     const epoch = link.epoch;
-    // Set ONLY when beforeStart refuses the turn because the link is
+    // Set when beforeStart refuses the turn because the link is
     // effectively muted at the starting line (bob's mute, the sidecar-reported
     // mute, or no ready link). That one refusal is a drop: nothing reached the
     // room and there is no action to judge.
@@ -589,12 +581,11 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log(`reachy: voice turn admission failed: ${detail}`);
-      // Only the starting-line mute refusal above is a drop. Every other
-      // failure returns a refusal and attempts a `reachy.refused` audit (the
-      // refusal is returned even if that audit fails), whatever the link state
-      // when it is caught: a stale epoch, a voice session that could not start,
-      // or a turn that started (and may have attempted a `say`) and then failed,
-      // even if the link muted or disconnected before this catch runs.
+      // The starting-line mute refusal above is a drop. Another failure returns
+      // a refusal and attempts a `reachy.refused` audit (the refusal is returned
+      // when that audit fails), also when the link muted or disconnected before
+      // this catch runs: a stale epoch, a voice session that failed to start, or
+      // a turn that started (and may have attempted a `say`) and then failed.
       if (droppedAtStart) return { kind: "drop" };
       return await refuse("voice", `admission failed: ${detail}`);
     } finally {
@@ -675,7 +666,7 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
       // echo guard, then bob's own `addressed` recompute. An addressed
       // transcript that passes both is submitted for admission as a voice-origin
       // turn (the admission can still refuse it). Until speaker
-      // authentication exists (V3), a sidecar-supplied `speakerId` never makes a
+      // authentication exists (V3), a sidecar-supplied `speakerId` does not make a
       // room transcript eligible for a memory write, even when it matches the
       // enrolment map: the memory path below stays unreachable under `voice`.
       if (state.profile === "voice") {

@@ -628,7 +628,7 @@ export interface RunSessionConfig {
   persistent?: boolean;
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
-  // bob#356 V2a: the resident reachy capability's speech bridge. Set ONLY on a
+  // bob#356 V2a: the resident reachy capability's speech bridge. Set on a
   // fresh voice session, so its `reachy_say` reaches the one live sidecar link
   // instead of opening a second connection. Absent everywhere else.
   voiceSpeech?: (text: string) => Promise<unknown>;

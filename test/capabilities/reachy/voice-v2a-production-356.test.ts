@@ -14,18 +14,19 @@
 // answers from a script, so the test reads the exact request body a model would
 // receive); the sidecar (driven-sidecar.py: the test supplies the transcript it
 // sends); Flair (flair-double.ts, which verifies signatures and serves the
-// bootstrap context only to the signing agent, refusing a request that names
+// bootstrap context to the signing agent, refusing a request that names
 // another agent as Flair does); and prMemory, which the persistent runtime
-// never loads itself (it comes from a launcher's PR recall), so the factory seam
+// does not load itself (it comes from a launcher's PR recall), so the factory seam
 // seeds it on the warm config before the warm session is built. The same seam hands the
 // warm config the reachy tools, as voice-session.test.ts does: no shipped role
-// allows a reachy tool yet, and a voice session may only use a tool the agent's
+// allows a reachy tool yet, and a voice session uses a tool the agent's
 // own policy allows.
 //
 // The resident session first serves a cron turn: its request carries the Flair
 // bootstrap, the prior-round memory and the turn itself (the control). Then the
 // sidecar sends one addressed transcript. The voice turn's model requests must
-// carry none of them, offer `reachy_say` alone and use the custody-held key; the
+// not carry those markers, must offer `reachy_say` alone and use the
+// custody-held key; the
 // model's `reachy_say` must reach the sidecar as a `say` through the resident
 // capability's speech bridge; no session file may appear for the voice turn; and
 // the runtime's BOB_PERSISTENT must survive the voice session's build.
@@ -154,7 +155,7 @@ function answer(request: ModelRequest): string {
   return sseText(RESIDENT_REPLY);
 }
 
-/** Stub the model endpoint; every other URL (the Flair double) goes through. */
+/** Stub the model endpoint; other URLs (the Flair double) go through. */
 function installModel(requests: ModelRequest[]): void {
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -244,7 +245,7 @@ function agentOnDisk(registry: unknown, flairUrl: string, keyFile: string, socke
   return { agentsRoot, agentDir };
 }
 
-/** Every session file pi wrote under the agent's durable session directory. */
+/** The session files pi wrote under the agent's durable session directory. */
 function sessionFiles(agentDir: string): string[] {
   const dir = join(agentDir, ".pi-agent", "sessions");
   if (!existsSync(dir)) return [];
@@ -360,7 +361,7 @@ describe("bob#356 V2a — a voice turn on the production path (startPersistent, 
         const tools = (request.body.tools ?? []) as Array<{ function?: { name?: string } }>;
         expect(tools.map((t) => t.function?.name)).toEqual(["reachy_say"]);
       }
-      // A fresh session: the only user message is the transcript itself.
+      // A fresh session: one user message, the transcript itself.
       const users = must(voice[0], "the first voice request").body.messages.filter(
         (m) => m.role === "user",
       );

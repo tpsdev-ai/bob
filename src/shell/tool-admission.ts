@@ -1,7 +1,7 @@
 // tool-admission.ts — bob's TOOL-ADMISSION gate (bob#356 V2a, D1).
 //
 // Runtime origins are metadata set AT ADMISSION; prompt, model and tool text
-// cannot supply one (turn-origin.ts). This gate reads the origin a tool call is
+// do not supply one (turn-origin.ts). This gate reads the origin a tool call is
 // BOUND to and answers one question before the executor runs: may this origin
 // reach this tool?
 //
@@ -13,20 +13,20 @@
 // grant tool is unreachable from voice the day it lands, without anyone
 // remembering to list it here.
 //
-// So in a session bob's factory built with this gate (every session a turn
+// So in a session bob's factory built with this gate (a session a turn
 // admission serves; the factory refuses one whose gate did not load), a
 // grant-class tool (mail send, calendar accept, payment) is not executed on a
 // voice-origin turn. The refusal is fixed and content-free, and it tells the
 // model that the member can ask again on an authenticated text channel. bob
 // ships no confirmation broker (bob#356 D1): nothing links that later request
-// to this refusal. Every non-voice origin (run, mail, cron, discord) passes
+// to this refusal. A non-voice origin (run, mail, cron, discord) passes
 // this gate unchanged, under its own turn's policy.
 
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { boundOrigin, getSessionOrigin, getTurnAdmission } from "./turn-admission.js";
 import type { TurnOrigin } from "./turn-origin.js";
 
-/** The ONLY tools a voice-origin turn may reach (bob#356 rev 2.1 D1). */
+/** The tools a voice-origin turn may reach (bob#356 rev 2.1 D1). */
 export const VOICE_TOOL_ALLOWLIST: readonly string[] = Object.freeze(["reachy_say"]);
 
 /** The audit classes named by the spec. They are labels for reporting, NOT the
@@ -57,9 +57,9 @@ export function isGrantTool(toolName: string): boolean {
 }
 
 /**
- * Decide whether a tool call may execute. Only a bound `voice` origin is
- * restricted: every other origin (run, mail, cron, discord) and an unbound call
- * (a session with no admission and no declared origin) are unchanged.
+ * Decide whether a tool call may execute. A bound `voice` origin is
+ * restricted. Another origin (run, mail, cron, discord), and a call bound to no
+ * admitted turn and no runtime-declared session origin, pass.
  */
 export function admitToolCall(
   toolName: string,
@@ -83,8 +83,8 @@ export interface ToolAdmissionPi {
 
 /**
  * The inline pi extension that refuses a blocked tool call BEFORE its executor
- * runs. bob's session factory loads it into every session that carries a turn
- * admission, so a voice-origin turn cannot reach a tool the gate refuses even if
+ * runs. bob's session factory loads it into a session that carries a turn
+ * admission, so a voice-origin call to a tool the gate refuses is blocked even if
  * a capability registered it.
  */
 export function createToolAdmissionExtension(
@@ -97,10 +97,10 @@ export function createToolAdmissionExtension(
     factory: ((pi: ToolAdmissionPi) => {
       const admission = getTurnAdmission(pi);
       const sessionOrigin = getSessionOrigin(pi);
-      // The gate is installed ONLY for a session a turn admission serves (see
+      // The gate is installed for a session a turn admission serves (see
       // createBobRuntimeFactory). A missing admission therefore means the runtime
       // service did not reach the loader: refuse the session rather than install
-      // no handler, because a session with no gate would execute every tool a
+      // no handler, because a session with no gate would execute the tools a
       // voice turn asked for. This throw is an extension-load failure; the
       // factory's assertToolAdmissionGateLoaded refuses session creation on it.
       if (admission === undefined) {

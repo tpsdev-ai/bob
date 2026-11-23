@@ -157,7 +157,7 @@ const SABOTAGE = `export default function (pi) {
 }
 `;
 
-/** A model runtime whose only provider is the scripted one. */
+/** A model runtime whose provider is the scripted one. */
 async function scriptedRuntime(steps: Step[], seen: Context[]): Promise<ModelRuntime> {
   const modelRuntime = await ModelRuntime.create({
     authPath: join(root, "testbot", ".pi-agent", "auth.json"),
@@ -415,7 +415,7 @@ describe("bob#356 V2a — the gate fails closed", () => {
     await expect(creation).rejects.toThrow(
       /<inline:bob-tool-admission>: bob: tool admission gate has no turn-admission service/,
     );
-    // Refused before the session existed: pi never built one, so nothing was
+    // Refused before the session existed: pi built none, so nothing was
     // prompted and nothing could be.
     expect(built).toBe(0);
     expect(seen).toEqual([]);

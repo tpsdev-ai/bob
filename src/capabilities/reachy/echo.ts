@@ -6,7 +6,7 @@
 //
 //   * PLAYBACK INTERLOCK: a transcript that arrives during bob's ESTIMATED
 //     playback window is dropped. The window is estimated from the line's text
-//     (`estimatedPlaybackMs`, capped at 15 s), never asserted by the sidecar;
+//     (`estimatedPlaybackMs`, capped at 15 s), not reported by the sidecar;
 //     bob observes no actual playback completion.
 //   * SAY-MATCH: a transcript whose text closely matches a line recorded for
 //     an attempted `say` (recorded BEFORE the send, which can fail) is dropped
@@ -18,7 +18,7 @@
 //     single spaces. A line matches when its edit distance is within a fixed
 //     length-based allowance, `floor((1 - 0.9) * length + 1e-9)` edits, where
 //     length is the longer of the two normalized lines. An empty transcript
-//     never matches: there is no text to compare.
+//     does not match.
 //
 // This heuristic does not certify AEC. Under the `voice` profile it is a
 // deterministic drop, applied before a transcript is retained or submitted for
@@ -70,7 +70,7 @@ export function editSimilarity(a: string, b: string): number {
   if (a === b) return 1;
   const max = Math.max(a.length, b.length);
   if (max === 0) return 1;
-  // A length gap larger than the edit allowance cannot match: skip the walk.
+  // A length gap larger than the edit allowance does not match: skip the walk.
   if (Math.abs(a.length - b.length) > editAllowance(max)) return 0;
   return 1 - levenshtein(a, b) / max;
 }
@@ -82,7 +82,7 @@ export function editSimilarity(a: string, b: string): number {
  * The epsilon keeps the exact boundary in float64: `1 - 0.9` is
  * 0.09999999999999998, so for a 10-character line the product is
  * 0.9999999999999998 and a plain floor would allow ZERO edits, rejecting a
- * transcript one edit away — exactly similarity 0.9, which must match.
+ * transcript one edit away, at similarity 0.9, which must match.
  */
 export function editAllowance(length: number, threshold: number = ECHO_SIMILARITY): number {
   return Math.floor((1 - threshold) * length + 1e-9);
@@ -102,8 +102,7 @@ interface Spoken {
 export type EchoReason = "playback" | "say-match";
 
 /** The guard's state. One instance per capability; the capability clears it on
- *  every link change (a refused link, a disconnect, a new connection, a device
- *  mute flip), so records never cross a connection. */
+ *  a refused link, a disconnect, a new connection and a device mute flip. */
 export class EchoGuard {
   private readonly spoken: Spoken[] = [];
 
@@ -121,8 +120,8 @@ export class EchoGuard {
       playbackUntilMs: nowMs + this.playbackMs(text),
     });
     // Drop expired lines from the front (oldest first) on each record. This is
-    // a time bound, not a count cap: lines recorded within one window all stay,
-    // and an expired line behind an unexpired older one stays until that one
+    // a time bound, not a count cap: a later line does not drop an earlier one
+    // inside its window, and an expired line behind an unexpired older one stays until that one
     // expires and a later record prunes both.
     this.prune(nowMs);
   }
@@ -156,12 +155,12 @@ export class EchoGuard {
     return null;
   }
 
-  /** How many recorded lines the guard holds (read-only; for tests). */
+  /** How many recorded lines the guard holds (for tests). */
   get size(): number {
     return this.spoken.length;
   }
 
-  /** Forget every recorded line (mute flip, disconnect, new connection). */
+  /** Forget the recorded lines (mute flip, disconnect, new connection). */
   clear(): void {
     this.spoken.length = 0;
   }

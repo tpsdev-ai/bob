@@ -832,7 +832,7 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
 });
 
 // ── the transcript memory path: stale recheck (bob#361) ─────────────────────
-// Under `voice` a transcript never reaches memory (V2a; no speaker
+// Under `voice` a transcript does not reach memory (V2a; no speaker
 // authentication until V3), so these memory-path rechecks run on the `reachy`
 // body profile, whose enrolment path still writes.
 describe("bob#361 — the transcript path rechecks the link epoch and the mute after the attempt audit", () => {

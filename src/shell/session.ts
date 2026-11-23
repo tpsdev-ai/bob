@@ -1353,7 +1353,7 @@ export interface BobFactoryInput {
   // factory; the warm session's factory already read and
   // deleted a keyed row's variable, so those factories reuse the key this map
   // holds instead of reading the environment again. The map lives in the
-  // runtime's factory closure, never in a config object or at module scope.
+  // runtime's factory closure, not in a config object or at module scope.
   // Absent: this factory keeps a custody of its own.
   custodyKeys?: Map<string, string>;
   // The validated provider selection this session was resolved from. The factory
@@ -1399,7 +1399,7 @@ export interface GateLoadSource {
 // checks, because either alone could pass an ungated session: no inline
 // extension of bob's may have failed to load, and the gate itself must be among
 // the loaded extensions (pi names it `<inline:<name>>`). Run at creation, before
-// the session is built, and again in the audit after every bind and reload.
+// the session is built, and again in the audit after a reload or a bind.
 export function assertToolAdmissionGateLoaded(
   loader: GateLoadSource,
   gate: InlineExtension | undefined,
@@ -1533,7 +1533,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // this closure, which outlives a single factory invocation; later invocations
   // reuse it without re-reading process.env. A caller that builds several
   // factories for one runtime (the persistent runtime's voice sessions) passes
-  // one map to all of them (BobFactoryInput.custodyKeys).
+  // them one shared map (BobFactoryInput.custodyKeys).
   const custodyKeys = input.custodyKeys ?? new Map<string, string>();
   return async ({ sessionManager }) => {
     // bob#321: once custody holds the selected keyed variable's credential,
@@ -1818,7 +1818,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       assertAllowedToolsActive(session, policy);
     };
     const runAudit = () => {
-      // bob#356 V2a: a reload re-runs every extension factory, the gate's too;
+      // bob#356 V2a: a reload re-runs the extension factories, the gate's included;
       // a gate that does not load again leaves the session ungated, so the
       // reload and bind audit refuses it like creation does.
       assertToolAdmissionGateLoaded(services.resourceLoader, toolAdmissionExt);

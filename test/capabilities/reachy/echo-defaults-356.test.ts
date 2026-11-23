@@ -38,7 +38,7 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
 
   it("an exact 0.9 similarity matches in float64, and a lower one does not", () => {
     const guard = new EchoGuard();
-    // 10 characters, ONE edit: 1 - 1/10 = 0.9 exactly, and must match.
+    // 10 characters, ONE edit: 1 - 1/10 = 0.9, which must match.
     const ten = "abcdefghij";
     expect(editSimilarity(ten, "abcdefghiX")).toBeCloseTo(0.9, 12);
     expect(editAllowance(10)).toBe(1);
@@ -48,7 +48,7 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     expect(editAllowance(9)).toBe(0);
     guard.record("abcdefghi", 1_000);
     expect(guard.matchesRecentSay("abcdefghX", 1_000)).toBe(false);
-    // 20 characters, TWO edits: 0.9 exactly; three edits are below it.
+    // 20 characters, TWO edits: 0.9; three edits are below it.
     const twenty = "abcdefghijklmnopqrst";
     expect(editAllowance(20)).toBe(2);
     guard.record(twenty, 1_000);
@@ -102,7 +102,7 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     expect(guard.size).toBe(1);
   });
 
-  it("clearing the guard forgets every recorded line", () => {
+  it("clearing the guard forgets a recorded line", () => {
     const guard = new EchoGuard();
     guard.record("The meeting is at noon today.", 1_000);
     expect(guard.check("The meeting is at noon today.", 1_000)).toBe("playback");

@@ -1,20 +1,19 @@
 // reachy/wire.ts — the ONE wire shape for the sidecar's inbound JSON lines, and
 // its validation. Decoding happens HERE, before policy: a line that does not match
-// the schema is MALFORMED, never thrown into the handler. The socket client skips
-// whitespace-only lines. On a ready link with bob's mute and the sidecar-reported
+// the schema is MALFORMED, not thrown into the handler. The socket client skips
+// blank lines (spaces and tabs). On a ready link with bob's mute and the sidecar-reported
 // mute both off, the caller logs the reason for a malformed NON-health line
 // delivered to the decoder and attempts a `reachy.malformed` audit (the write can
 // fail); a malformed health line (`protocol` set) fails the link instead
 // (`reachy.link.refused`). A line dropped by either mute, or one that arrives
-// before the handshake, gets neither that audit attempt nor that log line. Every
-// reason is content-free: it names fields or a fixed label, never a value from the
-// line.
+// before the handshake, gets neither that audit attempt nor that log line. The
+// reasons name fields or a fixed label, not a value from the line.
 //
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:
 //   {"type":"transcript","text":…,"ts":…,"wakeHeard":bool,"speakerId"?:id}
 //     (bob#356 V2a: text, timing and speakerId are BOUNDED; the text is ONE line,
-//     so a CR or LF is malformed; the failure reason names every failed field,
+//     so a CR or LF is malformed; the failure reason names each failed field,
 //     including speakerId)
 //   {"type":"proposal","action":…,"args":{…},"confidence":num,"inputs":[id]}
 //   {"type":"presence","count":n,"known":[id]}
@@ -150,8 +149,8 @@ function transcriptFieldFailures(obj: Record<string, unknown>): string[] {
 }
 
 /** What the socket client hands the decoder for a line over the 64 KiB bound,
- *  in place of the line's content. JSON.parse cannot produce a symbol, so no
- *  line from the wire equals it. */
+ *  in place of the line's content. A wire line is parsed JSON or a raw string,
+ *  so it does not equal this symbol. */
 export const OVERSIZED_LINE: unique symbol = Symbol("reachy.oversized-line");
 
 /** The fixed reason for a line whose `type` is missing or not one bob knows. */
@@ -178,7 +177,7 @@ export function decodeLine(raw: unknown): DecodedLine {
     };
   }
   if (type === "transcript") {
-    // Content-free: name EVERY field that failed, never echo the room's text.
+    // Name each field that failed, not the room's text.
     return {
       kind: "malformed",
       reason: `transcript line failed its schema (${transcriptFieldFailures(obj).join(", ")})`,
@@ -213,7 +212,7 @@ export function decodeLine(raw: unknown): DecodedLine {
     };
   }
   // Content-free: a known type that failed its schema is named by that type;
-  // any other `type` gets one fixed reason, so nothing from the line is copied
+  // another `type`, or none, gets the fixed reason, and no value from the line is copied
   // into the reason, the log or the audit.
   if (type === "proposal" || type === "presence")
     return { kind: "malformed", reason: `${type} line failed its schema` };
