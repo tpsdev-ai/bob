@@ -120,13 +120,14 @@ export function createTurnAdmission(
     ready = resolve;
   });
   // One event handler for every session this runtime prompts: the resident one
-  // and each fresh voice session. The AsyncLocalStorage store decides whether
-  // the event belongs to the turn in flight.
+  // and each fresh voice session. An event counts for the active turn when the
+  // AsyncLocalStorage store it was emitted under is that turn.
   const observe = (event: Parameters<Parameters<RunSession["subscribe"]>[0]>[0]): void => {
-    endings.observe(event);
     if (event.type === "message_end" && event.message?.role === "assistant") {
       const endingTurn = context.getStore();
       if (endingTurn && endingTurn === active) {
+        // The reasoning-only ending this turn's re-prompt reads.
+        endings.observe(event);
         const exhaustion = emptyResponseExhaustionOf(event.message);
         if (exhaustion !== undefined) endingTurn.exhaustion = exhaustion;
       }

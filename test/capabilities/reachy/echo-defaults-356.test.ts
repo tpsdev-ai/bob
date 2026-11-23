@@ -76,6 +76,32 @@ describe("bob#356 V2a — EchoGuard with its production defaults", () => {
     expect(guard.playbackActive(1_000)).toBe(true);
   });
 
+  it("a later, shorter line does not replace an earlier one inside its window", () => {
+    const guard = new EchoGuard();
+    const long = "The meeting is at noon today. Bring the printed agenda and the signed pages.";
+    const short = "Yes.";
+    guard.record(long, 0);
+    guard.record(short, 100);
+    expect(guard.size).toBe(2);
+    // After the short line's own estimate has ended, the long line still holds.
+    const afterShort = 100 + estimatedPlaybackMs(short) + 1;
+    expect(afterShort).toBeLessThan(estimatedPlaybackMs(long));
+    expect(guard.playbackActive(afterShort)).toBe(true);
+    expect(guard.matchesRecentSay(long, afterShort)).toBe(true);
+    expect(guard.matchesRecentSay(short, afterShort)).toBe(true);
+  });
+
+  it("record prunes expired lines from the front, keeping one behind an unexpired older line", () => {
+    const guard = new EchoGuard();
+    const long = "x".repeat(400); // a 15 s estimate: kept until 25 s
+    guard.record(long, 0);
+    guard.record("short", 1_000); // a 1 s estimate: expired after 12 s
+    guard.record("short", 13_000); // the front line is unexpired, so nothing goes
+    expect(guard.size).toBe(3);
+    guard.record("later", 26_000); // the front line has expired: it and both shorts go
+    expect(guard.size).toBe(1);
+  });
+
   it("clearing the guard forgets every recorded line", () => {
     const guard = new EchoGuard();
     guard.record("The meeting is at noon today.", 1_000);

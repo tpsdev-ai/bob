@@ -1,13 +1,14 @@
 // reachy/wire.ts — the ONE wire shape for the sidecar's inbound JSON lines, and
 // its validation. Decoding happens HERE, before policy: a line that does not match
-// the schema is MALFORMED, never thrown into the handler. On a ready link with
-// bob's mute and the sidecar-reported mute both off, the caller logs the reason
-// for a malformed NON-health line and attempts a `reachy.malformed` audit (the
-// write can fail); a malformed health line (`protocol` set) fails the link
-// instead (`reachy.link.refused`). A line dropped by either mute, or one that
-// arrives before the handshake, gets neither that audit attempt nor that log
-// line. Every reason is content-free: it names fields or a fixed label, never
-// a value from the line.
+// the schema is MALFORMED, never thrown into the handler. The socket client skips
+// whitespace-only lines. On a ready link with bob's mute and the sidecar-reported
+// mute both off, the caller logs the reason for a malformed NON-health line
+// delivered to the decoder and attempts a `reachy.malformed` audit (the write can
+// fail); a malformed health line (`protocol` set) fails the link instead
+// (`reachy.link.refused`). A line dropped by either mute, or one that arrives
+// before the handshake, gets neither that audit attempt nor that log line. Every
+// reason is content-free: it names fields or a fixed label, never a value from the
+// line.
 //
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:
@@ -148,8 +149,8 @@ function transcriptFieldFailures(obj: Record<string, unknown>): string[] {
   return bad.length > 0 ? bad : ["type"];
 }
 
-/** What the socket client hands the decoder for a line over the 64 KiB bound
- *  (the line itself is not buffered). JSON.parse cannot produce a symbol, so no
+/** What the socket client hands the decoder for a line over the 64 KiB bound,
+ *  in place of the line's content. JSON.parse cannot produce a symbol, so no
  *  line from the wire equals it. */
 export const OVERSIZED_LINE: unique symbol = Symbol("reachy.oversized-line");
 

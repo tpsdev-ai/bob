@@ -16,6 +16,8 @@ import {
   readVoiceWakeName,
   resolveCapabilities,
 } from "../../src/shell/capability-loader.js";
+import { REASONING_CONTINUE_TURN } from "../../src/shell/compaction-contract.js";
+import { ToolLoopError } from "../../src/shell/tool-loop.js";
 import {
   boundOrigin,
   createTurnAdmission,
@@ -113,6 +115,142 @@ describe("bob#356 V2a — an admission with no voice session refuses a voice tur
     // CONTROL: the same resident session serves a non-voice turn.
     await admission.admitTurn({ kind: "run" }, "next");
     expect(residentPrompts).toEqual(["next"]);
+  });
+});
+
+// A scripted session: `prompt` runs `onPrompt` with an `emit` that calls every
+// subscriber synchronously, so an event is emitted under the caller's
+// AsyncLocalStorage store (inside a turn's prompt, or outside every turn).
+function scriptedSession(
+  onPrompt: (text: string, emit: (event: unknown) => void) => Promise<void>,
+) {
+  const listeners: Array<(event: never) => void> = [];
+  const emit = (event: unknown) => {
+    for (const l of listeners) l(event as never);
+  };
+  const calls = { prompts: [] as string[], aborts: 0, disposals: 0 };
+  return {
+    calls,
+    emit,
+    session: {
+      subscribe(l: (event: never) => void) {
+        listeners.push(l);
+        return () => {
+          const i = listeners.indexOf(l);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+      dispose() {
+        calls.disposals += 1;
+      },
+      async abort() {
+        calls.aborts += 1;
+      },
+      async prompt(text: string) {
+        calls.prompts.push(text);
+        await onPrompt(text, emit);
+      },
+    },
+  };
+}
+const ending = (content: unknown) => ({
+  type: "message_end",
+  message: { role: "assistant", content, stopReason: "stop" },
+});
+const TEXT = [{ type: "text", text: "It is noon." }];
+const REASONING_ONLY = [{ type: "thinking", thinking: "the clock says noon" }];
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+describe("bob#356 V2a — another session's events do not set the active voice turn's ending", () => {
+  it("a reasoning-only ending emitted outside the turn does not re-prompt a voice turn that ended in text", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit(ending(TEXT));
+      await held;
+    });
+    const resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    const turn = admission.admitTurn(voice(), "jarvis, what time is it");
+    while (voiceSide.calls.prompts.length === 0) await tick();
+    resident.emit(ending(REASONING_ONLY)); // emitted outside every turn
+    release();
+    await turn;
+    expect(voiceSide.calls.prompts).toEqual(["jarvis, what time is it"]);
+  });
+
+  it("a text ending emitted outside the turn does not cancel a voice turn's reasoning-only re-prompt", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const voiceSide = scriptedSession(async (text, emit) => {
+      if (text === REASONING_CONTINUE_TURN) {
+        emit(ending(TEXT));
+        return;
+      }
+      emit(ending(REASONING_ONLY));
+      await held;
+    });
+    const resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    const turn = admission.admitTurn(voice(), "jarvis, what time is it");
+    while (voiceSide.calls.prompts.length === 0) await tick();
+    resident.emit(ending(TEXT)); // emitted outside every turn
+    release();
+    await turn;
+    expect(voiceSide.calls.prompts).toEqual(["jarvis, what time is it", REASONING_CONTINUE_TURN]);
+  });
+});
+
+describe("bob#356 V2a — a loop-broken voice turn", () => {
+  it("stops the voice session, keeps its binding and session until the prompt settles, then disposes it", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let admission!: ReturnType<typeof createTurnAdmission>;
+    const originsInPrompt: Array<TurnOrigin | undefined> = [];
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      for (let i = 0; i < 4; i++) {
+        emit({ type: "tool_execution_start", toolName: "reachy_say", args: { text: "again" } });
+      }
+      await held; // the prompt keeps running past the loop break
+      originsInPrompt.push(admission.readAdmittedOrigin());
+    });
+    const resident = scriptedSession(async () => {});
+    admission = createTurnAdmission({
+      log: () => {},
+      toolLoopLimit: 3,
+      loopAbortGraceMs: 20,
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    await expect(admission.admitTurn(voice(), "jarvis, say it again")).rejects.toBeInstanceOf(
+      ToolLoopError,
+    );
+    await tick();
+    // The stop went to the voice session, not the resident one.
+    expect(voiceSide.calls.aborts).toBe(1);
+    expect(resident.calls.aborts).toBe(0);
+    // The prompt has not settled: the session is not disposed yet.
+    expect(voiceSide.calls.disposals).toBe(0);
+    release();
+    while (voiceSide.calls.disposals === 0) await tick();
+    // Inside the prompt, after the break, the call was still bound to the turn.
+    expect(originsInPrompt).toEqual([voice()]);
+    expect(voiceSide.calls.disposals).toBe(1);
+    expect(admission.readAdmittedOrigin()).toBeUndefined();
   });
 });
 

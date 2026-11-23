@@ -156,6 +156,11 @@ export class EchoGuard {
     return null;
   }
 
+  /** How many recorded lines the guard holds (read-only; for tests). */
+  get size(): number {
+    return this.spoken.length;
+  }
+
   /** Forget every recorded line (mute flip, disconnect, new connection). */
   clear(): void {
     this.spoken.length = 0;

@@ -600,6 +600,7 @@ describe("bob#356 V2a — an unrecognised line type gets a fixed, content-free r
     client.onLine((l) => lines.push(l));
     client.ingest('{"type":"__oversized__"}\n');
     client.ingest(`${"x".repeat(MAX_LINE_BYTES + 1)}\n`);
+    client.ingest(" \t \n"); // whitespace-only: skipped, not delivered
     expect(lines).toHaveLength(2);
     expect(decodeLine(lines[0])).toEqual({ kind: "malformed", reason: UNRECOGNISED_LINE_REASON });
     expect(lines[1]).toBe(OVERSIZED_LINE);
