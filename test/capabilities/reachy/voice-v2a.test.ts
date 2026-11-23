@@ -217,8 +217,15 @@ async function connectBob(
     log: (m) => logs.push(m),
   });
   let pending: Array<Promise<unknown>> = [];
+  // Each line's handled result, in arrival order.
+  const results: Array<{ kind: string }> = [];
   client.onLine((line) => {
-    pending.push(wired.handleLine(line));
+    pending.push(
+      wired.handleLine(line).then((r) => {
+        results.push(r as { kind: string });
+        return r;
+      }),
+    );
   });
   client.onClose(() => wired.disconnected());
   // Connect, retrying until the fake sidecar has bound its socket. No stat of
@@ -262,6 +269,7 @@ async function connectBob(
     client,
     admissions,
     logs,
+    results,
     settle,
     transcript,
     close: () => {
@@ -310,7 +318,10 @@ describe("bob#356 V2a — bob recomputes `addressed`; wakeHeard alone does not a
     const bob = await connectBob(sidecar);
     try {
       sidecar.send(bob.transcript("what time is it", { wakeHeard: true }));
-      await wait(200);
+      await waitFor(
+        () => bob.logs.some((m) => m.includes("un-addressed transcript")),
+        "the un-addressed drop",
+      );
       await bob.settle();
       expect(bob.admissions).toEqual([]);
       expect(bob.logs.some((m) => m.includes("un-addressed transcript"))).toBe(true);
@@ -709,9 +720,12 @@ describe("bob#356 V2a — a transcript after a sidecar-reported mute is not admi
         send: healthLine(bob.wired, { profile: "voice", wakeName: "jarvis" }, { muted: true }),
       });
       await waitFor(() => bob.wired.link().deviceMuted === true, "the mute report");
+      const handled = bob.results.length;
       sidecar.send(bob.transcript("jarvis, are you there"));
-      await wait(200);
+      // Wait for THIS transcript's handled result: the mute must decide it.
+      await waitFor(() => bob.results.length > handled, "the muted transcript's result");
       await bob.settle();
+      expect(bob.results.at(-1)).toEqual({ kind: "drop" });
       expect(bob.admissions.length).toBe(1);
       expect(bob.store.all.some((e) => e.kind === "reachy.malformed")).toBe(false);
     } finally {
@@ -732,7 +746,10 @@ describe("bob#356 V2a — the echo guard drops text recorded for an attempted sa
       await waitFor(() => sidecar.command("say"), "the say command");
       // NFKC/case/punctuation-insensitive near-match of the emitted line.
       sidecar.send(bob.transcript("the meeting is at noon today"));
-      await wait(200);
+      await waitFor(
+        () => bob.logs.some((m) => m.includes("echo guard: say-match")),
+        "the say-match drop",
+      );
       await bob.settle();
       expect(bob.admissions).toEqual([]);
       expect(bob.logs.some((m) => m.includes("echo guard: say-match"))).toBe(true);
@@ -751,7 +768,10 @@ describe("bob#356 V2a — the echo guard drops text recorded for an attempted sa
       expect(await bob.pi.call("reachy_say", { text: "One moment." })).toBe("say: One moment.");
       await waitFor(() => sidecar.command("say"), "the say command");
       sidecar.send(bob.transcript("jarvis, what is on the calendar"));
-      await wait(200);
+      await waitFor(
+        () => bob.logs.some((m) => m.includes("echo guard: playback")),
+        "the playback drop",
+      );
       await bob.settle();
       expect(bob.admissions).toEqual([]);
       expect(bob.logs.some((m) => m.includes("echo guard: playback"))).toBe(true);
@@ -910,17 +930,21 @@ describe("bob#356 V2a — a stub grant tool is not executed on a voice-origin tu
   it("a socket-driven voice transcript does not make the gate execute a stub grant tool", async () => {
     const sidecar = startSidecar();
     let executed = false;
+    const decisions: unknown[] = [];
     const bob = await connectBob(sidecar, {
       admitVoiceTurn: async (origin) => {
         const decision = admitToolCall("mail_send", origin);
+        decisions.push(decision);
         if (decision.allow) executed = true;
         return [];
       },
     });
     try {
       sidecar.send(bob.transcript("jarvis, mail the report to the team"));
-      await wait(200);
+      // The transcript must reach the grant check, and the check must refuse.
+      await waitFor(() => decisions.length === 1, "the grant decision");
       await bob.settle();
+      expect(decisions).toEqual([{ allow: false, grant: true, reason: VOICE_GRANT_REFUSAL }]);
       expect(executed).toBe(false);
     } finally {
       bob.close();

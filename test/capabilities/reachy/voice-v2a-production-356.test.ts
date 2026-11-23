@@ -176,6 +176,18 @@ function installModel(requests: ModelRequest[]): void {
 }
 
 // ── the sidecar process ─────────────────────────────────────────────────────
+/** The `CMD <json>` records in the sidecar's stdout so far, by command name.
+ *  stdout arrives in chunks, so the text after the last newline is an
+ *  unfinished record and is left for a later read. */
+function sidecarCommands(stdout: string, name: string) {
+  return stdout
+    .split("\n")
+    .slice(0, -1)
+    .filter((line) => line.startsWith("CMD "))
+    .map((line) => JSON.parse(line.slice(4)) as { command?: string; args?: { text?: string } })
+    .filter((cmd) => cmd.command === name);
+}
+
 function startSidecar(socketPath: string) {
   const proc = spawn("python3", ["-I", DRIVEN, socketPath, TEST_SIDECAR_VERSION], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -185,12 +197,7 @@ function startSidecar(socketPath: string) {
   proc.stdout?.on("data", (b: Buffer) => {
     stdout += b.toString();
   });
-  const commands = (name: string) =>
-    stdout
-      .split("\n")
-      .filter((line) => line.startsWith("CMD "))
-      .map((line) => JSON.parse(line.slice(4)) as { command?: string; args?: { text?: string } })
-      .filter((cmd) => cmd.command === name);
+  const commands = (name: string) => sidecarCommands(stdout, name);
   return {
     out: () => stdout,
     commands,
@@ -256,6 +263,14 @@ interface Build {
   config: Partial<RunSessionConfig>;
   loaded: string[];
 }
+
+describe("bob#356 V2a — the sidecar output parser", () => {
+  it("reads complete records and leaves an unfinished last record for a later read", () => {
+    const done = 'CMD {"command":"say","args":{"text":"It is noon."}}\n';
+    expect(sidecarCommands(`${done}CMD {"command":`, "say")).toHaveLength(1);
+    expect(sidecarCommands(`${done}${done}`, "say")).toHaveLength(2);
+  });
+});
 
 describe("bob#356 V2a — a voice turn on the production path (startPersistent, the real factory, the built reachy extension)", () => {
   it("the voice model sees no resident history, bootstrap or prior-round memory, speaks through the resident bridge, and leaves no session file", async () => {

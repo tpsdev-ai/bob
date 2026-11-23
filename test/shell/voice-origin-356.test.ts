@@ -270,6 +270,193 @@ describe("bob#356 V2a — another session's tool calls and turn ends do not coun
   });
 });
 
+describe("bob#356 V2a — the resident session's events inside a voice turn do not count for it", () => {
+  // The resident session emits from INSIDE the voice prompt's async context:
+  // the emitting session is what tells these events apart from the turn's own.
+  it("two resident tool calls emitted inside the voice prompt do not trip its loop breaker", async () => {
+    const holder: { resident?: ReturnType<typeof scriptedSession> } = {};
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit(ending(TEXT));
+      for (let i = 0; i < 2; i++) {
+        holder.resident?.emit({
+          type: "tool_execution_start",
+          toolName: "reachy_say",
+          args: { text: "x" },
+        });
+      }
+    });
+    holder.resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      toolLoopLimit: 2,
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(holder.resident.session);
+    await admission.admitTurn(voice(), "jarvis, what time is it"); // no ToolLoopError
+    expect(voiceSide.calls.aborts).toBe(0);
+  });
+
+  it("a resident turn end emitted inside the voice prompt does not replace the turn's messages", async () => {
+    const holder: { resident?: ReturnType<typeof scriptedSession> } = {};
+    const own = { role: "assistant", content: TEXT, stopReason: "stop" };
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit({ type: "agent_end", messages: [own] });
+      holder.resident?.emit({
+        type: "agent_end",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "foreign" }], stopReason: "stop" },
+        ],
+      });
+    });
+    holder.resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(holder.resident.session);
+    expect(await admission.admitTurn(voice(), "jarvis, what time is it")).toEqual([own]);
+  });
+});
+
+describe("bob#356 V2a — the fresh voice session is disposed when its startup fails", () => {
+  const unsubscribeFails = (side: ReturnType<typeof scriptedSession>) => {
+    const subscribe = side.session.subscribe.bind(side.session);
+    side.session.subscribe = (l: (event: never) => void) => {
+      subscribe(l);
+      return () => {
+        throw new Error("unsubscribe failed");
+      };
+    };
+    return side;
+  };
+
+  it("an unsubscribe that throws still disposes the session: on a pre-start refusal", async () => {
+    const voiceSide = unsubscribeFails(scriptedSession(async () => {}));
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(scriptedSession(async () => {}).session);
+    await expect(
+      admission.admitTurn(voice(), "jarvis, hi", { beforeStart: () => "refused here" }),
+    ).rejects.toThrow("refused here");
+    expect(voiceSide.calls.disposals).toBe(1);
+  });
+
+  it("an unsubscribe that throws still disposes the session: after its prompt settles", async () => {
+    const voiceSide = unsubscribeFails(scriptedSession(async (_t, emit) => emit(ending(TEXT))));
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(scriptedSession(async () => {}).session);
+    await admission.admitTurn(voice(), "jarvis, hi");
+    expect(voiceSide.calls.disposals).toBe(1);
+  });
+
+  it("a subscribe, a beforeStart or an onTurnStart that throws disposes the session", async () => {
+    // subscribe throws
+    const a = scriptedSession(async () => {});
+    a.session.subscribe = () => {
+      throw new Error("subscribe failed");
+    };
+    const admissionA = createTurnAdmission({ log: () => {}, voiceSession: async () => a.session });
+    admissionA.bind(scriptedSession(async () => {}).session);
+    await expect(admissionA.admitTurn(voice(), "jarvis, hi")).rejects.toThrow("subscribe failed");
+    expect(a.calls.disposals).toBe(1);
+    // beforeStart throws
+    const b = scriptedSession(async () => {});
+    const admissionB = createTurnAdmission({ log: () => {}, voiceSession: async () => b.session });
+    admissionB.bind(scriptedSession(async () => {}).session);
+    await expect(
+      admissionB.admitTurn(voice(), "jarvis, hi", {
+        beforeStart: () => {
+          throw new Error("beforeStart failed");
+        },
+      }),
+    ).rejects.toThrow("beforeStart failed");
+    expect(b.calls.disposals).toBe(1);
+    // onTurnStart throws
+    const c = scriptedSession(async () => {});
+    const admissionC = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => c.session,
+      onTurnStart: () => {
+        throw new Error("onTurnStart failed");
+      },
+    });
+    admissionC.bind(scriptedSession(async () => {}).session);
+    await expect(admissionC.admitTurn(voice(), "jarvis, hi")).rejects.toThrow("onTurnStart failed");
+    expect(c.calls.disposals).toBe(1);
+    expect([a, b, c].map((side) => side.calls.prompts.length)).toEqual([0, 0, 0]);
+  });
+
+  it("a beforeStart that closes the admission stops the turn before its prompt", async () => {
+    const voiceSide = scriptedSession(async () => {});
+    let admission!: ReturnType<typeof createTurnAdmission>;
+    admission = createTurnAdmission({ log: () => {}, voiceSession: async () => voiceSide.session });
+    admission.bind(scriptedSession(async () => {}).session);
+    await expect(
+      admission.admitTurn(voice(), "jarvis, hi", {
+        beforeStart: () => {
+          admission.close();
+          return null;
+        },
+      }),
+    ).rejects.toThrow("turn admission is closed");
+    expect(voiceSide.calls.prompts).toEqual([]);
+    expect(voiceSide.calls.disposals).toBe(1);
+  });
+});
+
+describe("bob#356 V2a — each turn's reasoning-only check reads its own ending", () => {
+  it("a loop-broken voice prompt that settles late does not take the next turn's ending", async () => {
+    let releaseVoice!: () => void;
+    const voiceHeld = new Promise<void>((r) => {
+      releaseVoice = r;
+    });
+    let releaseResident!: () => void;
+    const residentHeld = new Promise<void>((r) => {
+      releaseResident = r;
+    });
+    const voiceSide = scriptedSession(async (text, emit) => {
+      if (text === REASONING_CONTINUE_TURN) return;
+      for (let i = 0; i < 3; i++) {
+        emit({ type: "tool_execution_start", toolName: "reachy_say", args: { text: "again" } });
+      }
+      await voiceHeld;
+    });
+    const resident = scriptedSession(async (text, emit) => {
+      if (text === REASONING_CONTINUE_TURN) {
+        emit(ending(TEXT));
+        return;
+      }
+      emit(ending(REASONING_ONLY));
+      await residentHeld;
+    });
+    const admission = createTurnAdmission({
+      log: () => {},
+      toolLoopLimit: 2,
+      loopAbortGraceMs: 10,
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(resident.session);
+    await expect(admission.admitTurn(voice(), "jarvis, again")).rejects.toBeInstanceOf(
+      ToolLoopError,
+    );
+    // The next turn starts while the voice prompt is still running, and its
+    // prompt records a reasoning-only ending.
+    const cronTurn = admission.admitTurn({ kind: "cron", job: "digest" }, "digest");
+    while (resident.calls.prompts.length === 0) await tick();
+    releaseVoice(); // the voice continuation reads its own (empty) ending
+    while (voiceSide.calls.disposals === 0) await tick();
+    releaseResident();
+    await cronTurn;
+    expect(voiceSide.calls.prompts).toEqual(["jarvis, again"]);
+    expect(resident.calls.prompts).toEqual(["digest", REASONING_CONTINUE_TURN]);
+  });
+});
+
 describe("bob#356 V2a — a loop-broken voice turn", () => {
   it("stops the voice session, keeps its binding and session until the prompt settles, then disposes it", async () => {
     let release!: () => void;
