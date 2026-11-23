@@ -184,8 +184,8 @@ export function wireReachyCapability(opts: WireOptions): WiredReachy {
   // The last transcript: read ONLY by the body's rate limit and the memory path,
   // never by speech, and cleared whenever the link or the mute changes.
   let lastTranscript: Transcript | null = null;
-  // bob#356 V2a: the echo guard, and the voiced utterances bob issued for turns
-  // in flight (correlationId → the addressed assertion this capability recorded).
+  // bob#356 V2a: the echo guard, and the addressed assertions this capability
+  // recorded for turns in flight, keyed by the bob-issued correlation id.
   const echo = new EchoGuard(opts.echoWindowMs, opts.playbackMs);
   const voiceUtterances = new Map<string, { addressed: boolean }>();
 

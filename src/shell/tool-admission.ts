@@ -1,9 +1,9 @@
 // tool-admission.ts — bob's TOOL-ADMISSION gate (bob#356 V2a, D1).
 //
-// Runtime origins are metadata set AT ADMISSION; prompt, model and tool text
-// do not supply one (turn-origin.ts). This gate reads the origin a tool call is
-// BOUND to and answers one question before the executor runs: may this origin
-// reach this tool?
+// This gate reads the origin a tool call is BOUND to (an admitted turn's
+// origin, or a one-shot run's runtime-declared session origin; turn-origin.ts)
+// and answers one question before the executor runs: may this origin reach
+// this tool?
 //
 // The rule is an ALLOWLIST, keyed on origin, not a denylist of today's grant
 // names (bob#356 Kern N2). A voice-origin turn — one a sidecar transcript of
@@ -17,7 +17,7 @@
 // admission serves; the factory refuses one whose gate did not load), a
 // grant-class tool (mail send, calendar accept, payment) is not executed on a
 // voice-origin turn. The refusal is fixed and content-free, and it tells the
-// model that the member can ask again on an authenticated text channel. bob
+// model that the caller can ask again on an authenticated text channel. bob
 // ships no confirmation broker (bob#356 D1): nothing links that later request
 // to this refusal. A non-voice origin (run, mail, cron, discord) passes
 // this gate unchanged, under its own turn's policy.

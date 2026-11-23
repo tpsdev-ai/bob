@@ -25,7 +25,7 @@
 // admission, and it is deliberately conservative: genuine barge-in during the
 // estimated playback is dropped too.
 
-/** How long recorded text stays in the say-match guard. */
+/** The say-match window after a recorded line's estimated playback end. */
 export const ECHO_WINDOW_MS = 10_000;
 /** Similarity at or above which a transcript counts as a recorded line. */
 export const ECHO_SIMILARITY = 0.9;

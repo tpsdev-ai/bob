@@ -65,7 +65,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       name: "reachy_say",
       label: "Reachy Say",
       description:
-        "Speak one short line in the room through the speaker. Allowed for the voice turn whose addressed utterance opened it, or for a turn whose origin the operator granted room speech; no memory reference.",
+        "Speak one short line in the room through the speaker, for the voice turn whose addressed utterance opened this session; no memory reference.",
       parameters: ACTION_ARG_SCHEMAS.say,
       async execute(_id: string, params: Record<string, unknown>) {
         if (typeof params.text !== "string")

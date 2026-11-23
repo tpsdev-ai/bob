@@ -927,7 +927,7 @@ describe("bob#356 V2a — a stub grant tool is not executed on a voice-origin tu
     expect(executed).toEqual(["reachy_say", "mail_send"]);
   });
 
-  it("a socket-driven voice transcript does not make the gate execute a stub grant tool", async () => {
+  it("a socket-driven voice transcript reaches the grant decision, which refuses mail_send", async () => {
     const sidecar = startSidecar();
     let executed = false;
     const decisions: unknown[] = [];

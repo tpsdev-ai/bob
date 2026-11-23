@@ -296,6 +296,42 @@ describe("bob#356 V2a — the resident session's events inside a voice turn do n
     expect(voiceSide.calls.aborts).toBe(0);
   });
 
+  it("a resident reasoning-only ending emitted inside the voice prompt does not re-prompt it", async () => {
+    const holder: { resident?: ReturnType<typeof scriptedSession> } = {};
+    const voiceSide = scriptedSession(async (_text, emit) => {
+      emit(ending(TEXT));
+      holder.resident?.emit(ending(REASONING_ONLY));
+    });
+    holder.resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(holder.resident.session);
+    await admission.admitTurn(voice(), "jarvis, what time is it");
+    expect(voiceSide.calls.prompts).toEqual(["jarvis, what time is it"]);
+  });
+
+  it("a resident text ending emitted inside the voice prompt does not cancel its re-prompt", async () => {
+    const holder: { resident?: ReturnType<typeof scriptedSession> } = {};
+    const voiceSide = scriptedSession(async (text, emit) => {
+      if (text === REASONING_CONTINUE_TURN) {
+        emit(ending(TEXT));
+        return;
+      }
+      emit(ending(REASONING_ONLY));
+      holder.resident?.emit(ending(TEXT));
+    });
+    holder.resident = scriptedSession(async () => {});
+    const admission = createTurnAdmission({
+      log: () => {},
+      voiceSession: async () => voiceSide.session,
+    });
+    admission.bind(holder.resident.session);
+    await admission.admitTurn(voice(), "jarvis, what time is it");
+    expect(voiceSide.calls.prompts).toEqual(["jarvis, what time is it", REASONING_CONTINUE_TURN]);
+  });
+
   it("a resident turn end emitted inside the voice prompt does not replace the turn's messages", async () => {
     const holder: { resident?: ReturnType<typeof scriptedSession> } = {};
     const own = { role: "assistant", content: TEXT, stopReason: "stop" };
