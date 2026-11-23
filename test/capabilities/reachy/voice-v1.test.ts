@@ -832,6 +832,9 @@ describe("bob#356 V1 — the say caller split (Kern 5)", () => {
 });
 
 // ── the transcript memory path: stale recheck (bob#361) ─────────────────────
+// Under `voice` a transcript does not reach memory (V2a; no speaker
+// authentication until V3), so these memory-path rechecks run on the `reachy`
+// body profile, whose enrolment path still writes.
 describe("bob#361 — the transcript path rechecks the link epoch and the mute after the attempt audit", () => {
   const enrolled = { enrolment: { "spk-1": "member-1" } };
   const speakerLine = {
@@ -858,7 +861,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   };
 
   it("CONTROL: with nothing changing, the memory IS written and the linked written event targets it", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     const r = await h.wired.handleLine(speakerLine);
     expect(r).toMatchObject({ kind: "memory", memoryId: "mem-361" });
@@ -873,7 +876,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   });
 
   it("a DISCONNECT during the audit writes no memory and records the linked refusal", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     h.store.during = (e) => {
       if (e.kind !== "reachy.memory.attempt") return;
@@ -887,7 +890,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   });
 
   it("a RECONNECT during the audit writes no memory and records the linked refusal", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     h.store.during = (e) => {
       if (e.kind !== "reachy.memory.attempt") return;
@@ -902,7 +905,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   });
 
   it("a sidecar-reported MUTE during the audit writes no memory and records the linked refusal", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     h.store.during = (e) => {
       if (e.kind !== "reachy.memory.attempt") return;
@@ -915,7 +918,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   });
 
   it("a sidecar-reported mute turned ON and back OFF during the audit (mute clear again, epoch advanced) still writes no memory", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     h.store.during = (e) => {
       if (e.kind !== "reachy.memory.attempt") return;
@@ -930,7 +933,7 @@ describe("bob#361 — the transcript path rechecks the link epoch and the mute a
   });
 
   it("an effective mute that is still ON at the recheck but did not advance the epoch (bob's own mute) also writes no memory", async () => {
-    const h = harness(enrolled);
+    const h = harness({ ...enrolled, profile: "reachy" });
     await h.ready();
     h.store.during = (e) => {
       if (e.kind !== "reachy.memory.attempt") return;

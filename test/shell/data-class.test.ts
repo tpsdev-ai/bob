@@ -104,6 +104,7 @@ describe("classification completeness", () => {
   it("pins bob's own extension, startup-context and injection rows", () => {
     expect({ ...BOB_EXTENSION_DATA_CLASS }).toEqual({
       "bob-contract-guard": "public",
+      "bob-tool-admission": "public",
       "bob-write-soul": "private",
     });
     expect({ ...STARTUP_CONTEXT_CLASS }).toEqual({

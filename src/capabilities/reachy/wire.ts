@@ -1,11 +1,20 @@
 // reachy/wire.ts — the ONE wire shape for the sidecar's inbound JSON lines, and
 // its validation. Decoding happens HERE, before policy: a line that does not match
-// the schema is MALFORMED (the caller emits an OrgEvent `reachy.malformed`), never
-// thrown into the handler.
+// the schema is MALFORMED, not thrown into the handler. The socket client skips
+// blank lines (spaces and tabs). On a ready link with bob's mute and the sidecar-reported
+// mute both off, the caller logs the reason for a malformed NON-health line
+// delivered to the decoder and attempts a `reachy.malformed` audit (the write can
+// fail); a malformed health line (`protocol` set) fails the link instead
+// (`reachy.link.refused`). A line dropped by either mute, or one that arrives
+// before the handshake, gets neither that audit attempt nor that log line. The
+// reasons name fields or a fixed label, not a value from the line.
 //
 // Line shape (spec §3.2) — one JSON object per line, `type` plus the payload at
 // the top level:
 //   {"type":"transcript","text":…,"ts":…,"wakeHeard":bool,"speakerId"?:id}
+//     (bob#356 V2a: text, timing and speakerId are BOUNDED; the text is ONE line,
+//     so a CR or LF is malformed; the failure reason names each failed field,
+//     including speakerId)
 //   {"type":"proposal","action":…,"args":{…},"confidence":num,"inputs":[id]}
 //   {"type":"presence","count":n,"known":[id]}
 //   {"type":"health","protocol":"reachy-voice/1",…}   (bob#356, below)
@@ -43,10 +52,12 @@ export type WakeMode = (typeof WAKE_MODES)[number];
 const TRANSCRIPT_LINE = Type.Object(
   {
     type: Type.Literal("transcript"),
-    text: Type.String(),
-    ts: Type.String(),
+    // The transcript is untrusted text from the room: bounded, ONE line.
+    text: Type.String({ minLength: 1, maxLength: 4096, pattern: "^[^\\r\\n]+$" }),
+    // Timing is carried, not trusted: a bounded opaque timestamp string.
+    ts: Type.String({ minLength: 1, maxLength: 64 }),
     wakeHeard: Type.Boolean(),
-    speakerId: Type.Optional(Type.String()),
+    speakerId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   // A trust boundary is STRICT: an unknown field is malformed (round 3 item 4).
   { additionalProperties: false },
@@ -117,16 +128,43 @@ function safeJson(raw: string): unknown {
   }
 }
 
+/** The field NAMES a transcript line failed, for a bounded, content-free reason. */
+function transcriptFieldFailures(obj: Record<string, unknown>): string[] {
+  const bad: string[] = [];
+  if (typeof obj.text !== "string" || obj.text.length < 1 || obj.text.length > 4096) {
+    bad.push("text");
+  } else if (/[\r\n]/.test(obj.text)) {
+    bad.push("text");
+  }
+  if (typeof obj.ts !== "string" || obj.ts.length < 1 || obj.ts.length > 64) bad.push("ts");
+  if (typeof obj.wakeHeard !== "boolean") bad.push("wakeHeard");
+  if (obj.speakerId !== undefined) {
+    const id = obj.speakerId;
+    if (typeof id !== "string" || id.length < 1 || id.length > 128) bad.push("speakerId");
+  }
+  const known = new Set(["type", "text", "ts", "wakeHeard", "speakerId"]);
+  if (Object.keys(obj).some((key) => !known.has(key))) bad.push("unknown field");
+  // The type literal itself is checked before this runs; keep a nonempty reason.
+  return bad.length > 0 ? bad : ["type"];
+}
+
+/** What the socket client hands the decoder for a line over the 64 KiB bound,
+ *  in place of the line's content. A wire line is parsed JSON or a raw string,
+ *  so it does not equal this symbol. */
+export const OVERSIZED_LINE: unique symbol = Symbol("reachy.oversized-line");
+
+/** The fixed reason for a line whose `type` is missing or not one bob knows. */
+export const UNRECOGNISED_LINE_REASON =
+  "unrecognised line type (not transcript, proposal, presence or health)";
+
 /** Decode one line (a raw string or an already-parsed object) into a DecodedLine. */
 export function decodeLine(raw: unknown): DecodedLine {
+  if (raw === OVERSIZED_LINE) return { kind: "malformed", reason: "line exceeds the 64 KiB bound" };
   const line = typeof raw === "string" ? safeJson(raw) : raw;
   if (line === null || typeof line !== "object")
     return { kind: "malformed", reason: "not a JSON object" };
   const obj = line as Record<string, unknown>;
   const type = obj.type;
-  // The socket client hands an oversized line as this marker (never buffered).
-  if (type === "__oversized__")
-    return { kind: "malformed", reason: "line exceeds the 64 KiB bound" };
   if (type === "transcript" && Value.Check(TRANSCRIPT_LINE, obj)) {
     return {
       kind: "transcript",
@@ -136,6 +174,13 @@ export function decodeLine(raw: unknown): DecodedLine {
         wakeHeard: obj.wakeHeard as boolean,
         speakerId: (obj.speakerId as string | undefined) ?? undefined,
       },
+    };
+  }
+  if (type === "transcript") {
+    // Name each field that failed, not the room's text.
+    return {
+      kind: "malformed",
+      reason: `transcript line failed its schema (${transcriptFieldFailures(obj).join(", ")})`,
     };
   }
   if (type === "proposal" && Value.Check(PROPOSAL_LINE, obj)) {
@@ -166,7 +211,12 @@ export function decodeLine(raw: unknown): DecodedLine {
       protocol: true,
     };
   }
-  return { kind: "malformed", reason: `unrecognised line (type=${JSON.stringify(type)})` };
+  // Content-free: a known type that failed its schema is named by that type;
+  // another `type`, or none, gets the fixed reason, and no value from the line is copied
+  // into the reason, the log or the audit.
+  if (type === "proposal" || type === "presence")
+    return { kind: "malformed", reason: `${type} line failed its schema` };
+  return { kind: "malformed", reason: UNRECOGNISED_LINE_REASON };
 }
 
 /** What bob expects the sidecar to repeat on this connection. */

@@ -26,7 +26,14 @@ export type AdmissionToken = object;
 
 export interface TurnAdmission {
   // Resolves with this admission's messages, for the inbound source's reply.
-  admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]>;
+  // `preflight.beforeStart` is checked for voice and non-voice turns, after the
+  // operation leaves the queue and immediately before its prompt starts; a
+  // non-null string refuses it, and nothing is prompted.
+  admitTurn(
+    origin: TurnOrigin,
+    text: string,
+    preflight?: { beforeStart?: () => string | null },
+  ): Promise<unknown[]>;
   // The origin of the admitted turn whose prompt the caller runs inside, from
   // admission until that prompt settles — never cleared mid-prompt by an
   // agent_end, a loop break, or a later admission. Elsewhere: run.
@@ -72,6 +79,12 @@ export function createTurnAdmission(
     // fresh compaction boundary and clear its empty-response latch; the
     // admission's own latch is per Turn and needs no reset.
     onTurnStart?: () => void;
+    // bob#356 V2a: create the FRESH session a voice-origin turn runs in, one per
+    // call, not the resident one. The runtime that supplies it decides what
+    // that session carries (persistent.ts: no Flair bootstrap, no prior-round
+    // memory, reachy_say as its one tool). Absent: a voice turn is refused (fail closed) —
+    // no voice prompt can fall back to the resident session.
+    voiceSession?: () => Promise<RunSession>;
   } = {},
 ) {
   const log = opts.log ?? ((m: string) => process.stderr.write(`${m}\n`));
@@ -92,10 +105,16 @@ export function createTurnAdmission(
     // empty-response wrapper's typed exhaustion provenance. It is never cleared
     // by a later message or compaction: the operation has failed.
     exhaustion?: EmptyResponseExhaustion;
+    // Set when the loop breaker fired: the stopped prompt gets no reasoning-only
+    // continuation when it settles.
+    loopBroken?: boolean;
     abort?: (err: Error) => void;
+    // The session this turn prompts (the resident one, or a fresh voice one).
+    target?: RunSession;
+    // This turn's last assistant ending, for its reasoning-only re-prompt.
+    endings: ReturnType<typeof createAssistantEndingTracker>;
   };
   const context = new AsyncLocalStorage<Turn>();
-  const endings = createAssistantEndingTracker();
   let active: Turn | undefined;
   let session: RunSession | undefined;
   let closed = false;
@@ -104,58 +123,72 @@ export function createTurnAdmission(
   const bound = new Promise<void>((resolve) => {
     ready = resolve;
   });
+  // One event handler for the sessions this runtime prompts: the resident one
+  // and each fresh voice session. An event counts for the active turn when the
+  // AsyncLocalStorage store it was emitted under is that turn AND the session
+  // that emitted it is that turn's target.
+  const observe = (
+    event: Parameters<Parameters<RunSession["subscribe"]>[0]>[0],
+    source: RunSession,
+  ): void => {
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      const endingTurn = context.getStore();
+      if (endingTurn && endingTurn === active && endingTurn.target === source) {
+        // The ending this turn's re-prompt check reads.
+        endingTurn.endings.observe(event);
+        const exhaustion = emptyResponseExhaustionOf(event.message);
+        if (exhaustion !== undefined) endingTurn.exhaustion = exhaustion;
+      }
+    }
+    if (event.type === "tool_execution_start") {
+      const turn = context.getStore();
+      if (turn && turn === active && turn.target === source) {
+        const { toolName, args } = event as unknown as { toolName: string; args: unknown };
+        const observation = turn.detector.observe(toolName, args);
+        if (observation.fire && turn.abort) {
+          const abort = turn.abort;
+          turn.abort = undefined;
+          turn.loopBroken = true;
+          log(loopBreakMessage(agentName, toolName, args, observation.count));
+          abort(new ToolLoopError(toolName, observation.count));
+          // Ask the session to stop. The binding does not depend on the
+          // answer: admitTurn releases it when the prompt settles.
+          requestStop(turn.target, log);
+        }
+      }
+    }
+    if (event.type !== "agent_end") return;
+    const turn = context.getStore();
+    if (turn !== active || !turn || turn.target !== source) return;
+    // agent_end fires INSIDE a prompt more than once (retries and
+    // continuations), so it CAPTURES the turn's messages here — it must
+    // not clear the origin. The admitted origin stays current from admission
+    // until the admitted prompt settles, which readOrigin() relies on: the
+    // discord tools bind a turn's outbound reach to readOrigin(), and a
+    // cleared origin mid-turn would restore their allowlist reach. The
+    // origin is cleared once, after the admitted prompt has resolved or
+    // rejected (see admitTurn's finally).
+    turn.messages = event.messages;
+    // The message_end latch above preserves exhaustion across compaction.
+    for (const message of event.messages) {
+      const exhaustion = emptyResponseExhaustionOf(message);
+      if (exhaustion !== undefined) {
+        turn.exhaustion = exhaustion;
+        break;
+      }
+    }
+  };
   const admission = {
     bind(value: RunSession): void {
       session = value;
-      value.subscribe((event) => {
-        endings.observe(event);
-        if (event.type === "message_end" && event.message?.role === "assistant") {
-          const endingTurn = context.getStore();
-          if (endingTurn && endingTurn === active) {
-            const exhaustion = emptyResponseExhaustionOf(event.message);
-            if (exhaustion !== undefined) endingTurn.exhaustion = exhaustion;
-          }
-        }
-        if (event.type === "tool_execution_start") {
-          const turn = context.getStore();
-          if (turn && turn === active) {
-            const { toolName, args } = event as unknown as { toolName: string; args: unknown };
-            const observation = turn.detector.observe(toolName, args);
-            if (observation.fire && turn.abort) {
-              const abort = turn.abort;
-              turn.abort = undefined;
-              log(loopBreakMessage(agentName, toolName, args, observation.count));
-              abort(new ToolLoopError(toolName, observation.count));
-              // Ask the session to stop. The binding does not depend on the
-              // answer: admitTurn releases it only when the prompt settles.
-              requestStop(session, log);
-            }
-          }
-        }
-        if (event.type !== "agent_end") return;
-        const turn = context.getStore();
-        if (turn !== active || !turn) return;
-        // agent_end fires INSIDE a prompt more than once (retries and
-        // continuations), so it only CAPTURES the turn's messages here — it must
-        // not clear the origin. The admitted origin stays current from admission
-        // until the admitted prompt settles, which readOrigin() relies on: the
-        // discord tools bind a turn's outbound reach to readOrigin(), and a
-        // cleared origin mid-turn would restore their allowlist reach. The
-        // origin is cleared once, after the admitted prompt has resolved or
-        // rejected (see admitTurn's finally).
-        turn.messages = event.messages;
-        // The message_end latch above preserves exhaustion across compaction.
-        for (const message of event.messages) {
-          const exhaustion = emptyResponseExhaustionOf(message);
-          if (exhaustion !== undefined) {
-            turn.exhaustion = exhaustion;
-            break;
-          }
-        }
-      });
+      value.subscribe((event) => observe(event, value));
       ready();
     },
-    admitTurn(origin: TurnOrigin, text: string): Promise<unknown[]> {
+    admitTurn(
+      origin: TurnOrigin,
+      text: string,
+      preflight?: { beforeStart?: () => string | null },
+    ): Promise<unknown[]> {
       // Copy before queuing: neither extra fields nor later caller mutations
       // may alter metadata. Closing is synchronous, including during preflight.
       let approved: TurnOrigin;
@@ -164,43 +197,95 @@ export function createTurnAdmission(
       } catch (err) {
         return Promise.reject(err);
       }
-      // bob#356 V1: the `voice` kind exists so the union, its validation, its
-      // projection and its label land together, but no voice-origin turn is
-      // admitted yet. A voice turn needs the tool admission that leaves it only
-      // `reachy_say` (D1) and the fresh, allowlisted session it runs in (D2);
-      // neither ships in V1, and the resident session holds every other tool
-      // and the private context. Refused before queuing, so nothing is prompted.
-      // Pinned for V2 (Sherlock NEW-7): that disposable session REPLACES pi's
-      // assembled system prompt — `systemPromptOverride` set to bob's fixed
-      // voice instruction, as the web session does (session.ts, bob#244) —
-      // because pi's own template names workspace paths.
-      if (approved.kind === "voice") {
-        return Promise.reject(
-          new Error(
-            "bob: voice-origin turns are not admitted yet: they need the voice tool admission and disposable session of bob#356 V2",
-          ),
-        );
-      }
+      const isVoice = approved.kind === "voice";
+      // bob#356 V2a: a voice-origin turn can be admitted now. Its origin carries
+      // `speakerVerified`, which is false in V2a (bob has no speaker
+      // authentication until V3), and the utterance/correlation ids bob issued
+      // for this transcript. It runs in a FRESH session (opts.voiceSession),
+      // not the resident one, so the resident session's history is not in
+      // front of the model; persistent.ts builds that session without the Flair
+      // bootstrap or prior-round memory. bob's tool-admission gate (session.ts,
+      // tool-admission.ts) restricts its reach to `reachy_say`: no recall, no
+      // transcript memory write or memory-writing tool, no grant tools (an
+      // admitted `reachy_say` still persists its speech audit as an OrgEvent).
+      // The reachy capability's speech gate
+      // accepts a voice-origin `say` with this turn's own current addressed
+      // utterance (policy.ts), so no later caller inherits the room's speech.
       const run = async (): Promise<unknown[]> => {
         await bound;
         if (closed) throw new Error("bob: turn admission is closed");
-        const target = session;
-        if (!target) throw new Error("bob: turn admission has no session");
-        await target.waitForIdle?.();
-        if (closed) throw new Error("bob: turn admission is closed");
+        let target: RunSession;
+        let voiceTarget: RunSession | undefined;
+        let unsubscribeVoice: (() => void) | undefined;
+        const discardVoice = (): void => {
+          if (voiceTarget === undefined) return;
+          // A session that failed before its prompt is being thrown away: each
+          // step is attempted on its own, so a failed unsubscribe still disposes.
+          try {
+            unsubscribeVoice?.();
+          } catch {
+            // the dispose below is what matters
+          }
+          try {
+            voiceTarget.dispose();
+          } catch {
+            // nothing else holds this session
+          }
+        };
+        // Until the prompt starts, a failure in startup work discards the fresh
+        // voice session before it propagates.
+        const beforePrompt = <T>(work: () => T): T => {
+          try {
+            return work();
+          } catch (err) {
+            discardVoice();
+            throw err;
+          }
+        };
+        if (isVoice) {
+          if (opts.voiceSession === undefined)
+            throw new Error(
+              "bob: a voice turn needs a fresh voice session, and this runtime configured none",
+            );
+          const fresh = await opts.voiceSession();
+          target = fresh;
+          voiceTarget = fresh;
+          unsubscribeVoice = beforePrompt(() => fresh.subscribe((event) => observe(event, fresh)));
+        } else {
+          const resident = session;
+          if (!resident) throw new Error("bob: turn admission has no session");
+          target = resident;
+          await target.waitForIdle?.();
+        }
+        if (closed) {
+          discardVoice();
+          throw new Error("bob: turn admission is closed");
+        }
+        const refusal = beforePrompt(() => preflight?.beforeStart?.() ?? null);
+        if (refusal !== null) {
+          discardVoice();
+          throw new Error(`bob: ${isVoice ? "voice turn" : "turn"} not admitted: ${refusal}`);
+        }
+        // beforeStart may have closed the admission.
+        if (closed) {
+          discardVoice();
+          throw new Error("bob: turn admission is closed");
+        }
         const turn: Turn = {
           origin: approved,
           messages: [],
           detector: new ToolLoopDetector(limit),
           token: {},
           live: true,
+          target,
+          endings: createAssistantEndingTracker(),
         };
         let abortTurn!: (err: Error) => void;
         const loopAbort = new Promise<never>((_resolve, reject) => {
           abortTurn = reject;
         });
         turn.abort = (err) => abortTurn(err);
-        opts.onTurnStart?.();
+        beforePrompt(() => opts.onTurnStart?.());
         active = turn;
         // The prompt itself, tracked apart from the race and from the abort:
         // only its settlement releases the turn's origin binding.
@@ -208,7 +293,7 @@ export function createTurnAdmission(
         try {
           // No await between installing the context and invoking the prompt.
           prompt = context.run(turn, () => {
-            endings.reset();
+            turn.endings.reset();
             return (async () => {
               await promptSession(target, text);
               // bob#256: continue through reasoning-only turns, bounded. Exhaustion
@@ -217,9 +302,9 @@ export function createTurnAdmission(
               // successful fire/reply.
               const reasoning = await repromptWhileReasoningOnly({
                 session: target,
-                readEnding: () => endings.current(),
-                beginTurn: () => endings.reset(),
-                shouldStop: () => turn.exhaustion !== undefined,
+                readEnding: () => turn.endings.current(),
+                beginTurn: () => turn.endings.reset(),
+                shouldStop: () => turn.exhaustion !== undefined || turn.loopBroken === true,
                 onReprompt: (n, max) =>
                   log(
                     `[bob] turn ended with reasoning only (no text beyond whitespace, no tool call) — re-prompting (${n}/${max})`,
@@ -263,13 +348,32 @@ export function createTurnAdmission(
             turn.released = true;
             if (active === turn) active = undefined;
           };
-          if (await settledWithin(prompt, graceMs)) {
+          // A fresh voice session serves one turn: release the binding,
+          // unsubscribe, then dispose. A loop-broken prompt that has not settled
+          // keeps the three until it does, so its in-flight tool calls still see
+          // the turn's origin.
+          const finish = (): void => {
             release();
+            if (voiceTarget === undefined) return;
+            const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
+            try {
+              unsubscribeVoice?.();
+            } catch (err) {
+              log(`[bob] could not unsubscribe from the voice session: ${describe(err)}`);
+            }
+            try {
+              voiceTarget.dispose();
+            } catch (err) {
+              log(`[bob] could not dispose the voice session: ${describe(err)}`);
+            }
+          };
+          if (await settledWithin(prompt, graceMs)) {
+            finish();
           } else {
             log(
               `[bob] loop breaker: the loop-broken turn's prompt did not settle within ${graceMs}ms; keeping its origin binding until it settles`,
             );
-            prompt.then(release, release);
+            prompt.then(finish, finish);
           }
         }
       };
@@ -356,6 +460,26 @@ const SERVICE = "bob:turn-admission";
 // today only an operator's one-shot `bob run` ({kind:"run"}). Absent for every
 // other session (a mail turn, an interactive launch), so nothing defaults to it.
 const SESSION_ORIGIN_SERVICE = "bob:session-origin";
+// bob#356 V2a: the resident reachy capability's speech bridge, handed to the
+// FRESH voice session so its `reachy_say` sends through the one live sidecar
+// link (the sidecar accepts one connection). The function is a runtime service,
+// not prompt or model text; it decides by the voice turn's bound origin.
+const VOICE_SPEECH_SERVICE = "bob:voice-speech";
+
+export type VoiceSpeech = (text: string) => Promise<unknown>;
+
+const voiceSpeechByAdmission = new WeakMap<object, VoiceSpeech>();
+
+/** The resident capability registers its speech path once its link is wired. */
+export function registerVoiceSpeech(admission: TurnAdmission, speak: VoiceSpeech): void {
+  voiceSpeechByAdmission.set(admission, speak);
+}
+
+/** The speech bridge for an admission, or undefined when no capability registered
+ *  one. Undefined is a refusal: a voice turn with no way to speak acts on nothing. */
+export function getRegisteredVoiceSpeech(admission: TurnAdmission): VoiceSpeech | undefined {
+  return voiceSpeechByAdmission.get(admission);
+}
 
 export function admissionEventBus(admission: TurnAdmission): EventBus {
   return runtimeEventBus({ admission });
@@ -367,9 +491,10 @@ export function admissionEventBus(admission: TurnAdmission): EventBus {
 export function runtimeEventBus(services: {
   admission?: TurnAdmission;
   sessionOrigin?: TurnOrigin;
+  voiceSpeech?: VoiceSpeech;
 }): EventBus {
   const bus = createEventBus();
-  const { admission, sessionOrigin } = services;
+  const { admission, sessionOrigin, voiceSpeech } = services;
   if (admission) {
     bus.on(SERVICE, (receive) => {
       (receive as (value: TurnAdmission) => void)(admission);
@@ -379,6 +504,11 @@ export function runtimeEventBus(services: {
     const frozen = approvedOrigin(sessionOrigin);
     bus.on(SESSION_ORIGIN_SERVICE, (receive) => {
       (receive as (value: TurnOrigin) => void)({ ...frozen });
+    });
+  }
+  if (voiceSpeech) {
+    bus.on(VOICE_SPEECH_SERVICE, (receive) => {
+      (receive as (value: VoiceSpeech) => void)(voiceSpeech);
     });
   }
   return bus;
@@ -392,6 +522,16 @@ export function getTurnAdmission(pi: {
     admission = value;
   });
   return admission;
+}
+
+/** The resident capability's speech bridge for this session, when the runtime
+ *  supplied one (a fresh voice session). */
+export function getVoiceSpeech(pi: { events: Pick<EventBus, "emit"> }): VoiceSpeech | undefined {
+  let speech: VoiceSpeech | undefined;
+  pi.events.emit(VOICE_SPEECH_SERVICE, (value: VoiceSpeech) => {
+    speech = value;
+  });
+  return speech;
 }
 
 /** The runtime-declared origin of this session, when the runtime declared one. */

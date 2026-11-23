@@ -96,6 +96,7 @@ import {
   type ContractGuardDeps,
   createContractGuardExtension,
 } from "./system-prompt-contract.js";
+import { createToolAdmissionExtension } from "./tool-admission.js";
 import { PI_BUILTIN_TOOLS, type ToolPolicy } from "./tool-allowlist.js";
 import { runtimeEventBus } from "./turn-admission.js";
 import { createWriteSoulExtension } from "./write-soul.js";
@@ -1024,6 +1025,7 @@ export function isolatedLoaderOptions(
     contractBlock?: string;
     turnAdmission?: RunSessionConfig["turnAdmission"];
     sessionOrigin?: RunSessionConfig["sessionOrigin"];
+    voiceSpeech?: RunSessionConfig["voiceSpeech"];
   },
   extra?: { guard?: InlineExtension; toolExtensions?: InlineExtension[]; webSession?: boolean },
 ): LoaderOptions {
@@ -1044,11 +1046,12 @@ export function isolatedLoaderOptions(
     additionalExtensionPaths: [...config.extensionSources],
     // bob#356: the runtime services a capability may read at load — the turn
     // admission (persistent) and the declared session origin (one-shot run).
-    ...(config.turnAdmission || config.sessionOrigin
+    ...(config.turnAdmission || config.sessionOrigin || config.voiceSpeech
       ? {
           eventBus: runtimeEventBus({
             ...(config.turnAdmission ? { admission: config.turnAdmission } : {}),
             ...(config.sessionOrigin ? { sessionOrigin: config.sessionOrigin } : {}),
+            ...(config.voiceSpeech ? { voiceSpeech: config.voiceSpeech } : {}),
           }),
         }
       : {}),
@@ -1345,6 +1348,14 @@ export interface BobFactoryInput {
   // can substitute one that returns a scripted "built" session so it can drive
   // the factory's dispose-on-refusal catch without a process-global module mock.
   buildSession?: typeof createAgentSessionFromServices;
+  // bob#356 V2a: provider-key custody SHARED with the other factories of one
+  // runtime. The persistent runtime builds each voice session through a new
+  // factory; the warm session's factory already read and
+  // deleted a keyed row's variable, so those factories reuse the key this map
+  // holds instead of reading the environment again. The map lives in the
+  // runtime's factory closure, not in a config object or at module scope.
+  // Absent: this factory keeps a custody of its own.
+  custodyKeys?: Map<string, string>;
   // The validated provider selection this session was resolved from. The factory
   // derives the on-disk refusal set from ITS rows, never a re-loaded default.
   registry?: ProviderRegistry;
@@ -1372,6 +1383,44 @@ export function assertContractGuardLoaded(
       "",
       "The #145 contract guard is registered as an inline extension; without it no request",
       "is checked for the contract, so the session is refused rather than run unguarded.",
+    ].join("\n"),
+  );
+}
+
+/** What the gate check reads: pi's loaded extensions (by path) and its load errors. */
+export interface GateLoadSource {
+  getExtensions(): {
+    errors: Array<{ path: string; error: string }>;
+    extensions?: ReadonlyArray<{ path: string }>;
+  };
+}
+
+// bob#356 V2a: fail the session unless the tool-admission gate is LOADED. Two
+// checks, because either alone could pass an ungated session: no inline
+// extension of bob's may have failed to load, and the gate itself must be among
+// the loaded extensions (pi names it `<inline:<name>>`). Run at creation, before
+// the session is built, and again in the audit after a reload or a bind.
+export function assertToolAdmissionGateLoaded(
+  loader: GateLoadSource,
+  gate: InlineExtension | undefined,
+): void {
+  if (gate === undefined) return;
+  const { errors, extensions } = loader.getExtensions();
+  const failures = (errors ?? []).filter((e) => e.path.startsWith("<inline:"));
+  const gatePath = `<inline:${gate.name}>`;
+  const present = Array.isArray(extensions) && extensions.some((e) => e.path === gatePath);
+  if (failures.length === 0 && present) return;
+  throw new Error(
+    [
+      ...(failures.length > 0
+        ? [
+            `bob: ${failures.length} of bob's own inline extension${failures.length === 1 ? " did" : "s did"} not load:`,
+            ...failures.map((f) => `  ${f.path}: ${f.error}`),
+          ]
+        : [`bob: the tool-admission gate ${gatePath} is not among the loaded extensions.`]),
+      "",
+      "The tool-admission gate is registered as an inline extension; without it a voice-origin",
+      "turn would reach every tool, so the session is refused rather than run ungated.",
     ].join("\n"),
   );
 }
@@ -1469,14 +1518,23 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
   // exactly where the setup policy grants it.
   const writeSoulExt =
     config.setupSoulPath !== undefined ? createWriteSoulExtension(config.setupSoulPath) : undefined;
+  // bob#356 V2a: a session served by a turn admission gets the TOOL-ADMISSION
+  // gate. It reads the origin the current tool call is bound to and refuses a
+  // voice-origin call to anything but reachy_say, before the executor runs.
+  // A one-shot run, a mail turn and the setup sessions carry no admission and
+  // load no gate (nothing there can bind a voice origin).
+  const toolAdmissionExt =
+    config.turnAdmission !== undefined ? createToolAdmissionExtension() : undefined;
   // The active-tool check mirrors run.ts's assertAllowedToolsActive; kept as a
   // parameter so this module does not depend on run.ts at runtime.
   // (round 8, item 4) pi calls this factory AGAIN for `/new`, `/resume`, `/fork`,
   // `/clone` and `/import` (agent-session-runtime.js). Custody is per VARIABLE:
   // the first invocation that reaches a keyed row reads its variable ONCE into
   // this closure, which outlives a single factory invocation; later invocations
-  // reuse it without re-reading process.env.
-  const custodyKeys = new Map<string, string>();
+  // reuse it without re-reading process.env. A caller that builds several
+  // factories for one runtime (the persistent runtime's voice sessions) passes
+  // them one shared map (BobFactoryInput.custodyKeys).
+  const custodyKeys = input.custodyKeys ?? new Map<string, string>();
   return async ({ sessionManager }) => {
     // bob#321: once custody holds the selected keyed variable's credential,
     // takeProviderKey's read-and-delete is skipped; without this deletion the
@@ -1688,7 +1746,14 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
           { ...config, ...(contractBlock !== undefined ? { contractBlock } : {}) },
           {
             ...(guard !== undefined ? { guard } : {}),
-            ...(writeSoulExt !== undefined ? { toolExtensions: [writeSoulExt] } : {}),
+            ...(writeSoulExt !== undefined || toolAdmissionExt !== undefined
+              ? {
+                  toolExtensions: [
+                    ...(writeSoulExt !== undefined ? [writeSoulExt] : []),
+                    ...(toolAdmissionExt !== undefined ? [toolAdmissionExt] : []),
+                  ],
+                }
+              : {}),
             ...(webSession ? { webSession: true } : {}),
           },
         ),
@@ -1702,6 +1767,7 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
     // And so is the guard: an inline extension that pi failed to load would
     // leave every request unchecked while the session looked healthy.
     assertContractGuardLoaded(services.resourceLoader, guard);
+    assertToolAdmissionGateLoaded(services.resourceLoader, toolAdmissionExt);
     if (keyedProvider !== undefined && keyedRow !== undefined) {
       await assertKeyedRuntimeUnchanged(modelRuntime as ModelRuntime, {
         row: keyedRow,
@@ -1752,6 +1818,10 @@ export function createBobRuntimeFactory(input: BobFactoryInput): CreateAgentSess
       assertAllowedToolsActive(session, policy);
     };
     const runAudit = () => {
+      // bob#356 V2a: a reload re-runs the extension factories, the gate's included;
+      // a gate that does not load again leaves the session ungated, so the
+      // reload and bind audit refuses it like creation does.
+      assertToolAdmissionGateLoaded(services.resourceLoader, toolAdmissionExt);
       auditCreatedSession(
         result.session as unknown as AuditSession,
         services.resourceLoader,

@@ -628,6 +628,10 @@ export interface RunSessionConfig {
   persistent?: boolean;
   // Owned by startPersistent; capabilities obtain it from the loader service.
   turnAdmission?: TurnAdmission;
+  // bob#356 V2a: the resident reachy capability's speech bridge. Set on a
+  // fresh voice session, so its `reachy_say` reaches the one live sidecar link
+  // instead of opening a second connection. Absent everywhere else.
+  voiceSpeech?: (text: string) => Promise<unknown>;
   // bob#356: the origin the runtime DECLARES for a session no admission serves:
   // `{kind:"run"}` only for an operator's one-shot `bob run` (the CLI entry
   // passes RunOptions.sessionOrigin); absent for `bob launch`, a mail turn and
@@ -2895,6 +2899,9 @@ export async function createPiRunSession(
   config: RunSessionConfig,
   sessionManagerFactory?: (cwd: string) => SessionManagerLike,
   registry?: ProviderRegistry,
+  // bob#356 V2a: one runtime's shared provider-key custody (see
+  // BobFactoryInput.custodyKeys). Omitted: the factory keeps its own.
+  custodyKeys?: Map<string, string>,
 ): Promise<RunSession> {
   assertToolPolicy(config);
   const policy: ToolPolicy = {
@@ -2914,6 +2921,7 @@ export async function createPiRunSession(
     config,
     policy,
     ...(registry !== undefined ? { registry } : {}),
+    ...(custodyKeys !== undefined ? { custodyKeys } : {}),
   });
   const { session } = await factory({
     cwd: config.cwd,

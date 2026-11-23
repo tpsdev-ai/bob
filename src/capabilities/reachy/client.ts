@@ -13,6 +13,7 @@ import {
   type WiredReachy,
 } from "./capability.js";
 import type { OrgEvent } from "./policy.js";
+import { OVERSIZED_LINE } from "./wire.js";
 
 /** The inbound line bound (64 KiB); a longer line is malformed, never buffered. */
 export const MAX_LINE_BYTES = 64 * 1024;
@@ -234,9 +235,9 @@ export class UnixSocketReachyClient implements ReachyCommands {
     }
   }
 
-  /** Hand the decoder the oversized marker, so it audits one `reachy.malformed`. */
+  /** Hand the decoder the oversized-line symbol (one malformed line). */
   private emitMalformed(): void {
-    for (const l of this.listeners) l({ type: "__oversized__" });
+    for (const l of this.listeners) l(OVERSIZED_LINE);
   }
 
   onLine(listener: (line: unknown) => void): void {
