@@ -197,7 +197,9 @@ export function createTurnAdmission(
       // front of the model; persistent.ts builds that session without the Flair
       // bootstrap or prior-round memory. bob's tool-admission gate (session.ts,
       // tool-admission.ts) restricts its reach to `reachy_say`: no recall, no
-      // memory writes, no grant tools. The reachy capability's speech gate
+      // transcript memory write or memory-writing tool, no grant tools (an
+      // admitted `reachy_say` still persists its speech audit as an OrgEvent).
+      // The reachy capability's speech gate
       // accepts a voice-origin `say` with this turn's own current addressed
       // utterance (policy.ts), so no later caller inherits the room's speech.
       const run = async (): Promise<unknown[]> => {
